@@ -295,4 +295,189 @@ mod tests {
             .acquire()
             .expect("the lease is released with the layer");
     }
+
+    /// A canonicalized scratch directory: `discover` canonicalizes `start`, so expectations keyed
+    /// on a path must be keyed on the resolved one.
+    fn scratch() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().expect("scratch directory");
+        let root = dir.path().canonicalize().expect("canonical scratch");
+        (dir, root)
+    }
+
+    /// A mock answering `is_subvolume` true for exactly `seed` and reporting no mount roots.
+    fn subvolume_at(seed: &Path) -> crate::snapshot::MockSubvolumes {
+        let seed = seed.to_path_buf();
+        let mut fs = crate::snapshot::MockSubvolumes::new();
+        fs.expect_is_subvolume()
+            .returning(move |candidate| candidate == seed);
+        fs.expect_is_mount_root().returning(|_| Ok(false));
+        fs
+    }
+
+    /// Discovery is the seed walk plus the state-directory derivation: the state of a seed goes
+    /// *beside* it, named after it, so two sibling seeds keep separate histories.
+    #[test]
+    fn discovery_puts_state_beside_the_nearest_enclosing_subvolume() {
+        let (_dir, base) = scratch();
+        let seed = base.join("seed");
+        let start = seed.join("src/deep");
+        std::fs::create_dir_all(&start).expect("start directory");
+
+        let layer = PersistenceLayer::discover(&start, &subvolume_at(&seed)).expect("discovery");
+
+        assert_eq!(layer.seed, seed);
+        assert_eq!(layer.root, base.join(STATE_DIR).join("seed"));
+        assert_eq!(layer.snap(), layer.root.join("snap"));
+        assert_eq!(layer.meta(), layer.root.join("meta"));
+    }
+
+    /// A seed that is its own mount root has no usable parent directory, so discovery refuses it
+    /// rather than writing state onto whatever filesystem holds the mount point.
+    #[test]
+    fn a_seed_that_is_its_mount_root_is_refused() {
+        let (_dir, base) = scratch();
+        let seed = base.join("seed");
+        std::fs::create_dir_all(&seed).expect("seed directory");
+        let mut fs = crate::snapshot::MockSubvolumes::new();
+        let expected = seed.clone();
+        fs.expect_is_subvolume()
+            .returning(move |candidate| candidate == expected);
+        fs.expect_is_mount_root().returning(|_| Ok(true));
+
+        let error = PersistenceLayer::discover(&seed, &fs).expect_err("refused");
+        assert!(
+            matches!(&error, Error::SeedIsMountRoot(path) if *path == seed),
+            "got {error:?}"
+        );
+    }
+
+    /// Nothing on the way up is a subvolume: there is no seed to commit into.
+    #[test]
+    fn discovery_without_any_enclosing_subvolume_fails() {
+        let (_dir, base) = scratch();
+        let start = base.join("plain");
+        std::fs::create_dir_all(&start).expect("start directory");
+        let mut fs = crate::snapshot::MockSubvolumes::new();
+        fs.expect_is_subvolume().returning(|_| false);
+
+        let error = PersistenceLayer::discover(&start, &fs).expect_err("refused");
+        assert!(
+            matches!(&error, Error::NoSubvolume(path) if *path == start),
+            "got {error:?}"
+        );
+    }
+
+    /// An unreadable mount table is not a "not a mount root" answer: it surfaces as the failure it
+    /// is, so a session never starts on a guess.
+    #[test]
+    fn a_mount_table_failure_stops_discovery() {
+        let (_dir, base) = scratch();
+        let seed = base.join("seed");
+        std::fs::create_dir_all(&seed).expect("seed directory");
+        let mut fs = crate::snapshot::MockSubvolumes::new();
+        fs.expect_is_subvolume().returning(|_| true);
+        fs.expect_is_mount_root()
+            .returning(|_| Err(Error::Io(std::io::Error::other("no mount table"))));
+
+        let error = PersistenceLayer::discover(&seed, &fs).expect_err("refused");
+        assert!(matches!(&error, Error::Io(_)), "got {error:?}");
+    }
+
+    /// A starting directory that does not exist is reported with its path and the reason, rather
+    /// than as a missing seed.
+    #[test]
+    fn a_starting_directory_that_cannot_be_resolved_is_reported_as_such() {
+        let (_dir, base) = scratch();
+        let start = base.join("absent");
+        let fs = crate::snapshot::MockSubvolumes::new();
+
+        let error = PersistenceLayer::discover(&start, &fs).expect_err("refused");
+        assert!(
+            matches!(&error, Error::SeedDir { path, reason }
+                if *path == start && !reason.is_empty()),
+            "got {error:?}"
+        );
+    }
+
+    /// Materialization is what makes the layout usable: both state subtrees exist afterwards, and
+    /// running it again on a live layout changes nothing.
+    #[test]
+    fn materializing_creates_the_state_layout_and_is_repeatable() {
+        let (_dir, base) = scratch();
+        let layer = PersistenceLayer::new(base.join("seed"), base.join("state"));
+        let mut fs = crate::snapshot::MockSubvolumes::new();
+        fs.expect_assert_btrfs().returning(|_| Ok(()));
+        fs.expect_assert_user_subvol_rm_allowed().returning(|_| Ok(()));
+
+        layer.materialize(&fs).expect("first materialization");
+        std::fs::write(layer.snap().join("keep"), b"x").expect("a file in snap");
+        layer.materialize(&fs).expect("second materialization");
+
+        assert!(layer.snap().is_dir());
+        assert!(layer.meta().join("runs").is_dir());
+        assert!(
+            layer.snap().join("keep").exists(),
+            "repeating materialization does not wipe existing state"
+        );
+    }
+
+    /// The btrfs assertions are the reason materialization exists; neither is swallowed.
+    #[test]
+    fn materializing_propagates_the_btrfs_assertions() {
+        let (_dir, base) = scratch();
+        let layer = PersistenceLayer::new(base.join("seed"), base.join("state"));
+
+        let mut not_btrfs = crate::snapshot::MockSubvolumes::new();
+        not_btrfs
+            .expect_assert_btrfs()
+            .returning(|path| Err(Error::NotBtrfs(path.to_path_buf())));
+        let error = layer.materialize(&not_btrfs).expect_err("refused");
+        assert!(
+            matches!(&error, Error::NotBtrfs(path) if *path == layer.root),
+            "got {error:?}"
+        );
+
+        let mut not_allowed = crate::snapshot::MockSubvolumes::new();
+        not_allowed.expect_assert_btrfs().returning(|_| Ok(()));
+        not_allowed
+            .expect_assert_user_subvol_rm_allowed()
+            .returning(|path| Err(Error::NotUserSubvolRmAllowed(path.to_path_buf())));
+        let error = layer.materialize(&not_allowed).expect_err("refused");
+        assert!(
+            matches!(&error, Error::NotUserSubvolRmAllowed(path) if *path == layer.root),
+            "got {error:?}"
+        );
+    }
+
+    /// A file where the state root belongs would otherwise surface as a bare `EEXIST` from
+    /// `create_dir_all`, which names neither the path nor the problem.
+    #[test]
+    fn a_file_occupying_the_state_root_is_named() {
+        let (_dir, base) = scratch();
+        let root = base.join("state");
+        std::fs::write(&root, b"not a directory").expect("occupying file");
+        let layer = PersistenceLayer::new(base.join("seed"), root.clone());
+        let fs = crate::snapshot::MockSubvolumes::new();
+
+        let error = layer.materialize(&fs).expect_err("refused");
+        assert!(
+            matches!(&error, Error::StateNotDirectory(path) if *path == root),
+            "got {error:?}"
+        );
+
+        let mut layer = layer;
+        let error = layer.acquire().expect_err("refused");
+        assert!(
+            matches!(&error, Error::StateNotDirectory(path) if *path == root),
+            "acquiring is refused for the same reason: got {error:?}"
+        );
+    }
+
+    /// A job's work tree and a version's reader tree are distinct names under one `snap/`.
+    #[test]
+    fn work_and_reader_trees_are_named_under_snap() {
+        let layer = PersistenceLayer::new(PathBuf::from("/seed"), PathBuf::from("/state"));
+        assert_eq!(layer.work("a9993e36"), PathBuf::from("/state/snap/a9993e36"));
+        assert_eq!(layer.reader(7), PathBuf::from("/state/snap/read-7"));
+    }
 }

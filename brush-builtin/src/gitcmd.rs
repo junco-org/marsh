@@ -477,4 +477,30 @@ mod tests {
              policy distinguishes a missing message from an empty one"
         );
     }
+
+    /// A pathspec is resolved textually against the caller's working directory, exactly as git
+    /// resolves it: no symlink is followed and no filesystem is consulted.
+    #[test]
+    fn a_pathspec_is_resolved_lexically_against_the_working_directory() {
+        let base = Path::new("/work/src");
+        assert_eq!(resolve(base, "a.txt"), Path::new("/work/src/a.txt"));
+        assert_eq!(resolve(base, "./a.txt"), Path::new("/work/src/a.txt"));
+        assert_eq!(resolve(base, "../a.txt"), Path::new("/work/a.txt"));
+        assert_eq!(resolve(base, "deep/../a.txt"), Path::new("/work/src/a.txt"));
+        assert_eq!(
+            resolve(base, "/etc/passwd"),
+            Path::new("/etc/passwd"),
+            "an absolute pathspec ignores the working directory"
+        );
+    }
+
+    /// The callers decide what a segment list means, so a component that is not a name must never
+    /// reach them as one.
+    #[test]
+    fn relative_segments_drops_components_that_are_not_names() {
+        assert_eq!(
+            relative_segments(Path::new("/work"), Path::new("/work/../etc/passwd")),
+            Some(vec!["etc".to_string(), "passwd".to_string()]),
+        );
+    }
 }

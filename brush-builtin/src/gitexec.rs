@@ -1386,4 +1386,290 @@ mod tests {
             "an untouched path names only its creating commit: {out:?}"
         );
     }
+
+    /// A repository whose `HEAD` is unborn: an index, no commit.
+    fn unborn(label: &str) -> tempfile::TempDir {
+        let directory = tempfile::Builder::new()
+            .prefix(&format!("gitexec-{label}-"))
+            .tempdir()
+            .expect("scratch directory");
+        let root = directory.path();
+        isolate_from_host_config();
+        std::fs::write(root.join("a.txt"), b"new\n").expect("seed file");
+        let repo = Repository::init_opts(
+            root,
+            git2::RepositoryInitOptions::new().initial_head("main"),
+        )
+        .expect("init");
+        let mut index = repo.index().expect("index");
+        index.add_path(Path::new("a.txt")).expect("add");
+        index.write().expect("write index");
+        drop(repo);
+        directory
+    }
+
+    #[test]
+    fn an_offset_without_a_sign_is_east_of_utc() {
+        let identity = identity_from_env(
+            |name| {
+                Some(match name {
+                    "GIT_AUTHOR_DATE" => "1112911993 0530".to_string(),
+                    _ => "x".to_string(),
+                })
+            },
+            "AUTHOR",
+        )
+        .expect("identity");
+        assert_eq!(identity.time.offset_minutes(), 330);
+    }
+
+    /// Each refusal is printed verbatim after `fatal: `, so its wording is a user-facing contract.
+    #[test]
+    fn every_identity_refusal_names_the_variable_that_has_to_be_set() {
+        /// The sentence the builtin prints after `fatal: `.
+        fn refusal(get: impl Fn(&str) -> Option<String>, who: &str) -> String {
+            match identity_from_env(get, who) {
+                Ok(_) => panic!("{who} identity accepted"),
+                Err(error) => error.to_string(),
+            }
+        }
+        let with = |date: &'static str| {
+            move |name: &str| {
+                Some(if name == "GIT_AUTHOR_DATE" {
+                    date.to_string()
+                } else {
+                    "x".to_string()
+                })
+            }
+        };
+        assert_eq!(refusal(|_| None, "AUTHOR"), "GIT_AUTHOR_NAME is not set");
+        assert_eq!(
+            refusal(
+                |name| (name != "GIT_COMMITTER_EMAIL").then(|| "x".to_string()),
+                "COMMITTER"
+            ),
+            "GIT_COMMITTER_EMAIL is not set"
+        );
+        assert_eq!(
+            refusal(
+                |name| (name != "GIT_AUTHOR_DATE").then(|| "x".to_string()),
+                "AUTHOR"
+            ),
+            "GIT_AUTHOR_DATE is not set"
+        );
+        assert_eq!(
+            refusal(with("1112911993"), "AUTHOR"),
+            "GIT_AUTHOR_DATE must be `<epoch> <±HHMM>`, got \"1112911993\""
+        );
+        assert_eq!(
+            refusal(with("yesterday +0000"), "AUTHOR"),
+            "GIT_AUTHOR_DATE epoch \"yesterday\" is not a number"
+        );
+        assert_eq!(
+            refusal(with("1112911993 +12345"), "AUTHOR"),
+            "GIT_AUTHOR_DATE offset \"+12345\" must be four digits with an optional sign"
+        );
+    }
+
+    #[test]
+    fn a_directory_that_is_not_a_repository_is_fatal() {
+        let directory = tempfile::tempdir().expect("scratch directory");
+        let (code, out, err) = exec(directory.path(), &["git", "add", "--", "a.txt"]);
+        assert_eq!((code, out.as_str()), (FATAL, ""));
+        assert!(
+            err.starts_with("fatal: not a git repository: "),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn an_identity_libgit2_will_not_sign_with_is_fatal_before_any_git_work() {
+        let directory = scratch("bad-signature");
+        let root = directory.path();
+        let argv: Vec<String> = ["git", "commit", "-m", "x", "--", "src/p.txt"]
+            .iter()
+            .map(|arg| (*arg).to_string())
+            .collect();
+        let invocation = crate::gitcmd::parse(&argv).expect("parse");
+        let empty = GitEnvIdentity {
+            name: String::new(),
+            email: String::new(),
+            time: git2::Time::new(1_112_911_993, 0),
+        };
+        let before = state(root);
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run(&invocation, root, &empty, &identity(), &mut out, &mut err);
+        assert_eq!(code, FATAL);
+        assert_eq!(
+            String::from_utf8_lossy(&err),
+            "fatal: invalid author or committer identity\n"
+        );
+        assert_eq!(state(root), before, "nothing was written");
+    }
+
+    #[test]
+    fn an_unborn_branch_refuses_every_command_that_needs_head() {
+        let directory = unborn("unborn");
+        let root = directory.path();
+
+        let (code, _, err) = exec(root, &["git", "commit", "-m", "first", "--", "a.txt"]);
+        assert_eq!((code, err.as_str()), (FATAL, "fatal: could not resolve 'HEAD'\n"));
+
+        let (code, _, err) = exec(root, &["git", "stash", "push", "--", "a.txt"]);
+        assert_eq!((code, err.as_str()), (FATAL, "fatal: could not resolve 'HEAD'\n"));
+
+        let (code, _, err) = exec(root, &["git", "checkout", "HEAD", "--", "a.txt"]);
+        assert_eq!(
+            (code, err.as_str()),
+            (
+                REFUSED,
+                "error: pathspec 'a.txt' did not match any file(s) known to git\n"
+            )
+        );
+
+        let (code, out, err) = exec(root, &["git", "log", "--", "a.txt"]);
+        assert_eq!(
+            (code, out.as_str(), err.as_str()),
+            (0, "", ""),
+            "there is no history to report yet"
+        );
+    }
+
+    /// A libgit2 failure that is not one of the modelled refusals still has to leave the shell with
+    /// git's own `fatal:` line and exit code, not a panic.
+    #[test]
+    fn an_unreadable_worktree_path_becomes_a_fatal_line() {
+        let directory = scratch("unreadable");
+        let root = directory.path();
+        std::fs::set_permissions(
+            root.join("src"),
+            std::os::unix::fs::PermissionsExt::from_mode(0o000),
+        )
+        .expect("seal the directory");
+        let (code, _, err) = exec(root, &["git", "commit", "-m", "x", "--", "src/p.txt"]);
+        std::fs::set_permissions(
+            root.join("src"),
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .expect("unseal the directory");
+        assert_eq!(
+            (code, err.as_str()),
+            (FATAL, "fatal: Permission denied (os error 13)\n"),
+            "the operating system's refusal reaches the shell as git's own fatal line"
+        );
+    }
+
+    #[test]
+    fn a_symlink_is_committed_and_restored_as_a_link() {
+        let directory = scratch("symlink");
+        let root = directory.path();
+        std::os::unix::fs::symlink("p.txt", root.join("src/link")).expect("symlink");
+        assert_eq!(exec(root, &["git", "add", "--", "src/link"]).0, 0);
+        assert_eq!(
+            exec(root, &["git", "commit", "-m", "link", "--", "src/link"]).0,
+            0
+        );
+
+        std::fs::remove_file(root.join("src/link")).expect("remove link");
+        std::fs::write(root.join("src/link"), b"a regular file now\n").expect("clobber");
+        let (code, _, err) = exec(root, &["git", "checkout", "HEAD", "--", "src/link"]);
+        assert_eq!((code, err.as_str()), (0, ""));
+
+        let restored = root.join("src/link");
+        assert!(
+            restored
+                .symlink_metadata()
+                .expect("metadata")
+                .file_type()
+                .is_symlink(),
+            "checkout restores the entry as a link, not as a file holding the target"
+        );
+        assert_eq!(
+            std::fs::read_link(&restored).expect("read link"),
+            Path::new("p.txt")
+        );
+    }
+
+    #[test]
+    fn the_executable_bit_survives_a_commit_and_a_checkout() {
+        let directory = scratch("executable");
+        let root = directory.path();
+        let script = root.join("src/run.sh");
+        std::fs::write(&script, b"#!/bin/sh\nexit 0\n").expect("script");
+        std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .expect("chmod +x");
+        assert_eq!(exec(root, &["git", "add", "--", "src/run.sh"]).0, 0);
+        assert_eq!(
+            exec(root, &["git", "commit", "-m", "script", "--", "src/run.sh"]).0,
+            0
+        );
+
+        std::fs::write(&script, b"clobbered\n").expect("clobber");
+        std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o644))
+            .expect("chmod -x");
+        assert_eq!(exec(root, &["git", "checkout", "HEAD", "--", "src/run.sh"]).0, 0);
+
+        assert_eq!(
+            std::fs::read(&script).expect("read"),
+            b"#!/bin/sh\nexit 0\n"
+        );
+        let mode = std::os::unix::fs::MetadataExt::mode(&script.metadata().expect("metadata"));
+        assert_ne!(mode & 0o111, 0, "the restored file is executable again");
+    }
+
+    #[test]
+    fn stashing_a_deleted_path_records_its_absence_and_brings_it_back() {
+        let directory = scratch("stash-deleted");
+        let root = directory.path();
+        std::fs::remove_file(root.join("src/p.txt")).expect("delete");
+
+        let (code, out, err) = exec(root, &["git", "stash", "push", "--", "src/p.txt"]);
+        assert_eq!((code, err.as_str()), (0, ""));
+        assert!(out.starts_with("Saved working directory"), "{out:?}");
+        assert_eq!(
+            std::fs::read(root.join("src/p.txt")).expect("restored"),
+            b"seed\n",
+            "the path goes back to HEAD"
+        );
+
+        let repo = Repository::open(root).expect("open");
+        let stash = repo
+            .find_reference("refs/stash")
+            .expect("stash ref")
+            .peel_to_commit()
+            .expect("stash commit");
+        assert!(
+            tree_blob(&stash.tree().expect("tree"), Path::new("src/p.txt")).is_none(),
+            "the stashed worktree tree records the deletion"
+        );
+    }
+
+    /// Raw git modes are what a tree entry carries; every one of them has to keep its meaning, or a
+    /// restored entry would change kind.
+    #[test]
+    fn raw_git_modes_keep_their_kind() {
+        assert_eq!(file_mode(0o120_000), FileMode::Link);
+        assert_eq!(file_mode(0o100_755), FileMode::BlobExecutable);
+        assert_eq!(file_mode(0o040_000), FileMode::Tree);
+        assert_eq!(file_mode(0o160_000), FileMode::Commit);
+        assert_eq!(file_mode(0o100_644), FileMode::Blob);
+    }
+
+    /// A worktree entry that is not a regular file and not a symlink has no content git could
+    /// compare, so `git rm` finds no local modification to refuse over and removes it.
+    #[test]
+    fn a_worktree_entry_that_is_not_a_file_carries_no_content() {
+        let directory = scratch("not-a-file");
+        let root = directory.path();
+        let path = root.join("src/p.txt");
+        std::fs::remove_file(&path).expect("delete the file");
+        let socket = std::os::unix::net::UnixListener::bind(&path).expect("bind a socket");
+
+        let (code, out, err) = exec(root, &["git", "rm", "--", "src/p.txt"]);
+        assert_eq!((code, out.as_str(), err.as_str()), (0, "rm 'src/p.txt'\n", ""));
+        drop(socket);
+        assert!(!path.exists(), "the entry is gone from the worktree");
+        assert_eq!(state(root).1, None, "and gone from the index");
+    }
 }

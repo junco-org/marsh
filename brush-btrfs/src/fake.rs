@@ -118,3 +118,127 @@ fn copy_tree(src: &Path, dest: &Path) -> Result<(), Error> {
     }
     Ok(())
 }
+
+#[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
+#[cfg(test)]
+mod tests {
+    use std::os::unix::fs::PermissionsExt;
+
+    use super::*;
+
+    /// Only what a caller declared — or what this implementation created — is a subvolume root, so
+    /// a seed walk over a plain tree stops exactly where the test said it should.
+    #[test]
+    fn only_registered_or_created_roots_are_subvolumes() {
+        let scratch = tempfile::tempdir().expect("scratch directory");
+        let fs = CopyTree::new();
+        let seed = scratch.path().join("seed");
+        let plain = scratch.path().join("plain");
+        std::fs::create_dir_all(&seed).expect("seed");
+        std::fs::create_dir_all(&plain).expect("plain");
+
+        assert!(!fs.is_subvolume(&seed), "nothing is registered yet");
+        fs.register(&seed);
+        assert!(fs.is_subvolume(&seed));
+        assert!(!fs.is_subvolume(&plain));
+        assert!(
+            !fs.is_subvolume(&scratch.path().join("absent")),
+            "a path that cannot be canonicalized is not a subvolume"
+        );
+
+        let created = scratch.path().join("created/nested");
+        fs.create_subvolume(&created).expect("create");
+        assert!(created.is_dir(), "creating makes the directory");
+        assert!(fs.is_subvolume(&created), "and registers it");
+    }
+
+    /// A snapshot is a copy that a diff can compare against the source: contents, permission bits
+    /// and symlinks-as-symlinks all survive, and the result is itself a subvolume root.
+    #[test]
+    fn a_snapshot_copies_contents_modes_and_symlinks() {
+        let scratch = tempfile::tempdir().expect("scratch directory");
+        let fs = CopyTree::new();
+        let seed = scratch.path().join("seed");
+        std::fs::create_dir_all(seed.join("sub")).expect("seed tree");
+        std::fs::write(seed.join("sub/a.txt"), b"seed\n").expect("a regular file");
+        let script = seed.join("run.sh");
+        std::fs::write(&script, b"#!/bin/sh\n").expect("an executable file");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+            .expect("set mode");
+        std::os::unix::fs::symlink("sub/a.txt", seed.join("link")).expect("a symlink");
+        fs.register(&seed);
+
+        let snap = scratch.path().join("snap");
+        fs.snapshot(&seed, &snap).expect("snapshot");
+
+        assert_eq!(
+            std::fs::read(snap.join("sub/a.txt")).expect("copied file"),
+            b"seed\n"
+        );
+        assert_eq!(
+            std::fs::metadata(snap.join("run.sh"))
+                .expect("copied mode")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755
+        );
+        assert_eq!(
+            std::fs::read_link(snap.join("link")).expect("the link is still a link"),
+            Path::new("sub/a.txt")
+        );
+        assert!(fs.is_subvolume(&snap), "a snapshot is a subvolume root");
+
+        std::fs::write(snap.join("sub/a.txt"), b"work\n").expect("snapshots are writable");
+        assert_eq!(
+            std::fs::read(seed.join("sub/a.txt")).expect("read seed"),
+            b"seed\n",
+            "writing the copy does not touch the source"
+        );
+    }
+
+    /// Snapshotting a source that is not there fails as I/O rather than producing an empty tree a
+    /// caller would mistake for an empty seed.
+    #[test]
+    fn snapshotting_an_absent_source_fails() {
+        let scratch = tempfile::tempdir().expect("scratch directory");
+        let fs = CopyTree::new();
+        let error = fs
+            .snapshot(&scratch.path().join("absent"), &scratch.path().join("snap"))
+            .expect_err("no source");
+        assert!(matches!(&error, Error::Io(_)), "got {error:?}");
+    }
+
+    /// Deleting reclaims the tree and retracts the registration, so a later walk over the same
+    /// path does not find a subvolume that is gone.
+    #[test]
+    fn deleting_removes_the_tree_and_the_registration() {
+        let scratch = tempfile::tempdir().expect("scratch directory");
+        let fs = CopyTree::new();
+        let snap = scratch.path().join("snap/nested");
+        fs.create_subvolume(&snap).expect("create");
+        std::fs::write(snap.join("a.txt"), b"x").expect("a file inside");
+
+        fs.delete_subvolume(&snap);
+        assert!(!snap.exists());
+        assert!(!fs.is_subvolume(&snap));
+
+        fs.delete_subvolume(&snap);
+        assert!(!snap.exists(), "deleting an absent path is harmless");
+    }
+
+    /// The two btrfs assertions describe properties a directory tree cannot have, so they pass,
+    /// and nothing here is a mount root — a caller testing against this is testing its own logic.
+    #[test]
+    fn the_btrfs_conditions_are_not_modelled() {
+        let scratch = tempfile::tempdir().expect("scratch directory");
+        let fs = CopyTree::new();
+        fs.assert_btrfs(scratch.path()).expect("always btrfs");
+        fs.assert_user_subvol_rm_allowed(scratch.path())
+            .expect("always reclaimable");
+        assert!(
+            !fs.is_mount_root(scratch.path()).expect("never fails"),
+            "no directory is reported as a mount root, so discovery never stops early"
+        );
+    }
+}

@@ -673,4 +673,323 @@ mod tests {
             "write-ahead log failure: transaction 7 declares 1 operations but contains 0"
         );
     }
+
+    /// A session that never published anything — no log at all, or a log that exists and is empty
+    /// — has no history to hand back, and recovery is not an error there.
+    #[test]
+    fn an_absent_or_empty_log_recovers_nothing() {
+        let temp = tempfile::tempdir().expect("scratch directory");
+        let layout = scratch(temp.path());
+        let recovered: Vec<Transaction<Meta>> =
+            recover(&layout.seed, &layout.snap, &layout.log).expect("no log at all");
+        assert!(recovered.is_empty());
+
+        std::fs::write(&layout.log, b"").expect("empty log");
+        let recovered: Vec<Transaction<Meta>> =
+            recover(&layout.seed, &layout.snap, &layout.log).expect("an empty log");
+        assert!(recovered.is_empty());
+    }
+
+    /// A line that is durable and unparsable is corruption: recovery stops rather than publishing
+    /// a transaction it only half understands.
+    #[test]
+    fn a_corrupt_log_line_stops_recovery() {
+        let temp = tempfile::tempdir().expect("scratch directory");
+        let layout = scratch(temp.path());
+        std::fs::write(&layout.log, b"{\"op\":\"NOPE\"}\n").expect("write a corrupt log");
+
+        let error = recover::<Meta>(&layout.seed, &layout.snap, &layout.log)
+            .expect_err("an unparsable record is corruption");
+        assert!(
+            matches!(&error, Error::Wal(message) if message.starts_with("corrupt record ")),
+            "got {error:?}"
+        );
+    }
+
+    /// A transaction the log describes as finished is reported but never re-applied: its snapshot
+    /// is long swept, and replaying it would fail on a source that is legitimately gone.
+    #[test]
+    fn a_finished_transaction_is_reported_without_being_reapplied() {
+        let temp = tempfile::tempdir().expect("scratch directory");
+        let layout = scratch(temp.path());
+        JsonLog::open(&layout.log)
+            .expect("open log")
+            .append(&[
+                WalRecord::Begin {
+                    seq: 4,
+                    uid: "swept".to_string(),
+                    op_count: Some(1),
+                    meta: meta("printf … > a.txt"),
+                },
+                WalRecord::Move {
+                    from: PathBuf::from("a.txt"),
+                    to: PathBuf::from("a.txt"),
+                    sha1: digest(b"published\n"),
+                },
+                WalRecord::End { seq: 4 },
+            ])
+            .expect("append a finished transaction");
+
+        let recovered: Vec<Transaction<Meta>> = recover(&layout.seed, &layout.snap, &layout.log)
+            .expect("a finished transaction needs no source");
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].seq, 4);
+        assert_eq!(
+            recovered[0].ops,
+            vec![CommitOp::Write(PathBuf::from("a.txt"))]
+        );
+        assert!(
+            !layout.seed.join("a.txt").exists(),
+            "nothing was replayed into the seed"
+        );
+    }
+
+    /// A removal is replayed like a move is: the seed has to reach the state the durable intent
+    /// described, whichever kind of operation was interrupted.
+    #[test]
+    fn an_unfinished_delete_is_replayed() {
+        let temp = tempfile::tempdir().expect("scratch directory");
+        let layout = scratch(temp.path());
+        std::fs::create_dir_all(layout.seed.join("src")).expect("seed dirs");
+        std::fs::write(layout.seed.join("src/gone.txt"), b"bye\n").expect("seed file");
+        JsonLog::open(&layout.log)
+            .expect("open log")
+            .append(&[
+                WalRecord::Begin {
+                    seq: 1,
+                    uid: "job0".to_string(),
+                    op_count: Some(1),
+                    meta: meta("rm src/gone.txt"),
+                },
+                WalRecord::Delete {
+                    path: PathBuf::from("src/gone.txt"),
+                },
+            ])
+            .expect("append an unfinished removal");
+
+        let recovered: Vec<Transaction<Meta>> =
+            recover(&layout.seed, &layout.snap, &layout.log).expect("recover");
+        assert!(!layout.seed.join("src/gone.txt").exists());
+        assert_eq!(
+            recovered[0].ops,
+            vec![CommitOp::Remove(PathBuf::from("src/gone.txt"))]
+        );
+        let records: Vec<WalRecord<Meta>> =
+            JsonLog::<WalRecord<Meta>>::read(&layout.log).expect("read the log");
+        assert!(matches!(records.last(), Some(WalRecord::End { seq: 1 })));
+    }
+
+    /// An operation ahead of every `BEGIN` belongs to no transaction. It describes nothing the
+    /// caller ever committed to, so it is dropped rather than applied.
+    #[test]
+    fn operations_before_any_begin_are_ignored() {
+        let temp = tempfile::tempdir().expect("scratch directory");
+        let layout = scratch(temp.path());
+        std::fs::write(layout.work("job0").join("real.txt"), b"real\n").expect("snapshot file");
+        JsonLog::open(&layout.log)
+            .expect("open log")
+            .append(&[
+                WalRecord::Delete {
+                    path: PathBuf::from("orphan.txt"),
+                },
+                WalRecord::Begin {
+                    seq: 1,
+                    uid: "job0".to_string(),
+                    op_count: Some(1),
+                    meta: meta("printf real > real.txt"),
+                },
+                WalRecord::Move {
+                    from: PathBuf::from("real.txt"),
+                    to: PathBuf::from("real.txt"),
+                    sha1: digest(b"real\n"),
+                },
+            ])
+            .expect("append an orphaned record ahead of a transaction");
+        std::fs::write(layout.seed.join("orphan.txt"), b"untouched\n").expect("seed file");
+
+        let recovered: Vec<Transaction<Meta>> =
+            recover(&layout.seed, &layout.snap, &layout.log).expect("recover");
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(
+            recovered[0].ops,
+            vec![CommitOp::Write(PathBuf::from("real.txt"))],
+            "the orphan joins no transaction"
+        );
+        assert!(
+            layout.seed.join("orphan.txt").exists(),
+            "and it is never applied"
+        );
+    }
+
+    /// A command that changed nothing still frames a transaction: the sequence number is consumed
+    /// and the caller's metadata is recorded, while the seed is left exactly as it was.
+    #[test]
+    fn a_transaction_with_no_operations_is_framed_and_changes_nothing() {
+        let temp = tempfile::tempdir().expect("scratch directory");
+        let layout = scratch(temp.path());
+        std::fs::write(layout.seed.join("a.txt"), b"seed\n").expect("seed file");
+
+        apply(
+            &layout.seed,
+            &layout.work("job0"),
+            &layout.log,
+            "job0",
+            1,
+            &meta("true"),
+            &[],
+        )
+        .expect("apply an empty transaction");
+
+        let records: Vec<WalRecord<Meta>> =
+            JsonLog::<WalRecord<Meta>>::read(&layout.log).expect("read the log");
+        assert!(
+            matches!(
+                records.as_slice(),
+                [WalRecord::Begin { seq: 1, .. }, WalRecord::End { seq: 1 }]
+            ),
+            "got {records:?}"
+        );
+        assert_eq!(
+            std::fs::read(layout.seed.join("a.txt")).expect("read the seed"),
+            b"seed\n"
+        );
+
+        let recovered: Vec<Transaction<Meta>> =
+            recover(&layout.seed, &layout.snap, &layout.log).expect("recover");
+        assert_eq!(recovered.len(), 1);
+        assert!(recovered[0].ops.is_empty());
+        assert_eq!(recovered[0].meta, meta("true"));
+    }
+
+    /// The one state a replay cannot resolve: the source is swept and the seed does not carry the
+    /// content either. Failing loudly is the only honest answer — the seed is neither before nor
+    /// after the transaction.
+    #[test]
+    fn a_move_with_neither_source_nor_published_content_fails() {
+        let temp = tempfile::tempdir().expect("scratch directory");
+        let layout = scratch(temp.path());
+        unfinished_log(&layout, "job0", "a.txt", b"recovered\n");
+        std::fs::write(layout.seed.join("a.txt"), b"something else\n").expect("stale seed file");
+        std::fs::remove_dir_all(layout.work("job0")).expect("sweep the snapshot");
+
+        let error = recover::<Meta>(&layout.seed, &layout.snap, &layout.log)
+            .expect_err("an unresolvable move must fail");
+        assert!(
+            matches!(&error, Error::Wal(message)
+                if message.contains("is gone and")
+                    && message.contains("does not carry its content")),
+            "got {error:?}"
+        );
+    }
+
+    /// A symlink is published as a link, and the hash the log records for it is the hash of its
+    /// target — the only content a link has.
+    #[test]
+    fn a_symlink_is_published_and_hashed_by_its_target() {
+        let temp = tempfile::tempdir().expect("scratch directory");
+        let layout = scratch(temp.path());
+        std::os::unix::fs::symlink("pointee.txt", layout.work("job0").join("link"))
+            .expect("snapshot symlink");
+
+        apply(
+            &layout.seed,
+            &layout.work("job0"),
+            &layout.log,
+            "job0",
+            1,
+            &meta("ln -s pointee.txt link"),
+            &[CommitOp::Write(PathBuf::from("link"))],
+        )
+        .expect("apply");
+
+        assert_eq!(
+            std::fs::read_link(layout.seed.join("link")).expect("read the published link"),
+            Path::new("pointee.txt")
+        );
+        let records: Vec<WalRecord<Meta>> =
+            JsonLog::<WalRecord<Meta>>::read(&layout.log).expect("read the log");
+        let moved = records
+            .iter()
+            .find_map(|record| match record {
+                WalRecord::Move { sha1, .. } => Some(sha1.clone()),
+                _ => None,
+            })
+            .expect("a MOVE record");
+        assert_eq!(moved, digest(b"pointee.txt"));
+    }
+
+    /// An entry with no content — a socket here — hashes as empty and cannot be copied. The
+    /// transaction fails on the copy instead of publishing a file that is not the entry.
+    #[test]
+    fn an_entry_with_no_content_hashes_empty_and_is_not_published() {
+        use std::os::unix::net::UnixListener;
+
+        let temp = tempfile::tempdir().expect("scratch directory");
+        let layout = scratch(temp.path());
+        let listener =
+            UnixListener::bind(layout.work("job0").join("sock")).expect("snapshot socket");
+        drop(listener);
+
+        let outcome = apply(
+            &layout.seed,
+            &layout.work("job0"),
+            &layout.log,
+            "job0",
+            1,
+            &meta("nc -lU sock"),
+            &[CommitOp::Write(PathBuf::from("sock"))],
+        );
+        assert!(matches!(outcome, Err(Error::Io(_))), "got {outcome:?}");
+        assert!(
+            !layout.seed.join("sock").exists(),
+            "no stand-in file is left in the seed"
+        );
+
+        let records: Vec<WalRecord<Meta>> =
+            JsonLog::<WalRecord<Meta>>::read(&layout.log).expect("read the log");
+        let moved = records
+            .iter()
+            .find_map(|record| match record {
+                WalRecord::Move { sha1, .. } => Some(sha1.clone()),
+                _ => None,
+            })
+            .expect("a MOVE record");
+        assert_eq!(
+            moved,
+            digest(&[]),
+            "an entry with nothing to read hashes as empty"
+        );
+    }
+
+    /// A deletion is published like a write is: the log carries a `DELETE` record for it, and the
+    /// seed loses the path — including the directories the loss empties.
+    #[test]
+    fn a_removal_is_logged_and_published() {
+        let temp = tempfile::tempdir().expect("scratch directory");
+        let layout = scratch(temp.path());
+        std::fs::create_dir_all(layout.seed.join("src")).expect("seed dirs");
+        std::fs::write(layout.seed.join("src/gone.txt"), b"bye\n").expect("seed file");
+
+        apply(
+            &layout.seed,
+            &layout.work("job0"),
+            &layout.log,
+            "job0",
+            2,
+            &meta("rm src/gone.txt"),
+            &[CommitOp::Remove(PathBuf::from("src/gone.txt"))],
+        )
+        .expect("apply");
+
+        assert!(!layout.seed.join("src").exists(), "the emptied parent goes too");
+        let records: Vec<WalRecord<Meta>> =
+            JsonLog::<WalRecord<Meta>>::read(&layout.log).expect("read the log");
+        assert!(
+            records.iter().any(|record| matches!(
+                record,
+                WalRecord::Delete { path } if path == Path::new("src/gone.txt")
+            )),
+            "got {records:?}"
+        );
+    }
 }

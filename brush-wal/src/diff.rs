@@ -361,4 +361,132 @@ mod tests {
         write(&work, "src/a.txt", "same");
         assert!(diff_trees(&seed, &work).expect("diff").is_empty());
     }
+
+    /// A tree that is not there cannot be diffed, and that is an I/O failure — never an empty
+    /// change set, which a caller would publish as "the command deleted everything".
+    #[test]
+    fn a_missing_tree_is_an_error_not_an_empty_diff() {
+        let scratch = tempfile::tempdir().expect("scratch directory");
+        let root = scratch.path();
+        let seed = root.join("seed");
+        write(&seed, "a.txt", "same");
+
+        assert!(matches!(
+            diff_trees(&seed, &root.join("work")),
+            Err(Error::Io(_))
+        ));
+        assert!(matches!(
+            diff_trees(&root.join("absent"), &seed),
+            Err(Error::Io(_))
+        ));
+    }
+
+    /// Entries with no content — a socket here — are compared by mode alone, and a mode change is
+    /// still a change. Reading them is not an option, so this is all the comparison there is.
+    #[test]
+    fn entries_without_content_are_compared_by_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::net::UnixListener;
+
+        let scratch = tempfile::tempdir().expect("scratch directory");
+        let root = scratch.path();
+        let seed = root.join("seed");
+        let work = root.join("work");
+        std::fs::create_dir_all(&seed).expect("seed dir");
+        std::fs::create_dir_all(&work).expect("work dir");
+        for (tree, name) in [(&seed, "same.sock"), (&work, "same.sock")] {
+            let listener = UnixListener::bind(tree.join(name)).expect("bind socket");
+            drop(listener);
+        }
+        for tree in [&seed, &work] {
+            let listener = UnixListener::bind(tree.join("moded.sock")).expect("bind socket");
+            drop(listener);
+        }
+        std::fs::set_permissions(
+            work.join("moded.sock"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .expect("chmod the work socket");
+        std::fs::set_permissions(
+            seed.join("moded.sock"),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .expect("chmod the seed socket");
+
+        assert_eq!(
+            diff_trees(&seed, &work).expect("diff"),
+            vec![CommitOp::Write(PathBuf::from("moded.sock"))],
+            "equal modes are unchanged; a differing mode is a write"
+        );
+    }
+
+    /// A file whose kind changed is a write whatever the two kinds are: publishing the seed's old
+    /// regular file under a name that is now a symlink would leave the trees different.
+    #[test]
+    fn a_change_of_kind_is_a_write() {
+        let scratch = tempfile::tempdir().expect("scratch directory");
+        let root = scratch.path();
+        let seed = root.join("seed");
+        let work = root.join("work");
+        write(&seed, "entry", "plain file");
+        std::fs::create_dir_all(&work).expect("work dir");
+        std::os::unix::fs::symlink("elsewhere", work.join("entry")).expect("work symlink");
+
+        assert_eq!(
+            diff_trees(&seed, &work).expect("diff"),
+            vec![CommitOp::Write(PathBuf::from("entry"))]
+        );
+    }
+
+    /// The identity short-circuit: a path that is literally the same inode in both trees — which
+    /// is what a snapshot of an untouched file is — is unchanged without being read.
+    #[test]
+    fn the_same_inode_in_both_trees_is_unchanged() {
+        let scratch = tempfile::tempdir().expect("scratch directory");
+        let root = scratch.path();
+        let seed = root.join("seed");
+        let work = root.join("work");
+        write(&seed, "shared.txt", "content");
+        std::fs::create_dir_all(&work).expect("work dir");
+        std::fs::hard_link(seed.join("shared.txt"), work.join("shared.txt"))
+            .expect("share the inode");
+
+        assert!(diff_trees(&seed, &work).expect("diff").is_empty());
+    }
+
+    /// Equal length is decided by reading, and the read has to run to the end: a difference past
+    /// the first buffer is still a difference.
+    #[test]
+    fn a_difference_past_the_first_chunk_is_found() {
+        let scratch = tempfile::tempdir().expect("scratch directory");
+        let root = scratch.path();
+        let seed = root.join("seed");
+        let work = root.join("work");
+        std::fs::create_dir_all(&seed).expect("seed dir");
+        std::fs::create_dir_all(&work).expect("work dir");
+        let mut bytes = vec![b'a'; 200 * 1024];
+        std::fs::write(seed.join("big.bin"), &bytes).expect("seed file");
+        let last = bytes.len() - 1;
+        bytes[last] = b'b';
+        std::fs::write(work.join("big.bin"), &bytes).expect("work file");
+
+        assert_eq!(
+            diff_trees(&seed, &work).expect("diff"),
+            vec![CommitOp::Write(PathBuf::from("big.bin"))]
+        );
+    }
+
+    /// Both operations name the path they act on, which is how a caller resolves them against a
+    /// tree root.
+    #[test]
+    fn an_operation_names_its_path() {
+        assert_eq!(
+            CommitOp::Write(PathBuf::from("src/a.txt")).path(),
+            Path::new("src/a.txt")
+        );
+        assert_eq!(
+            CommitOp::Remove(PathBuf::from("src/b.txt")).path(),
+            Path::new("src/b.txt")
+        );
+    }
 }

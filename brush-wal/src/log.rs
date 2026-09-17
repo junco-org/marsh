@@ -377,4 +377,252 @@ mod tests {
             "the temporary is renamed away, never left behind"
         );
     }
+
+    /// The two shapes that name no file: a path with no parent, and one whose last component is
+    /// `..`. Neither can be a destination, and both must be refused before anything is copied.
+    #[test]
+    fn a_write_target_that_names_no_file_is_refused() {
+        let scratch = tempfile::tempdir().expect("scratch directory");
+        let root = scratch.path();
+        let source = root.join("source.txt");
+        std::fs::write(&source, b"x\n").expect("source");
+
+        let error = apply_write(&source, Path::new("/")).expect_err("the root names no file");
+        assert_eq!(
+            error.to_string(),
+            "write-ahead log failure: write target / has no parent"
+        );
+
+        let parent_relative = root.join("dir").join("..");
+        let error = apply_write(&source, &parent_relative).expect_err("`..` names no file");
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "write-ahead log failure: write target {} has no name",
+                parent_relative.display()
+            )
+        );
+    }
+
+    /// A write whose source vanished is reported as such rather than landing an empty file: the
+    /// caller has to be able to tell "nothing to publish" from "published nothing".
+    #[test]
+    fn a_write_whose_source_is_gone_is_reported() {
+        let scratch = tempfile::tempdir().expect("scratch directory");
+        let root = scratch.path();
+        let source = root.join("gone.txt");
+        let target = root.join("target.txt");
+
+        let error = apply_write(&source, &target).expect_err("no source to copy");
+        assert!(
+            matches!(&error, Error::Wal(message)
+                if message.starts_with(&format!("missing source {}", source.display()))),
+            "got {error:?}"
+        );
+        assert!(!target.exists(), "nothing is created for an absent source");
+    }
+
+    /// A symlink is republished as a symlink: dereferencing it would publish the target's bytes
+    /// under the link's name and silently change what the tree means.
+    #[test]
+    fn a_symlink_source_is_recreated_not_dereferenced() {
+        let scratch = tempfile::tempdir().expect("scratch directory");
+        let root = scratch.path();
+        std::fs::write(root.join("pointee.txt"), b"pointee\n").expect("pointee");
+        let source = root.join("link");
+        std::os::unix::fs::symlink("pointee.txt", &source).expect("source symlink");
+        let target = root.join("out/link");
+
+        apply_write(&source, &target).expect("apply write");
+        assert_eq!(
+            std::fs::read_link(&target).expect("read the published link"),
+            Path::new("pointee.txt")
+        );
+    }
+
+    /// A path that was a directory and is now a file has to change kind, not fail: the diff emits
+    /// exactly this when a command replaces a directory.
+    #[test]
+    fn a_write_replaces_a_directory_at_the_target() {
+        let scratch = tempfile::tempdir().expect("scratch directory");
+        let root = scratch.path();
+        let source = root.join("source.txt");
+        std::fs::write(&source, b"file-side\n").expect("source");
+        let target = root.join("swap");
+        std::fs::create_dir_all(target.join("inner")).expect("directory at the target");
+        std::fs::write(target.join("inner/leaf.txt"), b"old\n").expect("leaf");
+
+        apply_write(&source, &target).expect("apply write");
+        assert_eq!(
+            std::fs::read(&target).expect("read target"),
+            b"file-side\n",
+            "the directory and its contents give way to the file"
+        );
+    }
+
+    /// A log path cannot be opened under a plain file, and the failure is I/O, not corruption.
+    #[test]
+    fn a_log_under_a_file_cannot_be_opened() {
+        let scratch = tempfile::tempdir().expect("scratch directory");
+        let root = scratch.path();
+        let blocker = root.join("meta");
+        std::fs::write(&blocker, b"not a directory\n").expect("blocking file");
+
+        assert!(matches!(
+            JsonLog::<Line>::open(&blocker.join("wal.jsonl")),
+            Err(Error::Io(_))
+        ));
+    }
+
+    /// A session that never logged anything reads as an empty history, and a log that cannot be
+    /// read at all is an I/O failure rather than an empty one.
+    #[test]
+    fn an_absent_log_reads_empty_and_an_unreadable_one_fails() {
+        let scratch = tempfile::tempdir().expect("scratch directory");
+        let root = scratch.path();
+        assert_eq!(
+            JsonLog::<Line>::read(&root.join("never-written.jsonl")).expect("absent log"),
+            Vec::new()
+        );
+
+        let directory = root.join("directory.jsonl");
+        std::fs::create_dir(&directory).expect("directory in the log's place");
+        assert!(matches!(
+            JsonLog::<Line>::read(&directory),
+            Err(Error::Io(_))
+        ));
+    }
+
+    /// An empty batch costs neither a write nor an fsync: a transaction that changed nothing must
+    /// not grow the log.
+    #[test]
+    fn an_empty_batch_does_not_touch_the_log() {
+        let scratch = tempfile::tempdir().expect("scratch directory");
+        let path = scratch.path().join("log.jsonl");
+        let mut log = JsonLog::open(&path).expect("open log");
+        log.append(&[Line { seq: 1 }]).expect("append");
+        let before = std::fs::metadata(&path).expect("stat log").len();
+
+        log.append(&[]).expect("an empty batch is a no-op");
+        assert_eq!(
+            std::fs::metadata(&path).expect("stat log").len(),
+            before,
+            "nothing was appended"
+        );
+    }
+
+    /// A record that cannot be serialized fails the append, and fails it before anything reaches
+    /// the log: a half-written line is exactly what the format cannot survive.
+    #[test]
+    fn an_unserializable_record_fails_the_append_without_writing() {
+        /// A record whose serialization always fails, standing in for the real case — a path no
+        /// JSON string can carry.
+        struct Unserializable;
+
+        impl serde::Serialize for Unserializable {
+            fn serialize<S: serde::Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
+                Err(<S::Error as serde::ser::Error>::custom("nope"))
+            }
+        }
+
+        let scratch = tempfile::tempdir().expect("scratch directory");
+        let path = scratch.path().join("log.jsonl");
+        let mut log = JsonLog::<Unserializable>::open(&path).expect("open log");
+
+        let error = log
+            .append(&[Unserializable])
+            .expect_err("an unserializable record cannot be logged");
+        assert!(
+            matches!(&error, Error::Wal(message) if message.starts_with("serialize record:")),
+            "got {error:?}"
+        );
+        assert_eq!(
+            std::fs::metadata(&path).expect("stat log").len(),
+            0,
+            "the batch is serialized whole before any of it is written"
+        );
+    }
+
+    /// A removal takes a whole directory, tolerates a path that is already gone, and reports a
+    /// removal it could not perform — an unwritable parent is not "already removed".
+    #[test]
+    fn a_removal_takes_directories_tolerates_absence_and_reports_refusal() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let scratch = tempfile::tempdir().expect("scratch directory");
+        let tree = scratch.path().join("tree");
+        std::fs::create_dir_all(tree.join("keep/sub/deep")).expect("nested dirs");
+        std::fs::write(tree.join("keep/sub/deep/leaf.txt"), b"x\n").expect("leaf");
+
+        apply_remove(&tree, &tree.join("keep/sub")).expect("remove a directory");
+        assert!(!tree.join("keep/sub").exists(), "the subtree is gone");
+        apply_remove(&tree, &tree.join("keep/sub")).expect("an absent path is not an error");
+
+        let locked = tree.join("locked");
+        std::fs::create_dir_all(&locked).expect("locked dir");
+        let victim = locked.join("file.txt");
+        std::fs::write(&victim, b"x\n").expect("victim");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555))
+            .expect("make the parent unwritable");
+        let outcome = apply_remove(&tree, &victim);
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755))
+            .expect("restore permissions");
+        assert!(matches!(outcome, Err(Error::Io(_))), "got {outcome:?}");
+        assert!(victim.exists(), "and the path really did survive");
+
+        let opaque = tree.join("opaque");
+        std::fs::create_dir_all(&opaque).expect("opaque dir");
+        let hidden = opaque.join("file.txt");
+        std::fs::write(&hidden, b"x\n").expect("hidden file");
+        std::fs::set_permissions(&opaque, std::fs::Permissions::from_mode(0o644))
+            .expect("make the parent unsearchable");
+        let outcome = apply_remove(&tree, &hidden);
+        std::fs::set_permissions(&opaque, std::fs::Permissions::from_mode(0o755))
+            .expect("restore permissions");
+        assert!(
+            matches!(outcome, Err(Error::Io(_))),
+            "a path that cannot even be inspected is not an absent path: got {outcome:?}"
+        );
+        assert!(hidden.exists());
+    }
+
+    /// A blank line carries no record; it is skipped, and it neither ends the log nor triggers the
+    /// torn-tail repair that would throw away everything after it.
+    #[test]
+    fn a_blank_line_is_skipped_not_treated_as_a_torn_tail() {
+        let scratch = tempfile::tempdir().expect("scratch directory");
+        let path = scratch.path().join("log.jsonl");
+        std::fs::write(&path, b"{\"seq\":1}\n\n{\"seq\":2}\n").expect("write log with a blank line");
+        let before = std::fs::metadata(&path).expect("stat log").len();
+
+        assert_eq!(
+            JsonLog::<Line>::read(&path).expect("read"),
+            vec![Line { seq: 1 }, Line { seq: 2 }]
+        );
+        assert_eq!(
+            std::fs::metadata(&path).expect("stat log").len(),
+            before,
+            "nothing was truncated"
+        );
+    }
+
+    /// Pruning stops at the root it was given, and a target outside that root prunes nothing: a
+    /// removal must never climb out of the tree it was published into.
+    #[test]
+    fn pruning_never_climbs_outside_its_root() {
+        let scratch = tempfile::tempdir().expect("scratch directory");
+        let root = scratch.path();
+        let tree = root.join("tree");
+        let outside = root.join("outside/nested");
+        std::fs::create_dir_all(&tree).expect("tree");
+        std::fs::create_dir_all(&outside).expect("outside dirs");
+        std::fs::write(outside.join("leaf.txt"), b"x\n").expect("leaf");
+
+        apply_remove(&tree, &outside.join("leaf.txt")).expect("remove outside the root");
+        assert!(
+            outside.exists(),
+            "an emptied directory outside the root is left alone"
+        );
+        assert!(tree.exists(), "and the root itself is never pruned");
+    }
 }

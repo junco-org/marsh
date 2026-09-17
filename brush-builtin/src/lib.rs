@@ -249,4 +249,14 @@ mod tests {
         std::fs::create_dir_all(root.join(".git")).expect("an outer repository");
         assert_eq!(repo_root(&root.join("run/foo1"), &root.join("run")), None);
     }
+
+    /// With no boundary to stop it, the search still has to end: a tree whose ancestors carry no
+    /// repository yields none rather than looping or opening the filesystem root.
+    #[test]
+    fn an_exhausted_search_names_no_repository() {
+        let directory = tempfile::tempdir().expect("scratch directory");
+        let start = directory.path().join("a/b");
+        std::fs::create_dir_all(&start).expect("dirs");
+        assert_eq!(repo_root(&start, Path::new("")), None);
+    }
 }

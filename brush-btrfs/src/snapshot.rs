@@ -328,6 +328,14 @@ mod tests {
             "writing the snapshot does not touch the seed"
         );
 
+        let error = fs
+            .snapshot(&subvol, &snap)
+            .expect_err("a snapshot cannot land on an occupied destination");
+        assert!(
+            matches!(&error, Error::Snapshot(message) if message.contains("->")),
+            "the refused ioctl names both ends: got {error:?}"
+        );
+
         fs.delete_subvolume(&snap);
         fs.delete_subvolume(&subvol);
         assert!(!snap.exists(), "snapshot removed");
@@ -365,6 +373,165 @@ mod tests {
             sibling.dest,
             Path::new("/"),
             "a string prefix would have picked /home"
+        );
+    }
+
+    /// Parses a `/proc/mounts` fixture the way [`mounts`] parses the real file.
+    fn fixture(text: &'static str) -> impl Iterator<Item = MountInfo> {
+        proc_mounts::MountIter::new_from_reader(std::io::BufReader::new(text.as_bytes()))
+            .filter_map(Result::ok)
+    }
+
+    /// A mount stacked on an existing mount point shadows the one below it, so among mount points
+    /// of equal depth the *last* line — the most recent mount — is the containing one.
+    #[test]
+    fn a_stacked_mount_shadows_the_one_it_covers() {
+        let stacked = concat!(
+            "/dev/under /home btrfs rw 0 0\n",
+            "/dev/over /home btrfs rw,user_subvol_rm_allowed 0 0\n",
+        );
+        let found = containing_mount(fixture(stacked), Path::new("/home/u"))
+            .expect("both mounts cover /home/u");
+        assert_eq!(found.source, Path::new("/dev/over"));
+        assert!(
+            found
+                .options
+                .iter()
+                .any(|option| option == "user_subvol_rm_allowed"),
+            "the shadowing mount's options are the ones that apply"
+        );
+    }
+
+    /// No mount covers the path: there is nothing to report, and the assertions built on top must
+    /// see that rather than a default.
+    #[test]
+    fn a_path_under_no_mount_has_no_containing_mount() {
+        let elsewhere = "/dev/sda1 /mnt/data ext4 rw 0 0\n";
+        assert!(containing_mount(fixture(elsewhere), Path::new("/home/u")).is_none());
+    }
+
+    /// `statfs(2)` cannot be asked about a path it cannot represent or cannot find; neither is a
+    /// btrfs answer, and the two are distinguished.
+    #[test]
+    fn a_path_statfs_cannot_answer_for_is_not_btrfs() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let with_nul = PathBuf::from(OsString::from_vec(b"/tmp/interior\0nul".to_vec()));
+        let error = assert_btrfs(&with_nul).expect_err("an unrepresentable path");
+        assert!(
+            matches!(&error, Error::NotBtrfs(path) if *path == with_nul),
+            "got {error:?}"
+        );
+
+        let missing = Path::new("/nonexistent-brush-btrfs-probe/deeper");
+        let error = assert_btrfs(missing).expect_err("an absent path");
+        assert!(
+            matches!(&error, Error::Io(io) if io.kind() == std::io::ErrorKind::NotFound),
+            "got {error:?}"
+        );
+
+        let procfs = Path::new("/proc");
+        let error = assert_btrfs(procfs).expect_err("procfs is a filesystem, just not btrfs");
+        assert!(
+            matches!(&error, Error::NotBtrfs(path) if path == procfs),
+            "got {error:?}"
+        );
+    }
+
+    /// Only a subvolume *root* answers true; a plain directory and a path that is not there at all
+    /// are both simply "no", which is what lets the seed walk run over arbitrary ancestors.
+    #[test]
+    fn a_plain_or_absent_directory_is_not_a_subvolume() {
+        let scratch = tempfile::tempdir().expect("scratch directory");
+        let plain = scratch.path().join("plain");
+        std::fs::create_dir_all(&plain).expect("plain directory");
+
+        assert!(!is_subvolume(&plain));
+        assert!(!is_subvolume(&scratch.path().join("absent")));
+        assert!(!LibBtrfs.is_subvolume(&plain), "the trait agrees");
+    }
+
+    /// A path the deletion chain cannot reach at all is not an error to report: the caller asked
+    /// for it gone, and it is gone.
+    #[test]
+    fn deleting_an_absent_path_does_nothing() {
+        let scratch = tempfile::tempdir().expect("scratch directory");
+        let absent = scratch.path().join("absent");
+        delete_subvolume(&absent);
+        assert!(!absent.exists());
+    }
+
+    /// The ioctl refuses a plain directory, and the `remove_dir_all` fallback takes over — which
+    /// is also what makes the chain usable on a mount whose options changed mid-session.
+    #[test]
+    fn deleting_a_plain_directory_falls_back_to_removing_its_contents() {
+        let scratch = tempfile::tempdir().expect("scratch directory");
+        let dir = scratch.path().join("tree/nested");
+        std::fs::create_dir_all(&dir).expect("nested directory");
+        std::fs::write(dir.join("a.txt"), b"x").expect("a file inside");
+
+        LibBtrfs.delete_subvolume(&scratch.path().join("tree"));
+        assert!(!scratch.path().join("tree").exists());
+    }
+
+    /// When every mechanism refuses, the path is left where it is and a warning is printed: a
+    /// snapshot that cannot be reclaimed costs disk space, and failing here would fail a merge
+    /// that has already committed.
+    #[test]
+    fn a_path_no_mechanism_can_delete_is_leaked_rather_than_failing() {
+        let scratch = tempfile::tempdir().expect("scratch directory");
+        // A regular file: the delete ioctl refuses it, `remove_dir_all` refuses it, and `btrfs
+        // subvolume delete` refuses it — the only input that reaches the end of the chain.
+        let file = scratch.path().join("regular");
+        std::fs::write(&file, b"x").expect("a regular file");
+
+        delete_subvolume(&file);
+
+        assert!(file.exists(), "the path is leaked, not removed");
+    }
+
+    /// [`LibBtrfs`] is delegation, so each method answers exactly what the free function of the
+    /// same name answers for inputs whose outcome does not depend on btrfs being present.
+    #[test]
+    fn the_real_implementation_answers_as_the_free_functions_do() {
+        let scratch = tempfile::tempdir().expect("scratch directory");
+        let plain = scratch.path().join("plain");
+        std::fs::create_dir_all(&plain).expect("plain directory");
+
+        assert!(
+            LibBtrfs.is_mount_root(Path::new("/")).expect("mount table"),
+            "the filesystem root is the root of its own mount"
+        );
+        assert!(
+            !LibBtrfs.is_mount_root(&plain).expect("mount table"),
+            "a directory inside a mount is not its root"
+        );
+
+        let missing = Path::new("/nonexistent-brush-btrfs-probe");
+        assert!(matches!(
+            LibBtrfs.assert_btrfs(missing),
+            Err(Error::Io(_))
+        ));
+        assert!(matches!(
+            LibBtrfs.assert_user_subvol_rm_allowed(missing),
+            Err(Error::NotUserSubvolRmAllowed(path)) if path == missing,
+        ));
+
+        let error = LibBtrfs
+            .snapshot(&plain, &scratch.path().join("copy"))
+            .expect_err("a plain directory is not a subvolume");
+        assert!(
+            matches!(&error, Error::Snapshot(message) if message.contains("open")),
+            "got {error:?}"
+        );
+
+        let error = LibBtrfs
+            .create_subvolume(&scratch.path().join("absent-parent/sub"))
+            .expect_err("a subvolume needs an existing parent");
+        assert!(
+            matches!(&error, Error::Snapshot(message) if message.contains("create")),
+            "got {error:?}"
         );
     }
 }
