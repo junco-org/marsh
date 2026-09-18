@@ -25,8 +25,9 @@ use brush_btrfs::fake::CopyTree;
 use brush_btrfs::{LibBtrfs, Subvolumes};
 use brush_core::{ProfileLoadBehavior, RcLoadBehavior, Shell, ShellVariable, SourceInfo};
 use brush_extensions::{
-    MarshError, MarshExecutor, MarshShellExtensions, PublishMeta, build_shell,
+    MarshError, MarshExecutor, MarshShellExtensions, Publication, PublishMeta, build_shell,
 };
+use brush_instrument::{BuiltinRecord, SpawnRecord, parse_records};
 use brush_wal::{JsonLog, WalRecord};
 use serial_test::serial;
 use sha1::{Digest, Sha1};
@@ -77,15 +78,14 @@ impl Fixture {
     }
 }
 
-/// Runs one line, returning its exit code.
-async fn run(shell: &mut Shell<MarshShellExtensions>, line: &str) -> u8 {
-    let params = shell.default_exec_params();
-    shell
-        .run_string(line, &SourceInfo::from("test"), &params)
-        .await
-        .expect("run the line")
-        .exit_code
-        .into()
+/// Runs one line through the executor, returning its exit code and what the line published.
+async fn run(
+    executor: &MarshExecutor,
+    shell: &mut Shell<MarshShellExtensions>,
+    line: &str,
+) -> (u8, Publication) {
+    let (result, publication) = executor.run(shell, line).await.expect("run the line");
+    (result.exit_code.into(), publication)
 }
 
 /// A repository with a root commit already in it.
@@ -153,50 +153,33 @@ fn moved(records: &[WalRecord<PublishMeta>]) -> Vec<PathBuf> {
         .collect()
 }
 
-/// The command records, as `(id, argv, cwd, kind)` for begins only.
-fn begins(
-    executor: &MarshExecutor,
-) -> Vec<(u64, Vec<String>, PathBuf, brush_instrument::CommandKind)> {
+/// The ids of the builtin invocations the executor recorded.
+fn builtin_begins(executor: &MarshExecutor) -> Vec<u64> {
     executor
-        .command_records()
+        .builtin_records()
         .into_iter()
         .filter_map(|record| match record {
-            brush_instrument::CommandRecord::Begin {
-                id, argv, cwd, kind, ..
-            } => Some((id, argv, cwd, kind)),
-            _ => None,
+            BuiltinRecord::Begin { id, .. } => Some(id),
+            BuiltinRecord::End { .. } => None,
         })
         .collect()
 }
 
-/// The id of the single command whose argv starts with `name`.
-fn id_of(executor: &MarshExecutor, name: &str) -> u64 {
-    let matching: Vec<u64> = begins(executor)
-        .into_iter()
-        .filter(|(_, argv, _, _)| argv.first().is_some_and(|word| word == name))
-        .map(|(id, _, _, _)| id)
-        .collect();
-    assert_eq!(
-        matching.len(),
-        1,
-        "expected exactly one {name} dispatch, got {matching:?}"
-    );
-    matching[0]
-}
-
 #[tokio::test]
 #[serial]
-async fn a_completed_command_is_published_and_recorded() {
+async fn a_completed_line_is_published_and_recorded() {
     let fixture = Fixture::new();
     let executor = fixture.open().expect("attach to the seed");
-    let uid = executor.uid().expect("an attached executor has a uid").to_string();
-    let snapshot = executor
-        .snapshot_root()
-        .expect("an attached executor has a snapshot")
-        .to_path_buf();
+    let uid = executor
+        .uid()
+        .expect("an attached executor has a uid")
+        .to_string();
     let mut shell = build_shell(&executor).await.expect("build the shell");
 
-    assert_eq!(run(&mut shell, "printf hi > b.txt").await, 0);
+    assert_eq!(
+        run(&executor, &mut shell, "printf hi > b.txt").await,
+        (0, Publication { seq: 1, ops: 1 })
+    );
 
     assert_eq!(
         std::fs::read(fixture.seed.join("b.txt")).expect("the seed received the file"),
@@ -205,111 +188,131 @@ async fn a_completed_command_is_published_and_recorded() {
 
     let records = fixture.wal();
     let (meta, logged_uid) = begin(&records, 1);
-    assert_eq!(meta.cmd, "printf hi");
+    assert_eq!(meta.cmd, "printf hi > b.txt", "the line is what is logged");
     assert_eq!(logged_uid, uid);
-    assert_eq!(meta.commands, vec![id_of(&executor, "printf")]);
+    assert!(meta.spawns.is_empty(), "printf is a builtin, not a spawn");
+    assert_eq!(meta.builtins, builtin_begins(&executor));
     assert_eq!(moved(&records), vec![PathBuf::from("b.txt")]);
     assert!(
         matches!(records.last(), Some(WalRecord::End { seq: 1 })),
         "the transaction is closed: {records:?}"
     );
-
-    let dispatched = begins(&executor);
-    assert_eq!(
-        dispatched,
-        vec![(
-            0,
-            vec!["printf".to_string(), "hi".to_string()],
-            snapshot,
-            brush_instrument::CommandKind::Builtin
-        )]
-    );
     assert!(
-        executor.command_records().iter().any(|record| matches!(
-            record,
-            brush_instrument::CommandRecord::End { exit: 0, .. }
-        )),
-        "the exit code was observed"
+        executor.spawn_records().is_empty(),
+        "no external command ran: {:?}",
+        executor.spawn_records()
     );
 
     let run_dir = fixture.state.join("meta/runs").join(&uid);
-    assert!(run_dir.join("commands.json").exists());
-    assert!(run_dir.join("builtins.json").exists());
+    let spawns = std::fs::read_to_string(run_dir.join("spawns.json")).expect("the spawn dump");
+    let builtins =
+        std::fs::read_to_string(run_dir.join("builtins.json")).expect("the builtin dump");
+    assert!(
+        parse_records::<SpawnRecord>(&spawns).is_ok(),
+        "the spawn dump parses: {spawns}"
+    );
+    assert_eq!(
+        parse_records::<BuiltinRecord>(&builtins).expect("the builtin dump parses"),
+        executor.builtin_records()
+    );
 }
 
 #[tokio::test]
 #[serial]
-async fn an_external_command_is_awaited_inline() {
+async fn an_external_command_is_recorded_with_its_pid() {
     let fixture = Fixture::new();
     let executor = fixture.open().expect("attach to the seed");
+    let snapshot = executor.snapshot_root().expect("a snapshot").to_path_buf();
     let mut shell = build_shell(&executor).await.expect("build the shell");
 
-    assert_eq!(run(&mut shell, "touch c.txt").await, 0);
-
+    assert_eq!(run(&executor, &mut shell, "touch c.txt").await.0, 0);
     assert!(
         fixture.seed.join("c.txt").exists(),
-        "an external command's effects are published before the line returns"
+        "an external command's effects are published when its line completes"
     );
-    let id = id_of(&executor, "touch");
+
+    let spawns = executor.spawn_records();
+    let [
+        SpawnRecord::Spawned {
+            id, request, pid, ..
+        },
+    ] = spawns.as_slice()
+    else {
+        panic!("expected exactly one started process, got {spawns:?}");
+    };
     assert_eq!(
-        begins(&executor)
-            .into_iter()
-            .find(|(recorded, _, _, _)| *recorded == id)
-            .map(|(_, _, _, kind)| kind),
-        Some(brush_instrument::CommandKind::External)
+        request.program.file_name().expect("a program name"),
+        "touch"
     );
-    let terminators: Vec<brush_instrument::CommandRecord> = executor
-        .command_records()
-        .into_iter()
-        .filter(|record| {
-            record.id() == id
-                && !matches!(record, brush_instrument::CommandRecord::Begin { .. })
-        })
+    assert_eq!(request.args, ["c.txt".to_string()]);
+    assert_eq!(
+        request.cwd, snapshot,
+        "the shell spawns inside the snapshot"
+    );
+    assert!(pid.is_some(), "a started process reports its pid");
+
+    let records = fixture.wal();
+    let (meta, _) = begin(&records, 1);
+    assert_eq!(meta.spawns, vec![*id]);
+}
+
+#[tokio::test]
+#[serial]
+async fn a_pipeline_is_published_once_when_its_line_completes() {
+    let fixture = Fixture::new();
+    let executor = fixture.open().expect("attach to the seed");
+    let mut shell = build_shell(&executor).await.expect("build the shell");
+
+    assert_eq!(
+        run(&executor, &mut shell, "printf 'x\\n' | cat > d.txt").await,
+        (0, Publication { seq: 1, ops: 1 })
+    );
+    assert_eq!(
+        std::fs::read(fixture.seed.join("d.txt")).expect("the line published its pipeline"),
+        b"x\n"
+    );
+
+    let programs: Vec<PathBuf> = executor
+        .spawn_records()
+        .iter()
+        .map(|record| record.request().program.clone())
         .collect();
     assert!(
-        matches!(
-            terminators.as_slice(),
-            [brush_instrument::CommandRecord::End { exit: 0, .. }]
-        ),
-        "the external command's exit code was observed, not deferred: {terminators:?}"
+        programs
+            .iter()
+            .any(|program| program.file_name().is_some_and(|name| name == "cat")),
+        "the pipeline's external stage reached the spawner: {programs:?}"
     );
 }
 
 #[tokio::test]
 #[serial]
-async fn a_pipeline_stage_is_deferred_until_the_next_boundary() {
+async fn a_spawn_that_fails_is_recorded_with_its_error() {
     let fixture = Fixture::new();
     let executor = fixture.open().expect("attach to the seed");
+    let snapshot = executor.snapshot_root().expect("a snapshot").to_path_buf();
+    // No execute bit: `execve` refuses the file for every uid, root included.
+    std::fs::write(snapshot.join("noexec.sh"), b"#!/bin/sh\ntrue\n").expect("write the script");
     let mut shell = build_shell(&executor).await.expect("build the shell");
 
-    assert_eq!(run(&mut shell, "printf 'x\\n' | cat > d.txt").await, 0);
-
-    let cat = id_of(&executor, "cat");
-    assert!(
-        executor.command_records().iter().any(|record| matches!(
-            record,
-            brush_instrument::CommandRecord::Spawned { id, .. } if *id == cat
-        )),
-        "a pipeline stage runs in an owned shell and is deferred"
-    );
-    assert!(
-        !fixture.seed.join("d.txt").exists(),
-        "nothing is published while the pipeline's stages are still owned by the interpreter"
-    );
-
-    assert_eq!(run(&mut shell, "true").await, 0);
-
     assert_eq!(
-        std::fs::read(fixture.seed.join("d.txt")).expect("the next boundary published it"),
-        b"x\n"
+        run(&executor, &mut shell, "./noexec.sh").await.0,
+        126,
+        "a spawn failure that is not `NotFound` is reported as failed-to-execute"
     );
-    let records = fixture.wal();
-    let (meta, _) = begin(&records, 1);
-    let printf = id_of(&executor, "printf");
+
+    let spawns = executor.spawn_records();
+    let [SpawnRecord::Failed { request, error, .. }] = spawns.as_slice() else {
+        panic!("expected exactly one refused spawn, got {spawns:?}");
+    };
     assert!(
-        meta.commands.contains(&printf) && meta.commands.contains(&cat),
-        "the transaction names every command it covers: {:?}",
-        meta.commands
+        request.program.ends_with("noexec.sh"),
+        "the refused program is named: {}",
+        request.program.display()
+    );
+    assert!(
+        error.to_lowercase().contains("permission denied"),
+        "the spawn error is recorded as reported: {error}"
     );
 }
 
@@ -325,8 +328,16 @@ async fn the_git_builtin_commits_inside_the_snapshot() {
     let mut shell = build_shell(&executor).await.expect("build the shell");
     export_git_identity(&mut shell);
 
-    assert_eq!(run(&mut shell, "git add -- src/a.txt").await, 0);
-    assert_eq!(run(&mut shell, "git commit -m init -- src/a.txt").await, 0);
+    assert_eq!(
+        run(&executor, &mut shell, "git add -- src/a.txt").await.0,
+        0
+    );
+    assert_eq!(
+        run(&executor, &mut shell, "git commit -m init -- src/a.txt")
+            .await
+            .0,
+        0
+    );
 
     let repository = git2::Repository::open(&fixture.seed).expect("the seed received .git");
     let head = repository
@@ -351,8 +362,8 @@ async fn the_git_builtin_commits_inside_the_snapshot() {
         .builtin_records()
         .into_iter()
         .filter_map(|record| match record {
-            brush_instrument::BuiltinRecord::Begin { builtin, .. } => Some(builtin),
-            brush_instrument::BuiltinRecord::End { .. } => None,
+            BuiltinRecord::Begin { builtin, .. } => Some(builtin),
+            BuiltinRecord::End { .. } => None,
         })
         .collect();
     assert_eq!(
@@ -364,43 +375,88 @@ async fn the_git_builtin_commits_inside_the_snapshot() {
 
 #[tokio::test]
 #[serial]
-async fn a_seed_cwd_is_remapped_into_the_snapshot() {
+async fn the_snapshot_root_is_exported_and_bounds_the_git_builtin() {
     let fixture = Fixture::new();
+    // A repository in the seed itself: an unbounded search from a working directory inside the
+    // seed would find it. The snapshot copies it, so no publication of this test touches it.
+    init_repository(&fixture.seed);
     let executor = fixture.open().expect("attach to the seed");
     let snapshot = executor.snapshot_root().expect("a snapshot").to_path_buf();
-    // Deliberately *not* `build_shell`: the point is a shell that starts inside the seed.
-    let mut shell = Shell::builder_with_extensions::<MarshShellExtensions>()
-        .command_executor(executor.clone())
-        .interactive(false)
-        .no_editing(true)
-        .profile(ProfileLoadBehavior::Skip)
-        .rc(RcLoadBehavior::Skip)
-        .working_dir(fixture.seed.clone())
-        .builtins(executor.builtins())
-        .build()
+    let mut shell = build_shell(&executor).await.expect("build the shell");
+    export_git_identity(&mut shell);
+
+    assert_eq!(
+        run(
+            &executor,
+            &mut shell,
+            "printf %s \"$MARSH_SNAPSHOT_ROOT\" > f.txt"
+        )
         .await
-        .expect("build the shell");
-
-    assert_eq!(run(&mut shell, "true").await, 0, "the first command attaches");
-    assert_eq!(run(&mut shell, "pwd > e.txt").await, 0);
-
-    assert!(
-        moved(&fixture.wal()).contains(&PathBuf::from("e.txt")),
-        "the write went through the snapshot and was published"
-    );
-    assert_eq!(
-        std::fs::read_to_string(fixture.seed.join("e.txt")).expect("read the published file"),
-        format!("{}\n", snapshot.display())
-    );
-
-    assert_eq!(
-        run(&mut shell, "printf %s \"$MARSH_SNAPSHOT_ROOT\" > f.txt").await,
+        .0,
         0
     );
     assert_eq!(
-        std::fs::read_to_string(fixture.seed.join("f.txt")).expect("read the published file"),
-        snapshot.display().to_string()
+        std::fs::read_to_string(fixture.seed.join("f.txt")).expect("the published file"),
+        snapshot.display().to_string(),
+        "the shell was told where the snapshot root is"
     );
+
+    let outside = format!(
+        "cd {} && git add -- src/a.txt 2>/dev/null",
+        fixture.seed.display()
+    );
+    assert_eq!(
+        run(&executor, &mut shell, &outside).await.0,
+        128,
+        "the repository search stops at the boundary instead of climbing into the seed"
+    );
+    let repository = git2::Repository::open(&fixture.seed).expect("the seed's repository");
+    assert!(
+        repository
+            .index()
+            .expect("index")
+            .get_path(Path::new("src/a.txt"), 0)
+            .is_none(),
+        "nothing was staged anywhere"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn dropping_the_executor_publishes_what_the_shell_left() {
+    let fixture = Fixture::new();
+    let executor = fixture.open().expect("attach to the seed");
+    let mut shell = build_shell(&executor).await.expect("build the shell");
+
+    // Deliberately not `MarshExecutor::run`: nothing publishes until the executor drops.
+    let params = shell.default_exec_params();
+    shell
+        .run_string("printf late > l.txt", &SourceInfo::from("test"), &params)
+        .await
+        .expect("run the line");
+    assert!(
+        !fixture.seed.join("l.txt").exists(),
+        "a line run behind the executor's back publishes nothing by itself"
+    );
+
+    drop(shell);
+    drop(executor);
+
+    assert_eq!(
+        std::fs::read(fixture.seed.join("l.txt")).expect("the drop published it"),
+        b"late"
+    );
+    let leftover: Vec<PathBuf> = std::fs::read_dir(fixture.state.join("snap"))
+        .expect("read snap/")
+        .map(|entry| entry.expect("entry").path())
+        .collect();
+    assert!(
+        leftover.is_empty(),
+        "the drop reclaimed its snapshot: {leftover:?}"
+    );
+    let records = fixture.wal();
+    let (meta, _) = begin(&records, 1);
+    assert_eq!(meta.cmd, "", "no command line named the final publication");
 }
 
 #[tokio::test]
@@ -419,7 +475,8 @@ async fn recovery_replays_an_unfinished_transaction_then_sweeps() {
             op_count: Some(1),
             meta: PublishMeta {
                 cmd: String::new(),
-                commands: Vec::new(),
+                spawns: Vec::new(),
+                builtins: Vec::new(),
             },
         },
         WalRecord::Move {
@@ -440,7 +497,13 @@ async fn recovery_replays_an_unfinished_transaction_then_sweeps() {
     );
     let remaining: Vec<String> = std::fs::read_dir(&snap)
         .expect("read snap/")
-        .map(|entry| entry.expect("entry").file_name().to_string_lossy().into_owned())
+        .map(|entry| {
+            entry
+                .expect("entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
         .collect();
     assert_eq!(
         remaining,
@@ -449,8 +512,11 @@ async fn recovery_replays_an_unfinished_transaction_then_sweeps() {
     );
 
     let mut shell = build_shell(&executor).await.expect("build the shell");
-    assert_eq!(run(&mut shell, "printf next > g.txt").await, 0);
-    let (_, _) = begin(&fixture.wal(), 4);
+    assert_eq!(
+        run(&executor, &mut shell, "printf next > g.txt").await,
+        (0, Publication { seq: 4, ops: 1 }),
+        "publication continues from the recovered sequence number"
+    );
 }
 
 #[tokio::test]
@@ -476,7 +542,7 @@ async fn a_detached_executor_passes_through() {
     let executor = MarshExecutor::default();
 
     let mut shell = Shell::builder_with_extensions::<MarshShellExtensions>()
-        .command_executor(executor.clone())
+        .external_command_spawner(executor.clone())
         .interactive(false)
         .no_editing(true)
         .profile(ProfileLoadBehavior::Skip)
@@ -487,12 +553,17 @@ async fn a_detached_executor_passes_through() {
         .await
         .expect("build the shell");
 
-    assert_eq!(
-        run(&mut shell, "f() { printf inner; }; f > h.txt").await,
-        0
-    );
-    assert_eq!(run(&mut shell, "printf a | cat > i.txt").await, 0);
-    assert_eq!(run(&mut shell, "false").await, 1);
+    let params = shell.default_exec_params();
+    for line in [
+        "f() { printf inner; }; f > h.txt",
+        "printf a | cat > i.txt",
+        "false",
+    ] {
+        shell
+            .run_string(line, &SourceInfo::from("test"), &params)
+            .await
+            .expect("run the line");
+    }
 
     // The same script through a stock shell, for parity.
     let mut stock = Shell::builder()
@@ -507,17 +578,26 @@ async fn a_detached_executor_passes_through() {
         .build()
         .await
         .expect("build a stock shell");
-    let params = stock.default_exec_params();
+    let stock_params = stock.default_exec_params();
+    let mut stock_exits = Vec::new();
     for line in [
         "f() { printf inner; }; f > j.txt",
         "printf a | cat > k.txt",
         "false",
     ] {
-        stock
-            .run_string(line, &SourceInfo::from("stock"), &params)
-            .await
-            .expect("run the line");
+        stock_exits.push(
+            stock
+                .run_string(line, &SourceInfo::from("stock"), &stock_params)
+                .await
+                .expect("run the line")
+                .exit_code,
+        );
     }
+    assert_eq!(
+        u8::from(stock_exits[2]),
+        1,
+        "the stock shell reports `false`"
+    );
 
     assert_eq!(
         std::fs::read(work.join("h.txt")).expect("read"),
@@ -530,16 +610,24 @@ async fn a_detached_executor_passes_through() {
         "a pipeline's output is the same with a detached executor"
     );
 
-    assert!(executor.command_records().is_empty());
+    assert!(executor.spawn_records().is_empty());
     assert!(executor.builtin_records().is_empty());
-    assert!(matches!(executor.publish(), Err(MarshError::Detached)));
+    assert!(matches!(executor.publish(""), Err(MarshError::Detached)));
+    assert!(
+        matches!(
+            executor.run(&mut shell, "printf x > never.txt").await,
+            Err(MarshError::Detached)
+        ),
+        "a detached executor refuses to run a line rather than running it unpublished"
+    );
+    assert!(!work.join("never.txt").exists());
 }
 
 #[tokio::test]
 #[serial]
 async fn real_btrfs_end_to_end() {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("target/tmp/brush-extensions-tests")
+    let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join("brush-extensions-tests")
         .join(std::process::id().to_string());
     std::fs::create_dir_all(&root).expect("create the test root");
     let fs = LibBtrfs;
@@ -553,7 +641,8 @@ async fn real_btrfs_end_to_end() {
     }
 
     let seed = root.join("seed");
-    fs.create_subvolume(&seed).expect("create the seed subvolume");
+    fs.create_subvolume(&seed)
+        .expect("create the seed subvolume");
 
     let snap = root.join(".marsh/seed/snap");
     {
@@ -564,7 +653,7 @@ async fn real_btrfs_end_to_end() {
             "the session's work tree is a real btrfs snapshot"
         );
         let mut shell = build_shell(&executor).await.expect("build the shell");
-        assert_eq!(run(&mut shell, "printf hi > f.txt").await, 0);
+        assert_eq!(run(&executor, &mut shell, "printf hi > f.txt").await.0, 0);
         assert_eq!(
             std::fs::read(seed.join("f.txt")).expect("the seed received the file"),
             b"hi"

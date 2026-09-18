@@ -171,32 +171,50 @@ mod tests {
     use std::sync::{Mutex, PoisonError};
 
     use brush_builtins::BuiltinSet;
-    use brush_core::commands::SimpleCommand;
     use brush_core::extensions::{
-        DefaultErrorFormatter, DefaultShellExtensions, ShellExtensionsImpl,
+        DefaultErrorFormatter, DefaultExternalCommandSpawner, DefaultShellExtensions,
+        ExternalCommandSpawner, ShellExtensionsImpl,
     };
-    use brush_core::{
-        CommandExecutor, DefaultCommandExecutor, ExecutionSpawnResult, ProfileLoadBehavior,
-        RcLoadBehavior, Shell, SourceInfo,
-    };
+    use brush_core::{ProfileLoadBehavior, RcLoadBehavior, Shell, SourceInfo};
     use serial_test::serial;
 
-    /// A [`CommandExecutor`] that only delegates: what makes [`PassThroughExtensions`] a second,
-    /// distinct `SE` for the generic and downcast-miss tests.
+    /// An [`ExternalCommandSpawner`] that only delegates: what makes [`PassThroughExtensions`] a
+    /// second, distinct `SE` for the generic and downcast-miss tests.
     #[derive(Clone, Default)]
-    struct PassThroughExecutor;
+    struct PassThroughSpawner;
 
-    impl CommandExecutor for PassThroughExecutor {
-        async fn execute<SE: ShellExtensions>(
+    impl ExternalCommandSpawner for PassThroughSpawner {
+        fn spawn(
             &self,
-            command: SimpleCommand<'_, SE>,
-        ) -> Result<ExecutionSpawnResult, brush_core::Error> {
-            DefaultCommandExecutor.execute(command).await
+            command: std::process::Command,
+            kill_on_drop: bool,
+        ) -> std::io::Result<brush_core::sys::process::Child> {
+            DefaultExternalCommandSpawner.spawn(command, kill_on_drop)
         }
     }
 
     /// Shell extensions that are not [`DefaultShellExtensions`].
-    type PassThroughExtensions = ShellExtensionsImpl<DefaultErrorFormatter, PassThroughExecutor>;
+    type PassThroughExtensions = ShellExtensionsImpl<DefaultErrorFormatter, PassThroughSpawner>;
+
+    /// A builtin whose execution is an `Err`, so the wrapper's error arm is reached on purpose.
+    struct Failing;
+
+    impl brush_core::builtins::SimpleCommand for Failing {
+        fn get_content(
+            _: &str,
+            _: brush_core::builtins::ContentType,
+            _: &brush_core::builtins::ContentOptions,
+        ) -> Result<String, brush_core::Error> {
+            Ok(String::new())
+        }
+
+        fn execute<SE: ShellExtensions, I: Iterator<Item = S>, S: AsRef<str>>(
+            _: ExecutionContext<'_, SE>,
+            _: I,
+        ) -> Result<ExecutionResult, brush_core::Error> {
+            brush_core::error::unimp("fail")
+        }
+    }
 
     /// One observed builtin invocation: what the hook was told, and how it ended.
     #[derive(Clone, Debug, PartialEq, Eq)]
@@ -356,18 +374,23 @@ mod tests {
         let (_dir, work) = scratch();
 
         let hook = Arc::new(LogHook::default());
-        let builtins = instrument(
-            brush_builtins::default_builtins::<DefaultShellExtensions>(BuiltinSet::BashMode),
-            hook.clone(),
+        let mut registrations =
+            brush_builtins::default_builtins::<DefaultShellExtensions>(BuiltinSet::BashMode);
+        registrations.insert(
+            "fail".to_string(),
+            brush_core::builtins::simple_builtin::<Failing, DefaultShellExtensions>(),
         );
+        let builtins = instrument(registrations, hook.clone());
         let mut shell = shell_with(&work, builtins).await;
 
-        // `cd -@` is unimplemented: the builtin returns `Err`, which the wrapper still has to
-        // terminate — an unterminated invocation would claim the builtin never returned.
-        let exit = run(&mut shell, "cd -@").await;
+        // `fail` returns `Err`, which the wrapper still has to terminate — an unterminated
+        // invocation would claim the builtin never returned. The brace group's redirection keeps
+        // the interpreter's rendering of the error out of the test output.
+        let exit = run(&mut shell, "{ fail; } 2>/dev/null").await;
         let calls = hook.calls();
         assert_eq!(calls.len(), 1, "one invocation: {calls:?}");
-        assert_eq!(calls[0].name, "cd");
+        assert_eq!(calls[0].name, "fail");
+        assert_ne!(exit, 0, "an erroring builtin does not report success");
         assert_eq!(
             calls[0].exit,
             Some(exit),

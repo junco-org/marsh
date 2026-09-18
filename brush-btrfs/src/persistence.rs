@@ -407,7 +407,8 @@ mod tests {
         let layer = PersistenceLayer::new(base.join("seed"), base.join("state"));
         let mut fs = crate::snapshot::MockSubvolumes::new();
         fs.expect_assert_btrfs().returning(|_| Ok(()));
-        fs.expect_assert_user_subvol_rm_allowed().returning(|_| Ok(()));
+        fs.expect_assert_user_subvol_rm_allowed()
+            .returning(|_| Ok(()));
 
         layer.materialize(&fs).expect("first materialization");
         std::fs::write(layer.snap().join("keep"), b"x").expect("a file in snap");
@@ -477,7 +478,10 @@ mod tests {
     #[test]
     fn work_and_reader_trees_are_named_under_snap() {
         let layer = PersistenceLayer::new(PathBuf::from("/seed"), PathBuf::from("/state"));
-        assert_eq!(layer.work("a9993e36"), PathBuf::from("/state/snap/a9993e36"));
+        assert_eq!(
+            layer.work("a9993e36"),
+            PathBuf::from("/state/snap/a9993e36")
+        );
         assert_eq!(layer.reader(7), PathBuf::from("/state/snap/read-7"));
     }
 }

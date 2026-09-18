@@ -178,7 +178,11 @@ async fn the_snapshot_root_stops_the_ancestor_search() {
          its worktree"
     );
 
-    export(&mut shell, SNAPSHOT_ROOT_VAR, &outer.join("tree").display().to_string());
+    export(
+        &mut shell,
+        SNAPSHOT_ROOT_VAR,
+        &outer.join("tree").display().to_string(),
+    );
     assert_eq!(
         run_capturing(&mut shell, &inner, "git add -- p").await,
         (
@@ -201,9 +205,7 @@ async fn a_pathspec_that_is_not_a_repository_resource_is_refused() {
             run_capturing(&mut shell, &work, &format!("git add -- {pathspec}")).await,
             (
                 2,
-                format!(
-                    "git: pathspec {pathspec:?} is outside the repository or inside .git/\n"
-                )
+                format!("git: pathspec {pathspec:?} is outside the repository or inside .git/\n")
             ),
             "{pathspec}"
         );

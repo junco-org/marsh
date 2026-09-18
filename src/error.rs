@@ -15,6 +15,9 @@ pub enum MarshError {
     /// Filesystem I/O failed.
     #[error(transparent)]
     Io(#[from] std::io::Error),
+    /// The shell failed to run a line.
+    #[error(transparent)]
+    Shell(#[from] brush_core::Error),
     /// The executor was built with `Default` and is not attached to a seed.
     #[error("executor is not attached to a seed")]
     Detached,

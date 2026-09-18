@@ -503,11 +503,11 @@ mod tests {
     fn an_unfinished_transaction_is_replayed_on_recover() {
         let temp = tempfile::tempdir().expect("scratch directory");
         let layout = scratch(temp.path());
-        std::fs::write(layout.work("job0").join("a.txt"), b"recovered\n")
-            .expect("snapshot file");
+        std::fs::write(layout.work("job0").join("a.txt"), b"recovered\n").expect("snapshot file");
         unfinished_log(&layout, "job0", "a.txt", b"recovered\n");
 
-        let recovered: Vec<Transaction<Meta>> = recover(&layout.seed, &layout.snap, &layout.log).expect("recover");
+        let recovered: Vec<Transaction<Meta>> =
+            recover(&layout.seed, &layout.snap, &layout.log).expect("recover");
         assert_eq!(
             std::fs::read(layout.seed.join("a.txt")).expect("read the seed"),
             b"recovered\n",
@@ -524,14 +524,14 @@ mod tests {
         );
 
         let records: Vec<WalRecord<Meta>> =
-            JsonLog::<WalRecord<Meta>>::read(&layout.log)
-                .expect("read the log");
+            JsonLog::<WalRecord<Meta>>::read(&layout.log).expect("read the log");
         assert!(
             matches!(records.last(), Some(WalRecord::End { seq: 1 })),
             "and the transaction is closed: {records:?}"
         );
 
-        let again: Vec<Transaction<Meta>> = recover(&layout.seed, &layout.snap, &layout.log).expect("recover again");
+        let again: Vec<Transaction<Meta>> =
+            recover(&layout.seed, &layout.snap, &layout.log).expect("recover again");
         assert_eq!(
             again.len(),
             1,
@@ -549,7 +549,8 @@ mod tests {
         std::fs::write(layout.seed.join("a.txt"), b"recovered\n").expect("seed file");
         std::fs::remove_dir_all(layout.work("job0")).expect("sweep the snapshot");
 
-        let recovered: Vec<Transaction<Meta>> = recover(&layout.seed, &layout.snap, &layout.log).expect("recover");
+        let recovered: Vec<Transaction<Meta>> =
+            recover(&layout.seed, &layout.snap, &layout.log).expect("recover");
         assert_eq!(recovered.len(), 1);
         assert_eq!(
             std::fs::read(layout.seed.join("a.txt")).expect("read the seed"),
@@ -564,8 +565,7 @@ mod tests {
     fn an_incomplete_counted_intent_is_abandoned() {
         let temp = tempfile::tempdir().expect("scratch directory");
         let layout = scratch(temp.path());
-        std::fs::write(layout.work("job0").join("a.txt"), b"not durable\n")
-            .expect("snapshot file");
+        std::fs::write(layout.work("job0").join("a.txt"), b"not durable\n").expect("snapshot file");
         JsonLog::open(&layout.log)
             .expect("open log")
             .append(&[
@@ -617,7 +617,8 @@ mod tests {
             ])
             .expect("append completed legacy transaction");
         let recovered: Vec<Transaction<Meta>> =
-            recover(&completed.seed, &completed.snap, &completed.log).expect("recover completed legacy transaction");
+            recover(&completed.seed, &completed.snap, &completed.log)
+                .expect("recover completed legacy transaction");
         assert_eq!(recovered.len(), 1);
         assert_eq!(recovered[0].seq, 1);
 
@@ -640,8 +641,8 @@ mod tests {
                 },
             ])
             .expect("append unfinished legacy transaction");
-        let error =
-            recover::<Meta>(&unfinished.seed, &unfinished.snap, &unfinished.log).expect_err("unfinished legacy intent must fail closed");
+        let error = recover::<Meta>(&unfinished.seed, &unfinished.snap, &unfinished.log)
+            .expect_err("unfinished legacy intent must fail closed");
         assert_eq!(
             error.to_string(),
             "write-ahead log failure: unfinished legacy transaction 1 has no operation count; recovery sources retained"
@@ -667,7 +668,8 @@ mod tests {
                 WalRecord::End { seq: 7 },
             ])
             .expect("append mismatched transaction");
-        let error = recover::<Meta>(&layout.seed, &layout.snap, &layout.log).expect_err("mismatched framing must fail");
+        let error = recover::<Meta>(&layout.seed, &layout.snap, &layout.log)
+            .expect_err("mismatched framing must fail");
         assert_eq!(
             error.to_string(),
             "write-ahead log failure: transaction 7 declares 1 operations but contains 0"
@@ -981,7 +983,10 @@ mod tests {
         )
         .expect("apply");
 
-        assert!(!layout.seed.join("src").exists(), "the emptied parent goes too");
+        assert!(
+            !layout.seed.join("src").exists(),
+            "the emptied parent goes too"
+        );
         let records: Vec<WalRecord<Meta>> =
             JsonLog::<WalRecord<Meta>>::read(&layout.log).expect("read the log");
         assert!(

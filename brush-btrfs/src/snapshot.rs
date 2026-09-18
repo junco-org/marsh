@@ -275,15 +275,16 @@ mod tests {
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
-    /// A unique scratch directory under this crate's `target/tmp`.
+    /// A unique scratch directory under the workspace's `target/tmp`.
     ///
     /// `/tmp` is not btrfs on a typical machine, so `tempfile`'s default root cannot be used for
-    /// anything involving subvolumes. `target/tmp` is where cargo points `CARGO_TARGET_TMPDIR` for
-    /// integration tests, and therefore where CI mounts its loopback btrfs — a unit test has no
-    /// `CARGO_TARGET_TMPDIR`, so it reconstructs the same directory rather than picking its own.
+    /// anything involving subvolumes. The workspace's `target/tmp` is where cargo points
+    /// `CARGO_TARGET_TMPDIR` for integration tests, and therefore where CI mounts its loopback
+    /// btrfs — a unit test has no `CARGO_TARGET_TMPDIR`, so it walks up from the crate to the same
+    /// directory rather than picking its own.
     fn test_root() -> PathBuf {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("target/tmp/brush-btrfs-tests")
+            .join("../target/tmp/brush-btrfs-tests")
             .join(format!(
                 "{}-{}",
                 std::process::id(),
@@ -509,10 +510,7 @@ mod tests {
         );
 
         let missing = Path::new("/nonexistent-brush-btrfs-probe");
-        assert!(matches!(
-            LibBtrfs.assert_btrfs(missing),
-            Err(Error::Io(_))
-        ));
+        assert!(matches!(LibBtrfs.assert_btrfs(missing), Err(Error::Io(_))));
         assert!(matches!(
             LibBtrfs.assert_user_subvol_rm_allowed(missing),
             Err(Error::NotUserSubvolRmAllowed(path)) if path == missing,

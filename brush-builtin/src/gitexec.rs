@@ -1514,10 +1514,16 @@ mod tests {
         let root = directory.path();
 
         let (code, _, err) = exec(root, &["git", "commit", "-m", "first", "--", "a.txt"]);
-        assert_eq!((code, err.as_str()), (FATAL, "fatal: could not resolve 'HEAD'\n"));
+        assert_eq!(
+            (code, err.as_str()),
+            (FATAL, "fatal: could not resolve 'HEAD'\n")
+        );
 
         let (code, _, err) = exec(root, &["git", "stash", "push", "--", "a.txt"]);
-        assert_eq!((code, err.as_str()), (FATAL, "fatal: could not resolve 'HEAD'\n"));
+        assert_eq!(
+            (code, err.as_str()),
+            (FATAL, "fatal: could not resolve 'HEAD'\n")
+        );
 
         let (code, _, err) = exec(root, &["git", "checkout", "HEAD", "--", "a.txt"]);
         assert_eq!(
@@ -1608,7 +1614,10 @@ mod tests {
         std::fs::write(&script, b"clobbered\n").expect("clobber");
         std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o644))
             .expect("chmod -x");
-        assert_eq!(exec(root, &["git", "checkout", "HEAD", "--", "src/run.sh"]).0, 0);
+        assert_eq!(
+            exec(root, &["git", "checkout", "HEAD", "--", "src/run.sh"]).0,
+            0
+        );
 
         assert_eq!(
             std::fs::read(&script).expect("read"),
@@ -1667,7 +1676,10 @@ mod tests {
         let socket = std::os::unix::net::UnixListener::bind(&path).expect("bind a socket");
 
         let (code, out, err) = exec(root, &["git", "rm", "--", "src/p.txt"]);
-        assert_eq!((code, out.as_str(), err.as_str()), (0, "rm 'src/p.txt'\n", ""));
+        assert_eq!(
+            (code, out.as_str(), err.as_str()),
+            (0, "rm 'src/p.txt'\n", "")
+        );
         drop(socket);
         assert!(!path.exists(), "the entry is gone from the worktree");
         assert_eq!(state(root).1, None, "and gone from the index");

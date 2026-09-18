@@ -4,23 +4,22 @@
 //! A shell built with this executor never writes into the tree it is pointed at. It runs inside one
 //! long-lived writable btrfs snapshot of that tree — the *seed* — and each command's effects are
 //! published back into the seed through a write-ahead log, so a crash leaves the seed either
-//! untouched or completable by a replay. Alongside, every simple command the shell dispatches and
+//! untouched or completable by a replay. Alongside, every external command the shell spawns and
 //! every builtin it runs is recorded, which is the only way effects inside the shell process can be
 //! attributed to the command that caused them.
 //!
-//! Nothing here modifies brush. [`MarshExecutor`] is a `brush_core::CommandExecutor`, selected
-//! statically through [`MarshShellExtensions`]; [`MarshExecutor::builtins`] is a stock builtin map
-//! with `git` added and each registration's public `execute_func` wrapped. A script running in the
-//! shell cannot see the instrumentation, write to it, or turn it off.
+//! Nothing here modifies brush. [`MarshExecutor`] is a
+//! `brush_core::extensions::ExternalCommandSpawner`, selected statically through
+//! [`MarshShellExtensions`]; [`MarshExecutor::builtins`] is a stock builtin map with `git` added
+//! and each registration's public `execute_func` wrapped. A script running in the shell cannot see
+//! the instrumentation, write to it, or turn it off.
 //!
 //! ```no_run
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 //! let executor = brush_extensions::MarshExecutor::open(std::path::Path::new("/srv/seed"))?;
 //! let mut shell = brush_extensions::build_shell(&executor).await?;
-//! let params = shell.default_exec_params();
-//! shell
-//!     .run_string("printf hi > greeting", &brush_core::SourceInfo::default(), &params)
-//!     .await?;
+//! let (result, publication) = executor.run(&mut shell, "printf hi > greeting").await?;
+//! # let _ = (result, publication);
 //! # Ok(())
 //! # }
 //! ```

@@ -13,12 +13,12 @@ use crate::executor::{MarshExecutor, MarshShellExtensions};
 ///
 /// Profile and rc files are skipped: a command's footprint must be the command's, not the host
 /// user's shell configuration. The working directory starts at the snapshot root, which is what
-/// keeps the *first* command's redirections out of the seed — the interpreter resolves those
-/// before the executor ever sees the command.
+/// keeps a command's redirections out of the seed — the interpreter resolves those itself, without
+/// ever reaching the spawner.
 ///
-/// An embedder that builds its own shell needs only `.command_executor(executor.clone())` and
-/// `.builtins(executor.builtins())`; the executor attaches the working directory and
-/// `MARSH_SNAPSHOT_ROOT` at its first dispatch.
+/// An embedder that builds its own shell needs `.external_command_spawner(executor.clone())`,
+/// `.builtins(executor.builtins())` and `.working_dir(<executor.snapshot_root()>)`, then
+/// [`MarshExecutor::export_snapshot_root`] on the built shell.
 ///
 /// # Errors
 ///
@@ -26,8 +26,8 @@ use crate::executor::{MarshExecutor, MarshShellExtensions};
 pub async fn build_shell(
     executor: &MarshExecutor,
 ) -> Result<Shell<MarshShellExtensions>, brush_core::Error> {
-    Shell::builder_with_extensions::<MarshShellExtensions>()
-        .command_executor(executor.clone())
+    let mut shell = Shell::builder_with_extensions::<MarshShellExtensions>()
+        .external_command_spawner(executor.clone())
         .interactive(false)
         .no_editing(true)
         .profile(ProfileLoadBehavior::Skip)
@@ -35,5 +35,7 @@ pub async fn build_shell(
         .maybe_working_dir(executor.snapshot_root().map(Path::to_path_buf))
         .builtins(executor.builtins())
         .build()
-        .await
+        .await?;
+    executor.export_snapshot_root(&mut shell)?;
+    Ok(shell)
 }

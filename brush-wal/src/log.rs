@@ -592,7 +592,8 @@ mod tests {
     fn a_blank_line_is_skipped_not_treated_as_a_torn_tail() {
         let scratch = tempfile::tempdir().expect("scratch directory");
         let path = scratch.path().join("log.jsonl");
-        std::fs::write(&path, b"{\"seq\":1}\n\n{\"seq\":2}\n").expect("write log with a blank line");
+        std::fs::write(&path, b"{\"seq\":1}\n\n{\"seq\":2}\n")
+            .expect("write log with a blank line");
         let before = std::fs::metadata(&path).expect("stat log").len();
 
         assert_eq!(

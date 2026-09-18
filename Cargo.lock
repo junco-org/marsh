@@ -262,7 +262,7 @@ dependencies = [
 [[package]]
 name = "brush-builtins"
 version = "0.2.0"
-source = "git+https://github.com/elefthei/brush?branch=main#860863409fc99fd6b9ded6d411f40bf987bf74cf"
+source = "git+https://github.com/elefthei/brush?branch=main#8e1f0ff410d6a2bd03823b5c92ec5738a8b9b1f2"
 dependencies = [
  "brush-core",
  "brush-parser",
@@ -285,7 +285,7 @@ dependencies = [
 [[package]]
 name = "brush-core"
 version = "0.5.0"
-source = "git+https://github.com/elefthei/brush?branch=main#860863409fc99fd6b9ded6d411f40bf987bf74cf"
+source = "git+https://github.com/elefthei/brush?branch=main#8e1f0ff410d6a2bd03823b5c92ec5738a8b9b1f2"
 dependencies = [
  "async-recursion",
  "async-trait",
@@ -359,7 +359,7 @@ dependencies = [
 [[package]]
 name = "brush-parser"
 version = "0.4.0"
-source = "git+https://github.com/elefthei/brush?branch=main#860863409fc99fd6b9ded6d411f40bf987bf74cf"
+source = "git+https://github.com/elefthei/brush?branch=main#8e1f0ff410d6a2bd03823b5c92ec5738a8b9b1f2"
 dependencies = [
  "bon",
  "cached",
@@ -767,7 +767,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -1853,7 +1853,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2082,7 +2082,7 @@ dependencies = [
  "getrandom",
  "once_cell",
  "rustix 1.1.5",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2092,7 +2092,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "230a1b821ccbd75b185820a1f1ff7b14d21da1e442e22c0863ea5f08771a8874"
 dependencies = [
  "rustix 1.1.5",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

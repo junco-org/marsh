@@ -6,9 +6,10 @@
 //! records every builtin lifecycle in memory, plus the record vocabulary a consumer merges with
 //! a syscall trace.
 //!
-//! [`CommandRecord`] is the executor-level counterpart: what a `brush_core::CommandExecutor` sees,
-//! which is every simple command the shell dispatches — builtin, function or external — before its
-//! name is resolved. It is stamped from the same clock and the same tid namespace as
+//! [`SpawnRecord`] is the spawner-level counterpart: what a
+//! `brush_core::extensions::ExternalCommandSpawner` sees, which is every *external* command the
+//! shell hands it — never a builtin or a function — and with no exit code, because the shell, not
+//! the spawner, awaits the child. It is stamped from the same clock and the same tid namespace as
 //! [`BuiltinRecord`], so the two streams sort together.
 //!
 //! There is exactly one hook implementation, and it writes nothing: tests install it and assert on
@@ -148,7 +149,7 @@ pub fn current_tid() -> u32 {
 /// either the file parses as an array of records or the run's instrumentation is unusable.
 ///
 /// Generic in the record type because a run dumps two streams — [`BuiltinRecord`] and
-/// [`CommandRecord`] — into two files of the same format.
+/// [`SpawnRecord`] — into two files of the same format.
 ///
 /// # Errors
 ///
@@ -168,136 +169,148 @@ pub fn dump_records<R: serde::Serialize>(records: &[R]) -> Result<String, serde_
     serde_json::to_string(records)
 }
 
-/// What resolved the command name, mirroring `SimpleCommand::execute`'s order.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum CommandKind {
-    /// A registered, enabled builtin.
-    Builtin,
-    /// A shell function.
-    Function,
-    /// Anything else: an external program, or a name that resolves to none.
-    External,
+/// What the shell asked the spawner to run.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SpawnRequest {
+    /// The resolved executable, as the shell passed it to [`std::process::Command::new`].
+    pub program: PathBuf,
+    /// The arguments after `argv[0]`.
+    ///
+    /// [`std::process::Command`] exposes no getter for the `arg0` override, so the user-facing
+    /// name the shell dispatched under is not recorded.
+    pub args: Vec<String>,
+    /// The directory the process starts in.
+    pub cwd: PathBuf,
 }
 
-/// One simple-command lifecycle record, as seen by a `brush_core::CommandExecutor`.
+impl SpawnRequest {
+    /// Describes `command` before it is consumed by the spawn.
+    ///
+    /// A command carrying no working directory of its own inherits the shell process's, so that
+    /// is what [`Self::cwd`] records for it.
+    #[must_use]
+    pub fn of(command: &std::process::Command) -> Self {
+        Self {
+            program: PathBuf::from(command.get_program()),
+            args: command
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect(),
+            cwd: command.get_current_dir().map_or_else(
+                || std::env::current_dir().unwrap_or_default(),
+                Path::to_path_buf,
+            ),
+        }
+    }
+}
+
+/// One external-command spawn attempt, as a
+/// `brush_core::extensions::ExternalCommandSpawner` sees it.
 ///
-/// An invocation is either a [`Self::Begin`] followed by an [`Self::End`] — the executor observed
-/// the result — or a [`Self::Begin`] followed by a [`Self::Spawned`], which says the command was
-/// handed back to the interpreter still running and its exit code belongs to nobody here.
+/// There is no exit code here: the spawner hands the child back and the *shell* awaits it, so the
+/// only outcome observable at this seam is whether a process started at all.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "k")]
-pub enum CommandRecord {
-    /// The executor received the command.
-    #[serde(rename = "cb")]
-    Begin {
-        /// Invocation id, unique within one recorder; echoed by the matching terminator.
-        id: u64,
-        /// `CLOCK_REALTIME` microseconds at the dispatch.
-        ts: u64,
-        /// Thread that dispatched the command.
-        tid: u32,
-        /// Full argument vector, including `argv[0]`.
-        argv: Vec<String>,
-        /// The shell's logical working directory at the dispatch.
-        cwd: PathBuf,
-        /// What the name resolves to.
-        kind: CommandKind,
-    },
-    /// The executor observed the command's result.
-    #[serde(rename = "ce")]
-    End {
-        /// Invocation id from the matching [`Self::Begin`].
-        id: u64,
-        /// `CLOCK_REALTIME` microseconds at the result.
-        ts: u64,
-        /// Thread that observed the result.
-        tid: u32,
-        /// Exit code the command produced.
-        exit: u8,
-    },
-    /// The command started a process or task whose completion the executor does not observe.
-    #[serde(rename = "cs")]
+pub enum SpawnRecord {
+    /// A process started.
+    #[serde(rename = "s")]
     Spawned {
-        /// Invocation id from the matching [`Self::Begin`].
+        /// Attempt id, unique within one recorder.
         id: u64,
         /// `CLOCK_REALTIME` microseconds at the spawn.
         ts: u64,
-        /// Thread that spawned it.
+        /// Thread that asked for the spawn.
         tid: u32,
+        /// What the shell asked to run.
+        #[serde(flatten)]
+        request: SpawnRequest,
         /// The child's process id, when there is one.
-        pid: Option<i32>,
+        pid: Option<u32>,
+    },
+    /// No process started; the shell reports 127 (`NotFound`) or 126 (anything else).
+    #[serde(rename = "f")]
+    Failed {
+        /// Attempt id, unique within one recorder.
+        id: u64,
+        /// `CLOCK_REALTIME` microseconds at the failure.
+        ts: u64,
+        /// Thread that asked for the spawn.
+        tid: u32,
+        /// What the shell asked to run.
+        #[serde(flatten)]
+        request: SpawnRequest,
+        /// The spawn failure, rendered.
+        error: String,
     },
 }
 
-impl CommandRecord {
-    /// The invocation the record belongs to.
+impl SpawnRecord {
+    /// The attempt the record belongs to.
     pub const fn id(&self) -> u64 {
         match self {
-            Self::Begin { id, .. } | Self::End { id, .. } | Self::Spawned { id, .. } => *id,
+            Self::Spawned { id, .. } | Self::Failed { id, .. } => *id,
         }
     }
 
     /// The record's timestamp, whichever variant it is.
     pub const fn ts(&self) -> u64 {
         match self {
-            Self::Begin { ts, .. } | Self::End { ts, .. } | Self::Spawned { ts, .. } => *ts,
+            Self::Spawned { ts, .. } | Self::Failed { ts, .. } => *ts,
+        }
+    }
+
+    /// What the shell asked to run, whichever variant it is.
+    pub const fn request(&self) -> &SpawnRequest {
+        match self {
+            Self::Spawned { request, .. } | Self::Failed { request, .. } => request,
         }
     }
 }
 
-/// Records every simple command an executor dispatches, in memory.
+/// Records every spawn attempt an `ExternalCommandSpawner` makes, in memory.
 ///
-/// The counterpart of [`RecordingHook`] one level up, and deliberately not a trait: an executor
-/// owns its recorder, where a builtin hook has to be reachable from a process-global installation.
+/// The counterpart of [`RecordingHook`] one level up, and deliberately not a trait: a spawner owns
+/// its recorder, where a builtin hook has to be reachable from a process-global installation.
 #[derive(Default)]
-pub struct CommandRecorder {
-    /// The log, in dispatch order.
-    records: Mutex<Vec<CommandRecord>>,
-    /// The next invocation id.
+pub struct SpawnRecorder {
+    /// The log, in attempt order.
+    records: Mutex<Vec<SpawnRecord>>,
+    /// The next attempt id.
     next: AtomicU64,
 }
 
-impl CommandRecorder {
-    /// Records a dispatch and returns the id its terminator must echo.
-    pub fn begin(&self, argv: &[String], cwd: &Path, kind: CommandKind) -> u64 {
+impl SpawnRecorder {
+    /// Records a started process and returns the attempt's id.
+    pub fn spawned(&self, request: SpawnRequest, pid: Option<u32>) -> u64 {
         let id = self.next.fetch_add(1, Ordering::Relaxed);
-        self.push(CommandRecord::Begin {
+        self.push(SpawnRecord::Spawned {
             id,
             ts: now_micros(),
             tid: current_tid(),
-            argv: argv.to_vec(),
-            cwd: cwd.to_path_buf(),
-            kind,
+            request,
+            pid,
         });
         id
     }
 
-    /// Records the observed result of the invocation identified by `id`.
-    pub fn end(&self, id: u64, exit: u8) {
-        self.push(CommandRecord::End {
+    /// Records a spawn that started no process, and returns the attempt's id.
+    pub fn failed(&self, request: SpawnRequest, error: &std::io::Error) -> u64 {
+        let id = self.next.fetch_add(1, Ordering::Relaxed);
+        self.push(SpawnRecord::Failed {
             id,
             ts: now_micros(),
             tid: current_tid(),
-            exit,
+            request,
+            error: error.to_string(),
         });
+        id
     }
 
-    /// Records that the invocation identified by `id` was handed back still running.
-    pub fn spawned(&self, id: u64, pid: Option<i32>) {
-        self.push(CommandRecord::Spawned {
-            id,
-            ts: now_micros(),
-            tid: current_tid(),
-            pid,
-        });
-    }
-
-    /// Every record collected so far, in the order the executor produced them.
+    /// Every record collected so far, in the order the spawner produced them.
     ///
     /// Poisoning is recovered rather than propagated, for the reason [`RecordingHook::records`]
     /// gives.
-    pub fn records(&self) -> Vec<CommandRecord> {
+    pub fn records(&self) -> Vec<SpawnRecord> {
         self.records
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -305,7 +318,7 @@ impl CommandRecorder {
     }
 
     /// Appends one record, with the same poisoning recovery as [`Self::records`].
-    fn push(&self, record: CommandRecord) {
+    fn push(&self, record: SpawnRecord) {
         self.records
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -391,36 +404,59 @@ mod tests {
         );
     }
 
+    /// A request that names no real program: the recorder never runs one.
+    fn request() -> SpawnRequest {
+        SpawnRequest {
+            program: PathBuf::from("/bin/echo"),
+            args: vec!["hi".to_string()],
+            cwd: PathBuf::from("/work"),
+        }
+    }
+
     #[test]
-    fn the_command_recorder_numbers_invocations_and_echoes_their_ids() {
-        let recorder = CommandRecorder::default();
-        let cwd = PathBuf::from("/work");
-        let builtin = recorder.begin(
-            &["cd".to_string(), "src".to_string()],
-            &cwd,
-            CommandKind::Builtin,
+    fn a_spawn_request_describes_the_command() {
+        let mut command = std::process::Command::new("/bin/echo");
+        command.args(["a", "b"]).current_dir("/tmp");
+        let described = SpawnRequest::of(&command);
+        assert_eq!(described.program, PathBuf::from("/bin/echo"));
+        assert_eq!(described.args, ["a".to_string(), "b".to_string()]);
+        assert_eq!(described.cwd, PathBuf::from("/tmp"));
+
+        let inherited = SpawnRequest::of(&std::process::Command::new("/bin/true"));
+        assert_eq!(
+            inherited.cwd,
+            std::env::current_dir().expect("a current directory"),
+            "a command with no working directory of its own inherits the process's"
         );
-        let external = recorder.begin(&["cat".to_string()], &cwd, CommandKind::External);
-        let function = recorder.begin(&["f".to_string()], &cwd, CommandKind::Function);
-        recorder.end(builtin, 0);
-        recorder.spawned(external, Some(4321));
-        recorder.spawned(function, None);
+        assert!(inherited.args.is_empty());
+    }
+
+    #[test]
+    fn the_spawn_recorder_numbers_attempts_in_order() {
+        let recorder = SpawnRecorder::default();
+        let started = recorder.spawned(request(), Some(4321));
+        let refused = recorder.failed(
+            request(),
+            &std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+        );
 
         assert_eq!(
-            [builtin, external, function],
-            [0, 1, 2],
-            "ids number the dispatches of one recorder"
+            [started, refused],
+            [0, 1],
+            "ids number the attempts of one recorder"
         );
 
         let records = recorder.records();
-        assert_eq!(records.len(), 6);
         assert_eq!(
-            records.iter().map(CommandRecord::id).collect::<Vec<_>>(),
-            vec![builtin, external, function, builtin, external, function],
-            "every terminator echoes the id of its dispatch"
+            records.iter().map(SpawnRecord::id).collect::<Vec<_>>(),
+            vec![started, refused]
+        );
+        assert!(
+            records.iter().all(|record| *record.request() == request()),
+            "the request reaches the record verbatim: {records:?}"
         );
 
-        let stamps: Vec<u64> = records.iter().map(CommandRecord::ts).collect();
+        let stamps: Vec<u64> = records.iter().map(SpawnRecord::ts).collect();
         assert!(
             stamps.windows(2).all(|pair| pair[0] <= pair[1]),
             "record order is time order: {stamps:?}"
@@ -430,117 +466,82 @@ mod tests {
         let tid = current_tid();
         assert!(
             records.iter().all(|record| match record {
-                CommandRecord::Begin { tid: recorded, .. }
-                | CommandRecord::End { tid: recorded, .. }
-                | CommandRecord::Spawned { tid: recorded, .. } => *recorded == tid,
+                SpawnRecord::Spawned { tid: recorded, .. }
+                | SpawnRecord::Failed { tid: recorded, .. } => *recorded == tid,
             }),
-            "a command is recorded by the thread that dispatched it"
+            "a spawn is recorded by the thread that asked for it"
         );
 
-        let CommandRecord::Begin { argv, cwd: recorded, kind, .. } = &records[0] else {
-            panic!("expected a begin record, got {:?}", records[0]);
+        assert!(
+            matches!(
+                records[0],
+                SpawnRecord::Spawned {
+                    pid: Some(4321),
+                    ..
+                }
+            ),
+            "a started process carries its pid: {:?}",
+            records[0]
+        );
+        let SpawnRecord::Failed { error, .. } = &records[1] else {
+            panic!("expected a failure record, got {:?}", records[1]);
         };
-        assert_eq!(argv, &["cd".to_string(), "src".to_string()]);
-        assert_eq!(recorded, &cwd);
-        assert_eq!(*kind, CommandKind::Builtin);
-
-        assert_eq!(
-            records[3],
-            CommandRecord::End {
-                id: builtin,
-                ts: records[3].ts(),
-                tid,
-                exit: 0,
-            }
-        );
-        assert_eq!(
-            records[4],
-            CommandRecord::Spawned {
-                id: external,
-                ts: records[4].ts(),
-                tid,
-                pid: Some(4321),
-            },
-            "a spawn carries the pid it was given"
-        );
-        assert_eq!(
-            records[5],
-            CommandRecord::Spawned {
-                id: function,
-                ts: records[5].ts(),
-                tid,
-                pid: None,
-            },
-            "a spawn with no process records none"
+        assert!(
+            error.to_lowercase().contains("permission denied"),
+            "the failure is rendered as the shell would report it: {error}"
         );
     }
 
     #[test]
-    fn recorded_commands_are_a_snapshot_not_a_live_view() {
-        let recorder = CommandRecorder::default();
-        let id = recorder.begin(&["true".to_string()], Path::new("/work"), CommandKind::Builtin);
+    fn recorded_spawns_are_a_snapshot_not_a_live_view() {
+        let recorder = SpawnRecorder::default();
+        recorder.spawned(request(), None);
         let taken = recorder.records();
-        recorder.end(id, 0);
+        recorder.spawned(request(), None);
 
         assert_eq!(taken.len(), 1, "the snapshot does not grow with the log");
         assert_eq!(recorder.records().len(), 2);
     }
 
     #[test]
-    fn command_records_round_trip_through_json() {
+    fn spawn_records_round_trip_through_json() {
         let records = vec![
-            CommandRecord::Begin {
+            SpawnRecord::Spawned {
                 id: 3,
                 ts: 1_700_000_000_000_001,
                 tid: 11,
-                argv: vec!["git".to_string(), "status".to_string()],
-                cwd: PathBuf::from("/work/src"),
-                kind: CommandKind::Builtin,
+                request: request(),
+                pid: Some(99),
             },
-            CommandRecord::End {
-                id: 3,
+            SpawnRecord::Failed {
+                id: 4,
                 ts: 1_700_000_000_000_002,
                 tid: 11,
-                exit: 128,
-            },
-            CommandRecord::Spawned {
-                id: 4,
-                ts: 1_700_000_000_000_003,
-                tid: 11,
-                pid: Some(99),
+                request: request(),
+                error: "No such file or directory (os error 2)".to_string(),
             },
         ];
         let text = dump_records(&records).expect("serialize");
-        assert_eq!(
-            parse_records::<CommandRecord>(&text).expect("parse"),
-            records
-        );
+        assert_eq!(parse_records::<SpawnRecord>(&text).expect("parse"), records);
 
         let json: serde_json::Value = serde_json::from_str(&text).expect("valid json");
-        let tags: Vec<&str> = json
-            .as_array()
-            .expect("an array")
-            .iter()
-            .map(|record| record["k"].as_str().expect("a tag"))
-            .collect();
-        assert_eq!(tags, ["cb", "ce", "cs"], "the wire tags are stable");
-        assert_eq!(json[0]["kind"], "builtin");
-
-        for (kind, expected) in [
-            (CommandKind::Builtin, "builtin"),
-            (CommandKind::Function, "function"),
-            (CommandKind::External, "external"),
-        ] {
-            assert_eq!(
-                serde_json::to_value(kind).expect("serialize the kind"),
-                expected
+        let array = json.as_array().expect("an array");
+        assert_eq!(array[0]["k"], "s", "the wire tags are stable");
+        assert_eq!(array[1]["k"], "f");
+        for element in array {
+            assert_eq!(element["program"], "/bin/echo");
+            assert_eq!(element["args"], serde_json::json!(["hi"]));
+            assert_eq!(element["cwd"], "/work");
+            assert!(
+                element.get("request").is_none(),
+                "the request is flattened into the record: {element}"
             );
         }
     }
 
     #[test]
-    fn a_malformed_command_dump_is_a_parse_error() {
-        assert!(parse_records::<CommandRecord>("{\"k\":\"cb\"}").is_err());
-        assert!(parse_records::<CommandRecord>("[{\"k\":\"cx\"}]").is_err());
+    fn a_malformed_spawn_dump_is_a_parse_error() {
+        assert!(parse_records::<SpawnRecord>("{\"k\":\"s\"}").is_err());
+        assert!(parse_records::<SpawnRecord>("[{\"k\":\"x\"}]").is_err());
     }
 }

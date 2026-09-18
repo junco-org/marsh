@@ -13,18 +13,20 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use brush_btrfs::{PersistenceLayer, Subvolumes, short_id};
-use brush_instrument::{CommandRecord, CommandRecorder, RecordingHook, dump_records};
+use brush_instrument::{BuiltinRecord, RecordingHook, SpawnRecord, SpawnRecorder, dump_records};
 
 use crate::MarshError;
 
 /// What every publication records in its `BEGIN` line.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PublishMeta {
-    /// The command line whose completion triggered the publication: its argv joined by single
-    /// spaces.
+    /// The command line whose completion triggered the publication; empty for the final
+    /// publication at drop and for a caller's explicit `publish("")`.
     pub cmd: String,
-    /// Ids of the [`CommandRecord`]s whose effects the publication may contain.
-    pub commands: Vec<u64>,
+    /// Ids of the [`SpawnRecord`]s recorded since the previous publication.
+    pub spawns: Vec<u64>,
+    /// Ids of the [`BuiltinRecord::Begin`]s recorded since the previous publication.
+    pub builtins: Vec<u64>,
 }
 
 /// The outcome of one publication.
@@ -40,8 +42,10 @@ pub struct Publication {
 struct PublishState {
     /// The highest transaction sequence number the log carries.
     seq: u64,
-    /// Ids of dispatched commands whose effects no publication has covered yet.
-    pending: Vec<u64>,
+    /// How many spawn records previous publications already accounted for.
+    spawns_seen: usize,
+    /// How many builtin records previous publications already accounted for.
+    builtins_seen: usize,
 }
 
 /// One attached session.
@@ -58,9 +62,9 @@ pub(crate) struct Session {
     log: PathBuf,
     /// The builtin hook an instrumented builtin map reports to.
     pub(crate) hook: Arc<RecordingHook>,
-    /// Every simple command the executor dispatched.
-    pub(crate) commands: CommandRecorder,
-    /// Sequence number and deferred command ids.
+    /// Every external command the spawner was asked to start.
+    pub(crate) spawns: SpawnRecorder,
+    /// Sequence number and record attribution.
     state: Mutex<PublishState>,
     /// The seed, the state directory, and the lease over both.
     ///
@@ -113,10 +117,11 @@ impl Session {
             run_dir,
             log,
             hook: Arc::new(RecordingHook::default()),
-            commands: CommandRecorder::default(),
+            spawns: SpawnRecorder::default(),
             state: Mutex::new(PublishState {
                 seq,
-                pending: Vec::new(),
+                spawns_seen: 0,
+                builtins_seen: 0,
             }),
             persistence,
         }))
@@ -132,31 +137,14 @@ impl Session {
         &self.uid
     }
 
-    /// Records that `id`'s effects are not yet covered by any publication.
-    pub(crate) fn defer(&self, id: u64) {
-        self.state
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .pending
-            .push(id);
-    }
-
-    /// Whether any dispatched command's effects are still uncovered.
-    pub(crate) fn has_pending(&self) -> bool {
-        !self
-            .state
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .pending
-            .is_empty()
-    }
-
     /// Publishes everything the snapshot changed since the last publication.
     ///
-    /// `trigger` is the command whose completion prompted it, if there is one; the transaction's
-    /// metadata names it and every command deferred before it. A publication that finds no
-    /// difference writes no transaction — it still refreshes the record dumps, which is the only
-    /// way a command that changed nothing shows up on disk at all.
+    /// `cmd` is the command line whose completion prompted it, or empty when nothing named it.
+    /// The transaction's metadata carries that line and the ids of every record produced since
+    /// the previous publication — records that precede a publication belong to it whether or not
+    /// it ends up writing a transaction. A publication that finds no difference writes none; it
+    /// still refreshes the record dumps, which is the only way a command that changed nothing
+    /// shows up on disk at all.
     ///
     /// # Errors
     ///
@@ -164,19 +152,30 @@ impl Session {
     /// or when a record stream cannot be written.
     #[allow(
         clippy::significant_drop_tightening,
-        reason = "the lock is held for the whole transaction on purpose: taking the pending set, \
+        reason = "the lock is held for the whole transaction on purpose: attributing the records, \
                   diffing, logging and bumping the sequence number are one atomic publication"
     )]
-    pub(crate) fn publish(&self, trigger: Option<u64>) -> Result<Publication, MarshError> {
+    pub(crate) fn publish(&self, cmd: &str) -> Result<Publication, MarshError> {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        let mut covered = std::mem::take(&mut state.pending);
-        if let Some(id) = trigger {
-            covered.push(id);
-        }
+        let spawns = self.spawns.records();
+        let builtins = self.hook.records();
+        let new_spawns: Vec<u64> = spawns[state.spawns_seen..]
+            .iter()
+            .map(SpawnRecord::id)
+            .collect();
+        let new_builtins: Vec<u64> = builtins[state.builtins_seen..]
+            .iter()
+            .filter_map(|record| match record {
+                BuiltinRecord::Begin { id, .. } => Some(*id),
+                BuiltinRecord::End { .. } => None,
+            })
+            .collect();
+        state.spawns_seen = spawns.len();
+        state.builtins_seen = builtins.len();
 
         let ops = brush_wal::diff_trees(&self.persistence.seed, &self.snapshot)?;
         if ops.is_empty() {
-            self.dump()?;
+            self.dump(&spawns, &builtins)?;
             return Ok(Publication {
                 seq: state.seq,
                 ops: 0,
@@ -184,7 +183,6 @@ impl Session {
         }
 
         let seq = state.seq + 1;
-        let cmd = self.command_line(trigger.or_else(|| covered.last().copied()));
         brush_wal::apply(
             &self.persistence.seed,
             &self.snapshot,
@@ -192,46 +190,24 @@ impl Session {
             &self.uid,
             seq,
             &PublishMeta {
-                cmd,
-                commands: covered,
+                cmd: cmd.to_string(),
+                spawns: new_spawns,
+                builtins: new_builtins,
             },
             &ops,
         )?;
         state.seq = seq;
-        self.dump()?;
+        self.dump(&spawns, &builtins)?;
         Ok(Publication {
             seq,
             ops: ops.len(),
         })
     }
 
-    /// The argv of the command `id` names, joined by single spaces; empty when there is none.
-    fn command_line(&self, id: Option<u64>) -> String {
-        let Some(id) = id else {
-            return String::new();
-        };
-        self.commands
-            .records()
-            .iter()
-            .find_map(|record| match record {
-                CommandRecord::Begin {
-                    id: recorded, argv, ..
-                } if *recorded == id => Some(argv.join(" ")),
-                _ => None,
-            })
-            .unwrap_or_default()
-    }
-
     /// Writes both record streams into `meta/runs/<uid>`, whole.
-    fn dump(&self) -> Result<(), MarshError> {
-        std::fs::write(
-            self.run_dir.join("commands.json"),
-            dump_records(&self.commands.records())?,
-        )?;
-        std::fs::write(
-            self.run_dir.join("builtins.json"),
-            dump_records(&self.hook.records())?,
-        )?;
+    fn dump(&self, spawns: &[SpawnRecord], builtins: &[BuiltinRecord]) -> Result<(), MarshError> {
+        std::fs::write(self.run_dir.join("spawns.json"), dump_records(spawns)?)?;
+        std::fs::write(self.run_dir.join("builtins.json"), dump_records(builtins)?)?;
         Ok(())
     }
 }
@@ -242,7 +218,7 @@ impl Drop for Session {
     /// A snapshot whose final publication failed is deliberately kept: it is the source the next
     /// session's recovery replays from, and deleting it would strand the log.
     fn drop(&mut self) {
-        if self.publish(None).is_ok() {
+        if self.publish("").is_ok() {
             self.fs.delete_subvolume(&self.snapshot);
         }
     }
