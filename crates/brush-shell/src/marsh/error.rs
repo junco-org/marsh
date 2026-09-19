@@ -1,0 +1,22 @@
+//! Infrastructure failures of an attached session.
+
+/// Failure raised while attaching to a seed, publishing into it or retaking its snapshot, or
+/// recording what was dispatched.
+#[derive(Debug, thiserror::Error)]
+pub enum MarshError {
+    /// Locating, snapshotting, or leasing the seed failed.
+    #[error(transparent)]
+    Btrfs(#[from] marsh_btrfs::Error),
+    /// Logging or publishing a transaction failed.
+    #[error(transparent)]
+    Wal(#[from] marsh_wal::Error),
+    /// A record stream could not be serialized.
+    #[error("instrumentation dump failed: {0}")]
+    Dump(#[from] serde_json::Error),
+    /// Filesystem I/O failed.
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    /// The shell failed to run a line.
+    #[error(transparent)]
+    Shell(#[from] brush_core::Error),
+}

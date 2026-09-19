@@ -1,6 +1,6 @@
 [package]
-name = "brush-extensions"
-description = "MarshExecutor: btrfs-snapshotted, WAL-published, instrumented command execution for a stock brush shell"
+name = "marsh"
+description = "brush, running inside a btrfs snapshot with policy-gated WAL publication and command instrumentation"
 version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
@@ -13,44 +13,41 @@ publish = false
 bench = false
 
 [dependencies]
-brush-core.workspace = true
-brush-builtins.workspace = true
-brush-btrfs = { path = "brush-btrfs" }
-brush-wal = { path = "brush-wal" }
-brush-instrument = { path = "brush-instrument" }
-brush-builtin = { path = "brush-builtin" }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-thiserror = "2"
-
-[dev-dependencies]
-brush-btrfs = { path = "brush-btrfs", features = ["fake"] }
-tempfile = "3"
-tokio = { version = "1", features = ["rt", "macros"] }
-git2 = { version = "0.21", default-features = false, features = ["vendored-libgit2"] }
-serial_test = "3"
-sha1 = "0.10"
-hex = "0.4"
+brush-shell = "0.4.0"
 
 [lints]
 workspace = true
 
 [workspace]
 resolver = "3"
-members = ["brush-btrfs", "brush-wal", "brush-instrument", "brush-builtin"]
+members = ["crates/*", "fuzz"]
 
 [workspace.package]
 authors = ["reuben olinsky"]
 edition = "2024"
 license = "MIT"
-repository = "https://github.com/junco-org/brush-extensions"
+repository = "https://github.com/junco-org/marsh"
 rust-version = "1.95.0"
 
-# Written identically in every member (`brush-core.workspace = true`): cargo unifies a git dependency
-# only when URL and branch match, and a differing spec would build two `brush-core` crates.
+# Every brush crate is named by its crates.io version requirement and redirected by
+# [patch.crates-io]: cargo unifies a package only when source and version match, so no member
+# may name the fork git directly. (brush-test-harness is the exception: not on crates.io, a
+# dev-only git dependency of crates/brush-shell.)
 [workspace.dependencies]
+brush-core = "0.5.0"
+brush-builtins = "0.2.0"
+
+# The fork's main is 151 commits past the crates.io releases and carries the
+# ExternalCommandSpawner seam; every brush crate must come from the same rev. brush-shell is
+# vendored with this workspace's surgical patches.
+[patch.crates-io]
 brush-core = { git = "https://github.com/elefthei/brush", branch = "main" }
+brush-parser = { git = "https://github.com/elefthei/brush", branch = "main" }
 brush-builtins = { git = "https://github.com/elefthei/brush", branch = "main" }
+brush-interactive = { git = "https://github.com/elefthei/brush", branch = "main" }
+brush-coreutils-builtins = { git = "https://github.com/elefthei/brush", branch = "main" }
+brush-experimental-builtins = { git = "https://github.com/elefthei/brush", branch = "main" }
+brush-shell = { path = "crates/brush-shell" }
 
 [workspace.lints.rust]
 warnings = { level = "deny" }
