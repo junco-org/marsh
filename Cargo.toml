@@ -8,12 +8,76 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 publish = false
+# `rmux` is the program this package is: the terminal multiplexer whose panes, popups and
+# workload helpers are marsh shells. `cargo run -p marsh` must be it, not a stray example.
+default-run = "rmux"
 
 [lib]
 bench = false
 
+# The full rmux CLI. `src/rmux/main.rs` is its own crate root, so the application glue ported
+# from upstream keeps resolving `crate::cli`, `crate::cli_args`, ... without a second copy of
+# those modules inside the library.
+[[bin]]
+name = "rmux"
+path = "src/rmux/main.rs"
+bench = false
+
+[features]
+default = ["web"]
+web = ["rmux-server/web"]
+perf-instrument = ["rmux-server/perf-instrument"]
+
 [dependencies]
-brush-shell = "0.4.0"
+marsh-core = { path = "crates/marsh-core" }
+
+# The server is the one rmux crate that is local: its pane, popup and workload backends are
+# marsh's. Everything else is upstream at the pinned commit.
+rmux-server = { version = "=0.10.0", default-features = false }
+rmux-client.workspace = true
+rmux-core.workspace = true
+rmux-os.workspace = true
+rmux-proto.workspace = true
+rmux-sdk.workspace = true
+
+# The public host constructor takes a `brush_core::env::ShellEnvironment`, and the CLI quotes
+# workload argv with brush's escaping rather than a second quoting implementation.
+brush-core.workspace = true
+
+# The application's own libraries, kept at upstream's feature selection so the CLI's QR,
+# ratatui and JSON code paths behave identically.
+chrono = { version = "0.4.42", default-features = false, features = ["std"] }
+clap = { version = "4.6.0", features = ["derive"] }
+libc = "0.2"
+# The OS random generator every managed pane's session nonce comes from. Portable on purpose: the
+# `-c` and Claude paths allocate one per invocation, so a unix-only source would fail them outright
+# on Windows.
+getrandom = "0.3"
+qrcode = { version = "0.14", default-features = false }
+ratatui = { version = "=0.29.0", default-features = false }
+serde_json = "1.0.149"
+tokio = { version = "1.52.3", features = [
+    "io-util",
+    "macros",
+    "net",
+    "rt",
+    "rt-multi-thread",
+    "sync",
+    "time",
+] }
+
+[dev-dependencies]
+brush-core.workspace = true
+brush-builtins.workspace = true
+marsh-btrfs = { path = "crates/marsh-btrfs", features = ["fake"] }
+marsh-wal = { path = "crates/marsh-wal" }
+marsh-instrument = { path = "crates/marsh-instrument" }
+git2 = { version = "0.21", default-features = false, features = ["vendored-libgit2"] }
+tempfile = "3.27.0"
+hex = "0.4"
+serial_test = "3"
+sha1 = "0.10"
+tokio = { version = "1.52.3", features = ["macros", "rt", "sync", "time"] }
 
 [lints]
 workspace = true
@@ -29,25 +93,29 @@ license = "MIT"
 repository = "https://github.com/junco-org/marsh"
 rust-version = "1.95.0"
 
-# Every brush crate is named by its crates.io version requirement and redirected by
-# [patch.crates-io]: cargo unifies a package only when source and version match, so no member
-# may name the fork git directly. (brush-test-harness is the exception: not on crates.io, a
-# dev-only git dependency of crates/brush-shell.)
 [workspace.dependencies]
 brush-core = "0.5.0"
 brush-builtins = "0.2.0"
 
-# The fork's main is 151 commits past the crates.io releases and carries the
-# ExternalCommandSpawner seam; every brush crate must come from the same rev. brush-shell is
-# vendored with this workspace's surgical patches.
+# Every rmux library except the server comes from upstream, pinned to the exact commit the
+# vendored server was copied from. The server itself is local — its pane, popup and workload
+# backends are marsh's — and is selected through `[patch.crates-io]` so that both this package
+# and the Git-sourced rmux libraries resolve to the same single instance.
+rmux-core = { version = "=0.10.0", git = "https://github.com/Helvesec/rmux", rev = "1f4571e74f36be0c033c6294d1616c7d3a6fbda1" }
+rmux-client = { version = "=0.10.0", git = "https://github.com/Helvesec/rmux", rev = "1f4571e74f36be0c033c6294d1616c7d3a6fbda1" }
+rmux-ipc = { version = "=0.10.0", git = "https://github.com/Helvesec/rmux", rev = "1f4571e74f36be0c033c6294d1616c7d3a6fbda1" }
+rmux-os = { version = "=0.10.0", git = "https://github.com/Helvesec/rmux", rev = "1f4571e74f36be0c033c6294d1616c7d3a6fbda1" }
+rmux-proto = { version = "=0.10.0", git = "https://github.com/Helvesec/rmux", rev = "1f4571e74f36be0c033c6294d1616c7d3a6fbda1" }
+rmux-pty = { version = "=0.10.0", git = "https://github.com/Helvesec/rmux", rev = "1f4571e74f36be0c033c6294d1616c7d3a6fbda1" }
+rmux-sdk = { version = "=0.10.0", git = "https://github.com/Helvesec/rmux", rev = "1f4571e74f36be0c033c6294d1616c7d3a6fbda1" }
+rmux-web-crypto = { version = "=0.10.0", git = "https://github.com/Helvesec/rmux", rev = "1f4571e74f36be0c033c6294d1616c7d3a6fbda1" }
+
+# brush-core carries one change that is not released: the ExternalCommandSpawner seam
+# (https://github.com/reubeno/brush/pull/1382), which MarshExecutor is an implementation of.
+# crates/brush-core is crates.io's 0.5.0 plus that seam; every other brush crate is stock.
 [patch.crates-io]
-brush-core = { git = "https://github.com/elefthei/brush", branch = "main" }
-brush-parser = { git = "https://github.com/elefthei/brush", branch = "main" }
-brush-builtins = { git = "https://github.com/elefthei/brush", branch = "main" }
-brush-interactive = { git = "https://github.com/elefthei/brush", branch = "main" }
-brush-coreutils-builtins = { git = "https://github.com/elefthei/brush", branch = "main" }
-brush-experimental-builtins = { git = "https://github.com/elefthei/brush", branch = "main" }
-brush-shell = { path = "crates/brush-shell" }
+brush-core = { path = "crates/brush-core" }
+rmux-server = { path = "crates/rmux-server" }
 
 [workspace.lints.rust]
 warnings = { level = "deny" }

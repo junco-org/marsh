@@ -1,0 +1,50 @@
+[package]
+name = "marsh-core"
+description = "brush, running inside a btrfs snapshot with policy-gated WAL publication and command instrumentation"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[lib]
+bench = false
+
+[dependencies]
+brush-core.workspace = true
+brush-builtins.workspace = true
+brush-interactive = "^0.4.0"
+clap = { version = "4.6.0", features = ["derive"] }
+marsh-btrfs = { path = "../marsh-btrfs" }
+marsh-wal = { path = "../marsh-wal" }
+marsh-instrument = { path = "../marsh-instrument" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0.149"
+thiserror = "2.0.18"
+tokio = { version = "1.52.3", features = ["rt", "rt-multi-thread", "sync", "net"] }
+# The pty ioctls, the `read`/`write` on its master, and the `kill(-pgid, SIGKILL)` a forced stop
+# sends: all of them syscalls with no safe wrapper in this dependency set.
+libc = "0.2"
+# The terminal and pty primitives `shellmux::pty` is built from. Pinned to brush-core's own major
+# so `nix::errno::Errno` converts into `brush_core::Error` through the impl brush-core provides.
+# `term` carries both `nix::sys::termios` and `nix::pty`.
+nix = { version = "0.31.2", features = ["fs", "term"] }
+# No ssh/https transports and no system libgit2: every repository the git builtin touches is a
+# local directory, and a vendored library is the only way the object database written here is
+# the one the git CLI would have written.
+git2 = { version = "0.21", default-features = false, features = ["vendored-libgit2"] }
+# The capability policy every staged line is checked against before it is published.
+junco-rust-validator = { git = "https://github.com/junco-org/junco-policy", branch = "main" }
+
+[dev-dependencies]
+marsh-btrfs = { path = "../marsh-btrfs", features = ["fake"] }
+tempfile = "3.27.0"
+hex = "0.4"
+serial_test = "3"
+sha1 = "0.10"
+tokio = { version = "1.52.3", features = ["macros", "time"] }
+
+[lints]
+workspace = true

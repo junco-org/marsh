@@ -1,13 +1,48 @@
-//! marsh — brush, the bash-compatible shell, with `MarshExecutor` plugged in as its
-//! `ExternalCommandSpawner`: every external command is recorded, builtins are instrumented,
-//! and with `--marsh-seed DIR` the shell runs inside a btrfs snapshot of `DIR` and publishes its
-//! effects back through a write-ahead log once junco-policy's capability check grants them.
+//! `marsh::Shell`: brush inside a btrfs snapshot, every command line instrumented, checked against a
+//! capability policy, and published through a write-ahead log — or discarded.
 //!
-//! The gated shell, its executor and its policy are re-exported at this crate's root; the
-//! vendored, patched `brush-shell`'s own public modules keep their names. The `brush` binary is
-//! `crates/brush-shell`'s own.
-pub use brush_shell::marsh::{
-    Denial, MarshError, MarshExecutor, MarshShellExtensions, Outcome, PolicyValidator,
-    PublishMeta, Publication, Shell, ShellRef, builtins, policy,
+//! A shell built here never writes into the tree it is pointed at. It runs inside a writable btrfs
+//! snapshot of that tree — the *seed* — and a command line's effects reach the seed only through a
+//! write-ahead log, and only once the policy has granted every capability they amount to: a crash
+//! leaves the seed untouched or completable by a replay, a refused line leaves it untouched.
+//! Alongside, every external command the shell spawns and every builtin it runs is recorded, which
+//! is the only way effects inside the shell process can be attributed to the command that caused
+//! them.
+//!
+//! Nothing here modifies brush. [`MarshExecutor`] is a `brush_core::extensions::ExternalCommandSpawner`,
+//! selected statically through [`MarshShellExtensions`]; [`Shell::attach`] makes a built shell the
+//! executor's — the `git` and `exec` builtins added, every builtin it holds instrumented — and wraps
+//! it. Each line the [`Shell`] runs is staged in the snapshot, its requests are checked by
+//! [`PolicyValidator`] — junco-policy's git legality over a history shared by every shell in the
+//! process — and it is published only when every request was granted. A script running in the
+//! shell cannot see the instrumentation, write to it, or turn it off.
+//!
+//! ```no_run
+//! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+//! let validator = marsh::PolicyValidator::global();
+//! let shell = marsh::Shell::new(std::path::Path::new("/srv/seed"), validator).await?;
+//! let (result, outcome) = shell.run("printf hi > greeting").await?;
+//! # let _ = (result, outcome);
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! Several shells over one seed: [`MarshExecutor::open`] once, `executor.snapshot(principal)` per
+//! shell; a line that lost a race to another principal comes back as [`Outcome::Stale`].
+//!
+//! The pieces are separate crates: `marsh-core` (this crate's implementation), `marsh-btrfs` (seed
+//! discovery, lease, snapshots), `marsh-wal` (diff and durable publication) and `marsh-instrument`
+//! (builtin hook and record vocabulary). `builtins` holds the `git` and `exec` builtins, `policy`
+//! the validator and the translation of a line's effects into requests, and `input` the gate an
+//! interactive driver reads lines through. [`shellmux`] is the layer above: a capability-gated
+//! shell multiplexer that runs one [`Shell`] per job over one seed, and delivers what each line
+//! became to a frontend it does not implement. `rmux` is the layer above *that*: the terminal
+//! multiplexer this crate's `rmux` program is, and the complete system-I/O interface it exposes.
+
+pub use marsh_core::{
+    Denial, GrantedAction, GrantedCapability, MarshError, MarshExecutor, MarshShellExtensions,
+    Outcome, PolicyValidator, Publication, PublishMeta, Shell, ShellRef, Signal, SnapshotUid,
+    StalePath, builtins, input, policy, shellmux,
 };
-pub use brush_shell::{args, bundled, config, entry, events};
+
+pub mod rmux;

@@ -1,0 +1,61 @@
+use std::io::Read;
+use std::path::Path;
+
+use super::{run_command, run_payload_command, ExitFailure};
+use crate::cli_args::{LoadBufferArgs, SaveBufferArgs};
+
+/// Runs `load-buffer`, reading the buffer from stdin when the path is `-`.
+pub(super) fn run_load_buffer(
+    args: LoadBufferArgs,
+    socket_path: &Path,
+) -> Result<i32, ExitFailure> {
+    if args.path == "-" {
+        let content = read_stdin_bytes("load-buffer")?;
+        return run_command(socket_path, "set-buffer", move |connection| {
+            connection.set_buffer_target_client(
+                args.name,
+                content,
+                false,
+                None,
+                args.set_clipboard,
+                args.target_client,
+            )
+        });
+    }
+
+    run_command(socket_path, "load-buffer", move |connection| {
+        connection.load_buffer_target_client(
+            args.path,
+            args.name,
+            args.set_clipboard,
+            args.target_client,
+        )
+    })
+}
+
+/// Runs `save-buffer`, writing the buffer to stdout when the path is `-`.
+pub(super) fn run_save_buffer(
+    args: SaveBufferArgs,
+    socket_path: &Path,
+) -> Result<i32, ExitFailure> {
+    if args.path == "-" {
+        return run_payload_command(socket_path, "show-buffer", move |connection| {
+            connection.show_buffer(args.name)
+        });
+    }
+
+    run_command(socket_path, "save-buffer", move |connection| {
+        connection.save_buffer(args.path, args.name, args.append)
+    })
+}
+
+/// Reads all of stdin as raw bytes, failing with a `command_name`-prefixed message.
+fn read_stdin_bytes(command_name: &str) -> Result<Vec<u8>, ExitFailure> {
+    let mut content = Vec::new();
+    std::io::stdin()
+        .read_to_end(&mut content)
+        .map_err(|error| {
+            ExitFailure::new(1, format!("{command_name}: failed to read stdin: {error}"))
+        })?;
+    Ok(content)
+}

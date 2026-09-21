@@ -1,5 +1,6 @@
-# Vendored from https://github.com/elefthei/brush fuzz at 8e1f0ff4; local change: path
-# dependencies become crates.io requirements redirected by the root's [patch.crates-io].
+# Vendored from https://github.com/reubeno/brush fuzz; local changes: path dependencies became
+# crates.io requirements (brush-core is redirected by the root's [patch.crates-io]), and the
+# fuzz_highlight target was dropped — it needs a highlighting API that is not in a release.
 [package]
 name = "brush-fuzz"
 description = "Fuzz tests for brush"
@@ -26,7 +27,6 @@ tokio = { version = "1.52.3", features = ["rt"] }
 
 brush-core = "^0.5.0"
 brush-parser = { version = "^0.4.0", features = ["arbitrary"] }
-brush-interactive = { version = "^0.4.0", features = ["highlighting"] }
 
 [[bin]]
 name = "fuzz_parse"
@@ -42,9 +42,3 @@ test = false
 doc = false
 bench = false
 
-[[bin]]
-name = "fuzz_highlight"
-path = "fuzz_targets/fuzz_highlight.rs"
-test = false
-doc = false
-bench = false

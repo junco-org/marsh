@@ -1,0 +1,36 @@
+[package]
+name = "rmux-windows-console"
+description = "Keystroke, text and control-event injection into a Windows console process, for the rmux daemon"
+# Vendored from https://github.com/Helvesec/rmux at 1f4571e74f36be0c033c6294d1616c7d3a6fbda1,
+# where this was `rmux-pty::windows_console_input`. `edition` is pinned to 2021 rather than
+# inherited for the same reason `rmux-server` pins it: the source is upstream's, and the only
+# review it gets is a diff against that revision, so the language it is read under must not move
+# underneath it. Everything else is the workspace's.
+version = "0.1.0"
+edition = "2021"
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[lib]
+bench = false
+
+[target.'cfg(windows)'.dependencies]
+# The whole reason this crate exists: `rmux-server` is `#![forbid(unsafe_code)]`, and the Win32
+# bindings these calls need are unsafe. The unsafe lives here, behind a six-item surface, so the
+# daemon keeps a lint that cannot be locally waived. The feature set is the subset of `rmux-pty`'s
+# own `windows-sys` entry that `src/console_input.rs` imports.
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    # `CreateFileW` takes a `*const SECURITY_ATTRIBUTES`, so `Win32_Storage_FileSystem` does not
+    # define it without this. Verified by compiling this crate for `x86_64-pc-windows-gnu`.
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+] }
+tracing = "0.1"
+
+[lints]
+workspace = true
