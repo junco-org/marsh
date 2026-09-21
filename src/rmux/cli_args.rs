@@ -373,7 +373,7 @@ fn implemented_command_help() -> &'static str {
 }
 
 /// The built-in command aliases advertised to users.
-pub(crate) fn documented_cli_aliases() -> &'static [DocumentedCliAlias] {
+pub(crate) const fn documented_cli_aliases() -> &'static [DocumentedCliAlias] {
     DOCUMENTED_CLI_ALIASES
 }
 
@@ -488,7 +488,7 @@ impl Cli {
         let mut command_queue = parsed_commands
             .into_commands()
             .into_iter()
-            .map(command_from_parsed)
+            .map(|command| command_from_parsed(&command))
             .collect::<Result<Vec<_>, _>>()?;
         if command_queue.is_empty() && explicit_command_args {
             command_queue.push(Command::Noop);
@@ -687,7 +687,7 @@ fn delimit_options_before_positionals(
             let name = long.split_once('=').map_or(long, |(name, _)| name);
             if !long_flags.contains(name) {
                 if positionals_allow_hyphen {
-                    return Err(unknown_flag_error(command_name, format!("--{name}")));
+                    return Err(unknown_flag_error(command_name, &format!("--{name}")));
                 }
                 continue;
             }
@@ -697,11 +697,12 @@ fn delimit_options_before_positionals(
             continue;
         }
 
-        let mut chars = argument[1..].chars().peekable();
+        let shorts = argument.strip_prefix('-').unwrap_or_default();
+        let mut chars = shorts.chars().peekable();
         while let Some(flag) = chars.next() {
             if !short_flags.contains(&flag) {
                 if positionals_allow_hyphen {
-                    return Err(unknown_flag_error(command_name, format!("-{flag}")));
+                    return Err(unknown_flag_error(command_name, &format!("-{flag}")));
                 }
                 continue;
             }
@@ -715,7 +716,7 @@ fn delimit_options_before_positionals(
     }
 
     if let Some(flag) = expected_value_flag {
-        return Err(missing_value_error(command_name, flag));
+        return Err(missing_value_error(command_name, &flag));
     }
 
     if let Some(index) = first_positional {
@@ -757,7 +758,7 @@ fn argument_requires_value(argument: &clap::Arg) -> bool {
 }
 
 /// Builds the tmux-shaped error for an unrecognized flag on `command_name`.
-fn unknown_flag_error(command_name: &'static str, flag: String) -> clap::Error {
+fn unknown_flag_error(command_name: &'static str, flag: &str) -> clap::Error {
     clap::Error::raw(
         clap::error::ErrorKind::UnknownArgument,
         format!("command {command_name}: unknown flag {flag}"),
@@ -765,7 +766,7 @@ fn unknown_flag_error(command_name: &'static str, flag: String) -> clap::Error {
 }
 
 /// Builds the tmux-shaped error for a flag on `command_name` that is missing its value.
-fn missing_value_error(command_name: &'static str, flag: String) -> clap::Error {
+fn missing_value_error(command_name: &'static str, flag: &str) -> clap::Error {
     clap::Error::raw(
         clap::error::ErrorKind::ValueValidation,
         format!("command {command_name}: {flag} expects an argument"),
@@ -878,8 +879,8 @@ fn normalize_compact_short_value_token(
         if value_flags.contains(&flag) {
             parts.push(format!("-{flag}"));
             let value_start = index + flag.len_utf8();
-            if value_start < flags.len() {
-                parts.push(flags[value_start..].to_owned());
+            if let Some(value) = flags.get(value_start..).filter(|value| !value.is_empty()) {
+                parts.push(value.to_owned());
                 return Some((parts, false));
             }
             return Some((parts, true));
@@ -1074,15 +1075,19 @@ trait QueuedCommand {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 #[path = "cli_args_tests.rs"]
 mod tests;
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 #[path = "cli_args_config_tests.rs"]
 mod config_tests;
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 #[path = "cli_args_layout_tests.rs"]
 mod layout_tests;
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 #[path = "cli_args_zoom_tests.rs"]
 mod zoom_tests;

@@ -106,7 +106,7 @@ pub enum MuxError {
     /// [`MuxError`] nor the errors it wraps are cloneable, and flattening them to a string at that
     /// point would throw away the source chain every one of those readers may want.
     #[error(transparent)]
-    Shared(Arc<MuxError>),
+    Shared(Arc<Self>),
     /// Filesystem or terminal I/O failed.
     #[error(transparent)]
     Io(#[from] std::io::Error),

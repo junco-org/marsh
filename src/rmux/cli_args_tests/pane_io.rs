@@ -18,7 +18,7 @@ fn pipe_pane_accepts_bidirectional_and_once_flags() {
             assert!(args.stdin);
             assert!(args.stdout);
             assert!(args.once);
-            assert_eq!(target_text(&args.target), "alpha:0.1");
+            assert_eq!(target_text(args.target.as_ref()), "alpha:0.1");
             assert_eq!(args.command, ["cat >/tmp/pipe-pane.out"]);
         }
         _ => panic!("expected PipePane command"),
@@ -48,7 +48,7 @@ fn respawn_pane_accepts_kill_directory_environment_and_command() {
             assert!(args.kill);
             assert_eq!(args.start_directory, Some(PathBuf::from("/tmp/work")));
             assert_eq!(args.environment, ["FOO=bar", "BAR=baz"]);
-            assert_eq!(target_text(&args.target), "alpha:0.1");
+            assert_eq!(target_text(args.target.as_ref()), "alpha:0.1");
             assert_eq!(args.command, ["printf", "done"]);
         }
         _ => panic!("expected RespawnPane command"),
@@ -97,7 +97,7 @@ fn last_pane_preserves_tmux_style_raw_targets() {
             assert_eq!(
                 args.target.as_ref().expect("target").to_string(),
                 "alpha:0.1"
-            )
+            );
         }
         _ => panic!("expected LastPane command"),
     }
@@ -125,7 +125,7 @@ fn kill_pane_accepts_session_targets_like_tmux() {
     match cli.command.expect("parsed command") {
         super::super::Command::KillPane(args) => {
             assert!(!args.kill_all_except);
-            assert_eq!(args.target.expect("target exists").to_string(), "alpha")
+            assert_eq!(args.target.expect("target exists").to_string(), "alpha");
         }
         _ => panic!("expected KillPane command"),
     }
@@ -160,7 +160,7 @@ fn select_pane_accepts_session_targets_like_tmux() {
     let cli = parse_args(&["select-pane", "-t", "alpha"]).unwrap();
     match cli.command.expect("parsed command") {
         super::super::Command::SelectPane(args) => {
-            assert_eq!(args.target.expect("target exists").to_string(), "alpha")
+            assert_eq!(args.target.expect("target exists").to_string(), "alpha");
         }
         _ => panic!("expected SelectPane command"),
     }
@@ -198,7 +198,7 @@ fn select_pane_accepts_non_zero_window_targets() {
     let cli = parse_args(&["select-pane", "-t", "alpha:5.2"]).unwrap();
     match cli.command.expect("parsed command") {
         super::super::Command::SelectPane(args) => {
-            assert_eq!(args.target.expect("target exists").to_string(), "alpha:5.2")
+            assert_eq!(args.target.expect("target exists").to_string(), "alpha:5.2");
         }
         _ => panic!("expected SelectPane command"),
     }
@@ -445,7 +445,7 @@ fn capture_pane_accepts_public_command_name_and_flags() {
 
     match cli.command.expect("parsed command") {
         super::super::Command::CapturePane(args) => {
-            assert_eq!(target_text(&args.target), "alpha:0.0");
+            assert_eq!(target_text(args.target.as_ref()), "alpha:0.0");
             assert_eq!(args.start.as_deref(), Some("-3"));
             assert_eq!(args.end.as_deref(), Some("-1"));
             assert!(args.print);
@@ -499,7 +499,7 @@ fn capture_pane_alias_accepts_print_mode() {
     match cli.command.expect("parsed command") {
         super::super::Command::CapturePane(args) => {
             assert!(args.print);
-            assert_eq!(target_text(&args.target), "alpha:0.0");
+            assert_eq!(target_text(args.target.as_ref()), "alpha:0.0");
         }
         _ => panic!("expected CapturePane command"),
     }
@@ -513,7 +513,7 @@ fn capture_pane_accepts_tmux_mode_screen_flag() {
         super::super::Command::CapturePane(args) => {
             assert!(args.use_mode_screen);
             assert!(args.print);
-            assert_eq!(target_text(&args.target), "alpha:0.0");
+            assert_eq!(target_text(args.target.as_ref()), "alpha:0.0");
         }
         _ => panic!("expected CapturePane command"),
     }
@@ -527,7 +527,7 @@ fn copy_mode_accepts_tmux_page_down_and_scrollbar_flags() {
         super::super::Command::CopyMode(args) => {
             assert!(args.page_down);
             assert!(args.scrollbar_scroll);
-            assert_eq!(target_text(&args.target), "alpha:0.0");
+            assert_eq!(target_text(args.target.as_ref()), "alpha:0.0");
         }
         _ => panic!("expected CopyMode command"),
     }
@@ -537,7 +537,7 @@ fn copy_mode_accepts_tmux_page_down_and_scrollbar_flags() {
 fn pane_commands_accept_session_or_window_targets_like_tmux() {
     let capture = parse_args(&["capture-pane", "-p", "-t", "alpha"]).unwrap();
     match capture.command.expect("parsed command") {
-        super::super::Command::CapturePane(args) => assert_eq!(target_text(&args.target), "alpha"),
+        super::super::Command::CapturePane(args) => assert_eq!(target_text(args.target.as_ref()), "alpha"),
         _ => panic!("expected CapturePane command"),
     }
 
@@ -547,7 +547,7 @@ fn pane_commands_accept_session_or_window_targets_like_tmux() {
             assert_eq!(
                 args.target.expect("send-prefix target").to_string(),
                 "alpha:2"
-            )
+            );
         }
         _ => panic!("expected SendPrefix command"),
     }
@@ -555,7 +555,7 @@ fn pane_commands_accept_session_or_window_targets_like_tmux() {
     let copy_mode = parse_args(&["copy-mode", "-t", "alpha"]).unwrap();
     match copy_mode.command.expect("parsed command") {
         super::super::Command::CopyMode(args) => {
-            assert_eq!(args.target.expect("copy-mode target").to_string(), "alpha")
+            assert_eq!(args.target.expect("copy-mode target").to_string(), "alpha");
         }
         _ => panic!("expected CopyMode command"),
     }

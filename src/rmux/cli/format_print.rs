@@ -12,7 +12,7 @@ pub(in crate::cli) fn print_target_format(
 ) -> Result<(), ExitFailure> {
     let response = connection
         .display_message(Some(target), true, Some(template.to_owned()))
-        .map_err(ExitFailure::from_client)?;
+        .map_err(ExitFailure::from)?;
     let output = expect_command_output(&response, "display-message")?;
     write_command_output(output)
 }

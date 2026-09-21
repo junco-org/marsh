@@ -19,7 +19,7 @@ impl TargetSpec {
     }
 
     /// The statically parsed target, or `None` when only the server can resolve the text.
-    pub(crate) fn exact(&self) -> Option<&Target> {
+    pub(crate) const fn exact(&self) -> Option<&Target> {
         self.exact.as_ref()
     }
 }
@@ -133,7 +133,7 @@ fn exact_match_target(value: &str) -> &str {
 }
 
 /// True for any nonempty value, which the running server may still resolve.
-fn is_runtime_resolved_target_shape(value: &str) -> bool {
+const fn is_runtime_resolved_target_shape(value: &str) -> bool {
     !value.is_empty()
 }
 

@@ -95,6 +95,10 @@ impl StartupEndpoint {
         use_connection: impl FnOnce(&mut Connection) -> T,
     ) -> T {
         let mut inner = self.inner.borrow_mut();
+        #[allow(
+            clippy::expect_used,
+            reason = "alias resolution runs before the connection is handed off; a missing connection is an unrecoverable CLI bug"
+        )]
         let connection = inner
             .connection
             .as_mut()
@@ -139,7 +143,7 @@ pub(in crate::cli) struct StartupOptions {
 
 impl StartupOptions {
     /// Builds the policy from an auto-start permission, its configuration, and an endpoint.
-    pub(in crate::cli) fn new(
+    pub(in crate::cli) const fn new(
         no_start_server: bool,
         config: AutoStartConfig,
         endpoint: StartupEndpoint,
@@ -328,6 +332,7 @@ pub(super) fn run_foreground_server(
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 mod tests {
     use super::{StartupEndpoint, StartupOptions};
     use rmux_client::{AutoStartConfig, ServerConnectionProvenance};

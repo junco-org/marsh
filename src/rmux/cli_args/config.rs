@@ -314,14 +314,14 @@ pub(crate) fn build_scope(global: bool, target: Option<SessionName>) -> ScopeSel
 
 /// Parses a `set-hook` argument of the form `name` or `name[index]`.
 fn parse_hook_spec(value: &str) -> Result<ParsedHookSpec, String> {
-    let (name, index) = if let Some(open_bracket) = value.find('[') {
-        let Some(index_text) = value[open_bracket + 1..].strip_suffix(']') else {
+    let (name, index) = if let Some((name, rest)) = value.split_once('[') {
+        let Some(index_text) = rest.strip_suffix(']') else {
             return Err(format!("unknown hook: {value}"));
         };
         let index = index_text
             .parse::<u32>()
             .map_err(|_| format!("invalid hook index: {value}"))?;
-        (&value[..open_bracket], Some(index))
+        (name, Some(index))
     } else {
         (value, None)
     };

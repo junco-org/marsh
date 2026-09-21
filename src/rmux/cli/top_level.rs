@@ -97,7 +97,7 @@ pub(super) fn top_level_version_output(invoked_as_tmux: bool) -> String {
 }
 
 /// The tmux release `rmux` reports as, chosen for plugin-manager compatibility.
-fn tmux_compatible_version() -> &'static str {
+const fn tmux_compatible_version() -> &'static str {
     "3.4"
 }
 
@@ -141,12 +141,12 @@ fn short_option_consumes_next_argument(bytes: &[u8]) -> bool {
 }
 
 /// Reports whether a short option flag requires a value.
-fn short_option_takes_argument(flag: u8) -> bool {
+const fn short_option_takes_argument(flag: u8) -> bool {
     matches!(flag, b'c' | b'f' | b'L' | b'S' | b'T')
 }
 
 /// Reports whether a short option flag is a standalone boolean switch.
-fn short_option_takes_no_argument(flag: u8) -> bool {
+const fn short_option_takes_no_argument(flag: u8) -> bool {
     matches!(flag, b'2' | b'C' | b'D' | b'l' | b'N' | b'u' | b'v')
 }
 
@@ -306,6 +306,7 @@ pub(super) fn accept_compatibility_options(cli: &Cli) {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 mod top_level_option_tests {
     use super::{
         scan_claude_top_level_invocation, top_level_version_requested,
@@ -459,6 +460,7 @@ mod top_level_option_tests {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 mod utf8_env_tests {
     use super::{env_value_contains_utf8, infer_client_utf8};
     use std::ffi::{OsStr, OsString};

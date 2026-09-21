@@ -94,7 +94,7 @@ fn server_command_alias_definitions(
             false,
             true,
         )
-        .map_err(ExitFailure::from_client)?;
+        .map_err(ExitFailure::from)?;
     let output = expect_command_output(&response, "show-options")?;
     decode_command_alias_definitions(output.stdout())
         .map_err(|error| ExitFailure::new(1, error.to_string()))
@@ -253,9 +253,9 @@ fn resolve_runtime_command_with_connection(
         }
         Err(error) => {
             let failure = match error {
-                RuntimeCommandExpansionError::Client(error) => ExitFailure::from_client(error),
+                RuntimeCommandExpansionError::Client(error) => ExitFailure::from(error),
                 RuntimeCommandExpansionError::Server(error) => {
-                    ExitFailure::from_client(rmux_client::ClientError::Protocol(error))
+                    ExitFailure::from(rmux_client::ClientError::Protocol(error))
                 }
                 RuntimeCommandExpansionError::Protocol(message) => ExitFailure::new(1, message),
             };
@@ -452,6 +452,7 @@ fn tmux_quote_value(argument: &str) -> String {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 mod tests {
     use std::ffi::OsStr;
 

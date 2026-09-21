@@ -13,7 +13,7 @@ use super::common::{
 
 /// Runs `pane-snapshot`, printing the requested region as text or as a JSON grid.
 pub(crate) fn run_pane_snapshot(
-    args: PaneSnapshotArgs,
+    args: &PaneSnapshotArgs,
     socket_path: &Path,
 ) -> Result<i32, ExitFailure> {
     check_disabled("RMUX_DISABLE_PANE_SNAPSHOT", "pane-snapshot")?;
@@ -153,6 +153,7 @@ fn snapshot_json(
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 mod tests {
     use rmux_proto::{PaneSnapshotCell, PaneSnapshotCursor, PaneSnapshotResponse};
 
@@ -232,9 +233,8 @@ mod tests {
         let mut snapshot = snapshot();
         snapshot.cells.pop();
 
-        let error = match SnapshotView::new(&snapshot, None) {
-            Ok(_) => panic!("grid is incomplete"),
-            Err(error) => error,
+        let Err(error) = SnapshotView::new(&snapshot, None) else {
+            panic!("grid is incomplete")
         };
 
         assert!(

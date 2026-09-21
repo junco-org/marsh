@@ -6,7 +6,19 @@ use rmux_core::command_parser::{
     ParsedCommands,
 };
 
-use super::*;
+use super::{
+    BroadcastKeysArgs, CapturePaneArgs, ChooseBufferArgs, ChooseClientArgs, ChooseTreeArgs,
+    CollectPaneOutputArgs, Command, ConfirmBeforeArgs, CopyModeArgs, CustomizeModeArgs,
+    DisplayMenuArgs, DisplayMessageArgs, DisplayPopupArgs, ExpectPaneArgs, FindWindowArgs,
+    IfShellArgs, ListKeysArgs, ListSessionsArgs, LocatorArgs, PositionalOptionPolicy, PromptArgs,
+    PromptHistoryArgs, QueuedCommand, RunShellArgs, RuntimeCommandGroup, SendKeysArgs,
+    ServerAccessArgs, SetBufferArgs, SetOptionArgs, SetOptionCommandKind, SetWindowOptionArgs,
+    ShowOptionsArgs, ShowWindowOptionsArgs, StreamPaneArgs, UnsupportedCommandArgs, WaitPaneArgs,
+    WithSessionArgs, parse_command_args, parse_command_args_with_policy, parse_join_pane_args,
+    parse_rename_window_args, parse_resize_pane_args, parse_select_layout_args,
+    parse_select_pane_args, parse_select_window_args, parse_source_file_args,
+    parse_split_window_args, parse_swap_window_args,
+};
 
 /// Splits raw command-line words into the queue of `tmux`-style commands they encode.
 pub(super) fn parse_command_queue(arguments: &[OsString]) -> Result<ParsedCommands, clap::Error> {
@@ -22,7 +34,7 @@ pub(super) fn parse_command_queue(arguments: &[OsString]) -> Result<ParsedComman
     TmuxCommandParser::new()
         .with_exact_commands(super::RMUX_EXTENSION_COMMANDS)
         .parse_arguments(&arguments)
-        .map_err(command_parse_error_to_clap)
+        .map_err(|error| command_parse_error_to_clap(&error))
 }
 
 /// Parses rendered runtime command groups into one flat queue, without alias expansion.
@@ -41,7 +53,7 @@ pub(super) fn parse_runtime_command_groups(
         }
         let commands = parser
             .parse_one_group(rendered)
-            .map_err(command_parse_error_to_clap)?;
+            .map_err(|error| command_parse_error_to_clap(&error))?;
         parsed.append(commands);
     }
 
@@ -112,7 +124,7 @@ fn command_argument_to_string(argument: &OsStr) -> Result<String, clap::Error> {
 }
 
 /// Converts a command-parser failure into a `clap` error with the matching error kind.
-fn command_parse_error_to_clap(error: CommandParseError) -> clap::Error {
+fn command_parse_error_to_clap(error: &CommandParseError) -> clap::Error {
     let message = cli_command_error_message(error.message());
 
     let kind =
@@ -141,7 +153,11 @@ fn cli_command_error_message(message: &str) -> &str {
 }
 
 /// Dispatches one parsed command name to its argument parser and builds the typed `Command`.
-pub(super) fn command_from_parsed(command: ParsedCommand) -> Result<Command, clap::Error> {
+#[allow(
+    clippy::too_many_lines,
+    reason = "one flat dispatch table over every tmux command name is clearer than arbitrary splits"
+)]
+pub(super) fn command_from_parsed(command: &ParsedCommand) -> Result<Command, clap::Error> {
     let name = command.name().to_owned();
     let error_command_name = name.clone();
     let queue_command = command.to_tmux_reparse_string();
@@ -170,7 +186,6 @@ pub(super) fn command_from_parsed(command: ParsedCommand) -> Result<Command, cla
         }
         "last-window" => parse_command_args("last-window", arguments).map(Command::LastWindow),
         "list-sessions" => parse_command_args::<ListSessionsArgs>("list-sessions", arguments)
-            .and_then(ListSessionsArgs::validate)
             .map(Command::ListSessions),
         "list-windows" => parse_command_args("list-windows", arguments).map(Command::ListWindows),
         "move-window" => parse_command_args("move-window", arguments).map(Command::MoveWindow),
@@ -205,7 +220,6 @@ pub(super) fn command_from_parsed(command: ParsedCommand) -> Result<Command, cla
         "list-panes" => parse_command_args("list-panes", arguments).map(Command::ListPanes),
         "select-pane" => parse_select_pane_args(arguments).map(Command::SelectPane),
         "copy-mode" => parse_command_args::<CopyModeArgs>("copy-mode", arguments)
-            .and_then(CopyModeArgs::validate)
             .map(Command::CopyMode),
         "clock-mode" => parse_command_args("clock-mode", arguments).map(Command::ClockMode),
         "wait-pane" => parse_command_args::<WaitPaneArgs>("wait-pane", arguments)
@@ -249,7 +263,7 @@ pub(super) fn command_from_parsed(command: ParsedCommand) -> Result<Command, cla
             parse_command_args("list-commands", arguments).map(Command::ListCommands)
         }
         "list-keys" => parse_command_args::<ListKeysArgs>("list-keys", arguments)
-            .and_then(ListKeysArgs::validate)
+            .map(ListKeysArgs::validate)
             .map(Command::ListKeys),
         "send-prefix" => parse_command_args("send-prefix", arguments).map(Command::SendPrefix),
         "attach-session" => {
@@ -309,7 +323,6 @@ pub(super) fn command_from_parsed(command: ParsedCommand) -> Result<Command, cla
             parse_command_args("show-messages", arguments).map(Command::ShowMessages)
         }
         "run-shell" => parse_command_args::<RunShellArgs>("run-shell", arguments)
-            .and_then(RunShellArgs::validate)
             .map(Command::RunShell),
         "source-file" => parse_source_file_args(arguments).map(Command::SourceFile),
         "if-shell" => parse_queue_command_args::<IfShellArgs>("if-shell", arguments)
@@ -317,7 +330,6 @@ pub(super) fn command_from_parsed(command: ParsedCommand) -> Result<Command, cla
         "wait-for" => parse_command_args("wait-for", arguments).map(Command::WaitFor),
         "web-share" => super::web::parse_web_share_args(arguments).map(Command::WebShare),
         "command-prompt" => parse_queue_command_args::<PromptArgs>("command-prompt", arguments)
-            .and_then(PromptArgs::validate)
             .map(|args| Command::Prompt(with_queue_command(args, queue_command))),
         "confirm-before" => {
             parse_queue_command_args::<ConfirmBeforeArgs>("confirm-before", arguments)
@@ -561,15 +573,15 @@ fn set_option_scope(
         if argument == "--" {
             break;
         }
-        if !argument.starts_with('-') || argument == "-" {
+        let Some(flags) = argument.strip_prefix('-').filter(|flags| !flags.is_empty()) else {
             break;
-        }
+        };
         if argument.starts_with("-t") && argument.len() > 2 {
             index += 1;
             continue;
         }
 
-        let mut chars = argument[1..].chars().peekable();
+        let mut chars = flags.chars().peekable();
         while let Some(flag) = chars.next() {
             match flag {
                 's' => scopes.server = true,
@@ -594,7 +606,7 @@ fn set_option_scope(
 }
 
 /// Forces exactly one scope field on the parsed arguments when a flag selected one.
-fn apply_set_option_scope(args: &mut SetOptionArgs, scope: Option<SetOptionScopeFlag>) {
+const fn apply_set_option_scope(args: &mut SetOptionArgs, scope: Option<SetOptionScopeFlag>) {
     let Some(scope) = scope else {
         return;
     };
@@ -641,8 +653,7 @@ fn set_option_positionals_before_separator(arguments: &[String]) -> usize {
             index += 1;
             continue;
         }
-        if argument.starts_with('-') && argument.len() > 1 {
-            let flags = &argument[1..];
+        if let Some(flags) = argument.strip_prefix('-').filter(|flags| !flags.is_empty()) {
             if let Some((offset, flag)) = flags.char_indices().find(|(_, flag)| *flag == 't') {
                 index += if offset + flag.len_utf8() == flags.len() {
                     2

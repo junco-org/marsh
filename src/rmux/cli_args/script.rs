@@ -30,12 +30,12 @@ fn validate_source_file_options(arguments: &[String]) -> Result<(), clap::Error>
         if let Some(long) = argument.strip_prefix("--") {
             let name = long.split_once('=').map_or(long, |(name, _)| name);
             if name != "help" {
-                return Err(source_file_unknown_flag(format!("--{name}")));
+                return Err(source_file_unknown_flag(&format!("--{name}")));
             }
             continue;
         }
 
-        let mut chars = argument[1..].chars().peekable();
+        let mut chars = argument.strip_prefix('-').unwrap_or(argument).chars().peekable();
         while let Some(flag) = chars.next() {
             match flag {
                 'F' | 'n' | 'q' | 'v' => {}
@@ -43,7 +43,7 @@ fn validate_source_file_options(arguments: &[String]) -> Result<(), clap::Error>
                     expect_target = chars.peek().is_none();
                     break;
                 }
-                _ => return Err(source_file_unknown_flag(format!("-{flag}"))),
+                _ => return Err(source_file_unknown_flag(&format!("-{flag}"))),
             }
         }
     }
@@ -51,7 +51,7 @@ fn validate_source_file_options(arguments: &[String]) -> Result<(), clap::Error>
 }
 
 /// Builds the `source-file` unknown-flag error carrying the offending flag text.
-fn source_file_unknown_flag(flag: String) -> clap::Error {
+fn source_file_unknown_flag(flag: &str) -> clap::Error {
     clap::Error::raw(
         clap::error::ErrorKind::UnknownArgument,
         format!("command source-file: unknown flag {flag}"),
@@ -75,13 +75,6 @@ pub(crate) struct RunShellArgs {
     pub(crate) target: Option<TargetSpec>,
     #[arg(allow_hyphen_values = true, trailing_var_arg = true)]
     pub(crate) command: Vec<String>,
-}
-
-impl RunShellArgs {
-    /// Accepts the parsed flags unchanged; `run-shell` has no cross-flag conflicts to reject.
-    pub(crate) fn validate(self) -> Result<Self, clap::Error> {
-        Ok(self)
-    }
 }
 
 /// Arguments for `source-file`, which loads and executes configuration files.
@@ -148,7 +141,7 @@ pub(crate) struct WaitForArgs {
 
 impl WaitForArgs {
     /// Resolves the exclusive `-S`, `-L` and `-U` flags into the channel operation to perform.
-    pub(crate) fn mode(&self) -> WaitForMode {
+    pub(crate) const fn mode(&self) -> WaitForMode {
         if self.signal {
             WaitForMode::Signal
         } else if self.lock {

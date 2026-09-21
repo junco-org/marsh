@@ -177,8 +177,10 @@ fn ctrl_d_deletes_at_the_cursor_unless_the_line_is_empty() {
 
 #[test]
 fn ctrl_c_abandons_the_line_and_the_construct_above_it() {
-    let mut line = Editing::default();
-    line.continuation = "for i in 1 2 3\n".to_owned();
+    let mut line = Editing {
+        continuation: "for i in 1 2 3\n".to_owned(),
+        ..Default::default()
+    };
     feed(&mut line, b"  do echo");
 
     assert_eq!(feed(&mut line, b"\x03"), vec![Submitted::Cancel]);

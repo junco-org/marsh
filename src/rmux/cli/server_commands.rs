@@ -32,7 +32,7 @@ pub(super) fn run_start_server(
             sort_order: None,
             reversed: false,
         })
-        .map_err(ExitFailure::from_client)?;
+        .map_err(ExitFailure::from)?;
     let _ = expect_command_output(&response, "list-sessions")?;
     Ok(0)
 }
@@ -53,7 +53,7 @@ pub(super) fn run_kill_server(socket_path: &Path) -> Result<i32, ExitFailure> {
             if let Some(wire_version) = legacy_shutdown_fallback_wire_version(&error) {
                 return run_legacy_wire_kill_server(&selected_socket_path, wire_version);
             }
-            return Err(ExitFailure::from_client(error));
+            return Err(ExitFailure::from(error));
         }
     }
     let shutdown = connection.kill_server_after_write();
@@ -67,7 +67,7 @@ pub(super) fn run_kill_server(socket_path: &Path) -> Result<i32, ExitFailure> {
             wait_for_killed_server_socket_cleanup(&selected_socket_path)?;
             Ok(0)
         }
-        Err(error) => Err(ExitFailure::from_client(error)),
+        Err(error) => Err(ExitFailure::from(error)),
     }
 }
 
@@ -96,7 +96,7 @@ pub(super) fn run_kill_server(socket_path: &Path) -> Result<i32, ExitFailure> {
             if let Some(wire_version) = legacy_shutdown_fallback_wire_version(&error) {
                 run_legacy_wire_kill_server(socket_path, wire_version)
             } else {
-                Err(ExitFailure::from_client(error))
+                Err(ExitFailure::from(error))
             }
         }
     }
@@ -133,13 +133,13 @@ fn run_legacy_wire_kill_server(socket_path: &Path, wire_version: u32) -> Result<
             wait_for_killed_server_socket_cleanup(socket_path)?;
             Ok(0)
         }
-        Err(error) => Err(ExitFailure::from_client(error)),
+        Err(error) => Err(ExitFailure::from(error)),
     }
 }
 
 /// Blocks until the killed server's socket has disappeared, so a reopen cannot race it.
 fn wait_for_killed_server_socket_cleanup(socket_path: &Path) -> Result<(), ExitFailure> {
-    rmux_client::wait_for_server_endpoint_cleanup(socket_path).map_err(ExitFailure::from_client)
+    rmux_client::wait_for_server_endpoint_cleanup(socket_path).map_err(ExitFailure::from)
 }
 
 /// Runs `server-access`, changing or listing per-user access to the server.
@@ -177,7 +177,7 @@ pub(super) fn run_lock_session(
             resolve_session_target_or_current(connection, args.target.as_ref(), "lock-session")?;
         connection
             .lock_session(target)
-            .map_err(ExitFailure::from_client)
+            .map_err(ExitFailure::from)
     })
 }
 

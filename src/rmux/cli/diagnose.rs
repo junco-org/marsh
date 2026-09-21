@@ -1,4 +1,5 @@
 use std::ffi::OsString;
+use std::fmt::Write as _;
 use std::io::{self, ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
@@ -20,7 +21,7 @@ enum DiagnoseFormat {
     Json,
 }
 
-/// The command-line state `rmux diagnose` needs: output format plus the tmux-style top-level flags.
+/// Command-line state `rmux diagnose` needs: output format plus tmux-style top-level flags.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct DiagnoseInvocation {
     format: DiagnoseFormat,
@@ -83,15 +84,16 @@ pub(super) fn parse_invocation(
 
 /// Collects the report and writes it to stdout in the requested format, yielding the exit code.
 pub(super) fn run(invocation: DiagnoseInvocation) -> Result<i32, ExitFailure> {
-    let report = DiagnoseReport::collect(&invocation)?;
-    let output = match invocation.format {
+    let format = invocation.format;
+    let report = DiagnoseReport::collect(invocation)?;
+    let output = match format {
         DiagnoseFormat::Human => report.render_human(),
         DiagnoseFormat::Json => report.render_json(),
     };
     write_stdout(&output)
 }
 
-/// The subset of tmux top-level flags that affect diagnose output, gathered before the command word.
+/// Tmux top-level flags that affect diagnose output, gathered before the command word.
 #[derive(Default)]
 struct TopLevelPrefix {
     socket_name: Option<OsString>,
@@ -142,16 +144,23 @@ fn split_top_level_prefix(arguments: &[OsString]) -> Option<(usize, TopLevelPref
                 }
             }
             _ if value.starts_with("-L") && value.len() > 2 => {
-                prefix.socket_name = Some(OsString::from(&value[2..]));
+                prefix.socket_name =
+                    Some(OsString::from(value.strip_prefix("-L").unwrap_or_default()));
             }
             _ if value.starts_with("-S") && value.len() > 2 => {
-                prefix.socket_path = Some(PathBuf::from(&value[2..]));
+                prefix.socket_path =
+                    Some(PathBuf::from(value.strip_prefix("-S").unwrap_or_default()));
             }
             _ if value.starts_with("-f") && value.len() > 2 => {
-                prefix.config_files.push(PathBuf::from(&value[2..]));
+                prefix
+                    .config_files
+                    .push(PathBuf::from(value.strip_prefix("-f").unwrap_or_default()));
             }
             _ if value.starts_with("-T") && value.len() > 2 => {
-                push_terminal_features(&mut prefix.terminal_features, &value[2..]);
+                push_terminal_features(
+                    &mut prefix.terminal_features,
+                    value.strip_prefix("-T").unwrap_or_default(),
+                );
             }
             _ if is_short_flag_cluster(value, "2CDNluv") => {
                 prefix.assume_256_colors |= value.contains('2');
@@ -222,13 +231,13 @@ fn set_format(
 
 impl DiagnoseReport {
     /// Gathers version, OS, terminal, shell, socket, and config facts with paths already redacted.
-    fn collect(invocation: &DiagnoseInvocation) -> Result<Self, ExitFailure> {
+    fn collect(invocation: DiagnoseInvocation) -> Result<Self, ExitFailure> {
         let socket_path = resolve_socket_path(
             invocation.socket_name.as_deref(),
             invocation.socket_path.as_deref(),
         )
-        .map_err(ExitFailure::from_client)?;
-        let mut terminal_features = invocation.terminal_features.clone();
+        .map_err(ExitFailure::from)?;
+        let mut terminal_features = invocation.terminal_features;
         if invocation.assume_256_colors {
             push_unique(&mut terminal_features, "256".to_owned());
         }
@@ -236,10 +245,11 @@ impl DiagnoseReport {
         let term = env_value("TERM");
         let term_program = env_value("TERM_PROGRAM");
         let terminal_host = detect_terminal_host(&term, &term_program);
-        let config_paths = if invocation.config_files.is_empty() {
-            default_config_paths()
+        let custom_config_files = !invocation.config_files.is_empty();
+        let config_paths = if custom_config_files {
+            invocation.config_files
         } else {
-            invocation.config_files.clone()
+            default_config_paths()
         };
         let config_paths = config_paths
             .iter()
@@ -261,10 +271,10 @@ impl DiagnoseReport {
             term,
             term_program,
             shell: detected_shell(),
-            config_mode: if invocation.config_files.is_empty() {
-                "default".to_owned()
-            } else {
+            config_mode: if custom_config_files {
                 "custom".to_owned()
+            } else {
+                "default".to_owned()
             },
             config_paths,
             config_messages,
@@ -279,34 +289,35 @@ impl DiagnoseReport {
     fn render_human(&self) -> String {
         let mut output = String::new();
         output.push_str("rmux diagnose\n");
-        output.push_str(&format!("version: {}\n", self.version));
-        output.push_str(&format!("os: {} ({})\n", self.os_name, self.os_arch));
-        output.push_str(&format!("os_version: {}\n", self.os_version));
-        output.push_str(&format!("terminal_host: {}\n", self.terminal_host));
-        output.push_str(&format!("term: {}\n", self.term));
-        output.push_str(&format!("term_program: {}\n", self.term_program));
-        output.push_str(&format!("shell: {}\n", self.shell));
-        output.push_str(&format!("socket_path: {}\n", self.socket_path));
-        output.push_str(&format!("config_mode: {}\n", self.config_mode));
+        let _ = writeln!(output, "version: {}", self.version);
+        let _ = writeln!(output, "os: {} ({})", self.os_name, self.os_arch);
+        let _ = writeln!(output, "os_version: {}", self.os_version);
+        let _ = writeln!(output, "terminal_host: {}", self.terminal_host);
+        let _ = writeln!(output, "term: {}", self.term);
+        let _ = writeln!(output, "term_program: {}", self.term_program);
+        let _ = writeln!(output, "shell: {}", self.shell);
+        let _ = writeln!(output, "socket_path: {}", self.socket_path);
+        let _ = writeln!(output, "config_mode: {}", self.config_mode);
         output.push_str("config_paths:\n");
         for path in &self.config_paths {
-            output.push_str(&format!("  - {path}\n"));
+            let _ = writeln!(output, "  - {path}");
         }
         output.push_str("config_messages:\n");
         if self.config_messages.is_empty() {
             output.push_str("  - none\n");
         } else {
             for message in &self.config_messages {
-                output.push_str(&format!("  - {message}\n"));
+                let _ = writeln!(output, "  - {message}");
             }
         }
         output.push_str("capabilities:\n");
-        output.push_str(&format!("  conpty: {}\n", self.conpty));
-        output.push_str(&format!("  osc52: {}\n", self.osc52));
-        output.push_str(&format!(
-            "  terminal_features: {}\n",
+        let _ = writeln!(output, "  conpty: {}", self.conpty);
+        let _ = writeln!(output, "  osc52: {}", self.osc52);
+        let _ = writeln!(
+            output,
+            "  terminal_features: {}",
             render_feature_list(&self.terminal_features)
-        ));
+        );
         output.push_str("privacy: environment values are summarized or redacted\n");
         output
     }
@@ -362,7 +373,7 @@ fn collect_config_messages(socket_path: &Path) -> Vec<String> {
         .collect()
 }
 
-/// Keeps a `show-messages` line if it reports a config problem, redacting it against the real homes.
+/// Keeps a `show-messages` line if it reports a config problem, redacted against real homes.
 fn config_message_from_show_messages_line(line: &str) -> Option<String> {
     config_message_from_show_messages_line_against(line, &home_prefixes())
 }
@@ -372,10 +383,7 @@ fn config_message_from_show_messages_line_against(
     line: &str,
     homes: &[PathBuf],
 ) -> Option<String> {
-    let message = line
-        .split_once(": ")
-        .map(|(_, message)| message)
-        .unwrap_or(line);
+    let message = line.split_once(": ").map_or(line, |(_, message)| message);
     if !is_config_diagnostic_message(message) {
         return None;
     }
@@ -395,21 +403,22 @@ fn is_config_diagnostic_message(message: &str) -> bool {
 /// Reports whether a message looks like `path:line: detail` naming a known config parse failure.
 fn source_location_config_diagnostic(message: &str) -> bool {
     for (colon_index, _) in message.match_indices(':') {
-        let after_colon = &message[colon_index + 1..];
-        let digits_len = after_colon
-            .chars()
-            .take_while(|ch| ch.is_ascii_digit())
-            .map(char::len_utf8)
-            .sum::<usize>();
-        if digits_len == 0 || !after_colon[digits_len..].starts_with(':') {
+        let (Some(path), Some(after_colon)) =
+            (message.get(..colon_index), message.get(colon_index + 1..))
+        else {
+            continue;
+        };
+        let after_digits = after_colon.trim_start_matches(|ch: char| ch.is_ascii_digit());
+        if after_digits.len() == after_colon.len() {
             continue;
         }
-        let path = &message[..colon_index];
+        let Some(detail) = after_digits.strip_prefix(':') else {
+            continue;
+        };
         if path.trim().is_empty() {
             continue;
         }
-        let detail = after_colon[digits_len + 1..].trim_start();
-        if source_location_config_detail(detail) {
+        if source_location_config_detail(detail.trim_start()) {
             return true;
         }
     }
@@ -449,7 +458,7 @@ fn truncate_diagnose_line(line: &str, max_bytes: usize) -> String {
     while end > 0 && !line.is_char_boundary(end) {
         end -= 1;
     }
-    format!("{}...", &line[..end])
+    format!("{}...", line.get(..end).unwrap_or_default())
 }
 
 /// Splits a comma-separated `-T` value and appends each distinct feature name.
@@ -478,7 +487,7 @@ fn env_value(name: &str) -> String {
         .unwrap_or_else(|| "unset".to_owned())
 }
 
-/// Names the enclosing terminal emulator, preferring Windows Terminal, then `TERM_PROGRAM`, then `TERM`.
+/// Names the enclosing terminal emulator: Windows Terminal, then `TERM_PROGRAM`, then `TERM`.
 fn detect_terminal_host(term: &str, term_program: &str) -> String {
     if std::env::var_os("WT_SESSION").is_some() {
         return "windows-terminal".to_owned();
@@ -533,7 +542,7 @@ fn command_output(program: &str, args: &[&str]) -> String {
 }
 
 /// Whether the platform offers a `ConPTY` backend.
-fn conpty_status() -> &'static str {
+const fn conpty_status() -> &'static str {
     #[cfg(windows)]
     {
         "available"
@@ -601,7 +610,7 @@ fn unix_default_config_paths() -> Vec<PathBuf> {
     paths
 }
 
-/// The Windows config lookup order across `XDG_CONFIG_HOME`, `USERPROFILE`, `APPDATA`, and `RMUX_CONFIG_FILE`.
+/// Windows config lookup order: `XDG_CONFIG_HOME`, `USERPROFILE`, `APPDATA`, `RMUX_CONFIG_FILE`.
 #[cfg(windows)]
 fn windows_default_config_paths() -> Vec<PathBuf> {
     let mut paths = Vec::new();
@@ -694,7 +703,7 @@ fn json_array(values: &[String]) -> String {
     output
 }
 
-/// Encodes a string as a JSON string literal, escaping quotes, backslashes, and control characters.
+/// Encodes a string as a JSON literal, escaping quotes, backslashes, and control characters.
 fn json_string(value: &str) -> String {
     let mut output = String::from("\"");
     for ch in value.chars() {
@@ -705,7 +714,7 @@ fn json_string(value: &str) -> String {
             '\r' => output.push_str("\\r"),
             '\t' => output.push_str("\\t"),
             ch if ch.is_control() => {
-                output.push_str(&format!("\\u{:04x}", ch as u32));
+                let _ = write!(output, "\\u{:04x}", ch as u32);
             }
             ch => output.push(ch),
         }
@@ -724,5 +733,6 @@ fn write_stdout(output: &str) -> Result<i32, ExitFailure> {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 #[path = "diagnose_tests.rs"]
 mod tests;

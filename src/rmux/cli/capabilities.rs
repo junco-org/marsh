@@ -1,4 +1,5 @@
 use std::ffi::OsString;
+use std::fmt::Write as _;
 use std::io::{self, ErrorKind, Write};
 
 use rmux_core::formats::TMUX_FORMAT_TABLE_NAMES;
@@ -141,16 +142,14 @@ fn set_format(
 fn render_human() -> String {
     let mut output = String::new();
     output.push_str("rmux capabilities\n");
-    output.push_str(&format!("version: {}\n", rmux_server::VERSION));
-    output.push_str(&format!(
-        "binary_contract_version: {BINARY_CONTRACT_VERSION}\n"
-    ));
-    output.push_str(&format!("wire_version: {RMUX_WIRE_VERSION}\n"));
+    let _ = writeln!(output, "version: {}", rmux_server::VERSION);
+    let _ = writeln!(output, "binary_contract_version: {BINARY_CONTRACT_VERSION}");
+    let _ = writeln!(output, "wire_version: {RMUX_WIRE_VERSION}");
     output.push_str("public_contract:\n");
     output.push_str("  - cli\n  - json-output\n  - format-tokens\n  - control-mode\n");
     output.push_str("json_commands:\n");
     for command in JSON_COMMANDS {
-        output.push_str(&format!("  - {command}\n"));
+        let _ = writeln!(output, "  - {command}");
     }
     output
 }
@@ -245,6 +244,7 @@ fn write_stdout(output: &str) -> Result<i32, ExitFailure> {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 mod tests {
     use super::{compiled_protocol_capabilities, parse_invocation, CapabilitiesFormat};
     use rmux_proto::CAPABILITY_WEB_SHARE;

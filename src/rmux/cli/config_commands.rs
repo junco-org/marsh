@@ -55,7 +55,7 @@ pub(crate) fn run_set_option(
                 format_target: request.format_target,
             },
         )))
-        .map_err(ExitFailure::from_client)?;
+        .map_err(ExitFailure::from)?;
     match response {
         response if quiet && quiet_option_response(&response) => Ok(0),
         response => {
@@ -86,7 +86,7 @@ pub(crate) fn run_set_environment(
         let scope = resolve_environment_scope(connection, args.global, args.target)?;
         connection
             .set_environment(scope, args.name, value, mode, args.hidden, args.format)
-            .map_err(ExitFailure::from_client)
+            .map_err(ExitFailure::from)
     })
 }
 
@@ -147,10 +147,10 @@ fn show_options_exit_failure(error: ClientError) -> ExitFailure {
             if option_lookup_error(&normalized) {
                 ExitFailure::new(1, normalized)
             } else {
-                ExitFailure::from_client(ClientError::Protocol(RmuxError::Server(message)))
+                ExitFailure::from(ClientError::Protocol(RmuxError::Server(message)))
             }
         }
-        error => ExitFailure::from_client(error),
+        error => ExitFailure::from(error),
     }
 }
 
@@ -202,7 +202,7 @@ pub(crate) fn run_show_environment(
         let scope = resolve_environment_scope(connection, args.global, args.target)?;
         connection
             .show_environment(scope, args.name, args.hidden, args.shell_format)
-            .map_err(ExitFailure::from_client)
+            .map_err(ExitFailure::from)
     })
 }
 
@@ -229,7 +229,7 @@ fn resolve_set_environment_mode(
 ) -> Result<Option<SetEnvironmentMode>, ExitFailure> {
     let mode = match (args.clear, args.unset) {
         (true, false) => Some(SetEnvironmentMode::Clear),
-        (false, true) | (true, true) => Some(SetEnvironmentMode::Unset),
+        (false | true, true) => Some(SetEnvironmentMode::Unset),
         (false, false) => Some(SetEnvironmentMode::Set),
     };
 
@@ -248,6 +248,7 @@ fn resolve_set_environment_mode(
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 mod tests {
     use super::{
         options::{
@@ -303,6 +304,10 @@ mod tests {
         }
     }
 
+    #[allow(
+        clippy::panic_in_result_fn,
+        reason = "a test helper has nothing to recover to when the resolution shape is wrong"
+    )]
     fn resolve_set_option_args(
         command: SetOptionCommandKind,
         args: SetOptionArgs,
@@ -584,9 +589,7 @@ mod tests {
 
         let resolved = resolve_set_option_args(
             SetOptionCommandKind::SetWindowOption,
-            SetOptionArgs {
-                ..global_set_args("history-limit", "1234")
-            },
+            global_set_args("history-limit", "1234"),
         )
         .expect("set-window-option -g session option resolves");
 
@@ -867,9 +870,8 @@ mod tests {
                 value: Some("value".to_owned()),
             },
         );
-        let error = match result {
-            Ok(_) => panic!("unknown option should fail"),
-            Err(error) => error,
+        let Err(error) = result else {
+            panic!("unknown option should fail")
         };
 
         assert_eq!(error.message(), "invalid option: nonexistent");

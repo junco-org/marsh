@@ -52,7 +52,7 @@ impl StableWaitTarget {
                 false,
                 false,
             )
-            .map_err(ExitFailure::from_client)?;
+            .map_err(ExitFailure::from)?;
         let session_name = match response {
             Response::ResolveTarget(response) => match response.target {
                 Target::Session(session_name) => session_name,
@@ -194,7 +194,7 @@ fn pane_identity_for_slot(
             Some(target.window_index()),
             Some("#{pane_index}\t#{pane-base-index}\t#{pane_id}\t#{session_id}\n".to_owned()),
         )
-        .map_err(ExitFailure::from_client)?;
+        .map_err(ExitFailure::from)?;
     let output = match response {
         Response::ListPanes(response) => response.output,
         Response::Error(error) => {
@@ -244,7 +244,7 @@ fn query_process_state(
                 target.pane_id,
             )),
         )
-        .map_err(ExitFailure::from_client)?;
+        .map_err(ExitFailure::from)?;
     let output = match response {
         Response::ListPanes(response) => response.output,
         Response::Error(_) => return Ok(ProcessLookup::TargetUnavailable),
@@ -296,7 +296,7 @@ fn parse_i32_field(value: Option<&str>) -> Option<i32> {
 }
 
 /// The human-readable kind word for a resolved `Target`.
-fn target_kind_name(target: &Target) -> &'static str {
+const fn target_kind_name(target: &Target) -> &'static str {
     match target {
         Target::Session(_) => "session",
         Target::Window(_) => "window",

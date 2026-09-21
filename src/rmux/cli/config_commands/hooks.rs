@@ -49,7 +49,7 @@ pub(crate) fn run_set_hook(args: SetHookArgs, socket_path: &Path) -> Result<i32,
                 run_immediately,
                 hook.index,
             )
-            .map_err(ExitFailure::from_client)
+            .map_err(ExitFailure::from)
     })
 }
 
@@ -68,7 +68,7 @@ pub(crate) fn run_show_hooks(args: ShowHooksArgs, socket_path: &Path) -> Result<
         }
         connection
             .show_hooks(scope, window, pane, hook)
-            .map_err(ExitFailure::from_client)
+            .map_err(ExitFailure::from)
     })
 }
 
@@ -328,7 +328,7 @@ fn resolve_active_window_index(
             session_name.clone(),
             Some("#{window_index}:#{window_active}".to_owned()),
         )
-        .map_err(ExitFailure::from_client)?;
+        .map_err(ExitFailure::from)?;
     let output = expect_command_output(&response, "list-windows")?;
     let stdout = String::from_utf8_lossy(output.stdout());
     for line in stdout.lines() {
@@ -360,7 +360,7 @@ fn resolve_active_pane_index(
             Some(window_index),
             Some("#{pane_index}:#{pane_active}".to_owned()),
         )
-        .map_err(ExitFailure::from_client)?;
+        .map_err(ExitFailure::from)?;
     let output = expect_command_output(&response, "list-panes")?;
     let stdout = String::from_utf8_lossy(output.stdout());
     for line in stdout.lines() {

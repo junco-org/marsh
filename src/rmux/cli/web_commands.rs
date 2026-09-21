@@ -39,7 +39,7 @@ pub(super) fn run_web_share(
         Ok(response) => response,
         Err(error) => {
             rollback_auto_web_share_session(&mut connection, built.auto_session.as_ref());
-            return Err(ExitFailure::from_client(error));
+            return Err(ExitFailure::from(error));
         }
     };
     if let Response::WebShare(response) = &response {
@@ -74,7 +74,7 @@ struct BuiltWebShareRequest {
 
 impl BuiltWebShareRequest {
     /// Wraps a request over pre-existing state, so there is nothing to roll back.
-    fn existing(request: WebShareRequest) -> Self {
+    const fn existing(request: WebShareRequest) -> Self {
         Self {
             request,
             auto_session: None,
@@ -213,7 +213,7 @@ fn build_web_share_request(
 }
 
 /// Reports whether the local terminal palette should be sampled for the web theme.
-fn should_capture_terminal_palette(
+const fn should_capture_terminal_palette(
     terminal_theme: Option<WebTerminalTheme>,
     stdout_is_terminal: bool,
 ) -> bool {
@@ -330,7 +330,7 @@ fn create_detached_web_share_session(
         let session_name = auto_web_share_session_name(seed, attempt)?;
         let response = connection
             .new_session(session_name, true, None)
-            .map_err(ExitFailure::from_client)?;
+            .map_err(ExitFailure::from)?;
         match response {
             Response::NewSession(created) => return Ok(created.session_name),
             Response::Error(ErrorResponse { error }) if session_already_exists(&error) => {}
@@ -350,7 +350,13 @@ fn create_detached_web_share_session(
 fn auto_web_share_session_seed() -> u64 {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos() as u64)
+        .map(|duration| {
+            // The seed only needs the low 64 bits of the nanosecond clock.
+            duration
+                .as_secs()
+                .wrapping_mul(1_000_000_000)
+                .wrapping_add(u64::from(duration.subsec_nanos()))
+        })
         .unwrap_or_default();
     nanos ^ u64::from(std::process::id()).rotate_left(17)
 }
@@ -449,6 +455,7 @@ fn parse_expires_at(value: Option<&str>) -> Result<Option<u64>, ExitFailure> {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 mod tests {
     use rmux_proto::WebTerminalTheme;
 

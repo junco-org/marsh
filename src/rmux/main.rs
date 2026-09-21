@@ -29,7 +29,7 @@ mod server_runtime;
 mod tmux_error_surface;
 
 use std::env;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::io::{self, ErrorKind, Write};
 use std::path::PathBuf;
 
@@ -141,28 +141,21 @@ fn parse_internal_daemon_args<I>(mut args: I) -> Result<InternalDaemonArgs, Stri
 where
     I: Iterator<Item = OsString>,
 {
-    let mut socket_path = None;
-    let mut config_selection = ServerConfigFileSelection::Disabled;
-    let mut config_quiet = false;
-    let mut config_cwd = None;
-    let mut web_frontend = None;
-    let mut web_port = None;
-    let mut startup_ready_fd = None;
+    let mut parsed = InternalDaemonArgs {
+        socket_path: None,
+        config_selection: ServerConfigFileSelection::Disabled,
+        config_quiet: false,
+        config_cwd: None,
+        web_frontend: None,
+        web_port: None,
+        startup_ready_fd: None,
+    };
 
     if let Some(first) = args.next() {
         if os_string::os_str_bytes(first.as_os_str()).starts_with(b"--") {
-            parse_internal_flag(
-                first,
-                &mut args,
-                &mut config_selection,
-                &mut config_quiet,
-                &mut config_cwd,
-                &mut web_frontend,
-                &mut web_port,
-                &mut startup_ready_fd,
-            )?;
+            parse_internal_flag(first.as_os_str(), &mut args, &mut parsed)?;
         } else {
-            socket_path = Some(PathBuf::from(first));
+            parsed.socket_path = Some(PathBuf::from(first));
         }
     }
 
@@ -170,57 +163,36 @@ where
         if !os_string::os_str_bytes(argument.as_os_str()).starts_with(b"--") {
             return Err("unexpected extra arguments for hidden daemon mode".to_owned());
         }
-        parse_internal_flag(
-            argument,
-            &mut args,
-            &mut config_selection,
-            &mut config_quiet,
-            &mut config_cwd,
-            &mut web_frontend,
-            &mut web_port,
-            &mut startup_ready_fd,
-        )?;
+        parse_internal_flag(argument.as_os_str(), &mut args, &mut parsed)?;
     }
 
-    Ok(InternalDaemonArgs {
-        socket_path,
-        config_selection,
-        config_quiet,
-        config_cwd,
-        web_frontend,
-        web_port,
-        startup_ready_fd,
-    })
+    Ok(parsed)
 }
 
 /// Applies one internal daemon flag and its value to the accumulating argument state.
 fn parse_internal_flag<I>(
-    argument: OsString,
+    argument: &OsStr,
     args: &mut I,
-    config_selection: &mut ServerConfigFileSelection,
-    config_quiet: &mut bool,
-    config_cwd: &mut Option<PathBuf>,
-    web_frontend: &mut Option<String>,
-    web_port: &mut Option<u16>,
-    startup_ready_fd: &mut Option<i32>,
+    parsed: &mut InternalDaemonArgs,
 ) -> Result<(), String>
 where
     I: Iterator<Item = OsString>,
 {
     match argument.to_str() {
         Some("--config-default") => {
-            if !matches!(config_selection, ServerConfigFileSelection::Disabled) {
+            if !matches!(parsed.config_selection, ServerConfigFileSelection::Disabled) {
                 return Err("duplicate hidden daemon config selection".to_owned());
             }
-            *config_selection = ServerConfigFileSelection::Default;
+            parsed.config_selection = ServerConfigFileSelection::Default;
         }
         Some("--config-file") => {
             let file = args
                 .next()
                 .ok_or_else(|| "--config-file requires a path".to_owned())?;
-            match config_selection {
+            let selection = &mut parsed.config_selection;
+            match selection {
                 ServerConfigFileSelection::Disabled => {
-                    *config_selection = ServerConfigFileSelection::Files(vec![PathBuf::from(file)]);
+                    *selection = ServerConfigFileSelection::Files(vec![PathBuf::from(file)]);
                 }
                 ServerConfigFileSelection::Files(files) => files.push(PathBuf::from(file)),
                 ServerConfigFileSelection::Default => {
@@ -228,12 +200,12 @@ where
                 }
             }
         }
-        Some("--config-quiet") => *config_quiet = true,
+        Some("--config-quiet") => parsed.config_quiet = true,
         Some("--config-cwd") => {
             let cwd = args
                 .next()
                 .ok_or_else(|| "--config-cwd requires a path".to_owned())?;
-            *config_cwd = Some(PathBuf::from(cwd));
+            parsed.config_cwd = Some(PathBuf::from(cwd));
         }
         Some("--web-port") => {
             let port = args
@@ -247,7 +219,7 @@ where
             if port == 0 {
                 return Err("--web-port must be between 1 and 65535".to_owned());
             }
-            *web_port = Some(port);
+            parsed.web_port = Some(port);
         }
         Some("--frontend-url" | "--web-frontend") => {
             let frontend = args
@@ -256,7 +228,7 @@ where
             let frontend = frontend
                 .to_str()
                 .ok_or_else(|| "invalid UTF-8 in --frontend-url".to_owned())?;
-            *web_frontend = Some(frontend.to_owned());
+            parsed.web_frontend = Some(frontend.to_owned());
         }
         Some("--startup-ready-fd") => {
             let fd = args
@@ -270,7 +242,7 @@ where
             if fd < 0 {
                 return Err("--startup-ready-fd requires a non-negative file descriptor".to_owned());
             }
-            *startup_ready_fd = Some(fd);
+            parsed.startup_ready_fd = Some(fd);
         }
         Some(other) => {
             return Err(format!("unexpected hidden daemon argument '{other}'"));
@@ -315,6 +287,11 @@ fn run_hidden_daemon(args: InternalDaemonArgs) -> io::Result<()> {
 }
 
 /// Rejects web-share flags when the binary was built without the `web` feature.
+#[allow(
+    clippy::missing_const_for_fn,
+    clippy::unnecessary_wraps,
+    reason = "the non-`web` build returns a real error here; the signature must stay identical for both builds"
+)]
 fn reject_unsupported_web_args(args: &InternalDaemonArgs) -> io::Result<()> {
     #[cfg(not(feature = "web"))]
     if args.web_port.is_some() || args.web_frontend.is_some() {
@@ -333,6 +310,7 @@ fn reject_unsupported_web_args(args: &InternalDaemonArgs) -> io::Result<()> {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 mod tests {
     use super::{
         parse_internal_daemon_args, parse_internal_socket_path, try_main, write_exit_message_to,

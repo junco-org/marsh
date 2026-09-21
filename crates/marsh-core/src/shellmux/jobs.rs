@@ -627,6 +627,11 @@ impl ShellMux {
     /// nothing in it, with [`MuxError::InvalidTerminalSize`] for a zero dimension, and with
     /// whatever the snapshot, the streams or the shell reported. A failed construction closes
     /// every descriptor it opened and releases the name.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "admission happens under one acquisition of the table lock; splitting the body \
+                  would have to hand that guard across functions"
+    )]
     pub async fn spawn(
         self: &Arc<Self>,
         dir: &str,
@@ -709,7 +714,7 @@ impl ShellMux {
                 .snapshot_root()
                 .map_or_else(PathBuf::new, |root| root.join(sandbox.dir.as_str()));
             table.open.push(Job {
-                id: id.clone(),
+                id,
                 sandbox: sandbox.clone(),
                 executor,
                 io,
@@ -807,6 +812,11 @@ impl ShellMux {
     }
 
     /// Builds one job's streams and shell, publishes them, and starts its lifecycle task.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one job's streams, shell and lifecycle are built as a single ordered sequence; \
+                  splitting it would only scatter the cleanup obligations it carries"
+    )]
     async fn build_resources(
         self: &Arc<Self>,
         handle: &Spawned,
@@ -1157,9 +1167,7 @@ impl ShellMux {
                 // is what that command would have run in. Reclaiming it is therefore owed here,
                 // by the launch that decided the line never runs — exactly as `run_command` owes
                 // it after a line that did.
-                let completion = self
-                    .conclude_command(job, None, Ok(Outcome::Discarded))
-                    .await;
+                let completion = self.conclude_command(job, None, Ok(Outcome::Discarded));
                 let closed = self.job_table().take_closable(&job.inner.id);
                 if let Some(closed) = closed {
                     self.reclaim(closed, completion).await;
@@ -1183,7 +1191,7 @@ impl ShellMux {
 
     /// Reports a failed launch, and closes the job it opened.
     async fn report_launch_failure(self: &Arc<Self>, job: &Spawned, error: MuxError) {
-        self.conclude_command(job, None, Err(error)).await;
+        self.conclude_command(job, None, Err(error));
         let closed = {
             let mut table = self.job_table();
             if let Ok(row) = table.resolve_mut(job, self) {
@@ -1204,7 +1212,7 @@ impl ShellMux {
     /// text, its callback, its sandbox and its closure decision are captured *before* the running
     /// slot is released, so a second command admitted the instant afterwards cannot inherit any of
     /// them. Nothing is read back off the row later.
-    async fn conclude_command(
+    fn conclude_command(
         self: &Arc<Self>,
         job: &Spawned,
         exit_code: Option<i32>,
@@ -1459,7 +1467,7 @@ impl ShellMux {
                 // Before the row changes: a failed kill leaves the job as it was.
                 if let Some(active) = row.command.as_ref().filter(|active| active.running) {
                     kill_since(&row.executor, active.spawn_mark, &row.id)?;
-                    context = active.context.clone();
+                    context.clone_from(&active.context);
                 }
                 row.close = Some(JobCloseMode::Force);
             } else {
@@ -1736,7 +1744,7 @@ impl ShellMux {
     /// is closing, [`MuxError::JobNotReady`] before the terminal exists, [`MuxError::Shared`]
     /// when an earlier lease left the terminal in a mode it could not undo, and for a stale or
     /// foreign handle.
-    pub async fn idle_terminal(
+    pub fn idle_terminal(
         self: &Arc<Self>,
         job: &Spawned,
     ) -> Result<IdleTerminal, MuxError> {
@@ -1823,8 +1831,10 @@ impl ShellMux {
         drop(guard);
         Ok(match parsed {
             Ok(_) => true,
-            Err(brush_core::parser::ParseError::ParsingAtEndOfInput)
-            | Err(brush_core::parser::ParseError::Tokenizing { .. }) => false,
+            Err(
+                brush_core::parser::ParseError::ParsingAtEndOfInput
+                | brush_core::parser::ParseError::Tokenizing { .. },
+            ) => false,
             Err(_) => true,
         })
     }
@@ -1998,7 +2008,7 @@ async fn run_command(
         // would be writing into a snapshot the discard below is about to reset.
         context.finish().await;
 
-        outcome.and_then(|result| {
+        let concluded = outcome.and_then(|result| {
             let forced = {
                 let table = mux.job_table();
                 let forced = table
@@ -2013,7 +2023,9 @@ async fn run_command(
                 shell.conclude(&mut guard, &cmd)
             };
             boundary.map(|boundary| (result, boundary))
-        })
+        });
+        drop(guard);
+        concluded
     };
     // Before the table: the reclamation below may drop the row's resources, and a last
     // `Shell::drop` does blocking I/O, so this clone must not be the one that dies on an async
@@ -2030,7 +2042,7 @@ async fn run_command(
 
     // Also refresh the recorded working directory, so a view taken after this line reports where
     // the shell actually stands rather than where it started.
-    let completion = mux.conclude_command(&job, exit_code, outcome).await;
+    let completion = mux.conclude_command(&job, exit_code, outcome);
     let closed = mux.job_table().take_closable(job.id());
     if let Some(closed) = closed {
         mux.reclaim(closed, completion).await;
@@ -2533,6 +2545,10 @@ mod tests {
     ///
     /// The pump must not read the second chunk until the first chunk's receipt is completed, and
     /// it must resume immediately once it is.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one ordered receipt-backpressure scenario; splitting it would hide the ordering it asserts"
+    )]
     #[tokio::test]
     async fn a_withheld_receipt_stops_the_stream_it_belongs_to() {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2612,11 +2628,13 @@ mod tests {
 
         // One delivery, and then nothing: the receipt is still outstanding.
         let first = loop {
-            let mut held = receipts.lock().unwrap_or_else(PoisonError::into_inner);
-            if let Some(receipt) = held.pop() {
+            let popped = {
+                let mut held = receipts.lock().unwrap_or_else(PoisonError::into_inner);
+                held.pop()
+            };
+            if let Some(receipt) = popped {
                 break receipt;
             }
-            drop(held);
             tokio::task::yield_now().await;
         };
         write(b"second").join().expect("the second write completes");
@@ -2641,11 +2659,13 @@ mod tests {
         // Closing every writer ends the stream, which ends the pump.
         drop(writer);
         let second = loop {
-            let mut held = receipts.lock().unwrap_or_else(PoisonError::into_inner);
-            if let Some(receipt) = held.pop() {
+            let popped = {
+                let mut held = receipts.lock().unwrap_or_else(PoisonError::into_inner);
+                held.pop()
+            };
+            if let Some(receipt) = popped {
                 break receipt;
             }
-            drop(held);
             tokio::task::yield_now().await;
         };
         let _ = second.send(());

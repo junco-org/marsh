@@ -285,7 +285,7 @@ pub(crate) struct RotateWindowArgs {
 
 impl RotateWindowArgs {
     /// Rotation direction requested, defaulting to `Up` when `-D` was not given.
-    pub(crate) fn direction(&self) -> RotateWindowDirection {
+    pub(crate) const fn direction(&self) -> RotateWindowDirection {
         if self.down {
             RotateWindowDirection::Down
         } else {

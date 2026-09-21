@@ -69,6 +69,7 @@ fn invalid_utf8() -> clap::Error {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 mod tests {
     use std::ffi::OsString;
 

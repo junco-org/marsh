@@ -1,3 +1,4 @@
+use std::fmt::Write as _;
 use std::io::{self, ErrorKind, Write};
 
 use rmux_core::formats::is_truthy;
@@ -76,11 +77,11 @@ pub(super) fn list_sessions_json_format() -> String {
 
 /// Length-prefixed `list-windows` format string pairing each field's length with its value.
 pub(super) fn list_windows_json_format() -> String {
-    LIST_WINDOWS_JSON_FIELDS
-        .iter()
-        .map(|field| format!("#{{n:{0}}}:#{{{0}}}", field.name))
-        .collect::<Vec<_>>()
-        .join("")
+    let mut format = String::new();
+    for field in LIST_WINDOWS_JSON_FIELDS {
+        let _ = write!(format, "#{{n:{0}}}:#{{{0}}}", field.name);
+    }
+    format
 }
 
 /// Joins field placeholders with the unit separator and ends the row with the record separator.
@@ -463,6 +464,7 @@ fn write_json_value(value: &Value, command_name: &'static str) -> Result<i32, Ex
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 mod tests {
     use super::{
         list_sessions_json_format, list_windows_json_format, parse_delimited_rows,
@@ -513,6 +515,10 @@ mod tests {
         assert!(error.message().contains("expected 10 fields"));
     }
 
+    #[allow(
+        clippy::literal_string_with_formatting_args,
+        reason = "`#{n:session_name}` and friends are tmux format placeholders, not Rust format arguments"
+    )]
     #[test]
     fn list_windows_length_prefix_preserves_all_user_control_characters() {
         assert!(list_windows_json_format()

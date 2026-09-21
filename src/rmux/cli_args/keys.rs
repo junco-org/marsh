@@ -48,7 +48,7 @@ pub(crate) struct SendKeysArgs {
 
 impl SendKeysArgs {
     /// Whether any `--wait` condition was requested, so the client must synchronize after sending.
-    pub(crate) fn has_wait(&self) -> bool {
+    pub(crate) const fn has_wait(&self) -> bool {
         self.wait.is_some()
             || self.wait_text.is_some()
             || self.wait_visible_text.is_some()
@@ -159,8 +159,8 @@ pub(crate) struct ListKeysArgs {
 
 impl ListKeysArgs {
     /// Accepts the parsed arguments unchanged; `list-keys` has no cross-flag constraints.
-    pub(crate) fn validate(self) -> Result<Self, clap::Error> {
-        Ok(self)
+    pub(crate) const fn validate(self) -> Self {
+        self
     }
 }
 

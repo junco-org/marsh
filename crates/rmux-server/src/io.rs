@@ -1320,7 +1320,7 @@ impl ShellIo {
     ) -> IoResult<marsh_core::shellmux::IdleTerminal> {
         let mux = self.service.admit()?;
         let spawned = self.owned(job)?.clone();
-        self.dispatch(async move { Ok(mux.idle_terminal(&spawned).await?) })
+        self.dispatch(async move { Ok(mux.idle_terminal(&spawned)?) })
             .await
     }
 

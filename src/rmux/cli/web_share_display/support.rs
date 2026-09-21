@@ -127,16 +127,14 @@ pub(super) fn frontend_label(created: &WebShareCreatedResponse) -> String {
         .as_deref()
         .or(created.operator_url.as_deref())
         .and_then(host_from_url)
-        .map(str::to_owned)
-        .unwrap_or_else(|| "share.rmux.io".to_owned())
+        .map_or_else(|| "share.rmux.io".to_owned(), str::to_owned)
 }
 
 /// Share expiry as an `RFC 3339` timestamp, or `no expiry` when unbounded.
 pub(super) fn expiry_label(created: &WebShareCreatedResponse) -> String {
     created
         .expires_at_unix
-        .map(format_unix_rfc3339)
-        .unwrap_or_else(|| "no expiry".to_owned())
+        .map_or_else(|| "no expiry".to_owned(), format_unix_rfc3339)
 }
 
 /// Pluralized participant-limit phrase for `role`, such as `limit: 2 spectators`.

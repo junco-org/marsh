@@ -23,6 +23,7 @@ mod qr;
 #[path = "web_share_display/support.rs"]
 mod support;
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 #[path = "web_share_display/tests.rs"]
 mod tests;
 
@@ -191,7 +192,11 @@ fn side_by_side_width(
         .iter()
         .map(|card| card_min_width(card.url, link_mode, qr_mode))
         .sum::<u16>()
-        .saturating_add(cards.len().saturating_sub(1) as u16 * 2)
+        .saturating_add(
+            u16::try_from(cards.len().saturating_sub(1))
+                .unwrap_or(u16::MAX)
+                .saturating_mul(2),
+        )
 }
 
 /// Narrowest card that still fits its QR code and URL label for the given modes.
@@ -208,7 +213,7 @@ fn card_min_width(url: &str, link_mode: LinkMode, qr_mode: qr::RenderMode) -> u1
         LinkMode::Osc8 => 2,
         LinkMode::PlainUrl => 6,
     };
-    qr_width.max(url_width).saturating_add(padding) as u16
+    u16::try_from(qr_width.max(url_width).saturating_add(padding)).unwrap_or(u16::MAX)
 }
 
 /// Whether every card's QR code fits inside `width` after the outer border.
@@ -321,7 +326,10 @@ fn render_cards(
             .map(|card| Constraint::Length(card_height(card, qr_mode)))
             .collect()
     } else {
-        vec![Constraint::Percentage(100 / cards.len() as u16); cards.len()]
+        vec![
+            Constraint::Percentage(100 / u16::try_from(cards.len()).unwrap_or(u16::MAX));
+            cards.len()
+        ]
     };
     let chunks = Layout::default()
         .direction(if stack {
@@ -474,7 +482,7 @@ fn plain_url_capacity(width: u16, cards: &[ShareCard<'_>], link_mode: LinkMode) 
     let card_width = if should_stack_cards(content_width, cards, link_mode) {
         content_width
     } else {
-        content_width / cards.len() as u16
+        content_width / u16::try_from(cards.len()).unwrap_or(u16::MAX)
     };
     Some(card_width.saturating_sub(6) as usize)
 }
@@ -565,7 +573,7 @@ fn pin_line(code: &str) -> Line<'static> {
 }
 
 /// ANSI foreground escape for the palette colors used by these cards.
-pub(super) fn ansi_fg(color: Color) -> &'static str {
+pub(super) const fn ansi_fg(color: Color) -> &'static str {
     match color {
         Color::Black => "\x1b[30m",
         Color::White => "\x1b[37m",
@@ -582,7 +590,7 @@ pub(super) fn ansi_fg(color: Color) -> &'static str {
 }
 
 /// ANSI background escape for the palette colors used by these cards.
-pub(super) fn ansi_bg(color: Color) -> &'static str {
+pub(super) const fn ansi_bg(color: Color) -> &'static str {
     match color {
         Color::Black => "\x1b[40m",
         Color::White => "\x1b[47m",

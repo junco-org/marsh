@@ -205,17 +205,13 @@ pub(super) fn rewrite_target(raw: &str) -> String {
 /// `new-session -s claude-swarm` is the case that matters: the shim creates the teammate
 /// session by exact name rather than by resolving a target.
 pub(super) fn rewrite_session_name(session_name: SessionName) -> SessionName {
-    ACTIVE.with(|active| {
-        active.borrow().as_ref().map_or_else(
-            || session_name.clone(),
-            |namespace| {
-                namespace
-                    .rewrite_component(session_name.as_str())
-                    .cloned()
-                    .unwrap_or_else(|| session_name.clone())
-            },
-        )
-    })
+    ACTIVE
+        .with(|active| {
+            active.borrow().as_ref().and_then(|namespace| {
+                namespace.rewrite_component(session_name.as_str()).cloned()
+            })
+        })
+        .unwrap_or(session_name)
 }
 
 /// Rewrites one target string against an active namespace.
@@ -236,6 +232,7 @@ fn rewrite_with(namespace: &ClaudeNamespace, raw: &str) -> String {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 mod tests {
     use std::path::PathBuf;
 

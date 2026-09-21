@@ -59,9 +59,11 @@ mod imp {
 
     /// Builds the `OSC` query string for foreground, background, cursor, and the 16 `ANSI` slots.
     fn query_bytes() -> String {
+        use std::fmt::Write as _;
+
         let mut query = String::from("\x1b]10;?\x1b\\\x1b]11;?\x1b\\\x1b]12;?\x1b\\");
         for index in 0..16 {
-            query.push_str(&format!("\x1b]4;{index};?\x1b\\"));
+            let _ = write!(query, "\x1b]4;{index};?\x1b\\");
         }
         query
     }
@@ -119,7 +121,7 @@ mod imp {
         }
         let raw = u16::from_str_radix(value, 16).ok()?;
         let max = (1u32 << (digits * 4)) - 1;
-        Some(((u32::from(raw) * 255 + (max / 2)) / max) as u8)
+        u8::try_from((u32::from(raw) * 255 + (max / 2)) / max).ok()
     }
 
     /// Waits up to `timeout` for `fd` to become readable.
@@ -129,10 +131,13 @@ mod imp {
             events: libc::POLLIN,
             revents: 0,
         };
-        let timeout_ms = timeout.as_millis().min(i32::MAX as u128) as libc::c_int;
+        let timeout_ms = libc::c_int::try_from(timeout.as_millis()).unwrap_or(libc::c_int::MAX);
         // SAFETY: `pollfd` points to a valid single-entry array for the duration of the call,
         // and `fd` is an open terminal descriptor owned by the caller.
-        unsafe { libc::poll(&mut pollfd, 1, timeout_ms) > 0 && pollfd.revents & libc::POLLIN != 0 }
+        unsafe {
+            libc::poll(std::ptr::from_mut(&mut pollfd), 1, timeout_ms) > 0
+                && pollfd.revents & libc::POLLIN != 0
+        }
     }
 
     /// Appends everything currently readable from `tty` to `bytes`, returning `false` on error.
@@ -199,7 +204,7 @@ mod imp {
             let mut original = unsafe { std::mem::zeroed::<libc::termios>() };
             // SAFETY: `original` is a valid writable termios buffer and `fd` is expected to be
             // an open terminal descriptor.
-            if unsafe { libc::tcgetattr(fd, &mut original) } != 0 {
+            if unsafe { libc::tcgetattr(fd, std::ptr::from_mut(&mut original)) } != 0 {
                 return None;
             }
             let mut raw = original;
@@ -208,7 +213,7 @@ mod imp {
             raw.c_cc[libc::VTIME] = 0;
             // SAFETY: `raw` was derived from a termios value returned by `tcgetattr` for this
             // descriptor, with only documented local-mode/control-byte fields adjusted.
-            if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &raw) } != 0 {
+            if unsafe { libc::tcsetattr(fd, libc::TCSANOW, std::ptr::from_ref(&raw)) } != 0 {
                 return None;
             }
             Some(Self { fd, original })
@@ -220,11 +225,14 @@ mod imp {
         fn drop(&mut self) {
             // SAFETY: `original` was captured from this descriptor by `tcgetattr`; restoring it
             // is best-effort and the return value is intentionally ignored during drop.
-            let _ = unsafe { libc::tcsetattr(self.fd, libc::TCSANOW, &self.original) };
+            let _ = unsafe {
+                libc::tcsetattr(self.fd, libc::TCSANOW, std::ptr::from_ref(&self.original))
+            };
         }
     }
 
     #[cfg(test)]
+    #[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
     mod tests {
         use super::*;
         use std::fs::File;
@@ -233,12 +241,14 @@ mod imp {
         use std::thread;
 
         fn palette_reply() -> String {
+            use std::fmt::Write as _;
+
             let mut input = "\x1b]10;rgb:eeee/eeee/eeee\x1b\\\
                          \x1b]11;rgb:3333/4444/5555\x1b\\\
                          \x1b]12;rgb:ffff/0000/0000\x1b\\"
                 .to_owned();
             for index in 0..16 {
-                input.push_str(&format!("\x1b]4;{index};rgb:{index:04x}/0000/ffff\x1b\\"));
+                let _ = write!(input, "\x1b]4;{index};rgb:{index:04x}/0000/ffff\x1b\\");
             }
             input
         }
@@ -284,8 +294,8 @@ mod imp {
             // arguments request libc defaults, and success initializes both descriptors.
             let result = unsafe {
                 libc::openpty(
-                    &mut master,
-                    &mut slave,
+                    std::ptr::from_mut(&mut master),
+                    std::ptr::from_mut(&mut slave),
                     std::ptr::null_mut(),
                     std::ptr::null_mut(),
                     std::ptr::null_mut(),
@@ -297,9 +307,13 @@ mod imp {
                 "openpty failed: {}",
                 std::io::Error::last_os_error()
             );
-            // SAFETY: `openpty` returned success, so both raw file descriptors are initialized
-            // and ownership is transferred exactly once into `File`.
-            unsafe { (File::from_raw_fd(master), File::from_raw_fd(slave)) }
+            // SAFETY: `openpty` returned success, so the master descriptor is initialized and
+            // its ownership is transferred exactly once into `File`.
+            let master = unsafe { File::from_raw_fd(master) };
+            // SAFETY: `openpty` returned success, so the slave descriptor is initialized and
+            // its ownership is transferred exactly once into `File`.
+            let slave = unsafe { File::from_raw_fd(slave) };
+            (master, slave)
         }
     }
 }
@@ -382,6 +396,7 @@ mod imp {
     }
 
     #[cfg(test)]
+    #[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
     mod tests {
         use super::*;
 

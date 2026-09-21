@@ -62,7 +62,7 @@ where
     F: FnOnce(&mut Connection) -> Result<Response, ClientError>,
 {
     let response = with_command_connection(socket_path, |connection| {
-        send(connection).map_err(ExitFailure::from_client)
+        send(connection).map_err(ExitFailure::from)
     })?;
     finish_command_success(response, command_name)
 }
@@ -73,7 +73,9 @@ pub(crate) fn cli_target_actions_enabled() -> bool {
 }
 
 /// Whether the server rejected the target-aware request and the untargeted form must be retried.
-pub(crate) fn target_action_needs_legacy_retry(response: &Result<Response, ClientError>) -> bool {
+pub(crate) const fn target_action_needs_legacy_retry(
+    response: &Result<Response, ClientError>,
+) -> bool {
     matches!(
         response,
         Ok(Response::Error(error)) if matches!(error.error, RmuxError::Decode(_))
@@ -81,7 +83,7 @@ pub(crate) fn target_action_needs_legacy_retry(response: &Result<Response, Clien
 }
 
 /// Like `target_action_needs_legacy_retry`, but also retries a capture that hit an unexpected EOF.
-pub(crate) fn capture_target_action_needs_legacy_retry(
+pub(crate) const fn capture_target_action_needs_legacy_retry(
     response: &Result<Response, ClientError>,
 ) -> bool {
     target_action_needs_legacy_retry(response)
@@ -98,7 +100,7 @@ where
     F: FnOnce(&mut Connection) -> Result<Response, ClientError>,
 {
     let response = with_command_connection(socket_path, |connection| {
-        send(connection).map_err(ExitFailure::from_client)
+        send(connection).map_err(ExitFailure::from)
     })?;
     let output = expect_command_output(&response, command_name)?;
     write_command_output(output)?;
@@ -215,7 +217,7 @@ fn list_windows_all_server_command_response(
             None,
             Some(payload),
         )
-        .map_err(ExitFailure::from_client)
+        .map_err(ExitFailure::from)
 }
 
 /// Queues `queue_command`, using the canonical execution path when the server expands commands.
@@ -226,7 +228,7 @@ fn queued_server_command_response(
 ) -> Result<Response, ExitFailure> {
     let source_path = if connection
         .supports_capability(CAPABILITY_CLI_RUNTIME_COMMAND_EXPANSION)
-        .map_err(ExitFailure::from_client)?
+        .map_err(ExitFailure::from)?
     {
         INTERNAL_CANONICAL_COMMAND_EXECUTION_PATH
     } else {
@@ -242,7 +244,7 @@ fn queued_server_command_response(
             target,
             Some(queue_command),
         )
-        .map_err(ExitFailure::from_client)
+        .map_err(ExitFailure::from)
 }
 
 /// Turns a queued command's response into an exit code, preferring its reported failure status.
@@ -311,43 +313,36 @@ fn with_command_connection<F, R>(socket_path: &Path, run: F) -> Result<R, ExitFa
 where
     F: FnOnce(&mut Connection) -> Result<R, ExitFailure>,
 {
-    if command_connection_cache_matches(socket_path) {
-        return COMMAND_CONNECTION_CACHE.with(|cache| {
-            let mut cache = cache.borrow_mut();
-            let cache = cache
-                .as_mut()
-                .expect("cache must exist after positive match");
-            if cache.connection.is_none() {
-                cache.connection = Some(
-                    connect(socket_path)
-                        .map_err(|error| ExitFailure::from_client_connect(socket_path, error))?,
-                );
-            }
-            let connection = cache
-                .connection
-                .as_mut()
-                .expect("connection must exist after initialization");
-            let result = run(connection);
-            if result.is_err() {
-                cache.connection = None;
-            }
-            result
-        });
-    }
+    let run = match COMMAND_CONNECTION_CACHE.with(|cache| {
+        let mut slot = cache.borrow_mut();
+        let Some(entry) = slot
+            .as_mut()
+            .filter(|entry| entry.socket_path == socket_path)
+        else {
+            return Err(run);
+        };
+        let mut connection = match entry.connection.take() {
+            Some(connection) => connection,
+            None => match connect(socket_path) {
+                Ok(connection) => connection,
+                Err(error) => {
+                    return Ok(Err(ExitFailure::from_client_connect(socket_path, error)));
+                }
+            },
+        };
+        let result = run(&mut connection);
+        if result.is_ok() {
+            entry.connection = Some(connection);
+        }
+        Ok(result)
+    }) {
+        Ok(result) => return result,
+        Err(run) => run,
+    };
 
     let mut connection = connect(socket_path)
         .map_err(|error| ExitFailure::from_client_connect(socket_path, error))?;
     run(&mut connection)
-}
-
-/// Whether a command connection cache is installed for exactly `socket_path`.
-fn command_connection_cache_matches(socket_path: &Path) -> bool {
-    COMMAND_CONNECTION_CACHE.with(|cache| {
-        cache
-            .borrow()
-            .as_ref()
-            .is_some_and(|cache| cache.socket_path == socket_path)
-    })
 }
 
 /// Resolves the pane this process was launched inside, when the environment names a live one.
@@ -360,7 +355,7 @@ pub(crate) fn inherited_pane_target(
     };
     let response = connection
         .resolve_target(Some(pane_id), ResolveTargetType::Pane, false, false)
-        .map_err(ExitFailure::from_client)?;
+        .map_err(ExitFailure::from)?;
     match response {
         Response::ResolveTarget(response) => match response.target {
             Target::Pane(target) => Ok(Some(target)),
@@ -468,6 +463,7 @@ pub(super) fn write_lines_output(lines: &[String]) -> Result<i32, ExitFailure> {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 mod tests {
     use rmux_client::ClientError;
     use rmux_proto::{ErrorResponse, Response, RmuxError};

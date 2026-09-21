@@ -22,7 +22,7 @@ const FIND_PANES_RECORD_SEPARATOR: char = '\u{1e}';
 const FIND_PANES_FORMAT: &str = "#{session_name}\u{1f}#{window_index}\u{1f}#{pane_index}\u{1f}#{pane_id}\u{1f}#{pane_title}\u{1f}#{pane_current_command}\u{1f}#{pane_current_path}\u{1e}";
 
 /// Runs `locator`, printing every `get-by-text` match in the target pane's visible snapshot.
-pub(crate) fn run_locator(args: LocatorArgs, socket_path: &Path) -> Result<i32, ExitFailure> {
+pub(crate) fn run_locator(args: &LocatorArgs, socket_path: &Path) -> Result<i32, ExitFailure> {
     let mut connection = connect_cli(socket_path)?;
     let target = resolve_pane_ref(&mut connection, args.target.as_ref(), "locator")?;
     let snapshot = pane_snapshot(&mut connection, target)?;
@@ -49,7 +49,7 @@ pub(crate) fn run_locator(args: LocatorArgs, socket_path: &Path) -> Result<i32, 
 
 /// Runs `expect-pane`, asserting visible, hidden, or exact-count `get-by-text` matches.
 pub(crate) fn run_expect_pane(
-    args: ExpectPaneArgs,
+    args: &ExpectPaneArgs,
     socket_path: &Path,
 ) -> Result<i32, ExitFailure> {
     let mut connection = connect_cli(socket_path)?;
@@ -97,14 +97,14 @@ pub(crate) fn run_expect_pane(
 }
 
 /// Runs `find-panes`, listing panes across all sessions filtered by title, command, and cwd.
-pub(crate) fn run_find_panes(args: FindPanesArgs, socket_path: &Path) -> Result<i32, ExitFailure> {
+pub(crate) fn run_find_panes(args: &FindPanesArgs, socket_path: &Path) -> Result<i32, ExitFailure> {
     let mut connection = connect_cli(socket_path)?;
     let sessions = list_session_names(&mut connection)?;
     let mut panes = Vec::new();
     for session_name in sessions {
         let response = connection
             .list_panes_in_window(session_name, None, Some(FIND_PANES_FORMAT.to_owned()))
-            .map_err(ExitFailure::from_client)?;
+            .map_err(ExitFailure::from)?;
         let Response::ListPanes(response) = response else {
             continue;
         };
@@ -114,7 +114,7 @@ pub(crate) fn run_find_panes(args: FindPanesArgs, socket_path: &Path) -> Result<
                 .filter_map(parse_pane_row),
         );
     }
-    panes.retain(|pane| pane_matches(pane, &args));
+    panes.retain(|pane| pane_matches(pane, args));
     if args.json {
         return write_json(&json!({
             "schema_version": SCHEMA_VERSION,
@@ -161,7 +161,7 @@ pub(crate) fn run_find_panes(args: FindPanesArgs, socket_path: &Path) -> Result<
 
 /// Runs `find-sessions`, listing session names filtered by exact name or name prefix.
 pub(crate) fn run_find_sessions(
-    args: FindSessionsArgs,
+    args: &FindSessionsArgs,
     socket_path: &Path,
 ) -> Result<i32, ExitFailure> {
     let mut connection = connect_cli(socket_path)?;
@@ -216,7 +216,7 @@ pub(crate) fn run_broadcast_keys(
             keys: args.keys,
             literal: args.literal,
         })
-        .map_err(ExitFailure::from_client)?
+        .map_err(ExitFailure::from)?
     {
         Response::PaneBroadcastInput(response) if response.failures.is_empty() => Ok(0),
         Response::PaneBroadcastInput(response) => Err(ExitFailure::new(
@@ -292,6 +292,7 @@ fn pane_matches(pane: &PaneRow, args: &FindPanesArgs) -> bool {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 mod tests {
     use super::*;
 

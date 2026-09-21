@@ -3,7 +3,7 @@
 //! Two invocation families — `rmux -c <shell-command>` and `rmux claude` — historically
 //! resolved a host shell (or `claude` itself) and `exec`'d it in the invoking process. Neither
 //! ever reached a policy gate, which made them the two ungated workload entrypoints in an
-//! otherwise gated multiplexer. Both now run as an ordinary one-shot ShellMux pane on the
+//! otherwise gated multiplexer. Both now run as an ordinary one-shot `ShellMux` pane on the
 //! **existing** daemon, created in a private session this invocation owns and destroys.
 //!
 //! # These modes have PTY semantics, not Unix-pipe semantics
@@ -77,7 +77,7 @@ const OWNED_SESSION_PREFIX: &str = "marsh-io-";
 const SWARM_SESSION_SUFFIX: &str = "-swarm";
 
 /// How long the teammate monitor waits for the companion session to appear.
-const VIEWER_WAIT_TIMEOUT: Duration = Duration::from_secs(600);
+const VIEWER_WAIT_TIMEOUT: Duration = Duration::from_mins(10);
 
 /// How often the teammate monitor and the attach exit observer re-check the daemon.
 const VIEWER_POLL_INTERVAL: Duration = Duration::from_millis(300);
@@ -188,6 +188,8 @@ impl ManagedPaneIdentity {
 
 /// Reads 128 bits of OS randomness as lowercase hex.
 fn random_hex_128() -> Result<String, ExitFailure> {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+
     let mut bytes = [0u8; 16];
     // The OS generator through `getrandom`, not `/dev/urandom` directly. Opening that path is a
     // unix assumption in code that has no other one: every managed `rmux -c` and every Claude
@@ -199,7 +201,6 @@ fn random_hex_128() -> Result<String, ExitFailure> {
         ExitFailure::new(1, format!("rmux: failed to read OS randomness: {error}"))
     })?;
 
-    const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut output = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
         output.push(HEX[(byte >> 4) as usize] as char);
@@ -347,7 +348,7 @@ fn arm_owned_pane(
             client_environment: None,
             skip_environment_update: true,
         })
-        .map_err(ExitFailure::from_client)?;
+        .map_err(ExitFailure::from)?;
     expect_command_success(response, "new-session")?;
 
     let slot = PaneTarget::with_window(identity.main.clone(), 0, 0);
@@ -451,7 +452,7 @@ fn wait_for(
 ) -> Result<(), ExitFailure> {
     let response = connection
         .wait_for(channel.to_owned(), mode)
-        .map_err(ExitFailure::from_client)?;
+        .map_err(ExitFailure::from)?;
     expect_command_success(response, "wait-for")
 }
 
@@ -467,7 +468,7 @@ fn set_remain_on_exit(connection: &mut Connection, slot: &PaneTarget) -> Result<
             false,
             false,
         )
-        .map_err(ExitFailure::from_client)?;
+        .map_err(ExitFailure::from)?;
     expect_command_success(response, "set-option")
 }
 
@@ -636,7 +637,7 @@ fn shell_quote(value: &OsStr) -> Result<String, ExitFailure> {
 
 /// Attaches this process' terminal to the owned session.
 fn attach(endpoint: &Path, session: &SessionName) -> Result<i32, ExitFailure> {
-    let target = parse_target_spec(&session.to_string())
+    let target = parse_target_spec(session.as_str())
         .map_err(|error| ExitFailure::new(1, format!("rmux: invalid managed session: {error}")))?;
     let args = AttachSessionArgs {
         working_directory: None,
@@ -782,7 +783,7 @@ fn show_teammate_window(
             false,
             false,
         )
-        .map_err(ExitFailure::from_client)?;
+        .map_err(ExitFailure::from)?;
     let linked = match response {
         Response::LinkWindow(response) => response.target,
         other => {
@@ -796,7 +797,7 @@ fn show_teammate_window(
 
     let response = connection
         .select_window(linked)
-        .map_err(ExitFailure::from_client)?;
+        .map_err(ExitFailure::from)?;
     expect_command_success(response, "select-window")
 }
 
@@ -841,15 +842,15 @@ async fn arm_output(
 ) -> Result<ArmedOutput, ExitFailure> {
     let rmux = rmux_sdk::Rmux::connect(rmux_sdk::RmuxEndpoint::UnixSocket(endpoint.to_path_buf()))
         .await
-        .map_err(sdk_failure)?;
+        .map_err(|error| sdk_failure(&error))?;
     let pane = rmux
         .pane_by_id(session, pane_id)
         .await
-        .map_err(sdk_failure)?;
+        .map_err(|error| sdk_failure(&error))?;
     let stream = pane
         .output_stream_starting_at(rmux_sdk::PaneOutputStart::Oldest)
         .await
-        .map_err(sdk_failure)?;
+        .map_err(|error| sdk_failure(&error))?;
     Ok(ArmedOutput {
         _rmux: rmux,
         stream,
@@ -857,7 +858,7 @@ async fn arm_output(
 }
 
 /// Converts an SDK failure into this CLI's exit failure.
-fn sdk_failure(error: rmux_sdk::RmuxError) -> ExitFailure {
+fn sdk_failure(error: &rmux_sdk::RmuxError) -> ExitFailure {
     ExitFailure::new(1, format!("rmux: managed output failed: {error}"))
 }
 
@@ -1019,7 +1020,7 @@ async fn drain_to_end(
     progress: &mut OutputProgress,
 ) -> Result<(), ExitFailure> {
     loop {
-        match stream.next().await.map_err(sdk_failure)? {
+        match stream.next().await.map_err(|error| sdk_failure(&error))? {
             Some(chunk) => {
                 consume_chunk(chunk, progress)?;
                 if progress.saw_end {
@@ -1052,7 +1053,11 @@ async fn pump_output(
             drain_to_end(&mut armed.stream, &mut progress).await?;
             break Some(status);
         }
-        let chunks = armed.stream.poll_once().await.map_err(sdk_failure)?;
+        let chunks = armed
+            .stream
+            .poll_once()
+            .await
+            .map_err(|error| sdk_failure(&error))?;
         progress.saw_output = !chunks.is_empty();
         for chunk in chunks {
             consume_chunk(chunk, &mut progress)?;
@@ -1131,6 +1136,9 @@ fn start_stdin_forwarder(endpoint: &Path, pane_id: rmux_proto::PaneId) {
                 return;
             }
         }
+        // Nothing reads stdin after the loop, so release the process-wide lock before the
+        // final round trip instead of holding it for the thread's lifetime.
+        drop(stdin);
         if let Ok(target) = resolve_pane_target_spec(&mut connection, &pane_spec) {
             let _ = send_terminal_eof(&mut connection, target);
         }
@@ -1160,7 +1168,7 @@ fn send_bytes(
             reset_terminal: false,
             repeat_count: None,
         })
-        .map_err(ExitFailure::from_client)?;
+        .map_err(ExitFailure::from)?;
     expect_command_success(response, "send-keys")
 }
 
@@ -1184,6 +1192,6 @@ fn send_terminal_eof(connection: &mut Connection, target: PaneTarget) -> Result<
             reset_terminal: false,
             repeat_count: None,
         })
-        .map_err(ExitFailure::from_client)?;
+        .map_err(ExitFailure::from)?;
     expect_command_success(response, "send-keys")
 }

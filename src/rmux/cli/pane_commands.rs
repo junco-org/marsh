@@ -52,7 +52,7 @@ pub(super) fn run_last_pane(args: LastPaneArgs, socket_path: &Path) -> Result<i3
         };
         connection
             .last_pane_with_options(target, args.keep_zoom, input_disabled)
-            .map_err(ExitFailure::from_client)
+            .map_err(ExitFailure::from)
     })
 }
 
@@ -68,7 +68,7 @@ pub(super) fn run_pipe_pane(args: PipePaneArgs, socket_path: &Path) -> Result<i3
         let target = resolve_pane_target_or_current(connection, args.target.as_ref(), "pipe-pane")?;
         connection
             .pipe_pane(target, args.stdin, stdout, args.once, command)
-            .map_err(ExitFailure::from_client)
+            .map_err(ExitFailure::from)
     })
 }
 
@@ -89,7 +89,7 @@ pub(super) fn run_respawn_pane(
                 command: (!args.command.is_empty()).then_some(args.command),
                 process_command: None,
             })
-            .map_err(ExitFailure::from_client)
+            .map_err(ExitFailure::from)
     })
 }
 
@@ -141,7 +141,7 @@ pub(super) fn run_list_panes(args: ListPanesArgs, socket_path: &Path) -> Result<
                 args.sort_order.clone(),
                 args.reversed,
             )
-            .map_err(ExitFailure::from_client)?;
+            .map_err(ExitFailure::from)?;
         let output = expect_command_output(&response, "list-panes")?;
         if json {
             let filtered;
@@ -169,7 +169,7 @@ pub(super) fn run_list_panes(args: ListPanesArgs, socket_path: &Path) -> Result<
 }
 
 /// Picks the default `list-panes` line format for the requested listing scope.
-fn list_panes_default_format(all_sessions: bool, session_scope: bool) -> &'static str {
+const fn list_panes_default_format(all_sessions: bool, session_scope: bool) -> &'static str {
     if all_sessions {
         DEFAULT_LIST_PANES_ALL_FORMAT
     } else if session_scope {
@@ -186,9 +186,10 @@ fn list_panes_server_format(
     default_format: &'static str,
 ) -> String {
     let line_format = format.unwrap_or(default_format);
-    filter
-        .map(|filter| format!("{filter}{LIST_PANES_FILTER_SEPARATOR}{line_format}"))
-        .unwrap_or_else(|| line_format.to_owned())
+    filter.map_or_else(
+        || line_format.to_owned(),
+        |filter| format!("{filter}{LIST_PANES_FILTER_SEPARATOR}{line_format}"),
+    )
 }
 
 /// Splits a filtered `list-panes` line, keeping its rendered text only when the filter matched.
@@ -248,7 +249,7 @@ fn resolve_active_window_index(
             session_name.clone(),
             Some("#{window_index}:#{window_active}".to_owned()),
         )
-        .map_err(ExitFailure::from_client)?;
+        .map_err(ExitFailure::from)?;
     let output = expect_command_output(&response, "list-windows")?;
     let stdout = String::from_utf8_lossy(output.stdout());
     let active_line = stdout
@@ -294,7 +295,7 @@ pub(super) fn run_select_pane(
                 Some(args.disable_input),
                 keep_zoom,
             )
-            .map_err(ExitFailure::from_client)?;
+            .map_err(ExitFailure::from)?;
         expect_command_success(response, "select-pane")?;
         return Ok(0);
     }
@@ -305,7 +306,7 @@ pub(super) fn run_select_pane(
             resolve_window_target_or_current(&mut connection, args.target.as_ref(), "select-pane")?;
         let response = connection
             .last_pane_with_zoom(target, keep_zoom)
-            .map_err(ExitFailure::from_client)?;
+            .map_err(ExitFailure::from)?;
         expect_command_success(response, "last-pane")?;
         return Ok(0);
     }
@@ -319,7 +320,7 @@ pub(super) fn run_select_pane(
             };
             connection
                 .select_pane_adjacent_with_zoom(target, direction, keep_zoom)
-                .map_err(ExitFailure::from_client)
+                .map_err(ExitFailure::from)
         });
     }
 
@@ -334,7 +335,7 @@ pub(super) fn run_select_pane(
             };
             connection
                 .select_pane_with_options(target, title.clone(), style.clone(), None, keep_zoom)
-                .map_err(ExitFailure::from_client)
+                .map_err(ExitFailure::from)
         });
     }
 
@@ -346,21 +347,20 @@ pub(super) fn run_select_pane(
     };
     let response = connection
         .select_pane_mark_with_title(target, args.clear_marked, args.title)
-        .map_err(ExitFailure::from_client)?;
+        .map_err(ExitFailure::from)?;
     expect_command_success(response, "select-pane")?;
     Ok(0)
 }
 
 /// Runs `resize-pane`, preferring the server-resolved target action over the legacy request.
 pub(super) fn run_resize_pane(
-    args: ResizePaneArgs,
+    args: &ResizePaneArgs,
     socket_path: &Path,
 ) -> Result<i32, ExitFailure> {
-    if !cli_target_actions_enabled() || resize_pane_uses_percent(&args) {
+    if !cli_target_actions_enabled() || resize_pane_uses_percent(args) {
         return run_resize_pane_legacy(args, socket_path);
     }
 
-    let legacy_args = args.clone();
     let target = args.target.as_ref().map(|target| target.raw().to_owned());
     let adjustment = resize_pane_adjustment(args, None);
     let mut connection = connect(socket_path)
@@ -368,10 +368,10 @@ pub(super) fn run_resize_pane(
     let response =
         connection.resize_pane_target_action(ResizePaneTargetActionRequest { target, adjustment });
     if target_action_needs_legacy_retry(&response) {
-        return run_resize_pane_legacy(legacy_args, socket_path);
+        return run_resize_pane_legacy(args, socket_path);
     }
     response
-        .map_err(ExitFailure::from_client)
+        .map_err(ExitFailure::from)
         .and_then(|response| {
             expect_command_success(response, "resize-pane")?;
             Ok(0)
@@ -379,19 +379,19 @@ pub(super) fn run_resize_pane(
 }
 
 /// Resizes a pane after resolving its target locally, as older servers require.
-fn run_resize_pane_legacy(args: ResizePaneArgs, socket_path: &Path) -> Result<i32, ExitFailure> {
+fn run_resize_pane_legacy(args: &ResizePaneArgs, socket_path: &Path) -> Result<i32, ExitFailure> {
     let mut connection = connect(socket_path)
         .map_err(|error| ExitFailure::from_client_connect(socket_path, error))?;
     let target =
         resolve_pane_target_or_current(&mut connection, args.target.as_ref(), "resize-pane")?;
-    let window_size = resize_pane_uses_percent(&args)
+    let window_size = resize_pane_uses_percent(args)
         .then(|| resize_pane_window_size(&mut connection, &target))
         .transpose()?;
     let adjustment = resize_pane_adjustment(args, window_size);
 
     connection
         .resize_pane(target, adjustment)
-        .map_err(ExitFailure::from_client)
+        .map_err(ExitFailure::from)
         .and_then(|response| {
             expect_command_success(response, "resize-pane")?;
             Ok(0)
@@ -409,7 +409,7 @@ fn resize_pane_uses_percent(args: &ResizePaneArgs) -> bool {
 
 /// Turns the parsed `resize-pane` flags into the single adjustment the server understands.
 fn resize_pane_adjustment(
-    args: ResizePaneArgs,
+    args: &ResizePaneArgs,
     window_size: Option<(u16, u16)>,
 ) -> ResizePaneAdjustment {
     if args.trim_below {
@@ -420,10 +420,10 @@ fn resize_pane_adjustment(
     }
     let columns = args
         .columns
-        .and_then(|size| size.resolve(window_size.map_or(0, |(width, _)| width)));
+        .map(|size| size.resolve(window_size.map_or(0, |(width, _)| width)));
     let rows = args
         .rows
-        .and_then(|size| size.resolve(window_size.map_or(0, |(_, height)| height)));
+        .map(|size| size.resolve(window_size.map_or(0, |(_, height)| height)));
     let relative = if let Some(cells) = args.left {
         Some((ResizePaneRelativeDirection::Left, cells))
     } else if let Some(cells) = args.right {
@@ -473,7 +473,7 @@ fn resize_pane_window_size(
             Some(target.window_index()),
             Some("#{pane_index}\t#{pane-base-index}\t#{window_width}\t#{window_height}".to_owned()),
         )
-        .map_err(ExitFailure::from_client)?;
+        .map_err(ExitFailure::from)?;
     let output = expect_command_output(&response, "list-panes")?;
     let stdout = String::from_utf8_lossy(output.stdout());
     let (width, height) = stdout

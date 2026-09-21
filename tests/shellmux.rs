@@ -1981,7 +1981,6 @@ async fn a_prompt_leases_its_terminal_again_after_every_line() {
     let lease = fixture
         .mux()
         .idle_terminal(&job)
-        .await
         .expect("lease the idle terminal");
     assert!(!lease.is_revoked(), "a fresh lease starts live");
     drop(lease);
@@ -1991,7 +1990,6 @@ async fn a_prompt_leases_its_terminal_again_after_every_line() {
     let lease = fixture
         .mux()
         .idle_terminal(&job)
-        .await
         .expect("lease again after releasing without admitting a command");
     assert!(read_through(&fixture, &job, &lease, b"typed\n").await);
     drop(lease);
@@ -2006,7 +2004,6 @@ async fn a_prompt_leases_its_terminal_again_after_every_line() {
     let lease = fixture
         .mux()
         .idle_terminal(&job)
-        .await
         .expect("lease again after a command");
     assert!(
         !lease.is_revoked(),

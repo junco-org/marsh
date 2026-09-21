@@ -29,16 +29,14 @@ pub(super) fn run_send_keys(args: SendKeysArgs, socket_path: &Path) -> Result<i3
         return super::automation::run_send_keys_with_wait(args, socket_path);
     }
 
-    if send_keys_uses_legacy_path(&args) {
-        let target = args
-            .target
-            .clone()
-            .expect("legacy send-keys path requires explicit target");
+    if send_keys_uses_legacy_path(&args)
+        && let Some(target) = args.target.clone()
+    {
         return run_command_resolved(socket_path, "send-keys", move |connection| {
             let target = resolve_pane_target_spec(connection, &target)?;
             connection
                 .send_keys(target, args.keys)
-                .map_err(ExitFailure::from_client)
+                .map_err(ExitFailure::from)
         });
     }
 
@@ -76,12 +74,12 @@ pub(super) fn run_send_keys(args: SendKeysArgs, socket_path: &Path) -> Result<i3
                 repeat_count: args.repeat_count,
             })
         };
-        response.map_err(ExitFailure::from_client)
+        response.map_err(ExitFailure::from)
     })
 }
 
 /// True when a targeted `send-keys` carries no extended flag and can use the plain request.
-fn send_keys_uses_legacy_path(args: &SendKeysArgs) -> bool {
+const fn send_keys_uses_legacy_path(args: &SendKeysArgs) -> bool {
     args.target.is_some()
         && args.client_target.is_none()
         && !args.expand_formats
@@ -134,21 +132,21 @@ pub(super) fn run_list_keys(args: ListKeysArgs, socket_path: &Path) -> Result<i3
         key: args.key,
     };
 
-    match connect_or_absent(socket_path).map_err(ExitFailure::from_client)? {
+    match connect_or_absent(socket_path).map_err(ExitFailure::from)? {
         ConnectResult::Connected(mut connection) => {
             let response = connection
                 .list_keys(request)
-                .map_err(ExitFailure::from_client)?;
+                .map_err(ExitFailure::from)?;
             let output = expect_command_output(&response, "list-keys")?;
             write_command_output(output)?;
             Ok(0)
         }
-        ConnectResult::Absent => run_default_list_keys(request, socket_path),
+        ConnectResult::Absent => run_default_list_keys(&request, socket_path),
     }
 }
 
 /// Renders `list-keys` from the default binding store when no server is reachable.
-fn run_default_list_keys(request: ListKeysRequest, socket_path: &Path) -> Result<i32, ExitFailure> {
+fn run_default_list_keys(request: &ListKeysRequest, socket_path: &Path) -> Result<i32, ExitFailure> {
     let sort_order = match request.sort_order.as_deref() {
         Some(value) => KeyBindingSortOrder::parse(value)
             .ok_or_else(|| ExitFailure::new(1, rmux_core::INVALID_SORT_ORDER))?,
@@ -170,7 +168,7 @@ fn run_default_list_keys(request: ListKeysRequest, socket_path: &Path) -> Result
             ));
         }
     }
-    let mut bindings = list_default_key_bindings(&store, &request, sort_order);
+    let mut bindings = list_default_key_bindings(&store, request, sort_order);
     if let Some(filter_key) = filter_key {
         if request.table_name.is_some() {
             write_command_output(&CommandOutput::from_stdout(Vec::new()))?;
@@ -189,7 +187,7 @@ fn run_default_list_keys(request: ListKeysRequest, socket_path: &Path) -> Result
 
     let output = render_default_list_keys_output(
         &bindings,
-        &request,
+        request,
         socket_path,
         render_metrics,
         notes_key_width,
@@ -365,7 +363,7 @@ fn command_output_from_lines(lines: &[String]) -> CommandOutput {
 }
 
 /// Renders a flag as the `1` or `0` text the format templates expect.
-fn bool_format(value: bool) -> &'static str {
+const fn bool_format(value: bool) -> &'static str {
     if value {
         "1"
     } else {
@@ -412,6 +410,6 @@ pub(super) fn run_send_prefix(
             .transpose()?;
         connection
             .send_prefix(target, args.secondary)
-            .map_err(ExitFailure::from_client)
+            .map_err(ExitFailure::from)
     })
 }

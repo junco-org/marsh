@@ -57,7 +57,9 @@ pub(super) fn buffer_to_ansi_string(
 /// Emits the `OSC 8` open sequence plus blue underlined styling when `link_mode` supports it.
 fn open_hyperlink(output: &mut String, href: &str, link_mode: LinkMode) {
     if link_mode.supports_osc8() {
-        output.push_str(&format!("\x1b]8;;{href}\x1b\\"));
+        output.push_str("\x1b]8;;");
+        output.push_str(href);
+        output.push_str("\x1b\\");
         output.push_str(ansi_fg(Color::Blue));
         output.push_str("\x1b[49m\x1b[4m");
     }
@@ -105,9 +107,11 @@ fn osc8_hyperlinks_for_line<'a>(line: &str, links: &'a [&'a str]) -> Vec<Hyperli
     let mut occupied = Vec::new();
     for (label, href) in unique_osc8_labels_for_line(line, links) {
         let mut search_from = 0usize;
-        while let Some(offset) = line[search_from..].find(&label) {
+        while let Some(offset) = line.get(search_from..).and_then(|rest| rest.find(&label)) {
             let start_byte = search_from + offset;
-            let start = line[..start_byte].chars().count();
+            let start = line
+                .get(..start_byte)
+                .map_or(0, |prefix| prefix.chars().count());
             let length = label.chars().count();
             let end = start + length;
             if !occupied
@@ -115,8 +119,8 @@ fn osc8_hyperlinks_for_line<'a>(line: &str, links: &'a [&'a str]) -> Vec<Hyperli
                 .any(|(known_start, known_end)| start < *known_end && end > *known_start)
             {
                 hyperlinks.push(Hyperlink {
-                    start: start as u16,
-                    end: end as u16,
+                    start: u16::try_from(start).unwrap_or(u16::MAX),
+                    end: u16::try_from(end).unwrap_or(u16::MAX),
                     href,
                 });
                 occupied.push((start, end));
@@ -171,10 +175,14 @@ fn plain_url_segments_for_line<'a>(line: &str, links: &'a [&'a str]) -> Vec<Hype
     let mut hyperlinks = Vec::new();
     for href in links.iter().copied() {
         let mut search_from = 0usize;
-        while let Some(offset) = line[search_from..].find(href) {
+        while let Some(offset) = line.get(search_from..).and_then(|rest| rest.find(href)) {
             let start_byte = search_from + offset;
-            let start = line[..start_byte].chars().count() as u16;
-            let length = href.chars().count() as u16;
+            let start = u16::try_from(
+                line.get(..start_byte)
+                    .map_or(0, |prefix| prefix.chars().count()),
+            )
+            .unwrap_or(u16::MAX);
+            let length = u16::try_from(href.chars().count()).unwrap_or(u16::MAX);
             hyperlinks.push(Hyperlink {
                 start,
                 end: start.saturating_add(length),
@@ -210,6 +218,7 @@ fn cell_is_meaningful(cell: &Cell) -> bool {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 mod tests {
     use ratatui::{buffer::Buffer, layout::Rect};
 
@@ -259,10 +268,10 @@ mod tests {
     }
 
     fn buffer_with_text(text: &str) -> Buffer {
-        let width = text.chars().count() as u16;
+        let width = u16::try_from(text.chars().count()).unwrap_or(u16::MAX);
         let mut buffer = Buffer::empty(Rect::new(0, 0, width, 1));
-        for (x, ch) in text.chars().enumerate() {
-            buffer[(x as u16, 0)].set_symbol(&ch.to_string());
+        for (x, ch) in (0u16..).zip(text.chars()) {
+            buffer[(x, 0)].set_symbol(&ch.to_string());
         }
         buffer
     }

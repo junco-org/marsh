@@ -158,7 +158,7 @@ fn respawn_window_accepts_directory_environment_and_command() {
         super::super::Command::RespawnWindow(args) => {
             assert!(args.kill);
             assert_eq!(args.environment, vec!["FOO=1".to_owned()]);
-            assert_eq!(target_text(&args.target), "alpha:1");
+            assert_eq!(target_text(args.target.as_ref()), "alpha:1");
             assert_eq!(args.start_directory, Some(PathBuf::from("/tmp/work")));
             assert_eq!(args.command, vec!["sleep".to_owned(), "30".to_owned()]);
         }
@@ -325,7 +325,7 @@ fn next_window_accepts_session_targets() {
 
     match cli.command.expect("parsed command") {
         super::super::Command::NextWindow(args) => {
-            assert_eq!(args.target.expect("target exists").to_string(), "alpha")
+            assert_eq!(args.target.expect("target exists").to_string(), "alpha");
         }
         _ => panic!("expected NextWindow command"),
     }

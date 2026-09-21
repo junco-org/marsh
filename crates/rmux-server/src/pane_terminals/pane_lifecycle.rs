@@ -611,15 +611,13 @@ impl HandlerState {
             terminal.terminate_in_background();
             return Err(error);
         }
-        if let Err(error) = self.terminals.insert_pane(
+        self.terminals.insert_pane(
             runtime_session_name.clone(),
             pane_id,
             window_index,
             pane_index,
             terminal,
-        ) {
-            return Err(error);
-        }
+        )?;
         if let Err(error) = self.reset_pane_output_with_sender(
             runtime_session_name,
             pane_id,

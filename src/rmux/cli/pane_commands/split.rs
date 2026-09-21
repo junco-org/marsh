@@ -71,7 +71,7 @@ pub(in crate::cli) fn run_split_window(
     if target_action_needs_legacy_retry(&response) {
         return run_split_window_legacy_with_stdin(legacy_args, socket_path, legacy_stdin_payload);
     }
-    let response = response.map_err(ExitFailure::from_client)?;
+    let response = response.map_err(ExitFailure::from)?;
     let pane = match response {
         Response::SplitWindow(response) => response.pane,
         Response::Error(ErrorResponse { error }) => {
@@ -87,7 +87,7 @@ pub(in crate::cli) fn run_split_window(
         print_target_format(
             &mut connection,
             "split-window",
-            rmux_proto::Target::Pane(pane.clone()),
+            rmux_proto::Target::Pane(pane),
             &print_format,
         )?;
     }
@@ -149,7 +149,7 @@ fn run_split_window_legacy_with_stdin(
     {
         connection
             .roundtrip(&Request::SplitWindowExt(Box::new(SplitWindowExtRequest {
-                target: target.clone(),
+                target,
                 direction,
                 before: args.before,
                 environment,
@@ -164,16 +164,16 @@ fn run_split_window_legacy_with_stdin(
                 full_size: args.full_size,
                 stdin_payload,
             })))
-            .map_err(ExitFailure::from_client)?
+            .map_err(ExitFailure::from)?
     } else {
         connection
             .roundtrip(&Request::SplitWindow(SplitWindowRequest {
-                target: target.clone(),
+                target,
                 direction,
                 before: args.before,
                 environment,
             }))
-            .map_err(ExitFailure::from_client)?
+            .map_err(ExitFailure::from)?
     };
     let pane = match response {
         Response::SplitWindow(response) => response.pane,
@@ -187,7 +187,7 @@ fn run_split_window_legacy_with_stdin(
         print_target_format(
             &mut connection,
             "split-window",
-            rmux_proto::Target::Pane(pane.clone()),
+            rmux_proto::Target::Pane(pane),
             &print_format,
         )?;
     }

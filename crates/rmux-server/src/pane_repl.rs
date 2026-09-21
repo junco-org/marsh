@@ -785,8 +785,7 @@ impl Prompt {
                 .io
                 .jobs()
                 .into_iter()
-                .filter(|view| matches!(view.io, JobIo::Terminal { .. }) && !view.closing)
-                .next_back()
+                .rfind(|view| matches!(view.io, JobIo::Terminal { .. }) && !view.closing)
             {
                 Some(view) => view.id,
                 None => return vec!["fg: no current job".to_owned()],

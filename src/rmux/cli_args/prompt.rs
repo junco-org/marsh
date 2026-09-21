@@ -37,13 +37,6 @@ pub(crate) struct PromptArgs {
     pub(crate) queue_command: String,
 }
 
-impl PromptArgs {
-    /// Accepts the parsed flags unchanged; `command-prompt` has no cross-flag conflicts to reject.
-    pub(crate) fn validate(self) -> Result<Self, clap::Error> {
-        Ok(self)
-    }
-}
-
 /// Arguments for `confirm-before`, which runs a command only after a yes/no client answer.
 #[derive(Debug, Clone, Args)]
 pub(crate) struct ConfirmBeforeArgs {

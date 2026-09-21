@@ -86,6 +86,7 @@ fn invalid_entry(message: impl fmt::Display) -> CommandAliasSnapshotError {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 mod tests {
     use super::{decode_command_alias_definitions, definition_matches_name};
 

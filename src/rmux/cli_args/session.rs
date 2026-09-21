@@ -180,13 +180,6 @@ pub(crate) struct ListSessionsArgs {
     pub(crate) reversed: bool,
 }
 
-impl ListSessionsArgs {
-    /// Accepts the parsed flags unchanged; `clap` already enforces the `-F`/`--json` conflict.
-    pub(crate) fn validate(self) -> Result<Self, clap::Error> {
-        Ok(self)
-    }
-}
-
 /// Parsed `rename-session` arguments: the session to rename and its new name.
 #[derive(Debug, Clone, Args)]
 pub(crate) struct RenameSessionArgs {

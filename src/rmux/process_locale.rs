@@ -127,6 +127,7 @@ fn setlocale(category: libc::c_int, locale: &str) -> bool {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 mod tests {
     use super::{initialize_locale, LocaleBackend};
     use std::cell::RefCell;

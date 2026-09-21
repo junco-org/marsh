@@ -9,8 +9,8 @@ fn parse_args(args: &[&str]) -> Result<super::Cli, clap::Error> {
     parse(full_args)
 }
 
-fn target_text(target: &Option<super::TargetSpec>) -> String {
-    target.as_ref().expect("target").to_string()
+fn target_text(target: Option<&super::TargetSpec>) -> String {
+    target.expect("target").to_string()
 }
 
 fn rendered_surface_entry(entry: &rmux_core::command_parser::CommandEntry) -> String {
@@ -29,7 +29,7 @@ fn help_dispatch_is_supported(name: &str) -> bool {
         .next()
         .unwrap_or_else(|| panic!("missing parsed command for {name}"));
 
-    match super::command_from_parsed(parsed) {
+    match super::command_from_parsed(&parsed) {
         Ok(super::Command::Unsupported(_)) => false,
         Ok(_) => true,
         Err(error) if error.kind() == clap::error::ErrorKind::DisplayHelp => true,
@@ -152,7 +152,7 @@ fn direct_cli_consumes_option_like_required_option_values() {
         panic!("expected list-windows command");
     };
     assert_eq!(args.format.as_deref(), Some("-tfoo"));
-    assert_eq!(target_text(&args.target), "beta");
+    assert_eq!(target_text(args.target.as_ref()), "beta");
 
     let cli = parse_args(&["list-panes", "-F", "--", "-t", "beta:0"])
         .expect("list-panes must consume a literal separator as its format");
@@ -160,7 +160,7 @@ fn direct_cli_consumes_option_like_required_option_values() {
         panic!("expected list-panes command");
     };
     assert_eq!(args.format.as_deref(), Some("--"));
-    assert_eq!(target_text(&args.target), "beta:0");
+    assert_eq!(target_text(args.target.as_ref()), "beta:0");
 
     let cli = parse_args(&["list-sessions", "-F", "-Q", "-r"])
         .expect("list-sessions must consume an unknown-looking format token");
@@ -184,8 +184,8 @@ fn direct_cli_consumes_option_like_required_option_values() {
         panic!("expected break-pane command");
     };
     assert_eq!(args.format.as_deref(), Some("-Q"));
-    assert_eq!(target_text(&args.source), "alpha:0.0");
-    assert_eq!(target_text(&args.target), "beta:0");
+    assert_eq!(target_text(args.source.as_ref()), "alpha:0.0");
+    assert_eq!(target_text(args.target.as_ref()), "beta:0");
 
     let error = parse_args(&["list-windows", "-Q"])
         .expect_err("an option-like token outside a value position must remain invalid");
@@ -200,7 +200,7 @@ fn direct_cli_keeps_optional_option_values_separate_from_following_flags() {
         panic!("expected resize-pane command");
     };
     assert_eq!(args.down, Some(1));
-    assert_eq!(target_text(&args.target), "beta:0.0");
+    assert_eq!(target_text(args.target.as_ref()), "beta:0.0");
 }
 
 #[test]

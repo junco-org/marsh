@@ -75,7 +75,7 @@ pub(super) fn run_new_session(
             client_environment: invoking_client_environment(),
             skip_environment_update: args.skip_environment_update,
         })
-        .map_err(ExitFailure::from_client)?;
+        .map_err(ExitFailure::from)?;
     let output = response.command_output().cloned();
     let (target, detached) = match response {
         Response::NewSession(response) => (response.session_name, response.detached),
@@ -141,7 +141,7 @@ fn reject_existing_session_before_attach_preflight(
     };
     let response = connection
         .has_session(session_name.clone())
-        .map_err(ExitFailure::from_client)?;
+        .map_err(ExitFailure::from)?;
     match response {
         Response::HasSession(response) if response.exists => Err(ExitFailure::new(
             1,
@@ -266,7 +266,7 @@ fn windows_client_shell_for_parent_name(
 
 /// Non-Windows builds forward no client environment to the daemon.
 #[cfg(not(windows))]
-fn invoking_client_environment() -> Option<Vec<String>> {
+const fn invoking_client_environment() -> Option<Vec<String>> {
     None
 }
 
@@ -277,16 +277,15 @@ fn current_working_directory() -> Option<PathBuf> {
 
 /// Runs `has-session`, exiting nonzero with tmux's message when the target is absent.
 pub(super) fn run_has_session(
-    args: SessionTargetArgs,
+    args: &SessionTargetArgs,
     socket_path: &Path,
 ) -> Result<i32, ExitFailure> {
     let mut connection = connect(socket_path)
         .map_err(|error| ExitFailure::from_client_connect(socket_path, error))?;
-    let missing_message = args
-        .target
-        .as_ref()
-        .map(|target| format!("can't find session: {target}"))
-        .unwrap_or_else(|| "can't find session".to_owned());
+    let missing_message = args.target.as_ref().map_or_else(
+        || "can't find session".to_owned(),
+        |target| format!("can't find session: {target}"),
+    );
     let target = match args.target.as_ref() {
         Some(target) => resolve_session_target_spec(&mut connection, target, false)
             .map_err(|error| map_has_session_lookup_error(error, target.raw()))?,
@@ -294,7 +293,7 @@ pub(super) fn run_has_session(
     };
     let response = connection
         .has_session(target)
-        .map_err(ExitFailure::from_client)?;
+        .map_err(ExitFailure::from)?;
 
     match response {
         Response::HasSession(response) => {
@@ -319,7 +318,7 @@ fn map_has_session_lookup_error(error: ExitFailure, raw_target: &str) -> ExitFai
 
 /// Runs `kill-session` against the resolved target, or the current session.
 pub(super) fn run_kill_session(
-    args: KillSessionArgs,
+    args: &KillSessionArgs,
     socket_path: &Path,
 ) -> Result<i32, ExitFailure> {
     let mut connection = connect(socket_path)
@@ -334,7 +333,7 @@ pub(super) fn run_kill_session(
             clear_alerts: args.clear_alerts,
             kill_group: args.kill_group,
         })
-        .map_err(ExitFailure::from_client)?;
+        .map_err(ExitFailure::from)?;
     expect_command_success(response, "kill-session")?;
     Ok(0)
 }
@@ -365,7 +364,7 @@ pub(super) fn run_rename_session(
             resolve_session_target_or_current(connection, args.target.as_ref(), "rename-session")?;
         connection
             .rename_session(target, args.new_name)
-            .map_err(ExitFailure::from_client)
+            .map_err(ExitFailure::from)
     })
 }
 
@@ -384,7 +383,7 @@ pub(super) fn run_list_sessions(
                 sort_order: args.sort_order,
                 reversed: args.reversed,
             })
-            .map_err(ExitFailure::from_client)?;
+            .map_err(ExitFailure::from)?;
         let output = super::expect_command_output(&response, "list-sessions")?;
         return write_list_sessions_json(output);
     }
@@ -400,6 +399,7 @@ pub(super) fn run_list_sessions(
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 mod tests {
     #[cfg(windows)]
     use std::ffi::OsString;

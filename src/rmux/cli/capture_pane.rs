@@ -136,14 +136,14 @@ pub(super) fn send_capture_pane_request(
         let request = build_capture_pane_request(connection, request)?;
         return connection
             .capture_pane(request)
-            .map_err(ExitFailure::from_client);
+            .map_err(ExitFailure::from);
     }
 
     let legacy_request = request.clone();
     let response =
         connection.capture_pane_target_action(build_capture_pane_target_action_request(request));
     if !capture_target_action_needs_legacy_retry(&response) {
-        return response.map_err(ExitFailure::from_client);
+        return response.map_err(ExitFailure::from);
     }
 
     let mut legacy_connection = connect(socket_path)
@@ -151,7 +151,7 @@ pub(super) fn send_capture_pane_request(
     let request = build_capture_pane_request(&mut legacy_connection, legacy_request)?;
     legacy_connection
         .capture_pane(request)
-        .map_err(ExitFailure::from_client)
+        .map_err(ExitFailure::from)
 }
 
 /// Parses an `-S`/`-E` bound, where `-` means the absolute history edge rather than a number.

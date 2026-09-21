@@ -21,7 +21,7 @@ const LINE_BUFFER_MAX: usize = 1_048_576;
 
 /// Runs `stream-pane`, forwarding a pane's live output to stdout as raw bytes or whole lines.
 pub(crate) fn run_stream_pane(
-    args: StreamPaneArgs,
+    args: &StreamPaneArgs,
     socket_path: &Path,
 ) -> Result<i32, ExitFailure> {
     check_disabled("RMUX_DISABLE_STREAM_PANE", "stream-pane")?;
@@ -134,7 +134,7 @@ fn write_lag_snapshot_seed(
 
 /// Runs `collect-pane-output`, accumulating a pane's output until both EOF and process exit.
 pub(crate) fn run_collect_pane_output(
-    args: CollectPaneOutputArgs,
+    args: &CollectPaneOutputArgs,
     socket_path: &Path,
 ) -> Result<i32, ExitFailure> {
     check_disabled("RMUX_DISABLE_STREAM_PANE", "collect-pane-output")?;
@@ -152,7 +152,7 @@ pub(crate) fn run_collect_pane_output(
     let mut pane_exit = None;
     let mut saw_eof = false;
     let mut missed_events = 0_u64;
-    loop {
+    let pane_exit = loop {
         let batch = poll_output(&mut connection, subscription_id, "collect-pane-output")?;
         saw_eof |= batch.saw_eof;
         if let Some(lag) = batch.lag {
@@ -176,13 +176,14 @@ pub(crate) fn run_collect_pane_output(
                 pane_exit = Some(value);
             }
         }
-        if saw_eof && pane_exit.is_some() {
-            break;
+        if saw_eof {
+            if let Some(value) = pane_exit.take() {
+                break value;
+            }
         }
         sleep_poll_interval();
-    }
+    };
     let _ = connection.unsubscribe_pane_output(subscription_id);
-    let pane_exit = pane_exit.expect("pane exit is observed before collect-pane-output breaks");
     if missed_events > 0 {
         if args.json {
             return write_json(&json!({
@@ -239,7 +240,7 @@ pub(super) fn subscribe(
 ) -> Result<PaneOutputSubscriptionId, ExitFailure> {
     match connection
         .subscribe_pane_output_ref(target, start)
-        .map_err(ExitFailure::from_client)?
+        .map_err(ExitFailure::from)?
     {
         Response::SubscribePaneOutput(response) => Ok(response.subscription_id),
         Response::Error(error) => Err(ExitFailure::new(
@@ -283,7 +284,7 @@ fn poll_output_inner(
 ) -> Result<OutputBatch, ExitFailure> {
     match connection
         .pane_output_cursor(subscription_id, Some(CURSOR_BATCH_EVENTS))
-        .map_err(ExitFailure::from_client)?
+        .map_err(ExitFailure::from)?
     {
         Response::PaneOutputCursor(response) => {
             let mut saw_eof = false;
@@ -419,6 +420,7 @@ where
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 mod tests {
     use super::{flush_line_buffer_into, split_lines_bounded, LINE_BUFFER_MAX};
 

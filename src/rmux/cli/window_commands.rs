@@ -63,7 +63,7 @@ pub(super) fn run_link_window(
                 args.kill_target,
                 args.detached,
             )
-            .map_err(ExitFailure::from_client)
+            .map_err(ExitFailure::from)
     })
 }
 
@@ -175,9 +175,8 @@ fn resolve_bare_session_window_destination(
     if !link_target_is_bare_session_candidate(target.raw()) {
         return Ok(None);
     }
-    let session_name = match resolve_session_target_spec(connection, target, false) {
-        Ok(session_name) => session_name,
-        Err(_) => return Ok(None),
+    let Ok(session_name) = resolve_session_target_spec(connection, target, false) else {
+        return Ok(None);
     };
     let index = first_available_window_index(connection, &session_name)?;
     Ok(Some(rmux_proto::WindowTarget::with_window(
@@ -230,7 +229,7 @@ fn resolve_window_placement_anchor_target(
     };
 
     if let Some(session_target) = signed_window_target_session_part(target.raw()) {
-        if let Some(session_target) = session_target {
+        if let SignedWindowSession::Named(session_target) = session_target {
             let session_target = crate::cli_args::parse_target_spec(session_target)
                 .map_err(|error| ExitFailure::new(1, error))?;
             let session_name = resolve_session_target_spec(connection, &session_target, false)?;
@@ -258,7 +257,7 @@ fn resolve_active_window_index(
             session_name.clone(),
             Some("#{window_index}:#{window_active}".to_owned()),
         )
-        .map_err(ExitFailure::from_client)?;
+        .map_err(ExitFailure::from)?;
     let output = expect_command_output(&response, "list-windows")?;
     let stdout = String::from_utf8_lossy(output.stdout());
     for line in stdout.lines() {
@@ -277,16 +276,24 @@ fn resolve_active_window_index(
     ))
 }
 
-/// Splits a signed target into its optional session part, or `None` when it is not signed.
-fn signed_window_target_session_part(raw_target: &str) -> Option<Option<&str>> {
+/// Session part of a signed `+`/`-` window target.
+enum SignedWindowSession<'a> {
+    /// The signed index applies to the client's current session.
+    Current,
+    /// The signed index applies to this explicitly named session.
+    Named(&'a str),
+}
+
+/// Splits a signed target into its session part, or `None` when it is not signed.
+fn signed_window_target_session_part(raw_target: &str) -> Option<SignedWindowSession<'_>> {
     if signed_window_index_target(raw_target) {
-        return Some(None);
+        return Some(SignedWindowSession::Current);
     }
     let (session, window) = raw_target.split_once(':')?;
     if session.is_empty() || !signed_window_index_target(window) {
         return None;
     }
-    Some(Some(session))
+    Some(SignedWindowSession::Named(session))
 }
 
 /// Parses `+`/`-` with an optional magnitude into a signed window-index offset.
@@ -297,7 +304,9 @@ fn parse_bare_relative_window_offset(value: &str) -> Result<Option<i64>, ExitFai
     if !matches!(sign, b'+' | b'-') {
         return Ok(None);
     }
-    let rest = &value[1..];
+    let Some(rest) = value.get(1..) else {
+        return Ok(None);
+    };
     let magnitude = if rest.is_empty() {
         1
     } else if rest.bytes().all(|byte| byte.is_ascii_digit()) {
@@ -312,10 +321,7 @@ fn parse_bare_relative_window_offset(value: &str) -> Result<Option<i64>, ExitFai
 /// Adds a signed offset to a window index, failing when the result leaves `u32` range.
 fn apply_window_index_offset(index: u32, offset: i64) -> Result<u32, ExitFailure> {
     let next = i64::from(index) + offset;
-    if next < 0 || next > i64::from(u32::MAX) {
-        return Err(ExitFailure::new(1, format!("can't find window: {next}")));
-    }
-    Ok(next as u32)
+    u32::try_from(next).map_err(|_| ExitFailure::new(1, format!("can't find window: {next}")))
 }
 
 /// Parses an all-digit target into an absolute window index.
@@ -349,7 +355,7 @@ fn first_available_window_index(
 ) -> Result<u32, ExitFailure> {
     let response = connection
         .list_windows(session_name.clone(), Some("#{window_index}".to_owned()))
-        .map_err(ExitFailure::from_client)?;
+        .map_err(ExitFailure::from)?;
     let output = expect_command_output(&response, "list-windows")?;
     let used = String::from_utf8_lossy(output.stdout())
         .lines()
@@ -385,7 +391,7 @@ fn session_base_index(
             true,
             false,
         )
-        .map_err(ExitFailure::from_client)?;
+        .map_err(ExitFailure::from)?;
     let output = expect_command_output(&response, "show-options")?;
     let value = String::from_utf8_lossy(output.stdout());
     value
@@ -400,11 +406,11 @@ pub(super) fn run_move_window(
     socket_path: &Path,
 ) -> Result<i32, ExitFailure> {
     if args.after || args.before {
-        return run_move_window_relative(args, socket_path);
+        return run_move_window_relative(&args, socket_path);
     }
 
     run_command_resolved(socket_path, "move-window", move |connection| {
-        let request = resolve_move_window_args(connection, args)?;
+        let request = resolve_move_window_args(connection, &args)?;
         connection
             .move_window(
                 request.source,
@@ -413,12 +419,12 @@ pub(super) fn run_move_window(
                 request.kill_destination,
                 request.detached,
             )
-            .map_err(ExitFailure::from_client)
+            .map_err(ExitFailure::from)
     })
 }
 
 /// Performs `move-window` insertion before or after an anchor window.
-fn run_move_window_relative(args: MoveWindowArgs, socket_path: &Path) -> Result<i32, ExitFailure> {
+fn run_move_window_relative(args: &MoveWindowArgs, socket_path: &Path) -> Result<i32, ExitFailure> {
     let mut connection = connect(socket_path)
         .map_err(|error| ExitFailure::from_client_connect(socket_path, error))?;
     let source =
@@ -438,7 +444,7 @@ fn run_move_window_relative(args: MoveWindowArgs, socket_path: &Path) -> Result<
             args.after,
             args.before,
         )
-        .map_err(ExitFailure::from_client)?;
+        .map_err(ExitFailure::from)?;
     match response {
         Response::MoveWindow(_) => {}
         Response::Error(ErrorResponse { error }) => {
@@ -463,11 +469,15 @@ pub(super) fn run_swap_window(
         )?;
         connection
             .swap_window(source, target, args.detached)
-            .map_err(ExitFailure::from_client)
+            .map_err(ExitFailure::from)
     })
 }
 
 /// Resolves the swap source: explicit target, else the marked pane's window, else the current one.
+#[allow(
+    clippy::literal_string_with_formatting_args,
+    reason = "`{marked}` is a tmux target token, not a format argument"
+)]
 fn resolve_window_source_or_marked_or_current(
     connection: &mut Connection,
     source: Option<&TargetSpec>,
@@ -499,7 +509,7 @@ pub(super) fn run_rotate_window(
             resolve_window_target_or_current(connection, args.target.as_ref(), "rotate-window")?;
         connection
             .rotate_window_with_zoom(target, direction, restore_zoom)
-            .map_err(ExitFailure::from_client)
+            .map_err(ExitFailure::from)
     })
 }
 
@@ -529,7 +539,7 @@ pub(super) fn run_resize_window(
             resolve_window_target_or_current(connection, args.target.as_ref(), "resize-window")?;
         connection
             .resize_window(target, args.width, args.height, adjustment)
-            .map_err(ExitFailure::from_client)
+            .map_err(ExitFailure::from)
     })
 }
 
@@ -554,7 +564,7 @@ pub(super) fn run_respawn_window(
                 args.start_directory,
                 (!args.command.is_empty()).then_some(args.command),
             )
-            .map_err(ExitFailure::from_client)
+            .map_err(ExitFailure::from)
     })
 }
 
@@ -571,7 +581,7 @@ pub(super) fn run_unlink_window(
         )?;
         connection
             .unlink_window(target, args.kill_if_last)
-            .map_err(ExitFailure::from_client)
+            .map_err(ExitFailure::from)
     })
 }
 
@@ -587,7 +597,7 @@ struct ResolvedMoveWindowArgs {
 /// Resolves `move-window` arguments, treating `-r` as a session renumber rather than a move.
 fn resolve_move_window_args(
     connection: &mut rmux_client::Connection,
-    args: MoveWindowArgs,
+    args: &MoveWindowArgs,
 ) -> Result<ResolvedMoveWindowArgs, ExitFailure> {
     let effective_reindex = args.reindex;
     let source = if effective_reindex {
@@ -650,14 +660,12 @@ fn resolve_move_window_destination(
     connection: &mut rmux_client::Connection,
     target: Option<&TargetSpec>,
 ) -> Result<rmux_proto::WindowTarget, ExitFailure> {
-    match target {
-        Some(target) => resolve_window_destination_target(connection, target, "move-window"),
-        None => {
-            let session_name = resolve_current_session(connection)?;
-            let index = first_available_window_index(connection, &session_name)?;
-            Ok(rmux_proto::WindowTarget::with_window(session_name, index))
-        }
-    }
+    let Some(target) = target else {
+        let session_name = resolve_current_session(connection)?;
+        let index = first_available_window_index(connection, &session_name)?;
+        return Ok(rmux_proto::WindowTarget::with_window(session_name, index));
+    };
+    resolve_window_destination_target(connection, target, "move-window")
 }
 
 /// Asks the server which session the client is currently attached to.
@@ -666,7 +674,7 @@ fn resolve_current_session(
 ) -> Result<rmux_proto::SessionName, ExitFailure> {
     match connection
         .resolve_target(None, rmux_proto::ResolveTargetType::Session, false, false)
-        .map_err(ExitFailure::from_client)?
+        .map_err(ExitFailure::from)?
     {
         rmux_proto::Response::ResolveTarget(response) => match response.target {
             rmux_proto::Target::Session(session_name) => Ok(session_name),
@@ -731,15 +739,15 @@ pub(super) fn run_new_window(args: NewWindowArgs, socket_path: &Path) -> Result<
         {
             if !args.detached {
                 connection
-                    .select_window(existing.clone())
-                    .map_err(ExitFailure::from_client)?;
+                    .select_window(existing)
+                    .map_err(ExitFailure::from)?;
             }
             return Ok(0);
         }
     }
     let response = connection
         .new_window_at_with_environment(
-            target.clone(),
+            target,
             target_window_index,
             name,
             args.detached,
@@ -748,7 +756,7 @@ pub(super) fn run_new_window(args: NewWindowArgs, socket_path: &Path) -> Result<
             (!args.command.is_empty()).then_some(args.command),
             insert_at_target,
         )
-        .map_err(ExitFailure::from_client)?;
+        .map_err(ExitFailure::from)?;
     let target = match response {
         Response::NewWindow(response) => response.target,
         response @ Response::Error(_) => {
@@ -788,7 +796,7 @@ fn find_window_by_name(
                 "#{{window_index}}{LIST_WINDOWS_FILTER_SEPARATOR}#{{window_name}}"
             )),
         )
-        .map_err(ExitFailure::from_client)?;
+        .map_err(ExitFailure::from)?;
     let output = expect_command_output(&response, "list-windows")?;
     let mut matched = None;
     for line in String::from_utf8_lossy(output.stdout()).lines() {
@@ -968,7 +976,7 @@ fn window_name_matches_target(
                 "#{{window_index}}{LIST_WINDOWS_FILTER_SEPARATOR}#{{window_name}}"
             )),
         )
-        .map_err(ExitFailure::from_client)?;
+        .map_err(ExitFailure::from)?;
     let output = expect_command_output(&response, "list-windows")?;
     for line in String::from_utf8_lossy(output.stdout()).lines() {
         let Some((index, window_name)) = line.split_once(LIST_WINDOWS_FILTER_SEPARATOR) else {
@@ -1011,7 +1019,7 @@ pub(super) fn run_kill_window(
             resolve_window_target_or_current(connection, args.target.as_ref(), "kill-window")?;
         let response = connection
             .kill_window(target, args.kill_others)
-            .map_err(ExitFailure::from_client)?;
+            .map_err(ExitFailure::from)?;
         Ok(response)
     })
 }
@@ -1027,7 +1035,7 @@ pub(super) fn run_select_window(
                 resolve_session_listing_target(connection, args.target.clone(), "select-window")?;
             return connection
                 .next_window(target, false)
-                .map_err(ExitFailure::from_client);
+                .map_err(ExitFailure::from);
         }
 
         if args.previous {
@@ -1035,7 +1043,7 @@ pub(super) fn run_select_window(
                 resolve_session_listing_target(connection, args.target.clone(), "select-window")?;
             return connection
                 .previous_window(target, false)
-                .map_err(ExitFailure::from_client);
+                .map_err(ExitFailure::from);
         }
 
         if args.last {
@@ -1043,7 +1051,7 @@ pub(super) fn run_select_window(
                 resolve_session_listing_target(connection, args.target.clone(), "select-window")?;
             return connection
                 .last_window(target)
-                .map_err(ExitFailure::from_client);
+                .map_err(ExitFailure::from);
         }
 
         let target =
@@ -1051,12 +1059,12 @@ pub(super) fn run_select_window(
         if args.toggle_last && window_target_is_current(connection, &target)? {
             return connection
                 .last_window(target.session_name().clone())
-                .map_err(ExitFailure::from_client);
+                .map_err(ExitFailure::from);
         }
 
         connection
             .select_window(target)
-            .map_err(ExitFailure::from_client)
+            .map_err(ExitFailure::from)
     })
 }
 
@@ -1079,13 +1087,13 @@ pub(super) fn run_rename_window(
         let target =
             resolve_window_target_or_current(connection, args.target.as_ref(), "rename-window")?;
         connection
-            .rename_window(target, tmux_rename_window_name(args.new_name))
-            .map_err(ExitFailure::from_client)
+            .rename_window(target, tmux_rename_window_name(&args.new_name))
+            .map_err(ExitFailure::from)
     })
 }
 
 /// Doubles backslashes so the new name survives format interpretation.
-fn tmux_rename_window_name(name: String) -> String {
+fn tmux_rename_window_name(name: &str) -> String {
     name.replace('\\', r"\\")
 }
 
@@ -1099,7 +1107,7 @@ pub(super) fn run_next_window(
             resolve_session_listing_target(connection, args.target.clone(), "next-window")?;
         connection
             .next_window(target, args.alerts_only)
-            .map_err(ExitFailure::from_client)
+            .map_err(ExitFailure::from)
     })
 }
 
@@ -1113,7 +1121,7 @@ pub(super) fn run_previous_window(
             resolve_session_listing_target(connection, args.target.clone(), "previous-window")?;
         connection
             .previous_window(target, args.alerts_only)
-            .map_err(ExitFailure::from_client)
+            .map_err(ExitFailure::from)
     })
 }
 
@@ -1127,11 +1135,15 @@ pub(super) fn run_last_window(
             resolve_session_target_or_current(connection, args.target.as_ref(), "last-window")?;
         connection
             .last_window(target)
-            .map_err(ExitFailure::from_client)
+            .map_err(ExitFailure::from)
     })
 }
 
 /// Runs `list-windows`, using the server-side `-a` queue when available, then sorts or emits JSON.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one linear list-windows pipeline; splitting it would obscure the ordering"
+)]
 pub(super) fn run_list_windows(
     args: ListWindowsArgs,
     socket_path: &Path,
@@ -1142,7 +1154,7 @@ pub(super) fn run_list_windows(
     let queued_all_sessions = args.all_sessions
         && connection
             .supports_capability(CAPABILITY_CLI_LIST_WINDOWS_ALL_QUEUE)
-            .map_err(ExitFailure::from_client)?;
+            .map_err(ExitFailure::from)?;
     if queued_all_sessions {
         let json_format = json.then(list_windows_json_format);
         let arguments = list_windows_all_queue_arguments(&args, json_format.as_deref());
@@ -1196,7 +1208,7 @@ pub(super) fn run_list_windows(
                 target_sort_order,
                 target_reversed,
             )
-            .map_err(ExitFailure::from_client)?;
+            .map_err(ExitFailure::from)?;
         match response {
             Response::ListWindows(response) => {
                 let parsed_windows = response
@@ -1448,6 +1460,7 @@ fn list_windows_filtered_line<'a>(
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 mod tests {
     use super::*;
 

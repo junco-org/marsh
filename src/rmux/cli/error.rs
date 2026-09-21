@@ -33,7 +33,7 @@ enum ExitFailureKind {
 
 impl ExitFailure {
     /// The process exit status this failure should produce.
-    pub(crate) fn exit_code(&self) -> i32 {
+    pub(crate) const fn exit_code(&self) -> i32 {
         self.exit_code
     }
 
@@ -43,12 +43,12 @@ impl ExitFailure {
     }
 
     /// Whether the message belongs on stderr rather than stdout.
-    pub(crate) fn use_stderr(&self) -> bool {
+    pub(crate) const fn use_stderr(&self) -> bool {
         self.use_stderr
     }
 
     /// Whether the message is newline-terminated or written verbatim.
-    pub(crate) fn message_termination(&self) -> ExitMessageTermination {
+    pub(crate) const fn message_termination(&self) -> ExitMessageTermination {
         self.message_termination
     }
 
@@ -110,45 +110,13 @@ impl ExitFailure {
         }
     }
 
-    /// Converts a `clap` parse error, mapping help and version requests to exit code `0`.
-    pub(super) fn from_clap(error: clap::Error) -> Self {
-        let exit_code = match error.kind() {
-            clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion => 0,
-            _ => 1,
-        };
-        let message = tmux_compat_clap_message(&error);
-
-        Self {
-            exit_code,
-            message,
-            use_stderr: error.use_stderr(),
-            message_termination: ExitMessageTermination::Line,
-            kind: ExitFailureKind::Generic,
-        }
-    }
-
-    /// Converts a client error, tagging unsupported wire versions for later socket context.
-    pub(super) fn from_client(error: ClientError) -> Self {
-        let kind = if unsupported_wire_version(&error) {
-            ExitFailureKind::UnsupportedWireVersion
-        } else {
-            ExitFailureKind::Generic
-        };
-        Self::new_with_kind(1, error.to_string(), kind)
-    }
-
     /// Converts a connect failure, preferring the `tmux`-compatible absent-server wording.
     pub(super) fn from_client_connect(socket_path: &Path, error: ClientError) -> Self {
         if let Some(message) = tmux_client_connect_error_message(socket_path, &error) {
             return Self::new_with_kind(1, message, ExitFailureKind::ServerAbsent);
         }
 
-        Self::from_client(error)
-    }
-
-    /// Converts a daemon auto-start failure into a plain exit-code-1 failure.
-    pub(super) fn from_auto_start(error: AutoStartError) -> Self {
-        Self::new(1, error.to_string())
+        Self::from(error)
     }
 
     /// Upgrades a wire-version mismatch into advice naming the socket and how to stop it.
@@ -173,7 +141,7 @@ impl ExitFailure {
 }
 
 /// Whether the client error is a protocol wire-version mismatch.
-fn unsupported_wire_version(error: &ClientError) -> bool {
+const fn unsupported_wire_version(error: &ClientError) -> bool {
     matches!(
         error,
         ClientError::Protocol(RmuxError::UnsupportedWireVersion { .. })
@@ -277,7 +245,46 @@ impl From<NestedContextError> for ExitFailure {
     }
 }
 
+impl From<clap::Error> for ExitFailure {
+    /// Converts a `clap` parse error, mapping help and version requests to exit code `0`.
+    fn from(error: clap::Error) -> Self {
+        let exit_code = match error.kind() {
+            clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion => 0,
+            _ => 1,
+        };
+        let message = tmux_compat_clap_message(&error);
+
+        Self {
+            exit_code,
+            message,
+            use_stderr: error.use_stderr(),
+            message_termination: ExitMessageTermination::Line,
+            kind: ExitFailureKind::Generic,
+        }
+    }
+}
+
+impl From<ClientError> for ExitFailure {
+    /// Converts a client error, tagging unsupported wire versions for later socket context.
+    fn from(error: ClientError) -> Self {
+        let kind = if unsupported_wire_version(&error) {
+            ExitFailureKind::UnsupportedWireVersion
+        } else {
+            ExitFailureKind::Generic
+        };
+        Self::new_with_kind(1, error.to_string(), kind)
+    }
+}
+
+impl From<AutoStartError> for ExitFailure {
+    /// Converts a daemon auto-start failure into a plain exit-code-1 failure.
+    fn from(error: AutoStartError) -> Self {
+        Self::new(1, error.to_string())
+    }
+}
+
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 mod tests {
     use super::tmux_compat_clap_message;
 

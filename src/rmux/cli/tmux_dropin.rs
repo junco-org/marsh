@@ -144,6 +144,8 @@ fn is_short_flag_cluster(value: &str, allowed: &str) -> bool {
 
 /// Prints whether this binary was invoked through a `tmux` shim, plus setup hints.
 fn run_doctor(argv0: Option<&OsString>) -> Result<i32, ExitFailure> {
+    use std::fmt::Write as _;
+
     let argv0_name = argv0
         .and_then(|value| Path::new(value).file_name())
         .and_then(OsStr::to_str)
@@ -160,7 +162,7 @@ fn run_doctor(argv0: Option<&OsString>) -> Result<i32, ExitFailure> {
 
     let mut output = String::new();
     output.push_str("rmux tmux-dropin doctor\n");
-    output.push_str(&format!("shim:        {shim}   (argv[0]={argv0_name})\n"));
+    let _ = writeln!(output, "shim:        {shim}   (argv[0]={argv0_name})");
     if !shim_detected {
         output.push_str("suggested:   ln -s $(command -v rmux) ~/.local/bin/tmux\n");
         output.push_str("setup:       rmux setup tmux-shim\n");
@@ -510,6 +512,7 @@ fn write_stdout(output: &str, context: &str) -> Result<i32, ExitFailure> {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 mod tests {
     #[cfg(unix)]
     use super::same_packaged_rmux_lineage;

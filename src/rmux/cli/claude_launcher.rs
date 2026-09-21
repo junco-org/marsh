@@ -55,7 +55,7 @@ pub(super) struct ClaudeInvocation {
 
 impl ClaudeInvocation {
     /// Wraps the pass-through arguments of one `rmux claude` invocation.
-    pub(super) fn new(args: Vec<OsString>) -> Self {
+    pub(super) const fn new(args: Vec<OsString>) -> Self {
         Self { args }
     }
 }
@@ -197,7 +197,7 @@ struct PrivateTmuxShim {
 impl PrivateTmuxShim {
     /// Adopts an existing per-user shim directory that outlives this process.
     #[cfg(unix)]
-    fn persistent(dir: PathBuf) -> Self {
+    const fn persistent(dir: PathBuf) -> Self {
         Self { dir }
     }
 
@@ -219,7 +219,7 @@ fn should_launch_attached() -> bool {
 
 /// Attach only for a real, non-msys terminal with no explicit direct-launch request.
 #[cfg(any(unix, windows))]
-fn launch_attached_decision(
+const fn launch_attached_decision(
     direct_launch_requested: bool,
     stdin_is_terminal: bool,
     stdin_is_msys_pty: bool,
@@ -237,7 +237,11 @@ enum DirectLaunchNotice {
 
 /// Picks the notice to print, or `None` when direct launch was requested or stderr cannot show it.
 #[cfg(any(unix, windows))]
-fn direct_launch_notice(
+#[allow(
+    clippy::fn_params_excessive_bools,
+    reason = "a pure decision over four independent terminal observations; bundling them in a struct would only rename the same four flags"
+)]
+const fn direct_launch_notice(
     direct_launch_requested: bool,
     stderr_is_terminal: bool,
     stdin_is_msys_pty: bool,
@@ -326,7 +330,7 @@ fn validate_secure_owner_directory(path: &Path, label: &str) -> Result<(), ExitF
     }
 
     let mode = metadata.mode() & 0o777;
-    if mode & 0o077 == 0 {
+    if mode.trailing_zeros() >= 6 {
         return Ok(());
     }
 
@@ -348,7 +352,7 @@ fn validate_secure_owner_directory(path: &Path, label: &str) -> Result<(), ExitF
             ),
         )
     })?;
-    if tightened.mode() & 0o077 == 0 {
+    if tightened.mode().trailing_zeros() >= 6 {
         Ok(())
     } else {
         Err(ExitFailure::new(
@@ -583,6 +587,7 @@ fn rmux_file_name() -> OsString {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 mod tests {
     use super::{
         direct_launch_notice, launch_attached_decision, path_with_shim_first_from,

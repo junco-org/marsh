@@ -130,7 +130,7 @@ impl std::fmt::Debug for ShellMux {
             .debug_struct("ShellMux")
             .field("seed", &self.executor.seed())
             .field("jobs", &self.jobs().len())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 

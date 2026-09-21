@@ -11,15 +11,15 @@ pub(super) fn parse_split_window_args(
     arguments: Vec<String>,
 ) -> Result<SplitWindowArgs, clap::Error> {
     validate_required_size_argument("split-window", &arguments)?;
-    parse_command_args::<SplitWindowArgs>("split-window", arguments)?.validate()
+    parse_command_args::<SplitWindowArgs>("split-window", arguments)
 }
 
-/// Parses and validates `join-pane`/`move-pane` arguments under `command_name`.
+/// Parses `join-pane`/`move-pane` arguments under `command_name`.
 pub(super) fn parse_join_pane_args(
     command_name: &'static str,
     arguments: Vec<String>,
 ) -> Result<JoinPaneArgs, clap::Error> {
-    parse_command_args::<JoinPaneArgs>(command_name, arguments)?.validate(command_name)
+    parse_command_args::<JoinPaneArgs>(command_name, arguments)
 }
 
 /// Parses `select-pane` arguments and rejects conflicting flag combinations.
@@ -112,12 +112,12 @@ pub(crate) enum ResizePaneSize {
 
 impl ResizePaneSize {
     /// Converts the size to a cell count against `total`, with a one-cell floor for percentages.
-    pub(crate) fn resolve(self, total: u16) -> Option<u16> {
+    pub(crate) fn resolve(self, total: u16) -> u16 {
         match self {
-            Self::Cells(value) => Some(value),
+            Self::Cells(value) => value,
             Self::Percent(value) => {
                 let cells = u32::from(total) * u32::from(value) / 100;
-                Some(u16::try_from(cells.max(1)).unwrap_or(u16::MAX))
+                u16::try_from(cells.max(1)).unwrap_or(u16::MAX)
             }
         }
     }
@@ -156,7 +156,9 @@ fn parse_resize_pane_delta(value: &str) -> Result<u16, String> {
     if cells > i128::from(i32::MAX) {
         return Err("adjustment too large".to_owned());
     }
-    Ok(clamp_resize_pane_cells(cells as i64))
+    Ok(clamp_resize_pane_cells(
+        i64::try_from(cells).unwrap_or(i64::MAX),
+    ))
 }
 
 /// Saturates a cell count into `u16`.
@@ -368,8 +370,9 @@ fn normalize_resize_pane_optional_delta(arguments: Vec<String>) -> Vec<String> {
         && resize_pane_has_standalone_trailing_delta(&arguments, direction_index)
     {
         let mut normalized = arguments;
-        let value = normalized.pop().expect("last resize-pane delta must exist");
-        normalized.insert(direction_index + 1, value);
+        if let Some(value) = normalized.pop() {
+            normalized.insert(direction_index + 1, value);
+        }
         return normalized;
     }
 
@@ -406,11 +409,10 @@ fn normalize_resize_pane_no_direction_trailing_adjustment(
     }
 
     let mut normalized = arguments;
-    let value = normalized
-        .pop()
-        .expect("last resize-pane adjustment must exist");
-    parse_resize_pane_delta(&value)
-        .map_err(|message| clap::Error::raw(clap::error::ErrorKind::ValueValidation, message))?;
+    if let Some(value) = normalized.pop() {
+        parse_resize_pane_delta(&value)
+            .map_err(|message| clap::Error::raw(clap::error::ErrorKind::ValueValidation, message))?;
+    }
     Ok(normalized)
 }
 
@@ -789,13 +791,6 @@ pub(crate) struct CopyModeArgs {
     pub(crate) page_up: bool,
 }
 
-impl CopyModeArgs {
-    /// Accepts the parsed arguments unchanged; `copy-mode` has no conflicting flags.
-    pub(crate) fn validate(self) -> Result<Self, clap::Error> {
-        Ok(self)
-    }
-}
-
 /// Parsed `clock-mode` command line.
 #[derive(Debug, Clone, Args)]
 pub(crate) struct ClockModeArgs {
@@ -840,13 +835,8 @@ pub(crate) struct ListPanesArgs {
 }
 
 impl SplitWindowArgs {
-    /// Accepts the parsed arguments unchanged; `clap` groups enforce the conflicts.
-    fn validate(self) -> Result<Self, clap::Error> {
-        Ok(self)
-    }
-
     /// The split orientation requested, defaulting to a vertical split.
-    pub(crate) fn direction(&self) -> SplitDirection {
+    pub(crate) const fn direction(&self) -> SplitDirection {
         if self.horizontal {
             SplitDirection::Horizontal
         } else {
@@ -864,19 +854,14 @@ impl SplitWindowArgs {
 
 impl SwapPaneArgs {
     /// Whether `-D` or `-U` selects the swap partner instead of `-s`.
-    pub(crate) fn uses_relative_target(&self) -> bool {
+    pub(crate) const fn uses_relative_target(&self) -> bool {
         self.down || self.up
     }
 }
 
 impl JoinPaneArgs {
-    /// Accepts the parsed arguments unchanged; `clap` groups enforce the conflicts.
-    fn validate(self, _command_name: &'static str) -> Result<Self, clap::Error> {
-        Ok(self)
-    }
-
     /// The join orientation requested, defaulting to a vertical split.
-    pub(crate) fn direction(&self) -> SplitDirection {
+    pub(crate) const fn direction(&self) -> SplitDirection {
         if self.horizontal {
             SplitDirection::Horizontal
         } else {
@@ -920,7 +905,7 @@ impl SelectPaneArgs {
     }
 
     /// The navigation direction requested, or `None` when no direction flag is set.
-    pub(crate) fn direction(&self) -> Option<SelectPaneDirection> {
+    pub(crate) const fn direction(&self) -> Option<SelectPaneDirection> {
         if self.up {
             Some(SelectPaneDirection::Up)
         } else if self.down {

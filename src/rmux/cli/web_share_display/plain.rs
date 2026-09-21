@@ -24,6 +24,7 @@ pub(super) fn buffer_to_plain_string(buffer: &Buffer) -> String {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 mod tests {
     use ratatui::{buffer::Buffer, layout::Rect, style::Color};
 

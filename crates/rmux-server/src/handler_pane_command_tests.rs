@@ -1630,7 +1630,7 @@ async fn respawn_pane_reuses_structured_command_cwd_and_private_environment() {
     assert!(matches!(created, Response::NewSession(_)), "{created:?}");
 
     let initial_cwd_text = expected_spawn_cwd(&initial_cwd);
-    let initial_line = respawn_probe_line(&initial_cwd_text, "initial", "argv");
+    let initial_line = respawn_probe_line(initial_cwd_text, "initial", "argv");
     wait_for_file_contents(&output, &initial_line).await;
     let target = PaneTarget::with_window(alpha.clone(), 0, 0);
     let pane_id = {
@@ -1680,7 +1680,7 @@ async fn respawn_pane_reuses_structured_command_cwd_and_private_environment() {
         .await;
     assert!(matches!(explicit, Response::RespawnPane(_)), "{explicit:?}");
     let override_cwd_text = expected_spawn_cwd(&override_cwd);
-    let override_line = respawn_probe_line(&override_cwd_text, "override", "shell");
+    let override_line = respawn_probe_line(override_cwd_text, "override", "shell");
     wait_for_file_contents(
         &output,
         &format!("{initial_line}{initial_line}{override_line}"),
@@ -1714,7 +1714,7 @@ async fn respawn_pane_reuses_structured_command_cwd_and_private_environment() {
         matches!(inherited_after_override, Response::RespawnPane(_)),
         "{inherited_after_override:?}"
     );
-    let inherited_override_line = respawn_probe_line(&override_cwd_text, "initial", "shell");
+    let inherited_override_line = respawn_probe_line(override_cwd_text, "initial", "shell");
     wait_for_file_contents(
         &output,
         &format!("{initial_line}{initial_line}{override_line}{inherited_override_line}"),

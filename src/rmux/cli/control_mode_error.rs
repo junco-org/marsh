@@ -26,7 +26,7 @@ pub(super) fn parse_failure(error: clap::Error, control_mode: u8) -> ExitFailure
         }
     }
 
-    let failure = ExitFailure::from_clap(error);
+    let failure = ExitFailure::from(error);
     exit_failure_for_count(failure.exit_code(), failure.message(), control_mode)
 }
 

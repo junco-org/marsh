@@ -6,8 +6,8 @@ fn parse_args(args: &[&str]) -> Result<super::Cli, clap::Error> {
     parse(full_args)
 }
 
-fn target_text(target: &Option<super::TargetSpec>) -> String {
-    target.as_ref().expect("target").to_string()
+fn target_text(target: Option<&super::TargetSpec>) -> String {
+    target.expect("target").to_string()
 }
 
 #[test]
@@ -33,7 +33,7 @@ fn resize_pane_zoom_after_columns_follows_tmux_last_wins() {
 
     match cli.command.expect("parsed command") {
         Command::ResizePane(args) => {
-            assert_eq!(target_text(&args.target), "alpha:0.1");
+            assert_eq!(target_text(args.target.as_ref()), "alpha:0.1");
             assert!(args.zoom);
             assert_eq!(args.columns, Some(super::ResizePaneSize::Cells(34)));
         }

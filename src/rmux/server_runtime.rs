@@ -80,8 +80,7 @@ pub(crate) fn build_daemon_runtime() -> io::Result<Runtime> {
 /// Available parallelism clamped into the daemon's worker-thread bounds.
 fn daemon_worker_threads() -> usize {
     std::thread::available_parallelism()
-        .map(NonZeroUsize::get)
-        .unwrap_or(DAEMON_MIN_WORKER_THREADS)
+        .map_or(DAEMON_MIN_WORKER_THREADS, NonZeroUsize::get)
         .clamp(DAEMON_MIN_WORKER_THREADS, DAEMON_MAX_WORKER_THREADS)
 }
 

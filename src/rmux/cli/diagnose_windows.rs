@@ -56,7 +56,7 @@ fn cmd_shell_path() -> Option<PathBuf> {
     })
 }
 
-/// The suffixes to try for `command`: none when it already has one, else `PATHEXT` or the defaults.
+/// Suffixes to try for `command`: none if it already has one, else `PATHEXT` or the defaults.
 fn executable_extensions(command: &Path, pathext: Option<&OsStr>) -> Vec<String> {
     if command.extension().is_some() {
         return vec![String::new()];
@@ -76,6 +76,7 @@ fn executable_extensions(command: &Path, pathext: Option<&OsStr>) -> Vec<String>
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 mod tests {
     use super::*;
     use std::ffi::OsString;

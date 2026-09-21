@@ -16,7 +16,7 @@ fn wait_pane_accepts_one_full_word_condition() {
     let super::super::Command::WaitPane(args) = queue.remove(0) else {
         panic!("expected wait-pane command");
     };
-    assert_eq!(target_text(&args.target), "%1");
+    assert_eq!(target_text(args.target.as_ref()), "%1");
     assert_eq!(args.visible_text.as_deref(), Some("Ready"));
     assert_eq!(args.timeout.expect("timeout").as_secs(), 30);
 }
@@ -170,7 +170,7 @@ fn send_keys_wait_keeps_payload_after_separator() {
     let super::super::Command::SendKeys(args) = queue.remove(0) else {
         panic!("expected send-keys command");
     };
-    assert_eq!(target_text(&args.target), "%1");
+    assert_eq!(target_text(args.target.as_ref()), "%1");
     assert_eq!(args.wait_next_text.as_deref(), Some("__DONE__"));
     assert_eq!(args.timeout.expect("timeout").as_secs(), 120);
     assert_eq!(args.keys, ["make test", "Enter"]);

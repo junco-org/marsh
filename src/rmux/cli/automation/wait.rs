@@ -27,11 +27,11 @@ const CLIENT_TARGET_FORMAT: &str =
 const PANE_EXIT_TOMBSTONE_HANDOFF_GRACE: Duration = Duration::from_millis(100);
 
 /// Runs the `wait-pane` CLI command, polling the resolved target until its condition holds.
-pub(crate) fn run_wait_pane(args: WaitPaneArgs, socket_path: &Path) -> Result<i32, ExitFailure> {
+pub(crate) fn run_wait_pane(args: &WaitPaneArgs, socket_path: &Path) -> Result<i32, ExitFailure> {
     check_disabled("RMUX_DISABLE_WAIT_PANE", "wait-pane")?;
     let started_at = Instant::now();
     let deadline = timeout_deadline(args.timeout);
-    let condition = WaitCondition::from_wait_pane(&args);
+    let condition = WaitCondition::from_wait_pane(args);
     let mut connection = connect_cli(socket_path)?;
     let target = wait_target::resolve(&mut connection, args.target.as_ref(), "wait-pane")?;
 
@@ -76,15 +76,11 @@ pub(crate) fn run_send_keys_with_wait(
     let condition = WaitCondition::from_send_keys(&args)?;
     let mut send_connection = connect_cli(socket_path)?;
     let mut target_plan = send_keys_target_plan(&mut send_connection, &args)?;
-    if target_plan.wait_target.is_none() {
+    let Some(mut wait_target) = target_plan.wait_target.take() else {
         return Err(unresolved_wait_target_error(&args));
-    }
+    };
 
     if let WaitCondition::NextText(bytes) = &condition {
-        let mut wait_target = target_plan
-            .wait_target
-            .clone()
-            .expect("send-keys --wait target was preflighted");
         let mut wait_connection = connect_cli(socket_path)?;
         let wait_target_ref =
             wait_target.refreshed_target_ref(&mut wait_connection, "send-keys")?;
@@ -123,23 +119,13 @@ pub(crate) fn run_send_keys_with_wait(
     }
 
     let baseline_revision = if matches!(condition, WaitCondition::Quiet(_)) {
-        target_plan
-            .wait_target
-            .as_mut()
-            .map(|target| {
-                wait_target::snapshot(&mut send_connection, target)
-                    .map(|snapshot| snapshot.revision)
-            })
-            .transpose()?
+        Some(wait_target::snapshot(&mut send_connection, &mut wait_target)?.revision)
     } else {
         None
     };
     let send_response =
         send_keys_through_command_path(&mut send_connection, args, target_plan.send_target)?;
     expect_command_success(send_response, "send-keys")?;
-    let wait_target = target_plan
-        .wait_target
-        .expect("send-keys --wait target was preflighted");
 
     match wait_condition(
         &mut send_connection,
@@ -604,7 +590,7 @@ fn attached_target_client_pane_ref(
     };
     let response = connection
         .resolve_target(Some(session_name), ResolveTargetType::Pane, false, false)
-        .map_err(ExitFailure::from_client)?;
+        .map_err(ExitFailure::from)?;
     let target = match response {
         Response::ResolveTarget(response) => match response.target {
             Target::Pane(target) => target,
@@ -662,7 +648,7 @@ fn attached_target_client_session(
             reversed: false,
             target_session: None,
         })
-        .map_err(ExitFailure::from_client)?;
+        .map_err(ExitFailure::from)?;
     let output = match response {
         Response::ListClients(response) => response.output,
         Response::Error(ErrorResponse { error }) => {
@@ -756,7 +742,7 @@ fn normalize_target_client(target_client: &str) -> &str {
 }
 
 /// The human readable kind name of a resolved `Target`.
-fn target_kind_name(target: &Target) -> &'static str {
+const fn target_kind_name(target: &Target) -> &'static str {
     match target {
         Target::Session(_) => "session",
         Target::Window(_) => "window",
@@ -785,7 +771,7 @@ fn send_keys_through_command_path(
                 repeat_count: args.repeat_count,
                 target_client: Some(target_client),
             })
-            .map_err(ExitFailure::from_client);
+            .map_err(ExitFailure::from);
     }
 
     connection
@@ -801,7 +787,7 @@ fn send_keys_through_command_path(
             reset_terminal: args.reset_terminal,
             repeat_count: args.repeat_count,
         })
-        .map_err(ExitFailure::from_client)
+        .map_err(ExitFailure::from)
 }
 
 /// The target's reference string as shown in messages and JSON output.
@@ -810,6 +796,7 @@ fn target_name(target: &StableWaitTarget) -> String {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 mod tests {
     use std::time::Duration;
 

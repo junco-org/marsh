@@ -152,7 +152,7 @@ impl CommandHandle {
 
     /// The job this command was admitted into.
     #[must_use]
-    pub fn shell(&self) -> &Sandbox {
+    pub const fn shell(&self) -> &Sandbox {
         &self.shell
     }
 

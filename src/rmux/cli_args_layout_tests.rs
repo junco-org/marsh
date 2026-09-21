@@ -87,7 +87,7 @@ fn next_layout_accepts_window_targets() {
 
     match cli.command.expect("parsed command") {
         super::Command::NextLayout(args) => {
-            assert_eq!(args.target.as_ref().expect("target").to_string(), "alpha:3")
+            assert_eq!(args.target.as_ref().expect("target").to_string(), "alpha:3");
         }
         _ => panic!("expected NextLayout command"),
     }
@@ -99,7 +99,7 @@ fn previous_layout_preserves_session_targets_for_runtime_resolution() {
 
     match cli.command.expect("parsed command") {
         super::Command::PreviousLayout(args) => {
-            assert_eq!(args.target.as_ref().expect("target").to_string(), "alpha")
+            assert_eq!(args.target.as_ref().expect("target").to_string(), "alpha");
         }
         _ => panic!("expected PreviousLayout command"),
     }

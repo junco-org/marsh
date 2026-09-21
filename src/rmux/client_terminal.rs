@@ -13,7 +13,7 @@ pub(crate) fn require_attach_terminal() -> Result<(), &'static str> {
 }
 
 /// Attach admission decision for a given stdin terminal state, split out for testing.
-fn require_attach_terminal_from(stdin_is_terminal: bool) -> Result<(), &'static str> {
+const fn require_attach_terminal_from(stdin_is_terminal: bool) -> Result<(), &'static str> {
     if stdin_is_terminal {
         Ok(())
     } else {
@@ -35,6 +35,11 @@ pub(crate) fn client_terminal_context_from_parts(
 }
 
 /// Adds the capabilities detected from the host environment to `context`.
+#[allow(
+    clippy::missing_const_for_fn,
+    clippy::needless_pass_by_ref_mut,
+    reason = "the Windows build mutates the context; the signature must stay identical for every target"
+)]
 pub(crate) fn apply_detected_client_terminal_features(context: &mut ClientTerminalContext) {
     #[cfg(windows)]
     apply_windows_terminal_features(
@@ -88,6 +93,7 @@ fn push_unique_terminal_feature(features: &mut Vec<String>, feature: &str) {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 mod tests {
     use super::{
         client_terminal_context_from_parts, require_attach_terminal_from,

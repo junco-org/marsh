@@ -1,9 +1,16 @@
 #![allow(
     clippy::expect_used,
     clippy::panic,
+    clippy::panic_in_result_fn,
     clippy::unwrap_used,
     reason = "a runnable consumer's failure mode is an immediate, loud abort naming the \
               observation that did not hold"
+)]
+#![allow(
+    clippy::too_many_lines,
+    reason = "this file is one documented `main` whose ordered observations are the proof; \
+              splitting it into helpers would hide that order and it is quoted verbatim by \
+              the README"
 )]
 //! An application driving rmux through nothing but `marsh::rmux`: `<seed> <socket>`.
 //!

@@ -483,7 +483,7 @@ fn has_session_preserves_exact_target_marker_in_attached_short_value() {
     let cli = parse_args(&["has-session", "-t=foo"]).unwrap();
     match cli.command.expect("parsed command") {
         super::super::Command::HasSession(args) => {
-            assert_eq!(target_text(&args.target), "=foo");
+            assert_eq!(target_text(args.target.as_ref()), "=foo");
         }
         _ => panic!("expected HasSession command"),
     }
@@ -510,7 +510,7 @@ fn rename_session_accepts_a_positional_new_name() {
 
     match cli.command.expect("parsed command") {
         super::super::Command::RenameSession(args) => {
-            assert_eq!(target_text(&args.target), "alpha");
+            assert_eq!(target_text(args.target.as_ref()), "alpha");
             assert_eq!(args.new_name.to_string(), "beta");
         }
         _ => panic!("expected RenameSession command"),
@@ -529,7 +529,7 @@ fn rename_alias_parses_like_rename_session() {
 
     match cli.command.expect("parsed command") {
         super::super::Command::RenameSession(args) => {
-            assert_eq!(target_text(&args.target), "alpha");
+            assert_eq!(target_text(args.target.as_ref()), "alpha");
             assert_eq!(args.new_name.to_string(), "beta");
         }
         _ => panic!("expected RenameSession command"),
@@ -544,7 +544,7 @@ fn kill_session_accepts_all_except_and_clear_alerts_flags() {
         super::super::Command::KillSession(args) => {
             assert!(args.kill_all_except_target);
             assert!(args.clear_alerts);
-            assert_eq!(target_text(&args.target), "alpha");
+            assert_eq!(target_text(args.target.as_ref()), "alpha");
         }
         _ => panic!("expected KillSession command"),
     }

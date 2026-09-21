@@ -583,7 +583,7 @@ fn join_pane_defaults_to_vertical_direction() {
                 args.source.as_ref().expect("source exists").to_string(),
                 "alpha:0.1"
             );
-            assert_eq!(target_text(&args.target), "alpha:1.0");
+            assert_eq!(target_text(args.target.as_ref()), "alpha:1.0");
             assert_eq!(args.direction(), rmux_proto::SplitDirection::Vertical);
         }
         _ => panic!("expected JoinPane command"),
@@ -662,7 +662,7 @@ fn join_pane_accepts_implicit_marked_source() {
     match cli.command.expect("parsed command") {
         super::super::Command::JoinPane(args) => {
             assert!(args.source.is_none());
-            assert_eq!(target_text(&args.target), "alpha:1.0");
+            assert_eq!(target_text(args.target.as_ref()), "alpha:1.0");
         }
         _ => panic!("expected JoinPane command"),
     }
@@ -721,7 +721,7 @@ fn move_pane_parses_the_full_join_pane_flag_surface() {
                 args.source.as_ref().expect("source exists").to_string(),
                 "alpha:0.1"
             );
-            assert_eq!(target_text(&args.target), "beta:1.2");
+            assert_eq!(target_text(args.target.as_ref()), "beta:1.2");
         }
         _ => panic!("expected MovePane command"),
     }

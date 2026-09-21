@@ -27,7 +27,7 @@ pub(super) fn resolve_set_option_args(
     validate_set_option_name(&args.option)?;
     let request = SetOptionScopeRequest::new(command, &args);
     let scope = resolve_set_option_scope(
-        request,
+        &request,
         &mut ConnectionSetOptionTargetResolver { connection },
     )?;
     let format_target = if args.format {
@@ -51,7 +51,7 @@ pub(super) fn resolve_set_option_args_with_exact_targets(
     validate_set_option_name(&args.option)?;
     let mut resolver = ExactSetOptionTargetResolver;
     let request = SetOptionScopeRequest::new(command, &args);
-    let scope = resolve_set_option_scope(request, &mut resolver)?;
+    let scope = resolve_set_option_scope(&request, &mut resolver)?;
     build_resolved_set_option_command(command, args, scope, None)
 }
 
@@ -199,8 +199,12 @@ impl<'a> SetOptionScopeRequest<'a> {
 }
 
 /// Applies tmux's flag, target and option-kind precedence to pick the scope to mutate.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one ordered precedence ladder; splitting it would hide the tmux rule order"
+)]
 fn resolve_set_option_scope(
-    request: SetOptionScopeRequest<'_>,
+    request: &SetOptionScopeRequest<'_>,
     resolver: &mut impl SetOptionTargetResolver,
 ) -> Result<ResolvedSetOptionScope, ExitFailure> {
     let force_window = matches!(request.command, SetOptionCommandKind::SetWindowOption);
@@ -467,6 +471,10 @@ fn option_supports_pane_scope(option: &str) -> bool {
 }
 
 /// Builds a throwaway pane selector used only to probe an option's supported scopes.
+#[allow(
+    clippy::expect_used,
+    reason = "a fixed literal session name is valid by construction"
+)]
 fn dummy_pane_scope() -> OptionScopeSelector {
     OptionScopeSelector::Pane(PaneTarget::with_window(
         SessionName::new("set-option").expect("valid session name"),
@@ -477,13 +485,11 @@ fn dummy_pane_scope() -> OptionScopeSelector {
 
 /// Reports whether the named option exists and accepts `scope`; unknown names are `false`.
 fn option_name_supports_scope(option: &str, scope: &OptionScopeSelector) -> bool {
-    rmux_core::resolve_option_name(option)
-        .map(|query| query.supports_scope(scope))
-        .unwrap_or(false)
+    rmux_core::resolve_option_name(option).is_ok_and(|query| query.supports_scope(scope))
 }
 
 /// Maps an option's default global scope to the target kind a spec must resolve to.
-fn target_type_for_scope(scope: &OptionScopeSelector) -> ResolveTargetType {
+const fn target_type_for_scope(scope: &OptionScopeSelector) -> ResolveTargetType {
     match scope {
         OptionScopeSelector::WindowGlobal | OptionScopeSelector::Window(_) => {
             ResolveTargetType::Window

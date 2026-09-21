@@ -72,7 +72,7 @@ fn set_option_accepts_trailing_colon_session_targets_like_tmux() {
 
     match cli.command.expect("parsed command") {
         super::super::Command::SetOption(args) => {
-            assert_eq!(target_text(&args.target), "alpha:");
+            assert_eq!(target_text(args.target.as_ref()), "alpha:");
         }
         _ => panic!("expected SetOption command"),
     }
@@ -176,7 +176,7 @@ fn set_option_scope_scanner_stops_at_mid_cluster_target_value() {
             assert!(!args.server);
             assert!(args.window);
             assert!(!args.pane);
-            assert_eq!(target_text(&args.target), "vps");
+            assert_eq!(target_text(args.target.as_ref()), "vps");
             assert_eq!(args.option, "@y");
             assert_eq!(args.value.as_deref(), Some("2"));
         }

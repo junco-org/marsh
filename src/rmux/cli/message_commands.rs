@@ -57,7 +57,7 @@ fn run_display_message_json_inner(
     } else {
         connection.display_message(target, true, message)
     }
-    .map_err(ExitFailure::from_client)?;
+    .map_err(ExitFailure::from)?;
 
     match response {
         Response::DisplayMessage(response) => {
@@ -99,7 +99,7 @@ fn run_display_message_direct(
     } else {
         connection.display_message(target, args.print, message)
     }
-    .map_err(ExitFailure::from_client)?;
+    .map_err(ExitFailure::from)?;
 
     if args.print {
         let output = expect_command_output(&response, "display-message")?;
@@ -111,7 +111,7 @@ fn run_display_message_direct(
 }
 
 /// Reports whether the flags are simple enough to skip the queued server-command path.
-fn display_message_can_use_direct_request(args: &DisplayMessageArgs) -> bool {
+const fn display_message_can_use_direct_request(args: &DisplayMessageArgs) -> bool {
     !args.all_formats && !args.stdin && !args.literal && !args.verbose && args.target.is_none()
 }
 

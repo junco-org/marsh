@@ -3,8 +3,8 @@
 //! # What this is
 //!
 //! This is **not** a PTY backend. Every pane, popup and workload helper in the rmux daemon runs
-//! on the shared `marsh-core` ShellMux; no `PtyMaster`, `PtyChild`, `ChildCommand`, descriptor
-//! reader loop or ConPTY fallback survives anywhere in that crate. What lives here is a different
+//! on the shared `marsh-core` `ShellMux`; no `PtyMaster`, `PtyChild`, `ChildCommand`, descriptor
+//! reader loop or `ConPTY` fallback survives anywhere in that crate. What lives here is a different
 //! mechanic that merely happened to share an upstream crate with the backend: attaching to
 //! another process's console and writing input records into it. It is the console analogue of the
 //! `rmux_os::process` probes — a platform input primitive the shell engine has no equivalent for,

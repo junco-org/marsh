@@ -24,7 +24,7 @@ pub(in crate::cli) fn run_swap_pane(
                     resolve_pane_target_or_current(connection, args.target.as_ref(), "swap-pane")?;
                 connection
                     .swap_pane_with_next(target, args.detached, args.preserve_zoom)
-                    .map_err(ExitFailure::from_client)
+                    .map_err(ExitFailure::from)
             });
         }
 
@@ -33,7 +33,7 @@ pub(in crate::cli) fn run_swap_pane(
                 resolve_pane_target_or_current(connection, args.target.as_ref(), "swap-pane")?;
             connection
                 .swap_pane_with_previous(target, args.detached, args.preserve_zoom)
-                .map_err(ExitFailure::from_client)
+                .map_err(ExitFailure::from)
         });
     }
 
@@ -42,7 +42,7 @@ pub(in crate::cli) fn run_swap_pane(
         let target = resolve_pane_target_or_current(connection, args.target.as_ref(), "swap-pane")?;
         connection
             .swap_pane(source, target, args.detached, args.preserve_zoom)
-            .map_err(ExitFailure::from_client)
+            .map_err(ExitFailure::from)
     })
 }
 
@@ -66,7 +66,7 @@ pub(in crate::cli) fn run_join_pane(
                 full_size: args.full_size,
                 size,
             })
-            .map_err(ExitFailure::from_client)
+            .map_err(ExitFailure::from)
     })
 }
 
@@ -94,7 +94,7 @@ pub(in crate::cli) fn run_break_pane(
                 print_target: args.print_target,
                 format: args.format,
             })
-            .map_err(ExitFailure::from_client)
+            .map_err(ExitFailure::from)
     })
 }
 
@@ -118,7 +118,7 @@ pub(in crate::cli) fn run_move_pane(
                 full_size: args.full_size,
                 size,
             })
-            .map_err(ExitFailure::from_client)
+            .map_err(ExitFailure::from)
     })
 }
 
@@ -131,6 +131,10 @@ fn resolve_pane_source_or_marked(
         return resolve_pane_target_spec(connection, source);
     }
 
+    #[allow(
+        clippy::literal_string_with_formatting_args,
+        reason = "`{marked}` is tmux's literal target spec, not a format placeholder"
+    )]
     let marked = parse_target_spec("{marked}").map_err(|error| ExitFailure::new(1, error))?;
     resolve_pane_target_spec(connection, &marked)
         .or_else(|_| resolve_pane_target_or_current(connection, None, "pane source"))

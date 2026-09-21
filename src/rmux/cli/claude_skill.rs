@@ -173,7 +173,7 @@ fn backup_existing_skill(path: &Path, existing: &[u8]) -> Result<PathBuf, ExitFa
                 })?;
                 return Ok(candidate);
             }
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
             Err(error) => {
                 return Err(ExitFailure::new(
                     1,
@@ -307,6 +307,7 @@ fn write_stdout(output: &str) -> Result<i32, ExitFailure> {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 mod tests {
     use super::{parse_invocation, ClaudeSkillInvocation, SKILL_CONTENT};
     use std::ffi::OsString;

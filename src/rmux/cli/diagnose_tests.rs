@@ -83,8 +83,9 @@ fn config_message_filter_redacts_home_paths() {
         home.join(".tmux.conf").display()
     );
 
-    let redacted = config_message_from_show_messages_line_against(&raw, &[home.clone()])
-        .expect("config message");
+    let redacted =
+        config_message_from_show_messages_line_against(&raw, std::slice::from_ref(&home))
+            .expect("config message");
 
     assert!(redacted.contains("~/.tmux.conf"), "{redacted}");
     assert!(

@@ -444,7 +444,7 @@ fn lock_session_parses_target() {
 
     match cli.command.expect("parsed command") {
         super::super::Command::LockSession(args) => {
-            assert_eq!(args.target.as_ref().expect("target").to_string(), "alpha")
+            assert_eq!(args.target.as_ref().expect("target").to_string(), "alpha");
         }
         _ => panic!("expected LockSession command"),
     }

@@ -107,7 +107,7 @@ impl JobDir {
 
     /// Whether this names the seed root.
     #[must_use]
-    pub fn is_root(&self) -> bool {
+    pub const fn is_root(&self) -> bool {
         self.0.is_empty()
     }
 }

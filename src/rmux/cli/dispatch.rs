@@ -63,7 +63,7 @@ use crate::empty_server_lifecycle::shutdown_started_empty_server_at;
 use crate::tmux_error_surface::source_file_error_uses_stdout;
 
 /// The implicit `new-session` used when the client is invoked with no command.
-pub(super) fn default_client_command() -> Command {
+pub(super) const fn default_client_command() -> Command {
     Command::NewSession(NewSessionArgs {
         attach_if_exists: false,
         working_directory: None,
@@ -88,8 +88,8 @@ pub(super) fn default_client_command() -> Command {
 pub(super) fn dispatch_command_queue(
     commands: Vec<Command>,
     socket_path: &Path,
-    startup: StartupOptions,
-    client_terminal: ClientTerminalContext,
+    startup: &StartupOptions,
+    client_terminal: &ClientTerminalContext,
 ) -> Result<i32, ExitFailure> {
     let commands = if commands.is_empty() {
         vec![default_client_command()]
@@ -103,17 +103,17 @@ pub(super) fn dispatch_command_queue(
             .all(command_allows_detached_connection_reuse);
     if can_reuse_connection {
         return with_command_connection_cache(socket_path, || {
-            dispatch_commands(commands, startup, client_terminal)
+            dispatch_commands(&commands, startup, client_terminal)
         });
     }
-    dispatch_commands(commands, startup, client_terminal)
+    dispatch_commands(&commands, startup, client_terminal)
 }
 
 /// Runs queued commands in order, tracking exit status, queued attach, and a terminal kill.
 fn dispatch_commands(
-    commands: Vec<Command>,
-    startup: StartupOptions,
-    client_terminal: ClientTerminalContext,
+    commands: &[Command],
+    startup: &StartupOptions,
+    client_terminal: &ClientTerminalContext,
 ) -> Result<i32, ExitFailure> {
     let mut exit_code = 0;
     let queued_commands = commands
@@ -141,7 +141,7 @@ fn dispatch_commands(
         let dispatch_result = dispatch(
             command,
             socket_path,
-            startup.clone(),
+            startup,
             client_terminal.clone(),
             queue_attach_sequence,
             &mut queued_attach_session,
@@ -200,7 +200,11 @@ fn attach_sequence_has_terminal_tail(tail: &[Command]) -> bool {
 }
 
 /// Whether the command is safe to run over a cached connection shared by the whole queue.
-fn command_allows_detached_connection_reuse(candidate: &Command) -> bool {
+#[allow(
+    clippy::too_many_lines,
+    reason = "one exhaustive per-command table; every variant must stay listed so a new command is a compile error"
+)]
+const fn command_allows_detached_connection_reuse(candidate: &Command) -> bool {
     match candidate {
         Command::SendKeys(args) if args.has_wait() => false,
         Command::Noop => true,
@@ -311,10 +315,14 @@ fn command_allows_detached_connection_reuse(candidate: &Command) -> bool {
 }
 
 /// Routes one parsed command to its handler with per-command startup options.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one exhaustive routing match; splitting it would only hide the command table"
+)]
 fn dispatch(
     command: Command,
     socket_path: &Path,
-    startup: StartupOptions,
+    startup: &StartupOptions,
     client_terminal: ClientTerminalContext,
     queue_attach_detach: bool,
     queued_attach_session: &mut Option<QueuedAttachSession>,
@@ -339,8 +347,8 @@ fn dispatch(
         }
         Command::StartServer(_) => run_start_server(socket_path, command_startup),
         Command::KillServer => run_kill_server(socket_path),
-        Command::HasSession(args) => run_has_session(args, socket_path),
-        Command::KillSession(args) => run_kill_session(args, socket_path),
+        Command::HasSession(args) => run_has_session(&args, socket_path),
+        Command::KillSession(args) => run_kill_session(&args, socket_path),
         Command::RenameSession(args) => run_rename_session(args, socket_path),
         Command::ServerAccess(args) => run_server_access(args, socket_path),
         Command::LockServer => run_lock_server(socket_path),
@@ -377,7 +385,7 @@ fn dispatch(
                 };
                 connection
                     .kill_pane_with_options(target, args.kill_all_except)
-                    .map_err(ExitFailure::from_client)
+                    .map_err(ExitFailure::from)
             })
         }
         Command::SelectLayout(args) => {
@@ -391,7 +399,7 @@ fn dispatch(
                     )?;
                     connection
                         .next_layout(target)
-                        .map_err(ExitFailure::from_client)
+                        .map_err(ExitFailure::from)
                 });
             }
             if mode == Some(SelectLayoutMode::Previous) {
@@ -403,7 +411,7 @@ fn dispatch(
                     )?;
                     connection
                         .previous_layout(target)
-                        .map_err(ExitFailure::from_client)
+                        .map_err(ExitFailure::from)
                 });
             }
             if mode == Some(SelectLayoutMode::Spread) {
@@ -416,7 +424,7 @@ fn dispatch(
                     };
                     connection
                         .spread_layout(target)
-                        .map_err(ExitFailure::from_client)
+                        .map_err(ExitFailure::from)
                 });
             }
             if mode == Some(SelectLayoutMode::Old) && args.layout.is_none() {
@@ -429,12 +437,12 @@ fn dispatch(
                     };
                     connection
                         .select_old_layout(target)
-                        .map_err(ExitFailure::from_client)
+                        .map_err(ExitFailure::from)
                 });
             }
-            if args.layout.is_none() {
+            let Some(layout) = args.layout else {
                 return run_select_layout_noop(args.target.as_ref(), socket_path);
-            }
+            };
             run_command_resolved(socket_path, "select-layout", move |connection| {
                 let target = match args.target.as_ref() {
                     Some(target) => resolve_select_layout_target_spec(connection, target)?,
@@ -442,20 +450,19 @@ fn dispatch(
                         resolve_window_target_or_current(connection, None, "select-layout")?,
                     ),
                 };
-                let layout = args.layout.as_ref().expect("handled no-op layout");
                 if mode == Some(SelectLayoutMode::Old) {
                     return connection
-                        .select_custom_layout(target, layout.clone())
-                        .map_err(ExitFailure::from_client);
+                        .select_custom_layout(target, layout)
+                        .map_err(ExitFailure::from);
                 }
                 match layout.parse::<LayoutName>() {
                     Ok(parsed) => connection
                         .select_layout(target, parsed)
-                        .map_err(ExitFailure::from_client),
-                    Err(_) if looks_like_custom_layout(layout) => connection
-                        .select_custom_layout(target, layout.clone())
-                        .map_err(ExitFailure::from_client),
-                    Err(_) => Err(invalid_layout_failure(layout)),
+                        .map_err(ExitFailure::from),
+                    Err(_) if looks_like_custom_layout(&layout) => connection
+                        .select_custom_layout(target, layout)
+                        .map_err(ExitFailure::from),
+                    Err(_) => Err(invalid_layout_failure(&layout)),
                 }
             })
         }
@@ -468,7 +475,7 @@ fn dispatch(
                 )?;
                 connection
                     .next_layout(target)
-                    .map_err(ExitFailure::from_client)
+                    .map_err(ExitFailure::from)
             })
         }
         Command::PreviousLayout(args) => {
@@ -480,10 +487,10 @@ fn dispatch(
                 )?;
                 connection
                     .previous_layout(target)
-                    .map_err(ExitFailure::from_client)
+                    .map_err(ExitFailure::from)
             })
         }
-        Command::ResizePane(args) => run_resize_pane(args, socket_path),
+        Command::ResizePane(args) => run_resize_pane(&args, socket_path),
         Command::DisplayPanes(args) => {
             let template = args.template_command();
             run_command_resolved(socket_path, "display-panes", move |connection| {
@@ -497,7 +504,7 @@ fn dispatch(
                         template,
                         args.target_client,
                     )
-                    .map_err(ExitFailure::from_client)
+                    .map_err(ExitFailure::from)
             })
         }
         Command::ListPanes(args) => run_list_panes(args, socket_path),
@@ -526,7 +533,7 @@ fn dispatch(
                         source,
                         page_up: args.page_up,
                     })
-                    .map_err(ExitFailure::from_client)
+                    .map_err(ExitFailure::from)
             })
         }
         Command::ClockMode(args) => {
@@ -538,23 +545,23 @@ fn dispatch(
                     .transpose()?;
                 connection
                     .clock_mode(target)
-                    .map_err(ExitFailure::from_client)
+                    .map_err(ExitFailure::from)
             })
         }
-        Command::WaitPane(args) => run_wait_pane(args, socket_path),
-        Command::PaneSnapshot(args) => run_pane_snapshot(args, socket_path),
-        Command::StreamPane(args) => run_stream_pane(args, socket_path),
-        Command::CollectPaneOutput(args) => run_collect_pane_output(args, socket_path),
-        Command::Locator(args) => run_locator(args, socket_path),
-        Command::ExpectPane(args) => run_expect_pane(args, socket_path),
-        Command::FindPanes(args) => run_find_panes(args, socket_path),
-        Command::FindSessions(args) => run_find_sessions(args, socket_path),
+        Command::WaitPane(args) => run_wait_pane(&args, socket_path),
+        Command::PaneSnapshot(args) => run_pane_snapshot(&args, socket_path),
+        Command::StreamPane(args) => run_stream_pane(&args, socket_path),
+        Command::CollectPaneOutput(args) => run_collect_pane_output(&args, socket_path),
+        Command::Locator(args) => run_locator(&args, socket_path),
+        Command::ExpectPane(args) => run_expect_pane(&args, socket_path),
+        Command::FindPanes(args) => run_find_panes(&args, socket_path),
+        Command::FindSessions(args) => run_find_sessions(&args, socket_path),
         Command::BroadcastKeys(args) => run_broadcast_keys(args, socket_path),
         Command::WithSession(args) => run_with_session(args, socket_path),
         Command::SendKeys(args) => run_send_keys(args, socket_path),
         Command::BindKey(args) => run_bind_key(args, socket_path),
         Command::UnbindKey(args) => run_unbind_key(args, socket_path),
-        Command::ListCommands(args) => run_list_commands(args, socket_path),
+        Command::ListCommands(args) => run_list_commands(&args, socket_path),
         Command::ListKeys(args) => run_list_keys(args, socket_path),
         Command::SendPrefix(args) => run_send_prefix(args, socket_path),
         Command::Prompt(args) => {
@@ -650,7 +657,7 @@ fn dispatch(
                         args.raw,
                         args.bracketed,
                     )
-                    .map_err(ExitFailure::from_client)
+                    .map_err(ExitFailure::from)
             })
         }
         Command::ListBuffers(args) => {
@@ -686,7 +693,7 @@ fn dispatch(
                 )?;
                 connection
                     .clear_history(target, args.reset_hyperlinks)
-                    .map_err(ExitFailure::from_client)
+                    .map_err(ExitFailure::from)
             })
         }
         Command::DisplayMessage(args) => run_display_message(args, socket_path),
@@ -697,7 +704,7 @@ fn dispatch(
         }
         Command::RunShell(args) if args.background => {
             let (command, arguments) =
-                run_shell_command_and_arguments(args.command, args.as_commands)?;
+                run_shell_command_and_arguments(args.command, args.as_commands);
             run_command_resolved(socket_path, "run-shell", move |connection| {
                 let target = resolve_canfail_pane_target(connection, args.target.as_ref())?;
                 connection
@@ -711,7 +718,7 @@ fn dispatch(
                         args.start_directory,
                         target,
                     )
-                    .map_err(ExitFailure::from_client)
+                    .map_err(ExitFailure::from)
             })
         }
         Command::RunShell(args) => run_shell_foreground(socket_path, args),
@@ -754,7 +761,7 @@ fn run_shell_foreground(
     socket_path: &Path,
     args: crate::cli_args::RunShellArgs,
 ) -> Result<i32, ExitFailure> {
-    let (command, arguments) = run_shell_command_and_arguments(args.command, args.as_commands)?;
+    let (command, arguments) = run_shell_command_and_arguments(args.command, args.as_commands);
     let mut connection = connect(socket_path)
         .map_err(|error| ExitFailure::from_client_connect(socket_path, error))?;
     let target = resolve_canfail_pane_target(&mut connection, args.target.as_ref())?;
@@ -769,7 +776,7 @@ fn run_shell_foreground(
             args.start_directory,
             target,
         )
-        .map_err(ExitFailure::from_client)?;
+        .map_err(ExitFailure::from)?;
 
     match response {
         Response::RunShell(response) => {
@@ -786,15 +793,15 @@ fn run_shell_foreground(
 fn run_shell_command_and_arguments(
     command: Vec<String>,
     as_commands: bool,
-) -> Result<(String, Vec<String>), ExitFailure> {
+) -> (String, Vec<String>) {
     let mut command = command.into_iter();
     let Some(shell_command) = command.next() else {
-        return Ok((String::new(), Vec::new()));
+        return (String::new(), Vec::new());
     };
     if as_commands {
-        return Ok((shell_command, Vec::new()));
+        return (shell_command, Vec::new());
     }
-    Ok((shell_command, command.collect()))
+    (shell_command, command.collect())
 }
 
 /// Resolves an optional pane target spec, tolerating a target that no longer exists.
@@ -850,7 +857,7 @@ fn run_apply_parse_time_assignments(
             None,
             Some(assignments),
         )
-        .map_err(ExitFailure::from_client)?;
+        .map_err(ExitFailure::from)?;
     finish_command_success(response, "source-file")
 }
 
@@ -865,7 +872,7 @@ fn invalid_layout_failure(layout: &str) -> ExitFailure {
 }
 
 /// Whether this command may start the daemon when none is running.
-pub(super) fn command_has_start_server_flag(command: &Command) -> bool {
+pub(super) const fn command_has_start_server_flag(command: &Command) -> bool {
     match command {
         Command::Noop | Command::ApplyParseTimeAssignments(_) => false,
         Command::NewSession(_) | Command::StartServer(_) | Command::AttachSession(_) => true,
@@ -875,7 +882,7 @@ pub(super) fn command_has_start_server_flag(command: &Command) -> bool {
 }
 
 /// Whether the `web-share` arguments create a share rather than inspect or stop one.
-fn web_share_creates_share(args: &crate::cli_args::WebShareArgs) -> bool {
+const fn web_share_creates_share(args: &crate::cli_args::WebShareArgs) -> bool {
     !args.list
         && args.stop.is_none()
         && args.disconnect.is_none()
@@ -885,7 +892,7 @@ fn web_share_creates_share(args: &crate::cli_args::WebShareArgs) -> bool {
 }
 
 /// Whether this command needs the web daemon started alongside the session daemon.
-fn command_requires_web_daemon(command: &Command) -> bool {
+const fn command_requires_web_daemon(command: &Command) -> bool {
     matches!(command, Command::WebShare(args) if web_share_creates_share(args))
 }
 
@@ -929,7 +936,7 @@ fn run_source_file(
             target,
             stdin,
         )
-        .map_err(ExitFailure::from_client)?;
+        .map_err(ExitFailure::from)?;
     if let Response::Error(ErrorResponse { error }) = &response {
         if source_file_error_uses_stdout(error) {
             return Err(ExitFailure::new_stdout(
@@ -955,14 +962,14 @@ fn run_source_file(
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 mod tests {
     use super::*;
 
     #[test]
     fn run_shell_as_commands_accepts_single_command_string() {
         let (command, arguments) =
-            run_shell_command_and_arguments(vec!["display-message ok".to_owned()], true)
-                .expect("single command string is valid");
+            run_shell_command_and_arguments(vec!["display-message ok".to_owned()], true);
 
         assert_eq!(command, "display-message ok");
         assert!(arguments.is_empty());
@@ -973,8 +980,7 @@ mod tests {
         let (command, arguments) = run_shell_command_and_arguments(
             vec!["display-message ok".to_owned(), "discarded".to_owned()],
             true,
-        )
-        .expect("tmux accepts and ignores trailing -C arguments");
+        );
 
         assert_eq!(command, "display-message ok");
         assert!(arguments.is_empty());

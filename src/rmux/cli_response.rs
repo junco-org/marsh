@@ -177,7 +177,7 @@ fn unexpected_response(command_name: &str, response: &Response) -> ExitFailure {
 }
 
 /// The tmux command name a response variant belongs to, used in diagnostics.
-pub(crate) fn response_name(response: &Response) -> &'static str {
+pub(crate) const fn response_name(response: &Response) -> &'static str {
     #[allow(unreachable_patterns)]
     match response {
         Response::NewSession(_) => "new-session",
@@ -263,6 +263,7 @@ pub(crate) fn response_name(response: &Response) -> &'static str {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 mod tests {
     use super::{
         expect_command_success, queued_source_file_success_command, tmux_cli_error_message,

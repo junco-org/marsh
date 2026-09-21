@@ -162,6 +162,11 @@ use top_level::{
 const TMUX_COMPAT_OVERRIDE_ENV: &str = "RMUX_INTERNAL_INVOKED_AS_TMUX";
 
 /// Runs one `rmux` invocation from its argument vector and returns its process exit code.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one linear invocation pipeline whose ordered early-exit branches are the CLI \
+              contract; splitting it would hide that order behind helper names"
+)]
 pub(crate) fn run<I, T>(args: I) -> Result<i32, ExitFailure>
 where
     I: IntoIterator<Item = T>,
@@ -221,7 +226,7 @@ where
             if control_mode != 0 {
                 return Err(control_mode_parse_failure(error, control_mode));
             }
-            return Err(ExitFailure::from_clap(error));
+            return Err(ExitFailure::from(error));
         }
         Err(error) if error.kind() == clap::error::ErrorKind::InvalidSubcommand => {
             match parse_cold_alias_queue_after_startup(&args, error)? {
@@ -272,7 +277,7 @@ where
             &socket_path,
             startup_config.auto_start.clone(),
         )
-        .map_err(ExitFailure::from_auto_start)
+        .map_err(ExitFailure::from)
         .map_err(|error| error.with_socket_context(&socket_path))?;
         let endpoint = StartupEndpoint::prestarted(outcome);
         let selected_socket_path = endpoint.socket_path();
@@ -291,7 +296,7 @@ where
         }
         if cold_resolution.is_some() {
             cli = parse_with_runtime_resolution(&args, cold_resolution.as_ref())
-                .map_err(ExitFailure::from_clap)?;
+                .map_err(ExitFailure::from)?;
             cli.utf8 |= infer_client_utf8_from_env();
             let command_was_provided = cli.command.is_some();
             validate_top_level_invocation(&cli, command_was_provided)?;
@@ -309,7 +314,7 @@ where
             &socket_path,
             StartupOptions::new(
                 cli.no_start_server,
-                startup_config.auto_start.clone(),
+                startup_config.auto_start,
                 startup_endpoint,
             ),
             shell_command,
@@ -333,7 +338,7 @@ where
     }
     let client_terminal = client_terminal_context_from_cli(&cli);
     let commands = cli.into_command_queue();
-    dispatch_command_queue(commands, &socket_path, startup, client_terminal)
+    dispatch_command_queue(commands, &socket_path, &startup, &client_terminal)
         .map_err(|error| error.with_socket_context(&socket_path))
 }
 
@@ -374,7 +379,7 @@ fn parse_cold_alias_queue_after_startup(
     let startup_config = startup_config_from_top_level_scan(&scan, &first_command);
     let outcome =
         ensure_server_running_with_config_outcome(&socket_path, startup_config.auto_start)
-            .map_err(ExitFailure::from_auto_start)
+            .map_err(ExitFailure::from)
             .map_err(|error| error.with_socket_context(&socket_path))?;
     let endpoint = StartupEndpoint::prestarted(outcome);
     let selected_socket_path = endpoint.socket_path();
@@ -386,13 +391,13 @@ fn parse_cold_alias_queue_after_startup(
         )
     })?;
     let Some(resolution) = resolution else {
-        return Err(ExitFailure::from_clap(original_error));
+        return Err(ExitFailure::from(original_error));
     };
     if let alias_fallback::RuntimeCommandResolution::LegacyServerDispatch(exit_code) = resolution {
         return Ok(ColdAliasParseOutcome::Dispatched(exit_code));
     }
     let cli =
-        parse_with_runtime_resolution(args, Some(&resolution)).map_err(ExitFailure::from_clap)?;
+        parse_with_runtime_resolution(args, Some(&resolution)).map_err(ExitFailure::from)?;
     Ok(ColdAliasParseOutcome::Parsed(Box::new(cli), endpoint))
 }
 
@@ -433,7 +438,7 @@ fn resolve_invocation_socket_path(
     } else {
         resolve_socket_path(socket_name, socket_path)
     }
-    .map_err(ExitFailure::from_client)
+    .map_err(ExitFailure::from)
 }
 
 /// Recovers the daemon endpoint and auto-start policy of an invocation dispatched before the
@@ -448,13 +453,13 @@ fn top_level_startup(args: &[OsString]) -> Result<(PathBuf, StartupOptions), Exi
     // The scan carries `-f`, `-L`, `-S` and `-N` when it succeeds. It only fails on argument
     // shapes the top level cannot describe at all, and even then the socket selection is
     // recoverable from raw argv the same way an unknown command's is.
-    let (socket_name, socket_path) = match scan.as_ref() {
-        Some(scan) => (scan.socket_name.clone(), scan.socket_path.clone()),
-        None => {
+    let (socket_name, socket_path) = scan.as_ref().map_or_else(
+        || {
             let (name, path) = recover_socket_selection(arguments).unwrap_or_default();
             (name, path.map(PathBuf::into_os_string))
-        }
-    };
+        },
+        |scan| (scan.socket_name.clone(), scan.socket_path.clone()),
+    );
     let socket_path = resolve_invocation_socket_path(
         invoked_as_tmux(args),
         socket_name.as_deref(),
@@ -500,12 +505,12 @@ fn parse_failure_or_absent_server(
     error: clap::Error,
 ) -> Result<i32, ExitFailure> {
     if !parse_failure_should_probe_server(args, &error) {
-        return Err(ExitFailure::from_clap(error));
+        return Err(ExitFailure::from(error));
     }
 
     let Some((socket_name, socket_path)) = recover_socket_selection(args.get(1..).unwrap_or(&[]))
     else {
-        return Err(ExitFailure::from_clap(error));
+        return Err(ExitFailure::from(error));
     };
     let resolved = resolve_invocation_socket_path(
         invoked_as_tmux(args),
@@ -522,7 +527,7 @@ fn parse_failure_or_absent_server(
             )
             .map_err(|error| error.with_socket_context(&resolved))
         }
-        Ok(_) => Err(ExitFailure::from_clap(error)),
+        Ok(_) => Err(ExitFailure::from(error)),
         Err(connect_error) => Err(ExitFailure::from_client_connect(&resolved, connect_error)),
     }
 }
@@ -589,10 +594,10 @@ fn recover_socket_selection(arguments: &[OsString]) -> Option<(Option<OsString>,
                 index += 1;
             }
             value if value.starts_with("-L") && value.len() > 2 => {
-                socket_name = Some(OsString::from(&value[2..]));
+                socket_name = value.get(2..).map(OsString::from);
             }
             value if value.starts_with("-S") && value.len() > 2 => {
-                socket_path = Some(PathBuf::from(&value[2..]));
+                socket_path = value.get(2..).map(PathBuf::from);
             }
             _ => {}
         }
@@ -671,7 +676,7 @@ fn connect_with_startserver_outcome(
         });
     }
     let outcome = ensure_server_running_with_config_outcome(socket_path, config)
-        .map_err(ExitFailure::from_auto_start)?;
+        .map_err(ExitFailure::from)?;
     endpoint.record_ensured(outcome.socket_path(), outcome.provenance());
     Ok(StartServerConnection {
         connection: outcome.into_connection(),
@@ -682,22 +687,23 @@ fn connect_with_startserver_outcome(
 /// Joins a command's tokens into one shell line, quoting each when there is more than one.
 fn shell_command_text(command: Vec<String>) -> String {
     if command.len() == 1 {
-        return command.into_iter().next().expect("single shell token");
+        return command.into_iter().next().unwrap_or_default();
     }
 
     command
         .into_iter()
-        .map(shell_command_token)
+        .map(|token| shell_command_token(&token))
         .collect::<Vec<_>>()
         .join(" ")
 }
 
 /// Single-quotes one shell token, escaping any embedded single quote.
-fn shell_command_token(token: String) -> String {
+fn shell_command_token(token: &str) -> String {
     format!("'{}'", token.replace('\'', "'\\''"))
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 mod tests {
     use super::{
         command_has_start_server_flag, default_client_command, render_list_commands_line, run,

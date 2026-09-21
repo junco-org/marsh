@@ -124,6 +124,7 @@ fn source_failure_message(stdout: &[u8], stderr: &[u8]) -> String {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 mod tests {
     use super::{decode_canonical_commands, source_failure_message};
 

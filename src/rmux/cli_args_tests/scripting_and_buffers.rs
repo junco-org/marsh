@@ -15,7 +15,7 @@ fn display_message_accepts_print_target_and_hyphen_prefixed_format_text_after_se
     match cli.command.expect("parsed command") {
         super::super::Command::DisplayMessage(args) => {
             assert!(args.print);
-            assert_eq!(args.target.expect("target").to_string(), "alpha:0.1");
+            assert_eq!(args.target.expect("target"), "alpha:0.1");
             assert_eq!(args.message, vec!["-#{session_name}"]);
         }
         _ => panic!("expected DisplayMessage command"),
@@ -150,7 +150,7 @@ fn display_message_json_keeps_supported_selectors_and_format() {
     assert!(args.json);
     assert!(args.no_freeze);
     assert_eq!(args.target_client.as_deref(), Some("client"));
-    assert_eq!(args.target.expect("target").to_string(), "alpha:0.1");
+    assert_eq!(args.target.expect("target"), "alpha:0.1");
     assert_eq!(args.format.as_deref(), Some("#{pane_id}"));
 }
 
@@ -447,7 +447,7 @@ fn if_shell_preserves_mouse_target_for_server_queue() {
 
     match cli.command.expect("parsed command") {
         super::super::Command::IfShell(args) => {
-            assert_eq!(args.target.expect("target").raw(), "{mouse}")
+            assert_eq!(args.target.expect("target").raw(), "{mouse}");
         }
         _ => panic!("expected IfShell command"),
     }
@@ -508,7 +508,7 @@ fn wait_for_accepts_all_modes() {
     let cli = parse_args(&["wait-for", "channel"]).unwrap();
     match cli.command.expect("parsed command") {
         super::super::Command::WaitFor(args) => {
-            assert_eq!(args.mode(), rmux_proto::WaitForMode::Wait)
+            assert_eq!(args.mode(), rmux_proto::WaitForMode::Wait);
         }
         _ => panic!("expected WaitFor command"),
     }
@@ -535,7 +535,7 @@ fn link_window_accepts_tmux_position_and_target_flags() {
             assert!(args.detached);
             assert!(args.kill_target);
             assert_eq!(args.source.as_ref().expect("source").to_string(), "alpha:0");
-            assert_eq!(target_text(&args.target), "beta:1");
+            assert_eq!(target_text(args.target.as_ref()), "beta:1");
         }
         _ => panic!("expected LinkWindow command"),
     }
@@ -549,7 +549,7 @@ fn link_window_accepts_tmux_position_and_target_flags() {
             assert!(!args.detached);
             assert!(!args.kill_target);
             assert_eq!(args.source.as_ref().expect("source").to_string(), "alpha:0");
-            assert_eq!(target_text(&args.target), "beta:1");
+            assert_eq!(target_text(args.target.as_ref()), "beta:1");
         }
         _ => panic!("expected LinkWindow command"),
     }
@@ -562,7 +562,7 @@ fn link_window_accepts_implicit_source() {
     match cli.command.expect("parsed command") {
         super::super::Command::LinkWindow(args) => {
             assert!(args.source.is_none());
-            assert_eq!(target_text(&args.target), "beta:1");
+            assert_eq!(target_text(args.target.as_ref()), "beta:1");
         }
         _ => panic!("expected LinkWindow command"),
     }
@@ -575,7 +575,7 @@ fn unlink_window_accepts_target_and_kill_if_last_flag() {
     match cli.command.expect("parsed command") {
         super::super::Command::UnlinkWindow(args) => {
             assert!(args.kill_if_last);
-            assert_eq!(target_text(&args.target), "alpha:0");
+            assert_eq!(target_text(args.target.as_ref()), "alpha:0");
         }
         _ => panic!("expected UnlinkWindow command"),
     }
@@ -587,7 +587,7 @@ fn link_and_unlink_window_aliases_dispatch_to_the_window_commands() {
     match cli.command.expect("parsed command") {
         super::super::Command::LinkWindow(args) => {
             assert_eq!(args.source.as_ref().expect("source").to_string(), "alpha:0");
-            assert_eq!(target_text(&args.target), "beta:1");
+            assert_eq!(target_text(args.target.as_ref()), "beta:1");
         }
         _ => panic!("expected LinkWindow command"),
     }
@@ -596,7 +596,7 @@ fn link_and_unlink_window_aliases_dispatch_to_the_window_commands() {
     match cli.command.expect("parsed command") {
         super::super::Command::LinkWindow(args) => {
             assert_eq!(args.source.as_ref().expect("source").to_string(), "alpha:0");
-            assert_eq!(target_text(&args.target), "beta:1");
+            assert_eq!(target_text(args.target.as_ref()), "beta:1");
         }
         _ => panic!("expected LinkWindow command"),
     }
@@ -604,7 +604,7 @@ fn link_and_unlink_window_aliases_dispatch_to_the_window_commands() {
     let cli = parse_args(&["unlinkw", "-t", "alpha:0"]).unwrap();
     match cli.command.expect("parsed command") {
         super::super::Command::UnlinkWindow(args) => {
-            assert_eq!(target_text(&args.target), "alpha:0");
+            assert_eq!(target_text(args.target.as_ref()), "alpha:0");
             assert!(!args.kill_if_last);
         }
         _ => panic!("expected UnlinkWindow command"),

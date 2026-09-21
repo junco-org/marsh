@@ -43,7 +43,11 @@ pub(crate) struct CapturePaneArgs {
 
 impl CapturePaneArgs {
     /// Accepts the parsed arguments unchanged; `capture-pane` has no cross-flag constraints.
-    pub(crate) fn validate(self) -> Result<Self, clap::Error> {
+    #[allow(
+        clippy::unnecessary_wraps,
+        reason = "queue dispatch uses `and_then(CapturePaneArgs::validate)` alongside fallible validators"
+    )]
+    pub(crate) const fn validate(self) -> Result<Self, clap::Error> {
         Ok(self)
     }
 }

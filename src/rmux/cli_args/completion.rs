@@ -1,6 +1,10 @@
 use clap::{ArgAction, Args};
 use rmux_core::command_parser::CommandEntry;
 
+#[allow(
+    clippy::wildcard_imports,
+    reason = "the completion tree mirrors the parent module's entire argument-type surface"
+)]
 use super::*;
 
 /// Builds the full `rmux` command tree used only to generate shell completions.
@@ -84,6 +88,10 @@ pub(crate) fn completion_command() -> clap::Command {
 }
 
 /// Maps one command-surface entry to its completion subcommand, including its alias.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one flat table mapping every command name to its argument type"
+)]
 fn completion_subcommand(entry: &'static CommandEntry) -> clap::Command {
     let mut command = match entry.name {
         "new-session" => completion_typed_subcommand::<NewSessionArgs>(entry.name),
@@ -216,6 +224,10 @@ fn completion_subcommand(entry: &'static CommandEntry) -> clap::Command {
                 .value_name("tmux-shim")
                 .value_parser(["tmux-shim"]),
         ),
+        #[allow(
+            clippy::panic,
+            reason = "an unmapped command surface entry is a build-time bug the surface test catches"
+        )]
         missing => panic!("completion tree missing command mapping for {missing}"),
     };
     if let Some(alias) = entry.alias {

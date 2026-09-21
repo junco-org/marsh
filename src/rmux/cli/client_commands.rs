@@ -202,7 +202,7 @@ fn rmux_socket_path_from_env(value: &OsStr) -> Option<PathBuf> {
     let value = value.to_string_lossy();
     let path = value
         .split_once(',')
-        .map_or(value.as_ref(), |(path, _)| path);
+        .map_or_else(|| value.as_ref(), |(path, _)| path);
     (!path.is_empty()).then(|| PathBuf::from(path))
 }
 
@@ -261,10 +261,10 @@ pub(super) fn run_control_mode(
             client_terminal_context_from_cli(cli),
             cli.control_command_lines(),
         )
-        .map_err(ExitFailure::from_client)?
+        .map_err(ExitFailure::from)?
     {
         ControlTransition::Upgraded(upgrade) => {
-            let control_result = drive_control_mode(upgrade, &[]).map_err(ExitFailure::from_client);
+            let control_result = drive_control_mode(upgrade, &[]).map_err(ExitFailure::from);
             let cleanup_result =
                 shutdown_started_empty_server_at(&endpoint.socket_path(), provenance)
                     .map_err(|error| ExitFailure::new(1, error.to_string()));
@@ -312,7 +312,7 @@ pub(super) fn run_switch_client_on_connection(
 ) -> Result<i32, ExitFailure> {
     let response = connection
         .switch_client_with_target_selector(request)
-        .map_err(ExitFailure::from_client)?;
+        .map_err(ExitFailure::from)?;
     expect_command_success(response, "switch-client")?;
     Ok(0)
 }
@@ -364,7 +364,7 @@ pub(super) fn run_list_clients(
                 reversed: args.reversed,
                 target_session,
             })
-            .map_err(ExitFailure::from_client)?;
+            .map_err(ExitFailure::from)?;
         return match response {
             Response::ListClients(response) => write_list_clients_json(&response),
             Response::Error(ErrorResponse { error }) => Err(ExitFailure::new(1, error.to_string())),
@@ -386,7 +386,7 @@ pub(super) fn run_list_clients(
                 reversed: args.reversed,
                 target_session,
             })
-            .map_err(ExitFailure::from_client)
+            .map_err(ExitFailure::from)
     })
 }
 
@@ -410,7 +410,7 @@ pub(super) fn run_detach_client(
             kill_on_detach: args.kill_on_detach,
             exec_command: args.exec_command,
         })
-        .map_err(ExitFailure::from_client)?;
+        .map_err(ExitFailure::from)?;
     finish_command_success(response, "detach-client")
 }
 
@@ -432,6 +432,7 @@ pub(super) fn optional_client_flags(flags: Vec<String>) -> Option<Vec<String>> {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 mod tests {
     use std::ffi::OsStr;
     use std::path::Path;

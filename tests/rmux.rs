@@ -582,7 +582,7 @@ async fn the_four_boundaries_are_separate_and_ordered() {
     let mut bytes = Vec::new();
     while let Ok(Some(item)) = stdout.recv().await {
         if let rmux_core::events::OutputCursorItem::Event(event) = item {
-            bytes.extend_from_slice(&event.bytes());
+            bytes.extend_from_slice(event.bytes());
         }
     }
     assert_eq!(bytes, b"done");
@@ -820,7 +820,7 @@ async fn stopping_the_daemon_releases_the_seed_even_with_a_clone_outstanding() {
         rmux,
         io,
         seed: _,
-        _scratch,
+        _scratch: scratch,
     } = host;
     drop(io);
     rmux.expect("the host is running")
@@ -857,7 +857,7 @@ async fn stopping_the_daemon_releases_the_seed_even_with_a_clone_outstanding() {
     // Still in scope for the whole run, and still harmless: a retained handle never pinned the
     // seed, before or after the reopen.
     drop(retained);
-    drop(_scratch);
+    drop(scratch);
 }
 
 /// The same release happens when the daemon is stopped from outside rather than by this host.
@@ -877,7 +877,9 @@ async fn an_external_stop_releases_the_seed_too() {
         .to_path_buf();
     let retained = host.io.clone();
     let Host {
-        rmux, _scratch, ..
+        rmux,
+        _scratch: scratch,
+        ..
     } = host;
     let rmux = rmux.expect("the host is running");
     let socket = rmux.socket_path().to_path_buf();
@@ -935,7 +937,7 @@ async fn an_external_stop_releases_the_seed_too() {
         .await
         .expect("shut the reopened frontend down");
     drop(retained);
-    drop(_scratch);
+    drop(scratch);
 }
 
 /// A workload that cannot be composed is refused having allocated nothing.

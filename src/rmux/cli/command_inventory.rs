@@ -13,7 +13,7 @@ use crate::cli_args::ListCommandsArgs;
 
 /// Runs `list-commands`, rendering the shared command inventory for the target socket.
 pub(super) fn run_list_commands(
-    args: ListCommandsArgs,
+    args: &ListCommandsArgs,
     socket_path: &Path,
 ) -> Result<i32, ExitFailure> {
     let socket_path = socket_path.to_string_lossy();
@@ -27,6 +27,7 @@ pub(super) fn run_list_commands(
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 mod tests {
     use super::*;
 

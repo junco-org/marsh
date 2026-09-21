@@ -9,6 +9,25 @@
 //! What remains local is metadata a *server* legitimately probes and the engine does not model:
 //! the terminal's name, the foreground process group of whatever the shell is currently running,
 //! the geometry rmux last asked for, and the profile the pane was created with.
+//!
+//! Pane creation itself is serialized, one transaction against the next.
+//!
+//! A pane is created in three steps — plan it with the handler's state locked, open its job with
+//! that lock *released*, commit it with the lock taken again — because opening a job awaits a
+//! shell build, a snapshot creation and the facade's admission lock, and awaiting any of those
+//! under the daemon's request mutex stalls every other session and inverts against the adoption
+//! path, which takes admission first and handler state second.
+//!
+//! Releasing the state lock mid-transaction is what makes this necessary. Two creations that
+//! interleave would each have taken a rollback snapshot of a session the other has since mutated,
+//! so the first failure to roll back would discard the second's window. Serializing the whole
+//! transaction removes that case outright, and costs nothing that matters: creating a pane was
+//! already serialized by the state mutex it no longer holds, while every other request, the
+//! observation consumer and output publication now run freely alongside it.
+//! The lock itself lives on the facade, as `ShellIo::pane_creation_transaction`, so it is per
+//! daemon rather than per process: two independent daemons share no session model and have
+//! nothing to roll back over each other, and a process-wide lock would make every one of them
+//! queue behind every other.
 
 #[cfg(unix)]
 use std::os::fd::BorrowedFd;
@@ -28,25 +47,6 @@ use crate::terminal::{validate_process_command, TerminalProfile};
 const GRACEFUL_TERMINATION_TIMEOUT: Duration = Duration::from_millis(100);
 /// How long a forced stop is waited on before the pane stops caring.
 const HARD_TERMINATION_TIMEOUT: Duration = Duration::from_millis(500);
-
-/// Serializes one pane-creation transaction against the next.
-///
-/// A pane is created in three steps — plan it with the handler's state locked, open its job with
-/// that lock *released*, commit it with the lock taken again — because opening a job awaits a
-/// shell build, a snapshot creation and the facade's admission lock, and awaiting any of those
-/// under the daemon's request mutex stalls every other session and inverts against the adoption
-/// path, which takes admission first and handler state second.
-///
-/// Releasing the state lock mid-transaction is what makes this necessary. Two creations that
-/// interleave would each have taken a rollback snapshot of a session the other has since mutated,
-/// so the first failure to roll back would discard the second's window. Serializing the whole
-/// transaction removes that case outright, and costs nothing that matters: creating a pane was
-/// already serialized by the state mutex it no longer holds, while every other request, the
-/// observation consumer and output publication now run freely alongside it.
-/// The lock itself lives on the facade, as `ShellIo::pane_creation_transaction`, so it is per
-/// daemon rather than per process: two independent daemons share no session model and have
-/// nothing to roll back over each other, and a process-wide lock would make every one of them
-/// queue behind every other.
 
 /// The surface a newly opened pane job is routed to.
 ///

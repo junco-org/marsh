@@ -43,7 +43,7 @@ use serial_test::serial;
 use tempfile::TempDir;
 
 /// How long a managed CLI invocation may take before a test declares it hung.
-const TIMEOUT: Duration = Duration::from_secs(60);
+const TIMEOUT: Duration = Duration::from_mins(1);
 
 /// A seed, a bound host, and the socket the CLI talks to it over.
 struct CliHost {
@@ -147,7 +147,7 @@ impl CliHost {
     }
 
     /// Job identities the daemon currently has, which is where an owned session's pane shows up.
-    async fn job_ids(&self) -> Vec<String> {
+    fn job_ids(&self) -> Vec<String> {
         let mut ids: Vec<String> = self.io.jobs().iter().map(|job| job.id.to_string()).collect();
         ids.sort();
         ids
@@ -196,7 +196,7 @@ async fn publish(io: &ShellIo, cmd: &str) {
 #[serial]
 async fn a_managed_command_publishes_and_leaves_no_session_behind() {
     let host = CliHost::new().await;
-    let before = host.job_ids().await;
+    let before = host.job_ids();
 
     let outcome = host
         .run_cli(&["-c", "printf gated > cli-file"], b"")
@@ -213,7 +213,7 @@ async fn a_managed_command_publishes_and_leaves_no_session_behind() {
         "the bytes in the seed are the bytes the command wrote"
     );
     assert_eq!(
-        host.job_ids().await,
+        host.job_ids(),
         before,
         "the owned `marsh-io-` session is disposed of before the invocation returns"
     );

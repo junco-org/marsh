@@ -80,7 +80,7 @@ pub(super) fn pane_snapshot(
 ) -> Result<PaneSnapshotResponse, ExitFailure> {
     match connection
         .pane_snapshot_ref(target)
-        .map_err(ExitFailure::from_client)?
+        .map_err(ExitFailure::from)?
     {
         Response::PaneSnapshot(snapshot) => Ok(snapshot),
         Response::Error(error) => Err(ExitFailure::new(
@@ -213,11 +213,10 @@ fn rendered_row(snapshot: &PaneSnapshotResponse, row: usize) -> RenderedRow {
         if cell.padding {
             continue;
         }
-        let cell_start = text.len();
         text.push_str(&cell.text);
         let width = usize::from(cell.width.max(1));
         let cell_end_col = relative_col.saturating_add(width).min(cols);
-        coords.extend(text[cell_start..].bytes().map(|_| ByteCoord {
+        coords.extend(cell.text.bytes().map(|_| ByteCoord {
             start_col: relative_col,
             end_col: cell_end_col,
         }));
@@ -232,7 +231,7 @@ fn literal_match_ranges(haystack: &str, needle: &str) -> Vec<(usize, usize)> {
     let mut ranges = Vec::new();
     let mut search_start = 0;
     while search_start <= haystack.len() {
-        let Some(relative) = haystack[search_start..].find(needle) else {
+        let Some(relative) = haystack.get(search_start..).and_then(|tail| tail.find(needle)) else {
             break;
         };
         let start = search_start + relative;
@@ -245,9 +244,9 @@ fn literal_match_ranges(haystack: &str, needle: &str) -> Vec<(usize, usize)> {
 
 /// Returns the byte index just past the character starting at `index`.
 fn next_char_boundary_after(value: &str, index: usize) -> usize {
-    value[index..]
-        .chars()
-        .next()
+    value
+        .get(index..)
+        .and_then(|tail| tail.chars().next())
         .map_or(value.len() + 1, |character| index + character.len_utf8())
 }
 
@@ -284,7 +283,7 @@ pub(super) fn stdout_closed() -> bool {
     // SAFETY: `pollfd` points to one initialized pollfd entry that remains
     // valid for the duration of the call; timeout 0 makes this a non-blocking
     // status probe of stdout.
-    let ready = unsafe { libc::poll(&mut pollfd, 1, 0) };
+    let ready = unsafe { libc::poll(&raw mut pollfd, 1, 0) };
     ready > 0 && pollfd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0
 }
 
@@ -473,7 +472,7 @@ fn pane_id_for_slot(
             Some(target.window_index()),
             Some("#{pane_index}\t#{pane-base-index}\t#{pane_id}\n".to_owned()),
         )
-        .map_err(ExitFailure::from_client)?;
+        .map_err(ExitFailure::from)?;
     let output = match response {
         Response::ListPanes(response) => response.output,
         Response::Error(error) => {
@@ -526,7 +525,7 @@ fn pane_process_state_for_slot(
                     .to_owned(),
             ),
         )
-        .map_err(ExitFailure::from_client)?;
+        .map_err(ExitFailure::from)?;
     let output = match response {
         Response::ListPanes(response) => response.output,
         Response::Error(_) => {
@@ -564,6 +563,10 @@ fn pane_process_state_for_slot(
 }
 
 /// Reads pane liveness by pane id, treating a vanished pane as exited.
+#[allow(
+    clippy::literal_string_with_formatting_args,
+    reason = "`#{pane_id}` and friends are tmux format placeholders sent over the wire, not Rust format arguments"
+)]
 fn pane_process_state_for_id(
     connection: &mut Connection,
     session_name: &rmux_proto::SessionName,
@@ -575,7 +578,7 @@ fn pane_process_state_for_id(
             None,
             Some("#{pane_id}\t#{pane_dead}\t#{pane_dead_status}\t#{pane_dead_signal}\n".to_owned()),
         )
-        .map_err(ExitFailure::from_client)?;
+        .map_err(ExitFailure::from)?;
     let output = match response {
         Response::ListPanes(response) => response.output,
         Response::Error(_) => {
@@ -625,6 +628,7 @@ fn parse_i32_field(value: Option<&str>) -> Option<i32> {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 mod tests {
     use rmux_proto::{PaneSnapshotCell, PaneSnapshotCursor, PaneSnapshotResponse};
 

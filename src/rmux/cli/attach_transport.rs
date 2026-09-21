@@ -42,7 +42,11 @@ struct AttachClientCapabilities {
 impl QueuedAttachSession {
     /// Takes over the terminal for the deferred upgrade and returns the attach exit code.
     pub(super) fn run(self) -> Result<i32, ExitFailure> {
-        run_attach_upgrade(self.upgrade, self.capabilities)
+        let Self {
+            upgrade,
+            capabilities,
+        } = self;
+        run_attach_upgrade(upgrade, &capabilities)
     }
 }
 
@@ -88,7 +92,7 @@ pub(super) fn queued_attach_session_is_active(socket_path: &Path) -> Result<bool
             reversed: false,
             target_session: None,
         })
-        .map_err(ExitFailure::from_client)?;
+        .map_err(ExitFailure::from)?;
     match response {
         Response::ListClients(response) => {
             let requester_pid = std::process::id().to_string();
@@ -111,7 +115,7 @@ pub(super) fn attach_with_connection(
     require_attach_terminal()?;
     let (transition, capabilities) = begin_attach(connection, request)?;
     match transition {
-        AttachTransition::Upgraded(upgrade) => run_attach_upgrade(upgrade, capabilities),
+        AttachTransition::Upgraded(upgrade) => run_attach_upgrade(upgrade, &capabilities),
         AttachTransition::Rejected(response) => {
             expect_command_success(response, "attach-session")?;
             Ok(0)
@@ -132,14 +136,14 @@ fn begin_attach(
 ) -> Result<(AttachTransition, AttachClientCapabilities), ExitFailure> {
     let resize_geometry = connection
         .supports_capability(CAPABILITY_ATTACH_RESIZE_GEOMETRY)
-        .map_err(ExitFailure::from_client)?;
+        .map_err(ExitFailure::from)?;
     let render = connection
         .supports_capability(CAPABILITY_ATTACH_RENDER)
-        .map_err(ExitFailure::from_client)?;
+        .map_err(ExitFailure::from)?;
     #[cfg(windows)]
     let windows_console_key = connection
         .supports_capability(CAPABILITY_ATTACH_WINDOWS_CONSOLE_KEY)
-        .map_err(ExitFailure::from_client)?;
+        .map_err(ExitFailure::from)?;
     let mut advertised = Vec::new();
     if render {
         advertised.push(CAPABILITY_ATTACH_RENDER.to_owned());
@@ -153,11 +157,11 @@ fn begin_attach(
             .begin_attach_with_capabilities(AttachSessionExt3Request::from_ext2(
                 request, advertised,
             ))
-            .map_err(ExitFailure::from_client)?
+            .map_err(ExitFailure::from)?
     } else {
         connection
             .begin_attach_with_target_spec(request)
-            .map_err(ExitFailure::from_client)?
+            .map_err(ExitFailure::from)?
     };
     Ok((
         transition,
@@ -172,9 +176,9 @@ fn begin_attach(
 /// Drives the upgraded stream as an attached terminal, honoring negotiated capabilities.
 fn run_attach_upgrade(
     upgrade: AttachSessionUpgrade,
-    capabilities: AttachClientCapabilities,
+    capabilities: &AttachClientCapabilities,
 ) -> Result<i32, ExitFailure> {
-    let AttachClientCapabilities {
+    let &AttachClientCapabilities {
         resize_geometry,
         #[cfg(windows)]
         windows_console_key,
@@ -208,13 +212,13 @@ fn attach_terminal_exit_failure(error: ClientError) -> ExitFailure {
     if attach_terminal_failed_because_stdio_is_not_terminal(&error) {
         ExitFailure::new(1, ATTACH_TERMINAL_REQUIRED_MESSAGE)
     } else {
-        ExitFailure::from_client(error)
+        ExitFailure::from(error)
     }
 }
 
 /// Reports whether the attach failed because stdio is not a terminal.
 #[cfg(unix)]
-fn attach_terminal_failed_because_stdio_is_not_terminal(error: &ClientError) -> bool {
+const fn attach_terminal_failed_because_stdio_is_not_terminal(error: &ClientError) -> bool {
     matches!(
         error,
         ClientError::Attach(AttachError::Termios(errno))

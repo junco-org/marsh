@@ -53,7 +53,9 @@ pub(in crate::cli::config_commands) fn resolve_show_options_scope(
             }
             Ok(ShowOptionsScope::CurrentWindow)
         }
-        (false, true, _) if args.global && hook.is_some() => show_pane_scope(args.target.as_ref()),
+        (false, true, _) if args.global && hook.is_some() => {
+            Ok(show_pane_scope(args.target.as_ref()))
+        }
         (false, true, _) if args.global => show_global_pane_options_scope(args),
         (false, true, Some(target)) => {
             if let Some(name) = args.name.as_deref() {
@@ -85,16 +87,18 @@ pub(in crate::cli::config_commands) fn resolve_show_options_scope(
             OptionScopeSelector::SessionGlobal
         }
         .into()),
-        (false, false, Some(target)) if hook.is_some() => Ok(ShowOptionsScope::Unresolved {
-            target: target.clone(),
-            kind: hook_scope_kind(hook.expect("hook checked above")),
-        }),
-        (false, false, Some(target)) => show_options_scope_for_target(target, args.name.as_deref()),
+        (false, false, Some(target)) => match hook {
+            Some(hook) => Ok(ShowOptionsScope::Unresolved {
+                target: target.clone(),
+                kind: hook_scope_kind(hook),
+            }),
+            None => show_options_scope_for_target(target, args.name.as_deref()),
+        },
         (false, false, None) if force_window => Ok(ShowOptionsScope::CurrentWindow),
-        (false, false, None) if hook.is_some() => {
-            Ok(current_hook_scope(hook.expect("hook checked above")))
-        }
-        (false, false, None) => Ok(ShowOptionsScope::CurrentSession),
+        (false, false, None) => Ok(match hook {
+            Some(hook) => current_hook_scope(hook),
+            None => ShowOptionsScope::CurrentSession,
+        }),
         (true, true, _) => unreachable!("clap scope group prevents -w and -p together"),
     }
 }
@@ -157,7 +161,7 @@ fn show_global_pane_options_scope(args: &ShowOptionsArgs) -> Result<ShowOptionsS
     if let Some(name) = args.name.as_deref() {
         match rmux_core::resolve_option_name(name) {
             Ok(query) if query.is_user() || query.supports_scope(&pane_scope) => {
-                return show_pane_scope(args.target.as_ref());
+                return Ok(show_pane_scope(args.target.as_ref()));
             }
             Ok(_) => {
                 return Ok(rmux_core::default_global_scope_for_option_name(name)
@@ -168,17 +172,17 @@ fn show_global_pane_options_scope(args: &ShowOptionsArgs) -> Result<ShowOptionsS
         }
     }
 
-    show_pane_scope(args.target.as_ref())
+    Ok(show_pane_scope(args.target.as_ref()))
 }
 
 /// Yields the given target's pane scope, or the client's current pane when no target was named.
-fn show_pane_scope(target: Option<&TargetSpec>) -> Result<ShowOptionsScope, ExitFailure> {
+fn show_pane_scope(target: Option<&TargetSpec>) -> ShowOptionsScope {
     match target {
-        Some(target) => Ok(ShowOptionsScope::Unresolved {
+        Some(target) => ShowOptionsScope::Unresolved {
             target: target.clone(),
             kind: UnresolvedShowOptionsScope::Pane,
-        }),
-        None => Ok(ShowOptionsScope::CurrentPane),
+        },
+        None => ShowOptionsScope::CurrentPane,
     }
 }
 
@@ -286,12 +290,14 @@ fn show_named_scope_fallback(
 
 /// Reports whether the named option may be read at `scope`, treating unknown names as unsupported.
 fn option_supports_show_scope(name: &str, scope: &OptionScopeSelector) -> bool {
-    rmux_core::resolve_option_name(name)
-        .map(|query| query.supports_scope(scope))
-        .unwrap_or(false)
+    rmux_core::resolve_option_name(name).is_ok_and(|query| query.supports_scope(scope))
 }
 
 /// Builds a throwaway pane scope used only to test whether an option is pane scoped.
+#[allow(
+    clippy::expect_used,
+    reason = "a fixed literal session name is valid by construction"
+)]
 fn dummy_pane_scope() -> OptionScopeSelector {
     OptionScopeSelector::Pane(PaneTarget::with_window(
         SessionName::new("show-scope").expect("valid session name"),
@@ -311,7 +317,7 @@ fn show_options_hook_name(value: &str) -> Option<rmux_proto::HookName> {
 }
 
 /// Maps a hook to the global scope its options live in, either session or window global.
-fn global_hook_option_scope(hook: rmux_proto::HookName) -> OptionScopeSelector {
+const fn global_hook_option_scope(hook: rmux_proto::HookName) -> OptionScopeSelector {
     match rmux_core::hook_global_root(hook) {
         rmux_core::HookGlobalRoot::Session => OptionScopeSelector::SessionGlobal,
         rmux_core::HookGlobalRoot::Window => OptionScopeSelector::WindowGlobal,
@@ -319,6 +325,10 @@ fn global_hook_option_scope(hook: rmux_proto::HookName) -> OptionScopeSelector {
 }
 
 /// Reports whether a hook naturally resolves against a session, window or pane target.
+#[allow(
+    clippy::expect_used,
+    reason = "a fixed literal session name is valid by construction"
+)]
 fn hook_scope_kind(hook: rmux_proto::HookName) -> UnresolvedShowOptionsScope {
     let target = Target::Pane(PaneTarget::with_window(
         SessionName::new("show-hook-scope").expect("valid session name"),

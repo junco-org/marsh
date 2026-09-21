@@ -13,7 +13,7 @@ pub(super) fn resolve_current_session_target(
 ) -> Result<rmux_proto::SessionName, ExitFailure> {
     match connection
         .resolve_target(None, ResolveTargetType::Session, false, false)
-        .map_err(ExitFailure::from_client)?
+        .map_err(ExitFailure::from)?
     {
         Response::ResolveTarget(response) => match response.target {
             rmux_proto::Target::Session(session_name) => Ok(session_name),
@@ -41,7 +41,7 @@ pub(super) fn list_session_names(
             sort_order: None,
             reversed: false,
         })
-        .map_err(ExitFailure::from_client)?;
+        .map_err(ExitFailure::from)?;
     let output = expect_command_output(&response, "list-sessions")?;
     String::from_utf8_lossy(output.stdout())
         .lines()
@@ -134,16 +134,15 @@ pub(super) fn resolve_window_target_or_current(
     target: Option<&TargetSpec>,
     command_name: &str,
 ) -> Result<rmux_proto::WindowTarget, ExitFailure> {
-    match target {
-        Some(target) => resolve_window_target_spec(connection, target, false),
-        None => {
-            let pane = resolve_current_pane_target(connection, command_name)?;
-            Ok(rmux_proto::WindowTarget::with_window(
-                pane.session_name().clone(),
-                pane.window_index(),
-            ))
-        }
+    if let Some(target) = target {
+        return resolve_window_target_spec(connection, target, false);
     }
+
+    let pane = resolve_current_pane_target(connection, command_name)?;
+    Ok(rmux_proto::WindowTarget::with_window(
+        pane.session_name().clone(),
+        pane.window_index(),
+    ))
 }
 
 /// Resolves an optional window spec as an index, defaulting to the current session's window.
@@ -191,7 +190,7 @@ pub(super) fn resolve_canfail_pane_target_spec(
             false,
             false,
         )
-        .map_err(ExitFailure::from_client)?;
+        .map_err(ExitFailure::from)?;
     match response {
         Response::ResolveTarget(response) => match response.target {
             rmux_proto::Target::Pane(target) => Ok(Some(target)),
@@ -229,16 +228,15 @@ pub(super) fn resolve_existing_window_target_or_current(
     target: Option<&TargetSpec>,
     command_name: &str,
 ) -> Result<rmux_proto::WindowTarget, ExitFailure> {
-    match target {
-        Some(target) => resolve_existing_window_target_spec(connection, target),
-        None => {
-            let pane = resolve_current_pane_target(connection, command_name)?;
-            Ok(rmux_proto::WindowTarget::with_window(
-                pane.session_name().clone(),
-                pane.window_index(),
-            ))
-        }
+    if let Some(target) = target {
+        return resolve_existing_window_target_spec(connection, target);
     }
+
+    let pane = resolve_current_pane_target(connection, command_name)?;
+    Ok(rmux_proto::WindowTarget::with_window(
+        pane.session_name().clone(),
+        pane.window_index(),
+    ))
 }
 
 /// Resolves an optional pane spec, falling back to the client's current pane.
@@ -288,7 +286,7 @@ pub(super) fn resolve_target_spec(
     let raw = super::claude_namespace::rewrite_target(target.raw());
     let response = connection
         .resolve_target(Some(raw), target_type, window_index, prefer_unattached)
-        .map_err(ExitFailure::from_client)?;
+        .map_err(ExitFailure::from)?;
     match response {
         Response::ResolveTarget(response) => Ok(response.target),
         Response::Error(ErrorResponse { error }) => {
@@ -391,7 +389,7 @@ fn window_target_lookup_token(raw_target: &str) -> &str {
 }
 
 /// Names the target kind a `resolve-target` response carried, for mismatch diagnostics.
-pub(super) fn response_name_for_target(target: &rmux_proto::Target) -> &'static str {
+pub(super) const fn response_name_for_target(target: &rmux_proto::Target) -> &'static str {
     match target {
         rmux_proto::Target::Session(_) => "session target",
         rmux_proto::Target::Window(_) => "window target",
@@ -419,13 +417,12 @@ pub(super) fn resolve_session_target_or_current(
     target: Option<&TargetSpec>,
     command_name: &str,
 ) -> Result<rmux_proto::SessionName, ExitFailure> {
-    match target {
-        Some(target) => resolve_session_target_spec(connection, target, false),
-        None => {
-            let _ = command_name;
-            resolve_current_session_target(connection)
-        }
+    if let Some(target) = target {
+        return resolve_session_target_spec(connection, target, false);
     }
+
+    let _ = command_name;
+    resolve_current_session_target(connection)
 }
 
 /// Asks the server for the client's current pane, reporting misses as `can't find pane`.
@@ -435,7 +432,7 @@ pub(super) fn resolve_current_pane_target(
 ) -> Result<rmux_proto::PaneTarget, ExitFailure> {
     match connection
         .resolve_target(None, ResolveTargetType::Pane, false, false)
-        .map_err(ExitFailure::from_client)?
+        .map_err(ExitFailure::from)?
     {
         Response::ResolveTarget(response) => match response.target {
             rmux_proto::Target::Pane(target) => Ok(target),
@@ -456,6 +453,7 @@ pub(super) fn resolve_current_pane_target(
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 mod tests {
     use super::*;
 

@@ -484,11 +484,9 @@ async fn supervise(job: PipeJob) {
         Some(PipeStop::Discard) => discarded(command.wait().await, &text),
         None => publication(command.wait().await, &text),
     };
-    if let Err(outcome) = closed_tx.send(outcome) {
-        // Nobody is waiting on this close, so a refusal is recorded instead of raised.
-        if let Err(error) = outcome {
-            tracing::warn!("{error}");
-        }
+    // Nobody is waiting on this close, so a refusal is recorded instead of raised.
+    if let Err(Err(error)) = closed_tx.send(outcome) {
+        tracing::warn!("{error}");
     }
 
     // Drained after the verdict is delivered, not before: a `-I` forwarder writing into a busy

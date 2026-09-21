@@ -46,7 +46,7 @@ pub(crate) fn run_with_session(
         match child.try_wait() {
             Ok(Some(status)) => {
                 if args.kill_on_owner_exit {
-                    kill_owned_session(&mut connection, args.session_name.clone())?;
+                    kill_owned_session(&mut connection, args.session_name)?;
                 } else {
                     release_lease(&mut connection, args.session_name, lease.token)?;
                 }
@@ -95,7 +95,7 @@ fn create_lease(
 ) -> Result<Lease, ExitFailure> {
     match connection
         .create_session_lease(session_name, ttl_millis)
-        .map_err(ExitFailure::from_client)?
+        .map_err(ExitFailure::from)?
     {
         Response::CreateSessionLease(response) => Ok(Lease {
             token: response.token,
@@ -123,7 +123,7 @@ fn renew_lease(
 ) -> Result<(), ExitFailure> {
     match connection
         .renew_session_lease(session_name, token, ttl_millis)
-        .map_err(ExitFailure::from_client)?
+        .map_err(ExitFailure::from)?
     {
         Response::RenewSessionLease(response) if response.renewed => Ok(()),
         Response::RenewSessionLease(_) => Err(ExitFailure::new(1, "with-session lease was lost")),
@@ -149,7 +149,7 @@ fn release_lease(
 ) -> Result<(), ExitFailure> {
     match connection
         .release_session_lease(session_name, token)
-        .map_err(ExitFailure::from_client)?
+        .map_err(ExitFailure::from)?
     {
         Response::ReleaseSessionLease(response) if response.released => Ok(()),
         Response::ReleaseSessionLease(_) => Err(ExitFailure::new(
@@ -182,7 +182,7 @@ fn kill_owned_session(
             clear_alerts: false,
             kill_group: false,
         })
-        .map_err(ExitFailure::from_client)?
+        .map_err(ExitFailure::from)?
     {
         Response::KillSession(_) => Ok(()),
         Response::Error(error)

@@ -41,8 +41,7 @@ pub(crate) fn tmux_cli_error_message(command_name: &str, error: &RmuxError) -> S
                 && reason == "window index already exists in session" =>
         {
             window_index_from_target(value)
-                .map(|index| format!("index in use: {index}"))
-                .unwrap_or_else(|| error.to_string())
+                .map_or_else(|| error.to_string(), |index| format!("index in use: {index}"))
         }
         RmuxError::InvalidTarget { reason, .. } if reason.starts_with("can't find ") => {
             reason.clone()
@@ -74,8 +73,7 @@ pub(crate) fn tmux_cli_error_message(command_name: &str, error: &RmuxError) -> S
         }
         RmuxError::InvalidSetOption(message) if message.ends_with(" is already set") => message
             .strip_suffix(" is already set")
-            .map(|name| format!("already set: {name}"))
-            .unwrap_or_else(|| message.clone()),
+            .map_or_else(|| message.clone(), |name| format!("already set: {name}")),
         RmuxError::Server(message)
             if command_name == "detach-client"
                 && message == "detach-client requires an attached client" =>
@@ -151,12 +149,13 @@ fn io_error_message_without_code(error: &std::io::Error) -> String {
     if let Some(errno) = error.raw_os_error() {
         // tmux reports the strerror text inside "error connecting to ... (...)"
         // without Rust's additional "(os error N)" suffix.
-        let message = unsafe {
-            // SAFETY: `strerror` returns either null or a pointer to a
-            // NUL-terminated process-owned message for the supplied errno.
-            let ptr = libc::strerror(errno);
-            (!ptr.is_null()).then(|| CStr::from_ptr(ptr).to_string_lossy().into_owned())
-        };
+        // SAFETY: `strerror` returns either null or a pointer to a NUL-terminated
+        // process-owned message for the supplied errno.
+        let ptr = unsafe { libc::strerror(errno) };
+        let message = (!ptr.is_null()).then(|| {
+            // SAFETY: `ptr` is non-null here and points at that NUL-terminated message.
+            unsafe { CStr::from_ptr(ptr) }.to_string_lossy().into_owned()
+        });
         if let Some(message) = message {
             return message;
         }
@@ -166,6 +165,7 @@ fn io_error_message_without_code(error: &std::io::Error) -> String {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 mod tests {
     use super::*;
 
