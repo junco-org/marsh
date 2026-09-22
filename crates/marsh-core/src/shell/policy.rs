@@ -25,6 +25,19 @@ use rust_validator::{Bump, GitPolicy, PolicyDecision};
 
 use super::builtins::gitcmd::{self, GitAction};
 
+// Keep caller-selected durable identities disjoint from reusable names and snapshot uids.
+const PRINCIPAL_NAMESPACE: &str = "@marsh/";
+
+pub(crate) fn durable_principal(name: &str) -> Principal {
+    Principal::from(format!("{PRINCIPAL_NAMESPACE}durable/{name}"))
+}
+
+pub(crate) fn escaped_live_principal(name: &Principal) -> Option<Principal> {
+    name.as_str()
+        .starts_with(PRINCIPAL_NAMESPACE)
+        .then(|| Principal::from(format!("{PRINCIPAL_NAMESPACE}live/{name}")))
+}
+
 /// One refused capability, with the policy's explanation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Denial {

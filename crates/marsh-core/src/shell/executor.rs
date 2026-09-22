@@ -3,17 +3,17 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use marsh_btrfs::{LibBtrfs, Subvolumes};
 use brush_core::extensions::{
     DefaultErrorFormatter, DefaultExternalCommandSpawner, ExternalCommandSpawner, ShellExtensions,
     ShellExtensionsImpl,
 };
 use brush_core::{Shell, ShellVariable};
+use marsh_btrfs::{LibBtrfs, Subvolumes};
 use marsh_instrument::{BuiltinHook, BuiltinRecord, SpawnRecord, SpawnRequest};
 
 use super::MarshError;
 use super::builtins::SNAPSHOT_ROOT_VAR;
-use super::policy::Principal;
+use super::policy::{Principal, escaped_live_principal};
 use super::session::{Session, Snapshot};
 
 /// Shell extensions selecting [`MarshExecutor`].
@@ -114,12 +114,15 @@ impl MarshExecutor {
     ///
     /// Every snapshot runs concurrently with every other one's lines: they share the seed's
     /// authority, which serializes only the boundaries. A detached executor stays detached.
+    /// Names here are session-local, not recovery credentials. To retain agent ownership across
+    /// reopening, use [`crate::shellmux::ShellId::durable`] when spawning a mux job.
     ///
     /// # Errors
     ///
     /// Fails when the snapshot cannot be taken.
     pub fn snapshot(&self, principal: Principal) -> Result<Self, MarshError> {
-        self.snapshot_for(Some(principal))
+        let principal = escaped_live_principal(&principal).unwrap_or(principal);
+        self.snapshot_for(Some(principal), None)
     }
 
     /// The same, with the snapshot's own uid for a principal: what a lone [`Shell`](super::Shell)
@@ -129,16 +132,20 @@ impl MarshExecutor {
     ///
     /// Fails when the snapshot cannot be taken.
     pub(crate) fn snapshot_as_uid(&self) -> Result<Self, MarshError> {
-        self.snapshot_for(None)
+        self.snapshot_for(None, None)
     }
 
-    /// The shared body of the two.
-    fn snapshot_for(&self, principal: Option<Principal>) -> Result<Self, MarshError> {
+    /// Shared construction for anonymous shells and already-scoped mux identities.
+    pub(crate) fn snapshot_for(
+        &self,
+        principal: Option<Principal>,
+        durable_name: Option<Principal>,
+    ) -> Result<Self, MarshError> {
         match &self.session {
             None => Ok(Self::default()),
             Some(session) => Ok(Self {
                 session: Some(Arc::clone(session)),
-                snapshot: Some(session.snapshot(principal)?),
+                snapshot: Some(session.snapshot(principal, durable_name)?),
             }),
         }
     }
