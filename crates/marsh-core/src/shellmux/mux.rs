@@ -367,6 +367,7 @@ impl ShellMux {
     ) -> Result<Arc<crate::Shell>, MuxError> {
         let mut builder = brush_core::Shell::builder_with_extensions::<MarshShellExtensions>()
             .external_command_spawner(executor.clone())
+            .do_not_inherit_env(environment.is_some())
             .interactive(false)
             .no_editing(true)
             .profile(ProfileLoadBehavior::Skip)
@@ -432,10 +433,7 @@ pub(crate) fn kill_since(
     let records = executor.spawn_records();
     let mut failure: Option<std::io::Error> = None;
     for record in records.get(mark..).unwrap_or_default() {
-        let SpawnRecord::Spawned {
-            pid: Some(pid), ..
-        } = record
-        else {
+        let SpawnRecord::Spawned { pid: Some(pid), .. } = record else {
             continue;
         };
         let Ok(pid) = libc::pid_t::try_from(*pid) else {
@@ -533,7 +531,7 @@ fn git_env(principal: &ShellId, uid: &SnapshotUid) -> Vec<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::shellmux::{JobIo, SpawnOptions};
+    use crate::shellmux::{CommandOptions, JobIo, SpawnOptions};
 
     /// A sandbox's directory is user input that becomes a path under the seed, so the one thing it
     /// must never do is name something outside it.
@@ -554,10 +552,12 @@ mod tests {
     /// not only the reusable name.
     #[test]
     fn a_principals_address_is_one_word_whatever_the_principal_is() {
-        let env: HashMap<String, String> =
-            git_env(&ShellId::from("a long name"), &SnapshotUid::from("ab12cd34"))
-                .into_iter()
-                .collect();
+        let env: HashMap<String, String> = git_env(
+            &ShellId::from("a long name"),
+            &SnapshotUid::from("ab12cd34"),
+        )
+        .into_iter()
+        .collect();
         assert_eq!(env["GIT_AUTHOR_NAME"], "a long name");
         assert_eq!(env["GIT_AUTHOR_EMAIL"], "a-long-name.ab12cd34@marsh.local");
         assert_eq!(
@@ -671,5 +671,91 @@ mod tests {
             mux.stop(&job, true).await.expect("stop the job");
             mux.shutdown().await.expect("shut the mux down");
         });
+    }
+
+    /// A supplied environment replaces both ambient and profile variables, while `None`
+    /// retains the ordinary inherited/profile environment. Values reach external commands intact.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn job_environment_replaces_inherited_and_profile_variables() {
+        let inherited = std::env::var("CARGO_MANIFEST_DIR").expect("Cargo test environment");
+        let inherited_value = std::env::var("MARSH_ENV_REPLACEMENT_TEST_VALUE").unwrap_or_default();
+        let scratch = tempfile::tempdir().expect("scratch directory");
+        let seed = scratch.path().join("seed");
+        std::fs::create_dir(&seed).expect("seed directory");
+        let filesystem = Arc::new(marsh_btrfs::fake::CopyTree::new());
+        filesystem.register(&seed);
+        let executor = MarshExecutor::open_with(&seed, filesystem).expect("open seed");
+        let mut profile = MuxProfile::default();
+        let mut variable = ShellVariable::new("profile");
+        variable.export();
+        profile
+            .environment
+            .set_global("MARSH_ENV_REPLACEMENT_PROFILE".to_owned(), variable)
+            .expect("profile variable");
+        let mux = ShellMux::new(
+            executor,
+            Arc::new(Mutex::new(PolicyValidator::new())),
+            profile,
+            Arc::new(Mutex::new(Silent::new(24, 80))),
+        )
+        .expect("build mux");
+        let value = "quotes:'\"; dollar:$HOME\nsecond line";
+        let mut replacement = brush_core::env::ShellEnvironment::new();
+        let mut variable = ShellVariable::new(value);
+        variable.export();
+        replacement
+            .set_global("MARSH_ENV_REPLACEMENT_TEST_VALUE".to_owned(), variable)
+            .expect("replacement variable");
+        let mut observations = Vec::new();
+        for (name, environment, expected) in [
+            (
+                "replaced",
+                Some(replacement),
+                format!("unset\nunset\n{value}\n"),
+            ),
+            (
+                "inherited",
+                None,
+                format!("{inherited}\nprofile\n{inherited_value}\n"),
+            ),
+        ] {
+            let job = mux
+                .spawn(
+                    "",
+                    Some(ShellId::from(name)),
+                    None,
+                    SpawnOptions {
+                        io: JobIo::Pipes,
+                        environment,
+                    },
+                )
+                .await
+                .expect("open pipe job");
+            mux.close_input(&job).await.expect("close input");
+            let text = format!(
+                "/bin/sh -c 'printf \"%s\\n\" \"${{CARGO_MANIFEST_DIR-unset}}\" \
+                 \"${{MARSH_ENV_REPLACEMENT_PROFILE-unset}}\" \
+                 \"$MARSH_ENV_REPLACEMENT_TEST_VALUE\"' > {name}.txt"
+            );
+            let command = mux
+                .start_in(&job, &text, CommandOptions::default())
+                .await
+                .expect("admit command");
+            let completion =
+                tokio::time::timeout(std::time::Duration::from_secs(30), command.wait())
+                    .await
+                    .expect("command deadline")
+                    .expect("command verdict");
+            job.wait_closed().await.expect("job closed");
+            let actual = std::fs::read_to_string(seed.join(format!("{name}.txt")))
+                .expect("published output");
+            observations.push((completion, actual, expected));
+        }
+        mux.shutdown().await.expect("shutdown mux");
+        for (completion, actual, expected) in observations {
+            assert!(completion.is_published());
+            assert_eq!(completion.exit_code, Some(0));
+            assert_eq!(actual, expected);
+        }
     }
 }
