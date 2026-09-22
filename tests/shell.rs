@@ -26,18 +26,18 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use marsh_btrfs::fake::CopyTree;
-use marsh_btrfs::{LibBtrfs, Subvolumes};
 use brush_core::traps::TrapSignal;
 use brush_core::{
     ExecutionControlFlow, ProfileLoadBehavior, RcLoadBehavior, ShellVariable, SourceInfo,
 };
-use marsh_instrument::{BuiltinRecord, SpawnRecord, parse_records};
 use marsh::policy::{Action, Event, Principal};
 use marsh::{
-    Denial, MarshError, MarshExecutor, MarshShellExtensions, Outcome, PolicyValidator,
-    Publication, PublishMeta, Shell, Signal, SnapshotUid, StalePath,
+    Denial, MarshError, MarshExecutor, MarshShellExtensions, Outcome, PolicyValidator, Publication,
+    PublishMeta, Shell, Signal, SnapshotUid, StalePath,
 };
+use marsh_btrfs::fake::CopyTree;
+use marsh_btrfs::{LibBtrfs, Subvolumes};
+use marsh_instrument::{BuiltinRecord, SpawnRecord, parse_records};
 use marsh_wal::{JsonLog, WalRecord};
 use serial_test::serial;
 use sha1::{Digest, Sha1};
@@ -962,6 +962,7 @@ async fn recovery_replays_an_unfinished_transaction_then_sweeps() {
                 spawns: Vec::new(),
                 builtins: Vec::new(),
                 principal: SnapshotUid::default(),
+                durable_principal: None,
                 granted: Vec::new(),
             },
         },
@@ -1046,8 +1047,16 @@ async fn two_principals_publish_concurrently_over_one_seed() {
 
     assert_eq!(a.principal(), &Principal::from("a"));
     assert_eq!(b.principal(), &Principal::from("b"));
-    let a_root = a.executor().snapshot_root().expect("a's root").to_path_buf();
-    let b_root = b.executor().snapshot_root().expect("b's root").to_path_buf();
+    let a_root = a
+        .executor()
+        .snapshot_root()
+        .expect("a's root")
+        .to_path_buf();
+    let b_root = b
+        .executor()
+        .snapshot_root()
+        .expect("b's root")
+        .to_path_buf();
     assert_ne!(a_root, b_root, "each shell runs in a snapshot of its own");
     assert!(a_root.is_dir() && b_root.is_dir());
 
@@ -1467,7 +1476,10 @@ async fn every_signal_is_known_to_brush() {
         Signal::Continue,
     ] {
         assert_eq!(
-            shell.signal_jobs(signal).await.expect("a known signal name"),
+            shell
+                .signal_jobs(signal)
+                .await
+                .expect("a known signal name"),
             0,
             "no jobs are running, so nothing accepts {signal:?}"
         );

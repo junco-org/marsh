@@ -27,15 +27,12 @@ use marsh_instrument::{BuiltinRecord, RecordingHook, SpawnRecord, SpawnRecorder,
 use marsh_wal::CommitOp;
 
 use super::MarshError;
-use super::policy::{Action, Event, PolicyValidator, Principal, Resource};
+use super::policy::{Action, Event, PolicyValidator, Principal, Resource, durable_principal};
 
-/// The id of one snapshot: the directory it lives in under `snap/`, and the identity every
-/// capability published out of it is durably recorded against.
-///
-/// A job's *name* comes back. A pane index is reused, and a restarted daemon numbers its jobs from
-/// one again — so a name is a fine identity for a live principal and a ruinous one for a durable
-/// stake: the next holder of the name would inherit the last holder's unsettled work. A snapshot
-/// id never comes back, which is why it, and not the name, is what a transaction records.
+/// The id of one snapshot: its directory under `snap/` and the default durable owner of its
+/// published capabilities. Reusable job names never inherit a previous snapshot's stake.
+/// An embedding caller can explicitly opt a stable [`crate::shellmux::ShellId::durable`]
+/// identity into WAL recovery instead; the snapshot uid still identifies its content.
 #[derive(
     Clone,
     Debug,
@@ -218,13 +215,19 @@ pub struct PublishMeta {
     /// Ids of the [`BuiltinRecord::Begin`]s recorded since the previous boundary, published or
     /// discarded.
     pub builtins: Vec<u64>,
-    /// The durable identity that published it: the id of the snapshot its content came from.
+    /// The snapshot that published this transaction, and its owner unless explicitly overridden.
     ///
     /// Defaulted so a log written before this field existed still parses. Such a transaction
     /// names nobody, and a reopen therefore grants its paths to nobody — which is exactly what
     /// that log says. It is not a reason to refuse the seed: an unparseable log is.
     #[serde(default)]
     pub principal: SnapshotUid,
+    /// The stable agent name explicitly opted into durable ownership, if any.
+    ///
+    /// Absent in legacy logs and ordinary jobs. Recovery scopes this name separately from
+    /// reusable names and snapshot ids; it never infers durable authority from a job label.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub durable_principal: Option<String>,
     /// The capabilities the policy granted for it, in grant order.
     ///
     /// Defaulted for the same reason, and empty for the same meaning.
@@ -262,8 +265,8 @@ pub(crate) struct Session {
     pub(crate) hook: Arc<RecordingHook>,
     /// Read = take or retake a snapshot; write = one boundary (diff, check, publish or discard).
     authority: RwLock<Authority>,
-    /// The capabilities this seed's log says were granted before this process existed, in log
-    /// order, each stamped with the snapshot id that published it.
+    /// The capabilities granted by this seed's log, in log order, stamped with their snapshot
+    /// owner or explicitly opted-in durable agent identity.
     ///
     /// Built once, at open, from the very transactions recovery replays. Empty means the log says
     /// nothing was ever published — a genuinely unowned seed — which is a different thing from a
@@ -330,21 +333,27 @@ impl Session {
             // sequence, and a reopen that forgot it would reissue a number the log already holds.
             seq = seq.max(transaction.seq);
             let PublishMeta {
-                principal, granted, ..
+                principal,
+                durable_principal: stable_name,
+                granted,
+                ..
             } = transaction.meta;
             // A transaction from a log written before grants were recorded names nobody, so it
             // hands nobody a stake. That is what such a line says; it is not a reason to refuse.
-            if principal.is_empty() || granted.is_empty() {
+            if granted.is_empty() || (stable_name.is_none() && principal.is_empty()) {
                 continue;
             }
+            let owner = stable_name
+                .as_deref()
+                .map_or_else(|| principal.principal(), durable_principal);
             for capability in granted {
                 durable.push(Event::new(
-                    principal.principal(),
+                    owner.clone(),
                     Action::from(capability.action),
                     capability.resource,
                 ));
             }
-            durable_principals.insert(principal.0);
+            durable_principals.insert(owner.as_str().to_owned());
         }
 
         sweep_snapshots(&persistence.snap(), fs.as_ref())?;
@@ -388,6 +397,8 @@ impl Session {
 
     /// Takes a fresh snapshot of the seed for `principal`, or for the snapshot's own uid when the
     /// caller named nobody.
+    /// `durable_name` is supplied only by an explicitly durable mux identity, whose already
+    /// scoped policy principal may resume the same grants after recovery.
     ///
     /// A live name that happens to spell a recovered snapshot's id is disambiguated by this
     /// snapshot's own: the policy compares principals as strings, a job may be called anything,
@@ -401,6 +412,7 @@ impl Session {
     pub(crate) fn snapshot(
         self: &Arc<Self>,
         principal: Option<Principal>,
+        durable_name: Option<Principal>,
     ) -> Result<Arc<Snapshot>, MarshError> {
         let uid = SnapshotUid::from(short_id(&format!(
             "{}:{}:{}:{}",
@@ -410,13 +422,17 @@ impl Session {
             nanos_since_epoch()
         )));
         let principal = principal.unwrap_or_else(|| uid.principal());
-        let principal = if self.durable_principals.contains(principal.as_str()) {
-            Principal::from(format!("{principal}@{uid}"))
-        } else {
-            principal
-        };
+        let principal =
+            if durable_name.is_none() && self.durable_principals.contains(principal.as_str()) {
+                Principal::from(format!("{principal}@{uid}"))
+            } else {
+                principal
+            };
 
-        let authority = self.authority.read().unwrap_or_else(PoisonError::into_inner);
+        let authority = self
+            .authority
+            .read()
+            .unwrap_or_else(PoisonError::into_inner);
         let path = self.persistence.work(uid.as_str());
         self.fs.snapshot(&self.persistence.seed, &path)?;
         let path = path.canonicalize()?;
@@ -430,6 +446,7 @@ impl Session {
             session: Arc::clone(self),
             uid,
             principal,
+            durable_name,
             path,
             run_dir,
             spawns: SpawnRecorder::default(),
@@ -458,15 +475,13 @@ impl Session {
 pub(crate) struct Snapshot {
     /// The seed this is a snapshot of.
     session: Arc<Session>,
-    /// This snapshot's id: the name of its directory under `snap/`, and the identity every
-    /// capability it publishes is durably recorded against.
+    /// This snapshot's id and the default durable owner of its publications.
     uid: SnapshotUid,
-    /// Who the shell running in it acts as while this process is alive.
-    ///
-    /// The name the caller gave, or this snapshot's own id when nobody named one. A denial names
-    /// this, because it is what a reader can act on; the log records [`Self::uid`], because that
-    /// is what still means the same thing after a restart.
+    /// The scoped policy principal used by the running shell. Ordinary names become snapshot
+    /// owners in the WAL; explicitly durable identities retain this same principal on recovery.
     principal: Principal,
+    /// The stable caller-owned agent name, only when durable ownership was explicitly selected.
+    durable_name: Option<Principal>,
     /// Canonical `snap/<uid>`.
     path: PathBuf,
     /// `meta/runs/<uid>`: where the record streams are dumped.
@@ -533,7 +548,9 @@ impl Snapshot {
         records
             .iter()
             .filter(|record| match record {
-                BuiltinRecord::Begin { id, .. } | BuiltinRecord::End { id, .. } => mine.contains(id),
+                BuiltinRecord::Begin { id, .. } | BuiltinRecord::End { id, .. } => {
+                    mine.contains(id)
+                }
             })
             .cloned()
             .collect()
@@ -748,6 +765,7 @@ impl Pending<'_> {
             spawns: self.new_spawns,
             builtins: self.new_builtins,
             principal: self.snapshot.uid.clone(),
+            durable_principal: self.snapshot.durable_name.as_ref().map(ToString::to_string),
             granted: granted.iter().map(GrantedCapability::from).collect(),
         };
         marsh_wal::apply(

@@ -1,29 +1,56 @@
 //! The two identities a job has: the name it answers to, and the snapshot it runs in.
 //!
-//! Both used to be bare strings, and both are load-bearing enough that a bare string is wrong. A
-//! job's name *is* its capability principal, so handing one where a directory label was meant
-//! would mis-attribute a grant; a snapshot id is what tells two generations of a reused name
-//! apart, so confusing it with a name would let a stale handle reach its own replacement. Neither
-//! mistake is possible when the compiler knows which is which.
+//! A name carries an explicit capability scope: reusable names are session-local, while a caller
+//! may opt a stable agent identity into durable ownership. Snapshot ids still distinguish every
+//! generation of a job, so a retained handle can never reach that name's replacement.
 
-use crate::policy::Principal;
+use crate::policy::{Principal, durable_principal, escaped_live_principal};
 
-/// A job's identity: the name a front-end prints, the handle `fg` resolves, and the principal its
-/// lines request capabilities as. One type, because they are one thing.
+/// A job's displayed name and capability identity. `From` creates an ordinary reusable name;
+/// [`Self::durable`] explicitly opts a stable caller-owned identity into WAL recovery.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct ShellId(Principal);
+pub struct ShellId {
+    name: Principal,
+    scoped_principal: Option<Principal>,
+    durable: bool,
+}
 
 impl ShellId {
+    /// A stable agent identity whose capabilities survive closing and reopening the seed.
+    ///
+    /// The embedding caller must control the identity and keep it stable for the same agent;
+    /// this is an explicit authority choice, not authentication of an arbitrary pane name.
+    /// Ordinary names cannot impersonate this identity, even by spelling its policy namespace.
+    /// This does not reassign legacy snapshot-UID grants. Keep the typed id when reusing it:
+    /// converting its displayed name through `From` deliberately selects session-local scope.
+    #[must_use]
+    pub fn durable(name: impl Into<Principal>) -> Self {
+        let name = name.into();
+        let scoped_principal = Some(durable_principal(name.as_str()));
+        Self {
+            name,
+            scoped_principal,
+            durable: true,
+        }
+    }
+
+    pub(crate) fn durable_name(&self) -> Option<&Principal> {
+        self.durable.then_some(&self.name)
+    }
+
     /// The name as written.
     #[must_use]
     pub fn as_str(&self) -> &str {
-        self.0.as_str()
+        self.name.as_str()
     }
 
     /// The capability principal this name is, for the policy layer.
     #[must_use]
     pub const fn principal(&self) -> &Principal {
-        &self.0
+        match &self.scoped_principal {
+            Some(principal) => principal,
+            None => &self.name,
+        }
     }
 
     /// Whether this name needs no quoting when written as `%name`: non-empty ASCII alphanumerics,
@@ -58,19 +85,24 @@ impl ShellId {
 
 impl From<&str> for ShellId {
     fn from(name: &str) -> Self {
-        Self(Principal::from(name))
+        Self::from(Principal::from(name))
     }
 }
 
 impl From<String> for ShellId {
     fn from(name: String) -> Self {
-        Self(Principal::from(name.as_str()))
+        Self::from(Principal::from(name))
     }
 }
 
 impl From<Principal> for ShellId {
-    fn from(principal: Principal) -> Self {
-        Self(principal)
+    fn from(name: Principal) -> Self {
+        let scoped_principal = escaped_live_principal(&name);
+        Self {
+            name,
+            scoped_principal,
+            durable: false,
+        }
     }
 }
 

@@ -322,7 +322,9 @@ impl ShellMux {
             });
         }
 
-        let executor = self.executor.snapshot(id.principal().clone())?;
+        let executor = self
+            .executor
+            .snapshot_for(Some(id.principal().clone()), id.durable_name().cloned())?;
         let uid = SnapshotUid::from(executor.uid().unwrap_or_default());
         Ok((
             Sandbox {
@@ -757,5 +759,148 @@ mod tests {
             assert_eq!(completion.exit_code, Some(0));
             assert_eq!(actual, expected);
         }
+    }
+
+    fn ownership_mux(seed: &Path, filesystem: Arc<marsh_btrfs::fake::CopyTree>) -> Arc<ShellMux> {
+        ShellMux::new(
+            MarshExecutor::open_with(seed, filesystem).expect("open seed"),
+            Arc::new(Mutex::new(PolicyValidator::new())),
+            MuxProfile::default(),
+            Arc::new(Mutex::new(Silent::new(24, 80))),
+        )
+        .expect("build mux")
+    }
+
+    async fn ownership_command(
+        mux: &Arc<ShellMux>,
+        id: ShellId,
+        text: &str,
+    ) -> Arc<crate::shellmux::CommandCompletion> {
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            let job = mux
+                .spawn(
+                    "",
+                    Some(id),
+                    None,
+                    SpawnOptions {
+                        io: JobIo::Pipes,
+                        environment: None,
+                    },
+                )
+                .await
+                .expect("open pipe job");
+            mux.close_input(&job).await.expect("close input");
+            let command = mux
+                .start_in(&job, text, CommandOptions::default())
+                .await
+                .expect("admit command");
+            let completion = command.wait().await.expect("command verdict");
+            job.wait_closed().await.expect("job closed");
+            completion
+        })
+        .await
+        .expect("command deadline")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial]
+    async fn durable_principal_recovers_without_granting_authority_to_reusable_names() {
+        let scratch = tempfile::tempdir().expect("scratch directory");
+        let seed = scratch.path().join("seed");
+        std::fs::create_dir(&seed).expect("seed directory");
+        let filesystem = Arc::new(marsh_btrfs::fake::CopyTree::new());
+        filesystem.register(&seed);
+        let owner = ShellId::durable("stable-agent");
+        let mux = ownership_mux(&seed, filesystem.clone());
+        assert!(
+            ownership_command(&mux, owner.clone(), "printf owned > file.txt")
+                .await
+                .is_published()
+        );
+
+        // Neither the displayed name nor a name copied from the policy namespace grants
+        // durable authority, even before any recovered-owner disambiguation exists.
+        for impostor in [
+            ShellId::from("stable-agent"),
+            ShellId::from(owner.principal().clone()),
+        ] {
+            let completion = ownership_command(&mux, impostor, "printf bad > file.txt; true").await;
+            assert_eq!(completion.exit_code, Some(0));
+            assert!(matches!(
+                completion.outcome.as_ref(),
+                Ok(crate::Outcome::Denied { .. })
+            ));
+            assert_eq!(
+                std::fs::read(seed.join("file.txt")).expect("seed contents"),
+                b"owned"
+            );
+        }
+        mux.shutdown().await.expect("close first session");
+        drop(mux);
+
+        let reopened = ownership_mux(&seed, filesystem);
+        let other = ownership_command(
+            &reopened,
+            ShellId::durable("another-agent"),
+            "printf bad > file.txt; true",
+        )
+        .await;
+        assert_eq!(other.exit_code, Some(0));
+        assert!(matches!(
+            other.outcome.as_ref(),
+            Ok(crate::Outcome::Denied { .. })
+        ));
+        assert_eq!(
+            std::fs::read(seed.join("file.txt")).expect("seed contents"),
+            b"owned"
+        );
+        let resumed = ownership_command(&reopened, owner, "printf resumed > file.txt").await;
+        reopened.shutdown().await.expect("close resumed session");
+        assert!(resumed.is_published());
+        assert_eq!(resumed.exit_code, Some(0));
+        assert_eq!(
+            std::fs::read(seed.join("file.txt")).expect("resumed contents"),
+            b"resumed"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial]
+    async fn durable_opt_in_never_reassigns_legacy_snapshot_ownership() {
+        let scratch = tempfile::tempdir().expect("scratch directory");
+        let seed = scratch.path().join("seed");
+        std::fs::create_dir(&seed).expect("seed directory");
+        let filesystem = Arc::new(marsh_btrfs::fake::CopyTree::new());
+        filesystem.register(&seed);
+        let mux = ownership_mux(&seed, filesystem.clone());
+        let original =
+            ownership_command(&mux, ShellId::from("reused"), "printf legacy > file.txt").await;
+        assert!(original.is_published());
+        let uid = original.shell.uid.as_str();
+        mux.shutdown().await.expect("close legacy session");
+        drop(mux);
+
+        let reopened = ownership_mux(&seed, filesystem);
+        // Cover ordinary name reuse, direct snapshot-id impersonation, and both attempts
+        // through the new opt-in API. Legacy WAL entries carry no durable agent authority.
+        for impostor in [
+            ShellId::from("reused"),
+            ShellId::from(uid),
+            ShellId::durable("reused"),
+            ShellId::durable(uid),
+        ] {
+            let completion =
+                ownership_command(&reopened, impostor, "printf bad > file.txt; true").await;
+            assert_eq!(completion.exit_code, Some(0));
+            assert!(matches!(
+                completion.outcome.as_ref(),
+                Ok(crate::Outcome::Denied { .. })
+            ));
+            assert_eq!(
+                std::fs::read(seed.join("file.txt")).expect("legacy contents"),
+                b"legacy"
+            );
+        }
+        reopened.shutdown().await.expect("close second session");
     }
 }
