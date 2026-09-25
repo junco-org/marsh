@@ -114,22 +114,6 @@ fn finish_after_write_error(
     paused_panes: &mut HashSet<u32>,
     error: io::Error,
 ) -> io::Result<()> {
-    #[cfg(windows)]
-    if matches!(
-        error.kind(),
-        io::ErrorKind::BrokenPipe
-            | io::ErrorKind::ConnectionAborted
-            | io::ErrorKind::ConnectionReset
-            | io::ErrorKind::NotConnected
-            | io::ErrorKind::UnexpectedEof
-    ) {
-        output_queue.transport_closed = true;
-        output_queue.blocks.clear();
-        output_queue.buffered_bytes = 0;
-        paused_panes.clear();
-        return Ok(());
-    }
-
     let _ = (output_queue, paused_panes);
     Err(error)
 }

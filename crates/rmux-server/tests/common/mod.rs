@@ -1,4 +1,3 @@
-#![cfg(unix)]
 #![allow(dead_code)]
 
 use std::collections::BTreeSet;
@@ -9,7 +8,7 @@ use std::os::fd::AsFd;
 use std::os::unix::net::UnixListener as StdUnixListener;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use marsh_core::shellmux::TerminalGeometry;
@@ -80,10 +79,10 @@ impl Drop for PtyTestGuard {
 
 /// Opens a daemon for `config` over a private seed under `seed_root`.
 ///
-/// [`RmuxFrontend::open_with`] takes the seed it will publish into and the backend to reach it
-/// through. None of these tests are about storage, so the seed is a plain directory tree behind
-/// [`marsh_btrfs::fake::CopyTree`]: the daemon cannot tell the difference, and the tests keep
-/// running on hosts with no btrfs.
+/// [`RmuxFrontend::open_with`] takes the directory its shells start in by default and the backend
+/// seeds are reached through. None of these tests are about storage, so the seed is a plain
+/// directory tree behind [`marsh_btrfs::fake::CopyTree`]: the daemon cannot tell the difference,
+/// and the tests keep running on hosts with no btrfs.
 ///
 /// `seed_root` must outlive the frontend and everything it hands out — the engine publishes into
 /// a tree below it, and a seed deleted underneath a live daemon is not a condition any of these
@@ -107,7 +106,6 @@ pub(crate) async fn daemon_over_seed(
     RmuxFrontend::open_with(
         config,
         &seed,
-        Arc::new(StdMutex::new(marsh_core::PolicyValidator::new())),
         brush_core::env::ShellEnvironment::new(),
         TerminalGeometry {
             rows: SEED_ROWS,

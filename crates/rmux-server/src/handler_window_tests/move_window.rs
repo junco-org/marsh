@@ -1457,20 +1457,34 @@ async fn move_window_within_session_restores_the_killed_destination_when_resize_
     create_session(&handler, "alpha").await;
     insert_window(&handler, &alpha, 1).await;
 
-    let (source_pane_id, destination_pane_id) = {
-        let state = handler.state.lock().await;
+    let (source_pane_id, destination_pane_id, stable_source, stable_destination) = {
+        let mut state = handler.state.lock().await;
         let session = state.sessions.session(&alpha).expect("alpha should exist");
+        let source_pane_id = session
+            .window_at(0)
+            .and_then(|window| window.pane(0))
+            .map(|pane| pane.id())
+            .expect("window 0 pane should exist");
+        let destination_pane_id = session
+            .window_at(1)
+            .and_then(|window| window.pane(0))
+            .map(|pane| pane.id())
+            .expect("window 1 pane should exist");
+        let stable_source = crate::handler::StableTargetIdentity::capture(
+            &mut state,
+            Target::Pane(PaneTarget::with_window(alpha.clone(), 0, 0)),
+        )
+        .expect("capture alpha:0.0 identity");
+        let stable_destination = crate::handler::StableTargetIdentity::capture(
+            &mut state,
+            Target::Pane(PaneTarget::with_window(alpha.clone(), 1, 0)),
+        )
+        .expect("capture alpha:1.0 identity");
         (
-            session
-                .window_at(0)
-                .and_then(|window| window.pane(0))
-                .map(|pane| pane.id())
-                .expect("window 0 pane should exist"),
-            session
-                .window_at(1)
-                .and_then(|window| window.pane(0))
-                .map(|pane| pane.id())
-                .expect("window 1 pane should exist"),
+            source_pane_id,
+            destination_pane_id,
+            stable_source,
+            stable_destination,
         )
     };
 
@@ -1514,6 +1528,14 @@ async fn move_window_within_session_restores_the_killed_destination_when_resize_
     state
         .pane_profile_in_window(&alpha, 1, 0)
         .expect("destination pane terminal should be restored");
+    assert!(
+        stable_source.is_current(&state),
+        "rollback must restore the source pane's tenancy stamp, not just its index"
+    );
+    assert!(
+        stable_destination.is_current(&state),
+        "rollback must restore the killed destination's tenancy stamp"
+    );
 }
 
 #[tokio::test]
@@ -1950,21 +1972,35 @@ async fn move_window_across_sessions_restores_terminal_ownership_when_resize_fai
     insert_window(&handler, &alpha, 1).await;
     insert_window(&handler, &beta, 4).await;
 
-    let (moved_pane_id, replaced_pane_id) = {
-        let state = handler.state.lock().await;
+    let (moved_pane_id, replaced_pane_id, stable_moved, stable_replaced) = {
+        let mut state = handler.state.lock().await;
         let alpha_session = state.sessions.session(&alpha).expect("alpha should exist");
+        let moved_pane_id = alpha_session
+            .window_at(1)
+            .and_then(|window| window.pane(0))
+            .map(|pane| pane.id())
+            .expect("alpha window 1 pane should exist");
         let beta_session = state.sessions.session(&beta).expect("beta should exist");
+        let replaced_pane_id = beta_session
+            .window_at(4)
+            .and_then(|window| window.pane(0))
+            .map(|pane| pane.id())
+            .expect("beta window 4 pane should exist");
+        let stable_moved = crate::handler::StableTargetIdentity::capture(
+            &mut state,
+            Target::Pane(PaneTarget::with_window(alpha.clone(), 1, 0)),
+        )
+        .expect("capture alpha:1.0 identity");
+        let stable_replaced = crate::handler::StableTargetIdentity::capture(
+            &mut state,
+            Target::Pane(PaneTarget::with_window(beta.clone(), 4, 0)),
+        )
+        .expect("capture beta:4.0 identity");
         (
-            alpha_session
-                .window_at(1)
-                .and_then(|window| window.pane(0))
-                .map(|pane| pane.id())
-                .expect("alpha window 1 pane should exist"),
-            beta_session
-                .window_at(4)
-                .and_then(|window| window.pane(0))
-                .map(|pane| pane.id())
-                .expect("beta window 4 pane should exist"),
+            moved_pane_id,
+            replaced_pane_id,
+            stable_moved,
+            stable_replaced,
         )
     };
 
@@ -2013,4 +2049,12 @@ async fn move_window_across_sessions_restores_terminal_ownership_when_resize_fai
     state
         .pane_profile_in_window(&beta, 4, 0)
         .expect("replaced pane terminal should return to the destination session");
+    assert!(
+        stable_moved.is_current(&state),
+        "rollback must restore the moved pane's tenancy stamp in its source session"
+    );
+    assert!(
+        stable_replaced.is_current(&state),
+        "rollback must restore the replaced destination pane's tenancy stamp"
+    );
 }

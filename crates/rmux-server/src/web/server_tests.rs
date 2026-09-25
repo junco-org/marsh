@@ -22,9 +22,6 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::{advance, pause, timeout, Duration};
 
-#[cfg(windows)]
-const WEBSOCKET_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
-#[cfg(not(windows))]
 const WEBSOCKET_FRAME_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[test]
@@ -1690,29 +1687,11 @@ async fn create_session(handler: &RequestHandler, name: &str) -> SessionName {
     session_name
 }
 
-#[cfg(unix)]
 fn quiet_pane_command() -> Vec<String> {
     vec![
         "/bin/sh".to_owned(),
         "-c".to_owned(),
         "exec sleep 120".to_owned(),
-    ]
-}
-
-#[cfg(windows)]
-fn quiet_pane_command() -> Vec<String> {
-    let system_root =
-        std::env::var_os("SystemRoot").unwrap_or_else(|| std::ffi::OsString::from(r"C:\Windows"));
-    vec![
-        std::path::PathBuf::from(system_root)
-            .join("System32")
-            .join("cmd.exe")
-            .to_string_lossy()
-            .into_owned(),
-        "/d".to_owned(),
-        "/q".to_owned(),
-        "/c".to_owned(),
-        "ping -n 120 127.0.0.1 >NUL".to_owned(),
     ]
 }
 

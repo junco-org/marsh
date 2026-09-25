@@ -1,5 +1,3 @@
-#![cfg(unix)]
-
 use std::error::Error;
 use std::io;
 use std::os::unix::net::UnixStream as StdUnixStream;
@@ -20,7 +18,7 @@ use tokio::net::UnixStream;
 use tokio::sync::Barrier;
 use tokio::time::{sleep, Duration};
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn socket_file_is_created_connectable_and_removed_on_shutdown() -> Result<(), Box<dyn Error>>
 {
     let harness = TestHarness::new("socket-lifecycle");
@@ -38,7 +36,7 @@ async fn socket_file_is_created_connectable_and_removed_on_shutdown() -> Result<
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn new_session_round_trips_through_the_real_socket() -> Result<(), Box<dyn Error>> {
     let harness = TestHarness::new("new-session");
     let socket_path = harness.socket_path().to_path_buf();
@@ -71,7 +69,7 @@ async fn new_session_round_trips_through_the_real_socket() -> Result<(), Box<dyn
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn duplicate_new_session_returns_duplicate_session() -> Result<(), Box<dyn Error>> {
     let harness = TestHarness::new("duplicate-session");
     let socket_path = harness.socket_path().to_path_buf();
@@ -98,7 +96,7 @@ async fn duplicate_new_session_returns_duplicate_session() -> Result<(), Box<dyn
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn has_session_reports_live_and_missing_sessions() -> Result<(), Box<dyn Error>> {
     let harness = TestHarness::new("has-session");
     let socket_path = harness.socket_path().to_path_buf();
@@ -144,7 +142,7 @@ async fn has_session_reports_live_and_missing_sessions() -> Result<(), Box<dyn E
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn kill_session_is_live_then_idempotent() -> Result<(), Box<dyn Error>> {
     let harness = TestHarness::new("kill-session");
     let socket_path = harness.socket_path().to_path_buf();
@@ -210,7 +208,7 @@ async fn kill_session_is_live_then_idempotent() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn rename_session_round_trips_through_the_real_socket() -> Result<(), Box<dyn Error>> {
     let harness = TestHarness::new("rename-session");
     let socket_path = harness.socket_path().to_path_buf();
@@ -268,7 +266,7 @@ async fn rename_session_round_trips_through_the_real_socket() -> Result<(), Box<
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn stale_socket_removal_allows_rebind() -> Result<(), Box<dyn Error>> {
     let harness = TestHarness::new("stale-rebind");
     let socket_path = harness.socket_path().to_path_buf();
@@ -355,7 +353,7 @@ async fn socket_file_is_removed_after_handle_drop() -> Result<(), Box<dyn Error>
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn attach_session_returns_an_upgrade_response() -> Result<(), Box<dyn Error>> {
     let harness = TestHarness::new("attach-upgrade");
     let socket_path = harness.socket_path().to_path_buf();
@@ -391,7 +389,7 @@ async fn attach_session_returns_an_upgrade_response() -> Result<(), Box<dyn Erro
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn switch_and_detach_require_an_attached_client_before_any_session_lookup(
 ) -> Result<(), Box<dyn Error>> {
     let harness = TestHarness::new("attached-client-required");
@@ -455,7 +453,7 @@ async fn switch_and_detach_require_an_attached_client_before_any_session_lookup(
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn persistent_connection_handles_multiple_requests() -> Result<(), Box<dyn Error>> {
     let harness = TestHarness::new("persistent-connection");
     let socket_path = harness.socket_path().to_path_buf();
@@ -499,7 +497,7 @@ async fn persistent_connection_handles_multiple_requests() -> Result<(), Box<dyn
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn shutdown_closes_existing_connections() -> Result<(), Box<dyn Error>> {
     let harness = TestHarness::new("shutdown-closes-connections");
     let socket_path = harness.socket_path().to_path_buf();
@@ -534,7 +532,7 @@ async fn shutdown_closes_existing_connections() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn concurrent_duplicate_creates_are_serialized() -> Result<(), Box<dyn Error>> {
     let harness = TestHarness::new("concurrent-duplicate");
     let socket_path = harness.socket_path().to_path_buf();

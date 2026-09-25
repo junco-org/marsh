@@ -413,13 +413,10 @@ mod tests {
     use chrono::{Local, TimeZone};
     use rmux_core::{OptionStore, Session};
     use rmux_proto::{
-        OptionName, ResizePaneAdjustment, ScopeSelector, SessionName, SetOptionMode, TerminalSize,
-        WindowTarget,
+        OptionName, ResizePaneAdjustment, ScopeSelector, SetOptionMode, TerminalSize, WindowTarget,
     };
 
-    fn session_name(value: &str) -> SessionName {
-        SessionName::new(value).expect("valid session name")
-    }
+    use crate::test_names::session_name;
 
     #[test]
     fn clock_overlay_draws_tmux_big_digits() {

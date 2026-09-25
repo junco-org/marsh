@@ -271,9 +271,11 @@ fn select_window_rejects_zoom_flag_like_tmux() {
     let error = parse_args(&["select-window", "-Z"]).unwrap_err();
 
     assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
-    assert!(error
-        .to_string()
-        .contains("command select-window: unknown flag -Z"));
+    assert!(
+        error
+            .to_string()
+            .contains("command select-window: unknown flag -Z")
+    );
 }
 
 #[test]
@@ -294,9 +296,11 @@ fn rename_window_rejects_extra_names_like_tmux() {
     let error = parse_args(&["rename-window", "-t", "alpha:0", "logs", "extra"]).unwrap_err();
 
     assert_eq!(error.kind(), clap::error::ErrorKind::TooManyValues);
-    assert!(error
-        .to_string()
-        .contains("command rename-window: too many arguments (need at most 1)"));
+    assert!(
+        error
+            .to_string()
+            .contains("command rename-window: too many arguments (need at most 1)")
+    );
 }
 
 #[test]
@@ -304,9 +308,11 @@ fn rename_window_rejects_missing_name_like_tmux() {
     let error = parse_args(&["rename-window"]).unwrap_err();
 
     assert_eq!(error.kind(), clap::error::ErrorKind::TooFewValues);
-    assert!(error
-        .to_string()
-        .contains("command rename-window: too few arguments (need at least 1)"));
+    assert!(
+        error
+            .to_string()
+            .contains("command rename-window: too few arguments (need at least 1)")
+    );
 }
 
 #[test]
@@ -314,9 +320,11 @@ fn swap_window_rejects_after_flag_like_tmux() {
     let error = parse_args(&["swap-window", "-a", "-s", "alpha:0", "-t", "alpha:1"]).unwrap_err();
 
     assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
-    assert!(error
-        .to_string()
-        .contains("command swap-window: unknown flag -a"));
+    assert!(
+        error
+            .to_string()
+            .contains("command swap-window: unknown flag -a")
+    );
 }
 
 #[test]
@@ -621,9 +629,11 @@ fn ambiguous_command_prefix_fails_before_flag_parsing() {
     let error = parse_args(&["list"]).unwrap_err();
 
     assert_eq!(error.kind(), clap::error::ErrorKind::InvalidSubcommand);
-    assert!(error
-        .to_string()
-        .contains("ambiguous command: list, could be:"));
+    assert!(
+        error
+            .to_string()
+            .contains("ambiguous command: list, could be:")
+    );
 }
 
 #[test]

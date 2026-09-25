@@ -175,12 +175,7 @@ mod tests {
     async fn reader_forwards_final_unterminated_line() {
         let (tx, mut rx) = mpsc::channel(2);
 
-        read_lines(
-            ProcessOutput::Stderr,
-            stream([b"last line".to_vec()]),
-            tx,
-        )
-        .await;
+        read_lines(ProcessOutput::Stderr, stream([b"last line".to_vec()]), tx).await;
 
         let (_, line) = rx.recv().await.expect("unterminated line is forwarded");
         assert_eq!(line, "last line");

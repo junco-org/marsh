@@ -16,11 +16,6 @@ use rmux_proto::{
 use crate::format_runtime::{render_runtime_template, RuntimeFormatContext};
 use crate::hook_runtime::PendingInlineHookFormat;
 use crate::pane_terminals::InitialPaneSpawnOptions;
-#[cfg(windows)]
-use crate::pane_terminals::{
-    CompletedDeferredInitialPane, DeferredInitialPaneIdentity, DeferredInitialPaneInputDrain,
-    DeferredInitialPaneSpawn,
-};
 use crate::terminal::{parse_environment_assignments, validate_process_command};
 
 #[path = "handler_session/client_environment.rs"]
@@ -35,90 +30,6 @@ mod list;
 mod options;
 #[path = "handler_session/output.rs"]
 mod output;
-
-// The deferred bracketed-paste final-sink proof lives next to the flush it
-// exercises. It is Windows-only because the starting-pane input queue is.
-#[cfg(all(test, windows))]
-#[path = "handler_session/bracketed_paste_final_sink_tests.rs"]
-mod bracketed_paste_final_sink_tests;
-
-/// Lets a test hold a deferred initial pane at the lifecycle boundary between
-/// "the child is running and publishing output" and "the starting queue is
-/// drained".
-///
-/// The deferred proof needs a real child to announce `ESC[?2004h` through
-/// actual pane output *while its pane is still starting*. That window exists in
-/// production but is not otherwise observable, and stamping the transcript
-/// instead only proves that a synthetic mode selects a route.
-///
-/// The gate is keyed by runtime session name, so a gated test never delays
-/// another one, and it is `#[cfg(test)]`, so no shipped code path can reach it.
-#[cfg(all(test, windows))]
-pub(crate) mod deferred_initial_gate {
-    use std::collections::HashMap;
-    use std::sync::{Arc, Mutex, OnceLock};
-
-    use rmux_proto::SessionName;
-    use tokio::sync::Semaphore;
-
-    fn gates() -> &'static Mutex<HashMap<SessionName, Arc<Semaphore>>> {
-        static GATES: OnceLock<Mutex<HashMap<SessionName, Arc<Semaphore>>>> = OnceLock::new();
-        GATES.get_or_init(|| Mutex::new(HashMap::new()))
-    }
-
-    /// Installed before the session is created; dropping it releases the pane.
-    pub(crate) struct DeferredInitialGate {
-        runtime_session_name: SessionName,
-        permits: Arc<Semaphore>,
-    }
-
-    impl DeferredInitialGate {
-        pub(crate) fn install(runtime_session_name: &SessionName) -> Self {
-            let permits = Arc::new(Semaphore::new(0));
-            gates()
-                .lock()
-                .expect("deferred initial gate registry")
-                .insert(runtime_session_name.clone(), Arc::clone(&permits));
-            Self {
-                runtime_session_name: runtime_session_name.clone(),
-                permits,
-            }
-        }
-    }
-
-    impl Drop for DeferredInitialGate {
-        fn drop(&mut self) {
-            // A stored permit releases the spawn task whether or not it has
-            // reached the boundary yet, so a test can never deadlock by
-            // finishing early.
-            self.permits.add_permits(1);
-            gates()
-                .lock()
-                .expect("deferred initial gate registry")
-                .remove(&self.runtime_session_name);
-        }
-    }
-
-    pub(super) async fn wait_if_gated(runtime_session_name: &SessionName) {
-        let permits = gates()
-            .lock()
-            .expect("deferred initial gate registry")
-            .get(runtime_session_name)
-            .map(Arc::clone);
-        if let Some(permits) = permits {
-            let _ = permits.acquire().await;
-        }
-    }
-}
-
-#[cfg(windows)]
-const DEFERRED_INITIAL_PANE_READY_TIMEOUT: Duration = Duration::from_millis(250);
-#[cfg(windows)]
-const DEFERRED_INITIAL_PANE_READY_SETTLE: Duration = Duration::from_millis(100);
-#[cfg(windows)]
-// Keep immediate post-new-session console control input queued until the
-// autostarted ConPTY console is safely isolated from the launching client.
-const DEFERRED_INITIAL_PANE_INPUT_GRACE: Duration = Duration::from_secs(2);
 
 /// How long an emptied server waits for its own teardown before deciding it is idle.
 ///
@@ -229,8 +140,6 @@ use list::{sort_list_sessions, ListSessionSnapshot};
 use options::resolve_session_creation_options;
 
 use super::attach_support::{surviving_attached_resize_targets, SessionDetachOnDestroy};
-#[cfg(windows)]
-use super::pane_support::format_references_pane_pid;
 use super::scripting_support::format_context_for_target;
 use super::target_support::{pane_id_target, requester_environment_pane_id};
 use super::{
@@ -628,13 +537,6 @@ impl RequestHandler {
         };
         let group_target = request.group_target;
         let working_directory = request.working_directory;
-        #[cfg(windows)]
-        if working_directory
-            .as_ref()
-            .is_some_and(|path| format_references_pane_pid(Some(path.as_str())))
-        {
-            self.wait_for_windows_deferred_all_pane_pids().await;
-        }
         let requester_cwd_pane_id = if working_directory
             .as_ref()
             .is_some_and(|path| path.contains("#{"))
@@ -662,8 +564,6 @@ impl RequestHandler {
             .or_else(|| crate::legacy_command::from_legacy_command(command.as_deref()));
         let requested_name = request.session_name;
         let socket_path = self.socket_path();
-        #[cfg(windows)]
-        let mut deferred_initial_spawn = None;
         let mut planned_initial_terminal = None;
         // The initial pane's job is opened between the locked phases below. Serialized against
         // every other pane creation, because each of them releases the request mutex across that
@@ -810,12 +710,6 @@ impl RequestHandler {
                 .map(|created| created.template_session.is_none())
                 .unwrap_or(true);
             if needs_terminal {
-                let defer_initial_terminal = should_defer_windows_initial_pane(
-                    detached,
-                    request.print_session_info,
-                    created_group.is_some(),
-                    process_command.is_some(),
-                );
                 let spawn_options = InitialPaneSpawnOptions {
                     socket_path: &socket_path,
                     spawn_environment: spawn_environment.as_ref(),
@@ -823,36 +717,18 @@ impl RequestHandler {
                     environment_overrides: environment_overrides.as_deref(),
                     command: process_command.as_ref(),
                 };
-                if defer_initial_terminal {
-                    #[cfg(windows)]
-                    {
-                        match state
-                            .prepare_deferred_initial_session_terminal(&session_name, spawn_options)
-                        {
-                            Ok(spawn) => {
-                                deferred_initial_spawn = Some(spawn);
-                            }
-                            Err(error) => {
-                                let _removed = state.sessions.remove_session(&session_name);
-                                let _ = state.environment.remove_session(&session_name);
-                                return Response::Error(ErrorResponse { error });
-                            }
-                        }
+                // Planned here, opened once this lock is released. Opening the job awaits a
+                // shell build and the facade's admission lock, and awaiting either under the
+                // daemon's request mutex would stall every other session and invert against
+                // the observation consumer's adoption path.
+                match state.plan_initial_session_terminal(&session_name, spawn_options) {
+                    Ok(planned) => {
+                        planned_initial_terminal = Some((session_name.clone(), planned));
                     }
-                } else {
-                    // Planned here, opened once this lock is released. Opening the job awaits a
-                    // shell build and the facade's admission lock, and awaiting either under the
-                    // daemon's request mutex would stall every other session and invert against
-                    // the observation consumer's adoption path.
-                    match state.plan_initial_session_terminal(&session_name, spawn_options) {
-                        Ok(planned) => {
-                            planned_initial_terminal = Some((session_name.clone(), planned));
-                        }
-                        Err(error) => {
-                            let _removed = state.sessions.remove_session(&session_name);
-                            let _ = state.environment.remove_session(&session_name);
-                            return Response::Error(ErrorResponse { error });
-                        }
+                    Err(error) => {
+                        let _removed = state.sessions.remove_session(&session_name);
+                        let _ = state.environment.remove_session(&session_name);
+                        return Response::Error(ErrorResponse { error });
                     }
                 }
             }
@@ -914,10 +790,6 @@ impl RequestHandler {
             return response;
         };
         let session_name = success.session_name.clone();
-        #[cfg(windows)]
-        if let Some(spawn) = deferred_initial_spawn {
-            self.spawn_deferred_initial_pane(spawn);
-        }
         if !detached {
             self.pause_before_created_session_control_attach(&session_name)
                 .await;
@@ -963,387 +835,6 @@ impl RequestHandler {
             }),
             Err(error) => Response::Error(ErrorResponse { error }),
         }
-    }
-
-    #[cfg(windows)]
-    fn spawn_deferred_initial_pane(&self, job: DeferredInitialPaneSpawn) {
-        let handler = self.clone();
-        let task = async move {
-            handler.run_deferred_initial_pane_spawn(job).await;
-        };
-        if let Some(runtime) = self.server_task_runtime() {
-            runtime.spawn(task);
-        } else {
-            tokio::spawn(task);
-        }
-    }
-
-    /// Runs a deferred initial pane's open-and-commit, off the request that asked for it.
-    ///
-    /// The last two phases of the transaction its locked prepare started: the job is opened with
-    /// no handler lock held, and the commit takes the lock again and installs the job only if the
-    /// pane it was opened for is still that pane.
-    ///
-    /// The creation transaction is taken here rather than inherited, because the request that
-    /// prepared this pane has already answered and dropped its own. Holding it spans the open and
-    /// the commit and no further: the input grace that follows is a replay into a pane that
-    /// exists, not a creation, and blocking every other session's pane creation for the length of
-    /// it would be a stall no one asked for.
-    #[cfg(windows)]
-    async fn run_deferred_initial_pane_spawn(&self, job: DeferredInitialPaneSpawn) {
-        let (commit, outcome) = {
-            let _creation = self.pane_creation_transaction().await;
-            let (commit, opened) = job.open().await;
-            let outcome = match opened {
-                Ok(terminal) => {
-                    let mut state = self.state.lock().await;
-                    state.commit_deferred_initial_pane(&commit, terminal)
-                }
-                Err(error) => Err(error),
-            };
-            (commit, outcome)
-        };
-        match outcome {
-            Ok(Some(completed)) => {
-                self.finish_deferred_initial_pane_spawn(completed).await;
-            }
-            Ok(None) => {}
-            Err(error) => {
-                self.fail_deferred_initial_pane(&commit, error).await;
-            }
-        }
-    }
-
-    #[cfg(windows)]
-    async fn finish_deferred_initial_pane_spawn(&self, completed: CompletedDeferredInitialPane) {
-        let identity = completed.identity;
-        let mut runtime_session_name_hint = completed.runtime_session_name_hint.clone();
-        let mut pending = completed.input_shell.map(|input_shell| {
-            crate::pane_terminals::DeferredInitialPaneInputFlush {
-                input_shell,
-                pane_pid: completed.pane_pid,
-                queued_input: completed.queued_input,
-            }
-        });
-
-        if let Some(current_runtime_session_name) = self
-            .wait_for_deferred_initial_pane_ready(&runtime_session_name_hint, identity)
-            .await
-        {
-            runtime_session_name_hint = current_runtime_session_name;
-        }
-
-        // An existing boundary: the child is running and its output already
-        // reaches the transcript, while the pane is still inside the production
-        // `Starting` window that the loop below closes. A test may hold it here
-        // to observe a real capability announcement. Nothing is stamped, no
-        // sink is selected, and no session outside a test is ever gated.
-        #[cfg(test)]
-        deferred_initial_gate::wait_if_gated(&runtime_session_name_hint).await;
-
-        let input_grace_deadline = tokio::time::Instant::now() + DEFERRED_INITIAL_PANE_INPUT_GRACE;
-        loop {
-            if let Some(flush) = pending {
-                let now = tokio::time::Instant::now();
-                if now < input_grace_deadline {
-                    pending = Some(flush);
-                    tokio::time::sleep(input_grace_deadline - now).await;
-                    continue;
-                }
-                let write_result = Self::flush_deferred_initial_pane_input(flush).await;
-                if let Err(error) = write_result {
-                    let mut state = self.state.lock().await;
-                    state.add_message(error.to_string());
-                    state.finish_deferred_initial_pane_input_after_error(
-                        &runtime_session_name_hint,
-                        identity,
-                    );
-                    break;
-                }
-            }
-
-            let now = tokio::time::Instant::now();
-            if now < input_grace_deadline {
-                pending = None;
-                tokio::time::sleep(input_grace_deadline - now).await;
-                continue;
-            }
-
-            let drained = {
-                let mut state = self.state.lock().await;
-                state.take_deferred_initial_pane_input_or_finish(
-                    &runtime_session_name_hint,
-                    identity,
-                )
-            };
-            match drained {
-                Ok(DeferredInitialPaneInputDrain::Flush {
-                    runtime_session_name,
-                    flush,
-                }) => {
-                    runtime_session_name_hint = runtime_session_name;
-                    pending = Some(flush);
-                }
-                Ok(DeferredInitialPaneInputDrain::Finished {
-                    runtime_session_name,
-                }) => {
-                    runtime_session_name_hint = runtime_session_name;
-                    break;
-                }
-                Ok(DeferredInitialPaneInputDrain::Missing) => {
-                    break;
-                }
-                Err(error) => {
-                    let mut state = self.state.lock().await;
-                    state.add_message(error.to_string());
-                    state.finish_deferred_initial_pane_input_after_error(
-                        &runtime_session_name_hint,
-                        identity,
-                    );
-                    break;
-                }
-            }
-        }
-
-        self.refresh_deferred_initial_pane(&runtime_session_name_hint, identity)
-            .await;
-    }
-
-    #[cfg(windows)]
-    async fn wait_for_deferred_initial_pane_ready(
-        &self,
-        runtime_session_name_hint: &SessionName,
-        identity: DeferredInitialPaneIdentity,
-    ) -> Option<SessionName> {
-        let (runtime_session_name, mut receiver) = ({
-            let state = self.state.lock().await;
-            let runtime_session_name =
-                state.starting_runtime_session_for_identity(runtime_session_name_hint, identity)?;
-            let receiver = state.subscribe_runtime_pane_output_from_oldest(
-                &runtime_session_name,
-                identity.pane_id(),
-            )?;
-            Some((runtime_session_name, receiver))
-        })?;
-
-        let deadline = tokio::time::Instant::now() + DEFERRED_INITIAL_PANE_READY_TIMEOUT;
-        loop {
-            while let Some(item) = receiver.try_recv() {
-                if deferred_initial_pane_ready_item(&item) {
-                    tokio::time::sleep(DEFERRED_INITIAL_PANE_READY_SETTLE).await;
-                    return Some(runtime_session_name);
-                }
-            }
-
-            let now = tokio::time::Instant::now();
-            if now >= deadline {
-                return Some(runtime_session_name);
-            }
-
-            match tokio::time::timeout(deadline - now, receiver.recv()).await {
-                Ok(item) if deferred_initial_pane_ready_item(&item) => {
-                    tokio::time::sleep(DEFERRED_INITIAL_PANE_READY_SETTLE).await;
-                    return Some(runtime_session_name);
-                }
-                Ok(_) => {}
-                Err(_) => return Some(runtime_session_name),
-            }
-        }
-    }
-
-    #[cfg(windows)]
-    async fn refresh_deferred_initial_pane(
-        &self,
-        runtime_session_name_hint: &SessionName,
-        identity: DeferredInitialPaneIdentity,
-    ) {
-        let refresh_identity = {
-            let state = self.state.lock().await;
-            let runtime_session_name = state.resolve_pane_event_runtime_session(
-                runtime_session_name_hint,
-                identity.pane_id(),
-                Some(identity.generation()),
-            );
-            runtime_session_name.and_then(|runtime_session_name| {
-                let target = state
-                    .pane_target_for_runtime_pane(&runtime_session_name, identity.pane_id())?;
-                let session = state.sessions.session(target.session_name())?;
-                Some((target.session_name().clone(), session.id()))
-            })
-        };
-        if let Some((session_name, session_id)) = refresh_identity {
-            self.refresh_attached_session_for_session_identity(&session_name, session_id)
-                .await;
-        }
-    }
-
-    /// Replays the input a Windows pane queued while it was still starting.
-    ///
-    /// Bytes take the managed route every other input path in this daemon takes — the pane's own
-    /// [`ShellIo::write_input`], against the generation-bound handle drained with the queue, so a
-    /// pane replaced between drain and replay receives nothing rather than another job's input.
-    /// Console records cannot: they are blocking Win32 calls that attach this process to the
-    /// pane's console under a global lock, so each one is handed to a blocking worker.
-    ///
-    /// The pane's process id is resolved per console record rather than once up front, because
-    /// only the console sinks need one. The managed route addresses the *job*, and a pane running
-    /// nothing has no OS process to name — failing a queue of ordinary bytes over a pid none of
-    /// them would have used would drop input the user typed.
-    #[cfg(windows)]
-    async fn flush_deferred_initial_pane_input(
-        flush: crate::pane_terminals::DeferredInitialPaneInputFlush,
-    ) -> Result<(), RmuxError> {
-        if flush.queued_input.is_empty() {
-            return Ok(());
-        }
-        let pane_pid = flush.pane_pid;
-        let (io, handle) = flush.input_shell;
-        for input in flush.queued_input {
-            match input {
-                crate::pane_terminals::DeferredInitialPaneInput::Bytes(bytes) => {
-                    io.write_input(&handle, &bytes)
-                        .await
-                        .map_err(Self::deferred_initial_pane_input_error)?;
-                }
-                // A pasted body queued during startup takes the sink the
-                // live path would have chosen for it, through the same
-                // decision: the console records are what keep a legacy
-                // ConPTY from parsing the pasted bytes, whether or not an
-                // envelope surrounds them.
-                //
-                // The Windows pane backend is not cut over, and this is the deferred half of the
-                // break `handler_pane::io_encoding::prepare_pane_input_write_with_encoding`
-                // carries: the capability used to be read off the pane's own pseudoterminal
-                // master, and the managed pane terminal exposes no verbatim-input capability to
-                // read it from. Both halves are written the same way on purpose, so landing that
-                // capability on `PaneTerminal` fixes them together.
-                crate::pane_terminals::DeferredInitialPaneInput::Paste {
-                    bytes,
-                    delimiters,
-                } => match super::pane_support::windows_paste_sink(
-                    master.preserves_verbatim_input(),
-                    &bytes,
-                    delimiters,
-                ) {
-                    super::pane_support::WindowsPasteSink::Pty => {
-                        io.write_input(&handle, &bytes)
-                            .await
-                            .map_err(Self::deferred_initial_pane_input_error)?;
-                    }
-                    super::pane_support::WindowsPasteSink::ConsoleUtf8 => {
-                        let pane_pid = Self::deferred_initial_pane_console_pid(pane_pid)?;
-                        Self::flush_deferred_initial_console_input(move || {
-                            crate::windows_console_input::write_windows_console_utf8(
-                                pane_pid, &bytes,
-                            )
-                        })
-                        .await?;
-                    }
-                    super::pane_support::WindowsPasteSink::RejectNonUtf8 => {
-                        return Err(RmuxError::Message(
-                            super::pane_support::LEGACY_CONPTY_NON_UTF8_BRACKETED_PASTE_ERROR
-                                .to_owned(),
-                        ));
-                    }
-                },
-                crate::pane_terminals::DeferredInitialPaneInput::Console { action, .. } => {
-                    let pane_pid = Self::deferred_initial_pane_console_pid(pane_pid)?;
-                    Self::flush_deferred_initial_console_input(move || {
-                        Self::write_deferred_initial_console_input(pane_pid, action)
-                    })
-                    .await?;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Runs one blocking console-input injection off the async workers.
-    #[cfg(windows)]
-    async fn flush_deferred_initial_console_input(
-        write: impl FnOnce() -> std::io::Result<()> + Send + 'static,
-    ) -> Result<(), RmuxError> {
-        tokio::task::spawn_blocking(write)
-            .await
-            .map_err(|error| RmuxError::Server(format!("deferred pane input task failed: {error}")))?
-            .map_err(Self::deferred_initial_pane_input_error)
-    }
-
-    #[cfg(windows)]
-    fn deferred_initial_pane_input_error(error: impl std::fmt::Display) -> RmuxError {
-        RmuxError::Server(format!("failed to flush deferred pane input: {error}"))
-    }
-
-    /// The process id a console record is injected into, for a pane that has one.
-    ///
-    /// A console record names the destination *process*; there is no handle form of this call.
-    /// A pane whose shell is idle has no OS process at all — its shell is embedded in this
-    /// daemon — so the queued record has nowhere to go and says so.
-    #[cfg(windows)]
-    fn deferred_initial_pane_console_pid(
-        pane_pid: Option<u32>,
-    ) -> Result<crate::windows_console_input::ProcessId, RmuxError> {
-        let pane_pid = pane_pid.ok_or_else(|| {
-            RmuxError::Server(
-                "deferred pane has no running process to receive console input".to_owned(),
-            )
-        })?;
-        crate::windows_console_input::ProcessId::new(pane_pid)
-            .map_err(|error| RmuxError::Server(error.to_string()))
-    }
-
-    #[cfg(windows)]
-    fn write_deferred_initial_console_input(
-        pane_pid: crate::windows_console_input::ProcessId,
-        action: crate::pane_terminals::DeferredInitialPaneConsoleInputAction,
-    ) -> std::io::Result<()> {
-        use crate::windows_console_input::{
-            send_windows_console_interrupt, write_windows_console_key,
-            write_windows_console_key_reporting_processed_input,
-        };
-
-        match action {
-            crate::pane_terminals::DeferredInitialPaneConsoleInputAction::Key(key) => {
-                crate::windows_console_input::write_with_transient_retry(|| {
-                    write_windows_console_key(pane_pid, key)
-                })
-            }
-            crate::pane_terminals::DeferredInitialPaneConsoleInputAction::KeyThenInterrupt(key) => {
-                crate::windows_console_input::write_console_key_then_processed_interrupt(
-                    || write_windows_console_key_reporting_processed_input(pane_pid, key),
-                    || send_windows_console_interrupt(pane_pid),
-                )
-            }
-            crate::pane_terminals::DeferredInitialPaneConsoleInputAction::Interrupt => {
-                crate::windows_console_input::write_with_transient_retry(|| {
-                    send_windows_console_interrupt(pane_pid)
-                })
-            }
-        }
-    }
-
-    /// Reports a deferred pane whose job never opened, and refreshes whoever is watching it.
-    ///
-    /// The exit the failure implies takes the daemon's one pane-exit path, the same one a job
-    /// that closed on its own reaches through [`Self::apply_shell_closed`]. It is published with
-    /// the state lock released, because handling an exit takes that lock itself.
-    #[cfg(windows)]
-    async fn fail_deferred_initial_pane(
-        &self,
-        commit: &crate::pane_terminals::DeferredInitialPaneCommit,
-        error: RmuxError,
-    ) {
-        let exit_event = {
-            let mut state = self.state.lock().await;
-            state.fail_deferred_initial_pane(commit, &error)
-        };
-        if let Some(event) = exit_event {
-            self.handle_pane_exit_event(event).await;
-        }
-        self.refresh_attached_session(commit.visible_session_name())
-            .await;
-        self.refresh_control_session(commit.visible_session_name())
-            .await;
     }
 
     pub(in crate::handler) async fn handle_kill_session(
@@ -1748,13 +1239,13 @@ impl RequestHandler {
         #[cfg(test)]
         self.pause_before_kill_session_web_prune(&removed_sessions)
             .await;
-        #[cfg(all(any(unix, windows), feature = "web"))]
+        #[cfg(all(unix, feature = "web"))]
         {
             self.web_shares.remove_targets_for_panes(&removed_pane_ids);
             self.web_shares
                 .remove_targets_for_sessions(&removed_sessions);
         }
-        #[cfg(not(all(any(unix, windows), feature = "web")))]
+        #[cfg(not(all(unix, feature = "web")))]
         let _ = &removed_sessions;
         if !removed_pane_ids.is_empty() {
             self.forget_pane_snapshot_coalescers(&removed_pane_ids);
@@ -1899,8 +1390,7 @@ impl RequestHandler {
             let event = LifecycleEvent::SessionRenamed {
                 session_name: new_name.clone(),
             };
-            self.emit_for_session_identity(event, &new_name, session_id)
-                .await;
+            self.emit_for_session_identity(event, session_id).await;
             self.refresh_attached_session(&new_name).await;
         }
 
@@ -1922,13 +1412,6 @@ impl RequestHandler {
             }
             None => SessionSortOrder::Name,
         };
-        #[cfg(windows)]
-        if format_references_pane_pid(request.format.as_deref())
-            || format_references_pane_pid(request.filter.as_deref())
-        {
-            self.wait_for_windows_deferred_list_session_pane_pids()
-                .await;
-        }
         let state = self.state.lock().await;
         let mut sessions = state
             .sessions
@@ -2062,11 +1545,6 @@ impl RequestHandler {
     }
 }
 
-#[cfg(windows)]
-fn deferred_initial_pane_ready_item(item: &rmux_core::events::OutputCursorItem) -> bool {
-    matches!(item, rmux_core::events::OutputCursorItem::Event(event) if !event.bytes().is_empty())
-}
-
 fn destroy_unattached_candidate_sessions(
     state: &crate::pane_terminals::HandlerState,
     scope: &OptionScopeSelector,
@@ -2111,34 +1589,4 @@ fn explicit_session_id_target(target: &SessionName) -> Option<SessionId> {
         return None;
     }
     raw_id.parse::<u32>().ok().map(SessionId::new)
-}
-
-fn should_defer_windows_initial_pane(
-    detached: bool,
-    print_session_info: bool,
-    grouped: bool,
-    has_command: bool,
-) -> bool {
-    #[cfg(windows)]
-    {
-        let _ = has_command;
-        detached && !print_session_info && !grouped && windows_deferred_initial_pane_enabled()
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = (detached, print_session_info, grouped, has_command);
-        false
-    }
-}
-
-#[cfg(windows)]
-fn windows_deferred_initial_pane_enabled() -> bool {
-    std::env::var("RMUX_WINDOWS_DEFER_CONPTY")
-        .map(|value| {
-            !matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "0" | "false" | "no" | "off"
-            )
-        })
-        .unwrap_or(true)
 }

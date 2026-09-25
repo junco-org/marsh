@@ -166,11 +166,8 @@ impl RequestHandler {
             environment,
             command,
         } = command;
-        // Whether the queued command itself carried `-c`, decided before the caller's own
-        // directory fills one in. A client's cwd is where their shell happened to be, not a place
-        // they asked for, so a client sitting outside this daemon's seed still gets a window — at
-        // the seed root — instead of a spawn refused for a directory it never named.
-        let named_directory = start_directory.is_some();
+        // A client's cwd fills in for a queued command that carried no `-c`. It is a real host
+        // path either way; which seed it lies in is the spawn's to discover.
         let start_directory = start_directory.or_else(|| context.caller_cwd.clone());
         let target_witness = *target_witness.ok_or_else(|| {
             RmuxError::Server("queued new-window target witness was not captured".to_owned())
@@ -224,8 +221,6 @@ impl RequestHandler {
 
         let socket_path = self.socket_path();
         let attached_count = self.attached_count(&target).await;
-        #[cfg(windows)]
-        self.wait_for_windows_deferred_all_pane_pids().await;
         let rendered_command = self
             .render_queued_new_window_command(
                 command.as_deref(),
@@ -280,7 +275,6 @@ impl RequestHandler {
                         detached,
                         spawn: WindowSpawnOptions {
                             start_directory: start_directory.as_deref(),
-                            inherited_start_directory: !named_directory,
                             command: process_command.as_ref(),
                             socket_path: &socket_path,
                             spawn_environment: spawn_environment.as_ref(),

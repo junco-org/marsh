@@ -12,22 +12,14 @@
 //! optional `fake` feature adds `fake::CopyTree`, which copies directories instead, so a caller's
 //! own tests need no btrfs.
 //!
-//! Everything is Linux-only: btrfs subvolume ioctls exist nowhere else. On other platforms the
-//! crate compiles to an empty library rather than failing to build, so a portable caller can depend
-//! on it unconditionally and gate its own use.
+//! Everything here is btrfs, so everything here is Linux: the subvolume ioctls exist nowhere else.
 
-#[cfg(target_os = "linux")]
 mod error;
-#[cfg(all(target_os = "linux", feature = "fake"))]
+#[cfg(feature = "fake")]
 pub mod fake;
-#[cfg(target_os = "linux")]
 pub mod persistence;
-#[cfg(target_os = "linux")]
 pub mod snapshot;
 
-#[cfg(target_os = "linux")]
 pub use error::Error;
-#[cfg(target_os = "linux")]
 pub use persistence::{PersistenceLayer, STATE_DIR, short_id};
-#[cfg(target_os = "linux")]
 pub use snapshot::{LibBtrfs, Subvolumes, delete_subvolume, snapshot};

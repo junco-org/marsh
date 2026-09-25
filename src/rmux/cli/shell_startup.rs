@@ -12,7 +12,7 @@ use std::path::Path;
 use rmux_proto::ProcessCommand;
 
 use super::managed_io::{
-    run_managed_pane_command, ManagedPaneCommand, ManagedPaneDisplay, ManagedPaneKind,
+    ManagedPaneCommand, ManagedPaneDisplay, ManagedPaneKind, run_managed_pane_command,
 };
 use super::{ExitFailure, StartupOptions};
 

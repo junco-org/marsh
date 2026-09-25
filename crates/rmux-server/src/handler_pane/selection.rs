@@ -303,9 +303,9 @@ impl RequestHandler {
                 );
             }
             // A select-pane on a session with no attached or control client has
-            // nothing to draw, so skip the refresh — and, on Windows, its
-            // deferred-pane wait — instead of stalling ~2s on the session's own
-            // just-spawned pane while it is still starting
+            // nothing to draw, so skip the refresh — and its deferred-pane wait
+            // — instead of stalling ~2s on the session's own just-spawned pane
+            // while it is still starting
             // (unrelated_starting_pane_does_not_block_a_stable_session_refresh).
             if refresh_sessions.is_empty() {
                 if self.attached_count(&session_name).await > 0 {

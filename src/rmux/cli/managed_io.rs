@@ -45,7 +45,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use rmux_client::{connect, AutoStartConfig, Connection};
+use rmux_client::{AutoStartConfig, Connection, connect};
 use rmux_proto::request::{DetachClientExtRequest, NewSessionExtRequest, SendKeysExtRequest};
 use rmux_proto::{
     KillSessionRequest, OptionScopeSelector, PaneTarget, PaneTargetRef, ProcessCommand, Response,
@@ -53,16 +53,16 @@ use rmux_proto::{
 };
 
 use super::automation::{
-    pane_process_state, stable_pane_ref_for_slot, PaneExitStatus, PaneProcessState,
+    PaneExitStatus, PaneProcessState, pane_process_state, stable_pane_ref_for_slot,
 };
 use super::client_commands::run_attach_session;
 use super::startup::StartupEndpoint;
 use super::{
-    connect_with_startserver, current_terminal_size, expect_command_output,
-    expect_command_success, infer_client_utf8_from_env, resolve_pane_target_spec, ExitFailure,
-    StartupOptions,
+    ExitFailure, StartupOptions, connect_with_startserver, current_terminal_size,
+    expect_command_output, expect_command_success, infer_client_utf8_from_env,
+    resolve_pane_target_spec,
 };
-use crate::cli_args::{parse_target_spec, AttachSessionArgs};
+use crate::cli_args::{AttachSessionArgs, parse_target_spec};
 use crate::client_terminal::client_terminal_context_from_parts;
 
 /// Prefix of every session this module owns.
@@ -191,12 +191,10 @@ fn random_hex_128() -> Result<String, ExitFailure> {
     const HEX: &[u8; 16] = b"0123456789abcdef";
 
     let mut bytes = [0u8; 16];
-    // The OS generator through `getrandom`, not `/dev/urandom` directly. Opening that path is a
-    // unix assumption in code that has no other one: every managed `rmux -c` and every Claude
-    // invocation allocates a nonce here, so a hard-coded device node would make both fail outright
-    // on Windows. `getrandom` reaches the same entropy source on unix and `BCryptGenRandom` on
-    // Windows, and needs no descriptor, so it also works where the process has exhausted its file
-    // handles.
+    // The OS generator through `getrandom`, not `/dev/urandom` directly: it reaches the same
+    // entropy source without holding a descriptor, so it still works where the process has
+    // exhausted its file handles. Every managed `rmux -c` and every Claude invocation allocates a
+    // nonce here, so an open failure would make both fail outright.
     getrandom::fill(&mut bytes).map_err(|error| {
         ExitFailure::new(1, format!("rmux: failed to read OS randomness: {error}"))
     })?;
@@ -387,8 +385,7 @@ fn release_and_display(
             PaneExitStatus::resolved_exit_code(pumped?, COMMAND_NAME)
         }
         ManagedPaneDisplay::Attach => {
-            let observer =
-                AttachExitObserver::start(endpoint, identity.main.clone(), pane.clone());
+            let observer = AttachExitObserver::start(endpoint, identity.main.clone(), pane.clone());
             wait_for(connection, &identity.channel, WaitForMode::Unlock)?;
             let attached = attach(endpoint, &identity.main);
             observer.stop();
@@ -917,9 +914,8 @@ impl PaneExitWatcher {
                 match pane_process_state(&mut connection, &pane) {
                     Ok(PaneProcessState::Exited(status)) => {
                         let settled = status.is_conclusive()
-                            || dead_since.is_some_and(|since: Instant| {
-                                since.elapsed() >= EXIT_STATUS_GRACE
-                            });
+                            || dead_since
+                                .is_some_and(|since: Instant| since.elapsed() >= EXIT_STATUS_GRACE);
                         if settled {
                             if let Ok(mut slot) = thread_exited.lock() {
                                 *slot = Some(status);

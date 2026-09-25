@@ -13,22 +13,10 @@ use tokio::sync::mpsc;
 
 use super::RequestHandler;
 
-fn session_name(value: &str) -> SessionName {
-    SessionName::new(value).expect("valid session name")
-}
+use crate::test_names::session_name;
 
 fn tagged_stdin_discard_command(tag: &str) -> String {
-    #[cfg(unix)]
-    {
-        format!("cat >/dev/null # {tag}")
-    }
-    #[cfg(windows)]
-    {
-        crate::test_shell::powershell_encoded_command(&format!(
-            "$tag='{}'; $inputStream=[Console]::OpenStandardInput(); $inputStream.CopyTo([System.IO.Stream]::Null)",
-            tag.replace('\'', "''")
-        ))
-    }
+    format!("cat >/dev/null # {tag}")
 }
 
 fn unique_temp_path(label: &str) -> PathBuf {

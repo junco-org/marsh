@@ -77,8 +77,7 @@ pub(crate) fn expand_client_title(
     // the title shares its cache, its concurrency limit and its cancellation.
     let profile = template
         .contains("#(")
-        .then(|| runtime.status_job_profile())
-        .flatten();
+        .then(|| runtime.status_job_profile());
     Some(render_status_template_jobs_with_profile(
         template,
         &runtime,

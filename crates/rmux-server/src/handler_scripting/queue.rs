@@ -80,26 +80,7 @@ impl QueueExecutionContext {
     }
 
     pub(in crate::handler) fn without_caller_cwd() -> Self {
-        Self {
-            caller_cwd: None,
-            source_file_depth: 0,
-            current_file: None,
-            current_target: None,
-            current_target_allows_canfail_fallback: false,
-            missing_current_target_fallback: MissingCurrentTargetFallback::AllowDefaultSession,
-            run_shell_canfail_fallback_target: false,
-            follows_attached_session: false,
-            client_name: None,
-            mouse_target: None,
-            mouse_event: None,
-            retained_lifecycle_target: None,
-            pinned_current_target_identity: None,
-            pinned_pane_output_identity: None,
-            rebased_current_session: None,
-            current_session_transition_policy: CurrentSessionTransitionPolicy::Stable,
-            run_shell_command_depth: 0,
-            control_queue_origin: None,
-        }
+        Self::new(None)
     }
 
     pub(in crate::handler) fn for_sourced_commands(
@@ -694,11 +675,9 @@ mod tests {
         AttachSessionExt2Request, AttachSessionExt3Request, AttachSessionExtRequest,
         SwitchClientExt2Request, SwitchClientExt3Request, SwitchClientExtRequest,
     };
-    use rmux_proto::{AttachSessionRequest, SessionName, SwitchClientRequest};
+    use rmux_proto::{AttachSessionRequest, SwitchClientRequest};
 
-    fn session_name(value: &str) -> SessionName {
-        SessionName::new(value).expect("valid test session")
-    }
+    use crate::test_names::session_name;
 
     #[test]
     fn attached_transition_capture_recognizes_every_request_generation() {

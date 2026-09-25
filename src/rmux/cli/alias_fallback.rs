@@ -1,24 +1,24 @@
 use std::ffi::OsString;
 use std::path::Path;
 
-use rmux_client::{connect, resolve_socket_path, resolve_tmux_compatible_socket_path, Connection};
+use rmux_client::{Connection, connect, resolve_socket_path, resolve_tmux_compatible_socket_path};
 use rmux_core::{
-    command_inventory::{has_tmux_command_candidate, RMUX_EXTENSION_COMMANDS},
-    command_parser::{is_parse_time_assignment, lookup_command, CommandParser},
+    command_inventory::{RMUX_EXTENSION_COMMANDS, has_tmux_command_candidate},
+    command_parser::{CommandParser, is_parse_time_assignment, lookup_command},
 };
 use rmux_proto::OptionScopeSelector;
 
 use crate::cli_args::{
-    parse, scan_top_level_command, Command, RuntimeCommandGroup, TopLevelCommandScan,
+    Command, RuntimeCommandGroup, TopLevelCommandScan, parse, scan_top_level_command,
 };
 use crate::cli_response::expect_command_output;
 use crate::command_alias_snapshot::{decode_command_alias_definitions, definition_matches_name};
 use crate::runtime_command_expansion::{
-    expand_runtime_command_segment, RuntimeCommandExpansionError,
+    RuntimeCommandExpansionError, expand_runtime_command_segment,
 };
 
-use super::command_runner::run_queued_server_command_with_connection;
 use super::ExitFailure;
+use super::command_runner::run_queued_server_command_with_connection;
 
 /// Outcome of resolving an argv command queue against a running server.
 pub(super) enum RuntimeCommandResolution {

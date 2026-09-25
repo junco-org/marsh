@@ -1,5 +1,3 @@
-#![cfg(unix)]
-
 mod common;
 
 use std::error::Error;
@@ -10,7 +8,7 @@ use rmux_proto::{
     WaitForRequest,
 };
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn run_shell_foreground_returns_status_and_stdout() -> Result<(), Box<dyn Error>> {
     let harness = TestHarness::new("run-shell-foreground");
     let socket_path = harness.socket_path().to_path_buf();
@@ -47,7 +45,7 @@ async fn run_shell_foreground_returns_status_and_stdout() -> Result<(), Box<dyn 
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn if_shell_rejects_unsupported_nested_command() -> Result<(), Box<dyn Error>> {
     let harness = TestHarness::new("if-shell-unsupported");
     let socket_path = harness.socket_path().to_path_buf();
@@ -72,7 +70,7 @@ async fn if_shell_rejects_unsupported_nested_command() -> Result<(), Box<dyn Err
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn if_shell_returns_nested_command_output() -> Result<(), Box<dyn Error>> {
     let harness = TestHarness::new("if-shell-output");
     let socket_path = harness.socket_path().to_path_buf();
@@ -116,7 +114,7 @@ async fn if_shell_returns_nested_command_output() -> Result<(), Box<dyn Error>> 
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn wait_for_signal_without_waiters_is_not_latched() -> Result<(), Box<dyn Error>> {
     let harness = TestHarness::new("wait-for-signal-no-waiters");
     let socket_path = harness.socket_path().to_path_buf();

@@ -24,7 +24,7 @@ async fn settled_timer_snapshot(
     handler: &RequestHandler,
     target: &WindowTarget,
 ) -> (u64, tokio::time::Instant) {
-    // Observe the production timer until any in-flight ConPTY startup activity
+    // Observe the production timer until any in-flight pane startup activity
     // has finished re-arming it. Do not replace the deadline here: doing so
     // would manufacture the baseline that these fanout tests are meant to
     // preserve.

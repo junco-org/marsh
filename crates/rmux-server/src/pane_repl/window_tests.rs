@@ -25,14 +25,8 @@ use crate::io::ShellIo;
 async fn prompt_over_session(name: &str) -> (RequestHandler, ShellIo, SessionName, Prompt) {
     let handler = RequestHandler::new();
     let io = crate::managed_workload::test_engine::install(&handler).expect("a test engine");
-    // `listener::serve` binds both directions. The test engine binds only the forward one, and a
-    // prompt reaches the session it lives in through the reverse one.
-    io.install_handler(RequestHandler::downgrade(&handler));
 
-    let seed = io
-        .executor_info()
-        .seed
-        .expect("the test engine publishes into a seed");
+    let seed = io.default_dir().to_path_buf();
     std::fs::create_dir_all(seed.join("docs")).expect("a directory for `sd` to name");
 
     let session = SessionName::new(name).expect("valid session name");
@@ -167,7 +161,9 @@ async fn a_trailing_ampersand_opens_a_detached_window_whose_job_keep_can_still_r
         "`&` adds a job; only `fg` switches to one"
     );
 
-    let handle = io.shell(&opened.id).expect("the background job is still live");
+    let handle = io
+        .shell(&opened.id)
+        .expect("the background job is still live");
     assert!(
         io.keep(&handle).expect("keep answers for a live job"),
         "an anonymous `&` keeps the engine's automatic closure, and `keep` must still cancel it"

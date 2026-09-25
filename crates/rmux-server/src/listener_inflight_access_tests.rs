@@ -202,14 +202,6 @@ async fn a_stale_admission_turns_an_inflight_raw_open_into_a_revoked_end() -> io
 
 /// A uid that is neither the server owner nor a reserved superuser, so its
 /// access entry can be removed while the connection is mid-request.
-#[cfg(unix)]
 fn revocable_peer_uid() -> u32 {
     rmux_os::identity::real_user_id().saturating_add(13_000)
-}
-
-#[cfg(windows)]
-fn revocable_peer_uid() -> u32 {
-    // Windows keys the access store by SID, so no uid entry can collide with
-    // the server owner or with a reserved identity.
-    13_000
 }

@@ -100,7 +100,7 @@ pub(super) async fn load(io: &ShellIo, name: &str) -> Result<TunnelPreset, RmuxE
         ));
     }
     let directories = preset_dirs();
-    let cwd = helper_directory();
+    let cwd = helper_directory(io);
     // One managed enumeration answers both questions this function has: whether a configured file
     // for this name exists, and what to list as available if it does not. Probing each candidate
     // path with `Path::is_file` would be the same requested filesystem work, done outside the
@@ -141,11 +141,11 @@ pub(super) async fn load(io: &ShellIo, name: &str) -> Result<TunnelPreset, RmuxE
 
 /// The directory the managed preset helpers run in.
 ///
-/// The daemon's own, so a relative `RMUX_TUNNEL_PRESET_DIR` resolves exactly where it did when
-/// these were plain [`std::fs`] calls. Every shipped preset directory is absolute and does not
-/// depend on it.
-fn helper_directory() -> PathBuf {
-    env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+/// This host's default, so a relative `RMUX_TUNNEL_PRESET_DIR` resolves where the daemon was
+/// started rather than wherever a request happened to come from. Every shipped preset directory
+/// is absolute and does not depend on it.
+fn helper_directory(io: &ShellIo) -> PathBuf {
+    io.default_dir().to_path_buf()
 }
 
 /// Parses a configured preset file's raw bytes.
@@ -290,11 +290,7 @@ pub(super) fn available_from(
     configured: impl IntoIterator<Item = String>,
 ) -> Vec<String> {
     let mut names = embedded.into_iter().collect::<BTreeSet<_>>();
-    names.extend(
-        configured
-            .into_iter()
-            .filter(|name| valid_name(name)),
-    );
+    names.extend(configured.into_iter().filter(|name| valid_name(name)));
     names.into_iter().collect()
 }
 

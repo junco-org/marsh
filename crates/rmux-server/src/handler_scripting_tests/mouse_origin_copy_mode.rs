@@ -4,35 +4,12 @@ use crate::mouse::{AttachedMouseEvent, MouseLocation};
 use rmux_core::{input::InputParser, PaneId, Screen};
 use tokio::sync::mpsc;
 
-#[cfg(unix)]
 fn quiet_command() -> Vec<String> {
     vec!["/bin/sh".to_owned(), "-c".to_owned(), "sleep 60".to_owned()]
 }
 
-#[cfg(unix)]
 fn failing_pipe_command() -> &'static str {
     "exit 7"
-}
-
-#[cfg(windows)]
-fn failing_pipe_command() -> &'static str {
-    "exit /b 7"
-}
-
-#[cfg(windows)]
-fn quiet_command() -> Vec<String> {
-    let system_root =
-        std::env::var_os("SystemRoot").unwrap_or_else(|| std::ffi::OsString::from(r"C:\Windows"));
-    let cmd = std::path::PathBuf::from(system_root)
-        .join("System32")
-        .join("cmd.exe");
-    vec![
-        cmd.to_string_lossy().into_owned(),
-        "/d".to_owned(),
-        "/q".to_owned(),
-        "/c".to_owned(),
-        "ping -n 120 127.0.0.1 >NUL".to_owned(),
-    ]
 }
 
 async fn fixture(name: &str) -> (RequestHandler, SessionName, PaneTarget) {
@@ -396,7 +373,6 @@ async fn background_command_queues_drop_mouse_origin_like_tmux() {
         ),
     ] {
         let (handler, session, target) = fixture(name).await;
-        use_platform_test_shell(&handler).await;
         execute_with_mouse(&handler, &target, &command).await;
         wait_for_line_number_state(&handler, &session, PaneId::new(0), true).await;
         wait_for_detached_request_count(&handler, 0).await;
@@ -466,7 +442,6 @@ async fn background_copy_commands_ignore_the_cached_mouse_event() {
         ),
     ] {
         let (handler, session, target) = fixture(name).await;
-        use_platform_test_shell(&handler).await;
         let _control_rx = prepare_copy_mode_fixture(&handler, &session, &target).await;
         {
             let mut active_attach = handler.active_attach.lock().await;

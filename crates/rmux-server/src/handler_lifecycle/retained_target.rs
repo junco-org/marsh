@@ -436,23 +436,12 @@ fn resolve_pane_anchor(
         &original_window,
     );
     if let Some(window) = window {
-        if let Some(pane_index) = state
-            .sessions
-            .session(window.session_name())
-            .and_then(|session| session.window_at(window.window_index()))
-            .and_then(|window| {
-                window
-                    .panes()
-                    .iter()
-                    .find(|pane| pane.id() == pane_id)
-                    .map(rmux_core::Pane::index)
-            })
-        {
-            return Some(PaneTarget::with_window(
-                window.session_name().clone(),
-                window.window_index(),
-                pane_index,
-            ));
+        if let Some(target) = state.pane_target_for_id_in_window(
+            window.session_name(),
+            window.window_index(),
+            pane_id,
+        ) {
+            return Some(target);
         }
     }
 

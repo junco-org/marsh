@@ -1,11 +1,11 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 
 use rmux_core::{AlertFlags, EnvironmentStore, PaneId, Session};
 use rmux_proto::{
     LinkWindowRequest, MoveWindowResponse, RmuxError, SessionName, SwapWindowResponse, WindowTarget,
 };
 
-use crate::pane_terminals::{WindowLinkGroup, WindowLinkOccurrenceId, WindowLinkSlot};
+use crate::pane_terminals::session_mutation::WindowMutationMetadataSnapshot;
 
 use super::super::{session_not_found, window_pane_ids, HandlerState};
 use crate::pane_terminals::terminate_removed_terminals;
@@ -29,12 +29,7 @@ impl HandlerState {
             .session(&target_session_name)
             .cloned()
             .ok_or_else(|| session_not_found(&target_session_name))?;
-        let previous_options = self.options.clone();
-        let previous_hooks = self.hooks.clone();
-        let previous_auto_named_windows = self.auto_named_windows.clone();
-        let previous_window_link_slots = self.window_link_slots.clone();
-        let previous_window_link_groups = self.window_link_groups.clone();
-        let previous_window_link_occurrences = self.window_link_occurrences.clone();
+        let previous_metadata = WindowMutationMetadataSnapshot::capture(self);
         let source_window = previous_source_session
             .window_at(source.window_index())
             .cloned()
@@ -136,12 +131,7 @@ impl HandlerState {
             &target_runtime_after,
             &target_pane_ids,
         ) {
-            self.options = previous_options;
-            self.hooks = previous_hooks;
-            self.auto_named_windows = previous_auto_named_windows;
-            self.window_link_slots = previous_window_link_slots;
-            self.window_link_groups = previous_window_link_groups;
-            self.window_link_occurrences = previous_window_link_occurrences;
+            previous_metadata.restore(self);
             self.restore_cross_session_window_change(
                 &source_session_name,
                 previous_source_session,
@@ -166,12 +156,7 @@ impl HandlerState {
                 &target_runtime_after,
                 &target_pane_ids,
             )?;
-            self.options = previous_options;
-            self.hooks = previous_hooks;
-            self.auto_named_windows = previous_auto_named_windows;
-            self.window_link_slots = previous_window_link_slots;
-            self.window_link_groups = previous_window_link_groups;
-            self.window_link_occurrences = previous_window_link_occurrences;
+            previous_metadata.restore(self);
             self.restore_cross_session_window_change(
                 &source_session_name,
                 previous_source_session,
@@ -198,12 +183,7 @@ impl HandlerState {
                 &target_runtime_after,
                 &target_pane_ids,
             )?;
-            self.options = previous_options;
-            self.hooks = previous_hooks;
-            self.auto_named_windows = previous_auto_named_windows;
-            self.window_link_slots = previous_window_link_slots;
-            self.window_link_groups = previous_window_link_groups;
-            self.window_link_occurrences = previous_window_link_occurrences;
+            previous_metadata.restore(self);
             self.restore_cross_session_window_change(
                 &source_session_name,
                 previous_source_session,
@@ -348,12 +328,7 @@ impl HandlerState {
             .session(&target_session_name)
             .cloned()
             .ok_or_else(|| session_not_found(&target_session_name))?;
-        let previous_options = self.options.clone();
-        let previous_hooks = self.hooks.clone();
-        let previous_auto_named_windows = self.auto_named_windows.clone();
-        let previous_window_link_slots = self.window_link_slots.clone();
-        let previous_window_link_groups = self.window_link_groups.clone();
-        let previous_window_link_occurrences = self.window_link_occurrences.clone();
+        let previous_metadata = WindowMutationMetadataSnapshot::capture(self);
         let source_was_last_window = previous_source_session.windows().len() == 1;
         let source_group_members_before = if source_was_last_window {
             self.sessions.session_group_members(&source_session_name)
@@ -388,8 +363,7 @@ impl HandlerState {
                 target_group_index_map,
                 previous_source_session,
                 previous_target_session,
-                previous_options,
-                previous_hooks,
+                previous_metadata,
             );
         }
 
@@ -497,12 +471,7 @@ impl HandlerState {
                 ) {
                     Ok(transfer) => transfer,
                     Err(error) => {
-                        self.options = previous_options;
-                        self.hooks = previous_hooks;
-                        self.auto_named_windows = previous_auto_named_windows;
-                        self.window_link_slots = previous_window_link_slots;
-                        self.window_link_groups = previous_window_link_groups;
-                        self.window_link_occurrences = previous_window_link_occurrences;
+                        previous_metadata.restore(self);
                         self.restore_cross_session_window_change(
                             &source_session_name,
                             previous_source_session,
@@ -532,12 +501,7 @@ impl HandlerState {
             {
                 Ok(removed_target_terminals) => removed_target_terminals,
                 Err(error) => {
-                    self.options = previous_options;
-                    self.hooks = previous_hooks;
-                    self.auto_named_windows = previous_auto_named_windows;
-                    self.window_link_slots = previous_window_link_slots;
-                    self.window_link_groups = previous_window_link_groups;
-                    self.window_link_occurrences = previous_window_link_occurrences;
+                    previous_metadata.restore(self);
                     self.restore_cross_session_window_change(
                         &source_session_name,
                         previous_source_session.clone(),
@@ -556,12 +520,7 @@ impl HandlerState {
             &source_pane_ids,
         ) {
             self.rollback_detached_window_link_runtime(&detached_target_runtime_transfer)?;
-            self.options = previous_options;
-            self.hooks = previous_hooks;
-            self.auto_named_windows = previous_auto_named_windows;
-            self.window_link_slots = previous_window_link_slots;
-            self.window_link_groups = previous_window_link_groups;
-            self.window_link_occurrences = previous_window_link_occurrences;
+            previous_metadata.restore(self);
             self.replace_two_sessions(
                 &source_session_name,
                 previous_source_session,
@@ -591,12 +550,7 @@ impl HandlerState {
                 &source_pane_ids,
             )?;
             self.rollback_detached_window_link_runtime(&detached_target_runtime_transfer)?;
-            self.options = previous_options;
-            self.hooks = previous_hooks;
-            self.auto_named_windows = previous_auto_named_windows;
-            self.window_link_slots = previous_window_link_slots;
-            self.window_link_groups = previous_window_link_groups;
-            self.window_link_occurrences = previous_window_link_occurrences;
+            previous_metadata.restore(self);
             self.replace_two_sessions(
                 &source_session_name,
                 previous_source_session,
@@ -637,12 +591,7 @@ impl HandlerState {
                     .insert_existing_panes(&target_runtime_before, removed_target_terminals)?;
             }
             self.insert_existing_pane_outputs(&target_runtime_before, removed_target_outputs);
-            self.options = previous_options;
-            self.hooks = previous_hooks;
-            self.auto_named_windows = previous_auto_named_windows;
-            self.window_link_slots = previous_window_link_slots;
-            self.window_link_groups = previous_window_link_groups;
-            self.window_link_occurrences = previous_window_link_occurrences;
+            previous_metadata.restore(self);
             self.restore_cross_session_window_change(
                 &source_session_name,
                 previous_source_session,
@@ -711,15 +660,10 @@ impl HandlerState {
         target_group_index_map: Option<&BTreeMap<u32, u32>>,
         previous_source_session: Session,
         previous_target_session: Session,
-        previous_options: rmux_core::OptionStore,
-        previous_hooks: rmux_core::HookStore,
+        previous_metadata: WindowMutationMetadataSnapshot,
     ) -> Result<MoveWindowResponse, RmuxError> {
         let source_session_name = source.session_name().clone();
         let target_session_name = target.session_name().clone();
-        let previous_auto_named_windows = self.auto_named_windows.clone();
-        let previous_window_link_slots = self.window_link_slots.clone();
-        let previous_window_link_groups = self.window_link_groups.clone();
-        let previous_window_link_occurrences = self.window_link_occurrences.clone();
         let previous_environment = self.environment.clone();
         let source_occurrence_id =
             self.window_link_occurrence_id(&source_session_name, source.window_index());
@@ -750,12 +694,7 @@ impl HandlerState {
                 &target_session_name,
                 previous_target_session,
                 previous_environment.clone(),
-                previous_options,
-                previous_hooks,
-                previous_auto_named_windows,
-                previous_window_link_slots,
-                previous_window_link_groups,
-                previous_window_link_occurrences,
+                previous_metadata,
             )?;
             return Err(error);
         }
@@ -803,12 +742,7 @@ impl HandlerState {
                 &target_session_name,
                 previous_target_session,
                 previous_environment,
-                previous_options,
-                previous_hooks,
-                previous_auto_named_windows,
-                previous_window_link_slots,
-                previous_window_link_groups,
-                previous_window_link_occurrences,
+                previous_metadata,
             )?;
             return Err(error);
         }
@@ -851,12 +785,7 @@ impl HandlerState {
         target_session_name: &SessionName,
         previous_target_session: Session,
         previous_environment: EnvironmentStore,
-        previous_options: rmux_core::OptionStore,
-        previous_hooks: rmux_core::HookStore,
-        previous_auto_named_windows: HashSet<(SessionName, u32)>,
-        previous_window_link_slots: HashMap<WindowLinkSlot, u64>,
-        previous_window_link_groups: HashMap<u64, WindowLinkGroup>,
-        previous_window_link_occurrences: HashMap<WindowLinkSlot, WindowLinkOccurrenceId>,
+        previous_metadata: WindowMutationMetadataSnapshot,
     ) -> Result<(), RmuxError> {
         self.replace_two_sessions(
             source_session_name,
@@ -865,12 +794,7 @@ impl HandlerState {
             previous_target_session,
         )?;
         self.environment = previous_environment;
-        self.options = previous_options;
-        self.hooks = previous_hooks;
-        self.auto_named_windows = previous_auto_named_windows;
-        self.window_link_slots = previous_window_link_slots;
-        self.window_link_groups = previous_window_link_groups;
-        self.window_link_occurrences = previous_window_link_occurrences;
+        previous_metadata.restore(self);
         Ok(())
     }
 

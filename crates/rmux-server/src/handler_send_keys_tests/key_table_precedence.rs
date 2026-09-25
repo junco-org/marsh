@@ -10,16 +10,20 @@
 //     live-input path.
 //
 // tmux 3.7b, measured through a real PTY client, honours a user binding on
-// every one of those keys in both tables and makes an unbound one completely
-// inert -- there is no hardcoded fallback in front of, or behind, the table.
-// Both shims are therefore gone and the tables are the sole authority, which
-// is what the detached `send-keys -X` path already did.
+// every one of those keys in both tables and makes an unbound one inert on a
+// freshly entered prefix -- there is no hardcoded fallback in front of, or
+// behind, the table. (Inertness is specific to that fresh prefix: inside an
+// active repeat window tmux re-resolves the key in the default table and, when
+// it is unbound there too, hands it to the pane.) Both shims are therefore gone
+// and the tables are the sole authority, which is what the detached
+// `send-keys -X` path already did.
 //
 // These tests pin the dispatch layer: the resolved binding wins, the defaults
 // still work when the user binds nothing, and the neighbouring tables plus the
 // modified arrows behave exactly as before.
 
 use super::*;
+use std::future::Future;
 
 const PROBE: &str = "@probe180";
 
@@ -432,25 +436,21 @@ async fn prefix_table_default_arrow_selects_the_pane_in_that_direction() {
 
 #[tokio::test]
 async fn prefix_table_unbound_arrow_stays_inert() {
+    // A *freshly* entered prefix swallows an unbound key: the arrow must not
+    // leak to the pane, and the key after it must not stay trapped in the
+    // prefix table either.
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    let target = PaneTarget::new(alpha.clone(), 0);
     let requester_pid = std::process::id();
 
-    create_send_keys_test_session(&handler, &alpha).await;
+    create_quiet_input_session(&handler, &alpha).await;
     let _control_rx = attach(&handler, requester_pid, &alpha).await;
     unbind(&handler, "prefix", "Up").await;
+    let capture = RawPaneInputProbe::start(&handler, &alpha, "d1-fresh-prefix", 1).await;
 
-    dispatch_key_table(&handler, &target, "C-b").await;
-    dispatch_key_table(&handler, &target, "Up").await;
+    type_live(&handler, requester_pid, b"\x02\x1b[Ax").await;
 
-    // The prefix table is left, and nothing ran.
-    let active_attach = handler.active_attach.lock().await;
-    let active = active_attach
-        .by_pid
-        .get(&requester_pid)
-        .expect("attached client remains registered");
-    assert_eq!(active.key_table_name, None);
+    capture.assert_contents(&handler, b"x").await;
 }
 
 async fn client_key_table(handler: &RequestHandler, requester_pid: u32) -> Option<String> {
@@ -606,6 +606,120 @@ async fn prefix_table_repeating_user_binding_repeats() {
     );
 }
 
+async fn set_session_option(
+    handler: &RequestHandler,
+    session: &rmux_proto::SessionName,
+    option: OptionName,
+    value: &str,
+) {
+    let response = handler
+        .handle(Request::SetOption(SetOptionRequest {
+            scope: ScopeSelector::Session(session.clone()),
+            option,
+            value: value.to_owned(),
+            mode: SetOptionMode::Replace,
+        }))
+        .await;
+    assert!(matches!(response, Response::SetOption(_)), "{response:?}");
+}
+
+/// A client whose `prefix Left` repeats, with a repeat window far longer than
+/// the test can take. Dispatch reads `std::time::Instant`, so the long window
+/// is what keeps a slow test from passing through the timeout path instead of
+/// the fallback path under test.
+async fn repeat_window_fixture(
+    handler: &RequestHandler,
+    alpha: &rmux_proto::SessionName,
+    requester_pid: u32,
+) -> mpsc::UnboundedReceiver<crate::pane_io::AttachControl> {
+    create_quiet_input_session(handler, alpha).await;
+    let control_rx = attach(handler, requester_pid, alpha).await;
+    bind_repeating(handler, "prefix", "Left", &["select-pane", "-L"]).await;
+    set_session_option(handler, alpha, OptionName::RepeatTime, "60000").await;
+    set_session_option(handler, alpha, OptionName::InitialRepeatTime, "60000").await;
+    control_rx
+}
+
+// Running a binding from the attached live-input path nests command dispatch
+// inside attached-key dispatch in a single poll. Mirror the daemon worker
+// budget instead of depending on the test harness thread stack.
+const DAEMON_TEST_STACK_SIZE: usize = 8 * 1024 * 1024;
+
+fn run_on_daemon_test_stack<F, Fut>(test: F)
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: Future<Output = ()> + 'static,
+{
+    let worker = std::thread::Builder::new()
+        .name("key-table-precedence-test".to_owned())
+        .stack_size(DAEMON_TEST_STACK_SIZE)
+        .spawn(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("key-table precedence test runtime should build");
+            runtime.block_on(test());
+        })
+        .expect("key-table precedence test worker should spawn");
+    if let Err(panic) = worker.join() {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+#[test]
+fn prefix_repeat_fallback_forwards_literal_input() {
+    run_on_daemon_test_stack(prefix_repeat_fallback_forwards_literal_input_case);
+}
+
+async fn prefix_repeat_fallback_forwards_literal_input_case() {
+    // Inside an active repeat window a key the prefix table binds without `-r`
+    // (`z` -> `resize-pane -Z`) and a key it does not bind at all (`j`) must
+    // both resolve again in the default table and, unbound there, reach the
+    // pane exactly once -- the retry tmux 3.7b does in
+    // `server_client_key_callback`. Before the fix both were swallowed as
+    // "unbound prefix key" because the snapshot still said `prefix`.
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+    let requester_pid = std::process::id();
+
+    let _control_rx = repeat_window_fixture(&handler, &alpha, requester_pid).await;
+    let capture = RawPaneInputProbe::start(&handler, &alpha, "d1-literal-fallback", 2).await;
+
+    type_live(&handler, requester_pid, b"\x02\x1b[Dz\x02\x1b[Dj").await;
+
+    capture.assert_contents(&handler, b"zj").await;
+}
+
+#[test]
+fn prefix_repeat_fallback_honors_configured_default_binding() {
+    run_on_daemon_test_stack(prefix_repeat_fallback_honors_configured_default_binding_case);
+}
+
+async fn prefix_repeat_fallback_honors_configured_default_binding_case() {
+    // The fallback goes to the *configured* default table, not a hardcoded
+    // root: a binding there consumes the key, and the ordinary key behind it
+    // still reaches the pane.
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+    let requester_pid = std::process::id();
+
+    let _control_rx = repeat_window_fixture(&handler, &alpha, requester_pid).await;
+    bind(
+        &handler,
+        "d1-default",
+        "j",
+        &["set-option", "-g", PROBE, "default-hit"],
+    )
+    .await;
+    set_session_option(&handler, &alpha, OptionName::KeyTable, "d1-default").await;
+    let capture = RawPaneInputProbe::start(&handler, &alpha, "d1-default-binding", 1).await;
+
+    type_live(&handler, requester_pid, b"\x02\x1b[Dj!").await;
+
+    assert_eq!(probe_value(&handler, PROBE).await, "default-hit");
+    capture.assert_contents(&handler, b"!").await;
+}
+
 async fn active_pane_index(handler: &RequestHandler, session: &rmux_proto::SessionName) -> u32 {
     let state = handler.state.lock().await;
     state
@@ -622,7 +736,7 @@ async fn active_pane_index(handler: &RequestHandler, session: &rmux_proto::Sessi
 // --------------------------------------------------------------------------
 
 /// Type raw terminal bytes into the attached client, the path a real keyboard
-/// takes. `\x1b[A` and friends are what Windows Terminal delivers for arrows.
+/// takes. `\x1b[A` and friends are what a terminal emulator delivers for arrows.
 async fn type_live(handler: &RequestHandler, requester_pid: u32, bytes: &[u8]) {
     handler
         .handle_attached_live_input_for_test(requester_pid, bytes)

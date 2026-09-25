@@ -13,17 +13,16 @@
 //! installs them here — once, at reopen, before any shell over that seed can reach
 //! [`PolicyValidator::check`].
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex};
-use std::time::UNIX_EPOCH;
 
-use marsh_instrument::BuiltinRecord;
-use marsh_wal::CommitOp;
 pub use rust_validator::{Action, Event, Principal, Resource};
 use rust_validator::{Bump, GitPolicy, PolicyDecision};
 
+use super::MarshError;
 use super::builtins::gitcmd::{self, GitAction};
+use super::session::GitEffectRecord;
 
 // Keep caller-selected durable identities disjoint from reusable names and snapshot uids.
 const PRINCIPAL_NAMESPACE: &str = "@marsh/";
@@ -153,101 +152,120 @@ impl PolicyValidator {
 
 /// The capabilities one command line requested, in the order it requested them.
 ///
-/// Edits come from the tree diff, stamped with the written file's mtime (a removal with its parent
-/// directory's); git requests come from the `git` builtin's records, stamped with the builtin's own
-/// clock. Merging the two by timestamp is what makes `printf x > p; git add -- p` arrive as an edit
-/// followed by a stage, which is what the policy's rows need: they hinge on the *last* state change
-/// of a resource.
+/// Two streams meet here. `edits` are the line's own changes to content — every path its
+/// publication carries that is a file, a symlink, or a file a directory replaced — each with the
+/// trace timestamps of the calls that wrote it. `git` is what each observed git invocation did,
+/// already in the git vocabulary and still unmapped. The trace and the invocation windows share
+/// one clock, so the line splits into segments: before the first invocation, each invocation's
+/// own window, between invocations, and after the last. That is what makes
+/// `printf a > p; git add -- p; printf b > p; git add -- p` arrive as edit, stage, edit, stage —
+/// the order the policy's rows need, since they hinge on the *last* state change of a resource.
 ///
-/// A tree change at a path this line asked git to write into — a `Checkout`, `Stash`, `Delete` or
-/// `Clean` — is git's doing, not a user edit, and produces nothing. That attribution is by request
-/// and never by timestamp: a filesystem stamps mtimes from the kernel's coarse clock, one tick
-/// wide, so a file libgit2 wrote can carry a time milliseconds *before* the builtin that wrote it
-/// began.
+/// Within an invocation's window, a path it wrote is its own doing when one of its recorded
+/// actions maps onto a state change of that path; otherwise the write is an ordinary edit,
+/// requested before the invocation's own actions. Writes under the repository metadata an
+/// invocation named are never edits. A recorded action that changes no state — a read, a diff,
+/// a history — requests nothing at all: observing a resource takes no claim on it.
 ///
-/// Paths under `.git/` are published but never requested, and exact duplicates collapse to their
-/// first occurrence.
+/// Paths under `.git/` are published but never requested, and only a consecutive repetition of
+/// the same action on one resource collapses: an edit, a stage and an edit again are three
+/// transitions and all three are requested.
+///
+/// # Errors
+///
+/// Fails when a path cannot be named losslessly as a policy resource — a component that is not
+/// a plain UTF-8 name — because two different files would otherwise be requested as one.
 pub(crate) fn translate(
     principal: &Principal,
-    snapshot: &Path,
-    ops: &[CommitOp],
-    builtins: &[BuiltinRecord],
-) -> Vec<Event> {
-    let mut exits: HashMap<u64, u8> = HashMap::new();
-    for record in builtins {
-        if let BuiltinRecord::End { id, exit, .. } = record {
-            exits.insert(*id, *exit);
-        }
-    }
+    edits: &[(PathBuf, Vec<u64>)],
+    git: &[GitEffectRecord],
+) -> Result<Vec<Event>, MarshError> {
+    let mut requests = Requests {
+        principal,
+        events: Vec::new(),
+        last: HashMap::new(),
+    };
+    let mut records: Vec<&GitEffectRecord> = git.iter().collect();
+    records.sort_by_key(|record| record.started_at);
 
-    let mut stamped: Vec<(u64, Event)> = Vec::new();
-    let mut git_writes: HashSet<PathBuf> = HashSet::new();
-    for record in builtins {
-        let BuiltinRecord::Begin {
-            id,
-            ts,
-            builtin,
-            argv,
-            cwd,
-            ..
-        } = record
-        else {
-            continue;
-        };
-        if builtin != "git" || exits.get(id).copied() != Some(0) {
-            continue;
+    let mut since = 0;
+    for record in records {
+        for path in written_between(edits, since, record.started_at) {
+            requests.push(Action::Edit, path)?;
         }
-        // Unreachable for an exit-0 record: the builtin refused whatever it could not parse.
-        let Ok(invocation) = gitcmd::parse(argv) else {
-            continue;
-        };
-        let action = capability_of(invocation.action);
-        let writes_the_tree = matches!(
-            action,
-            Action::Delete | Action::Clean | Action::Checkout | Action::Stash
-        );
-        for pathspec in &invocation.pathspecs {
-            let absolute = gitcmd::resolve(cwd, pathspec);
-            // Likewise unreachable at exit 0: the builtin bounds the repository by the snapshot.
-            let Some(segments) = gitcmd::relative_segments(snapshot, &absolute) else {
-                continue;
-            };
-            if writes_the_tree {
-                git_writes.insert(segments.iter().collect());
+        let mapped: Vec<(Action, &Path)> = record
+            .requests
+            .iter()
+            .map(|(action, path)| (capability_of(action.clone()), path.as_path()))
+            .filter(|(action, _)| action.is_write())
+            .collect();
+        for path in written_between(edits, record.started_at, record.finished_at) {
+            let accounted = mapped.iter().any(|(_, requested)| *requested == path)
+                || record.metadata.iter().any(|root| path.starts_with(root));
+            if !accounted {
+                requests.push(Action::Edit, path)?;
             }
-            let Some(resource) = resource_from(segments) else {
-                continue;
-            };
-            stamped.push((*ts, Event::new(principal.clone(), action.clone(), resource)));
         }
-    }
-
-    for op in ops {
-        if git_writes.contains(op.path()) {
-            continue;
+        for (action, path) in mapped {
+            requests.push(action, path)?;
         }
-        let Some(resource) = resource_from(segments_of(op.path())) else {
-            continue;
-        };
-        let stamp = match op {
-            CommitOp::Write(relative) => mtime_micros(&snapshot.join(relative)),
-            CommitOp::Remove(relative) => snapshot.join(relative).parent().map_or(0, mtime_micros),
-        };
-        stamped.push((stamp, Event::new(principal.clone(), Action::Edit, resource)));
+        since = record.finished_at;
     }
-
-    stamped.sort_by_key(|(stamp, _)| *stamp);
-    let mut events: Vec<Event> = Vec::new();
-    for (_, event) in stamped {
-        if !events.contains(&event) {
-            events.push(event);
-        }
+    for path in written_between(edits, since, u64::MAX) {
+        requests.push(Action::Edit, path)?;
     }
-    events
+    Ok(requests.events)
 }
 
-/// The policy vocabulary for a git operation the builtin performed.
-fn capability_of(action: GitAction) -> Action {
+/// The requests of one line as they accumulate, with the last action each resource received.
+struct Requests<'a> {
+    /// Who is asking.
+    principal: &'a Principal,
+    /// Everything requested so far, in order.
+    events: Vec<Event>,
+    /// The action each resource was last requested for, so a repetition collapses.
+    last: HashMap<Resource, Action>,
+}
+
+impl Requests<'_> {
+    /// Requests `action` over `path`, unless it names nothing the policy governs or repeats the
+    /// resource's previous request.
+    fn push(&mut self, action: Action, path: &Path) -> Result<(), MarshError> {
+        let Some(resource) = resource_of(path)? else {
+            return Ok(());
+        };
+        if self.last.get(&resource) == Some(&action) {
+            return Ok(());
+        }
+        self.last.insert(resource.clone(), action.clone());
+        self.events
+            .push(Event::new(self.principal.clone(), action, resource));
+        Ok(())
+    }
+}
+
+/// The edited paths with a write in `(after, until]`, ordered by the first such write.
+fn written_between(edits: &[(PathBuf, Vec<u64>)], after: u64, until: u64) -> Vec<&Path> {
+    let mut written: Vec<(u64, &Path)> = edits
+        .iter()
+        .filter_map(|(path, stamps)| {
+            stamps
+                .iter()
+                .copied()
+                .filter(|stamp| *stamp > after && *stamp <= until)
+                .min()
+                .map(|first| (first, path.as_path()))
+        })
+        .collect();
+    written.sort_by_key(|(first, _)| *first);
+    written.into_iter().map(|(_, path)| path).collect()
+}
+
+/// The policy vocabulary for a git operation.
+///
+/// The one mapping between the two. Whether an action reads or changes a resource is the
+/// policy's own answer — [`Action::is_read`], [`Action::is_write`] — asked of what this returns.
+pub(crate) fn capability_of(action: GitAction) -> Action {
     match action {
         GitAction::Stage => Action::Stage,
         GitAction::Delete => Action::Delete,
@@ -258,18 +276,28 @@ fn capability_of(action: GitAction) -> Action {
         GitAction::Clean => Action::Clean,
         GitAction::Diff => Action::Diff,
         GitAction::History => Action::History,
+        GitAction::Read => Action::Read,
+        GitAction::Edit => Action::Edit,
     }
 }
 
-/// The normal path components of a seed-relative path.
-fn segments_of(relative: &Path) -> Vec<String> {
-    relative
+/// The resource a snapshot-relative path names, or `None` when it names nothing the policy
+/// governs: the tree root itself, or anything inside a repository's `.git/`.
+///
+/// # Errors
+///
+/// Fails when a component is not a plain UTF-8 name.
+fn resource_of(relative: &Path) -> Result<Option<Resource>, MarshError> {
+    let lossless = relative
         .components()
-        .filter_map(|component| match component {
-            Component::Normal(part) => Some(part.to_string_lossy().into_owned()),
-            _ => None,
-        })
-        .collect()
+        .all(|component| matches!(component, Component::Normal(part) if part.to_str().is_some()));
+    if !lossless {
+        return Err(MarshError::Io(std::io::Error::other(format!(
+            "{} cannot be requested as a policy resource: its path is not a plain UTF-8 name",
+            relative.display()
+        ))));
+    }
+    Ok(gitcmd::relative_segments(Path::new(""), relative).and_then(resource_from))
 }
 
 /// The resource `segments` name, or `None` when they name nothing the policy governs: the tree
@@ -279,17 +307,6 @@ fn resource_from(segments: Vec<String>) -> Option<Resource> {
         return None;
     }
     Some(Resource::from(segments))
-}
-
-/// `path`'s modification time in `CLOCK_REALTIME` microseconds, or 0 when it has none.
-fn mtime_micros(path: &Path) -> u64 {
-    std::fs::symlink_metadata(path)
-        .and_then(|metadata| metadata.modified())
-        .ok()
-        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-        .map_or(0, |since| {
-            u64::try_from(since.as_micros()).unwrap_or(u64::MAX)
-        })
 }
 
 #[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
@@ -333,5 +350,149 @@ mod tests {
             .expect("the stage sees the edit that precedes it");
 
         assert_eq!(validator.history(), [edit, stage]);
+    }
+
+    /// One invocation's window with `requests` in it.
+    fn invocation(started_at: u64, requests: Vec<(GitAction, &str)>) -> GitEffectRecord {
+        GitEffectRecord {
+            started_at,
+            finished_at: started_at + 10,
+            requests: requests
+                .into_iter()
+                .map(|(action, path)| (action, PathBuf::from(path)))
+                .collect(),
+            metadata: Vec::new(),
+        }
+    }
+
+    /// Recorded git actions reach the real validator through the one mapping, so the policy's
+    /// staging and settlement rules hold for them: nobody stages what nobody edited, nobody
+    /// restores another principal's unstaged edit, and a committed resource is free again.
+    #[test]
+    fn mapped_git_actions_enforce_staging_and_settlement() {
+        let mut validator = PolicyValidator::new();
+        let (a, b) = (Principal::from("a"), Principal::from("b"));
+        let actions = |events: &[Event]| -> Vec<Action> {
+            events.iter().map(|event| event.action.clone()).collect()
+        };
+
+        let stage = translate(
+            &a,
+            &[],
+            &[invocation(10, vec![(GitAction::Stage, "src/p")])],
+        )
+        .expect("translate");
+        assert_eq!(
+            stage,
+            vec![Event::new(a.clone(), Action::Stage, ["src", "p"])]
+        );
+        validator
+            .check(&stage)
+            .expect_err("a stage of a clean resource");
+
+        let edit = translate(&a, &[(PathBuf::from("src/p"), vec![5])], &[]).expect("translate");
+        validator.check(&edit).expect("a's edit");
+
+        let checkout = translate(
+            &b,
+            &[],
+            &[invocation(20, vec![(GitAction::Checkout, "src/p")])],
+        )
+        .expect("translate");
+        assert_eq!(actions(&checkout), [Action::Checkout]);
+        validator
+            .check(&checkout)
+            .expect_err("b may not restore a's unstaged edit");
+
+        let settle = translate(
+            &a,
+            &[],
+            &[
+                invocation(30, vec![(GitAction::Stage, "src/p")]),
+                invocation(
+                    50,
+                    vec![(
+                        GitAction::Commit {
+                            message: Some("saved".to_string()),
+                        },
+                        "src/p",
+                    )],
+                ),
+            ],
+        )
+        .expect("translate");
+        assert_eq!(actions(&settle), [Action::Stage, Action::commit("saved")]);
+        validator.check(&settle).expect("a stages and commits");
+
+        let after = translate(&b, &[(PathBuf::from("src/p"), vec![70])], &[]).expect("translate");
+        validator
+            .check(&after)
+            .expect("the committed resource is b's to edit");
+
+        let observed = translate(
+            &a,
+            &[],
+            &[invocation(
+                80,
+                vec![
+                    (GitAction::Read, "src/p"),
+                    (GitAction::Diff, "src/p"),
+                    (GitAction::History, "src/p"),
+                ],
+            )],
+        )
+        .expect("translate");
+        assert!(
+            observed.is_empty(),
+            "observing claims nothing: {observed:?}"
+        );
+    }
+
+    /// The trace's clock splits a line around its git invocations, so repeated transitions of
+    /// one resource survive in order; a write inside an invocation's window is its own when it
+    /// recorded an action there, and an ordinary edit otherwise.
+    #[test]
+    fn edits_and_git_actions_interleave_by_window() {
+        let edits = [
+            (PathBuf::from("p"), vec![5, 25]),
+            (PathBuf::from("hook.log"), vec![55]),
+            (PathBuf::from("q"), vec![15]),
+            (PathBuf::from("repo.git/HEAD"), vec![75]),
+        ];
+        let git = [
+            invocation(10, vec![(GitAction::Stage, "p")]),
+            invocation(30, vec![(GitAction::Stage, "p")]),
+            invocation(50, vec![(GitAction::Checkout, "hook.log")]),
+            GitEffectRecord {
+                metadata: vec![PathBuf::from("repo.git")],
+                ..invocation(70, Vec::new())
+            },
+        ];
+        let events = translate(&Principal::from("a"), &edits, &git).expect("translate");
+        let rendered: Vec<String> = events
+            .iter()
+            .map(|event| format!("{} {}", event.action, event.resource))
+            .collect();
+        assert_eq!(
+            rendered,
+            [
+                "edit p",
+                "edit q",
+                "stage p",
+                "edit p",
+                "stage p",
+                "checkout hook.log"
+            ],
+            "q was written inside the first window with no action of its own there, so it is an \
+             edit requested before that invocation's own stage"
+        );
+    }
+
+    /// A path that is not a plain UTF-8 name cannot be requested without aliasing another one.
+    #[test]
+    fn a_path_that_is_not_utf8_is_refused() {
+        use std::os::unix::ffi::OsStrExt;
+        let path = PathBuf::from(std::ffi::OsStr::from_bytes(b"bad\xff"));
+        assert!(translate(&Principal::from("a"), &[(path, vec![1])], &[]).is_err());
     }
 }

@@ -29,9 +29,7 @@
 //! nothing to roll back over each other, and a process-wide lock would make every one of them
 //! queue behind every other.
 
-#[cfg(unix)]
 use std::os::fd::BorrowedFd;
-#[cfg(unix)]
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -163,9 +161,8 @@ impl PaneTerminal {
     /// terminal's foreground process group is. It is never used for I/O: reading it would steal
     /// bytes from the engine's own pump, and writing it would bypass the ordering and closure
     /// checks that [`ShellIo::write_input`] exists to enforce.
-    #[cfg(unix)]
     pub(crate) fn terminal_fd(&self) -> Option<BorrowedFd<'_>> {
-        self.handle.spawned().terminal_fd().ok()
+        self.handle.shell().terminal_fd().ok()
     }
 
     /// The process group currently in the foreground of this pane's terminal, when one is.
@@ -177,24 +174,17 @@ impl PaneTerminal {
     ///
     /// Best effort, as it always was: a group whose leader has exited can linger as a terminal's
     /// foreground group until something else claims it.
-    #[cfg(unix)]
     pub(crate) fn pid(&self) -> Option<u32> {
         let foreground = rmux_os::process::unix::foreground_pid(self.terminal_fd()?)?;
         (foreground != std::process::id()).then_some(foreground)
     }
 
-    /// The process group in the foreground of this pane's terminal.
-    ///
-    /// Always `None` off Unix: there is no managed pane backend there yet.
-    #[cfg(not(unix))]
-    pub(crate) const fn pid(&self) -> Option<u32> {
-        None
-    }
-
     /// The path of this pane's terminal, when the kernel named it.
-    #[cfg(unix)]
     pub(crate) fn tty_path(&self) -> Option<PathBuf> {
-        self.handle.spawned().tty_path().map(std::path::Path::to_path_buf)
+        self.handle
+            .shell()
+            .tty_path()
+            .map(std::path::Path::to_path_buf)
     }
 
     /// Whether the job this pane presents is still open.
@@ -326,16 +316,17 @@ pub(crate) struct PaneTerminalRequest {
 /// # What the pane starts
 ///
 /// An embedded pane with no command is opened idle and given the prompt reader: it is a shell
-/// waiting for a program, not a program, and reserving a command for it would close it the moment
-/// that command finished. Every other combination has a line, composed by
+/// waiting for a program, not a program, and giving it a command would close it the moment that
+/// command finished. Every other combination has a line, composed by
 /// [`TerminalProfile::pane_workload_line`], and the line is what the pane *is* — so it is admitted
 /// with `close_on_finish` and gets no prompt.
 ///
-/// The line is admitted separately from the spawn rather than handed to it. A command given to
-/// `spawn` becomes an anonymous job with core's automatic closure, which `switch` and `keep` are
-/// allowed to cancel — so selecting a fast one-shot pane between its last byte and its verdict
-/// would quietly make it permanent. [`PaneTerminalRequest::follow_mux_lifetime`] is the one case
-/// that wants exactly those semantics and says so.
+/// The line is admitted separately from the creation, because creation no longer takes one at
+/// all. An ordinary pane's closure therefore belongs to its *command*, which `keep` may not
+/// revoke — so selecting a fast one-shot pane between its last byte and its verdict cannot
+/// quietly make it permanent. [`PaneTerminalRequest::follow_mux_lifetime`] is the one case that
+/// wants core's cancellable automatic closure instead, and says so through
+/// [`SpawnOptions::automatic_close`](marsh_core::shellmux::SpawnOptions::automatic_close).
 ///
 /// # Errors
 ///
@@ -361,8 +352,12 @@ pub(crate) async fn open_pane_terminal(
     validate_process_command(command.as_ref())?;
     let line = profile.pane_workload_line(command.as_ref())?;
     let environment = profile.shell_environment()?;
-    let directory = profile.seed_relative_dir(&io.executor_info())?;
+    // The profile's own directory, as a host path; the core discovers the seed it lies in.
     let size = pane_terminal_size(geometry);
+    // A pane whose lifetime the engine owns keeps core's anonymous-shell rules: it reclaims
+    // itself once its line ends, and `keep` may cancel that. Every ordinary pane closes because
+    // its own one-shot command said so, which `keep` may not revoke.
+    let automatic_close = follow_mux_lifetime && shell_id.is_none() && line.is_some();
     let options = SpawnOptions {
         io: JobIo::Terminal {
             geometry: Some(TerminalGeometry {
@@ -371,12 +366,15 @@ pub(crate) async fn open_pane_terminal(
             }),
         },
         environment: Some(environment),
+        automatic_close,
+        // A pane's name is a reusable label typed by whoever runs the multiplexer, not a stable
+        // agent identity an embedding caller controls.
+        durable: false,
     };
 
-    let spawn_line = follow_mux_lifetime.then_some(line.as_deref()).flatten();
     let admission = io.admission_lock().lock().await;
     let handle = io
-        .spawn(&directory, shell_id, spawn_line, options)
+        .open_shell(profile.cwd(), shell_id, options)
         .await
         .map_err(|error| {
             RmuxError::spawn_failed(format!(
@@ -395,21 +393,26 @@ pub(crate) async fn open_pane_terminal(
     drop(admission);
 
     match line.as_deref() {
-        Some(line) if !follow_mux_lifetime => {
+        // Scheduled after the route and outside the admission lock. The pane *is* this line, so
+        // it is not awaited to completion: the pane has to exist and draw while it runs.
+        Some(line) => {
             if let Err(error) = io
-                .start_in(
+                .start_command(
                     &handle,
                     line,
                     CommandOptions {
                         on_finish: None,
-                        close_on_finish: true,
+                        // An engine-owned pane already reclaims itself; every other one closes
+                        // because this command said so.
+                        close_on_finish: !automatic_close,
+                        on_accept: None,
                     },
                 )
                 .await
             {
-                // The job exists and nothing will ever present it: the pane it was opened for is
-                // about to be rolled back. Leaving it would keep a snapshot, a principal and an
-                // idle terminal alive with no surface and no owner.
+                // The shell exists and nothing will ever present it: the pane it was opened for
+                // is about to be rolled back. Leaving it would keep a snapshot, a principal and
+                // an idle terminal alive with no surface and no owner.
                 io.install_route(handle.sandbox().uid.clone(), Route::Failed);
                 io.runtime().spawn(stop_with_grace(io.unleased(), handle));
                 return Err(RmuxError::spawn_failed(format!(
@@ -418,15 +421,11 @@ pub(crate) async fn open_pane_terminal(
                 )));
             }
         }
-        // Either an idle embedded pane, or a job whose command core already owns. Only the first
-        // needs a reader: nothing else in this daemon reads a pane's keyboard, composes a prompt
-        // or decides when a typed line is finished, so without it a user attaches, types, and
-        // watches keystrokes pile up on a slave nobody is reading.
-        Some(_) | None => {
-            if line.is_none() {
-                crate::pane_repl::spawn(io.unleased(), handle.clone());
-            }
-        }
+        // An idle embedded pane, which needs the prompt reader: nothing else in this daemon reads
+        // a pane's keyboard, composes a prompt or decides when a typed line is finished, so
+        // without it a user attaches, types, and watches keystrokes pile up on a slave nobody is
+        // reading.
+        None => crate::pane_repl::spawn(io.unleased(), handle.clone()),
     }
 
     Ok(PaneTerminal::new(

@@ -18,14 +18,9 @@ use rmux_proto::{HookLifecycle, HookName};
 use tokio::sync::mpsc;
 use tokio::time::{sleep, timeout};
 
-#[cfg(windows)]
-const PROCESS_OUTPUT_FILE_TIMEOUT: Duration = Duration::from_secs(20);
-#[cfg(not(windows))]
 const PROCESS_OUTPUT_FILE_TIMEOUT: Duration = Duration::from_secs(5);
 
-fn session_name(value: &str) -> SessionName {
-    SessionName::new(value).expect("valid session name")
-}
+use crate::test_names::session_name;
 
 fn unique_temp_path(label: &str) -> PathBuf {
     let unique = SystemTime::now()
@@ -38,7 +33,6 @@ fn unique_temp_path(label: &str) -> PathBuf {
     ))
 }
 
-#[cfg(unix)]
 fn shell_quote(path: &Path) -> String {
     crate::test_shell::sh_quote_path(path)
 }
@@ -60,10 +54,8 @@ fn pipe_discard_command() -> String {
 /// `$PWD` would not do: [`TerminalProfile`](crate::terminal::TerminalProfile) exports it as the
 /// *host* directory the caller asked for, so a probe reading it would agree with the request even
 /// if the job had opened somewhere else entirely.
-#[cfg(unix)]
 const JOB_DIRECTORY_NAME: &str = "dir=$(pwd); name=${dir##*/};";
 
-#[cfg(unix)]
 fn respawn_probe_command(output: &Path) -> String {
     format!(
         "{JOB_DIRECTORY_NAME} printf '%s:%s' \"$name\" \"$RMUX_RESPAWN\" > {}",
@@ -71,28 +63,11 @@ fn respawn_probe_command(output: &Path) -> String {
     )
 }
 
-#[cfg(windows)]
-fn respawn_probe_command(output: &Path) -> String {
-    crate::test_shell::powershell_encoded_command(&format!(
-        "[System.IO.File]::WriteAllText({}, ((Split-Path -Leaf (Get-Location).Path) + ':' + $env:RMUX_RESPAWN))",
-        crate::test_shell::powershell_quote_path(output)
-    ))
-}
-
-#[cfg(unix)]
 fn cwd_probe_command(output: &Path) -> String {
     format!(
         "{JOB_DIRECTORY_NAME} printf '%s' \"$name\" > {}",
         shell_quote(output)
     )
-}
-
-#[cfg(windows)]
-fn cwd_probe_command(output: &Path) -> String {
-    crate::test_shell::powershell_encoded_command(&format!(
-        "[System.IO.File]::WriteAllText({}, (Split-Path -Leaf (Get-Location).Path))",
-        crate::test_shell::powershell_quote_path(output)
-    ))
 }
 
 /// What a probe prints for the directory `scratch` names.
@@ -103,7 +78,6 @@ fn expected_spawn_cwd(scratch: &SeedScratch) -> &str {
     relative.rsplit('/').next().unwrap_or(relative)
 }
 
-#[cfg(unix)]
 fn respawn_replay_script(output: &Path, tag: &str) -> String {
     format!(
         "{JOB_DIRECTORY_NAME} printf '%s:%s:{tag}\\n' \"$name\" \"$RMUX_RESPAWN\" >> {}; sleep 60",
@@ -111,16 +85,6 @@ fn respawn_replay_script(output: &Path, tag: &str) -> String {
     )
 }
 
-#[cfg(windows)]
-fn respawn_replay_script(output: &Path, tag: &str) -> String {
-    format!(
-        "[System.IO.File]::AppendAllText({}, ((Split-Path -Leaf (Get-Location).Path) + ':' + $env:RMUX_RESPAWN + ':{}' + [char]10)); Start-Sleep -Seconds 60",
-        crate::test_shell::powershell_quote_path(output),
-        tag
-    )
-}
-
-#[cfg(unix)]
 fn respawn_argv_probe_command(output: &Path, tag: &str) -> Vec<String> {
     vec![
         "/bin/sh".to_owned(),
@@ -129,23 +93,10 @@ fn respawn_argv_probe_command(output: &Path, tag: &str) -> Vec<String> {
     ]
 }
 
-#[cfg(windows)]
-fn respawn_argv_probe_command(output: &Path, tag: &str) -> Vec<String> {
-    vec![
-        "powershell.exe".to_owned(),
-        "-NoProfile".to_owned(),
-        "-NonInteractive".to_owned(),
-        "-Command".to_owned(),
-        respawn_replay_script(output, tag),
-    ]
-}
-
-#[cfg(unix)]
 fn respawn_shell_probe_command(output: &Path, tag: &str) -> String {
     respawn_replay_script(output, tag)
 }
 
-#[cfg(unix)]
 fn respawn_shell_identity_command(output: &Path, tag: &str) -> String {
     format!(
         "printf '%s:%s:{tag}\\n' \"${{0##*/}}\" \"$SHELL\" >> {}; sleep 60",
@@ -153,7 +104,6 @@ fn respawn_shell_identity_command(output: &Path, tag: &str) -> String {
     )
 }
 
-#[cfg(unix)]
 async fn set_global_default_shell(handler: &RequestHandler, shell: &str) {
     let response = handler
         .handle(Request::SetOption(SetOptionRequest {
@@ -164,11 +114,6 @@ async fn set_global_default_shell(handler: &RequestHandler, shell: &str) {
         }))
         .await;
     assert!(matches!(response, Response::SetOption(_)), "{response:?}");
-}
-
-#[cfg(windows)]
-fn respawn_shell_probe_command(output: &Path, tag: &str) -> String {
-    crate::test_shell::powershell_encoded_command(&respawn_replay_script(output, tag))
 }
 
 fn respawn_probe_line(cwd: &str, environment: &str, tag: &str) -> String {
@@ -1135,7 +1080,6 @@ async fn move_pane_routes_through_join_semantics() {
                 1,
                 crate::pane_terminals::WindowSpawnOptions {
                     start_directory: None,
-                    inherited_start_directory: false,
                     command: None,
                     socket_path: Path::new("/tmp/rmux-test.sock"),
                     spawn_environment: None,
@@ -1725,7 +1669,6 @@ async fn respawn_pane_reuses_structured_command_cwd_and_private_environment() {
     let _ = fs::remove_file(output);
 }
 
-#[cfg(unix)]
 #[tokio::test]
 async fn respawn_pane_keeps_the_original_resolved_shell_after_option_changes() {
     let handler = RequestHandler::new();

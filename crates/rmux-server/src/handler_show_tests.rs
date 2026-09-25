@@ -9,9 +9,7 @@ use rmux_proto::{
     SplitWindowRequest, SplitWindowTarget, TerminalSize, WindowTarget,
 };
 
-fn session_name(value: &str) -> rmux_proto::SessionName {
-    rmux_proto::SessionName::new(value).expect("valid session name")
-}
+use crate::test_names::session_name;
 
 async fn create_session(handler: &RequestHandler, name: &str) {
     let response = handler

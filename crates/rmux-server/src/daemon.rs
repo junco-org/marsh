@@ -1,45 +1,24 @@
-#[cfg(windows)]
-use std::ffi::{OsStr, OsString};
 #[cfg(all(test, unix))]
 use std::fs;
 use std::io;
-#[cfg(windows)]
-use std::io::Read;
-#[cfg(windows)]
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
-#[cfg(windows)]
-use std::time::Duration;
 
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
 use rmux_core::events::SubscriptionLimits;
-#[cfg(windows)]
-use rmux_ipc::connect_blocking;
 use rmux_ipc::LocalEndpoint;
-#[cfg(windows)]
-use rmux_ipc::LocalListener;
-#[cfg(windows)]
-use rmux_proto::{
-    encode_frame, FrameDecoder, HasSessionRequest, Request, Response, RmuxError, SessionName,
-};
 
 use crate::io::{IoError, IoResult, ShellIo};
 use crate::listener;
 use crate::listener_options::ServeOptions;
-#[cfg(windows)]
-use crate::server_access::current_owner_uid;
-#[cfg(unix)]
 use crate::unix_socket::bind_unix_listener_at;
-#[cfg(unix)]
 use crate::unix_socket::real_user_id;
 #[cfg(all(test, unix))]
 use crate::unix_socket::{
     ensure_parent_directory, indicates_stale_socket, remove_stale_socket_if_needed,
 };
-#[cfg(unix)]
 use crate::unix_socket_access::UnixSocketAccessController;
 
 #[cfg(all(test, unix))]
@@ -85,8 +64,6 @@ pub struct DaemonConfig {
     web_port_explicit: bool,
     web_required: bool,
     startup_ready_fd: Option<i32>,
-    #[cfg(windows)]
-    startup_ready_event: Option<OsString>,
 }
 
 impl DaemonConfig {
@@ -102,8 +79,6 @@ impl DaemonConfig {
             web_port_explicit: false,
             web_required: false,
             startup_ready_fd: None,
-            #[cfg(windows)]
-            startup_ready_event: None,
         }
     }
 
@@ -205,30 +180,15 @@ impl DaemonConfig {
         self
     }
 
-    /// Signals this inherited Linux eventfd after the daemon listener is bound.
-    #[cfg(target_os = "linux")]
+    /// Signals this inherited eventfd after the daemon listener is bound.
     #[must_use]
     pub const fn with_startup_ready_fd(mut self, ready_fd: i32) -> Self {
         self.startup_ready_fd = Some(ready_fd);
         self
     }
 
-    #[cfg(unix)]
     const fn startup_ready_fd(&self) -> Option<i32> {
         self.startup_ready_fd
-    }
-
-    /// Signals this named Win32 event after the daemon listener is bound.
-    #[cfg(windows)]
-    #[must_use]
-    pub fn with_startup_ready_event(mut self, ready_event: OsString) -> Self {
-        self.startup_ready_event = Some(ready_event);
-        self
-    }
-
-    #[cfg(windows)]
-    fn startup_ready_event(&self) -> Option<&OsStr> {
-        self.startup_ready_event.as_deref()
     }
 }
 
@@ -372,99 +332,21 @@ impl Drop for CoreRelease {
     }
 }
 
-#[cfg(unix)]
-fn signal_startup_ready_fd(_ready_fd: i32) {
-    #[cfg(target_os = "linux")]
-    {
-        let _ = rmux_os::daemon::signal_startup_ready_fd(_ready_fd);
-    }
+fn signal_startup_ready_fd(ready_fd: i32) {
+    let _ = rmux_os::daemon::signal_startup_ready_fd(ready_fd);
 }
 
-#[cfg(windows)]
-fn signal_startup_ready_event(ready_event: &OsStr) {
-    let _ = rmux_os::daemon::signal_startup_ready_event(ready_event);
-}
-
-#[cfg(windows)]
-fn bind_windows_listener(endpoint: &LocalEndpoint) -> io::Result<LocalListener> {
-    match LocalListener::bind(endpoint) {
-        Ok(listener) => Ok(listener),
-        Err(bind_error) => Err(windows_bind_error(endpoint, bind_error)),
-    }
-}
-
-#[cfg(windows)]
-fn windows_bind_error(endpoint: &LocalEndpoint, bind_error: io::Error) -> io::Error {
-    if windows_pipe_responds(endpoint) {
-        return io::Error::new(
-            io::ErrorKind::AddrInUse,
-            format!(
-                "Windows named pipe '{}' is already held by a responsive rmux-compatible server",
-                endpoint.as_path().display()
-            ),
-        );
-    }
-
-    io::Error::new(
-        bind_error.kind(),
-        format!(
-            "failed to bind Windows named pipe '{}': {bind_error}. Another process may still be holding this endpoint",
-            endpoint.as_path().display()
-        ),
-    )
-}
-
-#[cfg(windows)]
-fn windows_pipe_responds(endpoint: &LocalEndpoint) -> bool {
-    let endpoint = endpoint.clone();
-    std::thread::spawn(move || windows_protocol_probe(&endpoint).unwrap_or(false))
-        .join()
-        .unwrap_or(false)
-}
-
-#[cfg(windows)]
-fn windows_protocol_probe(endpoint: &LocalEndpoint) -> io::Result<bool> {
-    let mut stream = connect_blocking(endpoint, Duration::from_millis(100))?;
-    stream.set_write_timeout(Some(Duration::from_millis(100)))?;
-    stream.set_read_timeout(Some(Duration::from_millis(100)))?;
-
-    let request = Request::HasSession(HasSessionRequest {
-        target: SessionName::new("__rmux_probe__").map_err(io::Error::other)?,
-    });
-    let frame = encode_frame(&request).map_err(io::Error::other)?;
-    stream.write_all(&frame)?;
-    stream.flush()?;
-
-    let mut decoder = FrameDecoder::new();
-    let mut buffer = [0_u8; 512];
-    loop {
-        let bytes_read = match stream.read(&mut buffer) {
-            Ok(0) => return Ok(false),
-            Ok(bytes_read) => bytes_read,
-            Err(error) if error.kind() == io::ErrorKind::TimedOut => return Ok(false),
-            Err(error) => return Err(error),
-        };
-        decoder.push_bytes(&buffer[..bytes_read]);
-        match decoder.next_frame::<Response>() {
-            Ok(Some(Response::HasSession(_))) => return Ok(true),
-            Ok(Some(_response)) => return Ok(false),
-            Ok(None) => continue,
-            Err(RmuxError::IncompleteFrame { .. }) => continue,
-            Err(_error) => return Ok(false),
-        }
-    }
-}
-
-/// One running rmux daemon over one btrfs seed: the whole owned system, in one value.
+/// One running rmux daemon: the whole owned system, in one value.
 ///
-/// Opening one leases the seed, replays its write-ahead log, builds the single multiplexer every
-/// pane, popup and workload helper of this daemon is a job on, and binds the local IPC endpoint.
-/// Nothing else has to be constructed by the caller: no executor, no mux, no profile, no callback
-/// queue, no observation task, and no daemon launcher. The one subsystem that *is* supplied is the
-/// policy validator, because whose history a seed is judged against is the caller's decision.
+/// Opening one binds the local IPC endpoint and builds the single multiplexer every pane, popup
+/// and workload helper of this daemon is a job on. It leases no seed: a seed is found from the
+/// directory each shell is started in, so a listener may be opened outside any subvolume and
+/// still serve a shell in a valid one. Nothing else has to be constructed by the caller: no
+/// executor, no mux, no validator, no profile, no callback queue, no observation task, and no
+/// daemon launcher.
 ///
-/// Neither cloneable nor comparable, deliberately. This is the unique owner — of the seed's
-/// exclusive lease, of the multiplexer, and of the listener task — and each of those may exist
+/// Neither cloneable nor comparable, deliberately. This is the unique owner — of every seed lease
+/// its shells took, of the multiplexer, and of the listener task — and each of those may exist
 /// exactly once. The shareable half is [`ShellIo`]: this type [`Deref`](std::ops::Deref)s to the
 /// one it holds, so every operation is directly callable on it, and [`Self::io`] hands out an
 /// independent cloneable lease for concurrent code. Dropping this requests shutdown without
@@ -479,18 +361,16 @@ pub struct RmuxFrontend {
 }
 
 impl RmuxFrontend {
-    /// Opens the seed enclosing `seed` on real btrfs and binds a daemon over it.
+    /// Binds a daemon on real btrfs, with `initial_dir` as its default starting directory.
     ///
-    /// `seed` is a path *inside* the seed subvolume; discovery walks up to the enclosing one and
-    /// derives the sibling `.marsh` state tree from it. The seed is leased exclusively and its
-    /// write-ahead log is recovered before a single job exists, so a competing marsh has already
-    /// failed by the time this returns.
+    /// `initial_dir` is only the default for requests that name no directory of their own: it is
+    /// captured as an absolute path and nothing is discovered, leased or recovered from it here.
+    /// A shell's own starting directory is what selects the seed it publishes into, so a seed
+    /// error belongs to the spawn that named it rather than to this constructor — and a listener
+    /// started outside btrfs can still open a pane inside a subvolume.
     ///
-    /// `validator` is the committed capability history every submitted line is judged against; it
-    /// is rehydrated from the seed's log during construction, so reopening with an empty one still
-    /// adopts that seed's durable grants. `environment` seeds every shell this daemon builds, on
-    /// top of what the process inherited. `geometry` is the size terminal jobs open at when they
-    /// ask for none.
+    /// `environment` seeds every shell this daemon builds, on top of what the process inherited.
+    /// `geometry` is the size terminal jobs open at when they ask for none.
     ///
     /// Must be called from a multi-threaded Tokio runtime; see [`Self::open_with`].
     ///
@@ -499,15 +379,13 @@ impl RmuxFrontend {
     /// Fails for the reasons [`Self::open_with`] does.
     pub async fn open(
         config: DaemonConfig,
-        seed: &Path,
-        validator: Arc<StdMutex<marsh_core::PolicyValidator>>,
+        initial_dir: &Path,
         environment: brush_core::env::ShellEnvironment,
         geometry: marsh_core::shellmux::TerminalGeometry,
     ) -> IoResult<Self> {
         Self::open_with(
             config,
-            seed,
-            validator,
+            initial_dir,
             environment,
             geometry,
             Arc::new(marsh_btrfs::LibBtrfs),
@@ -518,22 +396,19 @@ impl RmuxFrontend {
     /// [`Self::open`] over an explicit snapshot backend.
     ///
     /// The only reason to reach for this is to substitute the btrfs implementation — a test
-    /// fixture's copy tree is the standing example. Everything else is identical: the same seed
-    /// discovery, the same exclusive lease, the same log recovery, the same single multiplexer,
-    /// and the same bound socket.
+    /// fixture's copy tree is the standing example. Everything else is identical: the same
+    /// per-shell seed discovery, the same single multiplexer, and the same bound socket.
     ///
     /// # Errors
     ///
     /// Fails with [`IoError::Transport`] wrapping [`io::ErrorKind::Unsupported`] when there is no
-    /// ambient Tokio runtime or it is current-thread; with [`IoError::Mux`] when the seed cannot
-    /// be discovered, leased or recovered, or when a dimension of `geometry` is zero; and with
-    /// [`IoError::Transport`] wrapping [`io::ErrorKind::AddrInUse`] when a live server already
-    /// holds the socket — which is left exactly where it is, while the engine this call opened is
-    /// released, so its own seed can be reopened immediately.
+    /// ambient Tokio runtime or it is current-thread; with [`IoError::Mux`] when a dimension of
+    /// `geometry` is zero; and with [`IoError::Transport`] wrapping
+    /// [`io::ErrorKind::AddrInUse`] when a live server already holds the socket — which is left
+    /// exactly where it is, while the engine this call opened is released.
     pub async fn open_with(
         config: DaemonConfig,
-        seed: &Path,
-        validator: Arc<StdMutex<marsh_core::PolicyValidator>>,
+        initial_dir: &Path,
         environment: brush_core::env::ShellEnvironment,
         geometry: marsh_core::shellmux::TerminalGeometry,
         filesystem: Arc<dyn marsh_btrfs::Subvolumes>,
@@ -542,7 +417,7 @@ impl RmuxFrontend {
         // the facade creates lands on it, including ones requested from a status thread, a
         // foreign runtime or a detached command queue.
         //
-        // Refused before the seed is touched, and the reason is no longer the one this guard was
+        // Refused before anything is built, and the reason is no longer the one this guard was
         // written for. The synchronous pane-creation bridge it originally protected is gone: pane
         // create, split and respawn are now prepare -> async open with the handler lock released
         // -> identity-checked commit, and nothing in that path blocks a worker.
@@ -558,24 +433,22 @@ impl RmuxFrontend {
         //
         // An embedder that wants one should build a multi-threaded runtime with one worker
         // thread, which is cheap and has the pollability this relies on.
-        let runtime = match tokio::runtime::Handle::try_current() {
-            Ok(runtime)
-                if runtime.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread =>
-            {
-                runtime
-            }
-            _ => {
-                return Err(IoError::from(io::Error::new(
+        let runtime =
+            match tokio::runtime::Handle::try_current() {
+                Ok(runtime)
+                    if runtime.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread =>
+                {
+                    runtime
+                }
+                _ => return Err(IoError::from(io::Error::new(
                     io::ErrorKind::Unsupported,
                     "rmux requires a multi-threaded Tokio runtime: a single worker cannot poll a \
                      task while another waits on it",
-                )))
-            }
-        };
+                ))),
+            };
 
         let (io, events) = ShellIo::new(
-            seed,
-            validator,
+            initial_dir,
             environment,
             geometry,
             filesystem,
@@ -583,100 +456,55 @@ impl RmuxFrontend {
             config.socket_path().to_path_buf(),
         )?;
         // From here on every early return drops `io`, and with it the only handle to the service:
-        // the multiplexer goes, the executor goes, and the seed's exclusive lease is released. A
-        // refused bind must not leave a leased seed behind for a daemon that never started.
-        #[cfg(unix)]
-        {
-            let bound_listener = bind_unix_listener_at(config.socket_path())?;
-            let socket_access =
-                UnixSocketAccessController::new(config.socket_path(), bound_listener.identity)?;
-            let (shutdown_handle, shutdown_receiver) = ShutdownHandle::new();
-            let signal_watcher = crate::signals::SignalWatcher::install()?;
-            let socket_path = config.socket_path().to_path_buf();
-            let owner_uid = real_user_id()?;
-            let serve_options = ServeOptions::new(
-                config.config_load().clone(),
-                config.subscription_limits(),
-                owner_uid,
-            )
-            .with_web_options(
-                config.web_port(),
-                config.web_frontend().map(str::to_owned),
-                config.web_required(),
-                config.web_port_explicit(),
-            )
-            .with_socket_identity(bound_listener.identity)
-            .with_socket_access(socket_access)
-            .with_server_signals(signal_watcher)
-            .with_shell_io(io.unleased(), events);
+        // the multiplexer goes, its executors go, and every seed lease its shells took is
+        // released. A refused bind must not leave a leased seed behind for a daemon that never
+        // started.
+        let bound_listener = bind_unix_listener_at(config.socket_path())?;
+        let socket_access =
+            UnixSocketAccessController::new(config.socket_path(), bound_listener.identity)?;
+        let (shutdown_handle, shutdown_receiver) = ShutdownHandle::new();
+        let signal_watcher = crate::signals::SignalWatcher::install()?;
+        let socket_path = config.socket_path().to_path_buf();
+        let owner_uid = real_user_id()?;
+        let serve_options = ServeOptions::new(
+            config.config_load().clone(),
+            config.subscription_limits(),
+            owner_uid,
+        )
+        .with_web_options(
+            config.web_port(),
+            config.web_frontend().map(str::to_owned),
+            config.web_required(),
+            config.web_port_explicit(),
+        )
+        .with_socket_identity(bound_listener.identity)
+        .with_socket_access(socket_access)
+        .with_server_signals(signal_watcher)
+        .with_shell_io(io.unleased(), events);
 
-            // The owner's lease is taken *before* the listener exists. A daemon that decided it
-            // was empty between spawning its server task and this constructor returning would
-            // shut itself down under a caller that had done nothing wrong.
-            let owner = io.leased();
-            let task = tokio::spawn(serve_and_release(
-                io,
-                listener::serve(
-                    bound_listener.listener,
-                    socket_path,
-                    shutdown_handle.clone(),
-                    shutdown_receiver,
-                    serve_options,
-                ),
-            ));
-            if let Some(ready_fd) = config.startup_ready_fd() {
-                signal_startup_ready_fd(ready_fd);
-            }
-
-            Ok(Self {
-                shutdown_handle,
-                task: Some(task),
-                io: owner,
-            })
+        // The owner's lease is taken *before* the listener exists. A daemon that decided it
+        // was empty between spawning its server task and this constructor returning would
+        // shut itself down under a caller that had done nothing wrong.
+        let owner = io.leased();
+        let task = tokio::spawn(serve_and_release(
+            io,
+            listener::serve(
+                bound_listener.listener,
+                socket_path,
+                shutdown_handle.clone(),
+                shutdown_receiver,
+                serve_options,
+            ),
+        ));
+        if let Some(ready_fd) = config.startup_ready_fd() {
+            signal_startup_ready_fd(ready_fd);
         }
 
-        #[cfg(windows)]
-        {
-            let endpoint = LocalEndpoint::from_path(config.socket_path().to_path_buf());
-            let listener = bind_windows_listener(&endpoint)?;
-            let (shutdown_handle, shutdown_receiver) = ShutdownHandle::new();
-            let socket_path = config.socket_path().to_path_buf();
-            let owner_uid = current_owner_uid();
-            let serve_options = ServeOptions::new(
-                config.config_load().clone(),
-                config.subscription_limits(),
-                owner_uid,
-            )
-            .with_web_options(
-                config.web_port(),
-                config.web_frontend().map(str::to_owned),
-                config.web_required(),
-                config.web_port_explicit(),
-            )
-            .with_shell_io(io.unleased(), events);
-
-            // As above: the lease precedes the listener, never the other way round.
-            let owner = io.leased();
-            let task = tokio::spawn(serve_and_release(
-                io,
-                listener::serve(
-                    listener,
-                    socket_path,
-                    shutdown_handle.clone(),
-                    shutdown_receiver,
-                    serve_options,
-                ),
-            ));
-            if let Some(ready_event) = config.startup_ready_event() {
-                signal_startup_ready_event(ready_event);
-            }
-
-            Ok(Self {
-                shutdown_handle,
-                task: Some(task),
-                io: owner,
-            })
-        }
+        Ok(Self {
+            shutdown_handle,
+            task: Some(task),
+            io: owner,
+        })
     }
 
     /// The bound local IPC endpoint path for the running daemon.
@@ -783,8 +611,4 @@ impl Drop for RmuxFrontend {
 
 #[cfg(all(test, unix))]
 #[path = "daemon_tests/unix.rs"]
-mod tests;
-
-#[cfg(all(test, windows))]
-#[path = "daemon_tests/windows.rs"]
 mod tests;

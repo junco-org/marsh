@@ -127,28 +127,60 @@ pub(super) async fn execute_attached_binding_commands(
     }
 
     if parsed_commands_block_for_prompt(&commands) {
-        let prompt_started = if attached_live_input {
-            match live_identity {
-                Some(identity) => {
-                    handler
-                        .start_attached_prompt_binding_commands_for_identity(
-                            identity,
-                            session_name.clone(),
-                            session_id,
-                            requester_pid,
-                            &commands,
-                            &context,
-                        )
-                        .await?
+        // Opening a live prompt enters the command-parse and prompt-install
+        // stack. Poll it as a separate Tokio task so the attach input stack
+        // unwinds before that work begins; awaiting the task keeps the prompt
+        // installed before the next bytes of the same read are dispatched.
+        // Abort it if the attach request is cancelled instead of detaching
+        // work from its client.
+        let (prompt_started, commands, context, session_name) = if attached_live_input {
+            let task_handler = handler.clone();
+            let inherited_hook = current_hook_execution().map(|execution| {
+                let formats = current_hook_formats();
+                (execution, formats)
+            });
+            let task = tokio::spawn(async move {
+                let startup = async move {
+                    let prompt_started = match live_identity {
+                        Some(identity) => {
+                            task_handler
+                                .start_attached_prompt_binding_commands_for_identity(
+                                    identity,
+                                    session_name.clone(),
+                                    session_id,
+                                    requester_pid,
+                                    &commands,
+                                    &context,
+                                )
+                                .await?
+                        }
+                        None => {
+                            task_handler
+                                .start_attached_prompt_binding_commands(
+                                    requester_pid,
+                                    &commands,
+                                    &context,
+                                )
+                                .await?
+                        }
+                    };
+                    Ok::<_, RmuxError>((prompt_started, commands, context, session_name))
+                };
+                match inherited_hook {
+                    Some((hook_execution, formats)) => {
+                        with_hook_execution(hook_execution, formats, startup).await
+                    }
+                    None => startup.await,
                 }
-                None => {
-                    handler
-                        .start_attached_prompt_binding_commands(requester_pid, &commands, &context)
-                        .await?
-                }
-            }
+            });
+            let mut abort_on_drop = AbortAttachedBindingOnDrop::new(task.abort_handle());
+            let joined = task.await;
+            abort_on_drop.disarm();
+            joined.map_err(|error| {
+                RmuxError::Server(format!("attached binding task failed: {error}"))
+            })??
         } else {
-            false
+            (false, commands, context, session_name)
         };
         if prompt_started {
             return Ok(());

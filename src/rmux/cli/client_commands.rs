@@ -2,7 +2,7 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 use rmux_client::{
-    connect, detect_context, drive_control_mode, ClientContext, Connection, ControlTransition,
+    ClientContext, Connection, ControlTransition, connect, detect_context, drive_control_mode,
 };
 use rmux_proto::request::{
     AttachSessionExt2Request, DetachClientExtRequest, ListClientsRequest, RefreshClientRequest,
@@ -11,13 +11,13 @@ use rmux_proto::request::{
 use rmux_proto::{ClientTerminalContext, ControlMode, ErrorResponse, Response};
 
 use super::attach_transport::{
-    attach_with_connection, begin_queued_attach, QueuedAttachSessionResult,
+    QueuedAttachSessionResult, attach_with_connection, begin_queued_attach,
 };
 use super::json_output::{list_clients_json_format, write_list_clients_json};
 use super::{
-    connect_with_startserver_outcome, current_terminal_size, expect_command_success,
-    finish_command_success, list_session_names, resolve_session_target_spec, run_command,
-    run_payload_command_resolved, unexpected_response, ExitFailure, StartupOptions,
+    ExitFailure, StartupOptions, connect_with_startserver_outcome, current_terminal_size,
+    expect_command_success, finish_command_success, list_session_names,
+    resolve_session_target_spec, run_command, run_payload_command_resolved, unexpected_response,
 };
 use crate::cli_args::{
     AttachSessionArgs, Cli, DetachClientArgs, ListClientsArgs, RefreshClientArgs,
@@ -70,7 +70,7 @@ pub(super) fn run_attach_session(
         request,
         ..
     } = prepared;
-    attach_with_connection(connection, request)
+    attach_with_connection(connection, request, socket_path)
 }
 
 /// Like `run_attach_session`, but returns a queued attach the caller drives to completion.
@@ -90,7 +90,7 @@ pub(super) fn run_attach_session_queued(
         request,
         ..
     } = prepared;
-    begin_queued_attach(connection, request)
+    begin_queued_attach(connection, request, socket_path)
 }
 
 /// Connects, refuses an empty server, resolves the target and assembles the attach request.

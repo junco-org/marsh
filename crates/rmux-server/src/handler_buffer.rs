@@ -475,7 +475,9 @@ impl RequestHandler {
         // and its result is only applied to memory once the gate has approved the job.
         let content = match managed_workload::read_file(
             &io,
-            request.cwd.as_deref().unwrap_or_else(|| Path::new(".")),
+            // Empty on purpose; see the save path below for why the caller's directory is not
+            // the helper's.
+            Path::new(""),
             &resolved_path,
         )
         .await
@@ -538,7 +540,11 @@ impl RequestHandler {
         // written.
         let save_result = managed_workload::write_file(
             &io,
-            request.cwd.as_deref().unwrap_or_else(|| Path::new(".")),
+            // Empty on purpose: `resolved_path` above is already absolute against the caller's
+            // directory, so the helper's own is incidental — and a starting directory is what
+            // selects the seed a shell opens on. Handing it the caller's would refuse every save
+            // requested from outside a subvolume for a write that never opens over it.
+            Path::new(""),
             &resolved_path,
             content,
             request.append,

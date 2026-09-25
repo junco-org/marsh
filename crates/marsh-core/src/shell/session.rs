@@ -16,23 +16,29 @@
 //! [`Session::open`] hands them to the validator before any shell over the seed can run a line.
 //! Ownership established by one process is therefore still in force in the next one.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Once, PoisonError, RwLock, RwLockWriteGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use marsh_btrfs::{PersistenceLayer, Subvolumes, short_id};
-use marsh_instrument::{BuiltinRecord, RecordingHook, SpawnRecord, SpawnRecorder, dump_records};
+use marsh_instrument::{
+    BuiltinRecord, RecordingHook, SpawnRecord, SpawnRecorder, TraceLine, dump_records,
+};
 use marsh_wal::CommitOp;
 
 use super::MarshError;
+use super::access::Access;
+use super::builtins::gitcmd::GitAction;
 use super::policy::{Action, Event, PolicyValidator, Principal, Resource, durable_principal};
 
 /// The id of one snapshot: its directory under `snap/` and the default durable owner of its
-/// published capabilities. Reusable job names never inherit a previous snapshot's stake.
-/// An embedding caller can explicitly opt a stable [`crate::shellmux::ShellId::durable`]
-/// identity into WAL recovery instead; the snapshot uid still identifies its content.
+/// published capabilities.
+///
+/// Reusable job names never inherit a previous snapshot's stake. An embedding caller can
+/// explicitly opt a stable [`crate::shellmux::ShellId::durable`] identity into WAL recovery
+/// instead; the snapshot uid still identifies its content.
 #[derive(
     Clone,
     Debug,
@@ -164,7 +170,8 @@ impl From<GrantedAction> for Action {
 ///
 /// This is the part of a grant the seed cannot re-derive. A resource is recoverable from the
 /// transaction's own operations only when the grant was an [`Action::Edit`]; every git capability
-/// is built from the builtin records, and those live beside the snapshot and go when it is swept.
+/// comes from what the `git` builtin observed its invocations do, which lives only as long as the
+/// line it happened in.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct GrantedCapability {
     /// What was granted.
@@ -219,7 +226,8 @@ pub struct PublishMeta {
     ///
     /// Defaulted so a log written before this field existed still parses. Such a transaction
     /// names nobody, and a reopen therefore grants its paths to nobody — which is exactly what
-    /// that log says. It is not a reason to refuse the seed: an unparseable log is.
+    /// that log says. A log that cannot even parse into records of this shape is not refused
+    /// either: reading it resets it to empty, and startup proceeds over the fresh log that leaves.
     #[serde(default)]
     pub principal: SnapshotUid,
     /// The stable agent name explicitly opted into durable ownership, if any.
@@ -244,15 +252,6 @@ pub struct Publication {
     pub ops: usize,
 }
 
-/// A path another principal published after this line's snapshot was taken.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct StalePath {
-    /// Seed-relative path.
-    pub path: PathBuf,
-    /// Sequence number of the transaction that won it.
-    pub merged_seq: u64,
-}
-
 /// One seed, opened once per process: its lease, its log, and the authority every snapshot's
 /// boundary serializes through.
 pub(crate) struct Session {
@@ -260,8 +259,14 @@ pub(crate) struct Session {
     fs: Arc<dyn Subvolumes>,
     /// `meta/wal.jsonl`.
     log: PathBuf,
-    /// The one builtin hook every attached shell's builtins report to: instrumentation is
+    /// The builtin hook every attached shell's builtins report to: instrumentation is
     /// process-global, and every attach re-installs this same hook.
+    ///
+    /// Supplied at open rather than made here, because a host running shells over several seeds
+    /// has to give all of them one recorder — the global installation keeps only the last hook
+    /// installed, so per-session recorders would leave every seed but the newest unobserved.
+    /// Records are told apart by the snapshot path they were made in, not by which session owns
+    /// the recorder.
     pub(crate) hook: Arc<RecordingHook>,
     /// Read = take or retake a snapshot; write = one boundary (diff, check, publish or discard).
     authority: RwLock<Authority>,
@@ -302,9 +307,14 @@ struct Authority {
 }
 
 impl Session {
-    /// Attaches to the seed containing `seed`: takes its lease, recovers its log, rebuilds the
-    /// capability history that log describes, sweeps what a previous session left. Takes no
-    /// snapshot; [`Self::snapshot`] does that, once per shell.
+    /// Opens the seed an already-discovered `persistence` names: takes its lease, recovers its
+    /// log, rebuilds the capability history that log describes, sweeps what a previous session
+    /// left. Takes no snapshot; [`Self::snapshot`] does that, once per shell.
+    ///
+    /// Discovery is the caller's, because one mux hosts shells over several seeds and each of them
+    /// is found from its own shell's starting directory. `hook` is supplied for the same reason:
+    /// instrumentation is installed process-wide, so every session a single mux opens must report
+    /// to one recorder or the last seed opened would silence the others' builtins.
     ///
     /// The history is rebuilt from the same transactions recovery returns, so it costs no second
     /// read and cannot disagree with what was replayed. Rebuilding it is not new work: no
@@ -313,11 +323,14 @@ impl Session {
     ///
     /// # Errors
     ///
-    /// Fails when no btrfs subvolume contains `seed`, when another process already holds the
-    /// seed's lease, or when the log cannot be recovered. A seed with no log at all is not that
-    /// case: it reads as empty, and an empty log genuinely owes nobody anything.
-    pub(crate) fn open(seed: &Path, fs: Arc<dyn Subvolumes>) -> Result<Arc<Self>, MarshError> {
-        let mut persistence = PersistenceLayer::discover(seed, fs.as_ref())?;
+    /// Fails when the state directory cannot be materialized, when another process already holds
+    /// the seed's lease, or when the log cannot be recovered. A seed with no log at all is not
+    /// that case: it reads as empty, and an empty log genuinely owes nobody anything.
+    pub(crate) fn open(
+        mut persistence: PersistenceLayer,
+        fs: Arc<dyn Subvolumes>,
+        hook: Arc<RecordingHook>,
+    ) -> Result<Arc<Self>, MarshError> {
         persistence.materialize(fs.as_ref())?;
         persistence.acquire()?;
 
@@ -362,7 +375,7 @@ impl Session {
         Ok(Arc::new(Self {
             fs,
             log,
-            hook: Arc::new(RecordingHook::default()),
+            hook,
             // Empty: every snapshot this process takes has `base_seq >= seq`, so no transaction
             // already in the log can be newer than a snapshot taken after it.
             authority: RwLock::new(Authority {
@@ -434,15 +447,17 @@ impl Session {
             .read()
             .unwrap_or_else(PoisonError::into_inner);
         let path = self.persistence.work(uid.as_str());
-        self.fs.snapshot(&self.persistence.seed, &path)?;
+        let run_dir = self.internal(|| {
+            self.fs.snapshot(&self.persistence.seed, &path)?;
+            let run_dir = self.persistence.run_dir(uid.as_str())?;
+            std::fs::create_dir_all(&run_dir)?;
+            Ok::<_, MarshError>(run_dir)
+        })?;
         let path = path.canonicalize()?;
         let base_seq = authority.seq;
         drop(authority);
 
-        let run_dir = self.persistence.run_dir(uid.as_str())?;
-        std::fs::create_dir_all(&run_dir)?;
-
-        Ok(Arc::new(Snapshot {
+        let snapshot = Arc::new(Snapshot {
             session: Arc::clone(self),
             uid,
             principal,
@@ -450,13 +465,54 @@ impl Session {
             path,
             run_dir,
             spawns: SpawnRecorder::default(),
+            interrupted: Arc::new(AtomicBool::new(false)),
+            resume: Arc::new(tokio::sync::Notify::new()),
             state: Mutex::new(SnapshotState {
                 base_seq,
                 spawns_seen: 0,
                 builtins_seen: 0,
+                traces: Vec::new(),
+                traces_seen: 0,
+                reads: BTreeSet::new(),
+                writes: BTreeMap::new(),
+                recursive_reads: BTreeSet::new(),
+                recursive_writes: BTreeMap::new(),
+                access: Access::default(),
+                git: GitLine::default(),
+                dependency: None,
                 recovery_required: false,
             }),
-        }))
+        });
+
+        // After the tree exists and before any shell can run in it: from here on every file
+        // access inside this root is classified into the snapshot's own read and write sets. The
+        // observer holds a *weak* handle — the hook would otherwise keep every snapshot ever
+        // taken alive, and it is the snapshot's drop that unregisters it.
+        let observer = Arc::downgrade(&snapshot);
+        snapshot.session.hook.register_root(
+            snapshot.path(),
+            Arc::clone(&snapshot.interrupted),
+            Arc::new(move |line: &TraceLine| match observer.upgrade() {
+                None => Ok(()),
+                Some(snapshot) => snapshot.observe(line),
+            }),
+        )?;
+        Ok(snapshot)
+    }
+
+    /// Runs `work` with every syscall it makes marked as the implementation's own.
+    ///
+    /// Not bookkeeping: a tree diff walks the snapshot by name, a subvolume copy writes back into
+    /// it by name, and a record dump opens files beside it. Every one of those is a traced access
+    /// to a path inside a registered root, so a boundary that did not say "this is mine" would
+    /// observe itself reading the whole tree and writing back everything it restored — and would
+    /// then find its own footprint invalidated by the next principal's publication.
+    fn internal<T>(&self, work: impl FnOnce() -> T) -> T {
+        let scope = self.hook.scope(None);
+        let guard = scope.as_ref().map(marsh_instrument::TraceScope::enter);
+        let done = work();
+        drop(guard);
+        done
     }
 
     /// Whether an approved publication failed and its log still has to be replayed.
@@ -488,18 +544,52 @@ pub(crate) struct Snapshot {
     run_dir: PathBuf,
     /// This shell's own spawner records; the executor writes straight into here.
     pub(crate) spawns: SpawnRecorder,
-    /// Base version and record attribution.
+    /// Set when this evaluation read something another principal has since published.
+    ///
+    /// Shared with the instrumentation, which is what lets a builtin about to run — and Brush's
+    /// own interactive driver — learn that the line has to be evaluated again without this
+    /// snapshot's lock being involved at all.
+    pub(crate) interrupted: Arc<AtomicBool>,
+    /// Notified when [`Self::interrupted`] is set, so the run loop can signal this evaluation's
+    /// own processes without polling for it.
+    pub(crate) resume: Arc<tokio::sync::Notify>,
+    /// Base version, record attribution and this line's observed footprint.
     state: Mutex<SnapshotState>,
 }
 
 /// The mutable half of a snapshot, behind one lock.
 struct SnapshotState {
-    /// Seed seq this snapshot equals; staleness is measured against it.
+    /// Seed seq this snapshot equals; a read dependency is measured against it.
     base_seq: u64,
     /// Own spawn records already attributed to a boundary.
     spawns_seen: usize,
     /// Index into the session hook's shared stream already attributed to a boundary.
     builtins_seen: usize,
+    /// Every trace line attributed to this snapshot, as the tracer printed it.
+    traces: Vec<String>,
+    /// How much of [`Self::traces`] a boundary has already accounted for.
+    traces_seen: usize,
+    /// Seed-relative paths this evaluation observed the content or existence of.
+    reads: BTreeSet<PathBuf>,
+    /// Seed-relative paths this evaluation changed, each with the trace timestamps of the calls
+    /// that changed it: the clock a git invocation's window is measured on too.
+    writes: BTreeMap<PathBuf, Vec<u64>>,
+    /// Subtrees whose contents this evaluation depended on.
+    recursive_reads: BTreeSet<PathBuf>,
+    /// Subtrees this evaluation restructured, with the timestamps of the calls that did.
+    recursive_writes: BTreeMap<PathBuf, Vec<u64>>,
+    /// Where each traced thread resolves relative paths from, and what it has mapped.
+    access: Access,
+    /// What this evaluation's managed git invocations did, and which are still running.
+    git: GitLine,
+    /// The footprint's read dependency as last decided in full, and under which seqs.
+    ///
+    /// Within one pair of seqs only this evaluation's own new reads can change it: generations
+    /// move only with the authority's seq, and a footprint only grows until it is reset. So a
+    /// traced call checks only what it added, and the whole footprint is walked again only after a
+    /// publication or a rebase — not once per call, which for a command reading thousands of
+    /// paths is quadratic and leaves the tracer's drains waiting on this classification.
+    dependency: Option<Dependency>,
     /// Set before this snapshot's approved `marsh_wal::apply` and cleared only once the apply,
     /// the state update and the record dumps have all succeeded.
     ///
@@ -507,6 +597,318 @@ struct SnapshotState {
     /// half applied. Its drop must therefore leave it on disk: deleting it would strand the log
     /// with no content to replay from.
     recovery_required: bool,
+}
+
+/// A read dependency decided over a whole footprint.
+#[derive(Debug, Clone, Copy)]
+struct Dependency {
+    /// The authority's seq when it was decided.
+    seq: u64,
+    /// The snapshot's `base_seq` when it was decided.
+    base_seq: u64,
+    /// Whether the footprint read something published after `base_seq`.
+    newer: bool,
+}
+
+/// What one git invocation did to the resources of this snapshot, in the git vocabulary.
+///
+/// The window is two readings of the trace's own clock, taken around the native process, so a
+/// traced write can be placed before, inside or after it. Nothing here is a policy action yet:
+/// the gate maps each recorded action when it builds the line's requests.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GitEffectRecord {
+    /// `CLOCK_REALTIME` microseconds just before the process started.
+    pub(crate) started_at: u64,
+    /// The same clock, once the process had been reaped.
+    pub(crate) finished_at: u64,
+    /// Each observed transition, in the order it is requested, at its snapshot-relative path.
+    pub(crate) requests: Vec<(GitAction, PathBuf)>,
+    /// Snapshot-relative repository metadata the invocation used — a git directory, a common
+    /// directory — whose writes inside its window are git's bookkeeping, never edits.
+    pub(crate) metadata: Vec<PathBuf>,
+}
+
+/// How a managed git invocation shares the snapshot with the others running in it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GitCohortKind {
+    /// Observes only: any number run together.
+    Inspect,
+    /// May change state: its effects are attributed by comparing before with after, so nothing
+    /// else may run in the snapshot meanwhile.
+    Exclusive,
+}
+
+/// The managed git invocations of one evaluation.
+///
+/// Heterogeneous on purpose: the recorded effects, the first failure, and the running members
+/// with the processes they own are one lifecycle, reset together at every boundary.
+#[derive(Default)]
+struct GitLine {
+    /// Which evaluation the fields below describe; a guard from an earlier one touches nothing.
+    generation: u64,
+    /// Id of the next guard.
+    next_id: u64,
+    /// Guards alive in any generation: a process an earlier boundary cancelled may still be
+    /// exiting, and the tree may not be reused under it until it has.
+    live: usize,
+    /// The kind of the invocations running now, when any are.
+    cohort: Option<GitCohortKind>,
+    /// How many of this evaluation's invocations are running.
+    members: usize,
+    /// The native process each running invocation owns, by guard id: `(pid, process group)`.
+    children: BTreeMap<u64, (i32, Option<i32>)>,
+    /// Completed invocations' effects, in completion order.
+    records: Vec<GitEffectRecord>,
+    /// The first reason this evaluation's git effects cannot be published.
+    failure: Option<String>,
+}
+
+impl GitLine {
+    /// Latches `message` unless an earlier failure already explains the line.
+    fn fail(&mut self, message: String) {
+        self.failure.get_or_insert(message);
+    }
+
+    /// Forgets this evaluation, leaving every guard still alive unable to touch the next one.
+    fn reset(&mut self) {
+        self.generation += 1;
+        self.cohort = None;
+        self.members = 0;
+        self.children.clear();
+        self.records.clear();
+        self.failure = None;
+    }
+
+    /// Kills every process a running invocation owns and latches why the line cannot stand.
+    ///
+    /// A boundary that found git still running cannot know what it will have done, so neither
+    /// publishing nor retaking the tree under it is honest; the line fails and the processes are
+    /// ended rather than left to write into a tree nobody will look at.
+    fn cancel_running(&mut self) {
+        if self.members == 0 {
+            return;
+        }
+        for (pid, group) in self.children.values() {
+            end_process(*pid, *group);
+        }
+        self.fail("git: a managed git was still running at the line boundary".to_string());
+    }
+}
+
+/// Kills a native process this shell started, with the process group it leads, and resumes it
+/// in case it was stopped so the kill is delivered at once.
+///
+/// A process that joined this process's own group is signalled alone: that group is the host's,
+/// not the child's.
+pub(crate) fn end_process(pid: i32, group: Option<i32>) {
+    // SAFETY: `getpgrp` takes no arguments and cannot fail.
+    let own_group = unsafe { libc::getpgrp() };
+    let target = match group {
+        Some(group) if group != own_group => -group,
+        _ => pid,
+    };
+    // SAFETY: `kill` has no memory effects; a target that already exited is ESRCH.
+    unsafe { libc::kill(target, libc::SIGKILL) };
+    // SAFETY: as above.
+    unsafe { libc::kill(target, libc::SIGCONT) };
+}
+
+/// A managed git invocation's membership of its snapshot's cohort, released when dropped.
+///
+/// Its observation ends with [`Self::record`] or [`Self::finish`]. A guard dropped before either
+/// — a future cut short between the process and its probes — leaves effects nobody attributed,
+/// so the line it belonged to fails rather than publishing them.
+pub(crate) struct GitGuard {
+    /// The snapshot it runs in.
+    snapshot: Arc<Snapshot>,
+    /// The evaluation it was admitted to.
+    generation: u64,
+    /// Its id within the snapshot.
+    id: u64,
+    /// Whether its observation reached an end.
+    completed: bool,
+}
+
+impl GitGuard {
+    /// Runs `update` over the line state, when this guard's evaluation is still the current one.
+    fn current(&self, update: impl FnOnce(&mut GitLine)) {
+        let mut state = self
+            .snapshot
+            .state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if state.git.generation == self.generation {
+            update(&mut state.git);
+        }
+    }
+
+    /// Registers the native process this invocation started, so a boundary that finds it still
+    /// running can end it.
+    pub(crate) fn spawned(&self, pid: i32, group: Option<i32>) {
+        self.current(|line| {
+            line.children.insert(self.id, (pid, group));
+        });
+    }
+
+    /// Records what this invocation did, ending its observation.
+    pub(crate) fn record(mut self, record: GitEffectRecord) {
+        self.current(|line| line.records.push(record));
+        self.completed = true;
+    }
+
+    /// Ends an observation that had nothing to record.
+    pub(crate) fn finish(mut self) {
+        self.completed = true;
+    }
+
+    /// Latches why this evaluation's git effects cannot be published.
+    pub(crate) fn fail(&self, message: String) {
+        self.current(|line| line.fail(message));
+    }
+}
+
+impl Drop for GitGuard {
+    fn drop(&mut self) {
+        let mut state = self
+            .snapshot
+            .state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let line = &mut state.git;
+        line.live -= 1;
+        if line.generation == self.generation {
+            if !self.completed {
+                line.fail("git: a managed git's observation was cut short".to_string());
+            }
+            line.members -= 1;
+            line.children.remove(&self.id);
+            if line.members == 0 {
+                line.cohort = None;
+            }
+        }
+        drop(state);
+    }
+}
+
+impl SnapshotState {
+    /// Folds one traced call into this line's footprint, and says whether the footprint now
+    /// depends on something another principal published since `base_seq`.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the call named a path the decoder cannot read: the command touched something
+    /// and the evidence does not say what, which a publication may not be built on.
+    fn observe(
+        &mut self,
+        line: &TraceLine,
+        root: &Path,
+        authority: &Authority,
+    ) -> Result<bool, MarshError> {
+        let effects = self
+            .access
+            .observe(line, root)
+            .map_err(|cause| MarshError::Io(std::io::Error::other(cause)))?;
+        let known = self
+            .dependency
+            .filter(|known| known.seq == authority.seq && known.base_seq == self.base_seq);
+        let added = known.is_some_and(|known| !known.newer)
+            && self.newer(
+                &effects.reads,
+                &effects.recursive_reads,
+                &authority.generations,
+            );
+        if !effects.is_empty() {
+            self.traces.push(line.to_string());
+            self.reads.extend(effects.reads);
+            for path in effects.writes {
+                self.writes.entry(path).or_default().push(line.ts_us);
+            }
+            self.recursive_reads.extend(effects.recursive_reads);
+            for path in effects.recursive_writes {
+                self.recursive_writes
+                    .entry(path)
+                    .or_default()
+                    .push(line.ts_us);
+            }
+        }
+        let newer = match known {
+            Some(known) => known.newer || added,
+            None => self.depends_on_newer(&authority.generations),
+        };
+        self.dependency = Some(Dependency {
+            seq: authority.seq,
+            base_seq: self.base_seq,
+            newer,
+        });
+        Ok(newer)
+    }
+
+    /// Forgets the footprint of an evaluation that will be run again, keeping its evidence.
+    ///
+    /// The trace lines stay and the offset moves past them: the attempt happened and its record
+    /// is still dumped, but nothing it observed may reach the next evaluation's request.
+    fn reset_footprint(&mut self) {
+        self.traces_seen = self.traces.len();
+        self.reads.clear();
+        self.writes.clear();
+        self.recursive_reads.clear();
+        self.dependency = None;
+        self.recursive_writes.clear();
+        self.access = Access::default();
+        self.git.reset();
+    }
+
+    /// Whether `path` is inside what this evaluation was seen to write.
+    fn written(&self, path: &Path) -> bool {
+        self.writes.contains_key(path)
+            || self
+                .recursive_writes
+                .keys()
+                .any(|prefix| path.starts_with(prefix))
+    }
+
+    /// When this evaluation wrote `path`, on the trace's clock.
+    ///
+    /// The calls that wrote the path itself, when any did. Only a path no call named — one that
+    /// arrived inside a directory renamed into place — takes the stamps of the restructuring above
+    /// it: a `mkdir` that preceded a file's own write says nothing about when that write happened.
+    fn write_stamps(&self, path: &Path) -> Vec<u64> {
+        if let Some(stamps) = self.writes.get(path) {
+            return stamps.clone();
+        }
+        self.recursive_writes
+            .iter()
+            .filter(|(prefix, _)| path.starts_with(prefix))
+            .flat_map(|(_, stamps)| stamps.iter().copied())
+            .collect()
+    }
+
+    /// Whether another principal published something this evaluation read.
+    ///
+    /// A plain read names one path. A recursive read — a directory that was renamed or removed
+    /// out from under the command — depends on everything beneath it, because that is what moved.
+    fn depends_on_newer(&self, generations: &HashMap<PathBuf, u64>) -> bool {
+        self.newer(&self.reads, &self.recursive_reads, generations)
+    }
+
+    /// Whether any of `reads`, or anything beneath one of `recursive_reads`, was published after
+    /// `base_seq`.
+    fn newer<'a>(
+        &self,
+        reads: impl IntoIterator<Item = &'a PathBuf>,
+        recursive_reads: impl IntoIterator<Item = &'a PathBuf>,
+        generations: &HashMap<PathBuf, u64>,
+    ) -> bool {
+        let newer = |seq: &u64| *seq > self.base_seq;
+        reads
+            .into_iter()
+            .any(|path| generations.get(path).is_some_and(newer))
+            || recursive_reads.into_iter().any(|prefix| {
+                generations
+                    .iter()
+                    .any(|(path, seq)| newer(seq) && path.starts_with(prefix))
+            })
+    }
 }
 
 impl Snapshot {
@@ -536,7 +938,7 @@ impl Snapshot {
     /// its logical working directory lying inside its own snapshot — where
     /// [`MarshExecutor::attach`](super::MarshExecutor::attach) starts it. A builtin run after a
     /// `cd` to an absolute path outside the snapshot is attributed to nobody, which costs nothing:
-    /// [`policy::translate`](super::policy::translate) ignores such paths anyway.
+    /// the records are evidence for the dumps, and requests come from the observed footprint.
     pub(crate) fn attributed(&self, records: &[BuiltinRecord]) -> Vec<BuiltinRecord> {
         let mine: HashSet<u64> = records
             .iter()
@@ -561,6 +963,121 @@ impl Snapshot {
         self.attributed(&self.session.hook.records())
     }
 
+    /// Folds one traced call into this line's footprint, and decides whether the line has to be
+    /// evaluated again.
+    ///
+    /// Called by the instrumentation's decoder, outside every lock that layer holds, which is why
+    /// it may take this session's. The authority is read first and the snapshot's state second —
+    /// the order every boundary uses — and both are released before anything is signalled: a
+    /// publication must not wait on a process dying, and a driver must not be woken with the seed
+    /// held.
+    ///
+    /// Only *reads* invalidate. Two shells writing the same path is an ownership question the
+    /// capability policy already answers, and re-running the loser would not change its answer.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the call named a path the decoder cannot read.
+    pub(crate) fn observe(&self, line: &TraceLine) -> std::io::Result<()> {
+        let authority = self
+            .session
+            .authority
+            .read()
+            .unwrap_or_else(PoisonError::into_inner);
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let classified = state.observe(line, &self.path, &authority);
+        let depends = matches!(classified, Ok(true));
+        drop(state);
+        drop(authority);
+
+        if depends && !self.interrupted.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            // First observation only: the run loop signals this evaluation's own processes once,
+            // and a second notification would signal an evaluation that has already unwound.
+            self.resume.notify_waiters();
+        }
+        classified.map(|_newer| ()).map_err(|error| match error {
+            MarshError::Io(error) => error,
+            other => std::io::Error::other(other.to_string()),
+        })
+    }
+
+    /// Whether this evaluation was told to stop and start over.
+    pub(crate) fn interrupted(&self) -> bool {
+        self.interrupted.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Admits a managed git invocation of `kind`, or refuses one that could not be attributed.
+    ///
+    /// Inspections run together; anything that may change state runs alone, because its effects
+    /// are read off the difference between before and after and a second invocation's would be
+    /// indistinguishable from its own. A refusal is latched: the line it happened in fails at its
+    /// boundary rather than publishing whatever the other invocation left.
+    ///
+    /// # Errors
+    ///
+    /// Fails with the refusal's diagnostic when another invocation is running and either of the
+    /// two may change state.
+    pub(crate) fn begin_git(self: &Arc<Self>, kind: GitCohortKind) -> Result<GitGuard, String> {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let line = &mut state.git;
+        match line.cohort {
+            None => line.cohort = Some(kind),
+            Some(GitCohortKind::Inspect) if kind == GitCohortKind::Inspect => {}
+            Some(_) => {
+                let refusal = "git: overlapping managed Git mutations cannot be attributed";
+                line.fail(refusal.to_string());
+                return Err(refusal.to_string());
+            }
+        }
+        line.members += 1;
+        line.live += 1;
+        let id = line.next_id;
+        line.next_id += 1;
+        let generation = line.generation;
+        drop(state);
+        Ok(GitGuard {
+            snapshot: Arc::clone(self),
+            generation,
+            id,
+            completed: false,
+        })
+    }
+
+    /// Waits until every syscall this shell has issued so far has been decoded into its
+    /// footprint.
+    ///
+    /// Taken outside every lock of this session: the decoder classifies under them.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the evidence stream is broken, the decoder cannot keep up, or a call of this
+    /// line entered the kernel and never returned.
+    pub(crate) fn drain_trace(&self) -> Result<(), MarshError> {
+        self.session.hook.drain()?;
+        if self.session.hook.unresolved(&self.path) {
+            return Err(MarshError::Io(std::io::Error::other(
+                "file access tracing failed: a call of this line entered the kernel and never \
+                 returned, so its effect is unknown",
+            )));
+        }
+        Ok(())
+    }
+
+    /// The snapshot-relative paths this evaluation wrote in `(after, until]` on the trace's clock,
+    /// counting a restructured directory as the path it names.
+    ///
+    /// Only as complete as the decoder: call [`Self::drain_trace`] first.
+    pub(crate) fn writes_between(&self, after: u64, until: u64) -> Vec<PathBuf> {
+        let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state
+            .writes
+            .iter()
+            .chain(&state.recursive_writes)
+            .filter(|(_, stamps)| stamps.iter().any(|stamp| *stamp > after && *stamp <= until))
+            .map(|(path, _)| path.clone())
+            .collect()
+    }
+
     /// Retakes the snapshot from the seed when another principal has published since it was taken.
     ///
     /// Under the authority's read lock, so no publication interleaves with the retake, and under
@@ -583,11 +1100,19 @@ impl Snapshot {
             .read()
             .unwrap_or_else(PoisonError::into_inner);
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        if state.git.live > 0 {
+            return Err(MarshError::Io(std::io::Error::other(
+                "git: a managed git an earlier boundary cancelled is still exiting; the snapshot \
+                 cannot be retaken under it",
+            )));
+        }
         if state.base_seq != authority.seq {
-            self.session.fs.delete_subvolume(&self.path);
-            self.session
-                .fs
-                .snapshot(&self.session.persistence.seed, &self.path)?;
+            self.session.internal(|| {
+                self.session.fs.delete_subvolume(&self.path);
+                self.session
+                    .fs
+                    .snapshot(&self.session.persistence.seed, &self.path)
+            })?;
             state.base_seq = authority.seq;
         }
         Ok(())
@@ -618,6 +1143,7 @@ impl Snapshot {
             .write()
             .unwrap_or_else(PoisonError::into_inner);
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state.git.cancel_running();
 
         let spawns = self.spawns.records();
         let all = self.session.hook.records();
@@ -625,8 +1151,8 @@ impl Snapshot {
             .iter()
             .map(SpawnRecord::id)
             .collect();
-        let boundary_builtins = self.attributed(&all[state.builtins_seen..]);
-        let new_builtins: Vec<u64> = boundary_builtins
+        let new_builtins: Vec<u64> = self
+            .attributed(&all[state.builtins_seen..])
             .iter()
             .filter_map(|record| match record {
                 BuiltinRecord::Begin { id, .. } => Some(*id),
@@ -637,7 +1163,37 @@ impl Snapshot {
         state.spawns_seen = spawns.len();
         state.builtins_seen = all.len();
 
-        let ops = marsh_wal::diff_trees(&self.session.persistence.seed, &self.path)?;
+        // The read dependency is decided before the diff, and the diff is skipped when it holds:
+        // two full tree walks to describe a tree that is about to be thrown away and retaken is
+        // the one cost this boundary can simply not pay.
+        let needs_sync = state.depends_on_newer(&authority.generations);
+        let stale_view = state.base_seq != authority.seq;
+        let dirty = !state.writes.is_empty()
+            || !state.recursive_writes.is_empty()
+            || self.interrupted();
+        let (ops, edits) = if needs_sync {
+            (Vec::new(), Vec::new())
+        } else {
+            // Filtered by what this line was *seen* to write. A disjoint file another principal
+            // published while this line ran is present in the seed and absent from this older
+            // snapshot, and an unfiltered diff would carry it back out as a deletion. The order
+            // `diff_trees` produced — removals deepest first, then writes shallowest first — is
+            // preserved, because that order is what makes the apply legal.
+            let seed = &self.session.persistence.seed;
+            let ops: Vec<CommitOp> = self
+                .session
+                .internal(|| marsh_wal::diff_trees(seed, &self.path))?
+                .into_iter()
+                .filter(|op| state.written(op.path()))
+                .collect();
+            let edits = self.session.internal(|| {
+                ops.iter()
+                    .filter(|op| changes_content(seed, &self.path, op))
+                    .map(|op| (op.path().to_path_buf(), state.write_stamps(op.path())))
+                    .collect()
+            });
+            (ops, edits)
+        };
         Ok(Pending {
             snapshot: self,
             authority,
@@ -645,18 +1201,36 @@ impl Snapshot {
             cmd: cmd.to_string(),
             spawns,
             whole_builtins,
-            boundary_builtins,
             new_spawns,
             new_builtins,
             ops,
+            edits,
+            needs_sync,
+            stale_view,
+            dirty,
         })
     }
 
-    /// Writes both record streams into `meta/runs/<uid>`, whole.
-    fn dump(&self, spawns: &[SpawnRecord], builtins: &[BuiltinRecord]) -> Result<(), MarshError> {
-        std::fs::write(self.run_dir.join("spawns.json"), dump_records(spawns)?)?;
-        std::fs::write(self.run_dir.join("builtins.json"), dump_records(builtins)?)?;
-        Ok(())
+    /// Writes every record stream into `meta/runs/<uid>`, whole.
+    ///
+    /// `trace.log` sits beside the two record dumps because it is the third stream of the same
+    /// run: what the shell was asked to do, what it spawned, and what the kernel saw it touch.
+    /// An evaluation that was abandoned and run again leaves its evidence here too — the attempt
+    /// happened — even though nothing it observed reaches a capability request.
+    fn dump(
+        &self,
+        spawns: &[SpawnRecord],
+        builtins: &[BuiltinRecord],
+        traces: &[String],
+    ) -> Result<(), MarshError> {
+        let spawns = dump_records(spawns)?;
+        let builtins = dump_records(builtins)?;
+        self.session.internal(|| {
+            std::fs::write(self.run_dir.join("spawns.json"), spawns)?;
+            std::fs::write(self.run_dir.join("builtins.json"), builtins)?;
+            std::fs::write(self.run_dir.join("trace.log"), traces.join("\n"))?;
+            Ok(())
+        })
     }
 }
 
@@ -675,50 +1249,56 @@ pub(crate) struct Pending<'a> {
     spawns: Vec<SpawnRecord>,
     /// Every builtin record of this shell, whole, for the same reason.
     whole_builtins: Vec<BuiltinRecord>,
-    /// This boundary's builtin records only, which is what the translation reads.
-    boundary_builtins: Vec<BuiltinRecord>,
     /// Ids of this boundary's spawn records, for the transaction's metadata.
     new_spawns: Vec<u64>,
     /// Ids of this boundary's builtin invocations, for the transaction's metadata.
     new_builtins: Vec<u64>,
-    /// The seed-to-snapshot difference.
+    /// The seed-to-snapshot difference, filtered to this line's own write footprint.
     ops: Vec<CommitOp>,
+    /// The operations that change content rather than only the tree's shape, each with the trace
+    /// timestamps of the calls that wrote it.
+    edits: Vec<(PathBuf, Vec<u64>)>,
+    /// Whether this line read something another principal published while it ran.
+    ///
+    /// Decided before the diff, which is why there is no diff to look at when it is set.
+    needs_sync: bool,
+    /// Whether the seed moved on since this snapshot was taken.
+    ///
+    /// Not a verdict on this line — the publication may be entirely disjoint — but the reason a
+    /// tree cannot be called current without being retaken.
+    stale_view: bool,
+    /// Whether this evaluation was seen to write inside the snapshot, or was cut short with its
+    /// evidence incomplete.
+    dirty: bool,
 }
 
 impl Pending<'_> {
-    /// The difference this boundary found.
-    pub(crate) fn ops(&self) -> &[CommitOp] {
-        &self.ops
+    /// The content changes this boundary found, with the timestamps that place them in the line.
+    pub(crate) fn edits(&self) -> &[(PathBuf, Vec<u64>)] {
+        &self.edits
     }
 
-    /// This boundary's builtin records only.
-    pub(crate) fn builtins(&self) -> &[BuiltinRecord] {
-        &self.boundary_builtins
+    /// What this evaluation's git invocations did.
+    pub(crate) fn git_records(&self) -> &[GitEffectRecord] {
+        &self.state.git.records
     }
 
-    /// The paths this boundary touches or requests that another principal published first.
+    /// Why this evaluation's git effects cannot be published, when something made them so.
     ///
-    /// Empty means the line raced nobody and may be judged on its own merits.
-    pub(crate) fn stale(&self, requested: &[Event]) -> Vec<StalePath> {
-        let mut paths: Vec<PathBuf> = self
-            .ops
-            .iter()
-            .map(|op| op.path().to_path_buf())
-            .chain(
-                requested
-                    .iter()
-                    .map(|event| event.resource.segments().iter().collect::<PathBuf>()),
-            )
-            .collect();
-        paths.sort();
-        paths.dedup();
-        paths
-            .into_iter()
-            .filter_map(|path| {
-                let merged_seq = *self.authority.generations.get(&path)?;
-                (merged_seq > self.state.base_seq).then_some(StalePath { path, merged_seq })
-            })
-            .collect()
+    /// A line with a latched failure is never translated: whatever its tree holds was left by a
+    /// git whose effects are unknown or unattributable.
+    pub(crate) fn git_failure(&self) -> Option<&str> {
+        self.state.git.failure.as_deref()
+    }
+
+    /// Whether this line read something another principal has published since its snapshot was
+    /// taken.
+    ///
+    /// The line's own answer may depend on bytes that are no longer current, so it is evaluated
+    /// again rather than judged. Writes are deliberately not consulted: two principals writing one
+    /// path is an ownership question, and the capability policy is what answers it.
+    pub(crate) const fn needs_sync(&self) -> bool {
+        self.needs_sync
     }
 
     /// Applies the difference to the seed through the log, recording `granted` — the capabilities
@@ -735,8 +1315,8 @@ impl Pending<'_> {
     /// state — an edit, a stage, an unstage, a delete, a commit, a checkout, a stash — moves bytes
     /// in the tree or in `.git/`, so it is never what an empty difference was granted for. What is
     /// left is `read`, `diff`, `history` and `clean`, and the rule table treats every one of them
-    /// as state-preserving. Either way the snapshot equals the seed afterwards, so the next line
-    /// starts unstale.
+    /// as state-preserving. The snapshot is retaken either way, because an empty publication out
+    /// of an older tree leaves that tree older than the seed.
     ///
     /// # Errors
     ///
@@ -744,8 +1324,13 @@ impl Pending<'_> {
     /// written.
     pub(crate) fn publish(mut self, granted: &[Event]) -> Result<Publication, MarshError> {
         if self.ops.is_empty() {
-            self.snapshot.dump(&self.spawns, &self.whole_builtins)?;
-            self.state.base_seq = self.authority.seq;
+            self.finish()?;
+            // Retaken when the view moved or a write was seen, not merely renumbered: this tree
+            // may be older than the seed — another principal published a disjoint path while this
+            // line ran — and calling it current without retaking it would make the next line's
+            // diff report that path as a deletion.
+            let retake = self.stale_view || self.dirty;
+            self.resynchronize(retake)?;
             return Ok(Publication {
                 seq: self.authority.seq,
                 ops: 0,
@@ -761,22 +1346,24 @@ impl Pending<'_> {
 
         let seq = self.authority.seq + 1;
         let meta = PublishMeta {
-            cmd: self.cmd,
-            spawns: self.new_spawns,
-            builtins: self.new_builtins,
+            cmd: std::mem::take(&mut self.cmd),
+            spawns: std::mem::take(&mut self.new_spawns),
+            builtins: std::mem::take(&mut self.new_builtins),
             principal: self.snapshot.uid.clone(),
             durable_principal: self.snapshot.durable_name.as_ref().map(ToString::to_string),
             granted: granted.iter().map(GrantedCapability::from).collect(),
         };
-        marsh_wal::apply(
-            &self.snapshot.session.persistence.seed,
-            &self.snapshot.path,
-            &self.snapshot.session.log,
-            self.snapshot.uid.as_str(),
-            seq,
-            &meta,
-            &self.ops,
-        )?;
+        self.snapshot.session.internal(|| {
+            marsh_wal::apply(
+                &self.snapshot.session.persistence.seed,
+                &self.snapshot.path,
+                &self.snapshot.session.log,
+                self.snapshot.uid.as_str(),
+                seq,
+                &meta,
+                &self.ops,
+            )
+        })?;
         self.authority.seq = seq;
         for op in &self.ops {
             self.authority
@@ -784,9 +1371,15 @@ impl Pending<'_> {
                 .insert(op.path().to_path_buf(), seq);
         }
         self.state.base_seq = seq;
-        self.snapshot.dump(&self.spawns, &self.whole_builtins)?;
+        self.finish()?;
+        // Cleared before the retake: the apply and every record dump have succeeded, so the
+        // transaction is complete and this tree is no longer anybody's recovery source.
         self.state.recovery_required = false;
         self.authority.recovery_required = false;
+        // The apply made the seed carry this tree's writes. It does not make this tree carry
+        // somebody else's, so a tree that was already behind is retaken and a current one is not.
+        let retake = self.stale_view;
+        self.resynchronize(retake)?;
         Ok(Publication {
             seq,
             ops: self.ops.len(),
@@ -804,12 +1397,13 @@ impl Pending<'_> {
     ///
     /// Fails when a record stream cannot be written.
     pub(crate) fn abandon(self) -> Result<(), MarshError> {
-        self.snapshot.dump(&self.spawns, &self.whole_builtins)
+        let traces = self.state.traces.clone();
+        self.snapshot
+            .dump(&self.spawns, &self.whole_builtins, &traces)
     }
 
-    /// Throws the line away: dumps the records — the attempt happened — then, when anything
-    /// differed, deletes the snapshot and retakes it from the seed at the same path, so the tree
-    /// the shell runs in is the seed's again.
+    /// Throws the line away: dumps the records — the attempt happened — then retakes the snapshot
+    /// from the seed, so the tree the shell runs in is the seed's again.
     ///
     /// A background job still writing into the old snapshot writes into a deleted tree, which is
     /// what a per-line snapshot refresh means.
@@ -818,16 +1412,51 @@ impl Pending<'_> {
     ///
     /// Fails when a record stream cannot be written or the snapshot cannot be retaken.
     pub(crate) fn discard(mut self) -> Result<(), MarshError> {
-        self.snapshot.dump(&self.spawns, &self.whole_builtins)?;
-        if !self.ops.is_empty() {
-            self.snapshot
-                .session
-                .fs
-                .delete_subvolume(&self.snapshot.path);
-            self.snapshot
-                .session
-                .fs
-                .snapshot(&self.snapshot.session.persistence.seed, &self.snapshot.path)?;
+        // A discard can never prove the tree clean: it is thrown away precisely because the
+        // evidence for it was refused, invalidated or cut short. Retake unless nothing at all
+        // happened and the view never moved.
+        let retake = self.stale_view || self.dirty;
+        self.finish()?;
+        self.resynchronize(retake)
+    }
+
+    /// Dumps this boundary's evidence and forgets the footprint it was decided from.
+    ///
+    /// # Errors
+    ///
+    /// Fails when a record stream cannot be written.
+    fn finish(&mut self) -> Result<(), MarshError> {
+        let traces = self.state.traces.clone();
+        self.snapshot
+            .dump(&self.spawns, &self.whole_builtins, &traces)?;
+        self.state.reset_footprint();
+        self.snapshot
+            .interrupted
+            .store(false, std::sync::atomic::Ordering::Release);
+        self.snapshot.session.hook.retire_unresolved(&self.snapshot.path);
+        Ok(())
+    }
+
+    /// Makes the tree the seed's again, and records that it is.
+    ///
+    /// `retake` is the caller's judgement of whether this tree can still be *proved* equal to the
+    /// seed. "The filtered difference was empty" is not that proof — the filter is exactly what
+    /// hides a disjoint publication this tree does not have yet — so every ending decides it from
+    /// what it knows: whether the view moved, whether a write was observed, and whether the
+    /// evaluation was interrupted with its evidence incomplete.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the snapshot cannot be retaken.
+    fn resynchronize(&mut self, retake: bool) -> Result<(), MarshError> {
+        if retake {
+            let session = &self.snapshot.session;
+            session.internal(|| {
+                session.fs.delete_subvolume(&self.snapshot.path);
+                session
+                    .fs
+                    .snapshot(&session.persistence.seed, &self.snapshot.path)
+            })?;
         }
         self.state.base_seq = self.authority.seq;
         Ok(())
@@ -848,6 +1477,9 @@ impl Drop for Snapshot {
     /// The one tree that survives is the one whose *approved* publication failed: it is the
     /// content the next session's recovery replays from, and deleting it would strand the log.
     fn drop(&mut self) {
+        // Before anything else: no line of this shell can be decoded after its tree is gone, and
+        // the last root going is what stops the host's tracer.
+        let _ = self.session.hook.unregister_root(&self.path);
         let retained = self
             .state
             .lock()
@@ -861,10 +1493,31 @@ impl Drop for Snapshot {
     }
 }
 
+/// Whether `op` changes a file's content rather than only the tree's shape.
+///
+/// An empty directory's creation, mode change or removal is published so the seed keeps its
+/// shape — an unborn repository is empty directories and a few files — but it is not a resource
+/// anybody edits. A directory that replaced a file is still the end of that file, so it is.
+fn changes_content(seed: &Path, work: &Path, op: &CommitOp) -> bool {
+    let is_directory = |root: &Path| {
+        std::fs::symlink_metadata(root.join(op.path())).is_ok_and(|metadata| metadata.is_dir())
+    };
+    match op {
+        CommitOp::Write(path) => {
+            !is_directory(work)
+                || std::fs::symlink_metadata(seed.join(path))
+                    .is_ok_and(|metadata| !metadata.is_dir())
+        }
+        CommitOp::Remove(_) => !is_directory(seed),
+    }
+}
+
 /// Deletes every snapshot left by a previous session.
 ///
 /// Everything under `snap` is a snapshot by construction, so no name filtering. Called only after
-/// recovery has consumed whatever content those trees carried.
+/// recovery has run: normally that means every tree's content was already replayed or reported,
+/// but a log recovery reset because it could not be parsed discards those trees' content
+/// unreplayed instead — this sweep is what actually erases it.
 fn sweep_snapshots(snap: &Path, fs: &dyn Subvolumes) -> Result<(), MarshError> {
     if !snap.exists() {
         std::fs::create_dir_all(snap)?;
@@ -884,22 +1537,21 @@ fn sweep_snapshots(snap: &Path, fs: &dyn Subvolumes) -> Result<(), MarshError> {
 /// They are unreferenced by definition: a transaction either renamed its temporary into place or
 /// never completed.
 fn sweep_temporaries(root: &Path) -> Result<(), MarshError> {
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(directory) = stack.pop() {
-        for entry in std::fs::read_dir(&directory)? {
-            let entry = entry?;
-            let path = entry.path();
-            if entry.file_type()?.is_dir() {
-                stack.push(path);
-            } else if path.file_name().is_some_and(|name| {
-                name.as_encoded_bytes()
-                    .ends_with(marsh_wal::TEMPORARY_SUFFIX.as_bytes())
-            }) {
-                std::fs::remove_file(path)?;
-            }
+    marsh_lib::walk_directory::<_, MarshError>(root, (), |entry, ()| {
+        // The entry's own type, never `path.is_dir()`: that follows a symlink, and a link named
+        // like a temporary would take the sweep out of the tree it was asked to clean.
+        if entry.file_type()?.is_dir() {
+            return Ok(Some(()));
         }
-    }
-    Ok(())
+        let path = entry.path();
+        if path.file_name().is_some_and(|name| {
+            name.as_encoded_bytes()
+                .ends_with(marsh_wal::TEMPORARY_SUFFIX.as_bytes())
+        }) {
+            std::fs::remove_file(path)?;
+        }
+        Ok(None)
+    })
 }
 
 /// Nanoseconds since the epoch, or 0 on a clock that predates it.
@@ -910,4 +1562,119 @@ fn nanos_since_epoch() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_nanos())
+}
+
+#[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The sweep erases the temporaries a crash left behind and nothing else — and it classifies
+    /// entries by what they are, not by what following them would reach. A symlink out of the
+    /// seed is removed as the link it is; the tree it points at is not swept.
+    #[test]
+    fn sweep_temporaries_removes_only_temporary_leaves_without_following_links() {
+        let scratch = tempfile::tempdir().expect("scratch directory");
+        let seed = scratch.path().join("seed");
+        let outside = scratch.path().join("outside");
+        std::fs::create_dir_all(seed.join("nested")).expect("a nested directory");
+        std::fs::create_dir_all(seed.join("dir.tmp-wal")).expect("a directory named like one");
+        std::fs::create_dir_all(&outside).expect("a sibling tree");
+        std::fs::write(seed.join("a.tmp-wal"), b"a").expect("a temporary");
+        std::fs::write(seed.join("nested/b.tmp-wal"), b"b").expect("a nested temporary");
+        std::fs::write(seed.join("keep.txt"), b"keep").expect("a real file");
+        std::fs::write(seed.join("dir.tmp-wal/keep.txt"), b"keep").expect("a file inside it");
+        std::fs::write(outside.join("untouched.tmp-wal"), b"sentinel").expect("a sentinel");
+        std::os::unix::fs::symlink(&outside, seed.join("link.tmp-wal")).expect("a matching link");
+        std::os::unix::fs::symlink(&outside, seed.join("keep-link")).expect("an unrelated link");
+
+        sweep_temporaries(&seed).expect("the sweep runs");
+
+        for gone in ["a.tmp-wal", "nested/b.tmp-wal", "link.tmp-wal"] {
+            assert!(
+                seed.join(gone).symlink_metadata().is_err(),
+                "{gone} is a temporary and is gone"
+            );
+        }
+        for kept in [
+            "keep.txt",
+            "dir.tmp-wal",
+            "dir.tmp-wal/keep.txt",
+            "keep-link",
+        ] {
+            assert!(
+                seed.join(kept).symlink_metadata().is_ok(),
+                "{kept} is not a temporary leaf and survives"
+            );
+        }
+        assert!(
+            outside.join("untouched.tmp-wal").exists(),
+            "the sweep never walked through a symlink out of the seed"
+        );
+    }
+
+    /// A line's read dependency is decided call by call without walking the whole footprint each
+    /// time, yet a publication that lands *after* a read still counts against it from the very
+    /// next call — whatever that call touches — and a read made after a publication counts too.
+    #[test]
+    fn a_read_depends_on_publications_before_and_after_it() {
+        let root = Path::new("/work");
+        let read = |name: &str| TraceLine {
+            tid: 7,
+            ts_us: 1,
+            call: marsh_instrument::Call::Syscall {
+                name: "openat".to_string(),
+                args: format!("AT_FDCWD</work>, \"{name}\", O_RDONLY"),
+                ret: 3,
+                ret_path: Some(format!("/work/{name}")),
+            },
+        };
+        let mut state = SnapshotState {
+            base_seq: 0,
+            spawns_seen: 0,
+            builtins_seen: 0,
+            traces: Vec::new(),
+            traces_seen: 0,
+            reads: BTreeSet::new(),
+            writes: BTreeMap::new(),
+            recursive_reads: BTreeSet::new(),
+            recursive_writes: BTreeMap::new(),
+            access: Access::default(),
+            git: GitLine::default(),
+            dependency: None,
+            recovery_required: false,
+        };
+        let mut authority = Authority {
+            seq: 0,
+            generations: HashMap::new(),
+            recovery_required: false,
+        };
+        let observe = |state: &mut SnapshotState, authority: &Authority, name: &str| {
+            state
+                .observe(&read(name), root, authority)
+                .expect("a readable line")
+        };
+
+        assert!(!observe(&mut state, &authority, "a.txt"));
+        authority.seq = 1;
+        authority.generations.insert(PathBuf::from("a.txt"), 1);
+        assert!(
+            observe(&mut state, &authority, "b.txt"),
+            "a.txt was read before another principal published it"
+        );
+
+        state.reset_footprint();
+        state.base_seq = 1;
+        assert!(!observe(&mut state, &authority, "a.txt"), "rebased past it");
+        authority.seq = 2;
+        authority.generations.insert(PathBuf::from("c.txt"), 2);
+        assert!(
+            !observe(&mut state, &authority, "b.txt"),
+            "a publication of an unread file changes nothing"
+        );
+        assert!(
+            observe(&mut state, &authority, "c.txt"),
+            "c.txt was read after another principal published it"
+        );
+    }
 }

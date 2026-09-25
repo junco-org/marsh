@@ -1,10 +1,8 @@
-#[cfg(unix)]
 use std::ffi::CStr;
 use std::ffi::CString;
 
 // SAFETY: This declares libc's process-global timezone refresh entrypoint with its real C
 // signature: `void tzset(void)`. Calls are wrapped in `LibcLocaleBackend::tzset`.
-#[cfg(unix)]
 unsafe extern "C" {
     /// Refreshes libc's process-global timezone state from the environment.
     fn tzset();
@@ -68,7 +66,6 @@ impl LocaleBackend for LibcLocaleBackend {
     }
 
     /// Reads the active codeset from `nl_langinfo`, yielding `None` when libc has no answer.
-    #[cfg(unix)]
     fn codeset(&self) -> Option<String> {
         // SAFETY: `nl_langinfo(CODESET)` returns either null or a pointer to a
         // process-owned NUL-terminated string for the active locale.
@@ -85,38 +82,21 @@ impl LocaleBackend for LibcLocaleBackend {
         )
     }
 
-    /// Windows console I/O is driven as UTF-8, so no runtime query is needed.
-    #[cfg(windows)]
-    fn codeset(&self) -> Option<String> {
-        Some("UTF-8".to_owned())
-    }
-
     /// Sets `LC_TIME` from the environment, discarding failure as non-fatal.
     fn set_time_from_environment(&self) {
         let _ = setlocale(libc::LC_TIME, "");
     }
 
     /// Calls libc `tzset` so later time formatting sees the current `TZ`.
-    #[cfg(unix)]
     fn tzset(&self) {
         // SAFETY: `tzset` updates libc process-global timezone state and takes
         // no pointers or Rust-owned resources.
         unsafe { tzset() }
     }
-
-    /// Windows has no `tzset` equivalent to call here.
-    #[cfg(windows)]
-    fn tzset(&self) {}
 }
 
-/// Calls libc `setlocale`, mapping the UTF-8 locale names Windows spells differently.
+/// Calls libc `setlocale`, reporting whether the C library accepted `locale`.
 fn setlocale(category: libc::c_int, locale: &str) -> bool {
-    #[cfg(windows)]
-    let locale = match locale {
-        "en_US.UTF-8" | "C.UTF-8" => ".UTF-8",
-        other => other,
-    };
-
     let Ok(locale) = CString::new(locale) else {
         return false;
     };
@@ -129,7 +109,7 @@ fn setlocale(category: libc::c_int, locale: &str) -> bool {
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 mod tests {
-    use super::{initialize_locale, LocaleBackend};
+    use super::{LocaleBackend, initialize_locale};
     use std::cell::RefCell;
 
     #[derive(Default)]

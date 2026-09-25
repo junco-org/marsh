@@ -1,19 +1,11 @@
-#[cfg(any(unix, windows))]
 use super::attach_transport::AttachTransport;
-#[cfg(any(unix, windows))]
 use super::passthrough::render_passthroughs;
-#[cfg(any(unix, windows))]
 use super::types::OpenAttachTarget;
-#[cfg(any(unix, windows))]
 use super::wire::emit_attach_bytes;
-#[cfg(any(unix, windows))]
 use rmux_core::{TerminalPassthrough, TerminalPassthroughKind};
-#[cfg(any(unix, windows))]
 use std::io;
-#[cfg(any(unix, windows))]
 use tracing::warn;
 
-#[cfg(any(unix, windows))]
 const DEFERRED_PASSTHROUGH_LIMIT: usize = 16;
 
 // Terminal graphics are forwarded live to attached clients; they are not part
@@ -21,7 +13,6 @@ const DEFERRED_PASSTHROUGH_LIMIT: usize = 16;
 // delays passthroughs while rmux-owned overlays are visible, and stays bounded
 // so a busy image-producing app cannot grow server memory through the overlay
 // path.
-#[cfg(any(unix, windows))]
 pub(super) fn defer_passthroughs(
     deferred_passthroughs: &mut Vec<TerminalPassthrough>,
     passthroughs: Vec<TerminalPassthrough>,
@@ -43,7 +34,6 @@ pub(super) fn defer_passthroughs(
     }
 }
 
-#[cfg(any(unix, windows))]
 pub(super) fn take_passthrough_frame(
     current_target: &OpenAttachTarget,
     deferred_passthroughs: &mut Vec<TerminalPassthrough>,
@@ -55,7 +45,6 @@ pub(super) fn take_passthrough_frame(
     render_passthroughs(current_target, &passthroughs)
 }
 
-#[cfg(any(unix, windows))]
 pub(super) fn take_passthrough_frame_with_live_passthroughs(
     current_target: &OpenAttachTarget,
     deferred_passthroughs: &mut Vec<TerminalPassthrough>,
@@ -69,7 +58,6 @@ pub(super) fn take_passthrough_frame_with_live_passthroughs(
     render_passthroughs(current_target, &passthroughs)
 }
 
-#[cfg(any(unix, windows))]
 pub(super) fn clear_deferred_passthroughs_if_target_changed(
     target_changed: bool,
     deferred_passthroughs: &mut Vec<TerminalPassthrough>,
@@ -82,7 +70,6 @@ pub(super) fn clear_deferred_passthroughs_if_target_changed(
     }
 }
 
-#[cfg(any(unix, windows))]
 pub(super) async fn flush_deferred_passthroughs(
     stream: &AttachTransport,
     current_target: &OpenAttachTarget,
@@ -100,7 +87,7 @@ pub(super) async fn flush_deferred_passthroughs(
     emit_attach_bytes(stream, &frame).await
 }
 
-#[cfg(all(test, any(unix, windows)))]
+#[cfg(all(test, unix))]
 mod tests {
     use rmux_core::TerminalPassthrough;
 

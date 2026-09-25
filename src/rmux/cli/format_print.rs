@@ -1,7 +1,7 @@
 use rmux_client::Connection;
 use rmux_proto::Target;
 
-use super::{expect_command_output, write_command_output, ExitFailure};
+use super::{ExitFailure, expect_command_output, write_command_output};
 
 /// Renders a format template against a target by asking the daemon to display it, then prints it.
 pub(in crate::cli) fn print_target_format(

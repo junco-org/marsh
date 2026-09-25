@@ -3070,13 +3070,6 @@ async fn forward_attach_exited_control_drains_final_output_and_passthrough_befor
     ));
 
     let _initial = read_attach_data_until(&mut peer, b"BASE-0").await;
-    #[cfg(windows)]
-    {
-        control_tx
-            .send(AttachControl::Exited)
-            .expect("send exited control");
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
     let _ = pane_output.send_for_generation_with_passthroughs(
         None,
         b"FINAL_TAIL".to_vec(),
@@ -3087,7 +3080,6 @@ async fn forward_attach_exited_control_drains_final_output_and_passthrough_befor
         )],
     );
     let _ = pane_output.send_for_generation(None, Vec::new());
-    #[cfg(not(windows))]
     control_tx
         .send(AttachControl::Exited)
         .expect("send exited control");

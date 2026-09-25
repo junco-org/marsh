@@ -1,9 +1,7 @@
 use std::collections::HashMap;
-#[cfg(unix)]
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
-#[cfg(unix)]
 const DISABLE_TMUX_SHIM_ENV: &str = "RMUX_DISABLE_TMUX_SHIM";
 
 pub(crate) fn apply_tmux_shim_environment(
@@ -21,12 +19,10 @@ pub(crate) fn apply_tmux_shim_environment(
     );
 }
 
-#[cfg(unix)]
 pub(crate) fn cleanup_tmux_shim(socket_path: &Path) {
     let _ = remove_private_shim_dir(&shim_dir(socket_path));
 }
 
-#[cfg(unix)]
 fn ensure_tmux_shim(socket_path: &Path) -> Option<PathBuf> {
     if env_flag_enabled(DISABLE_TMUX_SHIM_ENV) {
         return None;
@@ -39,13 +35,6 @@ fn ensure_tmux_shim(socket_path: &Path) -> Option<PathBuf> {
     Some(shim)
 }
 
-#[cfg(windows)]
-fn ensure_tmux_shim(socket_path: &Path) -> Option<PathBuf> {
-    let _ = socket_path;
-    None
-}
-
-#[cfg(unix)]
 fn public_rmux_binary() -> Option<PathBuf> {
     let current = std::env::current_exe().ok()?;
     let file_stem = current.file_stem()?.to_str()?;
@@ -64,12 +53,10 @@ fn public_rmux_binary() -> Option<PathBuf> {
     candidate.is_file().then_some(candidate)
 }
 
-#[cfg(unix)]
 fn shim_dir(socket_path: &Path) -> PathBuf {
     shim_root().join(format!("rmux-shim-{:016x}", socket_hash(socket_path)))
 }
 
-#[cfg(unix)]
 fn shim_root() -> PathBuf {
     std::env::var_os("XDG_RUNTIME_DIR")
         .filter(|value| !value.is_empty())
@@ -77,14 +64,12 @@ fn shim_root() -> PathBuf {
         .unwrap_or_else(std::env::temp_dir)
 }
 
-#[cfg(unix)]
 fn socket_hash(socket_path: &Path) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     socket_path.as_os_str().hash(&mut hasher);
     hasher.finish()
 }
 
-#[cfg(unix)]
 fn ensure_private_dir(dir: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
@@ -107,7 +92,6 @@ fn ensure_private_dir(dir: &Path) -> std::io::Result<()> {
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
 }
 
-#[cfg(unix)]
 fn remove_private_shim_dir(dir: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::MetadataExt;
 
@@ -135,7 +119,6 @@ fn remove_private_shim_dir(dir: &Path) -> std::io::Result<()> {
     std::fs::remove_dir(dir)
 }
 
-#[cfg(unix)]
 fn create_or_replace_shim(shim: &Path, rmux: &Path) -> std::io::Result<()> {
     if let Ok(metadata) = std::fs::symlink_metadata(shim) {
         if metadata.file_type().is_symlink()
@@ -155,7 +138,6 @@ fn create_or_replace_shim(shim: &Path, rmux: &Path) -> std::io::Result<()> {
     std::os::unix::fs::symlink(rmux, shim)
 }
 
-#[cfg(unix)]
 fn shim_binary_name() -> &'static str {
     "tmux"
 }
@@ -176,12 +158,6 @@ fn prepend_path(environment: &mut HashMap<String, String>, dir: &Path) {
     set_environment_value(environment, "PATH".to_owned(), value);
 }
 
-#[cfg(windows)]
-fn path_separator() -> &'static str {
-    ";"
-}
-
-#[cfg(not(windows))]
 fn path_separator() -> &'static str {
     ":"
 }
@@ -195,26 +171,9 @@ fn remove_environment_value(
     environment: &mut HashMap<String, String>,
     name: &str,
 ) -> Option<String> {
-    #[cfg(windows)]
-    {
-        let keys = environment
-            .keys()
-            .filter(|key| key.eq_ignore_ascii_case(name))
-            .cloned()
-            .collect::<Vec<_>>();
-        let mut value = None;
-        for key in keys {
-            value = value.or_else(|| environment.remove(&key));
-        }
-        value
-    }
-    #[cfg(not(windows))]
-    {
-        environment.remove(name)
-    }
+    environment.remove(name)
 }
 
-#[cfg(unix)]
 fn env_flag_enabled(name: &str) -> bool {
     let Ok(value) = std::env::var(name) else {
         return false;
@@ -232,7 +191,6 @@ fn env_flag_enabled(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::apply_tmux_shim_environment;
-    #[cfg(unix)]
     use super::{cleanup_tmux_shim, create_or_replace_shim, shim_dir};
     use std::collections::HashMap;
     use std::path::Path;
@@ -252,7 +210,6 @@ mod tests {
         assert!(!environment.contains_key("TMUX_PROGRAM"));
     }
 
-    #[cfg(unix)]
     #[test]
     fn shim_dir_prefers_xdg_runtime_dir() {
         let _lock = crate::test_env::lock_blocking();
@@ -269,7 +226,6 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[test]
     fn cleanup_removes_private_shim_directory() {
         let socket_path = Path::new("/tmp/rmux-shim-cleanup-test.sock");
@@ -286,7 +242,6 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[test]
     fn create_or_replace_shim_keeps_existing_link_to_rmux() {
         use std::os::unix::fs::symlink;
@@ -306,7 +261,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    #[cfg(unix)]
     #[test]
     fn cleanup_does_not_follow_shim_directory_symlink() {
         use std::os::unix::fs::symlink;

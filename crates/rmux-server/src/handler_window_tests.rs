@@ -20,9 +20,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tokio::time::{timeout, Duration};
 
-fn session_name(value: &str) -> SessionName {
-    SessionName::new(value).expect("valid session name")
-}
+use crate::test_names::session_name;
 
 fn unique_window_temp_path(label: &str) -> PathBuf {
     let unique = SystemTime::now()
@@ -35,12 +33,10 @@ fn unique_window_temp_path(label: &str) -> PathBuf {
     ))
 }
 
-#[cfg(unix)]
 fn window_shell_quote(path: &Path) -> String {
     crate::test_shell::sh_quote_path(path)
 }
 
-#[cfg(unix)]
 fn window_respawn_replay_command(output: &Path, tag: &str) -> String {
     format!(
         "printf '%s:%s:{tag}\\n' \"$(pwd)\" \"$RMUX_RESPAWN\" >> {}; sleep 60",
@@ -48,21 +44,11 @@ fn window_respawn_replay_command(output: &Path, tag: &str) -> String {
     )
 }
 
-#[cfg(unix)]
 fn window_respawn_shell_identity_command(output: &Path, tag: &str) -> String {
     format!(
         "printf '%s:%s:{tag}\\n' \"${{0##*/}}\" \"$SHELL\" >> {}; sleep 60",
         window_shell_quote(output)
     )
-}
-
-#[cfg(windows)]
-fn window_respawn_replay_command(output: &Path, tag: &str) -> String {
-    crate::test_shell::powershell_encoded_command(&format!(
-        "[System.IO.File]::AppendAllText({}, ((Get-Location).Path + ':' + $env:RMUX_RESPAWN + ':{}' + [char]10)); Start-Sleep -Seconds 60",
-        crate::test_shell::powershell_quote_path(output),
-        tag
-    ))
 }
 
 /// Waits until `path` holds exactly these respawn probe lines, in order.
@@ -74,9 +60,6 @@ fn window_respawn_replay_command(output: &Path, tag: &str) -> String {
 /// is both what the caller asked for and what a regression loses: a start directory that was
 /// dropped opens at the snapshot root instead, where the path ends with the uid.
 async fn wait_for_window_respawn_probe(path: &Path, expected: &[(&str, &str, &str)]) {
-    #[cfg(windows)]
-    let limit = Duration::from_secs(20);
-    #[cfg(not(windows))]
     let limit = Duration::from_secs(5);
     let deadline = tokio::time::Instant::now() + limit;
     loop {
@@ -100,9 +83,6 @@ async fn wait_for_window_respawn_probe(path: &Path, expected: &[(&str, &str, &st
 }
 
 /// Whether one probe line reports the expected directory, environment and command tag.
-///
-/// Separators are normalized because the directory is spelled with `/` in the job's own
-/// seed-relative name and with `\` by the Windows probe that reports it back.
 fn window_respawn_probe_line_matches(line: &str, expected: &(&str, &str, &str)) -> bool {
     let (directory, environment, tag) = *expected;
     let mut fields = line.splitn(3, ':');
@@ -111,15 +91,12 @@ fn window_respawn_probe_line_matches(line: &str, expected: &(&str, &str, &str)) 
     else {
         return false;
     };
-    reported_directory.replace('\\', "/").ends_with(&format!("/{directory}"))
+    reported_directory.ends_with(&format!("/{directory}"))
         && reported_environment == environment
         && reported_tag == tag
 }
 
 async fn wait_for_window_file_contents(path: &Path, expected: &str) {
-    #[cfg(windows)]
-    let timeout = Duration::from_secs(20);
-    #[cfg(not(windows))]
     let timeout = Duration::from_secs(5);
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
@@ -142,7 +119,6 @@ async fn wait_for_window_file_contents(path: &Path, expected: &str) {
         }
     }
 }
-
 
 async fn create_session(handler: &RequestHandler, name: &str) {
     let created = handler
@@ -227,7 +203,6 @@ async fn enable_global_monitor_silence(handler: &RequestHandler) {
     assert!(matches!(response, Response::SetOption(_)), "{response:?}");
 }
 
-#[cfg(unix)]
 async fn set_window_test_default_shell(handler: &RequestHandler, shell: &str) {
     let response = handler
         .handle(Request::SetOption(SetOptionRequest {
@@ -240,30 +215,11 @@ async fn set_window_test_default_shell(handler: &RequestHandler, shell: &str) {
     assert!(matches!(response, Response::SetOption(_)), "{response:?}");
 }
 
-#[cfg(unix)]
 fn quiet_window_test_command() -> Vec<String> {
     ["/bin/sh", "-c", "sleep 60"]
         .into_iter()
         .map(str::to_owned)
         .collect()
-}
-
-#[cfg(windows)]
-fn quiet_window_test_command() -> Vec<String> {
-    let system_root =
-        std::env::var_os("SystemRoot").unwrap_or_else(|| std::ffi::OsString::from(r"C:\Windows"));
-    let cmd = std::path::PathBuf::from(system_root)
-        .join("System32")
-        .join("cmd.exe");
-    [
-        cmd.to_string_lossy().into_owned(),
-        "/d".to_owned(),
-        "/q".to_owned(),
-        "/c".to_owned(),
-        "ping -n 60 127.0.0.1 >NUL".to_owned(),
-    ]
-    .into_iter()
-    .collect()
 }
 
 async fn insert_window(handler: &RequestHandler, session_name: &SessionName, window_index: u32) {
@@ -288,7 +244,6 @@ async fn insert_window(handler: &RequestHandler, session_name: &SessionName, win
             window_index,
             crate::pane_terminals::WindowSpawnOptions {
                 start_directory: None,
-                inherited_start_directory: false,
                 command: None,
                 socket_path: Path::new("/tmp/rmux-test.sock"),
                 spawn_environment: None,

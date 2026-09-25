@@ -95,28 +95,28 @@ impl Subvolumes for CopyTree {
 
 /// Copies `src` onto `dest` recursively, recreating symlinks rather than following them.
 ///
+/// The walk state carried by [`marsh_lib::walk_directory`] is the destination directory the
+/// current source directory copies into, so each entry only has to join its own file name.
+///
 /// `std::fs::copy` carries the permission bits over, which is what makes the copy comparable to a
 /// btrfs snapshot for [`crate`]'s callers: the diff they run afterwards treats mode as part of an
 /// entry.
 fn copy_tree(src: &Path, dest: &Path) -> Result<(), Error> {
     std::fs::create_dir_all(dest)?;
-    let mut stack = vec![(src.to_path_buf(), dest.to_path_buf())];
-    while let Some((from, to)) = stack.pop() {
-        for entry in std::fs::read_dir(&from)? {
-            let entry = entry?;
-            let target = to.join(entry.file_name());
-            let file_type = entry.file_type()?;
-            if file_type.is_dir() {
-                std::fs::create_dir_all(&target)?;
-                stack.push((entry.path(), target));
-            } else if file_type.is_symlink() {
-                std::os::unix::fs::symlink(std::fs::read_link(entry.path())?, &target)?;
-            } else {
-                std::fs::copy(entry.path(), &target)?;
-            }
+    marsh_lib::walk_directory::<_, Error>(src, dest.to_path_buf(), |entry, to| {
+        let target = to.join(entry.file_name());
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            std::fs::create_dir_all(&target)?;
+            return Ok(Some(target));
         }
-    }
-    Ok(())
+        if file_type.is_symlink() {
+            std::os::unix::fs::symlink(std::fs::read_link(entry.path())?, &target)?;
+        } else {
+            std::fs::copy(entry.path(), &target)?;
+        }
+        Ok(None)
+    })
 }
 
 #[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]

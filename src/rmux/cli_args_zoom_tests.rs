@@ -1,4 +1,4 @@
-use super::{parse, Command};
+use super::{Command, parse};
 
 fn parse_args(args: &[&str]) -> Result<super::Cli, clap::Error> {
     let mut full_args = vec!["rmux"];

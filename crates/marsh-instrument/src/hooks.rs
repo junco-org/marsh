@@ -38,6 +38,19 @@ pub trait BuiltinHook: Send + Sync {
     /// Not called when the builtin panics or when the process is replaced (`exec`); an
     /// unterminated invocation is therefore observable, and meaningful, to the embedder.
     fn end(&self, id: u64, exit: u8);
+
+    /// Whether the shell whose logical working directory is `cwd` must stop what it is doing.
+    ///
+    /// Asked immediately before each builtin runs, so an embedder that has learned the line must
+    /// be evaluated again does not pay for the rest of it. `waker` is registered whatever the
+    /// answer, so a driver that observed `false` and then suspended is still woken by a decision
+    /// that lands right afterwards.
+    ///
+    /// The default is `false`: a hook that only records has nothing to interrupt.
+    fn interrupted(&self, cwd: &Path, waker: &std::task::Waker) -> bool {
+        let _ = (cwd, waker);
+        false
+    }
 }
 
 /// The hook and the original implementations one [`instrument`] call put in place.
@@ -67,14 +80,19 @@ static INSTALLED: RwLock<Option<Installed>> = RwLock::new(None);
 /// supported arrangement. A map instrumented for one `SE` and then superseded by an installation
 /// for another reports each of its builtins as uninstrumented rather than running it blind.
 ///
-/// The returned map is otherwise the one that was passed in — `content_func`, `disabled`,
-/// `special_builtin` and `declaration_builtin` are carried over untouched — so help text, `enable`
-/// and POSIX special-builtin semantics behave exactly as they did.
+/// The map that comes back is the map that went in, hasher and all: only each registration's
+/// `execute_func` is overwritten, in place. `content_func`, `disabled`, `special_builtin` and
+/// `declaration_builtin` are the caller's own values, so help text, `enable` and POSIX
+/// special-builtin semantics behave exactly as they did — and a map built around a configured
+/// hasher keeps that hasher, which rebuilding the table through `collect` could not do without
+/// demanding `S: Default` and constructing a second, differently configured one.
 #[must_use]
-pub fn instrument<SE: ShellExtensions, S: std::hash::BuildHasher + Default>(
-    builtins: HashMap<String, Registration<SE>, S>,
+pub fn instrument<SE: ShellExtensions, S>(
+    mut builtins: HashMap<String, Registration<SE>, S>,
     hook: Arc<dyn BuiltinHook>,
 ) -> HashMap<String, Registration<SE>, S> {
+    // Captured before the replacement below, so what is stored is each builtin's own
+    // implementation rather than the wrapper.
     let originals: HashMap<String, CommandExecuteFunc<SE>> = builtins
         .iter()
         .map(|(name, registration)| (name.clone(), registration.execute_func))
@@ -89,18 +107,10 @@ pub fn instrument<SE: ShellExtensions, S: std::hash::BuildHasher + Default>(
         originals: Box::new(originals),
     });
 
+    for registration in builtins.values_mut() {
+        registration.execute_func = instrumented_execute::<SE>;
+    }
     builtins
-        .into_iter()
-        .map(|(name, registration)| {
-            (
-                name,
-                Registration {
-                    execute_func: instrumented_execute::<SE>,
-                    ..registration
-                },
-            )
-        })
-        .collect()
 }
 
 /// The hook and the original implementation registered under `name`, if this process has an
@@ -150,6 +160,21 @@ fn instrumented_execute<SE: ShellExtensions>(
             return Ok(ExecutionResult::general_error());
         };
 
+        // Before the builtin runs, and before its invocation is recorded: an embedder that has
+        // already decided this line must be evaluated again gains nothing from the rest of it, and
+        // an unwind that recorded a `Begin` with no `End` would look like a builtin that died.
+        let unwind = Interruption {
+            hook: hook.as_ref(),
+            cwd: context.shell.working_dir(),
+        }
+        .await;
+        if unwind {
+            return Ok(ExecutionResult {
+                exit_code: ExecutionExitCode::Interrupted,
+                next_control_flow: brush_core::ExecutionControlFlow::ExitShell,
+            });
+        }
+
         let argv: Vec<String> = args.iter().map(ToString::to_string).collect();
         let id = hook.begin(&context.command_name, &argv, context.shell.working_dir());
         let result = original(context, args).await;
@@ -160,6 +185,28 @@ fn instrumented_execute<SE: ShellExtensions>(
         hook.end(id, exit);
         result
     })
+}
+
+/// Asks the hook whether to unwind, handing it the polling task's waker.
+///
+/// A future rather than a plain call, because the waker is only reachable from a poll: an embedder
+/// that answers `false` has to be able to wake this task later without it having to spin.
+struct Interruption<'hook> {
+    /// The installed hook.
+    hook: &'hook dyn BuiltinHook,
+    /// The shell's logical working directory, which is what identifies it to the hook.
+    cwd: &'hook Path,
+}
+
+impl Future for Interruption<'_> {
+    type Output = bool;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<bool> {
+        std::task::Poll::Ready(self.hook.interrupted(self.cwd, context.waker()))
+    }
 }
 
 #[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
@@ -320,6 +367,8 @@ mod tests {
                 .unwrap_or_else(PoisonError::into_inner)
                 .push((id, exit));
         });
+        // The wrapper asks before every builtin; a recorder with nothing to interrupt says no.
+        mock.expect_interrupted().returning(|_, _| false);
 
         let builtins = instrument(
             brush_builtins::default_builtins::<DefaultShellExtensions>(BuiltinSet::BashMode),
@@ -353,6 +402,7 @@ mod tests {
                 .unwrap_or_else(PoisonError::into_inner)
                 .push((id, exit));
         });
+        mock.expect_interrupted().returning(|_, _| false);
 
         let builtins = instrument(
             brush_builtins::default_builtins::<DefaultShellExtensions>(BuiltinSet::BashMode),
@@ -484,41 +534,57 @@ mod tests {
         );
     }
 
-    #[test]
-    #[serial]
-    fn instrumenting_changes_only_the_execute_func() {
-        let original =
-            brush_builtins::default_builtins::<DefaultShellExtensions>(BuiltinSet::BashMode);
-        let instrumented = instrument(original.clone(), Arc::new(LogHook::default()));
+    /// A [`std::hash::BuildHasher`] carrying a configured seed, and implementing neither `Default`
+    /// nor `Clone`: a map built with it cannot be rebuilt by `collect`, so a map of this type
+    /// reaching the shell at all is what proves the caller's hasher was carried over instead of
+    /// reconstructed.
+    struct KeyedHasher {
+        /// Written into every hasher ahead of the key's own bytes, so the configuration really
+        /// reaches the hashes the map computes rather than sitting unused beside them.
+        seed: u64,
+    }
 
-        assert_eq!(instrumented.len(), original.len());
-        for (name, before) in &original {
-            let after = instrumented
-                .get(name)
-                .unwrap_or_else(|| panic!("{name} survives instrumentation"));
-            assert!(
-                std::ptr::fn_addr_eq(after.content_func, before.content_func),
-                "{name} keeps its help text"
-            );
-            assert_eq!(after.disabled, before.disabled, "{name} keeps `disabled`");
-            assert_eq!(
-                after.special_builtin, before.special_builtin,
-                "{name} keeps `special_builtin`"
-            );
-            assert_eq!(
-                after.declaration_builtin, before.declaration_builtin,
-                "{name} keeps `declaration_builtin`"
-            );
-            assert!(
-                !std::ptr::fn_addr_eq(after.execute_func, before.execute_func),
-                "{name} is wrapped"
-            );
+    impl std::hash::BuildHasher for KeyedHasher {
+        type Hasher = std::collections::hash_map::DefaultHasher;
+
+        fn build_hasher(&self) -> Self::Hasher {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            std::hash::Hasher::write_u64(&mut hasher, self.seed);
+            hasher
         }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn a_map_with_a_configured_hasher_is_instrumented_in_place() {
+        let (_dir, work) = scratch();
+
+        let mut builtins: HashMap<String, Registration<DefaultShellExtensions>, KeyedHasher> =
+            HashMap::with_hasher(KeyedHasher {
+                seed: 0x5eed_0f15_c0ff_ee01,
+            });
+        builtins.extend(brush_builtins::default_builtins::<DefaultShellExtensions>(
+            BuiltinSet::BashMode,
+        ));
+
+        let hook = Arc::new(LogHook::default());
+        let instrumented = instrument(builtins, hook.clone());
         assert!(
-            original
-                .values()
-                .any(|registration| registration.special_builtin),
-            "the fixture has at least one special builtin to carry over"
+            instrumented.contains_key("false"),
+            "the returned map still looks its own keys up through the hasher it was built with"
+        );
+
+        let mut shell =
+            shell_with(&work, instrumented.into_iter().collect::<HashMap<_, _>>()).await;
+        assert_eq!(run(&mut shell, "false").await, 1);
+
+        let calls = hook.calls();
+        assert_eq!(calls.len(), 1, "one invocation: {calls:?}");
+        assert_eq!(calls[0].name, "false");
+        assert_eq!(
+            calls[0].exit,
+            Some(1),
+            "the end reached the begin's own invocation"
         );
     }
 }

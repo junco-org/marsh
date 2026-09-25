@@ -2,8 +2,6 @@ use rmux_proto::{
     ResolveTargetRequest, ResolveTargetType, RmuxError, RunShellRequest, SessionName, Target,
 };
 
-#[cfg(windows)]
-use super::super::pane_support::format_references_pane_pid;
 use super::super::{RequestHandler, StableTargetIdentity};
 use super::format_context::{format_context_for_target_with_server_values, global_format_context};
 use super::shell_runtime::{hook_session_default_target, pane_id_for_target};
@@ -42,10 +40,6 @@ impl RequestHandler {
                 Ok(Target::Pane(target)) => Some(target),
                 Ok(_) | Err(_) => None,
             };
-        }
-        #[cfg(windows)]
-        if format_references_pane_pid(Some(&request.command)) {
-            self.wait_for_windows_deferred_all_pane_pids().await;
         }
         let attached_count = match request.target.as_ref() {
             Some(target) => self.attached_count(target.session_name()).await,
@@ -103,6 +97,10 @@ impl RequestHandler {
             .as_ref()
             .and_then(|target| pane_id_for_target(state, target));
 
+        // The request's directory stays authoritative; this host's default is only what is left
+        // when it named none, so the helper starts somewhere real rather than wherever this
+        // process happens to be sitting.
+        let io = crate::managed_workload::handler_facade(self)?;
         TerminalProfile::for_run_shell(
             &state.environment,
             &state.options,
@@ -112,7 +110,12 @@ impl RequestHandler {
             base_environment.as_ref(),
             !self.config_loading_active(),
             pane_id,
-            request.start_directory.as_deref(),
+            Some(
+                request
+                    .start_directory
+                    .as_deref()
+                    .unwrap_or_else(|| io.default_dir()),
+            ),
         )
         .map(|profile| match request.source_depth {
             Some(depth) => profile.with_source_depth(depth),

@@ -46,15 +46,11 @@ pub(crate) fn session_window_allows_automatic_rename(
 #[cfg(test)]
 mod tests {
     use rmux_core::{OptionStore, Session};
-    use rmux_proto::{
-        OptionName, ScopeSelector, SessionName, SetOptionMode, TerminalSize, WindowTarget,
-    };
+    use rmux_proto::{OptionName, ScopeSelector, SetOptionMode, TerminalSize, WindowTarget};
 
     use super::{automatic_rename_enabled_for_new_window, session_window_allows_automatic_rename};
 
-    fn session_name(value: &str) -> SessionName {
-        SessionName::new(value).expect("valid session name")
-    }
+    use crate::test_names::session_name;
 
     #[test]
     fn automatic_rename_option_disables_automatic_name_updates() {

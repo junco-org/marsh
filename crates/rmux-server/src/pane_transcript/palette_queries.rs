@@ -4,7 +4,7 @@ use rmux_core::{TerminalPaletteIndex, TerminalPassthrough};
 
 // Registration happens when pane output is parsed, before a potentially busy
 // attach renderer writes the query to the outer terminal. Keep enough budget
-// for a loaded ConPTY/SSH path while retaining a short, explicit correlation
+// for a loaded PTY/SSH path while retaining a short, explicit correlation
 // window.
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(8);
 const MAX_RESPONSES_PER_INDEX: u8 = 8;

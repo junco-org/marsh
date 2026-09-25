@@ -3,11 +3,11 @@ use std::fmt::Write as _;
 use std::io::{self, ErrorKind, Write};
 
 use rmux_core::formats::TMUX_FORMAT_TABLE_NAMES;
-use rmux_proto::{capabilities_for_features, RMUX_WIRE_VERSION};
+use rmux_proto::{RMUX_WIRE_VERSION, capabilities_for_features};
 use serde_json::json;
 
-use super::scripting_contract::{BINARY_CONTRACT_VERSION, CONTROL_NOTIFICATIONS, JSON_COMMANDS};
 use super::ExitFailure;
+use super::scripting_contract::{BINARY_CONTRACT_VERSION, CONTROL_NOTIFICATIONS, JSON_COMMANDS};
 
 /// Output shape selected for the `capabilities` command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,12 +85,7 @@ fn split_top_level_prefix(arguments: &[OsString]) -> Option<usize> {
 }
 
 /// Whether `value` is a bundled short-flag run like `-2CD` whose letters are all in `allowed`.
-fn is_short_flag_cluster(value: &str, allowed: &str) -> bool {
-    value.len() > 2
-        && value.starts_with('-')
-        && !value.starts_with("--")
-        && value.chars().skip(1).all(|flag| allowed.contains(flag))
-}
+use super::is_short_flag_cluster;
 
 /// Parses the `capabilities` flags, rejecting conflicts and defaulting to human output.
 fn parse_capabilities_format(arguments: &[OsString]) -> Result<CapabilitiesFormat, ExitFailure> {
@@ -177,7 +172,7 @@ fn write_json() -> Result<i32, ExitFailure> {
 
 /// The wire capability names compiled into this build, reflecting the `web` feature.
 fn compiled_protocol_capabilities() -> Vec<&'static str> {
-    capabilities_for_features(cfg!(all(any(unix, windows), feature = "web")))
+    capabilities_for_features(cfg!(all(unix, feature = "web")))
 }
 
 /// The JSON description of control-mode framing: guard lines, escapes, and line shapes.
@@ -246,7 +241,7 @@ fn write_stdout(output: &str) -> Result<i32, ExitFailure> {
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 mod tests {
-    use super::{compiled_protocol_capabilities, parse_invocation, CapabilitiesFormat};
+    use super::{CapabilitiesFormat, compiled_protocol_capabilities, parse_invocation};
     use rmux_proto::CAPABILITY_WEB_SHARE;
     use std::ffi::OsString;
 
@@ -265,16 +260,18 @@ mod tests {
 
     #[test]
     fn ignores_other_commands() {
-        assert!(parse_invocation(&args(&["list-sessions"]))
-            .expect("parse succeeds")
-            .is_none());
+        assert!(
+            parse_invocation(&args(&["list-sessions"]))
+                .expect("parse succeeds")
+                .is_none()
+        );
     }
 
     #[test]
     fn local_inventory_reports_compiled_web_capability() {
         assert_eq!(
             compiled_protocol_capabilities().contains(&CAPABILITY_WEB_SHARE),
-            cfg!(all(any(unix, windows), feature = "web"))
+            cfg!(all(unix, feature = "web"))
         );
     }
 }

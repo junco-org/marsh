@@ -1,6 +1,7 @@
 use super::super::client_support::install_managed_client_resolution_pause;
 use super::super::overlay_support::{AttachedOverlayInput, ClientOverlayState};
 use super::super::scripting_support::QueueExecutionContext;
+use super::super::test_support::spawn_accounted_attach_control_drain;
 use super::super::RequestHandler;
 use rmux_proto::{
     KillSessionRequest, LinkWindowRequest, NewSessionRequest, NewWindowRequest, PaneTarget,
@@ -10,9 +11,7 @@ use rmux_proto::{
 use tokio::sync::mpsc;
 use tokio::time::{timeout, Duration};
 
-fn session_name(value: &str) -> SessionName {
-    SessionName::new(value).expect("valid session name")
-}
+use crate::test_names::session_name;
 
 async fn create_session(handler: &RequestHandler, name: &SessionName) {
     let response = handler
@@ -162,14 +161,19 @@ async fn menu_action_is_discarded_after_target_pane_respawn() {
     let alpha = session_name("overlay-pane-respawn");
     let pid = 971_021;
     create_session(&handler, &alpha).await;
-    let _control_rx = attach(&handler, pid, &alpha).await;
-    execute_overlay(
-        &handler,
-        pid,
-        &format!("display-menu -t {alpha}:0.0 Item i 'display-message should-not-run'"),
-    )
-    .await
-    .expect("menu opens");
+    // The respawn below refreshes this attached session, and a simulated
+    // transport that never reads its controls saturates the client's bounded
+    // control backlog. Production then closes and removes the overloaded
+    // client, so the stale-menu question could never be asked. Service the
+    // transport with the same accounting a real client performs.
+    let control_rx = attach(&handler, pid, &alpha).await;
+    let control_drain = spawn_accounted_attach_control_drain(&handler, pid, control_rx).await;
+    let client_identity = handler.active_attach_identity_for_test(pid).await;
+    let menu_command =
+        format!("display-menu -t {alpha}:0.0 Item i 'set-buffer -b stale-menu-fired executed'");
+    execute_overlay(&handler, pid, &menu_command)
+        .await
+        .expect("menu opens");
 
     let response = handler
         .handle(Request::RespawnPane(Box::new(RespawnPaneRequest {
@@ -182,13 +186,57 @@ async fn menu_action_is_discarded_after_target_pane_respawn() {
         })))
         .await;
     assert!(matches!(response, Response::RespawnPane(_)), "{response:?}");
-    handler
-        .handle_attached_live_input_for_test(pid, b"i")
+    assert!(
+        handler.current_live_attach_input(client_identity).await,
+        "the respawn must not disconnect the serviced client"
+    );
+
+    let mut pending_input = Vec::new();
+    let forwarded = handler
+        .handle_attached_live_input_inner(pid, &mut pending_input, b"i")
         .await
         .expect("stale menu input is consumed");
+    assert!(
+        !forwarded,
+        "stale menu input must not reach the respawned pane"
+    );
+    assert!(pending_input.is_empty());
     assert!(handler.active_attach.lock().await.by_pid[&pid]
         .overlay
         .is_none());
+    {
+        let state = handler.state.lock().await;
+        assert!(
+            state.buffers.get("stale-menu-fired").is_none(),
+            "the retired menu's action must not execute"
+        );
+    }
+    assert!(
+        handler.current_live_attach_input(client_identity).await,
+        "the same client must still be live after the stale menu retires"
+    );
+
+    // Positive control: the identical menu captured against the respawned pane
+    // still executes, so the retirement above is stale-target rejection rather
+    // than blanket menu-input loss or lost requester authority.
+    execute_overlay(&handler, pid, &menu_command)
+        .await
+        .expect("menu reopens against the respawned pane");
+    let mut pending_input = Vec::new();
+    let forwarded = handler
+        .handle_attached_live_input_inner(pid, &mut pending_input, b"i")
+        .await
+        .expect("current menu input is consumed");
+    assert!(!forwarded, "menu input must not reach the respawned pane");
+    assert!(pending_input.is_empty());
+    {
+        let state = handler.state.lock().await;
+        assert_eq!(
+            state.buffers.get("stale-menu-fired"),
+            Some(b"executed".as_slice())
+        );
+    }
+    control_drain.abort();
 }
 
 #[tokio::test]

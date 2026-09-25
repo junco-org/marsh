@@ -1,21 +1,9 @@
 pub(crate) fn local_hostname() -> Option<String> {
-    #[cfg(windows)]
-    {
-        hostname_from_sources([
-            rmux_os::host::local_hostname(),
-            std::env::var("COMPUTERNAME").ok(),
-            std::env::var("HOSTNAME").ok(),
-        ])
-    }
-
-    #[cfg(not(windows))]
-    {
-        hostname_from_sources([
-            rmux_os::host::local_hostname(),
-            std::env::var("HOSTNAME").ok(),
-            std::fs::read_to_string("/etc/hostname").ok(),
-        ])
-    }
+    hostname_from_sources([
+        rmux_os::host::local_hostname(),
+        std::env::var("HOSTNAME").ok(),
+        std::fs::read_to_string("/etc/hostname").ok(),
+    ])
 }
 
 fn hostname_from_sources<const N: usize>(sources: [Option<String>; N]) -> Option<String> {

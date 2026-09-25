@@ -18,33 +18,28 @@
 use std::env;
 use std::ffi::OsString;
 use std::fs;
-#[cfg(any(unix, windows))]
 use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
 
 use rmux_proto::ProcessCommand;
 
 use super::managed_io::{
-    run_managed_pane_command, ManagedPaneCommand, ManagedPaneDisplay, ManagedPaneKind,
+    ManagedPaneCommand, ManagedPaneDisplay, ManagedPaneKind, run_managed_pane_command,
 };
 use super::{ExitFailure, StartupOptions};
-#[cfg(unix)]
-use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 
 const TEAMMATE_MODE_FLAG: &str = "--teammate-mode";
 const TEAMMATE_MODE: &str = "tmux";
 const AGENT_TEAMS_ENV: &str = "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS";
 const DISABLE_TMUX_SHIM_ENV: &str = "RMUX_DISABLE_TMUX_SHIM";
-#[cfg(unix)]
 const PUBLIC_BINARY_OVERRIDE_ENV: &str = "RMUX_INTERNAL_PUBLIC_BINARY_PATH";
-#[cfg(any(unix, windows))]
 const DIRECT_LAUNCH_ENV: &str = "RMUX_CLAUDE_DIRECT";
 
 /// The program name the managed pane resolves through its own `PATH`.
 ///
-/// Resolution is the pane shell's, not this client's. Upstream had to resolve `claude.cmd` and
-/// Git Bash wrappers itself because `std::process::Command` could not run them; a pane shell
-/// runs them the same way an interactive user would.
+/// Resolution is the pane shell's, not this client's: the pane shell runs `claude` the same way
+/// an interactive user would, including any shell function or alias wrapping it.
 const CLAUDE_PROGRAM: &str = "claude";
 
 /// One `rmux claude` invocation's pass-through arguments.
@@ -76,11 +71,7 @@ pub(super) fn run(
     socket_path: &Path,
     startup: StartupOptions,
 ) -> Result<i32, ExitFailure> {
-    #[cfg(any(unix, windows))]
     let attached = should_launch_attached();
-    #[cfg(not(any(unix, windows)))]
-    let attached = false;
-    #[cfg(any(unix, windows))]
     if !attached {
         report_unrequested_direct_launch();
     }
@@ -181,7 +172,9 @@ fn env_flag_enabled(name: &str) -> bool {
     env::var_os(name).is_some_and(|value| {
         let value = value.to_string_lossy();
         let value = value.trim();
-        !value.is_empty() && !value.eq_ignore_ascii_case("0") && !value.eq_ignore_ascii_case("false")
+        !value.is_empty()
+            && !value.eq_ignore_ascii_case("0")
+            && !value.eq_ignore_ascii_case("false")
     })
 }
 
@@ -196,7 +189,6 @@ struct PrivateTmuxShim {
 
 impl PrivateTmuxShim {
     /// Adopts an existing per-user shim directory that outlives this process.
-    #[cfg(unix)]
     const fn persistent(dir: PathBuf) -> Self {
         Self { dir }
     }
@@ -208,86 +200,45 @@ impl PrivateTmuxShim {
 }
 
 /// Decides from the environment and stdin whether Claude gets an attached rmux client.
-#[cfg(any(unix, windows))]
 fn should_launch_attached() -> bool {
     launch_attached_decision(
         env::var_os(DIRECT_LAUNCH_ENV).is_some(),
         io::stdin().is_terminal(),
-        false,
     )
 }
 
-/// Attach only for a real, non-msys terminal with no explicit direct-launch request.
-#[cfg(any(unix, windows))]
-const fn launch_attached_decision(
-    direct_launch_requested: bool,
-    stdin_is_terminal: bool,
-    stdin_is_msys_pty: bool,
-) -> bool {
-    !direct_launch_requested && stdin_is_terminal && !stdin_is_msys_pty
+/// Attach only for a terminal stdin with no explicit direct-launch request.
+const fn launch_attached_decision(direct_launch_requested: bool, stdin_is_terminal: bool) -> bool {
+    !direct_launch_requested && stdin_is_terminal
 }
 
-/// Why a launch fell through to the relayed path without the user asking for it.
-#[cfg(any(unix, windows))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DirectLaunchNotice {
-    NonTerminal,
-    MsysPty,
-}
-
-/// Picks the notice to print, or `None` when direct launch was requested or stderr cannot show it.
-#[cfg(any(unix, windows))]
-#[allow(
-    clippy::fn_params_excessive_bools,
-    reason = "a pure decision over four independent terminal observations; bundling them in a struct would only rename the same four flags"
-)]
-const fn direct_launch_notice(
+/// Whether a fall-through to the relayed path should be explained on stderr.
+const fn should_report_direct_launch(
     direct_launch_requested: bool,
     stderr_is_terminal: bool,
-    stdin_is_msys_pty: bool,
-    stderr_is_msys_pty: bool,
-) -> Option<DirectLaunchNotice> {
-    if direct_launch_requested || (!stderr_is_terminal && !stderr_is_msys_pty) {
-        return None;
-    }
-    Some(if stdin_is_msys_pty {
-        DirectLaunchNotice::MsysPty
-    } else {
-        DirectLaunchNotice::NonTerminal
-    })
+) -> bool {
+    !direct_launch_requested && stderr_is_terminal
 }
 
 /// Explains a fall-through to the relayed launch path when the user did not ask for it.
 ///
 /// Claude's interactive UI needs a terminal; reaching this point means stdin was not recognized
-/// as one (issue #77: Git Bash/mintty ptys, VS Code tasks, plain pipes), and launching silently
-/// used to look like "rmux claude does nothing".
-#[cfg(any(unix, windows))]
+/// as one (issue #77: VS Code tasks, plain pipes), and launching silently used to look like
+/// "rmux claude does nothing".
 fn report_unrequested_direct_launch() {
-    let notice = direct_launch_notice(
+    if should_report_direct_launch(
         env::var_os(DIRECT_LAUNCH_ENV).is_some(),
         io::stderr().is_terminal(),
-        false,
-        false,
-    );
-    match notice {
-        Some(DirectLaunchNotice::MsysPty) => eprintln!(
-            "rmux claude: stdin is a Git Bash / MSYS pty, not a Windows console; \
-             the interactive claude UI cannot attach here. Run `rmux claude` from \
-             Windows Terminal, PowerShell, or cmd.exe (or prefix with `winpty`); \
-             set {DIRECT_LAUNCH_ENV}=1 to launch claude directly without a terminal."
-        ),
-        Some(DirectLaunchNotice::NonTerminal) => eprintln!(
+    ) {
+        eprintln!(
             "rmux claude: stdin is not a terminal, so the interactive UI is skipped \
              and claude's output is relayed; run from a terminal, or set \
              {DIRECT_LAUNCH_ENV}=1 to make the relayed launch explicit."
-        ),
-        None => {}
+        );
     }
 }
 
 /// Requires `path` to be a plain directory owned by this uid, tightening group/world bits.
-#[cfg(unix)]
 fn validate_secure_owner_directory(path: &Path, label: &str) -> Result<(), ExitFailure> {
     let metadata = fs::symlink_metadata(path).map_err(|error| {
         ExitFailure::new(
@@ -366,7 +317,6 @@ fn validate_secure_owner_directory(path: &Path, label: &str) -> Result<(), ExitF
 }
 
 /// Creates or repairs the per-user `tmux` symlink that points back at this executable.
-#[cfg(unix)]
 fn ensure_private_tmux_shim() -> Result<PrivateTmuxShim, ExitFailure> {
     let dir = private_shim_dir()?;
     fs::create_dir_all(&dir).map_err(|error| {
@@ -438,16 +388,7 @@ fn ensure_private_tmux_shim() -> Result<PrivateTmuxShim, ExitFailure> {
 }
 
 /// Always fails: the private `tmux` shim is only supported on Unix.
-#[cfg(not(unix))]
-fn ensure_private_tmux_shim() -> Result<PrivateTmuxShim, ExitFailure> {
-    Err(ExitFailure::new(
-        1,
-        "rmux claude: the private tmux shim is only supported on Unix",
-    ))
-}
-
 /// Per-user shim directory at `$HOME/.local/share/rmux/claude-tmux-shim`.
-#[cfg(unix)]
 fn private_shim_dir() -> Result<PathBuf, ExitFailure> {
     let home = env::var_os("HOME")
         .filter(|value| !value.is_empty())
@@ -460,14 +401,12 @@ fn private_shim_dir() -> Result<PathBuf, ExitFailure> {
 }
 
 /// Resolves the binary that the private `tmux` symlink should point to.
-#[cfg(unix)]
 fn private_tmux_shim_target_binary() -> Result<PathBuf, ExitFailure> {
     let public = public_rmux_binary()?;
     Ok(private_tmux_shim_target_for_public_binary(&public))
 }
 
 /// Prefers a `libexec` full helper beside `public`, falling back to `public` itself.
-#[cfg(unix)]
 fn private_tmux_shim_target_for_public_binary(public: &Path) -> PathBuf {
     unix_full_helper_candidates(public)
         .into_iter()
@@ -476,7 +415,6 @@ fn private_tmux_shim_target_for_public_binary(public: &Path) -> PathBuf {
 }
 
 /// Lists the `libexec`/`lib` places a full `rmux` helper may sit relative to `public`.
-#[cfg(unix)]
 fn unix_full_helper_candidates(public: &Path) -> Vec<PathBuf> {
     let Some(parent) = public.parent() else {
         return Vec::new();
@@ -498,7 +436,6 @@ fn unix_full_helper_candidates(public: &Path) -> Vec<PathBuf> {
 }
 
 /// Locates this rmux executable, honoring the internal public-binary override variable.
-#[cfg(unix)]
 fn public_rmux_binary() -> Result<PathBuf, ExitFailure> {
     if let Some(path) = env::var_os(PUBLIC_BINARY_OVERRIDE_ENV) {
         let path = PathBuf::from(path);
@@ -539,7 +476,6 @@ fn path_with_shim_first_from(
 }
 
 /// Reports whether the symlink at `shim` ultimately resolves to `target`.
-#[cfg(unix)]
 fn symlink_points_to(shim: &Path, target: &Path) -> bool {
     let Ok(link_target) = fs::read_link(shim) else {
         return false;
@@ -555,7 +491,6 @@ fn symlink_points_to(shim: &Path, target: &Path) -> bool {
 }
 
 /// Compares two paths by canonical identity, false when either cannot be canonicalized.
-#[cfg(unix)]
 fn paths_resolve_to_same_file(left: &Path, right: &Path) -> bool {
     let Ok(left) = fs::canonicalize(left) else {
         return false;
@@ -567,7 +502,6 @@ fn paths_resolve_to_same_file(left: &Path, right: &Path) -> bool {
 }
 
 /// File name of the `tmux` shim, with the platform executable suffix applied.
-#[cfg(unix)]
 fn tmux_file_name() -> OsString {
     let mut name = OsString::from("tmux");
     if !env::consts::EXE_SUFFIX.is_empty() {
@@ -577,7 +511,6 @@ fn tmux_file_name() -> OsString {
 }
 
 /// File name of the `rmux` helper, with the platform executable suffix applied.
-#[cfg(unix)]
 fn rmux_file_name() -> OsString {
     let mut name = OsString::from("rmux");
     if !env::consts::EXE_SUFFIX.is_empty() {
@@ -590,40 +523,26 @@ fn rmux_file_name() -> OsString {
 #[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 mod tests {
     use super::{
-        direct_launch_notice, launch_attached_decision, path_with_shim_first_from,
-        ClaudeInvocation, DirectLaunchNotice,
+        ClaudeInvocation, launch_attached_decision, path_with_shim_first_from,
+        should_report_direct_launch,
     };
     use std::env;
     use std::ffi::OsString;
-    #[cfg(unix)]
     use std::fs;
     use std::path::{Path, PathBuf};
 
     #[test]
     fn unrequested_direct_launch_notice_distinguishes_human_stderr_from_redirects() {
-        assert_eq!(direct_launch_notice(false, false, false, false), None);
-        assert_eq!(
-            direct_launch_notice(false, false, true, true),
-            Some(DirectLaunchNotice::MsysPty)
-        );
-        assert_eq!(direct_launch_notice(false, false, true, false), None);
-        assert_eq!(
-            direct_launch_notice(false, false, false, true),
-            Some(DirectLaunchNotice::NonTerminal)
-        );
-        assert_eq!(
-            direct_launch_notice(false, true, true, false),
-            Some(DirectLaunchNotice::MsysPty)
-        );
-        assert_eq!(direct_launch_notice(true, true, true, true), None);
+        assert!(should_report_direct_launch(false, true));
+        assert!(!should_report_direct_launch(false, false));
+        assert!(!should_report_direct_launch(true, true));
     }
 
     #[test]
-    fn attached_launch_rejects_direct_nonterminal_and_msys_inputs() {
-        assert!(launch_attached_decision(false, true, false));
-        assert!(!launch_attached_decision(true, true, false));
-        assert!(!launch_attached_decision(false, false, false));
-        assert!(!launch_attached_decision(false, true, true));
+    fn attached_launch_rejects_direct_and_nonterminal_inputs() {
+        assert!(launch_attached_decision(false, true));
+        assert!(!launch_attached_decision(true, true));
+        assert!(!launch_attached_decision(false, false));
     }
 
     fn args(values: &[&str]) -> Vec<OsString> {
@@ -660,7 +579,6 @@ mod tests {
         assert_eq!(entries.next(), Some(PathBuf::from("bin")));
     }
 
-    #[cfg(unix)]
     #[test]
     fn unix_private_tmux_shim_prefers_packaged_full_helper() {
         let root = unique_test_dir("unix-full-helper");
@@ -682,7 +600,6 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    #[cfg(unix)]
     #[test]
     fn unix_private_tmux_shim_supports_prefix_lib_full_helper() {
         let root = unique_test_dir("unix-prefix-lib-helper");
@@ -704,7 +621,6 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    #[cfg(unix)]
     #[test]
     fn unix_private_tmux_shim_prefers_standard_libexec_layout() {
         let root = unique_test_dir("unix-helper-precedence");
@@ -730,7 +646,6 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    #[cfg(unix)]
     #[test]
     fn unix_private_tmux_shim_falls_back_to_public_binary_without_helper() {
         let root = unique_test_dir("unix-no-helper");
@@ -747,7 +662,6 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    #[cfg(unix)]
     fn unique_test_dir(label: &str) -> PathBuf {
         env::temp_dir().join(format!(
             "rmux-claude-launcher-{label}-{}",

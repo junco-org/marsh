@@ -13,7 +13,6 @@ use tokio::time::Instant;
 
 use crate::client_flags::ClientFlags;
 use crate::control_mode::ControlModeUpgrade;
-#[cfg(any(unix, windows))]
 use crate::handler::{attach_support::ActiveAttachIdentity, RequestHandler};
 use crate::outer_terminal::{OuterTerminal, RenderedClientTitle};
 
@@ -116,7 +115,7 @@ pub(crate) struct PaneExitEvent {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PaneExitOutputState {
     EofPublished,
-    #[cfg(any(windows, test))]
+    #[cfg(test)]
     EofPending,
 }
 
@@ -134,7 +133,7 @@ impl PaneExitEvent {
         }
     }
 
-    #[cfg(any(windows, test))]
+    #[cfg(test)]
     pub(crate) fn eof_pending(
         session_name: rmux_proto::SessionName,
         pane_id: PaneId,
@@ -206,7 +205,6 @@ impl AttachTarget {
     }
 }
 
-#[cfg(any(unix, windows))]
 pub(crate) struct LiveAttachInputContext {
     pub(crate) handler: Arc<RequestHandler>,
     pub(crate) identity: ActiveAttachIdentity,
@@ -214,7 +212,6 @@ pub(crate) struct LiveAttachInputContext {
     pub(crate) validate_identity: bool,
 }
 
-#[cfg(any(unix, windows))]
 impl LiveAttachInputContext {
     pub(crate) fn new(handler: Arc<RequestHandler>, identity: ActiveAttachIdentity) -> Self {
         Self {
@@ -837,7 +834,7 @@ impl PaneOutputSender {
         )
     }
 
-    #[cfg_attr(not(all(any(unix, windows), feature = "web")), allow(dead_code))]
+    #[cfg_attr(not(all(unix, feature = "web")), allow(dead_code))]
     pub(crate) fn capture_with_next_sequence<T>(&self, capture: impl FnOnce() -> T) -> (u64, T) {
         let state = self
             .inner

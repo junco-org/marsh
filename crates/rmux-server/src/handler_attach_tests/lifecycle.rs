@@ -1,17 +1,7 @@
 use super::*;
-#[cfg(windows)]
-use crate::input_keys::{encode_key, ExtendedKeyFormat};
-#[cfg(windows)]
-use rmux_core::key_string_lookup_string;
 
-#[cfg(windows)]
-const ATTACHED_EXIT_INPUT: &[u8] = b"RMUX_EXIT\r\n";
-#[cfg(not(windows))]
 const ATTACHED_EXIT_INPUT: &[u8] = b"exit\r";
 
-#[cfg(windows)]
-const SUBMITTED_EXIT_LINE_NEEDLE: &str = "RMUX_EXIT";
-#[cfg(not(windows))]
 const SUBMITTED_EXIT_LINE_NEEDLE: &str = "exit";
 
 const REMAIN_ON_EXIT_CAPTURE_SETTLE_TIMEOUT: Duration = Duration::from_secs(20);
@@ -256,7 +246,6 @@ async fn attached_last_pane_exit_honors_detach_on_destroy_off() {
     assert!(!active.closing.load(Ordering::SeqCst));
 }
 
-#[cfg(any(unix, windows))]
 async fn create_exit_attached_session(
     handler: &RequestHandler,
     requester_pid: u32,
@@ -265,22 +254,7 @@ async fn create_exit_attached_session(
     create_line_exiting_attached_session(handler, requester_pid, session).await
 }
 
-#[cfg(not(any(unix, windows)))]
-async fn create_exit_attached_session(
-    handler: &RequestHandler,
-    requester_pid: u32,
-    session: &SessionName,
-) -> mpsc::UnboundedReceiver<AttachControl> {
-    create_attached_session(handler, requester_pid, session).await
-}
-
-#[cfg(any(unix, windows))]
 async fn prepare_exit_prompt(_handler: &RequestHandler, _target: &PaneTarget) {}
-
-#[cfg(not(any(unix, windows)))]
-async fn prepare_exit_prompt(handler: &RequestHandler, target: &PaneTarget) {
-    prepare_attached_shell_prompt(handler, target).await;
-}
 
 #[tokio::test]
 async fn attached_keystroke_stub_returns_key_dispatched_ack() {
@@ -482,22 +456,8 @@ async fn attached_send_prefix_emits_the_configured_prefix_byte() {
         .expect("configured prefix send-prefix input");
 
     capture.finish(&handler, &alpha).await;
-    #[cfg(not(windows))]
     let expected = b"\x01".to_vec();
-    #[cfg(windows)]
-    let expected = windows_cmd_select_all_bytes();
     capture.assert_contents(&handler, &expected).await;
-}
-
-#[cfg(windows)]
-fn windows_cmd_select_all_bytes() -> Vec<u8> {
-    ["C-Home", "S-End"]
-        .into_iter()
-        .flat_map(|key_name| {
-            let key = key_string_lookup_string(key_name).expect("test key must exist");
-            encode_key(0, ExtendedKeyFormat::Xterm, key).expect("test key must encode")
-        })
-        .collect()
 }
 
 #[tokio::test]
@@ -505,12 +465,8 @@ async fn attached_live_input_preserves_split_utf8_sequences() {
     let handler = RequestHandler::new();
     let requester_pid = std::process::id();
     let alpha = session_name("alpha");
-    #[cfg(windows)]
-    let _control_rx = create_line_echo_attached_session(&handler, requester_pid, &alpha).await;
-    #[cfg(not(windows))]
     let _control_rx = create_attached_session_in_utf8_locale(&handler, requester_pid, &alpha).await;
     let target = PaneTarget::new(alpha.clone(), 0);
-    #[cfg(not(windows))]
     prepare_attached_shell_prompt(&handler, &target).await;
 
     let mut pending_input = Vec::new();
@@ -542,20 +498,10 @@ struct SplitUtf8EchoCommand {
     echoed_command: Option<&'static str>,
 }
 
-#[cfg(unix)]
 fn split_utf8_echo_command() -> SplitUtf8EchoCommand {
     SplitUtf8EchoCommand {
         chunks: vec![b"printf 'cafe \xe6", b"\x96", b"\x87\\n'\r"],
         output_needle: "\ncafe 文",
         echoed_command: Some("printf 'cafe 文\\n'"),
-    }
-}
-
-#[cfg(windows)]
-fn split_utf8_echo_command() -> SplitUtf8EchoCommand {
-    SplitUtf8EchoCommand {
-        chunks: vec![b"cafe \xe6", b"\x96", b"\x87\r\n"],
-        output_needle: "cafe 文",
-        echoed_command: None,
     }
 }

@@ -35,8 +35,12 @@ use crate::io::{IoError, IoResult, ShellHandle, ShellIo};
 /// What to run, where, and as whom.
 #[derive(Clone, Debug)]
 pub struct ExecutionSpec {
-    /// Seed-relative directory the command starts in.
-    pub directory: String,
+    /// Host filesystem directory the command starts in, which also selects the seed it publishes
+    /// into.
+    ///
+    /// Empty selects the host's [`default_dir`](ShellIo::default_dir); a relative path is joined
+    /// onto that default; an absolute one keeps its host meaning.
+    pub initial_dir: std::path::PathBuf,
     /// The job name, which is also the capability principal. `None` draws the next automatic one.
     ///
     /// A recurring slot — a status-line producer, a cache entry — should keep its own name so its
@@ -168,8 +172,6 @@ impl Default for CollectOptions {
 ///         // The policy refused a capability. The snapshot was retaken from the seed and the
 ///         // history is as it was before the line; the exit code is untouched by any of that.
 ///         Ok(Outcome::Denied { denials, .. }) => format!("denied ({} refusals)", denials.len()),
-///         // Another principal published one of these paths first. Rerunnable, unlike a denial.
-///         Ok(Outcome::Stale { stale, .. }) => format!("stale on {} paths", stale.len()),
 ///         // Thrown away unchecked at the caller's request. It may well have run and spawned
 ///         // processes; what is gone is the staged filesystem work, not the fact of it.
 ///         Ok(Outcome::Discarded) => "discarded, having possibly run".to_owned(),
@@ -416,7 +418,7 @@ impl Execution {
     /// # async fn compress(io: &ShellIo, input: Vec<u8>) -> IoResult<Vec<u8>> {
     /// let ExecutionParts { command, stdin, mut stdout, mut stderr, .. } = io
     ///     .execute(ExecutionSpec {
-    ///         directory: String::new(),
+    ///         initial_dir: std::path::PathBuf::new(),
     ///         id: None,
     ///         process: ProcessCommand::Argv(vec!["gzip".to_owned(), "-c".to_owned()]),
     ///         environment: None,
@@ -590,7 +592,11 @@ async fn drain(
         }
         retained.extend_from_slice(&bytes[..allowed]);
     }
-    if overflowed { Err(retained) } else { Ok(retained) }
+    if overflowed {
+        Err(retained)
+    } else {
+        Ok(retained)
+    }
 }
 
 impl ShellIo {
@@ -625,42 +631,45 @@ impl ShellIo {
         let io = self.unleased();
         self.dispatch(async move {
             let shell = io
-                .spawn(
-                    &spec.directory,
+                .open_shell(
+                    &spec.initial_dir,
                     spec.id,
-                    None,
                     SpawnOptions {
                         io: JobIo::Pipes,
                         environment: spec.environment,
+                        ..SpawnOptions::default()
                     },
                 )
                 .await?;
 
             let uid = shell.sandbox().uid.clone();
-            let stdout = OutputStream::owner(
-                io.streams().arm_owner((uid.clone(), OutputChannel::Stdout)),
-            );
-            let stderr =
-                OutputStream::owner(io.streams().arm_owner((uid, OutputChannel::Stderr)));
+            let stdout =
+                OutputStream::owner(io.streams().arm_owner((uid.clone(), OutputChannel::Stdout)));
+            let stderr = OutputStream::owner(io.streams().arm_owner((uid, OutputChannel::Stderr)));
 
+            // Scheduled rather than awaited to completion: the caller still has to feed this
+            // execution's standard input and close it, and a program that reads to end of file
+            // never finishes until it does. This returns at admission; the verdict arrives
+            // through the receipt.
             let command = match io
-                .start_in(
+                .start_command(
                     &shell,
                     &line,
                     CommandOptions {
                         on_finish: None,
-                        // A pipe job is one-shot by construction; the core closes it after this
+                        // A pipe shell is one-shot by construction; the core closes it after this
                         // command whatever this says, and saying so here keeps the two agreeing.
                         close_on_finish: true,
+                        on_accept: None,
                     },
                 )
                 .await
             {
                 Ok(command) => command,
                 Err(error) => {
-                    // The job was admitted and nothing will ever run in it. Without this it would
-                    // sit open, holding a snapshot, until the host shut down — and a one-shot job
-                    // only closes when its command ends.
+                    // The shell was admitted and nothing will ever run in it. Without this it
+                    // would sit open, holding a snapshot, until the host shut down — and a
+                    // one-shot shell only closes when its command ends.
                     let _ = io.stop(&shell, true).await;
                     return Err(error);
                 }
@@ -708,9 +717,9 @@ impl ShellIo {
         // The job's own closure is authoritative and cannot age out of the retention tombstones,
         // so a stream belonging to a job that closed long ago still reports end of file rather
         // than waiting for bytes that can never arrive.
-        let (cursor, signal) =
-            self.streams()
-                .observe(key.clone(), start, job.spawned().is_closed());
+        let (cursor, signal) = self
+            .streams()
+            .observe(key.clone(), start, job.shell().is_closed());
         Ok(OutputStream {
             source: Source::Observer {
                 io: self.unleased(),

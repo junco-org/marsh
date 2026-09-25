@@ -287,16 +287,7 @@ pub(super) fn parse_queued_new_window(
     })
 }
 
-fn signed_window_target_session_part(raw_target: &str) -> Option<Option<&str>> {
-    if signed_window_index_target(raw_target) {
-        return Some(None);
-    }
-    let (session, window) = raw_target.split_once(':')?;
-    if session.is_empty() || !signed_window_index_target(window) {
-        return None;
-    }
-    Some(Some(session))
-}
+use super::signed_window_target_session_part;
 
 fn compact_value_or_next_argument(
     args: &mut VecDeque<CommandArgument>,
@@ -308,14 +299,6 @@ fn compact_value_or_next_argument(
         None => pop_string_argument(args, description),
     }
 }
-
-fn signed_window_index_target(value: &str) -> bool {
-    let Some(rest) = value.strip_prefix(['+', '-']) else {
-        return false;
-    };
-    rest.is_empty() || rest.bytes().all(|byte| byte.is_ascii_digit())
-}
-
 fn parse_queued_if_shell_target(
     raw_target: String,
     sessions: &SessionStore,

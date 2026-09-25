@@ -143,13 +143,6 @@ async fn shell_condition_is_true_with_timeout(
     timeout: Duration,
     shell_processes: Option<Arc<ShellProcessRegistry>>,
 ) -> Result<bool, RmuxError> {
-    #[cfg(windows)]
-    match command.trim() {
-        "true" => return Ok(true),
-        "false" => return Ok(false),
-        _ => {}
-    }
-
     // The predicate's output is discarded, as it was upstream — but it is still drained to end of
     // file, because a condition that filled a pipe and blocked would never answer at all.
     let captured = run_managed_shell(
@@ -337,7 +330,7 @@ mod tests {
         let Ok(io) = managed_workload::handler_facade(&handler) else {
             return;
         };
-        let seed = io.executor_info().seed.expect("test engine has a seed");
+        let seed = io.default_dir().to_path_buf();
         let profile = test_profile(&seed);
 
         let result = run_shell_foreground_with_timeout(
@@ -371,7 +364,7 @@ mod tests {
         let Ok(io) = managed_workload::handler_facade(&handler) else {
             return;
         };
-        let seed = io.executor_info().seed.expect("test engine has a seed");
+        let seed = io.default_dir().to_path_buf();
         let profile = test_profile(&seed);
 
         let output = super::run_managed_shell(

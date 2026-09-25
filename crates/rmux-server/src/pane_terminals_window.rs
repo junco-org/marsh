@@ -604,16 +604,12 @@ impl HandlerState {
                 .and_then(|provenance| provenance.process_command.clone())
         });
         validate_process_command(process_command.as_ref())?;
-        // Whether the *caller* named a directory, decided before the provenance fallback fills
-        // one in. The same rule `plan_pane_respawn` applies: a provenance directory is a replay
-        // of what the retiring pane resolved to — frequently the daemon's own process cwd — and
-        // refusing it as if someone had asked for it makes `respawn-window` fail on a window
-        // `new-window` had just created perfectly happily.
-        let named_directory = spawn
-            .start_directory
-            .is_some_and(|path| !path.as_os_str().is_empty());
+        // The caller's directory, then the retiring pane's provenance: a respawn with no `-c`
+        // restarts where its pane actually was, and `plan_pane_respawn` completes the chain with
+        // this host's default when neither answered.
         let start_directory = spawn
             .start_directory
+            .filter(|path| !path.as_os_str().is_empty())
             .map(std::path::Path::to_path_buf)
             .or_else(|| {
                 provenance
@@ -623,16 +619,13 @@ impl HandlerState {
         let respawn_environment = provenance
             .as_ref()
             .map(|provenance| provenance.private_environment.clone());
-        let respawn_shell = provenance
-            .as_ref()
-            .map(|provenance| &provenance.shell);
+        let respawn_shell = provenance.as_ref().map(|provenance| &provenance.shell);
         let environment_overrides = spawn
             .environment_overrides
             .map(<[String]>::to_vec)
             .or_else(|| respawn_environment.clone());
         let spawn = WindowSpawnOptions {
             start_directory: start_directory.as_deref(),
-            inherited_start_directory: !named_directory,
             command: process_command.as_ref(),
             socket_path: spawn.socket_path,
             spawn_environment: spawn.spawn_environment,
@@ -813,7 +806,6 @@ impl HandlerState {
             refresh_sessions: synchronized_sessions,
         })
     }
-
 }
 
 fn apply_prepared_automatic_window_name(
@@ -931,7 +923,11 @@ impl PlannedNewWindow {
     pub(crate) async fn open(
         self,
     ) -> Result<
-        (NewWindowCommit, super::WindowTerminalCommit, PreparedWindowTerminal),
+        (
+            NewWindowCommit,
+            super::WindowTerminalCommit,
+            PreparedWindowTerminal,
+        ),
         (NewWindowCommit, RmuxError),
     > {
         match self.planned.open().await {

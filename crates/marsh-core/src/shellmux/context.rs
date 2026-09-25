@@ -15,9 +15,9 @@
 //! pre-empted. Nothing here claims to interrupt arbitrary Rust or arbitrary syscalls.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::Arc;
 
+use crate::shell::Workers;
 use crate::shellmux::command::CommandId;
 use crate::shellmux::error::MuxError;
 use crate::shellmux::mux::Sandbox;
@@ -33,9 +33,19 @@ tokio::task_local! {
 /// refuse rather than fall back to doing it unmanaged. The context does not propagate into a
 /// `tokio::spawn`ed task, a subshell or a pipeline stage, which is why builtins that need it must
 /// be invoked as top-level parent-shell builtins.
+///
+/// The handle is stamped with the *current* evaluation, not the one the task-local was installed
+/// for. A line that was invalidated and is being run again installs no new context — it is the
+/// same logical command — so reading the generation here is what lets the replay's builtins
+/// register work while a handle somebody kept from the abandoned evaluation cannot.
 #[must_use]
 pub fn current_command_context() -> Option<CommandContext> {
-    CURRENT.try_with(Clone::clone).ok()
+    CURRENT
+        .try_with(|context| CommandContext {
+            inner: Arc::clone(&context.inner),
+            generation: context.inner.workers.generation(),
+        })
+        .ok()
 }
 
 /// Runs `body` with `context` installed as the current command context.
@@ -43,65 +53,39 @@ pub(crate) async fn with_context<F: Future>(context: CommandContext, body: F) ->
     CURRENT.scope(context, body).await
 }
 
-/// The cooperative cancellation flag one command's native workers share.
-#[derive(Debug, Default)]
-struct Cancellation {
-    /// Set once, never cleared.
-    requested: AtomicBool,
-    /// Wakes every future waiting on the flag.
-    signal: tokio::sync::Notify,
-}
-
-/// The workers one command registered, and whether it still admits new ones.
-#[derive(Debug, Default)]
-struct Workers {
-    /// Cleared before finalization: a retained context cannot start work after its verdict.
-    open: bool,
-    /// Every registered worker, joined by the core before the command concludes.
-    handles: Vec<tokio::task::JoinHandle<()>>,
-}
-
 /// The shared half of a command context.
 #[derive(Debug)]
 struct Inner {
     /// Which command this is the context of.
     id: CommandId,
-    /// The sandbox it runs in: its identity, its directory label and its snapshot id.
+    /// The sandbox it runs in: its identity, its seed, its directory label and its snapshot id.
     sandbox: Sandbox,
-    /// The seed this mux publishes into.
-    seed: Option<PathBuf>,
     /// The root of this command's own snapshot.
     snapshot_root: Option<PathBuf>,
-    /// The runtime the command was admitted on, so a worker started from a foreign thread still
-    /// lands on the daemon's own runtime.
-    runtime: tokio::runtime::Handle,
-    /// The cooperative cancellation flag.
-    cancellation: Cancellation,
-    /// The registered native workers.
-    workers: Mutex<Workers>,
-    /// Whether the single join has been started, and how every finisher learns it is over.
+    /// The workers this command owns, which the shell below the mux joins at every boundary.
     ///
-    /// Finalization cannot be "drain the list and await it here". Two things break that:
-    /// concurrency — a second caller arriving mid-drain finds the list empty and concludes there
-    /// is nothing to wait for — and cancellation — the first caller's stack owns the handles, so
-    /// dropping that future detaches the very workers the next caller needs to wait for. Either
-    /// way someone reclaims a snapshot while a worker is still writing into it.
-    ///
-    /// So the join happens exactly once, on a task the *runtime* owns, and every finisher waits on
-    /// this. A cancelled finisher takes nothing with it.
-    joined: tokio::sync::watch::Sender<bool>,
-    /// Set when the join task has been spawned, so it is spawned once.
-    joining: AtomicBool,
+    /// Shared rather than duplicated: a line is evaluated below this layer, so the party that has
+    /// to join a worker before it reseeds a tree is the same party that has to decide whether the
+    /// line runs again. A second worker table up here could only ever disagree with that one.
+    workers: Arc<Workers>,
 }
 
 /// A handle on the managed command running on this task.
 ///
 /// Cloneable and cheap. Holding one past the command's end is safe and useless: admission closes
-/// before finalization, so [`Self::spawn_blocking`] then refuses.
+/// before finalization, so [`Self::spawn_blocking`] then refuses — and so does a handle retained
+/// across a replay, because the generation it was taken at has been superseded.
 #[derive(Clone, Debug)]
 pub struct CommandContext {
     /// The shared state.
     inner: Arc<Inner>,
+    /// The evaluation this handle was taken during.
+    ///
+    /// A line whose reads were invalidated is evaluated again in a new generation, and the tree it
+    /// ran in is retaken first. Work started through a handle from the abandoned evaluation would
+    /// land in that retaken tree, so the generation travels with the handle and is checked at
+    /// every registration.
+    generation: u64,
 }
 
 impl CommandContext {
@@ -109,25 +93,19 @@ impl CommandContext {
     pub(crate) fn new(
         id: CommandId,
         sandbox: Sandbox,
-        seed: Option<PathBuf>,
         snapshot_root: Option<PathBuf>,
         runtime: tokio::runtime::Handle,
     ) -> Self {
+        let workers = Arc::new(Workers::new(runtime, snapshot_root.clone()));
+        let generation = workers.generation();
         Self {
             inner: Arc::new(Inner {
                 id,
                 sandbox,
-                seed,
                 snapshot_root,
-                runtime,
-                cancellation: Cancellation::default(),
-                joined: tokio::sync::watch::channel(false).0,
-                joining: AtomicBool::new(false),
-                workers: Mutex::new(Workers {
-                    open: true,
-                    handles: Vec::new(),
-                }),
+                workers,
             }),
+            generation,
         }
     }
 
@@ -146,10 +124,13 @@ impl CommandContext {
         &self.inner.sandbox
     }
 
-    /// The seed this mux publishes into, when it has one.
+    /// The seed this command's job publishes into.
+    ///
+    /// One mux hosts jobs over several seeds, so this is the *job's* seed rather than a property
+    /// of the host: borrowed from the sandbox, which is the one authoritative copy.
     #[must_use]
-    pub fn seed(&self) -> Option<&Path> {
-        self.inner.seed.as_deref()
+    pub fn seed(&self) -> &Path {
+        &self.inner.sandbox.seed
     }
 
     /// The root of this command's own snapshot, when it has one.
@@ -164,9 +145,11 @@ impl CommandContext {
     /// Whether a forced stop has asked this command's work to end.
     ///
     /// A request, not an interruption. A worker that never checks is joined rather than killed.
+    /// A handle from a superseded evaluation answers `true` unconditionally: whatever it was
+    /// doing is no longer wanted, whether or not anybody asked the command itself to stop.
     #[must_use]
     pub fn cancellation_requested(&self) -> bool {
-        self.inner.cancellation.requested.load(Ordering::Acquire)
+        self.inner.workers.cancellation_requested() || self.superseded()
     }
 
     /// Resolves once cancellation has been requested.
@@ -174,14 +157,10 @@ impl CommandContext {
     /// Already-requested cancellation resolves immediately, so there is no lost-wakeup window
     /// between a check and a wait.
     pub async fn cancelled(&self) {
-        loop {
-            // Registered before the check, so a request landing between them still wakes this.
-            let notified = self.inner.cancellation.signal.notified();
-            if self.cancellation_requested() {
-                return;
-            }
-            notified.await;
+        if self.superseded() {
+            return;
         }
+        self.inner.workers.cancelled().await;
     }
 
     /// Runs `operation` on a blocking worker this command owns.
@@ -197,89 +176,53 @@ impl CommandContext {
     /// # Errors
     ///
     /// Fails with [`MuxError::CommandFinalizing`] once this command has stopped admitting work,
-    /// which is the whole point: a retained context cannot start something after its verdict.
-    pub fn spawn_blocking<F, T>(&self, operation: F) -> Result<tokio::sync::oneshot::Receiver<T>, MuxError>
+    /// which is the whole point: a retained context cannot start something after its verdict, and
+    /// a handle from an evaluation that was abandoned and run again cannot start something in the
+    /// replay.
+    pub fn spawn_blocking<F, T>(
+        &self,
+        operation: F,
+    ) -> Result<tokio::sync::oneshot::Receiver<T>, MuxError>
     where
         F: FnOnce() -> T + Send + 'static,
         T: Send + 'static,
     {
-        let (sender, receiver) = tokio::sync::oneshot::channel();
-        let mut workers = self
-            .inner
+        self.inner
             .workers
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        if !workers.open {
-            return Err(MuxError::CommandFinalizing(self.inner.id));
-        }
-        let handle = self.inner.runtime.spawn_blocking(move || {
-            let value = operation();
-            let _ = sender.send(value);
-        });
-        workers.handles.push(handle);
-        drop(workers);
-        Ok(receiver)
+            .spawn_blocking(self.generation, operation)
+            .map_err(|()| MuxError::CommandFinalizing(self.inner.id))
+    }
+
+    /// The workers this command owns, for the evaluator below the mux.
+    pub(crate) fn workers(&self) -> Arc<Workers> {
+        Arc::clone(&self.inner.workers)
     }
 
     /// Asks every worker of this command to stop.
     pub(crate) fn request_cancellation(&self) {
-        self.inner
-            .cancellation
-            .requested
-            .store(true, Ordering::Release);
-        self.inner.cancellation.signal.notify_waiters();
+        self.inner.workers.request_cancellation();
     }
 
-    /// Closes admission and joins every registered worker.
+    /// Closes admission and joins every registered worker of the current evaluation.
     ///
     /// Called by the core before the command's boundary, so no native worker outlives the snapshot
     /// it writes into. A worker that panicked is joined like any other; its failure has already
     /// been observed by whoever held its receiver.
     pub(crate) async fn finish(&self) {
-        // Exactly one finisher starts the join, on a task the runtime owns. Everyone else — and
-        // the starter too — waits on the shared signal below, so cancelling any of them detaches
-        // nothing and a later caller never sees an emptied list it did not wait for.
-        if !self.inner.joining.swap(true, Ordering::AcqRel) {
-            let handles = {
-                let mut workers = self
-                    .inner
-                    .workers
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner);
-                workers.open = false;
-                let handles = std::mem::take(&mut workers.handles);
-                drop(workers);
-                handles
-            };
-            let joined = self.inner.joined.clone();
-            self.inner.runtime.spawn(async move {
-                for handle in handles {
-                    // A worker that panicked is joined like any other; its failure has already
-                    // been observed by whoever held its receiver.
-                    let _ = handle.await;
-                }
-                // `send_replace`, not `send`. With no receiver yet subscribed — and the finisher
-                // that spawned this only subscribes afterwards — `send` fails AND leaves the
-                // value untouched, so every finisher would then wait forever on a flag that was
-                // never set. `send_replace` updates the value whether or not anyone is listening.
-                let _ = joined.send_replace(true);
-            });
-        }
+        self.inner.workers.finish().await;
+    }
 
-        let mut done = self.inner.joined.subscribe();
-        while !*done.borrow_and_update() {
-            if done.changed().await.is_err() {
-                // The sender is gone, which can only mean the join task was itself lost. There is
-                // nothing better to wait for, and hanging here would stall a boundary forever.
-                return;
-            }
-        }
+    /// Whether the evaluation this handle was taken during has been superseded by a replay.
+    fn superseded(&self) -> bool {
+        self.inner.workers.superseded(self.generation)
     }
 }
 
 #[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
     use super::*;
     use crate::shellmux::ids::{JobDir, ShellId, SnapshotUid};
 
@@ -289,10 +232,10 @@ mod tests {
             CommandId(1),
             Sandbox {
                 id: ShellId::from("t"),
+                seed: PathBuf::from("/seed"),
                 dir: JobDir::default(),
                 uid: SnapshotUid::from("uid-t"),
             },
-            None,
             None,
             tokio::runtime::Handle::current(),
         )
@@ -311,6 +254,52 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(5), context.finish())
             .await
             .expect("a command with no workers finalizes immediately");
+    }
+
+    /// A line that was invalidated and is being run again opens a new generation, and a handle
+    /// somebody kept from the abandoned one may not start work in it.
+    ///
+    /// The work would land in a tree the replay has already thrown away and retaken, which is the
+    /// same hazard admission closing at a verdict protects against — a replay is simply that
+    /// verdict happening twice.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_handle_from_an_abandoned_evaluation_cannot_start_work() {
+        let retained = context();
+        let workers = retained.workers();
+
+        // What the shell below the mux does between two evaluations of one line.
+        workers.finish().await;
+        workers.reopen();
+
+        assert!(
+            matches!(
+                retained.spawn_blocking(|| ()),
+                Err(MuxError::CommandFinalizing(_))
+            ),
+            "the abandoned evaluation's handle is refused"
+        );
+        assert!(
+            retained.cancellation_requested(),
+            "and reads as cancelled, so a worker holding one stops looking for work"
+        );
+
+        // The handle `current_command_context` hands the replay's builtins is the live one.
+        let fresh = CommandContext {
+            inner: Arc::clone(&retained.inner),
+            generation: workers.generation(),
+        };
+        let done = Arc::new(AtomicBool::new(false));
+        let worker = Arc::clone(&done);
+        let receiver = fresh
+            .spawn_blocking(move || worker.store(true, Ordering::Release))
+            .expect("the replay admits its own work");
+        receiver.await.expect("the worker ran");
+        assert!(done.load(Ordering::Acquire));
+
+        // And the replay's boundary still joins it, exactly as the first evaluation's did.
+        tokio::time::timeout(std::time::Duration::from_secs(5), fresh.finish())
+            .await
+            .expect("the replay's workers are joined");
     }
 
     /// Every concurrent finisher waits for the same join, and a cancelled one takes nothing with
@@ -332,7 +321,8 @@ mod tests {
             .expect("an open context admits work");
 
         // Cancelled well before the worker finishes.
-        let cancelled = tokio::time::timeout(std::time::Duration::from_millis(20), context.finish());
+        let cancelled =
+            tokio::time::timeout(std::time::Duration::from_millis(20), context.finish());
         assert!(cancelled.await.is_err(), "the first finisher is cancelled");
 
         tokio::time::timeout(std::time::Duration::from_secs(5), context.finish())

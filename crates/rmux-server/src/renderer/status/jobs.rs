@@ -1,8 +1,7 @@
 use std::time::Duration;
 
 use crate::io::ShellIo;
-use crate::status_jobs::StatusJobRuntime;
-use crate::terminal::TerminalProfile;
+use crate::status_jobs::{StatusJobProfile, StatusJobRuntime};
 
 /// Expands every `#(command)` in `template` from the status-job cache.
 ///
@@ -11,7 +10,7 @@ use crate::terminal::TerminalProfile;
 /// schedules nothing.
 pub(super) fn render_template_with_status_jobs<C, T>(
     template: &str,
-    profile: Option<&TerminalProfile>,
+    profile: Option<&StatusJobProfile>,
     cache_ttl: Duration,
     status_jobs: Option<&StatusJobRuntime>,
     shell_io: Option<&ShellIo>,

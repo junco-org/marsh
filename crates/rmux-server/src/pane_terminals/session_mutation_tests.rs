@@ -1,4 +1,4 @@
-use rmux_proto::{PaneTarget, SessionName, TerminalSize, WindowTarget};
+use rmux_proto::{PaneTarget, TerminalSize, WindowTarget};
 
 use super::{HandlerState, PaneTransferGeometryContext};
 
@@ -138,6 +138,4 @@ fn join_or_move_geometry_orders_source_target_then_collateral() {
     );
 }
 
-fn session_name(value: &str) -> SessionName {
-    SessionName::new(value).expect("test session name")
-}
+use crate::test_names::session_name;

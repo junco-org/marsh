@@ -1,5 +1,3 @@
-#![cfg(unix)]
-
 use std::error::Error;
 use std::fs;
 use std::io;
@@ -210,7 +208,7 @@ fn shell_quote(path: &Path) -> String {
     format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn send_keys_writes_to_the_correct_pane_through_the_socket() -> Result<(), Box<dyn Error>> {
     let _guard = PTY_TEST_LOCK.lock().await;
     let harness = TestHarness::new("send-keys");
@@ -302,7 +300,7 @@ async fn send_keys_writes_to_the_correct_pane_through_the_socket() -> Result<(),
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn send_keys_targets_the_correct_pane_in_a_multi_pane_session() -> Result<(), Box<dyn Error>>
 {
     let _guard = PTY_TEST_LOCK.lock().await;
@@ -405,7 +403,7 @@ async fn send_keys_targets_the_correct_pane_in_a_multi_pane_session() -> Result<
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn send_keys_ctrl_c_interrupts_a_real_pane_process() -> Result<(), Box<dyn Error>> {
     let _guard = PTY_TEST_LOCK.lock().await;
     let harness = TestHarness::new("send-keys-ctrl-c");

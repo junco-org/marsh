@@ -7,9 +7,7 @@ use rmux_proto::{
     WindowTarget,
 };
 
-fn session_name(value: &str) -> SessionName {
-    SessionName::new(value).expect("valid session name")
-}
+use crate::test_names::session_name;
 
 pub(super) async fn create_session(handler: &RequestHandler, name: &str) -> SessionName {
     let session_name = session_name(name);

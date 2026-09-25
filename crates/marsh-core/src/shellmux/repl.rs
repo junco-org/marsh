@@ -8,9 +8,10 @@
 //! rendering `%foo denied 1 of 2:` are not, so they are separated out and unit-tested directly.
 //!
 //! The grammar is deliberately tiny and resolved *before* any brush parsing: the frontend builtins
-//! (`jobs`, `fg`, `bg`, `stop`, `kill`, `exit`, `sd`, and the trailing `&`) never reach the text,
+//! (`jobs`, `fg`, `bg`, `stop`, `kill`, `sd`, and the trailing `&`) never reach the text,
 //! because the shell that composes the prompt is not the shell that runs commands — every real
-//! command line is handed to a job instead.
+//! command line is handed to a job instead. `exit` is deliberately not among them: it is the
+//! shell's own builtin, so its status argument reaches the job that runs it.
 
 use crate::policy::Action;
 
@@ -29,8 +30,6 @@ pub enum Input {
     Empty,
     /// List the job table.
     Jobs,
-    /// End the session.
-    Exit,
     /// Attach a job to the terminal; `None` means the most recent one.
     Fg(Option<String>),
     /// Signal process ids; the tokens are passed through verbatim, signal flag included.
@@ -79,8 +78,6 @@ pub fn parse(line: &str) -> Input {
 
     match first {
         "jobs" if rest.is_empty() => Input::Jobs,
-        // `exit 1` is still an exit: the console has no exit status to pass on.
-        "exit" => Input::Exit,
         "fg" => Input::Fg(job_reference(&line[first.len()..])),
         // `kill` keeps its argv verbatim — the signal flag and every target are the builtin's to
         // interpret, exactly as in bash, where `kill -9 1234 5678` is one invocation. Its tokens
@@ -281,7 +278,7 @@ pub fn valid_name(name: &str) -> bool {
 /// filesystem's root, since every path here is seed-relative.
 ///
 /// Only the join is here. Normalizing `.` and `..`, and refusing a path that climbs out of the
-/// seed, belong to `ShellMux::spawn`, which is the half that knows where the seed is.
+/// seed, are [`seed_relative`]'s.
 pub fn job_dir(base: &str, dir: &str) -> String {
     if base.is_empty() || dir.starts_with('/') {
         return dir.to_string();
@@ -289,29 +286,52 @@ pub fn job_dir(base: &str, dir: &str) -> String {
     format!("{base}/{dir}")
 }
 
-/// The instrumentation label for an action: the syscall verb, or the git command line that means
-/// it.
+/// Normalizes a seed-relative directory, or `None` when it escapes the seed.
 ///
-/// The mapping is exact rather than decorative. [`Action::Read`] and [`Action::Edit`] are produced
-/// only by the tree diff, and every other action only by the shell's parse of a recorded git
-/// builtin invocation, so each label also names which of the two instrumentation streams observed
-/// the capability.
+/// Purely lexical, and deliberately so: the seed's own layout decides what exists, and a `..` that
+/// climbs past the root must be refused before any path is built from it. A leading `/` names the
+/// seed root rather than the filesystem's, because everything in this grammar is seed-relative.
+///
+/// This is the `sd`/`bg` grammar's half of the job, kept apart from the host paths
+/// [`ShellMux::open_shell`](crate::shellmux::ShellMux::open_shell) takes: a frontend joins the
+/// result onto the seed of the shell the line was typed in, so `/` still means *that* shell's
+/// root and never the daemon's default one.
+#[must_use]
+pub fn seed_relative(dir: &str) -> Option<String> {
+    let mut segments: Vec<&str> = Vec::new();
+    for component in dir.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => {
+                segments.pop()?;
+            }
+            other => segments.push(other),
+        }
+    }
+    Some(segments.join("/"))
+}
+
+/// The console label for an action: the capability's own name.
+///
+/// Never a reconstructed command line. One capability is requested by many git commands — a
+/// `checkout` comes from `git switch`, `git reset --hard` and `git restore` alike — so naming a
+/// command would claim the user ran something they did not.
 fn action_label(action: &Action) -> String {
     match action {
         Action::Read => "read".to_string(),
         Action::Edit => "edit".to_string(),
-        Action::Stage => "git add".to_string(),
-        Action::Delete => "git rm".to_string(),
-        Action::Unstage => "git restore --staged".to_string(),
+        Action::Stage => "stage".to_string(),
+        Action::Delete => "delete".to_string(),
+        Action::Unstage => "unstage".to_string(),
         Action::Commit {
             message: Some(message),
-        } => format!("git commit -m {message:?}"),
-        Action::Commit { message: None } => "git commit".to_string(),
-        Action::Checkout => "git checkout HEAD".to_string(),
-        Action::Stash => "git stash push".to_string(),
-        Action::Clean => "git clean -f".to_string(),
-        Action::Diff => "git diff".to_string(),
-        Action::History => "git log".to_string(),
+        } => format!("commit {message:?}"),
+        Action::Commit { message: None } => "commit".to_string(),
+        Action::Checkout => "checkout".to_string(),
+        Action::Stash => "stash".to_string(),
+        Action::Clean => "clean".to_string(),
+        Action::Diff => "diff".to_string(),
+        Action::History => "history".to_string(),
     }
 }
 
@@ -365,19 +385,6 @@ pub fn report_lines(id: &ShellId, outcome: &Result<Outcome, MuxError>) -> Vec<St
                 }
             }
         }
-        Ok(Outcome::Stale { requested, stale }) => {
-            push_events(&mut lines, requested);
-            lines.push(format!(
-                "{job} stale — rerun (first shell to get caps wins):"
-            ));
-            for path in stale {
-                lines.push(format!(
-                    "  - {} merged by seq {}",
-                    path.path.display(),
-                    path.merged_seq
-                ));
-            }
-        }
         Ok(Outcome::Discarded) => {
             lines.push(format!(
                 "{job} stopped — the line was discarded, nothing published"
@@ -402,7 +409,20 @@ mod tests {
     use super::*;
 
     use crate::policy::Resource;
-    use crate::{Denial, Publication, StalePath};
+    use crate::{Denial, Publication};
+
+    /// A typed directory becomes a path under the originating shell's seed, so the one thing it
+    /// must never do is name something outside it.
+    #[test]
+    fn a_typed_directory_cannot_climb_out_of_the_seed() {
+        assert_eq!(seed_relative(""), Some(String::new()));
+        assert_eq!(seed_relative("."), Some(String::new()));
+        assert_eq!(seed_relative("./src"), Some("src".to_string()));
+        assert_eq!(seed_relative("/src/"), Some("src".to_string()));
+        assert_eq!(seed_relative("deep/../src"), Some("src".to_string()));
+        assert_eq!(seed_relative(".."), None);
+        assert_eq!(seed_relative("src/../.."), None);
+    }
 
     #[test]
     fn an_empty_line_asks_for_nothing() {
@@ -414,8 +434,6 @@ mod tests {
     fn console_builtins_are_recognized_before_the_shell_sees_them() {
         assert_eq!(parse("jobs"), Input::Jobs);
         assert_eq!(parse("  jobs  "), Input::Jobs);
-        assert_eq!(parse("exit"), Input::Exit);
-        assert_eq!(parse("exit 1"), Input::Exit);
     }
 
     #[test]
@@ -705,7 +723,7 @@ mod tests {
             report_lines(&ShellId::from("foo"), &outcome),
             vec![
                 "%foo: edit \"a.txt\"".to_string(),
-                "%foo: git add \"a.txt\"".to_string(),
+                "%foo: stage \"a.txt\"".to_string(),
                 "%foo denied 1 of 2:".to_string(),
                 "  - foo stage a.txt: no edit precedes the stage".to_string(),
                 "    fix: edit a.txt; git rm a.txt".to_string(),
@@ -713,28 +731,8 @@ mod tests {
         );
     }
 
-    /// Losing the race is not an error; the only useful instruction is to rerun.
-    #[test]
-    fn a_conflict_tells_the_user_to_rerun() {
-        let outcome = Ok(Outcome::Stale {
-            requested: Vec::new(),
-            stale: vec![StalePath {
-                path: "src/a.txt".into(),
-                merged_seq: 3,
-            }],
-        });
-
-        assert_eq!(
-            report_lines(&ShellId::from("2"), &outcome),
-            vec![
-                "%2 stale — rerun (first shell to get caps wins):".to_string(),
-                "  - src/a.txt merged by seq 3".to_string(),
-            ]
-        );
-    }
-
-    /// The three endings that are neither a verdict nor a race: a shell with no seed behind it, a
-    /// forced stop that threw the line away, and the mux itself breaking.
+    /// The three endings that are neither a publication nor a denial: a shell with no seed behind
+    /// it, a forced stop that threw the line away, and the mux itself breaking.
     #[test]
     fn other_outcomes_render_distinctly() {
         assert_eq!(
@@ -751,56 +749,6 @@ mod tests {
         assert_eq!(
             report_lines(&ShellId::from("foo"), &error),
             vec!["%foo error: %foo is already running a command".to_string()]
-        );
-    }
-
-    /// Every git action must name the command line that requested it: the label is the user's only
-    /// evidence of *why* a capability was asked for.
-    #[test]
-    fn every_git_action_names_the_command_that_requested_it() {
-        let granted = vec![
-            Event::new("1", Action::Delete, Resource::from(vec!["a"])),
-            Event::new("1", Action::Unstage, Resource::from(vec!["a"])),
-            Event::new(
-                "1",
-                Action::Commit {
-                    message: Some("m".to_string()),
-                },
-                Resource::from(vec!["a"]),
-            ),
-            Event::new(
-                "1",
-                Action::Commit { message: None },
-                Resource::from(vec!["a"]),
-            ),
-            Event::new("1", Action::Checkout, Resource::from(vec!["a"])),
-            Event::new("1", Action::Stash, Resource::from(vec!["a"])),
-            Event::new("1", Action::Clean, Resource::from(vec!["a"])),
-            Event::new("1", Action::Diff, Resource::from(vec!["a"])),
-            Event::new("1", Action::History, Resource::from(vec!["a"])),
-            Event::new("1", Action::Read, Resource::from(vec!["a"])),
-        ];
-        let outcome = Ok(Outcome::Published {
-            publication: Publication { seq: 1, ops: 1 },
-            granted,
-        });
-
-        let lines = report_lines(&ShellId::from("1"), &outcome);
-        assert_eq!(
-            lines,
-            vec![
-                "%1: git rm \"a\"".to_string(),
-                "%1: git restore --staged \"a\"".to_string(),
-                "%1: git commit -m \"m\" \"a\"".to_string(),
-                "%1: git commit \"a\"".to_string(),
-                "%1: git checkout HEAD \"a\"".to_string(),
-                "%1: git stash push \"a\"".to_string(),
-                "%1: git clean -f \"a\"".to_string(),
-                "%1: git diff \"a\"".to_string(),
-                "%1: git log \"a\"".to_string(),
-                "%1: read \"a\"".to_string(),
-                "%1 committed seq=1 ops=1".to_string(),
-            ]
         );
     }
 }

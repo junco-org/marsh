@@ -171,9 +171,8 @@ async fn attached_switch_credits_the_destination_recency_exactly_once() {
     // window's newest sizing authority, through the frame and both aliases.
     // The frame that carries it is the *move*, not the live pane's own render
     // refresh, which rides the same channel at the geometry the resident owns.
-    let framed = frame_geometry(
-        recv_moved_switch_target(&mut mover_rx, "combined switch frame").await,
-    );
+    let framed =
+        frame_geometry(recv_moved_switch_target(&mut mover_rx, "combined switch frame").await);
     assert_eq!(framed, MOVER_SIZE, "the switch frame carries the mover");
     for (alias, window_index) in [(&beta, TARGET_WINDOW_INDEX), (&alpha, SOURCE_WINDOW_INDEX)] {
         assert_eq!(

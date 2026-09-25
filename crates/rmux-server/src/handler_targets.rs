@@ -240,9 +240,7 @@ mod tests {
         TerminalSize,
     };
 
-    fn session_name(value: &str) -> rmux_proto::SessionName {
-        rmux_proto::SessionName::new(value).expect("valid session name")
-    }
+    use crate::test_names::session_name;
 
     async fn resolve_pane(handler: &RequestHandler, target: &str) -> Target {
         let response = handler

@@ -1,6 +1,6 @@
 use clap::{ArgAction, Args};
 
-use super::{parse_target_spec, TargetSpec};
+use super::{TargetSpec, parse_target_spec};
 
 /// Flags for `set-buffer`, which stores or renames a paste buffer's contents.
 #[derive(Debug, Clone, Args)]

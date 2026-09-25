@@ -1,5 +1,5 @@
 use clap::error::{ContextKind, ContextValue, ErrorKind};
-use rmux_proto::{ControlMode, CONTROL_CONTROL_END, CONTROL_CONTROL_START};
+use rmux_proto::{CONTROL_CONTROL_END, CONTROL_CONTROL_START, ControlMode};
 
 use super::ExitFailure;
 

@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use rmux_client::{default_socket_path, AutoStartError, ClientError, NestedContextError};
+use rmux_client::{AutoStartError, ClientError, NestedContextError, default_socket_path};
 use rmux_proto::{DisplayMessageDurationParseError, RmuxError};
 
 use crate::tmux_error_surface::tmux_client_connect_error_message;
@@ -119,6 +119,30 @@ impl ExitFailure {
         Self::from(error)
     }
 
+    /// Names the startup operation behind a generic failure, keeping its original cause.
+    ///
+    /// Classified failures are left alone: absent-server wording drives cold startup and
+    /// wire-version wording carries recovery advice, and both are matched on elsewhere.
+    pub(super) fn with_startup_context(
+        mut self,
+        stage: &'static str,
+        socket_path: Option<&Path>,
+    ) -> Self {
+        if self.message.is_empty() || self.kind != ExitFailureKind::Generic {
+            return self;
+        }
+
+        self.message = match socket_path {
+            Some(socket_path) => format!(
+                "rmux: startup failed during {stage} (socket '{}'): {}",
+                socket_path.display(),
+                self.message
+            ),
+            None => format!("rmux: startup failed during {stage}: {}", self.message),
+        };
+        self
+    }
+
     /// Upgrades a wire-version mismatch into advice naming the socket and how to stop it.
     pub(super) fn with_socket_context(self, socket_path: &Path) -> Self {
         if self.kind == ExitFailureKind::UnsupportedWireVersion {
@@ -172,11 +196,6 @@ fn shell_quote_path(path: &Path) -> String {
         return text;
     }
 
-    #[cfg(windows)]
-    {
-        format!("\"{}\"", text.replace('"', "\"\""))
-    }
-    #[cfg(not(windows))]
     format!("'{}'", text.replace('\'', "'\\''"))
 }
 

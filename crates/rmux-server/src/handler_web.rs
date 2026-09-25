@@ -697,8 +697,6 @@ impl RequestHandler {
     ) -> Result<(), RmuxError> {
         let _admission = self.begin_web_mutation()?;
         let session_target = self.current_web_session_target(session_target).await?;
-        #[cfg(windows)]
-        self.wait_for_windows_deferred_all_pane_pids().await;
         let response = self
             .dispatch_web_request(
                 requester_pid,
@@ -723,8 +721,6 @@ impl RequestHandler {
     ) -> Result<(), RmuxError> {
         let _admission = self.begin_web_mutation()?;
         let session_target = self.current_web_session_target(session_target).await?;
-        #[cfg(windows)]
-        self.wait_for_windows_deferred_all_pane_pids().await;
         let response = self
             .dispatch_web_request(
                 requester_pid,
@@ -747,8 +743,6 @@ impl RequestHandler {
     ) -> Result<(), RmuxError> {
         let _admission = self.begin_web_mutation()?;
         let session_target = self.current_web_session_target(session_target).await?;
-        #[cfg(windows)]
-        self.wait_for_windows_deferred_all_pane_pids().await;
         let response = self
             .dispatch_web_request(
                 requester_pid,
@@ -770,8 +764,6 @@ impl RequestHandler {
     ) -> Result<(), RmuxError> {
         let _admission = self.begin_web_mutation()?;
         let session_target = self.current_web_session_target(session_target).await?;
-        #[cfg(windows)]
-        self.wait_for_windows_deferred_all_pane_pids().await;
         let response = self
             .dispatch_web_request(
                 requester_pid,
@@ -795,8 +787,6 @@ impl RequestHandler {
     ) -> Result<(), RmuxError> {
         let _admission = self.begin_web_mutation()?;
         let session_target = self.current_web_session_target(session_target).await?;
-        #[cfg(windows)]
-        self.wait_for_windows_deferred_all_pane_pids().await;
         let response = self
             .dispatch_web_request(
                 requester_pid,
@@ -827,8 +817,6 @@ impl RequestHandler {
         let (session_target, pane_id) = self
             .web_session_active_pane_identity(session_target)
             .await?;
-        #[cfg(windows)]
-        self.wait_for_windows_deferred_all_pane_pids().await;
         let response = self
             .dispatch_web_request(
                 requester_pid,
@@ -853,8 +841,6 @@ impl RequestHandler {
         let (session_target, window_id) = self
             .current_web_window_identity(session_target, window_index)
             .await?;
-        #[cfg(windows)]
-        self.wait_for_windows_deferred_all_pane_pids().await;
         let response = self
             .dispatch_web_window_request(
                 requester_pid,
@@ -950,8 +936,6 @@ impl RequestHandler {
         let (session_target, window_id) = self
             .current_web_window_identity(session_target, window_index)
             .await?;
-        #[cfg(windows)]
-        self.wait_for_windows_deferred_all_pane_pids().await;
         let response = self
             .dispatch_web_window_request(
                 requester_pid,
@@ -977,8 +961,6 @@ impl RequestHandler {
         let (session_target, window_id) = self
             .current_web_window_identity(session_target, window_index)
             .await?;
-        #[cfg(windows)]
-        self.wait_for_windows_deferred_all_pane_pids().await;
         let response = self
             .dispatch_web_window_request(
                 requester_pid,

@@ -24,9 +24,7 @@ mod tests {
     use super::super::prepare_lifecycle_event;
     use crate::handler::RequestHandler;
 
-    fn session_name(value: &str) -> SessionName {
-        SessionName::new(value).expect("valid session name")
-    }
+    use crate::test_names::session_name;
 
     async fn create_session(handler: &RequestHandler, name: &str) -> SessionName {
         let session = session_name(name);

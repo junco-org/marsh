@@ -338,7 +338,6 @@ fn list_keys_accepts_tmux_sort_format_and_reverse_flags() {
     }
 }
 
-#[cfg(unix)]
 #[test]
 fn command_arguments_reject_invalid_utf8_without_lossy_replacement() {
     use std::ffi::OsString;

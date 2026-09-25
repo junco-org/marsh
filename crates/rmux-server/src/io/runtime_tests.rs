@@ -66,7 +66,6 @@ impl Host {
             async move {
                 let (io, events) = ShellIo::new(
                     &seed,
-                    Arc::new(StdMutex::new(marsh_core::PolicyValidator::new())),
                     brush_core::env::ShellEnvironment::new(),
                     TerminalGeometry {
                         rows: ROWS,
@@ -180,11 +179,11 @@ fn block_on<F: std::future::Future>(future: F) -> F::Output {
     }
 }
 
-/// An idle pipe job: two real output streams and nothing running in it yet.
+/// An idle pipe shell: two real output streams and nothing running in it yet.
 fn pipes() -> SpawnOptions {
     SpawnOptions {
         io: JobIo::Pipes,
-        environment: None,
+        ..SpawnOptions::default()
     }
 }
 
@@ -193,6 +192,7 @@ fn line() -> CommandOptions {
     CommandOptions {
         on_finish: None,
         close_on_finish: false,
+        on_accept: None,
     }
 }
 
@@ -206,34 +206,47 @@ fn a_job_admitted_from_another_runtime_belongs_to_this_host() {
         .build()
         .expect("the caller's runtime");
     let job = caller
-        .block_on(host.io.spawn("", None, None, pipes()))
-        .expect("admit the job from the caller's runtime");
+        .block_on(host.io.open_shell(std::path::Path::new(""), None, pipes()))
+        .expect("admit the shell from the caller's runtime");
 
     assert_eq!(
         caller.metrics().num_alive_tasks(),
         0,
-        "the caller's runtime carries none of the job's tasks"
+        "the caller's runtime carries none of the shell's tasks"
     );
     assert!(
         host.alive_tasks() > idle,
-        "the job's tasks were created on the host's runtime"
+        "the shell's tasks were created on the host's runtime"
     );
 
-    // Everything the caller had is now gone: its worker, its reactor and its blocking pool. A job
-    // whose pumps or whose pipe registrations had been created there is now a job that can never
-    // report another byte.
+    // The acceptance observation, deliberately: returning here at *completion* would mean the
+    // caller's runtime outlived the command, and dropping it afterwards would prove nothing. The
+    // receipt arrives at admission, the `run_command` future is abandoned with it, and the
+    // caller's whole executor then goes away underneath a line that is still the host's.
+    let (accepted, admission) = tokio::sync::oneshot::channel();
+    let command = caller.block_on(async {
+        let run = job.run_command(
+            "echo marsh",
+            CommandOptions {
+                on_accept: Some(accepted),
+                ..line()
+            },
+        );
+        let mut run = std::pin::pin!(run);
+        tokio::select! {
+            received = admission => received.expect("the line was admitted"),
+            _ = &mut run => panic!("the line concluded before it was ever admitted"),
+        }
+    });
+
+    // Everything the caller had is now gone: its worker, its reactor and its blocking pool. A
+    // shell whose pumps or whose pipe registrations had been created there is now a shell that
+    // can never report another byte, and a command owned by it would never reach a verdict.
     drop(caller);
 
     let completion = host
         .runtime
-        .block_on(async {
-            let command = host
-                .io
-                .start_in(&job, "echo marsh", line())
-                .await
-                .expect("submit a line into the surviving job");
-            command.wait().await
-        })
+        .block_on(command.wait())
         .expect("the line reached a verdict");
     assert_eq!(
         completion.exit_code,
@@ -243,7 +256,7 @@ fn a_job_admitted_from_another_runtime_belongs_to_this_host() {
     assert_eq!(
         host.await_output(b"marsh\n"),
         b"marsh\n".to_vec(),
-        "the job's pipe pumps survived the caller's runtime and delivered its bytes"
+        "the shell's pipe pumps survived the caller's runtime and delivered its bytes"
     );
 
     host.finish();
@@ -255,31 +268,25 @@ fn a_job_admitted_from_a_thread_with_no_runtime_belongs_to_this_host() {
     let idle = host.alive_tasks();
 
     let io = host.io.unleased();
-    let job = std::thread::spawn(move || block_on(io.spawn("", None, None, pipes())))
-        .join()
-        .expect("the caller thread finished")
-        .expect("admit the job from a thread with no runtime");
-
-    assert!(
-        host.alive_tasks() > idle,
-        "the job's tasks were created on the host's runtime, since the caller had none"
-    );
-
-    // The same shape from the other direction: the whole exchange — submitting the line and
-    // waiting for its verdict — is driven by a thread that has no executor of its own.
-    let io = host.io.unleased();
-    let completion = std::thread::spawn(move || {
-        block_on(async move {
-            let command = io
-                .start_in(&job, "echo marsh", line())
-                .await
-                .expect("submit a line from a thread with no runtime");
-            command.wait().await
-        })
+    let job = std::thread::spawn(move || {
+        block_on(io.open_shell(std::path::Path::new(""), None, pipes()))
     })
     .join()
     .expect("the caller thread finished")
-    .expect("the line reached a verdict");
+    .expect("admit the shell from a thread with no runtime");
+
+    assert!(
+        host.alive_tasks() > idle,
+        "the shell's tasks were created on the host's runtime, since the caller had none"
+    );
+
+    // The same shape from the other direction: the whole exchange — running the line and waiting
+    // for its verdict — is driven by a thread that has no executor of its own. `run_command` is
+    // an ordinary future woken by the host's runtime, so a plain parked thread can complete it.
+    let completion = std::thread::spawn(move || block_on(job.run_command("echo marsh", line())))
+        .join()
+        .expect("the caller thread finished")
+        .expect("the line reached a verdict");
 
     assert_eq!(
         completion.exit_code,
@@ -289,7 +296,7 @@ fn a_job_admitted_from_a_thread_with_no_runtime_belongs_to_this_host() {
     assert_eq!(
         host.await_output(b"marsh\n"),
         b"marsh\n".to_vec(),
-        "the job's pipe pumps delivered its bytes"
+        "the shell's pipe pumps delivered its bytes"
     );
 
     host.finish();

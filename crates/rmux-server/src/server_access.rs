@@ -87,7 +87,6 @@ fn current_user_identity() -> std::io::Result<UserIdentity> {
 }
 
 pub(crate) fn resolve_user(value: &str) -> Result<ResolvedUser, RmuxError> {
-    #[cfg(unix)]
     if let Some(user) = IdentityResolver::unix_user_by_name(value).map_err(resolve_user_error)? {
         return Ok(ResolvedUser {
             uid: user.uid,
@@ -98,44 +97,27 @@ pub(crate) fn resolve_user(value: &str) -> Result<ResolvedUser, RmuxError> {
     let uid = value
         .parse::<u32>()
         .map_err(|_| RmuxError::Server(format!("unknown user: {value}")))?;
-    #[cfg(unix)]
-    let Some(user) = IdentityResolver::unix_user_by_uid(uid).map_err(resolve_user_error)?
-    else {
+    let Some(user) = IdentityResolver::unix_user_by_uid(uid).map_err(resolve_user_error)? else {
         return Err(RmuxError::Server(format!("unknown user: {value}")));
     };
 
-    #[cfg(windows)]
-    let _ = uid;
-    #[cfg(windows)]
-    return Err(RmuxError::Server(format!("unknown user: {value}")));
-
-    #[cfg(unix)]
     Ok(ResolvedUser {
         uid,
         name: user.name,
     })
 }
 
-#[cfg(unix)]
 fn resolve_user_error(error: std::io::Error) -> RmuxError {
     RmuxError::Server(format!("failed to resolve user: {error}"))
 }
 
 #[must_use]
 pub(crate) fn user_name_for_uid(uid: u32) -> String {
-    #[cfg(unix)]
-    {
-        IdentityResolver::unix_user_by_uid(uid)
-            .ok()
-            .flatten()
-            .map(|entry| entry.name)
-            .unwrap_or_else(|| uid.to_string())
-    }
-
-    #[cfg(windows)]
-    {
-        uid.to_string()
-    }
+    IdentityResolver::unix_user_by_uid(uid)
+        .ok()
+        .flatten()
+        .map(|entry| entry.name)
+        .unwrap_or_else(|| uid.to_string())
 }
 
 pub(crate) fn apply_access_policy(request: Request, can_write: bool) -> Result<Request, RmuxError> {
@@ -326,13 +308,6 @@ pub(crate) fn validate_server_access_request(
             "-r and -w cannot be used together".to_owned(),
         ));
     }
-    #[cfg(windows)]
-    {
-        Err(RmuxError::Server(
-            "server-access user mutations are unsupported on Windows; named-pipe access is scoped to the current Windows SID".to_owned(),
-        ))
-    }
-    #[cfg(not(windows))]
     {
         if request.user.is_none() {
             return Err(RmuxError::Server("missing user argument".to_owned()));
@@ -359,7 +334,7 @@ mod tests {
     };
 
     #[test]
-    fn access_store_can_key_owner_by_windows_sid() {
+    fn access_store_keys_owner_by_an_identity_that_has_no_uid() {
         let owner = UserIdentity::Sid("S-1-5-21-1000".into());
         let store = ServerAccessStore::new_for_identity(0, owner.clone());
 
@@ -464,17 +439,6 @@ mod tests {
         );
     }
 
-    #[cfg(windows)]
-    #[test]
-    fn access_store_does_not_trust_uid_zero_on_windows() {
-        let owner = UserIdentity::Sid("S-1-5-21-1000".into());
-        let store = ServerAccessStore::new_for_identity(0, owner.clone());
-
-        assert_eq!(store.mode_for_identity(&owner), Some(AccessMode::ReadWrite));
-        assert_eq!(store.mode_for_identity(&UserIdentity::Uid(0)), None);
-    }
-
-    #[cfg(unix)]
     #[test]
     fn access_store_trusts_uid_zero_only_on_unix() {
         let owner = UserIdentity::Uid(1000);
@@ -494,7 +458,6 @@ mod tests {
         assert_eq!(store.mode_for_identity(&owner), Some(AccessMode::ReadWrite));
     }
 
-    #[cfg(unix)]
     #[test]
     fn resolve_user_uses_platform_account_database() {
         let UserIdentity::Uid(uid) = current_user_identity().expect("current identity") else {
@@ -1129,39 +1092,5 @@ mod tests {
             start_is_absolute: false,
             end_is_absolute: false,
         }
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn server_access_user_mutations_are_explicitly_unsupported_on_windows() {
-        let error = validate_server_access_request(&ServerAccessRequest {
-            add: true,
-            deny: false,
-            list: false,
-            read_only: false,
-            write: false,
-            target: None,
-            user: Some("someone".to_owned()),
-        })
-        .expect_err("Windows cannot safely map server-access users to Unix UIDs");
-
-        assert!(error
-            .to_string()
-            .contains("unsupported on Windows; named-pipe access"));
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn server_access_list_still_validates_on_windows() {
-        validate_server_access_request(&ServerAccessRequest {
-            add: false,
-            deny: false,
-            list: true,
-            read_only: false,
-            write: false,
-            target: None,
-            user: None,
-        })
-        .expect("server-access -l remains read-only and portable");
     }
 }

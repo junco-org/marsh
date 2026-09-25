@@ -33,7 +33,6 @@ pub(crate) use types::{
 pub(crate) use types::{
     BorderControlRange, MouseDragHandler, PaneScrollbarsMode, ScrollbarPosition,
 };
-#[cfg_attr(windows, allow(unused_imports))]
 pub(crate) use types::{StatusLineLayout, StatusRangeType};
 
 const KEYC_CLICK_TIMEOUT: Duration = Duration::from_millis(300);

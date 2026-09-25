@@ -131,23 +131,6 @@ async fn create_quiet_attached_session(
     control_rx
 }
 
-#[cfg(windows)]
-fn quiet_overlay_command() -> Vec<String> {
-    let system_root =
-        std::env::var_os("SystemRoot").unwrap_or_else(|| std::ffi::OsString::from(r"C:\Windows"));
-    let cmd = std::path::PathBuf::from(system_root)
-        .join("System32")
-        .join("cmd.exe");
-    vec![
-        cmd.to_string_lossy().into_owned(),
-        "/d".to_owned(),
-        "/q".to_owned(),
-        "/c".to_owned(),
-        "ping -n 120 127.0.0.1 >NUL".to_owned(),
-    ]
-}
-
-#[cfg(unix)]
 fn quiet_overlay_command() -> Vec<String> {
     ["/bin/sh", "-c", "sleep 60"]
         .into_iter()
@@ -586,13 +569,23 @@ async fn stale_same_pid_popup_callbacks_cannot_mutate_replacement_popup() {
         .await
         .expect("stale waiter callback is ignored");
 
+    let mut cleared_frames = 0usize;
+    while let Ok(control) = replacement_rx.try_recv() {
+        if matches!(&control, AttachControl::Overlay(frame) if frame.frame.is_empty()) {
+            cleared_frames += 1;
+        }
+    }
+    assert_eq!(
+        cleared_frames, 0,
+        "stale callbacks must not clear the replacement popup with an empty overlay frame"
+    );
+
     let active_attach = handler.active_attach.lock().await;
     let active = &active_attach.by_pid[&requester_pid];
     assert!(
         matches!(active.overlay, Some(ClientOverlayState::Popup(_))),
         "old reader/waiter callbacks must not refresh or close B's colliding popup"
     );
-    assert_eq!(active.overlay.as_ref().map(ClientOverlayState::id), Some(1));
 }
 
 #[tokio::test]

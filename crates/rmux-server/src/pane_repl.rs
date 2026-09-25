@@ -28,9 +28,9 @@
 //! terminal, held only while no command is running in it, and revoked the instant one is admitted.
 //!
 //! Releasing it before *any* mutating call into the multiplexer is what keeps this task from
-//! waiting on itself. `start_in`, a stop and an end-of-input closure all wait for the outstanding
-//! lease to be acknowledged before they proceed; holding the lease across one of them is a
-//! deadlock, not a slow path.
+//! waiting on itself. Submitting a line, a stop and an end-of-input closure all wait for the
+//! outstanding lease to be acknowledged before they proceed; holding the lease across one of
+//! them is a deadlock, not a slow path.
 //!
 //! # Not a second editor
 //!
@@ -44,9 +44,9 @@ use std::io::Write as _;
 use std::time::Duration;
 
 use marsh_core::shellmux::{
-    CommandOptions, IdleTerminal, JobIo, JobView, MuxError, ShellId, jobctl, repl,
+    jobctl, repl, CommandOptions, IdleTerminal, JobIo, JobView, MuxError, ShellId,
 };
-use rmux_core::{Utf8Config, text_width};
+use rmux_core::{text_width, Utf8Config};
 
 use crate::handler::pane_support::pane_prompt_input::decode_prompt_input_event;
 use crate::handler::prompt_support::PromptInputEvent;
@@ -271,11 +271,15 @@ impl Editing {
             PromptInputEvent::Enter => Step::Submit,
             PromptInputEvent::Backspace => changed(self.editor.delete_left()),
             PromptInputEvent::Delete => changed(self.editor.delete_at_cursor()),
-            PromptInputEvent::Left | PromptInputEvent::Ctrl('b') => changed(self.editor.move_left()),
+            PromptInputEvent::Left | PromptInputEvent::Ctrl('b') => {
+                changed(self.editor.move_left())
+            }
             PromptInputEvent::Right | PromptInputEvent::Ctrl('f') => {
                 changed(self.editor.move_right())
             }
-            PromptInputEvent::Home | PromptInputEvent::Ctrl('a') => changed(self.editor.move_home()),
+            PromptInputEvent::Home | PromptInputEvent::Ctrl('a') => {
+                changed(self.editor.move_home())
+            }
             PromptInputEvent::End | PromptInputEvent::Ctrl('e') => changed(self.editor.move_end()),
             PromptInputEvent::Up | PromptInputEvent::Ctrl('p') => {
                 changed(self.editor.history_up(&self.history))
@@ -385,7 +389,7 @@ impl Prompt {
             };
 
             let session = self.session(&lease).await;
-            // Released before *anything* mutating: `start_in`, a stop and an end-of-input closure
+            // Released before *anything* mutating: a submitted line, a stop and an end-of-input
             // all wait for this lease to be acknowledged first.
             self.release(lease).await;
 
@@ -556,7 +560,7 @@ impl Prompt {
         let full = self.line.take_submitted();
         let input = repl::parse(&full);
         // Only a real command line can be unfinished. A frontend builtin has its own grammar, and
-        // asking brush whether `exit` is complete would answer about a different `exit`.
+        // asking brush whether `jobs` is complete would answer about a different `jobs`.
         let command = match &input {
             repl::Input::Foreground(cmd) | repl::Input::Background { cmd, .. } => Some(cmd.clone()),
             _ => None,
@@ -666,12 +670,6 @@ impl Prompt {
             repl::Input::Empty => Vec::new(),
             repl::Input::Invalid(message) => vec![message],
             repl::Input::Jobs => self.jobs_table(),
-            repl::Input::Exit => {
-                // Graceful: whatever is still running concludes and is gated, rather than being
-                // discarded because the console went away.
-                let _ = self.io.stop(&self.job, false).await;
-                return std::ops::ControlFlow::Break(());
-            }
             repl::Input::Fg(name) => self.foreground(name.as_deref()).await,
             repl::Input::Stop(args) => self.stop_job(&args).await,
             // Never `jobctl::kill`: a signal asked for as a workload command is workload, and
@@ -679,9 +677,7 @@ impl Prompt {
             // that every other line goes through.
             repl::Input::Kill(args) => return self.submit(kill_line(&args), suffix).await,
             repl::Input::SpawnDir { name, dir } => self.spawn_job(name, Some(&dir), None).await,
-            repl::Input::Background { cmd, name } => {
-                self.spawn_job(name, None, Some(&cmd)).await
-            }
+            repl::Input::Background { cmd, name } => self.spawn_job(name, None, Some(&cmd)).await,
             repl::Input::Foreground(cmd) => return self.submit(cmd, suffix).await,
         };
 
@@ -691,11 +687,14 @@ impl Prompt {
         std::ops::ControlFlow::Continue(())
     }
 
-    /// Submits one command line into this pane's own job and waits for its verdict.
+    /// Submits one command line into this pane's own shell and waits for its verdict.
     async fn submit(&mut self, cmd: String, suffix: Vec<u8>) -> std::ops::ControlFlow<()> {
+        // The admission, not the completion. This prompt still owes the program the input typed
+        // behind its line, and waiting for the verdict first would deadlock anything reading
+        // standard input.
         let command = match self
             .io
-            .start_in(&self.job, &cmd, CommandOptions::default())
+            .start_command(&self.job, &cmd, CommandOptions::default())
             .await
         {
             Ok(command) => command,
@@ -726,9 +725,9 @@ impl Prompt {
             // getting a verdict, and inventing one would be worse than saying nothing.
             return std::ops::ControlFlow::Continue(());
         };
-        // Every outcome that is not an ordinary publication is reported: a denial, a stale path
-        // and a discard are all things the user must see, because the command may have exited zero
-        // and still changed nothing.
+        // Every outcome that is not an ordinary publication is reported: a denial and a discard
+        // are both things the user must see, because the command may have exited zero and still
+        // changed nothing.
         let report = repl::report_lines(self.job.id(), &completion.outcome);
         self.deliver(report, Some(completion.id)).await
     }
@@ -899,7 +898,11 @@ enum Submission {
 
 /// A repaint when something changed, nothing when it did not.
 const fn changed(changed: bool) -> Step {
-    if changed { Step::Changed } else { Step::Idle }
+    if changed {
+        Step::Changed
+    } else {
+        Step::Idle
+    }
 }
 
 /// The managed `kill` invocation a typed `kill` becomes.
@@ -924,7 +927,11 @@ fn caret(prompt: &str, text: &str, cursor: usize, utf8: &Utf8Config) -> (usize, 
     let head = &text[..prompt_buffer::byte_index_for_char(text, cursor)];
     let row = head.matches('\n').count();
     let last = head.rsplit('\n').next().unwrap_or(head);
-    let indent = if row == 0 { text_width(prompt, utf8) } else { 0 };
+    let indent = if row == 0 {
+        text_width(prompt, utf8)
+    } else {
+        0
+    };
     (row, indent + text_width(last, utf8))
 }
 

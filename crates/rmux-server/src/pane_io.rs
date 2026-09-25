@@ -1,34 +1,20 @@
-#[cfg(any(unix, windows))]
 use rmux_core::TerminalPassthrough;
-#[cfg(any(unix, windows))]
 use rmux_proto::{AttachFrameDecoder, AttachMessage};
-#[cfg(any(unix, windows))]
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
-#[cfg(any(unix, windows))]
 use std::sync::Arc;
-#[cfg(any(unix, windows))]
 use std::{collections::VecDeque, io, sync::atomic::Ordering};
-#[cfg(any(unix, windows))]
 use tokio::sync::mpsc;
-#[cfg(any(unix, windows))]
 use tokio::sync::watch;
-#[cfg(any(unix, windows))]
 use tokio::time::{Duration, Instant};
 
 pub(crate) const READ_BUFFER_SIZE: usize = 64 * 1024;
-#[cfg(any(unix, windows))]
 const ATTACH_INTERACTIVE_OUTPUT_WINDOW: Duration = Duration::from_millis(250);
-#[cfg(any(unix, windows))]
 // Bound each opportunistic socket drain so sustained attach input cannot keep
 // this task away from render, control, shutdown, or escape-flush futures.
 const MAX_IMMEDIATE_ATTACH_READS: usize = 8;
-#[cfg(windows)]
-const ATTACH_EXIT_OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
-#[cfg(any(unix, windows))]
 const ATTACH_INPUT_STACK_PAYLOAD: usize = 1024;
 #[cfg(all(unix, test))]
 const MAX_PREDICTED_LOCAL_ECHO_BYTES: usize = 16;
-#[cfg(unix)]
 const PREDICTED_LOCAL_ECHO_TIMEOUT: Duration = Duration::from_millis(250);
 
 #[cfg(test)]
@@ -136,39 +122,31 @@ mod refresh_scheduler;
 mod types;
 mod wire;
 
-#[cfg(any(unix, windows))]
 use crate::renderer::{PaneRenderDelta, PaneRenderDeltaFrame};
 #[cfg(test)]
 pub(crate) use attach_control::release_attach_control_backlog;
-#[cfg_attr(windows, allow(unused_imports))]
 pub(crate) use attach_control::{AttachControl, AttachControlSender};
-#[cfg(any(unix, windows))]
 use attach_output_batch::{
     collect_attach_output_batch, collect_attach_output_batch_metadata, AttachOutputBatch,
 };
-#[cfg(all(any(unix, windows), feature = "web"))]
+#[cfg(all(unix, feature = "web"))]
 pub(crate) use attach_transport::in_process_attach_pair;
 use attach_transport::{AttachTransport, TryAttachRead};
-#[cfg(any(unix, windows))]
 use control::{
     apply_pending_attach_controls, coalesce_render_switches, preserves_live_output,
     recv_attach_control, redraw_after_persistent_overlay_state_advance, should_emit_overlay,
     switch_attach_target, take_pending_live_passthroughs, try_recv_attach_control,
     PendingAttachAction, PendingAttachExit, PendingAttachInputState,
 };
-#[cfg(any(unix, windows))]
 use deferred_passthrough::{
     clear_deferred_passthroughs_if_target_changed, defer_passthroughs, flush_deferred_passthroughs,
     take_passthrough_frame_with_live_passthroughs,
 };
-#[cfg(any(unix, windows))]
 use exit_log::{record_attach_error, record_attach_exit, AttachExitReason};
 pub(crate) use live_render::LivePaneRender;
-#[cfg(any(unix, windows))]
 use pending_escape::PendingEscapeFlush;
 #[cfg(test)]
 pub(crate) use persistent_overlay::replay_client_visible_payloads;
-#[cfg(any(unix, windows))]
 use persistent_overlay::{
     accept_persistent_overlay_state, advance_persistent_overlay_state, clear_then_base_frame,
     defer_persistent_clear, discard_stale_persistent_overlays, is_stale_persistent_switch,
@@ -179,21 +157,17 @@ use persistent_overlay::{
 pub(crate) use reader::publish_shell_pane_bytes;
 #[cfg(test)]
 pub(crate) use reader::{publish_pane_bytes_capturing_alerts, publish_pane_bytes_for_test};
-#[cfg(any(unix, windows))]
 use refresh_scheduler::{
     wait_for_refresh_deadline, AttachRefreshScheduler, AttachStatusRefreshScheduler,
 };
 #[cfg(test)]
 pub(crate) use types::pane_output_channel_with_limits;
-#[cfg(any(unix, windows))]
 pub(crate) use types::LiveAttachInputContext;
-#[cfg_attr(windows, allow(unused_imports))]
 pub(crate) use types::{
     pane_output_channel, AttachSessionUpgrade, AttachTarget, HandleOutcome, OverlayFrame,
-    PaneAlertCallback, PaneAlertEvent, PaneBoundary, PaneExitEvent,
-    PaneInvalidationReason, PaneObservationItem, PaneOutputReceiver, PaneOutputSender,
+    PaneAlertCallback, PaneAlertEvent, PaneBoundary, PaneExitEvent, PaneInvalidationReason,
+    PaneObservationItem, PaneOutputReceiver, PaneOutputSender,
 };
-#[cfg(any(unix, windows))]
 use wire::{
     emit_attach_bytes, emit_attach_frame, emit_attach_message, emit_attach_stop,
     emit_coalescible_render_frame, emit_detached_attach_stop, emit_exited_attach_stop,
@@ -201,10 +175,8 @@ use wire::{
     recv_pane_output_optional, try_read_socket_bytes,
 };
 
-#[cfg(any(unix, windows))]
 struct AttachControlBacklogCleanup(Arc<AtomicUsize>);
 
-#[cfg(any(unix, windows))]
 impl Drop for AttachControlBacklogCleanup {
     fn drop(&mut self) {
         // The receiver and all deferred controls are dropped before this
@@ -214,7 +186,6 @@ impl Drop for AttachControlBacklogCleanup {
 }
 
 #[allow(clippy::too_many_arguments)]
-#[cfg(any(unix, windows))]
 pub(crate) async fn forward_attach(
     stream: impl Into<AttachTransport>,
     target: AttachTarget,
@@ -1296,7 +1267,6 @@ pub(crate) async fn forward_attach(
                         shutdown_draining = true;
                         continue;
                     };
-                    #[cfg(unix)]
                     if let rmux_core::events::OutputCursorItem::Event(event) = &item {
                         if event.passthroughs().is_empty() {
                             match consume_predicted_echo(&mut current_target, event.bytes()) {
@@ -1609,7 +1579,6 @@ pub(crate) async fn forward_attach(
 }
 
 #[allow(clippy::too_many_arguments)]
-#[cfg(any(unix, windows))]
 async fn synchronize_persistent_overlay_epoch(
     persistent_overlay_epoch: &AtomicU64,
     stream: &AttachTransport,
@@ -1642,12 +1611,10 @@ async fn synchronize_persistent_overlay_epoch(
     .await
 }
 
-#[cfg(any(unix, windows))]
 fn attach_shutdown_observable(shutdown: &watch::Receiver<()>) -> bool {
     shutdown.has_changed().unwrap_or(true)
 }
 
-#[cfg(any(unix, windows))]
 /// Linearize one attach mutation batch against shutdown.
 ///
 /// Callers keep the returned Drain guard through the batch's last handler mutation and any
@@ -1669,7 +1636,6 @@ fn begin_attach_mutation_batch(
     Some(guard)
 }
 
-#[cfg(any(unix, windows))]
 fn take_pending_terminal_attach_control(
     deferred_controls: &mut VecDeque<AttachControl>,
     mut attach_controls: Option<&mut mpsc::UnboundedReceiver<AttachControl>>,
@@ -1697,7 +1663,6 @@ fn take_pending_terminal_attach_control(
     }
 }
 
-#[cfg(any(unix, windows))]
 async fn finish_terminal_attach_control(
     control: AttachControl,
     stream: &AttachTransport,
@@ -1745,7 +1710,6 @@ async fn finish_terminal_attach_control(
     }
 }
 
-#[cfg(any(unix, windows))]
 fn log_attach_exit(
     live_input: &LiveAttachInputContext,
     current_target: &types::OpenAttachTarget,
@@ -1758,7 +1722,6 @@ fn log_attach_exit(
     );
 }
 
-#[cfg(any(unix, windows))]
 async fn finish_pending_attach_exit(
     reason: AttachExitReason,
     stream: &AttachTransport,
@@ -1775,7 +1738,6 @@ async fn finish_pending_attach_exit(
     .await
 }
 
-#[cfg(any(unix, windows))]
 fn pending_attach_exit_output_batch(
     drop_pending_output: bool,
     snapshot_covered_output_before_sequence: Option<u64>,
@@ -1790,7 +1752,6 @@ fn pending_attach_exit_output_batch(
     })
 }
 
-#[cfg(any(unix, windows))]
 async fn finish_pending_attach_exit_with_batch(
     reason: AttachExitReason,
     stream: &AttachTransport,
@@ -1814,7 +1775,6 @@ async fn finish_pending_attach_exit_with_batch(
         current_target.pane_output.take()
     };
     if let Some(mut pane_output) = pane_output {
-        #[cfg(not(windows))]
         while let Some(item) = pane_output.try_recv() {
             if collect_final_attach_output_item(
                 item,
@@ -1824,28 +1784,6 @@ async fn finish_pending_attach_exit_with_batch(
                 &mut saw_gap,
             ) {
                 break;
-            }
-        }
-        #[cfg(windows)]
-        {
-            let deadline = Instant::now() + ATTACH_EXIT_OUTPUT_DRAIN_TIMEOUT;
-            loop {
-                let item = match pane_output.try_recv() {
-                    Some(item) => item,
-                    None => match tokio::time::timeout_at(deadline, pane_output.recv()).await {
-                        Ok(item) => item,
-                        Err(_) => break,
-                    },
-                };
-                if collect_final_attach_output_item(
-                    item,
-                    &mut pane_output,
-                    &mut output_bytes,
-                    &mut passthroughs,
-                    &mut saw_gap,
-                ) {
-                    break;
-                }
             }
         }
     }
@@ -1877,7 +1815,6 @@ async fn finish_pending_attach_exit_with_batch(
     emit_exited_attach_stop(stream, current_target).await
 }
 
-#[cfg(any(unix, windows))]
 fn collect_final_attach_output_item(
     item: rmux_core::events::OutputCursorItem,
     pane_output: &mut types::PaneOutputReceiver,
@@ -1889,7 +1826,6 @@ fn collect_final_attach_output_item(
     collect_final_attach_output_batch(batch, output_bytes, passthroughs, saw_gap)
 }
 
-#[cfg(any(unix, windows))]
 fn collect_final_attach_output_batch(
     batch: AttachOutputBatch,
     output_bytes: &mut Vec<u8>,
@@ -1916,7 +1852,6 @@ fn collect_final_attach_output_batch(
     }
 }
 
-#[cfg(any(unix, windows))]
 fn clear_close_pane_output_after_refresh_if_target_changed(
     target_changed: bool,
     close_pane_output_after_refresh: &mut bool,
@@ -1926,7 +1861,6 @@ fn clear_close_pane_output_after_refresh_if_target_changed(
     }
 }
 
-#[cfg(any(unix, windows))]
 async fn reschedule_status_refresh_if_target_changed(
     target_changed: bool,
     status_refresh: &mut AttachStatusRefreshScheduler,
@@ -1938,7 +1872,6 @@ async fn reschedule_status_refresh_if_target_changed(
     }
 }
 
-#[cfg(any(unix, windows))]
 async fn emit_live_render_frame(
     stream: &AttachTransport,
     current_target: &mut types::OpenAttachTarget,
@@ -1967,7 +1900,6 @@ async fn emit_live_render_frame(
     }
 }
 
-#[cfg(any(unix, windows))]
 async fn try_forward_plain_output(
     stream: &AttachTransport,
     current_target: &mut types::OpenAttachTarget,
@@ -2006,7 +1938,6 @@ async fn try_forward_plain_output(
     Ok(false)
 }
 
-#[cfg(any(unix, windows))]
 async fn schedule_attach_render_refresh(
     pane_refresh: &mut AttachRefreshScheduler,
     pane_refresh_requires_full: &mut bool,
@@ -2021,7 +1952,6 @@ async fn schedule_attach_render_refresh(
     pane_refresh.schedule_now();
 }
 
-#[cfg(any(unix, windows))]
 fn collect_pending_attach_output_batch_metadata(
     current_target: &mut types::OpenAttachTarget,
 ) -> Option<AttachOutputBatch> {
@@ -2033,7 +1963,6 @@ fn collect_pending_attach_output_batch_metadata(
     ))
 }
 
-#[cfg(any(unix, windows))]
 async fn refresh_current_attach_client(live_input: &LiveAttachInputContext) {
     if let Ok(session_name) = live_input
         .handler
@@ -2047,7 +1976,6 @@ async fn refresh_current_attach_client(live_input: &LiveAttachInputContext) {
     }
 }
 
-#[cfg(any(unix, windows))]
 async fn reschedule_status_refresh_for_target(
     status_refresh: &mut AttachStatusRefreshScheduler,
     live_input: &LiveAttachInputContext,
@@ -2057,7 +1985,6 @@ async fn reschedule_status_refresh_for_target(
         .await;
 }
 
-#[cfg(any(unix, windows))]
 async fn reschedule_status_refresh_for_session(
     status_refresh: &mut AttachStatusRefreshScheduler,
     live_input: &LiveAttachInputContext,
@@ -2071,7 +1998,6 @@ async fn reschedule_status_refresh_for_session(
     );
 }
 
-#[cfg(any(unix, windows))]
 async fn sync_pending_escape_flush(
     pending_escape_flush: &mut PendingEscapeFlush,
     live_input: &LiveAttachInputContext,
@@ -2085,7 +2011,6 @@ async fn sync_pending_escape_flush(
     sync_pending_escape_flush_with_escape_time(pending_escape_flush, pending_input, escape_time);
 }
 
-#[cfg(any(unix, windows))]
 async fn absorb_transient_terminal_prefix(
     live_input: &LiveAttachInputContext,
     pending_input: &mut Vec<u8>,
@@ -2102,7 +2027,6 @@ async fn absorb_transient_terminal_prefix(
     sync_pending_escape_flush(pending_escape_flush, live_input, pending_input).await;
 }
 
-#[cfg(any(unix, windows))]
 async fn flush_due_pending_escape_input(
     pending_escape_flush: &mut PendingEscapeFlush,
     live_input: &LiveAttachInputContext,
@@ -2147,14 +2071,12 @@ async fn flush_due_pending_escape_input(
     Ok(())
 }
 
-#[cfg(any(unix, windows))]
 fn pending_escape_deadline_due(pending_escape_flush: &PendingEscapeFlush) -> bool {
     pending_escape_flush
         .deadline()
         .is_some_and(|deadline| deadline <= Instant::now())
 }
 
-#[cfg(any(unix, windows))]
 fn sync_pending_escape_flush_with_escape_time(
     pending_escape_flush: &mut PendingEscapeFlush,
     pending_input: &[u8],
@@ -2166,7 +2088,6 @@ fn sync_pending_escape_flush_with_escape_time(
     pending_escape_flush.sync(pending_input, escape_time);
 }
 
-#[cfg(any(unix, windows))]
 #[allow(clippy::too_many_arguments)]
 async fn process_attach_socket_messages(
     decoder: &mut AttachFrameDecoder,
@@ -2214,7 +2135,6 @@ async fn process_attach_socket_messages(
     Ok(())
 }
 
-#[cfg(any(unix, windows))]
 fn mark_attach_interactive_input(
     pane_refresh: &mut AttachRefreshScheduler,
     last_client_input_at: &mut Option<Instant>,
@@ -2223,7 +2143,6 @@ fn mark_attach_interactive_input(
     pane_refresh.note_interactive_output();
 }
 
-#[cfg(any(unix, windows))]
 enum DeferredAttachInputOutput {
     Frame(AttachMessage),
     Unlock {
@@ -2233,7 +2152,6 @@ enum DeferredAttachInputOutput {
     },
 }
 
-#[cfg(any(unix, windows))]
 async fn process_socket_messages(
     decoder: &mut AttachFrameDecoder,
     stream: &AttachTransport,
@@ -2455,7 +2373,6 @@ async fn process_socket_messages(
     Ok(forwarded_to_pane)
 }
 
-#[cfg(any(unix, windows))]
 async fn process_attach_data_payload(
     live_input: &LiveAttachInputContext,
     stream: &AttachTransport,
@@ -2505,7 +2422,6 @@ fn predictable_local_echo_prefix_len(bytes: &[u8]) -> usize {
     0
 }
 
-#[cfg(unix)]
 fn consume_predicted_echo(
     current_target: &mut types::OpenAttachTarget,
     bytes: &[u8],
@@ -2539,7 +2455,6 @@ fn consume_predicted_echo(
     PredictedEcho::Consumed
 }
 
-#[cfg(unix)]
 fn expire_stale_predicted_echo(current_target: &mut types::OpenAttachTarget) {
     if current_target
         .predicted_echo_started_at
@@ -2551,13 +2466,11 @@ fn expire_stale_predicted_echo(current_target: &mut types::OpenAttachTarget) {
     }
 }
 
-#[cfg(unix)]
 fn clear_predicted_echo(current_target: &mut types::OpenAttachTarget) {
     current_target.predicted_echo.clear();
     current_target.predicted_echo_started_at = None;
 }
 
-#[cfg(unix)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PredictedEcho {
     NoPrediction,
@@ -2565,7 +2478,6 @@ enum PredictedEcho {
     Mismatch,
 }
 
-#[cfg(any(unix, windows))]
 fn should_treat_attach_output_as_interactive(last_client_input_at: Option<Instant>) -> bool {
     last_client_input_at.is_some_and(|input_at| {
         Instant::now().saturating_duration_since(input_at) <= ATTACH_INTERACTIVE_OUTPUT_WINDOW

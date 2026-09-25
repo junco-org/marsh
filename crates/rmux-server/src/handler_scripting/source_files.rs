@@ -144,14 +144,7 @@ impl ParsedSourceFileCommand {
 }
 
 pub(super) fn default_config_paths() -> Vec<String> {
-    #[cfg(windows)]
-    {
-        windows_default_config_paths()
-    }
-    #[cfg(not(windows))]
-    {
-        unix_default_config_paths()
-    }
+    unix_default_config_paths()
 }
 
 pub(super) fn default_tmux_fallback_paths() -> Vec<String> {
@@ -159,16 +152,7 @@ pub(super) fn default_tmux_fallback_paths() -> Vec<String> {
         return Vec::new();
     }
 
-    let paths = {
-        #[cfg(windows)]
-        {
-            windows_tmux_fallback_paths()
-        }
-        #[cfg(not(windows))]
-        {
-            unix_tmux_fallback_paths()
-        }
-    };
+    let paths = { unix_tmux_fallback_paths() };
 
     dedupe_existing_source_paths(paths)
 }
@@ -193,7 +177,6 @@ fn dedupe_existing_source_paths(paths: Vec<String>) -> Vec<String> {
     deduped
 }
 
-#[cfg(unix)]
 fn existing_source_path_identity(path: &Path) -> Option<String> {
     use std::os::unix::fs::MetadataExt;
 
@@ -201,20 +184,6 @@ fn existing_source_path_identity(path: &Path) -> Option<String> {
     Some(format!("{}:{}", metadata.dev(), metadata.ino()))
 }
 
-#[cfg(not(unix))]
-fn existing_source_path_identity(path: &Path) -> Option<String> {
-    let canonical = fs::canonicalize(path).ok()?;
-    #[cfg(windows)]
-    {
-        Some(canonical.to_string_lossy().to_ascii_lowercase())
-    }
-    #[cfg(not(windows))]
-    {
-        Some(canonical.to_string_lossy().into_owned())
-    }
-}
-
-#[cfg(not(windows))]
 fn unix_default_config_paths() -> Vec<String> {
     let mut paths = Vec::new();
     let mut push_unique = |path: String| {
@@ -237,7 +206,6 @@ fn unix_default_config_paths() -> Vec<String> {
     paths
 }
 
-#[cfg(not(windows))]
 fn unix_tmux_fallback_paths() -> Vec<String> {
     let mut paths = Vec::new();
     let mut push_unique = |path: String| {
@@ -255,64 +223,6 @@ fn unix_tmux_fallback_paths() -> Vec<String> {
     }
     if let Some(home) = nonempty_env("HOME") {
         push_unique(format!("{home}/.config/tmux/tmux.conf"));
-    }
-
-    paths
-}
-
-#[cfg(windows)]
-fn windows_default_config_paths() -> Vec<String> {
-    let mut paths = Vec::new();
-    let mut push_unique = |path: PathBuf| {
-        let path = path.to_string_lossy().into_owned();
-        if !paths.contains(&path) {
-            paths.push(path);
-        }
-    };
-
-    if let Some(xdg_config_home) = nonempty_env("XDG_CONFIG_HOME") {
-        push_unique(
-            PathBuf::from(xdg_config_home)
-                .join("rmux")
-                .join("rmux.conf"),
-        );
-    }
-    if let Some(userprofile) = nonempty_env("USERPROFILE") {
-        let userprofile = PathBuf::from(userprofile);
-        push_unique(userprofile.join(".rmux.conf"));
-    }
-    if let Some(appdata) = nonempty_env("APPDATA") {
-        push_unique(PathBuf::from(appdata).join("rmux").join("rmux.conf"));
-    }
-    if let Some(config_file) = nonempty_env("RMUX_CONFIG_FILE") {
-        push_unique(PathBuf::from(config_file));
-    }
-
-    paths
-}
-
-#[cfg(windows)]
-fn windows_tmux_fallback_paths() -> Vec<String> {
-    let mut paths = Vec::new();
-    let mut push_unique = |path: PathBuf| {
-        let path = path.to_string_lossy().into_owned();
-        if !paths.contains(&path) {
-            paths.push(path);
-        }
-    };
-
-    if let Some(xdg_config_home) = nonempty_env("XDG_CONFIG_HOME") {
-        push_unique(
-            PathBuf::from(xdg_config_home)
-                .join("tmux")
-                .join("tmux.conf"),
-        );
-    }
-    if let Some(userprofile) = nonempty_env("USERPROFILE") {
-        push_unique(PathBuf::from(userprofile).join(".tmux.conf"));
-    }
-    if let Some(appdata) = nonempty_env("APPDATA") {
-        push_unique(PathBuf::from(appdata).join("tmux").join("tmux.conf"));
     }
 
     paths
@@ -358,21 +268,7 @@ pub(super) fn source_inputs_for_path_with_diagnostics(
     stdin: Option<&str>,
     read_policy: SourceReadPolicy,
 ) -> Result<SourcePathRead, RmuxError> {
-    #[cfg(unix)]
     if is_unix_null_config_path(path) {
-        return Ok(SourcePathRead {
-            inputs: vec![SourceInput {
-                current_file: path.to_owned(),
-                contents: String::new(),
-            }],
-            error: None,
-            matched_files: 1,
-            content_bytes: 0,
-        });
-    }
-
-    #[cfg(windows)]
-    if is_windows_null_config_path(path) {
         return Ok(SourcePathRead {
             inputs: vec![SourceInput {
                 current_file: path.to_owned(),
@@ -401,7 +297,6 @@ pub(super) fn source_inputs_for_path_with_diagnostics(
             content_bytes: stdin.len(),
         });
     }
-
     let pattern = glob_pattern_for_source_path(path, cwd);
     let has_glob_metachars = source_path_has_glob_metachars(path);
     let entries = glob::glob(&pattern).map_err(|error| {
@@ -537,7 +432,6 @@ fn validate_strict_source_metadata(metadata: &fs::Metadata) -> io::Result<()> {
     Ok(())
 }
 
-#[cfg(unix)]
 fn open_strict_source_entry(entry: &Path) -> io::Result<File> {
     use rustix::fs::{open, Mode, OFlags};
 
@@ -548,11 +442,6 @@ fn open_strict_source_entry(entry: &Path) -> io::Result<File> {
     )
     .map_err(io::Error::from)?;
     Ok(File::from(fd))
-}
-
-#[cfg(not(unix))]
-fn open_strict_source_entry(entry: &Path) -> io::Result<File> {
-    File::open(entry)
 }
 
 fn read_tmux_compat_source_entry(entry: &Path) -> io::Result<String> {
@@ -585,7 +474,6 @@ fn validate_tmux_compat_regular_metadata(metadata: &fs::Metadata) -> io::Result<
     Ok(())
 }
 
-#[cfg(unix)]
 fn open_tmux_compat_regular_file(entry: &Path) -> io::Result<File> {
     use rustix::fs::{open, Mode, OFlags};
 
@@ -598,31 +486,12 @@ fn open_tmux_compat_regular_file(entry: &Path) -> io::Result<File> {
     Ok(File::from(fd))
 }
 
-#[cfg(not(unix))]
-fn open_tmux_compat_regular_file(entry: &Path) -> io::Result<File> {
-    File::open(entry)
-}
-
 fn oversized_source_config_error() -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, "source file exceeds 16 MiB")
 }
 
-#[cfg(unix)]
 fn is_unix_null_config_path(path: &str) -> bool {
     Path::new(path) == Path::new("/dev/null")
-}
-
-#[cfg(windows)]
-fn is_windows_null_config_path(path: &str) -> bool {
-    let trimmed = path.trim_end_matches(['\\', '/']);
-    let Some(component) = trimmed.rsplit(['\\', '/']).next() else {
-        return false;
-    };
-    let component = component.trim_end_matches(':');
-    let device = component
-        .split_once('.')
-        .map_or(component, |(stem, _)| stem);
-    device.eq_ignore_ascii_case("NUL")
 }
 
 fn glob_pattern_for_source_path(path: &str, cwd: Option<&Path>) -> String {
@@ -642,27 +511,11 @@ fn glob_pattern_for_source_path(path: &str, cwd: Option<&Path>) -> String {
 }
 
 fn path_to_glob_pattern(path: &Path) -> String {
-    #[cfg(windows)]
-    {
-        path.to_string_lossy().replace('\\', "/")
-    }
-
-    #[cfg(not(windows))]
-    {
-        path.to_string_lossy().into_owned()
-    }
+    path.to_string_lossy().into_owned()
 }
 
 fn source_entry_display_path(path: &Path) -> String {
-    #[cfg(windows)]
-    {
-        path.to_string_lossy().replace('/', "\\")
-    }
-
-    #[cfg(not(windows))]
-    {
-        path.to_string_lossy().into_owned()
-    }
+    path.to_string_lossy().into_owned()
 }
 
 fn no_such_source_file(path: &str) -> RmuxError {
@@ -689,9 +542,6 @@ pub(super) fn source_parse_error_with_line_offset(
 #[cfg(test)]
 mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
-
-    #[cfg(windows)]
-    use super::glob_pattern_for_source_path;
 
     use super::{
         source_inputs_for_path, source_inputs_for_path_with_diagnostics, LoadedSourceFile,
@@ -931,7 +781,6 @@ mod tests {
         assert!(error.to_string().contains("aggregate bytes"), "{error}");
     }
 
-    #[cfg(unix)]
     #[test]
     fn strict_source_rejects_fifo_without_blocking() {
         let path = temp_source_path("fifo-strict-source");
@@ -973,7 +822,6 @@ mod tests {
         assert!(inputs.is_empty());
     }
 
-    #[cfg(unix)]
     #[test]
     fn tmux_best_effort_source_skips_fifo_without_blocking() {
         let path = temp_source_path("fifo-tmux-fallback");
@@ -992,7 +840,6 @@ mod tests {
         assert!(inputs.is_empty());
     }
 
-    #[cfg(unix)]
     #[test]
     fn tmux_best_effort_source_skips_symlink_to_fifo_without_blocking() {
         let fifo_path = temp_source_path("symlink-target-fifo-tmux-fallback");
@@ -1014,7 +861,6 @@ mod tests {
         assert!(inputs.is_empty());
     }
 
-    #[cfg(unix)]
     #[test]
     fn tmux_best_effort_source_accepts_symlink_to_regular_file() {
         let target_path = temp_source_path("symlink-target-regular-tmux-fallback");
@@ -1037,7 +883,6 @@ mod tests {
         assert_eq!(inputs[0].contents, "set -g status off\n");
     }
 
-    #[cfg(unix)]
     #[test]
     fn fallback_path_dedupe_collapses_symlinked_entries() {
         let target_path = temp_source_path("fallback-dedupe-target");
@@ -1076,38 +921,6 @@ mod tests {
         assert!(loaded.has_errors());
     }
 
-    #[cfg(windows)]
-    #[test]
-    fn windows_relative_source_file_uses_glob_safe_separators() {
-        let pattern = glob_pattern_for_source_path(
-            "nested\\*.conf",
-            Some(std::path::Path::new(r"C:\Users\RMUXUser\rmux")),
-        );
-
-        assert_eq!(pattern, "C:/Users/RMUXUser/rmux/nested/*.conf");
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn windows_absolute_source_file_uses_forward_slashes() {
-        let pattern = glob_pattern_for_source_path(r"C:\Users\RMUXUser\rmux\config.conf", None);
-
-        assert_eq!(pattern, "C:/Users/RMUXUser/rmux/config.conf");
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn windows_null_device_config_paths_are_ignored() {
-        assert!(super::is_windows_null_config_path("NUL"));
-        assert!(super::is_windows_null_config_path("nul:"));
-        assert!(super::is_windows_null_config_path(r"C:\tmp\NUL"));
-        assert!(super::is_windows_null_config_path(r"C:\tmp\NUL.conf"));
-        assert!(super::is_windows_null_config_path(r"\\.\NUL"));
-        assert!(!super::is_windows_null_config_path(r"C:\tmp\null.conf"));
-        assert!(!super::is_windows_null_config_path(r"C:\tmp\nulled"));
-    }
-
-    #[cfg(unix)]
     #[test]
     fn unix_dev_null_config_path_is_empty() {
         let inputs =
@@ -1130,7 +943,6 @@ mod tests {
         ))
     }
 
-    #[cfg(unix)]
     fn create_test_fifo(path: &std::path::Path) {
         let output = std::process::Command::new("mkfifo")
             .arg(path)

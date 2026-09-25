@@ -2,11 +2,11 @@ use std::cmp::Ordering;
 use std::collections::BTreeSet;
 use std::path::Path;
 
-use rmux_client::{connect, Connection};
-use rmux_core::formats::{is_truthy, DEFAULT_LIST_WINDOWS_ALL_FORMAT, DEFAULT_LIST_WINDOWS_FORMAT};
+use rmux_client::{Connection, connect};
+use rmux_core::formats::{DEFAULT_LIST_WINDOWS_ALL_FORMAT, DEFAULT_LIST_WINDOWS_FORMAT, is_truthy};
 use rmux_proto::{
-    CommandOutput, ErrorResponse, ListWindowsResponse, MoveWindowTarget, OptionScopeSelector,
-    ResolveTargetType, Response, WindowListEntry, CAPABILITY_CLI_LIST_WINDOWS_ALL_QUEUE,
+    CAPABILITY_CLI_LIST_WINDOWS_ALL_QUEUE, CommandOutput, ErrorResponse, ListWindowsResponse,
+    MoveWindowTarget, OptionScopeSelector, ResolveTargetType, Response, WindowListEntry,
 };
 
 use super::command_runner::{
@@ -19,12 +19,13 @@ use super::json_output::{
     list_windows_json_format, write_length_prefixed_list_windows_json, write_list_windows_json,
 };
 use super::{
-    expect_command_output, expect_command_success, list_session_names, resolve_current_pane_target,
-    resolve_current_session_target, resolve_existing_window_target_or_current,
-    resolve_session_listing_target, resolve_session_target_or_current, resolve_session_target_spec,
-    resolve_target_spec, resolve_window_index_target_or_current_session,
-    resolve_window_target_or_current, resolve_window_target_spec, response_name_for_target,
-    run_command_resolved, unexpected_response, write_lines_output, ExitFailure,
+    ExitFailure, expect_command_output, expect_command_success, list_session_names,
+    resolve_current_pane_target, resolve_current_session_target,
+    resolve_existing_window_target_or_current, resolve_session_listing_target,
+    resolve_session_target_or_current, resolve_session_target_spec, resolve_target_spec,
+    resolve_window_index_target_or_current_session, resolve_window_target_or_current,
+    resolve_window_target_spec, response_name_for_target, run_command_resolved,
+    unexpected_response, write_lines_output,
 };
 use crate::cli_args::{
     AlertSessionTargetArgs, KillWindowArgs, LinkWindowArgs, ListWindowsArgs, MoveWindowArgs,
@@ -448,7 +449,7 @@ fn run_move_window_relative(args: &MoveWindowArgs, socket_path: &Path) -> Result
     match response {
         Response::MoveWindow(_) => {}
         Response::Error(ErrorResponse { error }) => {
-            return Err(ExitFailure::new(1, error.to_string()))
+            return Err(ExitFailure::new(1, error.to_string()));
         }
         other => return Err(unexpected_response("move-window", &other)),
     }
@@ -1049,9 +1050,7 @@ pub(super) fn run_select_window(
         if args.last {
             let target =
                 resolve_session_listing_target(connection, args.target.clone(), "select-window")?;
-            return connection
-                .last_window(target)
-                .map_err(ExitFailure::from);
+            return connection.last_window(target).map_err(ExitFailure::from);
         }
 
         let target =
@@ -1062,9 +1061,7 @@ pub(super) fn run_select_window(
                 .map_err(ExitFailure::from);
         }
 
-        connection
-            .select_window(target)
-            .map_err(ExitFailure::from)
+        connection.select_window(target).map_err(ExitFailure::from)
     })
 }
 
@@ -1133,9 +1130,7 @@ pub(super) fn run_last_window(
     run_command_resolved(socket_path, "last-window", move |connection| {
         let target =
             resolve_session_target_or_current(connection, args.target.as_ref(), "last-window")?;
-        connection
-            .last_window(target)
-            .map_err(ExitFailure::from)
+        connection.last_window(target).map_err(ExitFailure::from)
     })
 }
 
@@ -1246,7 +1241,7 @@ pub(super) fn run_list_windows(
                 }
             }
             Response::Error(ErrorResponse { error }) => {
-                return Err(ExitFailure::new(1, error.to_string()))
+                return Err(ExitFailure::new(1, error.to_string()));
             }
             other => return Err(unexpected_response("list-windows", &other)),
         }

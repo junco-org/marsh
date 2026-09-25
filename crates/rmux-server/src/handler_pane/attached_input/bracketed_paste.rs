@@ -225,11 +225,7 @@ fn incomplete_utf8_suffix_len(input: &[u8]) -> usize {
     }
 }
 
-fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack
-        .windows(needle.len())
-        .position(|window| window == needle)
-}
+use super::find_subslice;
 
 #[cfg(test)]
 mod tests {

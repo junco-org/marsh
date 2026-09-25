@@ -1,14 +1,12 @@
 //! The seed the daemon's own unit tests open an [`RmuxFrontend`] over.
 //!
-//! [`RmuxFrontend::open_with`] takes the seed it will publish into and the backend to reach it
-//! through. Nothing below is about storage — these tests exercise socket and named-pipe lifetimes
-//! — so the seed here is a plain directory behind [`marsh_btrfs::fake::CopyTree`]. The daemon
-//! cannot tell the difference, and the tests keep running on hosts with no btrfs.
-//!
-//! Compiled from both `daemon_tests/unix.rs` and `daemon_tests/windows.rs`, which are the two
-//! platform spellings of the same module and never build together.
+//! [`RmuxFrontend::open_with`] takes the directory its shells start in by default and the backend
+//! seeds are reached through. Nothing below is about storage — these tests exercise socket
+//! lifetimes — so the seed here is a plain directory behind
+//! [`marsh_btrfs::fake::CopyTree`]. The daemon cannot tell the difference, and the tests keep
+//! running on hosts with no btrfs.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use marsh_core::shellmux::TerminalGeometry;
 use tempfile::TempDir;
@@ -45,7 +43,6 @@ pub(super) async fn daemon(config: DaemonConfig) -> (RmuxFrontend, TempDir) {
     let frontend = RmuxFrontend::open_with(
         config,
         &seed,
-        Arc::new(Mutex::new(marsh_core::PolicyValidator::new())),
         brush_core::env::ShellEnvironment::new(),
         TerminalGeometry {
             rows: ROWS,

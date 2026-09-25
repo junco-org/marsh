@@ -30,6 +30,7 @@ perf-instrument = ["rmux-server/perf-instrument"]
 
 [dependencies]
 marsh-core = { path = "crates/marsh-core" }
+marsh-lib = { path = "crates/marsh-lib", default-features = false }
 
 # The server is the one rmux crate that is local: its pane, popup and workload backends are
 # marsh's. Everything else is upstream at the pinned commit.
@@ -49,9 +50,8 @@ brush-core.workspace = true
 chrono = { version = "0.4.42", default-features = false, features = ["std"] }
 clap = { version = "4.6.0", features = ["derive"] }
 libc = "0.2"
-# The OS random generator every managed pane's session nonce comes from. Portable on purpose: the
-# `-c` and Claude paths allocate one per invocation, so a unix-only source would fail them outright
-# on Windows.
+# The OS random generator every managed pane's session nonce comes from: the `-c` and Claude
+# paths allocate one per invocation, so it must not need a spare file descriptor.
 getrandom = "0.3"
 qrcode = { version = "0.14", default-features = false }
 ratatui = { version = "=0.29.0", default-features = false }
@@ -110,9 +110,12 @@ rmux-pty = { version = "=0.10.0", git = "https://github.com/Helvesec/rmux", rev 
 rmux-sdk = { version = "=0.10.0", git = "https://github.com/Helvesec/rmux", rev = "1f4571e74f36be0c033c6294d1616c7d3a6fbda1" }
 rmux-web-crypto = { version = "=0.10.0", git = "https://github.com/Helvesec/rmux", rev = "1f4571e74f36be0c033c6294d1616c7d3a6fbda1" }
 
-# brush-core carries one change that is not released: the ExternalCommandSpawner seam
-# (https://github.com/reubeno/brush/pull/1382), which MarshExecutor is an implementation of.
-# crates/brush-core is crates.io's 0.5.0 plus that seam; every other brush crate is stock.
+# brush-core carries changes that are not released: the ExternalCommandSpawner seam
+# (https://github.com/reubeno/brush/pull/1382), which MarshExecutor is an implementation of, a
+# public accessor for a shell's spawner, and the pipeline's process group carried into a
+# builtin's ExecutionContext, which the `git` builtin needs to start the system git through that
+# spawner in the right group. crates/brush-core is crates.io's 0.5.0 plus those; every other
+# brush crate is stock.
 [patch.crates-io]
 brush-core = { path = "crates/brush-core" }
 rmux-server = { path = "crates/rmux-server" }

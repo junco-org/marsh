@@ -1637,7 +1637,6 @@ dependencies = [
 [[package]]
 name = "junco-rust-validator"
 version = "0.1.0"
-source = "git+https://github.com/junco-org/junco-policy?branch=main#7aca329b6a0420da5c2ced3b2395588087bb1c78"
 dependencies = [
  "bumpalo",
  "hashbrown 0.16.1",
@@ -1847,6 +1846,7 @@ dependencies = [
  "marsh-btrfs",
  "marsh-core",
  "marsh-instrument",
+ "marsh-lib",
  "marsh-wal",
  "qrcode",
  "ratatui",
@@ -1870,6 +1870,7 @@ dependencies = [
  "btrfsutil",
  "hex",
  "libc",
+ "marsh-lib",
  "mockall",
  "proc-mounts",
  "sha1",
@@ -1885,12 +1886,12 @@ dependencies = [
  "brush-core",
  "brush-interactive",
  "clap",
- "git2",
  "hex",
  "junco-rust-validator",
  "libc",
  "marsh-btrfs",
  "marsh-instrument",
+ "marsh-lib",
  "marsh-wal",
  "nix",
  "serde",
@@ -1909,6 +1910,7 @@ dependencies = [
  "brush-builtins",
  "brush-core",
  "libc",
+ "marsh-lib",
  "mockall",
  "serde",
  "serde_json",
@@ -1918,10 +1920,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "marsh-lib"
+version = "0.1.0"
+dependencies = [
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "marsh-wal"
 version = "0.1.0"
 dependencies = [
  "hex",
+ "marsh-lib",
  "serde",
  "serde_json",
  "sha1",
@@ -2672,7 +2683,6 @@ dependencies = [
  "rmux-pty",
  "rmux-sdk",
  "rmux-web-crypto",
- "rmux-windows-console",
  "rustix 1.1.4",
  "serde",
  "serde_json",
@@ -2708,14 +2718,6 @@ dependencies = [
  "subtle",
  "x25519-dalek",
  "zeroize",
-]
-
-[[package]]
-name = "rmux-windows-console"
-version = "0.1.0"
-dependencies = [
- "tracing",
- "windows-sys 0.61.2",
 ]
 
 [[package]]

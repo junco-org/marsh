@@ -17,31 +17,6 @@ fn create_session_in_state(
     name
 }
 
-async fn retained_alert_binding(
-    handler: &RequestHandler,
-    session_name: &SessionName,
-) -> (Option<Target>, std::sync::Arc<LifecycleTargetLease>) {
-    let mut state = handler.state.lock().await;
-    let event = super::super::super::prepare_lifecycle_event(
-        &mut state,
-        &rmux_core::LifecycleEvent::AlertActivity {
-            target: WindowTarget::with_window(session_name.clone(), 0),
-        },
-    );
-    (
-        event.current_target,
-        event
-            .retained_current_target
-            .expect("activity event captures a retained window"),
-    )
-}
-
-async fn wait_for_pause(pause: &crate::handler::scripting_support::QueueExactTargetCapturePause) {
-    tokio::time::timeout(Duration::from_secs(2), pause.reached.notified())
-        .await
-        .expect("queued command reaches the post-parse pause");
-}
-
 #[tokio::test]
 async fn parsed_implicit_mutation_revalidates_after_slot_replacement() {
     let handler = RequestHandler::new();
@@ -62,7 +37,7 @@ async fn parsed_implicit_mutation_revalidates_after_slot_replacement() {
             )
             .await
     });
-    wait_for_pause(&pause).await;
+    pause.wait_until_reached().await;
 
     let replacement_id = {
         let mut state = handler.state.lock().await;
@@ -135,7 +110,7 @@ async fn implicit_pane_role_revalidates_after_same_window_slot_replacement() {
             )
             .await
     });
-    wait_for_pause(&pause).await;
+    pause.wait_until_reached().await;
 
     {
         let mut state = handler.state.lock().await;
@@ -191,7 +166,7 @@ async fn implicit_pane_role_rejects_respawned_output_generation() {
             )
             .await
     });
-    wait_for_pause(&pause).await;
+    pause.wait_until_reached().await;
 
     let respawned = handler
         .handle(Request::RespawnPane(Box::new(
@@ -265,7 +240,7 @@ async fn explicit_send_keys_revalidates_before_copy_mode_effects() {
             )
             .await
     });
-    wait_for_pause(&pause).await;
+    pause.wait_until_reached().await;
 
     {
         let mut state = handler.state.lock().await;
@@ -397,7 +372,7 @@ async fn join_pane_implicit_source_revalidates_after_slot_replacement() {
             )
             .await
     });
-    wait_for_pause(&pause).await;
+    pause.wait_until_reached().await;
 
     {
         let mut state = handler.state.lock().await;
@@ -459,7 +434,7 @@ async fn assert_session_command_rejects_stale_window(command_name: &str, command
                 )
                 .await
         });
-        wait_for_pause(&pause).await;
+        pause.wait_until_reached().await;
 
         {
             let mut state = handler.state.lock().await;
@@ -542,7 +517,7 @@ async fn queued_new_window_relative_target_keeps_its_captured_anchor() {
             )
             .await
     });
-    wait_for_pause(&pause).await;
+    pause.wait_until_reached().await;
 
     handler
         .state
@@ -601,7 +576,7 @@ async fn queued_new_window_insert_rejects_replaced_before_and_after_anchors() {
                 )
                 .await
         });
-        wait_for_pause(&pause).await;
+        pause.wait_until_reached().await;
 
         let replacement_id = {
             let mut state = handler.state.lock().await;
@@ -674,7 +649,7 @@ async fn queued_new_window_kill_revalidates_the_destination_at_replacement() {
             )
             .await
     });
-    wait_for_pause(&pause).await;
+    pause.wait_until_reached().await;
 
     let moved = handler
         .handle_move_window(rmux_proto::MoveWindowRequest {
@@ -900,7 +875,7 @@ async fn implicit_session_role_rejects_a_post_parse_alias_move() {
             )
             .await
     });
-    wait_for_pause(&pause).await;
+    pause.wait_until_reached().await;
 
     {
         let mut state = handler.state.lock().await;
@@ -956,7 +931,7 @@ async fn assert_read_rejects_replaced_target(command_name: &str, command: &str) 
             )
             .await
     });
-    wait_for_pause(&pause).await;
+    pause.wait_until_reached().await;
 
     {
         let mut state = handler.state.lock().await;
@@ -1014,7 +989,7 @@ async fn target_client_display_follows_the_captured_registration_not_the_lifecyc
             )
             .await
     });
-    wait_for_pause(&pause).await;
+    pause.wait_until_reached().await;
 
     let response = handler
         .dispatch(
@@ -1073,7 +1048,7 @@ async fn target_client_display_rejects_a_recreated_attach_registration() {
             )
             .await
     });
-    wait_for_pause(&pause).await;
+    pause.wait_until_reached().await;
 
     let (replacement_tx, mut replacement_rx) = mpsc::unbounded_channel();
     handler

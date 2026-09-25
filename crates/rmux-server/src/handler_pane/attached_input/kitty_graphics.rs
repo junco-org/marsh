@@ -42,11 +42,7 @@ pub(super) fn decode_kitty_graphics_apc_after_append(
     KittyGraphicsApcDecode::NotKittyGraphics
 }
 
-fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack
-        .windows(needle.len())
-        .position(|window| window == needle)
-}
+use super::find_subslice;
 
 #[cfg(test)]
 mod tests {

@@ -78,7 +78,6 @@ async fn lock_client_with_invalid_target_returns_error() {
     );
 }
 
-#[cfg(unix)]
 #[tokio::test]
 async fn lock_client_accepts_tty_path_targets() {
     let handler = RequestHandler::new();
@@ -138,7 +137,6 @@ async fn lock_client_accepts_tty_path_targets() {
     terminate_child(&mut child);
 }
 
-#[cfg(unix)]
 #[tokio::test]
 async fn overlay_commands_resolve_names_published_by_list_clients() {
     let handler = RequestHandler::new();
@@ -237,19 +235,16 @@ async fn server_access_list_returns_server_access_response() {
     );
 }
 
-#[cfg(unix)]
 struct TtyChild {
     spawned: rmux_pty::SpawnedPty,
 }
 
-#[cfg(unix)]
 impl TtyChild {
     fn id(&self) -> u32 {
         self.spawned.child().pid().as_u32()
     }
 }
 
-#[cfg(unix)]
 fn spawn_tty_child() -> Result<TtyChild, Box<dyn std::error::Error>> {
     let spawned = ChildCommand::new("sh")
         .arg("-c")
@@ -260,7 +255,6 @@ fn spawn_tty_child() -> Result<TtyChild, Box<dyn std::error::Error>> {
     Ok(TtyChild { spawned })
 }
 
-#[cfg(unix)]
 fn terminate_child(child: &mut TtyChild) {
     let _ = child.spawned.child().terminate_forcefully();
     let _ = child.spawned.child_mut().wait();

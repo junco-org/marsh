@@ -7,8 +7,6 @@ use rmux_proto::{
     UnlinkWindowResponse, WindowTarget,
 };
 
-#[cfg(windows)]
-use super::pane_support::format_references_pane_pid;
 use super::{
     attach_support::{
         linked_window_client_content_size, surviving_attached_resize_targets,
@@ -183,11 +181,6 @@ impl RequestHandler {
         requester_pid: u32,
         request: rmux_proto::NewWindowRequest,
     ) -> Response {
-        #[cfg(windows)]
-        let wait_for_deferred_pane_pid = !request.detached
-            || request.start_directory.as_ref().is_some_and(|path| {
-                format_references_pane_pid(Some(path.as_os_str().to_string_lossy().as_ref()))
-            });
         let session_name = request.target;
         let environment_overrides = request.environment;
         let start_directory = request.start_directory;
@@ -199,10 +192,6 @@ impl RequestHandler {
         let client_environment = client_environment_snapshot(requester_pid);
         let spawn_environment = client_spawn_environment(client_environment.as_ref());
         let attached_count = self.attached_count(&session_name).await;
-        #[cfg(windows)]
-        if wait_for_deferred_pane_pid {
-            self.wait_for_windows_deferred_all_pane_pids().await;
-        }
         // The pane's job is opened between the two locked phases below, with the request mutex
         // released: opening one awaits a shell build, a snapshot creation and the facade's
         // admission lock, and awaiting any of those under this daemon's request mutex would stall
@@ -242,7 +231,6 @@ impl RequestHandler {
                 detached: request.detached,
                 spawn: WindowSpawnOptions {
                     start_directory: start_directory.as_deref(),
-                    inherited_start_directory: false,
                     command: process_command.as_ref(),
                     socket_path: &socket_path,
                     spawn_environment: spawn_environment.as_ref(),
@@ -564,7 +552,7 @@ impl RequestHandler {
             for prepared in prepared_rehomes {
                 self.exit_prepared_attached_session_identity(prepared).await;
             }
-            #[cfg(all(any(unix, windows), feature = "web"))]
+            #[cfg(all(unix, feature = "web"))]
             {
                 self.web_shares.remove_targets_for_panes(&removed_pane_ids);
                 self.web_shares
@@ -678,8 +666,7 @@ impl RequestHandler {
                 let event = LifecycleEvent::SessionWindowChanged {
                     session_name: session_name.clone(),
                 };
-                self.emit_for_session_identity(event, &session_name, session_id)
-                    .await;
+                self.emit_for_session_identity(event, session_id).await;
             }
             self.queue_inline_hook(
                 HookName::AfterSelectWindow,
@@ -772,8 +759,7 @@ impl RequestHandler {
             let event = LifecycleEvent::SessionWindowChanged {
                 session_name: session_name.clone(),
             };
-            self.emit_for_session_identity(event, &session_name, session_id)
-                .await;
+            self.emit_for_session_identity(event, session_id).await;
             if let Response::NextWindow(success) = &response {
                 self.queue_inline_hook(
                     HookName::AfterSelectWindow,
@@ -831,8 +817,7 @@ impl RequestHandler {
             let event = LifecycleEvent::SessionWindowChanged {
                 session_name: session_name.clone(),
             };
-            self.emit_for_session_identity(event, &session_name, session_id)
-                .await;
+            self.emit_for_session_identity(event, session_id).await;
             if let Response::PreviousWindow(success) = &response {
                 self.queue_inline_hook(
                     HookName::AfterSelectWindow,
@@ -890,8 +875,7 @@ impl RequestHandler {
             let event = LifecycleEvent::SessionWindowChanged {
                 session_name: session_name.clone(),
             };
-            self.emit_for_session_identity(event, &session_name, session_id)
-                .await;
+            self.emit_for_session_identity(event, session_id).await;
             if let Response::LastWindow(success) = &response {
                 self.queue_inline_hook(
                     HookName::AfterSelectWindow,
@@ -916,12 +900,6 @@ impl RequestHandler {
             let active_attach = self.active_attach.lock().await;
             active_attach.attached_count(&request.target)
         };
-        #[cfg(windows)]
-        if format_references_pane_pid(request.format.as_deref())
-            || format_references_pane_pid(request.filter.as_deref())
-        {
-            self.wait_for_windows_deferred_all_pane_pids().await;
-        }
         let state = self.state.lock().await;
         match state.list_windows(ListWindowsSelection {
             session_name: &request.target,
@@ -1600,7 +1578,6 @@ impl RequestHandler {
                     kill: request.kill,
                     spawn: WindowSpawnOptions {
                         start_directory: request.start_directory.as_deref(),
-                        inherited_start_directory: false,
                         command: process_command.as_ref(),
                         socket_path: &socket_path,
                         spawn_environment: spawn_environment.as_ref(),

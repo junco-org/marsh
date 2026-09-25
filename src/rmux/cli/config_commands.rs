@@ -7,7 +7,7 @@ mod hooks;
 #[path = "config_commands/options.rs"]
 mod options;
 
-use rmux_client::{connect, ClientError};
+use rmux_client::{ClientError, connect};
 use rmux_proto::{
     ErrorResponse, Request, Response, RmuxError, ScopeSelector, SetEnvironmentMode,
     SetOptionByNameRequest,
@@ -15,15 +15,15 @@ use rmux_proto::{
 
 use crate::cli::target_resolution::resolve_session_target_spec;
 use crate::cli::{
-    expect_command_output, expect_command_success, resolve_current_session_target,
-    run_command_resolved, run_payload_command_resolved, write_command_output, ExitFailure,
+    ExitFailure, expect_command_output, expect_command_success, resolve_current_session_target,
+    run_command_resolved, run_payload_command_resolved, write_command_output,
 };
 use crate::cli_args::{
     SetEnvironmentArgs, SetOptionArgs, SetOptionCommandKind, ShowEnvironmentArgs, ShowOptionsArgs,
     ShowOptionsCommandKind, TargetSpec,
 };
 pub(crate) use hooks::{run_set_hook, run_show_hooks};
-use options::{resolve_set_option_args, resolve_show_options_scope, ResolvedSetOptionCommand};
+use options::{ResolvedSetOptionCommand, resolve_set_option_args, resolve_show_options_scope};
 
 /// Runs `set-option` and its variants, silently succeeding on option errors when `-q` is given.
 pub(crate) fn run_set_option(
@@ -252,15 +252,15 @@ fn resolve_set_environment_mode(
 mod tests {
     use super::{
         options::{
-            resolve_set_option_args_with_exact_targets as resolve_set_option_command,
             ResolvedSetOptionArgs, ResolvedSetOptionCommand, ShowOptionsScope,
             UnresolvedShowOptionsScope,
+            resolve_set_option_args_with_exact_targets as resolve_set_option_command,
         },
         resolve_show_options_scope,
     };
     use crate::cli_args::{
-        parse_target_spec, SetEnvironmentArgs, SetOptionArgs, SetOptionCommandKind,
-        ShowOptionsArgs, ShowOptionsCommandKind, TargetSpec,
+        SetEnvironmentArgs, SetOptionArgs, SetOptionCommandKind, ShowOptionsArgs,
+        ShowOptionsCommandKind, TargetSpec, parse_target_spec,
     };
     use rmux_proto::{
         OptionScopeSelector, PaneTarget, SessionName, SetEnvironmentMode, WindowTarget,

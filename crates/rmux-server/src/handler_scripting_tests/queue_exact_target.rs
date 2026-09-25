@@ -57,12 +57,6 @@ async fn replace_window_slot(
         .expect("replacement window survives")
 }
 
-async fn wait_for_pause(pause: &crate::handler::scripting_support::QueueExactTargetCapturePause) {
-    tokio::time::timeout(Duration::from_secs(2), pause.reached.notified())
-        .await
-        .expect("queued command reaches exact-target capture pause");
-}
-
 #[tokio::test]
 async fn exact_window_and_pane_targets_reject_post_parse_slot_replacement() {
     for command_name in ["rename-window", "kill-pane"] {
@@ -104,7 +98,7 @@ async fn exact_window_and_pane_targets_reject_post_parse_slot_replacement() {
                 .await
         });
 
-        wait_for_pause(&pause).await;
+        pause.wait_until_reached().await;
         let replacement_id = replace_window_slot(&handler, &source, &target).await;
         assert_ne!(replacement_id, original_window_id);
         pause.release.notify_one();
@@ -160,7 +154,7 @@ async fn exact_pane_target_rejects_respawned_output_generation() {
             .await
     });
 
-    wait_for_pause(&pause).await;
+    pause.wait_until_reached().await;
     let respawned = handler
         .handle(Request::RespawnPane(Box::new(RespawnPaneRequest {
             target: target.clone(),
@@ -245,7 +239,7 @@ async fn capture_initializes_only_the_addressed_lazy_occurrence() {
             .await
     });
 
-    wait_for_pause(&pause).await;
+    pause.wait_until_reached().await;
     {
         let mut state = handler.state.lock().await;
         assert!(
@@ -309,7 +303,7 @@ async fn unlink_relink_of_the_same_window_id_is_still_rejected() {
             .await
     });
 
-    wait_for_pause(&pause).await;
+    pause.wait_until_reached().await;
     let unlinked = handler
         .handle(Request::UnlinkWindow(UnlinkWindowRequest {
             target: WindowTarget::with_window(alias.clone(), 1),
@@ -381,7 +375,7 @@ async fn control_queue_uses_the_same_exact_target_guard() {
             .await
     });
 
-    wait_for_pause(&pause).await;
+    pause.wait_until_reached().await;
     let replacement_id = replace_window_slot(&handler, &source, &target).await;
     pause.release.notify_one();
     let result = tokio::time::timeout(Duration::from_secs(2), queued)
@@ -439,7 +433,7 @@ async fn source_file_queue_uses_the_same_exact_target_guard() {
             .await
     });
 
-    wait_for_pause(&pause).await;
+    pause.wait_until_reached().await;
     let replacement_id = replace_window_slot(&handler, &source, &target).await;
     pause.release.notify_one();
     let error = tokio::time::timeout(Duration::from_secs(2), queued)
@@ -488,7 +482,7 @@ async fn hook_command_path_uses_the_same_exact_target_guard() {
             .await
     });
 
-    wait_for_pause(&pause).await;
+    pause.wait_until_reached().await;
     let replacement_id = replace_window_slot(&handler, &source, &target).await;
     pause.release.notify_one();
     tokio::time::timeout(Duration::from_secs(2), queued)

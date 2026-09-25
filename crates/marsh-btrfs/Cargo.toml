@@ -16,6 +16,7 @@ bench = false
 fake = []
 
 [dependencies]
+marsh-lib = { path = "../marsh-lib", default-features = false }
 thiserror = "2"
 sha1 = "0.10"
 hex = "0.4"

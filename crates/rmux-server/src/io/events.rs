@@ -23,8 +23,7 @@
 use std::sync::Arc;
 
 use marsh_core::shellmux::{
-    CommandCompletion, CommandHandle, JobEnd, MuxSnapshot, OutputChannel,
-    TerminalGeometry,
+    CommandCompletion, CommandHandle, JobEnd, MuxSnapshot, OutputChannel, TerminalGeometry,
 };
 
 use crate::io::{IoError, IoResult, ShellHandle};
@@ -158,9 +157,16 @@ pub enum IoEvent {
 pub struct IoSnapshot {
     /// Where the service is in its life.
     pub phase: IoPhase,
-    /// The core's own snapshot: jobs, unfinished commands, selection and default geometry, all
-    /// taken under one lock.
+    /// The core's own snapshot: shells, unfinished commands and default geometry, all taken under
+    /// one lock.
     pub state: MuxSnapshot,
+    /// The shell this front-end has selected, when one is selected and still present in `state`.
+    ///
+    /// Selection belongs to the facade rather than to the engine, and it is resolved against
+    /// exactly the [`MuxSnapshot::jobs`] beside it: a reader never sees a selection naming a
+    /// shell this snapshot does not contain, and a stopped shell whose principal was reopened
+    /// does not inherit the selection its predecessor earned.
+    pub current: Option<marsh_core::shellmux::ShellId>,
     /// The sequence the first event *after* this snapshot will carry.
     ///
     /// Everything before it is already reflected in `state`; everything from it onwards arrives on

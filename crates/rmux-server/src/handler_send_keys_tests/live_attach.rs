@@ -1,4 +1,5 @@
 use super::*;
+use crate::handler::test_support::spawn_accounted_attach_control_drain;
 use crate::handler::QueuedLifecycleEvent;
 use rmux_core::LifecycleEvent;
 
@@ -8,23 +9,10 @@ const PROMPT_CANCEL_CHAIN_REPETITIONS: usize = 512;
 // These stress cases execute one real binding command per repetition in a
 // debug test binary. Keep the 8K recursion regression load and give parallel
 // nextest runs headroom without removing the finite completion bound.
-const LONG_PREFIX_CHAIN_TIMEOUT: Duration = if cfg!(windows) {
-    Duration::from_secs(120)
-} else {
-    Duration::from_secs(60)
-};
-const ITERATIVE_INPUT_CHAIN_TIMEOUT: Duration = if cfg!(windows) {
-    Duration::from_secs(60)
-} else {
-    Duration::from_secs(30)
-};
+const LONG_PREFIX_CHAIN_TIMEOUT: Duration = Duration::from_secs(60);
+const ITERATIVE_INPUT_CHAIN_TIMEOUT: Duration = Duration::from_secs(30);
 const BOUNDED_REROUTE_CHAIN_TIMEOUT: Duration = Duration::from_secs(30);
-const BACKGROUND_RUN_SHELL_TIMEOUT: Duration = if cfg!(windows) {
-    // A cold PowerShell process can exceed ten seconds on hosted Windows CI.
-    Duration::from_secs(30)
-} else {
-    Duration::from_secs(10)
-};
+const BACKGROUND_RUN_SHELL_TIMEOUT: Duration = Duration::from_secs(10);
 
 async fn set_global_hook(handler: &RequestHandler, hook: HookName, command: &str) {
     let response = handler
@@ -167,255 +155,6 @@ async fn send_keys_sends_modified_cursor_keys_without_extended_mode() {
 
     capture.finish(&handler, &alpha).await;
     capture.assert_contents(&handler, expected).await;
-}
-
-#[cfg(windows)]
-#[tokio::test]
-async fn live_attach_ctrl_a_emulates_cmd_select_all() {
-    let handler = RequestHandler::new();
-    let alpha = session_name("alpha");
-    let requester_pid = std::process::id();
-
-    {
-        let mut state = handler.state.lock().await;
-        state
-            .options
-            .set(
-                ScopeSelector::Global,
-                OptionName::DefaultShell,
-                "cmd.exe".to_owned(),
-                SetOptionMode::Replace,
-            )
-            .expect("test default-shell is valid");
-    }
-    create_send_keys_test_session(&handler, &alpha).await;
-
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
-
-    let mut expected = encode_key(
-        0,
-        ExtendedKeyFormat::Xterm,
-        key_string_lookup_string("C-Home").expect("C-Home parses"),
-    )
-    .expect("C-Home encodes");
-    expected.extend_from_slice(
-        &encode_key(
-            0,
-            ExtendedKeyFormat::Xterm,
-            key_string_lookup_string("S-End").expect("S-End parses"),
-        )
-        .expect("S-End encodes"),
-    );
-    let capture =
-        RawPaneInputProbe::start(&handler, &alpha, "live-attach-cmd-c-a", expected.len()).await;
-
-    let mut pending_input = Vec::new();
-    handler
-        .handle_attached_live_input(requester_pid, &mut pending_input, b"\x01")
-        .await
-        .expect("Ctrl+A attached input succeeds");
-
-    capture.finish(&handler, &alpha).await;
-    capture.assert_contents(&handler, &expected).await;
-}
-
-#[cfg(windows)]
-#[tokio::test]
-async fn live_attach_ctrl_d_uses_windows_console_key_path() {
-    let handler = RequestHandler::new();
-    let alpha = session_name("alpha");
-    let requester_pid = std::process::id();
-
-    create_send_keys_test_session(&handler, &alpha).await;
-
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
-    let capture = RawPaneInputProbe::start(&handler, &alpha, "live-attach-c-d", 1).await;
-
-    let mut pending_input = Vec::new();
-    let keystroke = rmux_proto::AttachedKeystroke::new(vec![0x04]).with_windows_console_key(
-        rmux_proto::AttachedWindowsConsoleKey::new(0x44, 0x20, 0x04, 0x0008, 1),
-    );
-    let forwarded = handler
-        .handle_attached_keystroke_input(requester_pid, &mut pending_input, &keystroke)
-        .await
-        .expect("Ctrl+D attached input succeeds");
-
-    assert!(forwarded);
-    assert!(pending_input.is_empty());
-    capture.finish(&handler, &alpha).await;
-    capture.assert_contents(&handler, &[0x04]).await;
-}
-
-#[cfg(windows)]
-#[tokio::test]
-async fn live_attach_unbound_ctrl_p_uses_windows_console_key_path() {
-    let handler = RequestHandler::new();
-    let alpha = session_name("alpha");
-    let requester_pid = std::process::id();
-
-    create_send_keys_test_session(&handler, &alpha).await;
-
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
-    let capture = RawPaneInputProbe::start(&handler, &alpha, "live-attach-c-p", 1).await;
-
-    let mut pending_input = Vec::new();
-    let keystroke = rmux_proto::AttachedKeystroke::new(vec![0x10]).with_windows_console_key(
-        rmux_proto::AttachedWindowsConsoleKey::new(0x50, 0x19, 0x10, 0x0008, 1),
-    );
-    let forwarded = handler
-        .handle_attached_keystroke_input(requester_pid, &mut pending_input, &keystroke)
-        .await
-        .expect("Ctrl+P attached input succeeds");
-
-    assert!(forwarded);
-    assert!(pending_input.is_empty());
-    capture.finish(&handler, &alpha).await;
-    capture.assert_contents(&handler, &[0x10]).await;
-}
-
-#[cfg(windows)]
-#[tokio::test]
-async fn live_attach_prefix_ctrl_b_is_not_forwarded_as_windows_console_key() {
-    let handler = RequestHandler::new();
-    let alpha = session_name("alpha");
-    let requester_pid = std::process::id();
-
-    create_send_keys_test_session(&handler, &alpha).await;
-
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
-    let capture = RawPaneInputProbe::start(&handler, &alpha, "live-attach-c-b", 0).await;
-
-    let mut pending_input = Vec::new();
-    let keystroke = rmux_proto::AttachedKeystroke::new(vec![0x02]).with_windows_console_key(
-        rmux_proto::AttachedWindowsConsoleKey::new(0x42, 0x30, 0x02, 0x0008, 1),
-    );
-    let forwarded = handler
-        .handle_attached_keystroke_input(requester_pid, &mut pending_input, &keystroke)
-        .await
-        .expect("Ctrl+B attached input succeeds");
-
-    assert!(!forwarded);
-    assert!(pending_input.is_empty());
-    capture.finish(&handler, &alpha).await;
-    capture.assert_contents(&handler, &[]).await;
-}
-
-#[cfg(windows)]
-#[tokio::test]
-async fn live_attach_windows_console_ctrl_semicolon_dispatches_root_binding() {
-    let handler = RequestHandler::new();
-    let alpha = session_name("alpha");
-    let requester_pid = std::process::id();
-
-    create_send_keys_test_session(&handler, &alpha).await;
-
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
-    let rebound = handler
-        .handle(Request::BindKey(Box::new(BindKeyRequest {
-            table_name: "root".to_owned(),
-            key: "C-;".to_owned(),
-            note: Some("live-attach-ctrl-semicolon".to_owned()),
-            repeat: false,
-            command: Some(vec![
-                "send-keys".to_owned(),
-                "-l".to_owned(),
-                "R".to_owned(),
-            ]),
-        })))
-        .await;
-    assert!(matches!(rebound, Response::BindKey(_)));
-
-    let capture =
-        RawPaneInputProbe::start(&handler, &alpha, "live-attach-c-semicolon-root", 1).await;
-    let mut pending_input = Vec::new();
-    let keystroke = rmux_proto::AttachedKeystroke::new(b";".to_vec()).with_windows_console_key(
-        rmux_proto::AttachedWindowsConsoleKey::new(0xba, 0x27, b';' as u16, 0x0008, 1),
-    );
-    let forwarded = handler
-        .handle_attached_keystroke_input(requester_pid, &mut pending_input, &keystroke)
-        .await
-        .expect("Ctrl+; attached input succeeds");
-
-    assert!(!forwarded);
-    assert!(pending_input.is_empty());
-    capture.finish(&handler, &alpha).await;
-    capture.assert_contents(&handler, b"R").await;
-}
-
-#[cfg(windows)]
-#[tokio::test]
-async fn live_attach_windows_console_ctrl_semicolon_enters_prefix_table() {
-    let handler = RequestHandler::new();
-    let alpha = session_name("alpha");
-    let requester_pid = std::process::id();
-
-    create_send_keys_test_session(&handler, &alpha).await;
-
-    let set_prefix = handler
-        .handle(Request::SetOption(SetOptionRequest {
-            scope: ScopeSelector::Global,
-            option: OptionName::Prefix,
-            value: "C-;".to_owned(),
-            mode: SetOptionMode::Replace,
-        }))
-        .await;
-    assert!(matches!(set_prefix, Response::SetOption(_)));
-
-    let rebound = handler
-        .handle(Request::BindKey(Box::new(BindKeyRequest {
-            table_name: "prefix".to_owned(),
-            key: "X".to_owned(),
-            note: Some("live-attach-ctrl-semicolon-prefix".to_owned()),
-            repeat: false,
-            command: Some(vec![
-                "send-keys".to_owned(),
-                "-l".to_owned(),
-                "P".to_owned(),
-            ]),
-        })))
-        .await;
-    assert!(matches!(rebound, Response::BindKey(_)));
-
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
-    let capture =
-        RawPaneInputProbe::start(&handler, &alpha, "live-attach-c-semicolon-prefix", 1).await;
-
-    let mut pending_input = Vec::new();
-    let keystroke = rmux_proto::AttachedKeystroke::new(b";".to_vec()).with_windows_console_key(
-        rmux_proto::AttachedWindowsConsoleKey::new(0xba, 0x27, b';' as u16, 0x0008, 1),
-    );
-    let forwarded = handler
-        .handle_attached_keystroke_input(requester_pid, &mut pending_input, &keystroke)
-        .await
-        .expect("Ctrl+; attached input succeeds");
-    assert!(!forwarded);
-
-    handler
-        .handle_attached_live_input_for_test(requester_pid, b"X")
-        .await
-        .expect("prefix X dispatches after Ctrl+;");
-
-    assert!(pending_input.is_empty());
-    capture.finish(&handler, &alpha).await;
-    capture.assert_contents(&handler, b"P").await;
 }
 
 #[tokio::test]
@@ -2847,8 +2586,8 @@ async fn display_message_ignore_protocol_reloads_target_after_each_focus_hook() 
         .await;
     {
         // Shell startup may enable focus reporting before the fixture takes
-        // control (notably PowerShell/PSReadLine on Windows). Pin both pane
-        // modes so this test measures target reload rather than shell policy.
+        // control. Pin both pane modes so this test measures target reload
+        // rather than shell policy.
         let mut state = handler.state.lock().await;
         state
             .append_bytes_to_pane_transcript_for_test(&alpha, 0, 0, b"\x1b[?1004l")
@@ -3512,7 +3251,7 @@ async fn setup_two_pane_mouse_click(
 async fn live_attach_mouse_binding_executes_every_command_in_the_sequence() {
     // Issue #96 reports that a root mouse binding of the shape
     // `select-pane -t = \; <command>` runs select-pane but skips the tail on
-    // a live Windows attach. Bind the exact shape and assert BOTH effects.
+    // a live attach. Bind the exact shape and assert BOTH effects.
     let handler = RequestHandler::new();
     let alpha = session_name("mouse-binding-sequence");
     let requester_pid = std::process::id();
@@ -3627,28 +3366,6 @@ async fn live_attach_mouse_binding_run_shell_tail_writes_its_file() {
     let requester_pid = std::process::id();
 
     create_send_keys_test_session(&handler, &alpha).await;
-    #[cfg(windows)]
-    {
-        let system_root = std::env::var_os("SystemRoot")
-            .unwrap_or_else(|| std::ffi::OsString::from(r"C:\Windows"));
-        let powershell = std::path::PathBuf::from(system_root)
-            .join("System32")
-            .join("WindowsPowerShell")
-            .join("v1.0")
-            .join("powershell.exe")
-            .to_string_lossy()
-            .into_owned();
-        let mut state = handler.state.lock().await;
-        state
-            .options
-            .set(
-                ScopeSelector::Global,
-                OptionName::DefaultShell,
-                powershell,
-                SetOptionMode::Replace,
-            )
-            .expect("Windows test default-shell is valid");
-    }
     let root = std::env::temp_dir().join(format!(
         "rmux-mouse-run-shell-{}-{requester_pid}",
         std::process::id()
@@ -3656,15 +3373,9 @@ async fn live_attach_mouse_binding_run_shell_tail_writes_its_file() {
     std::fs::create_dir_all(&root).expect("run-shell temp root");
     let output_path = root.join("mouse-hit.txt");
     let _ = std::fs::remove_file(&output_path);
-    #[cfg(unix)]
     let shell_command = format!(
         "printf %s hit > {}",
         crate::test_shell::sh_quote_path(&output_path)
-    );
-    #[cfg(windows)]
-    let shell_command = format!(
-        "[IO.File]::WriteAllText({}, 'hit', [Text.UTF8Encoding]::new($false))",
-        crate::test_shell::powershell_quote_path(&output_path)
     );
 
     let rebound = handler
@@ -4426,7 +4137,6 @@ async fn attached_session_switch_resets_click_state_without_clearing_a_new_timer
     handler.close_normal_and_drain_lifecycle_producers().await;
 }
 
-#[cfg(unix)]
 fn mouse_word_pane_command() -> Vec<String> {
     [
         "/bin/sh",
@@ -4436,22 +4146,6 @@ fn mouse_word_pane_command() -> Vec<String> {
     .into_iter()
     .map(str::to_owned)
     .collect()
-}
-
-#[cfg(windows)]
-fn mouse_word_pane_command() -> Vec<String> {
-    let system_root =
-        std::env::var_os("SystemRoot").unwrap_or_else(|| std::ffi::OsString::from(r"C:\Windows"));
-    let cmd = std::path::PathBuf::from(system_root)
-        .join("System32")
-        .join("cmd.exe");
-    vec![
-        cmd.to_string_lossy().into_owned(),
-        "/d".to_owned(),
-        "/q".to_owned(),
-        "/c".to_owned(),
-        "echo alpha beta gamma & ping -n 120 127.0.0.1 >NUL".to_owned(),
-    ]
 }
 
 async fn create_mouse_word_session(handler: &RequestHandler, session: &rmux_proto::SessionName) {
@@ -4516,7 +4210,7 @@ async fn live_attach_default_double_click_copies_word_from_mouse_pane() {
     let requester_pid = std::process::id();
 
     // Source the selectable text from the real pane output stream. In
-    // particular, a Windows ConPTY can publish its initial blank frame after
+    // particular, the pane reader can publish its initial blank frame after
     // terminal installation, so direct transcript injection would race it.
     create_mouse_word_session(&handler, &alpha).await;
     let target = PaneTarget::new(alpha.clone(), 0);

@@ -1,53 +1,67 @@
-//! The git command grammar, shared by the builtins and by whoever interprets a recorded run.
+//! The git command grammar: what a command line asks git to do to a resource.
 //!
-//! One grammar, two consumers: the `git` builtin ([`super::git_builtins`]) parses its argv with it
-//! to decide what to *do*, and whoever later reads the recorded argv of that builtin invocation
-//! parses it again to decide what was *requested*. A second parser would be a second opinion, and
-//! the whole point of executing git in-process is that the executed operation and the interpreted
-//! request cannot disagree.
+//! The `git` builtin forwards every command line to the system git unchanged, so this grammar
+//! decides nothing about *how* a command runs. It classifies one: [`parse`] names the operation a
+//! command line requests as a [`GitAction`], and the builtin maps that onto the policy vocabulary
+//! to decide how closely the run has to be observed. What the run actually did to each path is
+//! observed afterwards and recorded in the same vocabulary; the classification never becomes a
+//! request by itself.
 //!
-//! The parse target is [`GitAction`]: the operations this executor can actually perform, named
-//! without reference to any policy vocabulary. A subcommand with no [`GitAction`] is rejected here
-//! rather than approximated later.
+//! The grammar is git's own where it matters: global options before the subcommand, option
+//! operands, clustered short options, unique-prefix abbreviations of long options, `--no-`
+//! negations, nested subcommands (`stash`, `bisect`, `history`) and the `--` boundary. A form it
+//! cannot decide is classified as [`GitAction::Edit`] — never as something harmless — and git
+//! itself reports whatever is wrong with the line.
 
 use std::path::{Component, Path, PathBuf};
 
-/// A git operation this executor can perform.
+/// A git operation, named by what it does to a resource.
 ///
-/// Execution-local by design: the executor reports what a command asked git to do, and a caller
+/// Execution-local by design: the grammar reports what a command asked git to do, and a caller
 /// maps that onto whatever authorization vocabulary it uses.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GitAction {
     /// `git add`/`git stage`: worktree state into the index.
     Stage,
-    /// `git rm`: the path leaves both the worktree and the index.
+    /// `git rm`: the path leaves the index, and the worktree unless `--cached`.
     Delete,
-    /// `git commit`: the named paths' worktree state becomes a commit.
+    /// `git commit`: staged state becomes a commit.
     Commit {
         /// Commit message. `None` is distinct from an empty message.
         message: Option<String>,
     },
-    /// `git restore --staged`: `HEAD` state back into the index.
+    /// `git restore --staged`, `git reset`: `HEAD` state back into the index.
     Unstage,
-    /// `git checkout HEAD`: `HEAD` state into both worktree and index.
+    /// `git checkout`, `git switch`, `git reset --hard`: repository state into the worktree.
     Checkout,
     /// `git stash push`: worktree and index state moves to `refs/stash`.
     Stash,
-    /// `git clean -f`: untracked content at the named paths is deleted.
+    /// `git clean`: untracked content is deleted.
     Clean,
-    /// `git diff`: the index-to-worktree patch.
+    /// `git diff`, `git status`: differences between HEAD, index and worktree.
     Diff,
-    /// `git log`: the commits in which a named path changed.
+    /// `git log`, `git show`: committed history.
     History,
+    /// `git grep`: resource contents.
+    Read,
+    /// A resource's contents change without being settled: a conflict, a moved path's new name,
+    /// a popped stash — or a command line whose effect this grammar cannot decide.
+    Edit,
 }
 
-/// A parsed git command line: the operation it requests, and the resources it names.
+/// A classified git command line, borrowing every word from the vector it was parsed from.
 #[derive(Debug)]
-pub struct GitInvocation {
-    /// The operation the subcommand maps to.
-    pub action: GitAction,
-    /// Literal pathspecs, in command-line order, relative to the caller's working directory.
-    pub pathspecs: Vec<String>,
+pub struct GitInvocation<'a, S: AsRef<str>> {
+    /// The operation the command line requests, or `None` for one that names no file resource:
+    /// repository and ref metadata, object transfer, or git's own help and version output.
+    pub action: Option<GitAction>,
+    /// The subcommand word, or the informational option (`--version`, `--exec-path`) that took
+    /// its place; `None` for a bare `git` and for a global option this grammar does not know.
+    pub subcommand: Option<&'a str>,
+    /// The options between `git` and the subcommand.
+    pub global_args: &'a [S],
+    /// Everything after the subcommand.
+    pub command_args: &'a [S],
 }
 
 /// Resolves `path` against `base` and normalizes it lexically.
@@ -94,213 +108,643 @@ pub fn relative_segments(root: &Path, path: &Path) -> Option<Vec<String>> {
     )
 }
 
-/// Why a git command line does not name a capability.
-#[derive(Debug, thiserror::Error)]
-pub enum GitCmdError {
-    /// `git` with nothing after it.
-    #[error("git without a subcommand is not mappable to capabilities")]
-    NoSubcommand,
-    /// A leading `-flag` where the subcommand belongs.
-    #[error("git global flags not supported")]
-    GlobalFlags,
-    /// The subcommand's grammar takes a fixed number of leading words and got a different number.
-    #[error("git {subcommand} expects {expected} leading argument(s), got {got:?}")]
-    LeadingArguments {
-        /// The subcommand.
-        subcommand: String,
-        /// How many leading words its grammar reserves.
-        expected: usize,
-        /// What was actually there.
-        got: Vec<String>,
-    },
-    /// `git restore` without `--staged` moves the index into the worktree, which no action names.
-    #[error("git restore without --staged is not a capability; use git checkout HEAD -- <path>")]
-    RestoreWithoutStaged,
-    /// `git checkout` of anything but `HEAD`.
-    #[error("git checkout of {0:?} is not mappable to capabilities")]
-    Checkout(String),
-    /// A `git stash` subcommand other than `push`.
-    #[error("only `git stash push` is mappable to capabilities")]
-    Stash,
-    /// `git clean` without `-f`/`--force`.
-    #[error("git clean requires -f")]
-    CleanWithoutForce,
-    /// A subcommand the capability model has no action for.
-    #[error("git {0} not mappable to capabilities")]
-    UnknownSubcommand(String),
-    /// A command whose target set is implicit rather than named.
-    #[error("git {0} with an empty pathspec list")]
-    EmptyPathspecs(String),
-    /// A pathspec with a glob metacharacter: a computed target set, not a resource.
-    #[error("git pathspec pattern {0:?} is not a resource")]
-    PathspecPattern(String),
-    /// `git commit -F`/`--file`, whose message is not on the command line.
-    #[error("git commit -F/--file is not mappable to capabilities")]
-    CommitFromFile,
-    /// `-m` as the last argument.
-    #[error("git commit -m without a message")]
-    CommitMessageMissing,
+/// How one global option before the subcommand is spelled.
+enum Global {
+    /// A switch that is the whole word.
+    Flag,
+    /// An option whose value is the next word.
+    Value,
+    /// An option that makes git print something and exit instead of running a subcommand.
+    Informational,
+    /// Not an option git knows, which git refuses.
+    Unknown,
 }
 
-/// Parses a git command line (`argv[0]` included) into the capability it requests.
+/// Git's global options, as `git.c`'s `handle_options` reads them.
 ///
-/// The `--` separator is optional: `git add foo` and `git add -- foo` are the same request. What is
-/// *not* optional is that the request name resources — a command whose target set is implicit (the
-/// whole worktree) or computed (a glob) has no capability expression, and is an error here.
-pub fn parse(argv: &[String]) -> Result<GitInvocation, GitCmdError> {
-    let Some(subcommand) = argv.get(1) else {
-        return Err(GitCmdError::NoSubcommand);
-    };
-    if subcommand.starts_with('-') {
-        return Err(GitCmdError::GlobalFlags);
+/// `-C` and `-c` take the next word and never an attached value; the long options that take one
+/// accept it either attached with `=` or as the next word, except `--shallow-file`, which only
+/// takes the next word. `--exec-path` alone prints the exec path; only `--exec-path=<path>` sets
+/// it. `--help`, `-h`, `--version` and `-v` end option handling and run as the `help` and
+/// `version` commands.
+fn global_option(arg: &str) -> Global {
+    const ATTACHED: [&str; 6] = [
+        "--git-dir=",
+        "--work-tree=",
+        "--namespace=",
+        "--config-env=",
+        "--attr-source=",
+        "--exec-path=",
+    ];
+    match arg {
+        "-h" | "--help" | "-v" | "--version" | "--exec-path" | "--html-path" | "--man-path"
+        | "--info-path" => Global::Informational,
+        "-C" | "-c" | "--git-dir" | "--work-tree" | "--namespace" | "--config-env"
+        | "--attr-source" | "--shallow-file" => Global::Value,
+        "-p"
+        | "--paginate"
+        | "-P"
+        | "--no-pager"
+        | "--bare"
+        | "--no-replace-objects"
+        | "--literal-pathspecs"
+        | "--glob-pathspecs"
+        | "--noglob-pathspecs"
+        | "--icase-pathspecs"
+        | "--no-optional-locks"
+        | "--no-lazy-fetch"
+        | "--no-advice" => Global::Flag,
+        _ if arg.starts_with("--list-cmds=") => Global::Informational,
+        _ if ATTACHED.iter().any(|prefix| arg.starts_with(prefix)) => Global::Flag,
+        _ => Global::Unknown,
     }
-    let subcommand = subcommand.as_str();
-    let rest = &argv[2..];
+}
 
-    // Reserved leading words that are part of the subcommand's grammar rather than its target set.
-    let reserved = match subcommand {
-        "checkout" => 1, // the revision, which must be HEAD
-        "stash" => 1,    // the stash subcommand, which must be push
-        _ => 0,
-    };
-
-    let (flags, revisions, pathspecs) =
-        if let Some(separator) = rest.iter().position(|arg| arg == "--") {
-            let (flags, before) = split_flags(&rest[..separator]);
-            (flags, before, rest[separator + 1..].to_vec())
-        } else {
-            let (flags, mut positionals) = split_flags(rest);
-            let pathspecs = positionals.split_off(positionals.len().min(reserved));
-            (flags, positionals, pathspecs)
+/// Classifies a git command line, `argv[0]` included.
+///
+/// Never fails: a line git would refuse is still a line git will run, and what it would do is the
+/// question. An unknown global option or a value option missing its value is classified as
+/// [`GitAction::Edit`]; git reports the real error when it runs.
+///
+/// The argument vector may be borrowed or owned — `&[String]` from a builtin's own argv, `&[&str]`
+/// from a recorded line — because nothing about the grammar needs to own its input.
+pub fn parse<S: AsRef<str>>(argv: &[S]) -> GitInvocation<'_, S> {
+    let args = argv.get(1..).unwrap_or(&[]);
+    let mut index = 0;
+    while let Some(arg) = args.get(index).map(AsRef::as_ref) {
+        if !arg.starts_with('-') {
+            break;
+        }
+        match global_option(arg) {
+            Global::Flag => index += 1,
+            Global::Value if index + 1 < args.len() => index += 2,
+            Global::Informational => {
+                return GitInvocation {
+                    action: None,
+                    subcommand: Some(arg),
+                    global_args: &args[..index],
+                    command_args: &args[index + 1..],
+                };
+            }
+            Global::Value | Global::Unknown => {
+                return GitInvocation {
+                    action: Some(GitAction::Edit),
+                    subcommand: None,
+                    global_args: &args[..index],
+                    command_args: &args[index..],
+                };
+            }
+        }
+    }
+    let Some(subcommand) = args.get(index).map(AsRef::as_ref) else {
+        // A bare `git` prints its help.
+        return GitInvocation {
+            action: None,
+            subcommand: None,
+            global_args: args,
+            command_args: &[],
         };
-    if revisions.len() != reserved {
-        return Err(GitCmdError::LeadingArguments {
-            subcommand: subcommand.to_string(),
-            expected: reserved,
-            got: revisions,
-        });
+    };
+    let command_args = &args[index + 1..];
+    GitInvocation {
+        action: classify(subcommand, command_args),
+        subcommand: Some(subcommand),
+        global_args: &args[..index],
+        command_args,
     }
+}
 
-    let action = match subcommand {
-        "add" | "stage" => GitAction::Stage,
-        "rm" => GitAction::Delete,
-        "commit" => GitAction::Commit {
-            message: commit_message(&flags)?,
-        },
-        // `git restore --staged` moves HEAD into the index, which is exactly `GitAction::Unstage`.
-        // Without `--staged` it moves the *index* into the worktree, and no capability says that:
-        // `GitAction::Checkout` means HEAD into worktree and index, which is `git checkout HEAD`. One
-        // action must have exactly one execution, so the index-sourced form is refused.
-        "restore" => {
-            if flags.iter().any(|flag| flag == "--staged") {
-                GitAction::Unstage
+/// The primary action of `subcommand` run with `args`.
+fn classify<S: AsRef<str>>(subcommand: &str, args: &[S]) -> Option<GitAction> {
+    match subcommand {
+        "add" | "stage" => Some(GitAction::Stage),
+        "diff" | "status" => Some(GitAction::Diff),
+        "grep" => Some(GitAction::Read),
+        "log" | "show" => Some(GitAction::History),
+        "switch" | "checkout" | "pull" => Some(GitAction::Checkout),
+        "init" | "branch" | "tag" | "fetch" | "push" | "backfill" | "help" | "version" => None,
+        "clone" => {
+            let scan = scan(args, &CLONE);
+            let no_checkout = scan.last_switch(Some('n'), "no-checkout") == Some(true)
+                && scan.last_switch(None, "checkout") != Some(true);
+            if scan.has(None, "bare") || scan.has(None, "mirror") || no_checkout {
+                None
             } else {
-                return Err(GitCmdError::RestoreWithoutStaged);
+                Some(GitAction::Checkout)
             }
         }
-        "checkout" => {
-            if revisions[0] != "HEAD" {
-                return Err(GitCmdError::Checkout(revisions[0].clone()));
+        "mv" | "rm" => {
+            let grammar = if subcommand == "mv" { &MV } else { &RM };
+            if scan(args, grammar).has(Some('n'), "dry-run") {
+                Some(GitAction::Diff)
+            } else {
+                Some(GitAction::Delete)
             }
-            GitAction::Checkout
-        }
-        "stash" => {
-            if revisions[0] != "push" {
-                return Err(GitCmdError::Stash);
-            }
-            GitAction::Stash
         }
         "clean" => {
-            if !flags.iter().any(|flag| flag == "-f" || flag == "--force") {
-                return Err(GitCmdError::CleanWithoutForce);
+            if scan(args, &CLEAN).has(Some('n'), "dry-run") {
+                Some(GitAction::Diff)
+            } else {
+                Some(GitAction::Clean)
             }
-            GitAction::Clean
         }
-        "diff" => GitAction::Diff,
-        "log" => GitAction::History,
-        other => return Err(GitCmdError::UnknownSubcommand(other.to_string())),
-    };
-
-    if pathspecs.is_empty() {
-        return Err(GitCmdError::EmptyPathspecs(subcommand.to_string()));
-    }
-    for pathspec in &pathspecs {
-        if pathspec.contains(['*', '?', '[']) {
-            return Err(GitCmdError::PathspecPattern(pathspec.clone()));
+        "restore" => {
+            let scan = scan(args, &RESTORE);
+            let staged = scan.last_switch(Some('S'), "staged") == Some(true);
+            let worktree = scan.last_switch(Some('W'), "worktree") == Some(true);
+            if staged && !worktree {
+                Some(GitAction::Unstage)
+            } else {
+                Some(GitAction::Checkout)
+            }
         }
+        "reset" => reset_mode(&scan(args, &RESET)),
+        "commit" => Some(GitAction::Commit {
+            message: commit_message(&scan(args, &COMMIT)),
+        }),
+        "merge" => ends_without_checkout(&scan(args, &MERGE), &["quit"]),
+        "rebase" => ends_without_checkout(&scan(args, &REBASE), &["quit", "edit-todo"]),
+        "stash" => match args.first().map(AsRef::as_ref) {
+            None | Some("push" | "save") => Some(GitAction::Stash),
+            Some(option) if option.starts_with('-') => Some(GitAction::Stash),
+            Some("apply" | "pop") => Some(GitAction::Edit),
+            Some("branch") => Some(GitAction::Checkout),
+            Some("show") => Some(GitAction::Diff),
+            Some("list") => Some(GitAction::History),
+            Some("create" | "drop" | "clear" | "store") => None,
+            Some(_) => Some(GitAction::Edit),
+        },
+        "bisect" => match args.first().map(AsRef::as_ref) {
+            None | Some("help") => None,
+            Some("log" | "terms" | "visualize" | "view") => Some(GitAction::History),
+            Some("start") if scan(&args[1..], &BISECT_START).has(None, "no-checkout") => None,
+            // Every other word — the built-in terms, custom ones, `run`, `replay`, `reset` —
+            // can move the worktree, and a mode persisted by an earlier `start` is not visible
+            // on this line.
+            Some(_) => Some(GitAction::Checkout),
+        },
+        "history" => match args.first().map(AsRef::as_ref) {
+            None | Some("reword" | "split") => None,
+            Some("fixup") => Some(GitAction::Commit { message: None }),
+            Some(_) => Some(GitAction::Edit),
+        },
+        _ => Some(GitAction::Edit),
     }
-
-    Ok(GitInvocation { action, pathspecs })
 }
 
-/// Separates flags from positional arguments.
+/// `git reset`'s mode: the last mode option wins, as git's own option table has it.
+fn reset_mode(scan: &Scan<'_>) -> Option<GitAction> {
+    let mut mode = Some(GitAction::Unstage);
+    for option in &scan.options {
+        let Opt::Long {
+            name,
+            negated: false,
+            ..
+        } = option
+        else {
+            if matches!(option, Opt::Short('p', _)) {
+                mode = Some(GitAction::Unstage);
+            }
+            continue;
+        };
+        match *name {
+            "soft" => mode = None,
+            "mixed" | "patch" => mode = Some(GitAction::Unstage),
+            "hard" | "merge" | "keep" => mode = Some(GitAction::Checkout),
+            _ => {}
+        }
+    }
+    mode
+}
+
+/// `Checkout`, unless one of `quits` — an ending that leaves the worktree alone — was given.
+fn ends_without_checkout(scan: &Scan<'_>, quits: &[&str]) -> Option<GitAction> {
+    if quits.iter().any(|quit| scan.has(None, quit)) {
+        None
+    } else {
+        Some(GitAction::Checkout)
+    }
+}
+
+/// The message `git commit` was given on its command line: `-m`/`--message` values joined by a
+/// blank line, exactly as git composes multiple `-m` paragraphs.
 ///
-/// The value of a `-m`/`--message` flag stays with the flags, immediately after it, so
-/// [`commit_message`] can read the pairs regardless of where they appeared on the command line.
-fn split_flags(args: &[String]) -> (Vec<String>, Vec<String>) {
-    let mut flags = Vec::new();
+/// `None` when the message comes from anywhere else — a file, a reused commit, an editor — or an
+/// `-m` has no operand. Nothing is read and no editor is started to find out: the recorded
+/// commit's own message is what a request carries.
+fn commit_message(scan: &Scan<'_>) -> Option<String> {
+    let mut messages: Vec<&str> = Vec::new();
+    for option in &scan.options {
+        match option {
+            Opt::Short('m', value)
+            | Opt::Long {
+                name: "message",
+                value,
+                ..
+            } => messages.push((*value)?),
+            Opt::Short('F' | 'C' | 'c', _)
+            | Opt::Long {
+                name: "file" | "reuse-message" | "reedit-message",
+                ..
+            } => return None,
+            _ => {}
+        }
+    }
+    (!messages.is_empty()).then(|| messages.join("\n\n"))
+}
+
+/// How a subcommand's options take their operands, as far as classifying it needs to know.
+pub(crate) struct Grammar {
+    /// Short options that take a value, attached (`-bmain`) or as the next word.
+    short_values: &'static str,
+    /// Long options that take a value, attached (`--branch=main`) or as the next word.
+    long_values: &'static [&'static str],
+    /// Long options that take none — or only an attached one — listed so that a unique prefix
+    /// of one is read as the option it abbreviates.
+    long_flags: &'static [&'static str],
+}
+
+/// `git clone`, as `builtin/clone.c` declares its options.
+pub(crate) const CLONE: Grammar = Grammar {
+    short_values: "jobuc",
+    long_values: &[
+        "jobs",
+        "template",
+        "reference",
+        "reference-if-able",
+        "origin",
+        "branch",
+        "revision",
+        "upload-pack",
+        "depth",
+        "shallow-since",
+        "shallow-exclude",
+        "separate-git-dir",
+        "ref-format",
+        "config",
+        "server-option",
+        "filter",
+        "bundle-uri",
+    ],
+    long_flags: &[
+        "verbose",
+        "quiet",
+        "progress",
+        "reject-shallow",
+        "no-checkout",
+        "checkout",
+        "bare",
+        "mirror",
+        "local",
+        "no-hardlinks",
+        "hardlinks",
+        "shared",
+        "recurse-submodules",
+        "recursive",
+        "dissociate",
+        "single-branch",
+        "tags",
+        "shallow-submodules",
+        "ipv4",
+        "ipv6",
+        "also-filter-submodules",
+        "remote-submodules",
+        "sparse",
+    ],
+};
+
+/// `git init`, as `builtin/init-db.c` declares its options.
+pub(crate) const INIT: Grammar = Grammar {
+    short_values: "b",
+    long_values: &[
+        "template",
+        "separate-git-dir",
+        "initial-branch",
+        "object-format",
+        "ref-format",
+    ],
+    long_flags: &["bare", "shared", "quiet"],
+};
+
+/// `git mv`.
+const MV: Grammar = Grammar {
+    short_values: "",
+    long_values: &[],
+    long_flags: &["dry-run", "force", "verbose", "sparse"],
+};
+
+/// `git rm`.
+const RM: Grammar = Grammar {
+    short_values: "",
+    long_values: &["pathspec-from-file"],
+    long_flags: &[
+        "dry-run",
+        "quiet",
+        "cached",
+        "force",
+        "ignore-unmatch",
+        "sparse",
+        "pathspec-file-nul",
+    ],
+};
+
+/// `git clean`.
+const CLEAN: Grammar = Grammar {
+    short_values: "e",
+    long_values: &["exclude"],
+    long_flags: &["dry-run", "quiet", "force", "interactive"],
+};
+
+/// `git restore`.
+const RESTORE: Grammar = Grammar {
+    short_values: "s",
+    long_values: &["source", "pathspec-from-file", "conflict"],
+    long_flags: &[
+        "staged",
+        "worktree",
+        "patch",
+        "ours",
+        "theirs",
+        "merge",
+        "overlay",
+        "ignore-unmerged",
+        "ignore-skip-worktree-bits",
+        "recurse-submodules",
+        "progress",
+        "quiet",
+        "pathspec-file-nul",
+    ],
+};
+
+/// `git reset`.
+const RESET: Grammar = Grammar {
+    short_values: "",
+    long_values: &["pathspec-from-file"],
+    long_flags: &[
+        "soft",
+        "mixed",
+        "hard",
+        "merge",
+        "keep",
+        "patch",
+        "quiet",
+        "intent-to-add",
+        "recurse-submodules",
+        "refresh",
+        "pathspec-file-nul",
+    ],
+};
+
+/// `git commit`.
+const COMMIT: Grammar = Grammar {
+    short_values: "mFCct",
+    long_values: &[
+        "message",
+        "file",
+        "reuse-message",
+        "reedit-message",
+        "fixup",
+        "squash",
+        "author",
+        "date",
+        "template",
+        "cleanup",
+        "pathspec-from-file",
+        "trailer",
+    ],
+    long_flags: &[
+        "all",
+        "patch",
+        "amend",
+        "allow-empty",
+        "allow-empty-message",
+        "no-verify",
+        "verify",
+        "dry-run",
+        "include",
+        "only",
+        "signoff",
+        "edit",
+        "quiet",
+        "verbose",
+        "short",
+        "porcelain",
+        "long",
+        "status",
+        "null",
+        "reset-author",
+        "no-post-rewrite",
+    ],
+};
+
+/// `git merge`.
+const MERGE: Grammar = Grammar {
+    short_values: "mFsX",
+    long_values: &[
+        "message",
+        "file",
+        "strategy",
+        "strategy-option",
+        "into-name",
+        "cleanup",
+    ],
+    long_flags: &[
+        "quit",
+        "abort",
+        "continue",
+        "commit",
+        "edit",
+        "ff",
+        "ff-only",
+        "squash",
+        "stat",
+        "summary",
+        "log",
+        "signoff",
+        "verify",
+        "verbose",
+        "quiet",
+        "progress",
+        "autostash",
+        "allow-unrelated-histories",
+        "rerere-autoupdate",
+        "overwrite-ignore",
+    ],
+};
+
+/// `git rebase`.
+const REBASE: Grammar = Grammar {
+    short_values: "sXx",
+    long_values: &["onto", "strategy", "strategy-option", "exec", "whitespace"],
+    long_flags: &[
+        "quit",
+        "edit-todo",
+        "abort",
+        "continue",
+        "skip",
+        "show-current-patch",
+        "interactive",
+        "merge",
+        "apply",
+        "root",
+        "autosquash",
+        "autostash",
+        "update-refs",
+        "keep-base",
+        "fork-point",
+        "quiet",
+        "verbose",
+        "stat",
+        "verify",
+        "signoff",
+        "reapply-cherry-picks",
+        "rebase-merges",
+        "empty",
+        "committer-date-is-author-date",
+        "ignore-date",
+        "reschedule-failed-exec",
+    ],
+};
+
+/// `git bisect start`.
+const BISECT_START: Grammar = Grammar {
+    short_values: "",
+    long_values: &["term-new", "term-bad", "term-old", "term-good"],
+    long_flags: &["no-checkout", "first-parent"],
+};
+
+/// One option word, or one option of a clustered short word.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Opt<'a> {
+    /// `-x`, with the value it took when it takes one.
+    Short(char, Option<&'a str>),
+    /// `--name`, spelled out or abbreviated, with `negated` for its `--no-` form.
+    Long {
+        /// The option's full name as its grammar declares it, or the word itself when it is not
+        /// one the grammar knows.
+        name: &'a str,
+        /// Whether it was given as `--no-<name>`.
+        negated: bool,
+        /// The value it took when it takes one; `None` also for a value option that ended the
+        /// line without its value.
+        value: Option<&'a str>,
+    },
+}
+
+/// A subcommand's arguments, split into options and positional words.
+pub(crate) struct Scan<'a> {
+    /// Every option before `--`, in command-line order.
+    pub(crate) options: Vec<Opt<'a>>,
+    /// Every positional word, before and after `--`, in command-line order.
+    pub(crate) positionals: Vec<&'a str>,
+}
+
+impl Scan<'_> {
+    /// Whether the option was given, in either spelling, and not negated.
+    pub(crate) fn has(&self, short: Option<char>, long: &str) -> bool {
+        self.last_switch(short, long) == Some(true)
+    }
+
+    /// The last setting of a switch: `Some(true)` for its last plain spelling, `Some(false)` for
+    /// a `--no-` form given after it, `None` when the line never mentions it.
+    pub(crate) fn last_switch(&self, short: Option<char>, long: &str) -> Option<bool> {
+        self.options.iter().rev().find_map(|option| match option {
+            Opt::Short(letter, _) if Some(*letter) == short => Some(true),
+            Opt::Long { name, negated, .. } if *name == long => Some(!negated),
+            _ => None,
+        })
+    }
+
+    /// The value of the last occurrence of a value option, in either spelling.
+    pub(crate) fn value(&self, short: Option<char>, long: &str) -> Option<&str> {
+        self.options.iter().rev().find_map(|option| match option {
+            Opt::Short(letter, value) if Some(*letter) == short => *value,
+            Opt::Long {
+                name,
+                negated: false,
+                value,
+            } if *name == long => *value,
+            _ => None,
+        })
+    }
+}
+
+/// Splits `args` into options and positionals the way git's `parse-options` reads them.
+///
+/// A long option is matched exactly, then as a unique prefix of one the grammar declares, then
+/// through its `--no-` form. A value option takes its operand attached or as the next word, so an
+/// operand that looks like an option or like `--` is still that option's value. A single `-` is
+/// a positional, and every word after the first `--` is one.
+pub(crate) fn scan<'a, S: AsRef<str>>(args: &'a [S], grammar: &Grammar) -> Scan<'a> {
+    let mut options = Vec::new();
     let mut positionals = Vec::new();
-    let mut index = 0;
-    while index < args.len() {
-        let arg = &args[index];
-        if arg.starts_with('-') {
-            flags.push(arg.clone());
-            if (arg == "-m" || arg == "--message" || arg == "-F" || arg == "--file")
-                && let Some(value) = args.get(index + 1)
-            {
-                flags.push(value.clone());
-                index += 2;
-                continue;
+    let mut words = args.iter().map(AsRef::as_ref);
+    while let Some(word) = words.next() {
+        if word == "--" {
+            positionals.extend(words.by_ref());
+            break;
+        }
+        if let Some(long) = word.strip_prefix("--") {
+            let (spelled, attached) = match long.split_once('=') {
+                Some((spelled, value)) => (spelled, Some(value)),
+                None => (long, None),
+            };
+            let (name, negated) = long_name(spelled, grammar);
+            let value = if !negated && grammar.long_values.contains(&name) {
+                attached.or_else(|| words.next())
+            } else {
+                attached
+            };
+            options.push(Opt::Long {
+                name,
+                negated,
+                value,
+            });
+        } else if let Some(cluster) = word.strip_prefix('-').filter(|cluster| !cluster.is_empty()) {
+            for (at, letter) in cluster.char_indices() {
+                if grammar.short_values.contains(letter) {
+                    let rest = cluster.get(at + letter.len_utf8()..).unwrap_or_default();
+                    let value = if rest.is_empty() {
+                        words.next()
+                    } else {
+                        Some(rest)
+                    };
+                    options.push(Opt::Short(letter, value));
+                    break;
+                }
+                options.push(Opt::Short(letter, None));
             }
         } else {
-            positionals.push(arg.clone());
+            positionals.push(word);
         }
-        index += 1;
     }
-    (flags, positionals)
+    Scan {
+        options,
+        positionals,
+    }
 }
 
-/// Extracts a commit message from `git commit` flags: `-m`/`--message` values joined by a blank
-/// line, exactly as git composes multiple `-m` paragraphs.
-fn commit_message(flags: &[String]) -> Result<Option<String>, GitCmdError> {
-    let mut messages: Vec<String> = Vec::new();
-    let mut index = 0;
-    while index < flags.len() {
-        let flag = flags[index].as_str();
-        if flag == "-F" || flag == "--file" || flag.starts_with("--file=") {
-            return Err(GitCmdError::CommitFromFile);
-        }
-        if flag == "-m" || flag == "--message" {
-            let value = flags
-                .get(index + 1)
-                .ok_or(GitCmdError::CommitMessageMissing)?;
-            messages.push(value.clone());
-            index += 2;
-            continue;
-        }
-        if let Some(value) = flag.strip_prefix("--message=") {
-            messages.push(value.to_string());
-        } else if let Some(value) = flag.strip_prefix("-m").filter(|value| !value.is_empty()) {
-            messages.push(value.to_string());
-        }
-        index += 1;
+/// The declared name `spelled` means, and whether it was the `--no-` form of it.
+fn long_name<'a>(spelled: &'a str, grammar: &Grammar) -> (&'a str, bool) {
+    let declared = grammar.long_values.iter().chain(grammar.long_flags);
+    if let Some(exact) = declared.clone().find(|name| **name == spelled) {
+        return (*exact, false);
     }
-    if messages.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(messages.join("\n\n")))
+    let mut prefixed = declared.filter(|name| name.starts_with(spelled));
+    if let (Some(only), None) = (prefixed.next(), prefixed.next()) {
+        return (*only, false);
     }
+    if let Some(positive) = spelled.strip_prefix("no-") {
+        let (name, _) = long_name(positive, grammar);
+        return (name, true);
+    }
+    (spelled, false)
 }
 
 #[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn parse_argv(argv: &[&str]) -> Result<GitInvocation, GitCmdError> {
-        let argv: Vec<String> = argv.iter().map(|arg| (*arg).to_string()).collect();
-        parse(&argv)
-    }
 
     /// A commit action with the message the command line carried.
     fn commit(message: Option<&str>) -> GitAction {
@@ -328,154 +772,290 @@ mod tests {
         assert_eq!(relative_segments(root, Path::new("/elsewhere/a.txt")), None);
     }
 
+    /// Every subcommand git 2.55 advertises, and the four other names the builtin has always
+    /// answered to, classify by their mode — not by their name alone.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one flat table over every advertised subcommand and its modes"
+    )]
     #[test]
     fn subcommands_map_to_their_capabilities() {
-        let cases: [(&[&str], GitAction); 11] = [
-            (&["git", "add", "--", "src/a.txt"], GitAction::Stage),
-            (&["git", "stage", "--", "src/a.txt"], GitAction::Stage),
-            (&["git", "rm", "--", "src/a.txt"], GitAction::Delete),
+        use GitAction::{
+            Checkout, Clean, Delete, Diff, Edit, History, Read, Stage, Stash, Unstage,
+        };
+        let cases: &[(&[&str], Option<GitAction>)] = &[
+            // Start a working area.
+            (&["git", "clone", "origin", "dest"], Some(Checkout)),
+            (&["git", "clone", "--bare", "origin"], None),
+            (&["git", "clone", "--mirror", "origin"], None),
+            (&["git", "clone", "-n", "origin"], None),
+            (&["git", "clone", "--no-checkout", "origin"], None),
+            (&["git", "clone", "--no-check", "origin"], None),
+            (&["git", "clone", "-b", "--bare", "origin"], Some(Checkout)),
+            (&["git", "init", "-b", "main"], None),
+            // Work on the current change.
+            (&["git", "add", "--", "p"], Some(Stage)),
+            (&["git", "add", "-A"], Some(Stage)),
+            (&["git", "add", "*.txt"], Some(Stage)),
+            (&["git", "stage", "p"], Some(Stage)),
+            (&["git", "mv", "--", "p", "q"], Some(Delete)),
+            (&["git", "mv", "-n", "p", "q"], Some(Diff)),
+            (&["git", "mv", "--", "-n", "q"], Some(Delete)),
+            (&["git", "restore", "--staged", "--", "p"], Some(Unstage)),
+            (&["git", "restore", "-S", "p"], Some(Unstage)),
+            (&["git", "restore", "--", "p"], Some(Checkout)),
+            (&["git", "restore", "-SW", "p"], Some(Checkout)),
             (
-                &["git", "commit", "-m", "step 7", "--", "src/a.txt"],
-                commit(Some("step 7")),
+                &["git", "restore", "--staged", "--worktree", "p"],
+                Some(Checkout),
             ),
             (
-                &["git", "restore", "--staged", "--", "src/a.txt"],
-                GitAction::Unstage,
+                &["git", "restore", "--staged", "--no-staged", "p"],
+                Some(Checkout),
             ),
+            (&["git", "restore", "-s", "--staged", "p"], Some(Checkout)),
+            (&["git", "rm", "--", "p"], Some(Delete)),
+            (&["git", "rm", "--cached", "p"], Some(Delete)),
+            (&["git", "rm", "-rn", "p"], Some(Diff)),
+            (&["git", "rm", "--dry-run", "p"], Some(Diff)),
+            // Examine history and state.
+            (&["git", "bisect", "start"], Some(Checkout)),
+            (&["git", "bisect", "start", "--no-checkout"], None),
+            (&["git", "bisect", "bad", "HEAD"], Some(Checkout)),
+            (&["git", "bisect", "run", "true"], Some(Checkout)),
+            (&["git", "bisect", "log"], Some(History)),
+            (&["git", "bisect", "visualize"], Some(History)),
+            (&["git", "bisect"], None),
+            (&["git", "diff", "--", "p"], Some(Diff)),
+            (&["git", "grep", "-n", "beta"], Some(Read)),
+            (&["git", "grep", "--cached", "beta"], Some(Read)),
+            (&["git", "log", "--oneline", "--", "p"], Some(History)),
+            (&["git", "show", "HEAD:p"], Some(History)),
+            (&["git", "status"], Some(Diff)),
+            (&["git", "status", "--porcelain=v1"], Some(Diff)),
+            // Grow, mark, and tweak history.
+            (&["git", "backfill", "--min-batch-size=1"], None),
+            (&["git", "branch", "feature"], None),
             (
-                &["git", "checkout", "HEAD", "--", "src/a.txt"],
-                GitAction::Checkout,
+                &["git", "commit", "-m", "saved"],
+                Some(commit(Some("saved"))),
             ),
+            (&["git", "history", "fixup", "HEAD~1"], Some(commit(None))),
+            (&["git", "history", "reword", "HEAD"], None),
+            (&["git", "history", "split", "HEAD"], None),
+            (&["git", "merge", "--ff-only", "feature"], Some(Checkout)),
+            (&["git", "merge", "--quit"], None),
+            (&["git", "merge", "-m", "--quit", "feature"], Some(Checkout)),
+            (&["git", "rebase", "main"], Some(Checkout)),
+            (&["git", "rebase", "--quit"], None),
+            (&["git", "rebase", "--edit-todo"], None),
+            (&["git", "reset", "--hard", "HEAD~1"], Some(Checkout)),
+            (&["git", "reset", "--merge"], Some(Checkout)),
+            (&["git", "reset", "--keep", "HEAD"], Some(Checkout)),
+            (&["git", "reset", "--soft", "HEAD~1"], None),
+            (&["git", "reset", "--mixed", "HEAD~1"], Some(Unstage)),
+            (&["git", "reset", "HEAD~1"], Some(Unstage)),
+            (&["git", "reset", "--", "p"], Some(Unstage)),
+            (&["git", "reset", "-p"], Some(Unstage)),
+            (&["git", "reset", "--hard", "--soft"], None),
+            (&["git", "reset", "--ha"], Some(Checkout)),
+            (&["git", "reset", "--", "--hard"], Some(Unstage)),
+            (&["git", "switch", "feature"], Some(Checkout)),
+            (&["git", "tag", "v1"], None),
+            // Collaborate.
+            (&["git", "fetch", "origin"], None),
             (
-                &["git", "stash", "push", "--", "src/a.txt"],
-                GitAction::Stash,
+                &["git", "pull", "--ff-only", "origin", "main"],
+                Some(Checkout),
             ),
-            (&["git", "clean", "-f", "--", "src/a.txt"], GitAction::Clean),
-            (&["git", "diff", "--", "src/a.txt"], GitAction::Diff),
-            (&["git", "log", "--", "src/a.txt"], GitAction::History),
-            // The separator is optional; the builtin owns its grammar.
-            (&["git", "add", "src/a.txt"], GitAction::Stage),
+            (&["git", "push", "origin", "main"], None),
+            // The builtin's other names.
+            (&["git", "checkout", "HEAD", "--", "p"], Some(Checkout)),
+            (&["git", "checkout", "feature"], Some(Checkout)),
+            (&["git", "stash"], Some(Stash)),
+            (&["git", "stash", "push", "--", "p"], Some(Stash)),
+            (&["git", "stash", "-u"], Some(Stash)),
+            (&["git", "stash", "apply"], Some(Edit)),
+            (&["git", "stash", "pop"], Some(Edit)),
+            (&["git", "stash", "branch", "b"], Some(Checkout)),
+            (&["git", "stash", "show", "-p"], Some(Diff)),
+            (&["git", "stash", "list"], Some(History)),
+            (&["git", "stash", "drop"], None),
+            (&["git", "stash", "store", "x"], None),
+            (&["git", "clean", "-f", "--", "p"], Some(Clean)),
+            (&["git", "clean", "-fn"], Some(Diff)),
+            (&["git", "clean", "--dry-run"], Some(Diff)),
+            (&["git", "clean", "-e", "-n", "-f"], Some(Clean)),
+            // What the grammar cannot decide is never harmless.
+            (&["git", "cherry-pick", "HEAD"], Some(Edit)),
+            (&["git", "history", "rewrite"], Some(Edit)),
+            (&["git", "stash", "unknown"], Some(Edit)),
         ];
         for (argv, action) in cases {
-            let invocation = parse_argv(argv).unwrap_or_else(|error| panic!("{argv:?}: {error}"));
-            assert_eq!(invocation.action, action, "{argv:?}");
+            let invocation = parse(argv);
+            assert_eq!(&invocation.action, action, "{argv:?}");
+            assert_eq!(invocation.subcommand, Some(argv[1]), "{argv:?}");
             assert_eq!(
-                invocation.pathspecs,
-                vec!["src/a.txt".to_string()],
-                "{argv:?}"
+                invocation.command_args,
+                &argv[2..],
+                "the raw arguments: {argv:?}"
             );
         }
     }
 
+    /// Global options are consumed before the subcommand is found, with their operands; what
+    /// makes git print and exit, or git refuses, never reaches a subcommand.
     #[test]
-    fn reserved_words_and_flag_values_are_not_pathspecs() {
-        let cases: [(&[&str], GitAction); 4] = [
-            (
-                &["git", "checkout", "HEAD", "src/a.txt"],
-                GitAction::Checkout,
-            ),
-            (&["git", "stash", "push", "src/a.txt"], GitAction::Stash),
-            (
-                &["git", "commit", "-m", "step 7", "src/a.txt"],
-                commit(Some("step 7")),
-            ),
-            (&["git", "clean", "-f", "src/a.txt"], GitAction::Clean),
-        ];
-        for (argv, action) in cases {
-            let invocation = parse_argv(argv).unwrap_or_else(|error| panic!("{argv:?}: {error}"));
-            assert_eq!(invocation.action, action, "{argv:?}");
-            assert_eq!(
-                invocation.pathspecs,
-                vec!["src/a.txt".to_string()],
-                "{argv:?}"
-            );
+    fn global_options_precede_the_subcommand() {
+        let invocation = parse(&[
+            "git",
+            "-C",
+            "sub",
+            "-C",
+            "",
+            "-c",
+            "core.abbrev=12",
+            "--no-pager",
+            "--git-dir=.git",
+            "--work-tree",
+            ".",
+            "--config-env",
+            "a.b=ENV",
+            "--shallow-file",
+            "s",
+            "--no-optional-locks",
+            "--no-lazy-fetch",
+            "--no-advice",
+            "--exec-path=/x",
+            "status",
+            "-s",
+        ]);
+        assert_eq!(invocation.action, Some(GitAction::Diff));
+        assert_eq!(invocation.subcommand, Some("status"));
+        assert_eq!(invocation.global_args.len(), 18);
+        assert_eq!(invocation.command_args, ["-s"]);
+
+        for informational in [
+            "--version",
+            "-v",
+            "--help",
+            "-h",
+            "--exec-path",
+            "--html-path",
+        ] {
+            let argv = ["git", "-c", "a.b=c", informational, "status"];
+            let invocation = parse(&argv);
+            assert_eq!(invocation.action, None, "{informational}");
+            assert_eq!(invocation.subcommand, Some(informational));
+            assert_eq!(invocation.command_args, ["status"]);
+        }
+        let bare = parse(&["git", "--no-pager"]);
+        assert_eq!((bare.action, bare.subcommand), (None, None));
+        assert!(parse::<&str>(&[]).action.is_none());
+
+        for undecidable in [
+            &["git", "--frobnicate", "status"][..],
+            &["git", "-C"][..],
+            &["git", "-Csub", "status"][..],
+        ] {
+            let invocation = parse(undecidable);
+            assert_eq!(invocation.action, Some(GitAction::Edit), "{undecidable:?}");
+            assert_eq!(invocation.subcommand, None, "{undecidable:?}");
         }
     }
 
     #[test]
-    fn multiple_pathspecs_and_messages_are_preserved() {
-        let invocation = parse_argv(&[
-            "git", "commit", "-m", "one", "-m", "two", "--", "a.txt", "b.txt",
-        ])
-        .expect("parse");
-        assert_eq!(invocation.action, commit(Some("one\n\ntwo")));
+    fn multiple_messages_are_joined_as_paragraphs() {
         assert_eq!(
-            invocation.pathspecs,
-            vec!["a.txt".to_string(), "b.txt".to_string()]
+            parse(&["git", "commit", "-m", "one", "-m", "two", "--", "a.txt"]).action,
+            Some(commit(Some("one\n\ntwo")))
         );
         assert_eq!(
-            parse_argv(&["git", "commit", "-mshort", "--", "a.txt"])
-                .expect("parse")
-                .action,
-            commit(Some("short")),
+            parse(&["git", "commit", "-mshort"]).action,
+            Some(commit(Some("short"))),
             "the attached form is the same message"
         );
         assert_eq!(
-            parse_argv(&["git", "commit", "--message=long", "--", "a.txt"])
-                .expect("parse")
-                .action,
-            commit(Some("long")),
+            parse(&["git", "commit", "--message=long"]).action,
+            Some(commit(Some("long")))
+        );
+        assert_eq!(
+            parse(&["git", "commit", "--mess", "abbreviated"]).action,
+            Some(commit(Some("abbreviated")))
+        );
+        assert_eq!(
+            parse(&["git", "commit", "-am", "all"]).action,
+            Some(commit(Some("all"))),
+            "-m clustered after a switch"
+        );
+        assert_eq!(
+            parse(&["git", "commit", "-m", "--", "p"]).action,
+            Some(commit(Some("--"))),
+            "`--` after -m is that option's value"
+        );
+        assert_eq!(
+            parse(&["git", "commit", "-m", ""]).action,
+            Some(commit(Some(""))),
+            "an empty message is a message"
         );
     }
 
+    /// A message that is not on the command line is not a message the classification can know;
+    /// the commit the run records carries the real one.
     #[test]
-    fn unmappable_command_lines_are_rejected() {
-        let cases: [(&[&str], &str); 12] = [
-            (&["git"], "without a subcommand"),
-            (&["git", "--version"], "global flags"),
-            (&["git", "push", "--", "a.txt"], "not mappable"),
-            (&["git", "status", "--", "a.txt"], "not mappable"),
-            (&["git", "add"], "empty pathspec list"),
-            (&["git", "add", "--"], "empty pathspec list"),
-            (&["git", "add", "--", "src/*.txt"], "pathspec pattern"),
-            (&["git", "restore", "--", "a.txt"], "use git checkout HEAD"),
-            (
-                &["git", "checkout", "other-branch", "--", "a.txt"],
-                "not mappable",
-            ),
-            (&["git", "checkout", "--", "a.txt"], "leading argument"),
-            (&["git", "stash", "pop", "--", "a.txt"], "stash push"),
-            (&["git", "clean", "--", "a.txt"], "requires -f"),
-        ];
-        for (argv, expected) in cases {
-            let error = parse_argv(argv)
-                .err()
-                .unwrap_or_else(|| panic!("{argv:?} parsed"))
-                .to_string();
-            assert!(error.contains(expected), "{argv:?} reported {error:?}");
+    fn a_message_from_elsewhere_is_unknown() {
+        for argv in [
+            &["git", "commit", "-F", "msg.txt"][..],
+            &["git", "commit", "--file=msg.txt"][..],
+            &["git", "commit", "-C", "HEAD"][..],
+            &["git", "commit", "-m", "x", "-F", "msg.txt"][..],
+            &["git", "commit"][..],
+            &["git", "commit", "-m"][..],
+        ] {
+            assert_eq!(parse(argv).action, Some(commit(None)), "{argv:?}");
         }
     }
 
-    /// The parse refusal is what a git builtin prints to the command's stderr, so its wording is a
-    /// user-facing contract, not an internal label.
+    /// The same grammar has to answer identically whether its caller owns its argument vector or
+    /// borrows it: the builtin passes its own `Vec<String>`, and a recorded line arrives as `&str`.
     #[test]
-    fn a_refusal_reads_as_the_sentence_the_builtin_prints() {
-        assert_eq!(
-            parse_argv(&["git", "status"]).unwrap_err().to_string(),
-            "git status not mappable to capabilities"
-        );
-        assert_eq!(
-            parse_argv(&["git", "restore", "--", "a"])
-                .unwrap_err()
-                .to_string(),
-            "git restore without --staged is not a capability; use git checkout HEAD -- <path>"
-        );
+    fn borrowed_and_owned_argument_vectors_parse_identically() {
+        let borrowed = [
+            "git", "-C", "sub", "commit", "-m", "one", "-m", "two", "--", "a.txt",
+        ];
+        let owned: Vec<String> = borrowed.iter().map(|arg| (*arg).to_string()).collect();
+
+        let from_borrowed = parse(&borrowed);
+        let from_owned = parse(&owned);
+        assert_eq!(from_borrowed.action, from_owned.action);
+        assert_eq!(from_borrowed.subcommand, from_owned.subcommand);
+        assert_eq!(from_owned.global_args, ["-C", "sub"]);
+        assert_eq!(from_owned.command_args, &owned[4..]);
+        assert_eq!(from_owned.action, Some(commit(Some("one\n\ntwo"))));
     }
 
+    /// The scanner is also what finds `git clone`'s and `git init`'s destinations, so an operand
+    /// that looks like an option has to stay with the option that takes it.
     #[test]
-    fn a_message_file_is_not_a_message() {
-        let error = parse_argv(&["git", "commit", "-F", "msg.txt", "--", "a.txt"])
-            .expect_err("rejected")
-            .to_string();
-        assert!(error.contains("-F/--file"), "got {error:?}");
-        assert_eq!(
-            parse_argv(&["git", "commit", "--", "a.txt"])
-                .expect("parse")
-                .action,
-            commit(None),
-            "no -m at all is a missing message, not an error: the builtin refuses it, and the \
-             policy distinguishes a missing message from an empty one"
+    fn option_operands_and_positionals_are_told_apart() {
+        let scan = scan(
+            &[
+                "-q",
+                "--sep",
+                "../meta",
+                "-bmain",
+                "--depth=1",
+                "src",
+                "--",
+                "-dest",
+            ],
+            &CLONE,
         );
+        assert_eq!(scan.value(None, "separate-git-dir"), Some("../meta"));
+        assert_eq!(scan.value(Some('b'), "branch"), Some("main"));
+        assert_eq!(scan.value(None, "depth"), Some("1"));
+        assert_eq!(scan.positionals, ["src", "-dest"]);
+        assert!(scan.has(Some('q'), "quiet"));
     }
 
     /// A pathspec is resolved textually against the caller's working directory, exactly as git

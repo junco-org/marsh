@@ -11,9 +11,7 @@ use rmux_proto::{
     ShowOptionsRequest, TerminalSize, WindowTarget,
 };
 
-fn session_name(value: &str) -> SessionName {
-    SessionName::new(value).expect("valid session name")
-}
+use crate::test_names::session_name;
 
 fn temp_path(label: &str) -> std::path::PathBuf {
     let stamp = SystemTime::now()
@@ -1947,18 +1945,9 @@ fn shell_quote_str(value: &str) -> String {
     crate::test_shell::command_quote(value)
 }
 
-#[cfg(unix)]
 fn append_x_command(path: &std::path::Path) -> String {
     format!(
         "printf x >> {}",
         shell_quote_str(&path.display().to_string())
     )
-}
-
-#[cfg(windows)]
-fn append_x_command(path: &std::path::Path) -> String {
-    crate::test_shell::powershell_encoded_command(&format!(
-        "Add-Content -NoNewline -LiteralPath {} -Value 'x'",
-        crate::test_shell::powershell_quote_path(path)
-    ))
 }

@@ -14,9 +14,7 @@ use rmux_proto::{
     SplitWindowTarget, SubscribePaneStateRequest, TerminalSize, UnlinkWindowRequest, WindowTarget,
 };
 
-fn session_name(value: &str) -> SessionName {
-    SessionName::new(value).expect("valid session name")
-}
+use crate::test_names::session_name;
 
 async fn create_session(handler: &RequestHandler, value: &str) -> SessionName {
     let session = session_name(value);

@@ -8,8 +8,8 @@ use super::command_runner::{
     finish_command_success, inherited_pane_target, run_queued_server_command, write_command_output,
 };
 use super::json_output::{stdout_string, write_json_object};
-use super::{expect_command_output, resolve_target_spec, unexpected_response, ExitFailure};
-use crate::cli_args::{parse_target_spec, DisplayMessageArgs};
+use super::{ExitFailure, expect_command_output, resolve_target_spec, unexpected_response};
+use crate::cli_args::{DisplayMessageArgs, parse_target_spec};
 
 /// Runs `display-message`, choosing the JSON, queued, or direct request path from `args`.
 pub(super) fn run_display_message(

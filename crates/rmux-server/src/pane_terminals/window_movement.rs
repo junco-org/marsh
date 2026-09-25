@@ -9,6 +9,7 @@ use super::{
     ensure_session_panes_exist, link_window_destination_index, request_target_string,
     session_not_found, window_pane_ids, HandlerState, RemovedWindowHookContext,
 };
+use crate::pane_terminals::session_mutation::WindowMutationMetadataSnapshot;
 use crate::pane_terminals::{terminate_removed_terminals, MovedWindowResult};
 
 #[path = "window_movement/cross_session.rs"]
@@ -174,12 +175,7 @@ impl HandlerState {
                 .session(&session_name)
                 .cloned()
                 .ok_or_else(|| session_not_found(&session_name))?;
-            let previous_options = self.options.clone();
-            let previous_hooks = self.hooks.clone();
-            let previous_auto_named_windows = self.auto_named_windows.clone();
-            let previous_window_link_slots = self.window_link_slots.clone();
-            let previous_window_link_groups = self.window_link_groups.clone();
-            let previous_window_link_occurrences = self.window_link_occurrences.clone();
+            let previous_metadata = WindowMutationMetadataSnapshot::capture(self);
             ensure_session_panes_exist(self, &session_name, &previous_session)?;
 
             {
@@ -214,12 +210,7 @@ impl HandlerState {
             );
 
             if let Err(error) = self.resize_terminals(&session_name) {
-                self.options = previous_options;
-                self.hooks = previous_hooks;
-                self.auto_named_windows = previous_auto_named_windows;
-                self.window_link_slots = previous_window_link_slots;
-                self.window_link_groups = previous_window_link_groups;
-                self.window_link_occurrences = previous_window_link_occurrences;
+                previous_metadata.restore(self);
                 self.restore_session_after_resize_error(&session_name, previous_session, &error)?;
                 return Err(error);
             }
@@ -281,22 +272,12 @@ impl HandlerState {
             .session(&session_name)
             .cloned()
             .ok_or_else(|| session_not_found(&session_name))?;
-        let previous_options = self.options.clone();
-        let previous_hooks = self.hooks.clone();
-        let previous_auto_named_windows = self.auto_named_windows.clone();
-        let previous_window_link_slots = self.window_link_slots.clone();
-        let previous_window_link_groups = self.window_link_groups.clone();
-        let previous_window_link_occurrences = self.window_link_occurrences.clone();
+        let previous_metadata = WindowMutationMetadataSnapshot::capture(self);
 
         let winlink_alert_map = self.reindex_windows_from_base(&session_name)?;
         if let Err(error) = self.resize_terminals(&session_name) {
             self.replace_session(&session_name, previous_session)?;
-            self.options = previous_options;
-            self.hooks = previous_hooks;
-            self.auto_named_windows = previous_auto_named_windows;
-            self.window_link_slots = previous_window_link_slots;
-            self.window_link_groups = previous_window_link_groups;
-            self.window_link_occurrences = previous_window_link_occurrences;
+            previous_metadata.restore(self);
             return Err(error);
         }
 
@@ -326,12 +307,7 @@ impl HandlerState {
             .session(&session_name)
             .cloned()
             .ok_or_else(|| session_not_found(&session_name))?;
-        let previous_options = self.options.clone();
-        let previous_hooks = self.hooks.clone();
-        let previous_auto_named_windows = self.auto_named_windows.clone();
-        let previous_window_link_slots = self.window_link_slots.clone();
-        let previous_window_link_groups = self.window_link_groups.clone();
-        let previous_window_link_occurrences = self.window_link_occurrences.clone();
+        let previous_metadata = WindowMutationMetadataSnapshot::capture(self);
         ensure_session_panes_exist(self, &session_name, &previous_session)?;
         let target_link_runtime_transfer_slot = if kill_destination
             && source.window_index() != destination_index
@@ -408,12 +384,7 @@ impl HandlerState {
             ) {
                 Ok(transfer) => transfer,
                 Err(error) => {
-                    self.options = previous_options;
-                    self.hooks = previous_hooks;
-                    self.auto_named_windows = previous_auto_named_windows;
-                    self.window_link_slots = previous_window_link_slots;
-                    self.window_link_groups = previous_window_link_groups;
-                    self.window_link_occurrences = previous_window_link_occurrences;
+                    previous_metadata.restore(self);
                     self.replace_session(&session_name, previous_session)?;
                     return Err(error);
                 }
@@ -431,12 +402,7 @@ impl HandlerState {
             {
                 Ok(removed_terminals) => removed_terminals,
                 Err(error) => {
-                    self.options = previous_options;
-                    self.hooks = previous_hooks;
-                    self.auto_named_windows = previous_auto_named_windows;
-                    self.window_link_slots = previous_window_link_slots;
-                    self.window_link_groups = previous_window_link_groups;
-                    self.window_link_occurrences = previous_window_link_occurrences;
+                    previous_metadata.restore(self);
                     self.restore_session_after_resize_error(
                         &session_name,
                         previous_session.clone(),
@@ -450,12 +416,7 @@ impl HandlerState {
 
         if let Err(error) = self.resize_terminals(&session_name) {
             self.rollback_detached_window_link_runtime(&detached_target_runtime_transfer)?;
-            self.options = previous_options;
-            self.hooks = previous_hooks;
-            self.auto_named_windows = previous_auto_named_windows;
-            self.window_link_slots = previous_window_link_slots;
-            self.window_link_groups = previous_window_link_groups;
-            self.window_link_occurrences = previous_window_link_occurrences;
+            previous_metadata.restore(self);
             self.replace_session(&session_name, previous_session)?;
             if !removed_terminals.is_empty() {
                 self.terminals

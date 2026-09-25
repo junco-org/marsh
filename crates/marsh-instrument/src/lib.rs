@@ -10,16 +10,27 @@
 //! [`dump_records`] writes and [`parse_records`] reads back. [`SpawnRecorder`] is the same
 //! vocabulary one level up, for a `brush_core::extensions::ExternalCommandSpawner`: a
 //! [`SpawnRecord`] per external command the shell hands to its spawner, stamped from the same
-//! clock. Nothing here is a shell-visible feature: a script cannot see the instrumentation, write
-//! to it, or turn it off. The shell is stock — only the builtin map it was built with is different.
+//! clock.
+//!
+//! The third stream is the syscalls themselves. [`RecordingHook::shared`] also owns one system
+//! `strace` attached to the host, and hands every [`TraceLine`] it decodes to the registered root
+//! the call belongs to — which is what lets an embedder know the *files* a line read and wrote
+//! rather than the commands it named. [`Scoped`] and [`TraceScope`] are how work is attributed to
+//! a root; [`RecordingHook::drain`] is how a caller proves every syscall issued so far has been
+//! accounted for.
+//!
+//! Nothing here is a shell-visible feature: a script cannot see the instrumentation, write to it,
+//! or turn it off. The shell is stock — only the builtin map it was built with is different.
 
 mod hooks;
-#[cfg(target_os = "linux")]
 mod record;
+mod strace;
 
 pub use hooks::{BuiltinHook, instrument};
-#[cfg(target_os = "linux")]
 pub use record::{
     BuiltinRecord, RecordingHook, SpawnRecord, SpawnRecorder, SpawnRequest, current_tid,
     dump_records, now_micros, parse_records,
+};
+pub use strace::{
+    Call, Scoped, TraceLine, TraceObserver, TraceScope, TraceScopeGuard, parse_quoted, split_args,
 };

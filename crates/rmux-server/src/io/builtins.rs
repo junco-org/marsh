@@ -35,8 +35,8 @@ use std::path::{Path, PathBuf};
 use brush_core::builtins::Registration;
 use brush_core::commands::{CommandArg, ExecutionContext};
 use brush_core::results::ExecutionResult;
+use marsh_core::shellmux::{current_command_context, CommandContext};
 use marsh_core::MarshShellExtensions;
-use marsh_core::shellmux::{CommandContext, current_command_context};
 
 /// The name this builtin is registered under.
 ///
@@ -159,13 +159,8 @@ fn rebase(managed: &CommandContext, path: &Path) -> PathBuf {
     if path.starts_with(root) {
         return path.to_path_buf();
     }
-    managed.seed().map_or_else(
-        || path.to_path_buf(),
-        |seed| {
-            path.strip_prefix(seed)
-                .map_or_else(|_| path.to_path_buf(), |relative| root.join(relative))
-        },
-    )
+    path.strip_prefix(managed.seed())
+        .map_or_else(|_| path.to_path_buf(), |relative| root.join(relative))
 }
 
 /// `read -- PATH`: the file's raw bytes on standard output.
@@ -224,7 +219,10 @@ async fn write(
     // [`CommandContext::spawn_blocking`] is for: the core joins the worker before it decides any
     // boundary, so the bytes are still read before the gate sees them.
     let Some(mut input) = context.params.try_stdin(context.shell) else {
-        let _ = writeln!(context.stderr(), "{RMUX_IO_BUILTIN} write: cannot read stdin");
+        let _ = writeln!(
+            context.stderr(),
+            "{RMUX_IO_BUILTIN} write: cannot read stdin"
+        );
         return ExecutionResult::new(1);
     };
     let drained = managed.spawn_blocking(move || {
@@ -239,7 +237,10 @@ async fn write(
                 return ExecutionResult::new(1);
             }
             Err(_) => {
-                let _ = writeln!(context.stderr(), "{RMUX_IO_BUILTIN} write: cannot read stdin");
+                let _ = writeln!(
+                    context.stderr(),
+                    "{RMUX_IO_BUILTIN} write: cannot read stdin"
+                );
                 return ExecutionResult::new(1);
             }
         },
@@ -251,10 +252,10 @@ async fn write(
 
     if mkdirs {
         if let Some(parent) = path.parent() {
-        let parent = parent.to_path_buf();
-        // Through the context's tracked worker, so the core joins it before any boundary: a
-        // directory created after a discard would be a change nobody staged.
-        match managed.spawn_blocking(move || std::fs::create_dir_all(parent)) {
+            let parent = parent.to_path_buf();
+            // Through the context's tracked worker, so the core joins it before any boundary: a
+            // directory created after a discard would be a change nobody staged.
+            match managed.spawn_blocking(move || std::fs::create_dir_all(parent)) {
                 Ok(receiver) => {
                     if let Ok(Err(error)) = receiver.await {
                         let _ = writeln!(context.stderr(), "{RMUX_IO_BUILTIN} write: {error}");
@@ -369,7 +370,10 @@ async fn presets(
         };
         for entry in entries.flatten() {
             let entry = entry.path();
-            if entry.extension().is_some_and(|extension| extension == "toml") {
+            if entry
+                .extension()
+                .is_some_and(|extension| extension == "toml")
+            {
                 if let Some(stem) = entry.file_stem() {
                     names.push(stem.to_string_lossy().into_owned());
                 }

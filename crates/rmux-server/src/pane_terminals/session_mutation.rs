@@ -110,6 +110,42 @@ impl SessionTransferSnapshot {
     }
 }
 
+/// The metadata a window-slot mutation must restore when it rolls back: the
+/// option/hook stores keyed by window index plus the auto-name and window-link
+/// maps that follow those indices. Deliberately narrower than
+/// [`SessionTransferSnapshot`], which also owns pane state, counters and the
+/// resize queue.
+pub(in crate::pane_terminals) struct WindowMutationMetadataSnapshot {
+    options: OptionStore,
+    hooks: HookStore,
+    auto_named_windows: HashSet<(SessionName, u32)>,
+    window_link_slots: HashMap<WindowLinkSlot, u64>,
+    window_link_groups: HashMap<u64, WindowLinkGroup>,
+    window_link_occurrences: HashMap<WindowLinkSlot, super::WindowLinkOccurrenceId>,
+}
+
+impl WindowMutationMetadataSnapshot {
+    pub(in crate::pane_terminals) fn capture(state: &HandlerState) -> Self {
+        Self {
+            options: state.options.clone(),
+            hooks: state.hooks.clone(),
+            auto_named_windows: state.auto_named_windows.clone(),
+            window_link_slots: state.window_link_slots.clone(),
+            window_link_groups: state.window_link_groups.clone(),
+            window_link_occurrences: state.window_link_occurrences.clone(),
+        }
+    }
+
+    pub(in crate::pane_terminals) fn restore(self, state: &mut HandlerState) {
+        state.options = self.options;
+        state.hooks = self.hooks;
+        state.auto_named_windows = self.auto_named_windows;
+        state.window_link_slots = self.window_link_slots;
+        state.window_link_groups = self.window_link_groups;
+        state.window_link_occurrences = self.window_link_occurrences;
+    }
+}
+
 impl WindowGeometrySnapshot {
     fn capture_all(state: &HandlerState, context: &PaneTransferGeometryContext) -> Self {
         let source_window_id = window_id_at(state, &context.source);

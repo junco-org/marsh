@@ -30,16 +30,15 @@ use tempfile::TempDir;
 use crate::handler::RequestHandler;
 use crate::io::ShellIo;
 
-/// A directory inside one handler's own seed, for a test that *names* a start directory.
+/// A directory inside one handler's own default tree, for a test that *names* a start directory.
 ///
 /// # Why a test cannot just use `std::env::temp_dir()`
 ///
-/// A pane, a popup and every workload helper now run in a snapshot of the single seed this daemon
-/// leased. A directory the caller *named* that lies outside that seed is a request the daemon
-/// genuinely cannot honour, so it is refused loudly — see
-/// [`TerminalProfile::seed_relative_dir`](crate::terminal::TerminalProfile::seed_relative_dir).
-/// A test that allocates under the process temp directory and passes it as `start_directory` is
-/// pinning the old unconfined semantics, where a pane could start anywhere on the host.
+/// A pane, a popup and every workload helper runs in a snapshot of the seed its own starting
+/// directory lies in. A directory the caller names that is under no subvolume at all is a request
+/// the daemon genuinely cannot honour, so it is refused loudly. A test that allocates under the
+/// process temp directory and passes it as `start_directory` is pinning the old unconfined
+/// semantics, where a pane could start anywhere on the host.
 ///
 /// # Why this is built per handler and never cached
 ///
@@ -104,16 +103,14 @@ impl SeedScratch {
 ///
 /// # Panics
 ///
-/// Panics when the handler has no engine, when that engine leases no seed, and when the directory
-/// cannot be created. All three are fixture failures with nothing to fall back to.
+/// Panics when the handler has no engine and when the directory cannot be created. Both are
+/// fixture failures with nothing to fall back to.
 pub(crate) fn seed_scratch_dir(handler: &RequestHandler, label: &str) -> SeedScratch {
     let io = crate::managed_workload::handler_facade(handler)
         .expect("a unit-test handler builds its own engine");
-    let seed = io
-        .executor_info()
-        .seed
-        .expect("a unit-test engine leases a seed");
-    let host = seed.join(label);
+    // The engine's default directory *is* its registered seed: `open` below hands it exactly that
+    // tree, so a path under it is inside the seed a job opened here will discover.
+    let host = io.default_dir().join(label);
     std::fs::create_dir_all(&host).expect("create a scratch directory in the test seed");
     SeedScratch {
         host,
@@ -191,7 +188,6 @@ pub(super) fn open(
     // path to pin an SDK connection, which no unit test opens.
     let (io, events) = ShellIo::new(
         &seed,
-        Arc::new(StdMutex::new(marsh_core::PolicyValidator::new())),
         brush_core::env::ShellEnvironment::new(),
         TerminalGeometry {
             rows: ROWS,
@@ -202,6 +198,10 @@ pub(super) fn open(
         root.join("rmux.sock"),
     )
     .ok()?;
+    // Both directions, before the consumer starts. Selection is the facade's own state now, so a
+    // `switch` publishes its event and then calls the handler back; a fixture that installed only
+    // the forward consumer would see the event and never the pane selection it implies.
+    io.install_handler(handler.clone());
     let consumer = runtime.spawn(crate::io::observation::consume(
         io.unleased(),
         handler,

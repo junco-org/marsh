@@ -7,8 +7,6 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use crate::shellmux::ids::ShellId;
-
 /// A terminal's size, in character cells.
 ///
 /// Rows before columns, in that order, everywhere in this crate. There are no pixel dimensions:
@@ -30,12 +28,12 @@ impl TerminalGeometry {
     }
 }
 
-/// What a job's standard descriptors are.
+/// What a shell's standard descriptors are.
 ///
-/// The choice is made once, at [`spawn`](crate::shellmux::ShellMux::spawn), and never changes: a
-/// terminal job and a pipe job differ in what their bytes *mean*, not only in how they are
-/// carried, so converting one into the other afterwards would silently change the semantics a
-/// running program already depends on.
+/// The choice is made once, at [`open_shell`](crate::shellmux::ShellMux::open_shell), and never
+/// changes: a terminal shell and a pipe shell differ in what their bytes *mean*, not only in how
+/// they are carried, so converting one into the other afterwards would silently change the
+/// semantics a running program already depends on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum JobIo {
     /// One pseudoterminal on fds 0, 1 and 2.
@@ -80,18 +78,34 @@ pub enum OutputChannel {
     Stderr,
 }
 
-/// How a job is to be opened.
+/// How a shell is to be opened.
 #[derive(Clone, Debug, Default)]
 pub struct SpawnOptions {
-    /// The job's standard descriptors.
+    /// The shell's standard descriptors.
     pub io: JobIo,
-    /// Variables replacing the mux profile's for this job alone, or `None` to inherit them.
+    /// Variables replacing the mux profile's for this shell alone, or `None` to inherit them.
     ///
     /// `Some` *replaces* the ordinary inherited and profile variables rather than merging with
     /// them; it does not resurrect a variable the caller unset. Marsh's own principal, git and
     /// snapshot variables are reapplied afterwards, because they are the shell's identity rather
     /// than the caller's configuration.
     pub environment: Option<brush_core::env::ShellEnvironment>,
+    /// Whether this shell reclaims itself once a command run in it ends.
+    ///
+    /// Terminal shells only, and cancellable by
+    /// [`Shell::keep`](crate::shellmux::Shell::keep): it is the `1`, `2`, … series' default
+    /// rather than a decision, which is the one closure a reader taking an interest may revoke.
+    ///
+    /// `false` — the default — is an ordinary persistent shell: opening one runs nothing, and it
+    /// outlives every command submitted into it until something stops it.
+    pub automatic_close: bool,
+    /// Whether a named shell is a stable agent identity whose capabilities survive closing and
+    /// reopening the seed, as [`ShellId::durable`](crate::shellmux::ShellId::durable) describes.
+    ///
+    /// An explicit authority choice by the embedding caller, which must control the name and keep
+    /// it stable for the same agent. Ignored for an unnamed shell: the `1`, `2`, … series reuses
+    /// its numbers by design, so such a shell is always session-local.
+    pub durable: bool,
 }
 
 impl Default for JobIo {
@@ -101,24 +115,36 @@ impl Default for JobIo {
     }
 }
 
-/// How one command submitted into an open job is to be treated.
+/// How one command submitted into an open shell is to be treated.
 #[derive(Default)]
 pub struct CommandOptions {
     /// Called once when this command ends, when a caller asked to be told.
     ///
-    /// One slot per job, kept for the callers that only have to stop waiting.
+    /// One slot per shell, kept for the callers that only have to stop waiting.
     /// [`CommandHandle::wait`](crate::shellmux::CommandHandle::wait) is the cloneable form and
     /// does not occupy it.
     pub on_finish: Option<crate::shellmux::OnFinish>,
-    /// Whether the job closes once this command ends.
+    /// Whether the shell closes once this command ends.
     ///
-    /// Recorded when the command is admitted, not when it finishes, so the job is already marked
-    /// closing in the window between the command's last byte and its verdict: neither a `keep` nor
-    /// a second submission can slip in there and make a one-shot job persistent.
+    /// Recorded on the *command* when it is admitted, and applied to the shell in the same
+    /// critical section that releases the running slot: neither a `keep` nor a second submission
+    /// can slip into the window between the command's last byte and its verdict, while standard
+    /// input stays writable for the whole of the command that is still running.
     ///
-    /// Terminal jobs only. A pipe job is one-shot by construction and closes after its first
+    /// Terminal shells only. A pipe shell is one-shot by construction and closes after its first
     /// admitted command whatever this says.
     pub close_on_finish: bool,
+    /// Sent the command's receipt once, the moment it is admitted.
+    ///
+    /// [`Shell::run_command`](crate::shellmux::Shell::run_command) resolves with the *completed*
+    /// verdict, which is the wrong moment for a caller that has to act while the command runs:
+    /// feed its standard input, close that input so a program reading to end of file can finish,
+    /// signal it, or attach an observer. This is that moment — after admission and after the
+    /// idle-terminal lease is back, and before interpretation can emit a byte or finish.
+    ///
+    /// A failed admission drops the sender rather than inventing a receipt, and a dropped
+    /// receiver cancels nothing: the command was accepted and remains the collection's.
+    pub on_accept: Option<tokio::sync::oneshot::Sender<crate::shellmux::CommandHandle>>,
 }
 
 impl std::fmt::Debug for CommandOptions {
@@ -127,6 +153,7 @@ impl std::fmt::Debug for CommandOptions {
             .debug_struct("CommandOptions")
             .field("on_finish", &self.on_finish.is_some())
             .field("close_on_finish", &self.close_on_finish)
+            .field("on_accept", &self.on_accept.is_some())
             .finish()
     }
 }
@@ -163,36 +190,31 @@ impl std::fmt::Debug for MuxProfile {
     }
 }
 
-/// What a mux will say about the executor it was built over, without handing the executor out.
+/// What a mux will say about one seed it has opened, without handing its executor out.
 ///
 /// The raw [`MarshExecutor`](crate::MarshExecutor) is deliberately not reachable through a mux: it
 /// is both an ungated spawner and a publication capability, and a caller that only wants to know
-/// where the seed is must not have to hold one to find out.
+/// where a seed is must not have to hold one to find out.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ExecutorInfo {
-    /// The seed this mux publishes into, or `None` for a detached executor.
-    pub seed: Option<PathBuf>,
-    /// The directory whose immediate children are this session's per-job snapshots, or `None` for
-    /// a detached executor.
+pub struct SeedInfo {
+    /// The canonical seed, which is also the key every query about it is asked with.
+    pub seed: PathBuf,
+    /// The directory whose immediate children are this seed's per-job snapshots.
     ///
     /// Deliberately not called `snapshot_root`: that is
     /// [`JobView::snapshot_root`](crate::shellmux::JobView::snapshot_root), one *job's own* tree,
-    /// and the two were once spelled alike. This is their shared parent, and a mux has it even
-    /// though the seed-level executor it is built over holds no snapshot at all.
+    /// and the two were once spelled alike. This is their shared parent.
     ///
     /// What it is for: recognizing a path a client handed over from inside one of this daemon's
     /// panes. A pane's shell starts at its job's snapshot, so it spells its own directory
     /// `<snapshot_parent>/<uid>/<rest>` — the same place in the seed as `<seed>/<rest>`.
-    pub snapshot_parent: Option<PathBuf>,
-    /// The seed-level executor's snapshot id.
-    pub uid: Option<String>,
-    /// The principal the seed-level executor itself acts as, when attached.
-    pub principal: Option<ShellId>,
-    /// Whether an approved publication failed and its durable log still has to be replayed.
+    pub snapshot_parent: PathBuf,
+    /// Whether an approved publication failed and this seed's durable log still has to be
+    /// replayed.
     ///
-    /// While this is true the session admits no new work and every gate refuses: continuing
-    /// against a partially applied seed would publish on top of a state nobody has verified. The
-    /// snapshot that failed is kept on disk as the recovery source, and an explicit reopen is what
-    /// replays it.
+    /// While this is true the session admits no new work and every gate over *this* seed refuses:
+    /// continuing against a partially applied seed would publish on top of a state nobody has
+    /// verified. Other seeds of the same mux are unaffected. The snapshot that failed is kept on
+    /// disk as the recovery source, and an explicit reopen is what replays it.
     pub recovery_required: bool,
 }

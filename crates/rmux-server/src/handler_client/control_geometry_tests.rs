@@ -1698,9 +1698,7 @@ async fn an_identity_checked_dispatch_publishes_a_pending_applied_window_resize(
     .await;
 }
 
-fn session_name(value: &str) -> SessionName {
-    SessionName::new(value).expect("valid session name")
-}
+use crate::test_names::session_name;
 
 async fn create_session(handler: &RequestHandler, session: SessionName, size: TerminalSize) {
     let response = handler

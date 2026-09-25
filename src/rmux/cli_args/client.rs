@@ -1,6 +1,6 @@
 use clap::{ArgAction, ArgGroup, Args};
 
-use super::{parse_target_spec, TargetSpec};
+use super::{TargetSpec, parse_target_spec};
 
 /// Flags for `refresh-client`, which redraws or reconfigures an attached client.
 #[derive(Debug, Clone, Args)]

@@ -134,9 +134,6 @@ impl RequestHandler {
         expected_attach_id: u64,
         request: AttachedSwitchCommitRequest,
     ) -> Result<AttachedSwitchCommitOutcome, AttachedSwitchCommitFailure> {
-        #[cfg(windows)]
-        self.wait_for_windows_deferred_all_pane_pids().await;
-
         // The switching client is still registered under the session it is
         // leaving, so it enters the selection as the incoming client and that
         // exact registration drops out with it. The generation matters: the loop

@@ -75,14 +75,11 @@ pub(crate) async fn serve(
     mut shutdown: oneshot::Receiver<()>,
     options: ServeOptions,
 ) -> io::Result<()> {
-    #[cfg(unix)]
     let mut cleanup_on_drop = SocketCleanup::new(socket_path.clone(), options.socket_identity);
-    #[cfg(windows)]
-    let mut cleanup_on_drop = SocketCleanup::new(socket_path.clone());
     let server_signals = options.server_signals;
-    #[cfg(all(any(unix, windows), feature = "web"))]
+    #[cfg(all(unix, feature = "web"))]
     let web_required = options.web_required;
-    #[cfg(all(any(unix, windows), feature = "web"))]
+    #[cfg(all(unix, feature = "web"))]
     let handler = Arc::new(
         RequestHandler::with_owner_uid_subscription_limits_and_web_settings(
             options.owner_uid,
@@ -95,12 +92,11 @@ pub(crate) async fn serve(
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?,
         ),
     );
-    #[cfg(not(all(any(unix, windows), feature = "web")))]
+    #[cfg(not(all(unix, feature = "web")))]
     let handler = Arc::new(RequestHandler::with_owner_uid_and_subscription_limits(
         options.owner_uid,
         options.subscription_limits,
     ));
-    #[cfg(unix)]
     handler.install_unix_socket_access_controller(options.socket_access.ok_or_else(|| {
         io::Error::other("Unix socket access controller is missing from serve options")
     })?)?;
@@ -109,7 +105,7 @@ pub(crate) async fn serve(
     let lifecycle_events = handler
         .take_lifecycle_dispatch_receiver()
         .ok_or_else(|| io::Error::other("lifecycle dispatch receiver already active"))?;
-    #[cfg(all(any(unix, windows), feature = "web"))]
+    #[cfg(all(unix, feature = "web"))]
     if web_required {
         handler
             .ensure_web_share_listener_running()
@@ -256,17 +252,29 @@ pub(crate) async fn serve(
     // Keep the old endpoint reserved until every accepted lifecycle hook has either
     // completed or been cancelled. Releasing it earlier lets an old hook reconnect
     // to a new daemon generation through its inherited RMUX/TMUX environment.
-    #[cfg(unix)]
     if let Err(error) = handler.restore_owner_only_unix_transport().await {
         warn!(
             path = %socket_path.display(),
             "failed to restore owner-only Unix socket permissions during shutdown: {error}"
         );
     }
+    // Before the endpoint is released, not after. The client an application launch stops the
+    // previous daemon through treats this socket's pathname disappearing as the stop having
+    // completed, so giving it up while the multiplexer still holds every opened seed's
+    // *exclusive* lease admits a replacement whose very first pane then cannot open the seed it
+    // was started in — a seed that "already has an active session" belonging to a daemon that is
+    // already gone.
+    //
+    // Deliberately not `?`: the identity-aware endpoint cleanup below must still run when
+    // termination failed, and that failure must reach the caller rather than become a success.
+    let shutdown_result = shell_io
+        .shutdown()
+        .await
+        .map_err(|error| io::Error::other(error.to_string()));
     drop(listener);
     cleanup_on_drop.cleanup_now();
 
-    Ok(())
+    shutdown_result
 }
 
 async fn quiesce_and_drain_connection_tasks_for_shutdown(
@@ -570,9 +578,6 @@ async fn serve_connection(
                         let _ = handler.request_shutdown_if_server_empty().await;
                     }
                     drop(detached_request_guard.take());
-                    #[cfg(windows)]
-                    let _ = handler
-                        .request_shutdown_if_pending_excluding_detached_connection(Some(connection_id));
                     return Err(error);
                 }
 
@@ -761,9 +766,6 @@ async fn write_prepared_sdk_wait(
 
     if let Err(error) = conn.write_response(&response).await {
         drop(detached_request_guard.take());
-        #[cfg(windows)]
-        let _ =
-            handler.request_shutdown_if_pending_excluding_detached_connection(Some(connection_id));
         return Err(error);
     }
 
@@ -1295,7 +1297,6 @@ mod tests {
     /// before and after shutdown, and no evidence about the tree. `$!` is no better: the managed
     /// shell reports no background job id for the line. An external child is the only thing here
     /// with a process to reap, and reaping it is the whole claim.
-    #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
     async fn shutdown_bounds_and_reaps_a_foreground_run_shell_tree() -> io::Result<()> {
         let handler = Arc::new(RequestHandler::new());
@@ -2306,63 +2307,3 @@ mod inflight_access_tests;
 #[cfg(test)]
 #[path = "listener_attach_identity_tests.rs"]
 mod attach_identity_tests;
-
-#[cfg(all(test, windows))]
-mod windows_tests {
-    use super::*;
-    use std::io::Write as _;
-
-    use rmux_proto::KillServerRequest;
-
-    #[tokio::test]
-    async fn kill_server_peer_disconnect_still_requests_shutdown() -> io::Result<()> {
-        let endpoint = rmux_ipc::endpoint_for_label(format!(
-            "listener-kill-disconnect-{}",
-            std::process::id()
-        ))?;
-        let listener = rmux_ipc::LocalListener::bind(&endpoint)?;
-        let handler = Arc::new(RequestHandler::new());
-        let (connection_shutdown_tx, connection_shutdown_rx) = watch::channel(());
-        let (shutdown_handle, shutdown_request_rx) = ShutdownHandle::new();
-        handler.install_shutdown_handle(shutdown_handle.clone());
-
-        let connection_handler = Arc::clone(&handler);
-        let connection_task = tokio::spawn(async move {
-            let (server, requester) = listener.accept().await?;
-            let connection_id = connection_handler.allocate_connection_id();
-            run_connection_with_cleanup(
-                server,
-                requester,
-                connection_handler,
-                connection_id,
-                connection_shutdown_rx,
-                shutdown_handle,
-            )
-            .await
-        });
-
-        let frame =
-            encode_frame(&Request::KillServer(KillServerRequest)).map_err(io::Error::other)?;
-        let endpoint_for_client = endpoint.clone();
-        tokio::task::spawn_blocking(move || -> io::Result<()> {
-            let mut client =
-                rmux_ipc::connect_blocking(&endpoint_for_client, Duration::from_secs(2))?;
-            client.write_all(&frame)?;
-            Ok(())
-        })
-        .await
-        .expect("client task should not panic")?;
-
-        tokio::time::timeout(Duration::from_secs(2), shutdown_request_rx)
-            .await
-            .expect("kill-server should request daemon shutdown")
-            .expect("shutdown receiver should complete cleanly");
-        let _ = connection_shutdown_tx.send(());
-
-        match connection_task.await.expect("connection task") {
-            Ok(()) => Ok(()),
-            Err(error) if rmux_ipc::is_peer_disconnect(&error) => Ok(()),
-            Err(error) => Err(error),
-        }
-    }
-}

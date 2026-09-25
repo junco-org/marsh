@@ -56,10 +56,7 @@ pub(super) async fn run_pipe_command(
     )?;
 
     let execution = managed_workload::start(&io, spec).await?;
-    let mut guard = match handler
-        .shell_processes
-        .register(&io, execution.shell())
-    {
+    let mut guard = match handler.shell_processes.register(&io, execution.shell()) {
         Ok(guard) => guard,
         Err(ShellProcessRegistrationError::Closing) => {
             let _ = execution.cancel().await;
@@ -170,7 +167,7 @@ mod tests {
         let Ok(io) = crate::managed_workload::handler_facade(&handler) else {
             return;
         };
-        let seed = io.executor_info().seed.expect("test engine has a seed");
+        let seed = io.default_dir().to_path_buf();
         let destination = seed.join("selection.txt");
 
         run_pipe_command(

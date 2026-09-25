@@ -24,63 +24,40 @@ pub(super) const QUEUE_EXACT_TARGET_COVERAGE: &[(&str, QueueExactTargetRole)] = 
     ("kill-pane", QueueExactTargetRole::Pane),
 ];
 
-#[derive(Debug)]
-pub(super) enum QueueExactTargetCapture {
-    NotCovered,
-    OptionAbsent,
-    Captured(StableTargetIdentity),
-    RequiredUnavailable(RmuxError),
-}
-
-impl QueueExactTargetCapture {
-    pub(super) fn capture(
-        command: &ParsedCommand,
-        invocation: &QueueInvocation,
-        state: &mut HandlerState,
-    ) -> Self {
-        let Some((declared_command, role)) = QUEUE_EXACT_TARGET_COVERAGE
-            .iter()
-            .find(|(declared_command, _)| *declared_command == command.name())
-        else {
-            return Self::NotCovered;
-        };
-        let Some(has_target) = has_short_option_value(command, 't') else {
-            return Self::RequiredUnavailable(RmuxError::Server(format!(
-                "queued {} target guard has no short-option inventory",
-                declared_command
-            )));
-        };
-        if !has_target {
-            return Self::OptionAbsent;
-        }
-        let target = match (*role, invocation) {
-            (
-                QueueExactTargetRole::Window,
-                QueueInvocation::Request(Request::RenameWindow(request)),
-            ) => Target::Window(request.target.clone()),
-            (QueueExactTargetRole::Pane, QueueInvocation::Request(Request::KillPane(request))) => {
-                Target::Pane(request.target.clone())
-            }
-            _ => {
-                return Self::RequiredUnavailable(RmuxError::Server(format!(
-                    "queued {} target guard did not receive its declared request role",
-                    declared_command
-                )))
-            }
-        };
-        match StableTargetIdentity::capture(state, target) {
-            Ok(identity) => Self::Captured(identity),
-            Err(error) => Self::RequiredUnavailable(error),
-        }
+pub(super) fn capture_queue_exact_target(
+    command: &ParsedCommand,
+    invocation: &QueueInvocation,
+    state: &mut HandlerState,
+) -> Result<Option<StableTargetIdentity>, RmuxError> {
+    let Some((declared_command, role)) = QUEUE_EXACT_TARGET_COVERAGE
+        .iter()
+        .find(|(declared_command, _)| *declared_command == command.name())
+    else {
+        return Ok(None);
+    };
+    let Some(has_target) = has_short_option_value(command, 't') else {
+        return Err(RmuxError::Server(format!(
+            "queued {declared_command} target guard has no short-option inventory"
+        )));
+    };
+    if !has_target {
+        return Ok(None);
     }
-
-    pub(super) fn into_identity(self) -> Result<Option<StableTargetIdentity>, RmuxError> {
-        match self {
-            Self::NotCovered | Self::OptionAbsent => Ok(None),
-            Self::Captured(identity) => Ok(Some(identity)),
-            Self::RequiredUnavailable(error) => Err(error),
+    let target = match (*role, invocation) {
+        (
+            QueueExactTargetRole::Window,
+            QueueInvocation::Request(Request::RenameWindow(request)),
+        ) => Target::Window(request.target.clone()),
+        (QueueExactTargetRole::Pane, QueueInvocation::Request(Request::KillPane(request))) => {
+            Target::Pane(request.target.clone())
         }
-    }
+        _ => {
+            return Err(RmuxError::Server(format!(
+                "queued {declared_command} target guard did not receive its declared request role"
+            )))
+        }
+    };
+    StableTargetIdentity::capture(state, target).map(Some)
 }
 
 pub(super) fn has_short_option_value(command: &ParsedCommand, expected: char) -> Option<bool> {
@@ -135,19 +112,16 @@ pub(super) fn has_short_option_value(command: &ParsedCommand, expected: char) ->
 #[cfg(test)]
 pub(crate) use test_pause::{
     install_queue_exact_target_capture_pause, pause_after_queue_exact_target_capture,
-    QueueExactTargetCapturePause,
 };
 
 #[cfg(test)]
 mod tests {
     use rmux_core::command_parser::CommandParser;
-    use rmux_proto::{KillPaneRequest, PaneTarget, RenameWindowRequest, SessionName, WindowTarget};
+    use rmux_proto::{KillPaneRequest, PaneTarget, RenameWindowRequest, WindowTarget};
 
     use super::*;
 
-    fn session_name(value: &str) -> SessionName {
-        SessionName::new(value).expect("valid session name")
-    }
+    use crate::test_names::session_name;
 
     #[test]
     fn coverage_inventory_has_one_unique_role_per_command() {
@@ -182,8 +156,8 @@ mod tests {
         }));
         let mut state = HandlerState::default();
         assert!(matches!(
-            QueueExactTargetCapture::capture(&command, &invocation, &mut state),
-            QueueExactTargetCapture::OptionAbsent
+            capture_queue_exact_target(&command, &invocation, &mut state),
+            Ok(None)
         ));
     }
 
@@ -201,8 +175,8 @@ mod tests {
         }));
         let mut state = HandlerState::default();
         assert!(matches!(
-            QueueExactTargetCapture::capture(&command, &invocation, &mut state),
-            QueueExactTargetCapture::RequiredUnavailable(_)
+            capture_queue_exact_target(&command, &invocation, &mut state),
+            Err(_)
         ));
     }
 
@@ -220,8 +194,8 @@ mod tests {
         }));
         let mut state = HandlerState::default();
         assert!(matches!(
-            QueueExactTargetCapture::capture(&command, &invocation, &mut state),
-            QueueExactTargetCapture::RequiredUnavailable(_)
+            capture_queue_exact_target(&command, &invocation, &mut state),
+            Err(_)
         ));
     }
 }

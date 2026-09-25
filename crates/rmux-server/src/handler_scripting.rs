@@ -19,8 +19,6 @@ use super::control_support::{
     with_control_command_response_capture, with_control_queue_identity, ControlClientIdentity,
     ControlQueueEofAction, ManagedClient,
 };
-#[cfg(windows)]
-use super::pane_support::format_references_pane_pid;
 use super::{
     active_session_target, current_expected_attach_identity, expected_attach_follows_registration,
     rebase_expected_attach_session_after_switch, validate_expected_attach_identity, RequestHandler,
@@ -149,11 +147,9 @@ pub(in crate::handler) use self::queue::{
 pub(super) use self::queue::{QueueCommandAction, QueueExecutionContext};
 pub(in crate::handler) use self::queue_current_session_transition::record_queued_new_session_transition;
 use self::queue_current_session_transition::QueuedCurrentSessionTransition;
-use self::queue_exact_target::QueueExactTargetCapture;
+use self::queue_exact_target::capture_queue_exact_target;
 #[cfg(test)]
-pub(crate) use self::queue_exact_target::{
-    install_queue_exact_target_capture_pause, QueueExactTargetCapturePause,
-};
+pub(crate) use self::queue_exact_target::install_queue_exact_target_capture_pause;
 use self::queue_lifecycle_target::{QueueLifecycleTargetCapture, QueueLifecycleTargetPlan};
 use self::queue_session_rename::QueuedSessionRename;
 use self::queue_special_target::QueueSpecialTargetPlan;
@@ -1058,8 +1054,7 @@ impl RequestHandler {
                 }
                 let session_rename = QueuedSessionRename::capture(&invocation, &state)?;
                 let exact_target =
-                    QueueExactTargetCapture::capture(&command_for_hooks, &invocation, &mut state)
-                        .into_identity()?;
+                    capture_queue_exact_target(&command_for_hooks, &invocation, &mut state)?;
                 let lifecycle_target = match (lifecycle_plan, retained_target) {
                     (Some(plan), Some(retained_target)) => {
                         plan.capture(&invocation, &mut state, retained_target)?
@@ -1604,12 +1599,6 @@ impl RequestHandler {
         &self,
         command: self::list_parse::ParsedListWindowsAllCommand,
     ) -> Result<QueueCommandAction, RmuxError> {
-        #[cfg(windows)]
-        if format_references_pane_pid(command.format.as_deref())
-            || format_references_pane_pid(command.filter.as_deref())
-        {
-            self.wait_for_windows_deferred_all_pane_pids().await;
-        }
         let session_names = {
             let state = self.state.lock().await;
             state
@@ -1937,6 +1926,24 @@ fn window_index_from_target(value: &str) -> Option<&str> {
     let (_, window) = value.split_once(':')?;
     let window = window.split_once('.').map_or(window, |(window, _)| window);
     (!window.is_empty() && window.bytes().all(|byte| byte.is_ascii_digit())).then_some(window)
+}
+
+fn signed_window_target_session_part(raw_target: &str) -> Option<Option<&str>> {
+    if signed_window_index_target(raw_target) {
+        return Some(None);
+    }
+    let (session, window) = raw_target.split_once(':')?;
+    if session.is_empty() || !signed_window_index_target(window) {
+        return None;
+    }
+    Some(Some(session))
+}
+
+fn signed_window_index_target(value: &str) -> bool {
+    let Some(rest) = value.strip_prefix(['+', '-']) else {
+        return false;
+    };
+    rest.is_empty() || rest.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 fn unexpected_flag_argument_for_command<'a>(

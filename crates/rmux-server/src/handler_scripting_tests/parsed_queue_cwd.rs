@@ -8,7 +8,8 @@ async fn queued_window_spawns_use_non_attached_caller_cwd() {
     // daemon's seed is refused, so the fixture allocates inside the seed this handler leased
     // rather than beside it under the process temp directory.
     let root = seed_scratch_dir(&handler, "queued-window-caller-cwd");
-    let session_cwd = fs::canonicalize(root.child("session").path()).expect("canonical session cwd");
+    let session_cwd =
+        fs::canonicalize(root.child("session").path()).expect("canonical session cwd");
     let caller_cwd = fs::canonicalize(root.child("caller").path()).expect("canonical caller cwd");
     let session = session_name("queued-window-caller-cwd");
     create_session_with_cwd(&handler, &session, &session_cwd).await;
@@ -38,7 +39,8 @@ async fn queued_window_spawns_use_non_attached_caller_cwd() {
 async fn queued_window_spawns_without_caller_cwd_keep_session_cwd() {
     let handler = RequestHandler::new();
     let root = seed_scratch_dir(&handler, "queued-window-attached-cwd");
-    let session_cwd = fs::canonicalize(root.child("session").path()).expect("canonical session cwd");
+    let session_cwd =
+        fs::canonicalize(root.child("session").path()).expect("canonical session cwd");
     let session = session_name("queued-window-attached-cwd");
     create_session_with_cwd(&handler, &session, &session_cwd).await;
 
@@ -67,7 +69,8 @@ async fn queued_window_spawns_without_caller_cwd_keep_session_cwd() {
 async fn queued_window_explicit_cwd_overrides_non_attached_caller_cwd() {
     let handler = RequestHandler::new();
     let root = seed_scratch_dir(&handler, "queued-window-explicit-cwd");
-    let session_cwd = fs::canonicalize(root.child("session").path()).expect("canonical session cwd");
+    let session_cwd =
+        fs::canonicalize(root.child("session").path()).expect("canonical session cwd");
     let caller_cwd = fs::canonicalize(root.child("caller").path()).expect("canonical caller cwd");
     let explicit_cwd =
         fs::canonicalize(root.child("explicit").path()).expect("canonical explicit cwd");

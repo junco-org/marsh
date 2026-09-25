@@ -56,14 +56,12 @@ pub enum MuxError {
         #[source]
         source: std::io::Error,
     },
-    /// A handle from a different mux was passed to this one.
-    #[error("{} belongs to a different shell multiplexer", .0.reference())]
-    ForeignJob(ShellId),
-    /// The job this handle names has closed, and the name may since have been reused.
+    /// The shell this object names has closed, and the name may since have been reused.
     ///
     /// Distinct from [`Self::NoSuchJob`], which is a name nothing answers to: this one says the
-    /// *instance* is gone. A handle that outlived its job can never reach the replacement that
-    /// took its name, because the two differ in [`Sandbox::uid`](crate::shellmux::Sandbox).
+    /// *instance* is gone. A [`Shell`](crate::shellmux::Shell) that outlived its generation can
+    /// never reach the shell that took its name, because it owns its own live state and resolves
+    /// no name at all.
     #[error("{} has closed", .0.reference())]
     StaleJob(ShellId),
     /// The job exists but its terminal, pipes or shell are not open yet.

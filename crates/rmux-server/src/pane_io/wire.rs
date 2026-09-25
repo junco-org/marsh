@@ -222,7 +222,6 @@ pub(super) async fn emit_exited_attach_stop(
     emit_attach_bytes(stream, &bytes).await
 }
 
-
 async fn write_all_to_stream(stream: &AttachTransport, bytes: &[u8]) -> io::Result<()> {
     stream.write_all(bytes).await
 }

@@ -3,12 +3,10 @@ use super::{
     StatusJobKey, StatusJobRuntime, STATUS_JOB_ACTIVE_LIMIT, STATUS_JOB_CACHE_LIMIT,
 };
 use std::collections::HashMap;
-#[cfg(unix)]
 use std::path::Path;
 use std::time::{Duration, Instant};
 use tokio::sync::watch;
 
-#[cfg(unix)]
 #[test]
 fn status_job_key_canonicalizes_profile_environment_order() {
     let profile = test_profile(&[("RMUX_STATUS_KEY", "shared")]);
@@ -122,7 +120,6 @@ async fn status_job_runtime_bounds_active_workers() {
 /// previous generation never reported back cannot swallow the next request. The drive loop runs
 /// on this thread, which is not one of that runtime's workers, so a starved runtime fails this on
 /// its deadline instead of hanging it.
-#[cfg(unix)]
 #[test]
 fn a_status_producer_that_never_stops_writing_leaves_the_daemon_answering() {
     /// Small on purpose: the defect costs one worker per generation, so the fewer there are, the
@@ -187,7 +184,6 @@ fn a_status_producer_that_never_stops_writing_leaves_the_daemon_answering() {
     );
 }
 
-#[cfg(unix)]
 #[test]
 fn status_job_cache_is_partitioned_by_profile_environment() {
     let first = test_profile(&[("TMUX_PANE", "%1")]);
@@ -199,7 +195,6 @@ fn status_job_cache_is_partitioned_by_profile_environment() {
     );
 }
 
-#[cfg(unix)]
 fn test_profile(environment: &[(&str, &str)]) -> crate::terminal::TerminalProfile {
     use rmux_core::{EnvironmentStore, OptionStore};
     use rmux_proto::SessionName;

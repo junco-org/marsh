@@ -3,15 +3,11 @@ use rmux_proto::ProcessCommand;
 pub(crate) fn from_legacy_command(command: Option<&[String]>) -> Option<ProcessCommand> {
     match command {
         Some([single]) => Some(ProcessCommand::Shell(single.clone())),
-        #[cfg(unix)]
         Some(argv) if !argv.is_empty() => Some(ProcessCommand::Shell(shell_join(argv))),
-        #[cfg(windows)]
-        Some(argv) if !argv.is_empty() => Some(ProcessCommand::Argv(argv.to_vec())),
         _ => None,
     }
 }
 
-#[cfg(unix)]
 fn shell_join(argv: &[String]) -> String {
     argv.iter()
         .map(|argument| shell_quote(argument))
@@ -19,7 +15,6 @@ fn shell_join(argv: &[String]) -> String {
         .join(" ")
 }
 
-#[cfg(unix)]
 fn shell_quote(argument: &str) -> String {
     if !argument.is_empty()
         && argument.bytes().all(|byte| {
@@ -48,7 +43,6 @@ fn shell_quote(argument: &str) -> String {
 mod tests {
     use rmux_proto::ProcessCommand;
 
-    #[cfg(unix)]
     #[test]
     fn legacy_command_vectors_become_quoted_shell_commands() {
         let command = vec![
@@ -65,7 +59,6 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[test]
     fn legacy_command_shell_join_quotes_empty_and_spaces() {
         let command = vec!["printf".to_owned(), "".to_owned(), "a b".to_owned()];
@@ -73,17 +66,6 @@ mod tests {
         assert_eq!(
             super::from_legacy_command(Some(&command)),
             Some(ProcessCommand::Shell("printf '' 'a b'".to_owned()))
-        );
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn legacy_command_vectors_stay_argv_on_windows() {
-        let command = vec!["cmd.exe".to_owned(), "/C".to_owned(), "echo hi".to_owned()];
-
-        assert_eq!(
-            super::from_legacy_command(Some(&command)),
-            Some(ProcessCommand::Argv(command))
         );
     }
 }

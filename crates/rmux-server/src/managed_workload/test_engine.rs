@@ -53,7 +53,6 @@ pub(crate) fn install(handler: &RequestHandler) -> Option<ShellIo> {
 
     let (io, events) = ShellIo::new(
         &seed,
-        Arc::new(StdMutex::new(marsh_core::PolicyValidator::new())),
         brush_core::env::ShellEnvironment::new(),
         TerminalGeometry {
             rows: ROWS,
@@ -70,9 +69,12 @@ pub(crate) fn install(handler: &RequestHandler) -> Option<ShellIo> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .push(scratch);
 
-    // The observation consumer is what turns the engine's queue into this daemon's pane output,
-    // command verdicts and job closures. Without it a test would spawn jobs whose bytes nothing
-    // ever drains, and the engine's pumps would block on receipts nobody completes.
+    // Both directions, before the consumer starts. The forward half turns the engine's queue into
+    // this daemon's pane output, command verdicts and shell closures — without it a test would
+    // open shells whose bytes nothing ever drains, and the engine's pumps would block on receipts
+    // nobody completes. The reverse half is what a facade-owned `switch` calls back into, so
+    // native selection reaches the pane it names instead of stopping at an event.
+    io.install_handler(RequestHandler::downgrade(handler));
     tokio::spawn(crate::io::observation::consume(
         io.unleased(),
         RequestHandler::downgrade(handler),

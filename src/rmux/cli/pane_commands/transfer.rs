@@ -3,10 +3,10 @@ use std::path::Path;
 use rmux_proto::{BreakPaneRequest, JoinPaneRequest, MovePaneRequest, PaneSplitSize};
 
 use super::super::{
-    resolve_pane_target_or_current, resolve_pane_target_spec, resolve_window_target_spec,
-    run_command_resolved, ExitFailure,
+    ExitFailure, resolve_pane_target_or_current, resolve_pane_target_spec,
+    resolve_window_target_spec, run_command_resolved,
 };
-use crate::cli_args::{parse_target_spec, BreakPaneArgs, JoinPaneArgs, SwapPaneArgs, TargetSpec};
+use crate::cli_args::{BreakPaneArgs, JoinPaneArgs, SwapPaneArgs, TargetSpec, parse_target_spec};
 
 /// Runs `swap-pane`, exchanging two panes or the next/previous pane with `-D`/`-U`.
 pub(in crate::cli) fn run_swap_pane(

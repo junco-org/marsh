@@ -1,0 +1,33 @@
+[package]
+name = "marsh-lib"
+description = "Shared generic primitives for the owned Marsh packages"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[lib]
+bench = false
+
+[features]
+default = []
+watch = ["dep:tokio"]
+
+[dependencies]
+# Only the watch channel the shared completion state is carried on. A consumer that waits on
+# nothing gets a std-only library.
+tokio = { version = "1.52.3", optional = true, default-features = false, features = ["sync"] }
+
+[dev-dependencies]
+tokio = { version = "1.52.3", default-features = false, features = [
+    "rt",
+    "macros",
+    "time",
+] }
+tempfile = "3"
+
+[lints]
+workspace = true

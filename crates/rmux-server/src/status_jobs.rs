@@ -27,7 +27,7 @@
 //!
 //! * 256 cached entries, evicted oldest-completed-first;
 //! * 32 live producers, above which a stale slot is not refreshed at all;
-//! * 750ms per generation on Unix, 5s on Windows;
+//! * 750ms per generation;
 //! * 64KiB of retained output per generation.
 //!
 //! The cap is now a *combined* budget across standard output and standard error rather than a
@@ -54,9 +54,6 @@ use crate::io::{CapturedOutput, ExecutionSpec, IoResult, ShellHandle, ShellIo};
 use crate::managed_workload;
 use crate::terminal::TerminalProfile;
 
-#[cfg(windows)]
-const STATUS_JOB_TIMEOUT: Duration = Duration::from_secs(5);
-#[cfg(not(windows))]
 const STATUS_JOB_TIMEOUT: Duration = Duration::from_millis(750);
 const STATUS_JOB_CACHE_LIMIT: usize = 256;
 const STATUS_JOB_OUTPUT_LIMIT: usize = 64 * 1024;
@@ -68,6 +65,39 @@ const STATUS_JOB_ACTIVE_LIMIT: usize = 32;
 /// previous approved text. This is the only record that distinguishes "refused by the gate" from
 /// "never ran" afterwards.
 const STATUS_JOB: &str = "status-job";
+
+/// Which profile a status `#(command)` producer runs under — including "none it may use".
+///
+/// A bare `Option<TerminalProfile>` collapsed two unrelated answers into `None`: *nothing was ever
+/// chosen for this producer*, and *something was chosen but could not be built*. Per-shell seeds
+/// make that conflation unsafe, because a producer's directory is what selects its seed. Falling
+/// back to the host default for the second case would run a pane's producer against a different
+/// seed — publishing into that seed's history, judged by that seed's validator — and would drop
+/// the pane's environment on the way. Only the first case may start where the host does.
+pub(crate) enum StatusJobProfile {
+    /// Nothing was chosen: no handler state, session, options or socket path to build one from.
+    /// The producer inherits the mux profile and the daemon's default directory.
+    Unset,
+    /// The producer's own shell, environment and working directory.
+    Chosen(TerminalProfile),
+    /// A profile was chosen and could not be built — typically its recorded directory is gone or
+    /// is not a directory. The typed failure is carried rather than discarded so the producer can
+    /// be refused instead of relocated.
+    Unusable(RmuxError),
+}
+
+impl StatusJobProfile {
+    /// The profile a generation would run under, or `None` when it would run bare.
+    ///
+    /// [`Self::Unusable`] answers `None` too, so a caller that fails to refuse it first still
+    /// cannot key or spawn a generation against a profile that does not exist.
+    fn chosen(&self) -> Option<&TerminalProfile> {
+        match self {
+            Self::Chosen(profile) => Some(profile),
+            Self::Unset | Self::Unusable(_) => None,
+        }
+    }
+}
 
 pub(crate) struct StatusJobRuntime {
     inner: Arc<StatusJobRuntimeInner>,
@@ -180,15 +210,28 @@ impl StatusJobRuntime {
     /// `io` is `None` before the daemon has bound its shell facade, and in the renderer's own unit
     /// tests. That is an ordinary answer, not a failure: the cached value is returned and nothing
     /// is scheduled, because there is nothing to schedule onto.
+    ///
+    /// A [`StatusJobProfile::Unusable`] producer is refused outright: it is neither keyed nor
+    /// scheduled, and it renders whatever its command last produced. Its directory is what chose
+    /// its seed, so there is no second place it could correctly run.
     pub(crate) fn cached_output(
         &self,
         io: Option<&ShellIo>,
         command: &str,
-        profile: Option<&TerminalProfile>,
+        profile: Option<&StatusJobProfile>,
         cache_ttl: Duration,
     ) -> String {
+        if let Some(StatusJobProfile::Unusable(reason)) = profile {
+            crate::diagnostic_log::record_workload_not_run(
+                STATUS_JOB,
+                command,
+                &reason.to_string(),
+            );
+            return self.last_output_for(command);
+        }
+        let chosen = profile.and_then(StatusJobProfile::chosen);
         let now = Instant::now();
-        let key = StatusJobKey::new(command, profile);
+        let key = StatusJobKey::new(command, chosen);
         let mut state = self.inner.lock_state();
         reap_completed_workers(&mut state);
         if state.closing {
@@ -233,7 +276,7 @@ impl StatusJobRuntime {
         let worker_inner = Arc::downgrade(&self.inner);
         let worker_key = key;
         let worker_command = command.to_owned();
-        let worker_profile = profile.cloned();
+        let worker_profile = chosen.cloned();
         let worker = io.runtime().spawn(async move {
             let output = produce_status_job_value(
                 &worker_io,
@@ -259,6 +302,24 @@ impl StatusJobRuntime {
             },
         );
         cached
+    }
+
+    /// What a refused producer keeps rendering.
+    ///
+    /// A refused producer has no cache key: the key is derived from the profile that could not be
+    /// built. So its slot is found by command text, most recently completed first. That keeps the
+    /// rule every other non-producing generation follows — the previous approved value stays — and
+    /// it stays read-only: nothing is inserted, marked in flight, or scheduled, so a refusal can
+    /// never reach a shell. Bounded by the 256-entry cache limit and only walked on refusal.
+    fn last_output_for(&self, command: &str) -> String {
+        let state = self.inner.lock_state();
+        state
+            .cache
+            .iter()
+            .filter(|(key, entry)| key.command == command && entry.updated_at.is_some())
+            .max_by_key(|(_, entry)| entry.updated_at)
+            .map(|(_, entry)| entry.output.clone())
+            .unwrap_or_default()
     }
 
     /// Closes the runtime and ends every generation still running.
@@ -603,8 +664,11 @@ fn status_job_spec(
             Some(shell_id),
             process,
         ),
+        // `None` reaches here only for [`StatusJobProfile::Unset`]: no directory was ever chosen
+        // for this producer, so it starts where the host does. A producer whose chosen directory
+        // could not be resolved never gets this far — `cached_output` refuses it instead.
         None => Ok(ExecutionSpec {
-            directory: io.default_dir(),
+            initial_dir: io.default_dir().to_path_buf(),
             id: Some(shell_id),
             process,
             environment: None,

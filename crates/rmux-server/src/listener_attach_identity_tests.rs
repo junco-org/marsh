@@ -41,16 +41,8 @@ const LATER_OUTER_GEOMETRY: &str = "later 80x24";
 
 /// A local identity that is neither the server owner nor a reserved
 /// superuser, so granting it access models a delegated peer.
-#[cfg(unix)]
 fn delegated_peer_uid() -> u32 {
     rmux_os::identity::real_user_id().saturating_add(18_200)
-}
-
-#[cfg(windows)]
-fn delegated_peer_uid() -> u32 {
-    // Windows keys the access store by SID, so no uid entry can collide with
-    // the server owner or with a reserved identity.
-    18_200
 }
 
 /// A second delegated identity, for the connection that reaches a numeric pid

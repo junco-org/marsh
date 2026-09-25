@@ -9,15 +9,7 @@ use super::super::{
     attach_support::SessionDetachOnDestroy, subscription_support::capture_pane_stream_sources,
     RequestHandler, SelectionTransitionSnapshot,
 };
-#[cfg(windows)]
-use super::pane_io_encoding::{
-    prepare_pane_console_input_write, tokens_emulate_windows_cmd_select_all,
-    tokens_route_windows_control_as_pty_bytes, windows_console_input_for_target_tokens,
-    write_windows_console_input_action_to_target_io,
-};
 use super::pane_kill_effects::{after_kill_pane_target, KillPaneLifecycleBatch};
-#[cfg(windows)]
-use super::pane_windows_console_sequence::prepare_single_pane_windows_console_input_sequence;
 use super::{
     encode_tokens_for_target, prepare_pane_input_write, write_bytes_to_target, PaneInputLiveness,
 };
@@ -49,81 +41,6 @@ impl RequestHandler {
                     Err(error) => return Response::Error(ErrorResponse { error }),
                 }
             };
-            #[cfg(windows)]
-            if !request.literal
-                && !tokens_emulate_windows_cmd_select_all(&state, &target, &request.keys)
-            {
-                match prepare_single_pane_windows_console_input_sequence(
-                    &mut state,
-                    &target,
-                    &request.keys,
-                    None,
-                ) {
-                    Ok(Some(steps)) => {
-                        drop(state);
-                        return self
-                            .write_windows_console_input_sequence_and_mark_interactive(
-                                steps, key_count,
-                            )
-                            .await;
-                    }
-                    Ok(None) => {}
-                    Err(error) => return Response::Error(ErrorResponse { error }),
-                }
-                if let Some((action, console_bytes)) =
-                    windows_console_input_for_target_tokens(&state, &target, &request.keys, 1)
-                {
-                    if tokens_route_windows_control_as_pty_bytes(&state, &target, &request.keys) {
-                        let write = match prepare_pane_input_write(
-                            &mut state,
-                            &target,
-                            &bytes,
-                            PaneInputLiveness::TolerateDead,
-                        ) {
-                            Ok(write) => write,
-                            Err(error) => return Response::Error(ErrorResponse { error }),
-                        };
-                        let session_name = write.session_name().clone();
-                        let wrote_bytes = !bytes.is_empty();
-                        drop(state);
-                        let response = write_bytes_to_target(write, bytes, key_count).await;
-                        return self
-                            .mark_single_pane_input_ref_as_interactive(
-                                &session_name,
-                                wrote_bytes,
-                                response,
-                            )
-                            .await;
-                    }
-                    let write = match prepare_pane_console_input_write(
-                        &mut state,
-                        &target,
-                        &console_bytes,
-                        action,
-                    ) {
-                        Ok(write) => write,
-                        Err(error) => return Response::Error(ErrorResponse { error }),
-                    };
-                    let session_name = write.session_name().clone();
-                    let wrote_bytes = !console_bytes.is_empty();
-                    drop(state);
-                    let response = match write_windows_console_input_action_to_target_io(
-                        write, action,
-                    )
-                    .await
-                    {
-                        Ok(()) => Response::SendKeys(rmux_proto::SendKeysResponse { key_count }),
-                        Err(error) => Response::Error(ErrorResponse { error }),
-                    };
-                    return self
-                        .mark_single_pane_input_ref_as_interactive(
-                            &session_name,
-                            wrote_bytes,
-                            response,
-                        )
-                        .await;
-                }
-            }
             let write = match prepare_pane_input_write(
                 &mut state,
                 &target,
@@ -226,8 +143,8 @@ impl RequestHandler {
             }
             if !matches!(adjustment, ResizePaneAdjustment::NoOp) {
                 // See handle_resize_pane in layout.rs: skip the refresh (and
-                // its Windows deferred-pane wait) when nothing is attached so
-                // a still-starting sibling cannot stall a detached resize.
+                // its deferred-pane wait) when nothing is attached so a
+                // still-starting sibling cannot stall a detached resize.
                 if refresh_sessions.is_empty() {
                     if self.attached_count(&session_name).await > 0 {
                         self.refresh_attached_session(&session_name).await;
@@ -563,9 +480,7 @@ impl RequestHandler {
             let opened = planned.open().await;
             let mut state = self.state.lock().await;
             let committed = match opened {
-                Ok((commit, prepared)) => {
-                    state.commit_pane_respawn(commit, prepared, |_, _| {})
-                }
+                Ok((commit, prepared)) => state.commit_pane_respawn(commit, prepared, |_, _| {}),
                 Err(error) => Err(error),
             };
             match committed {

@@ -43,9 +43,7 @@ impl Default for AttachSettings {
     }
 }
 
-fn session_name(value: &str) -> SessionName {
-    SessionName::new(value).expect("valid session name")
-}
+use crate::test_names::session_name;
 
 async fn create_fixture(name: &str) -> PaneFixture {
     let handler = RequestHandler::new();

@@ -1,5 +1,3 @@
-#![cfg(unix)]
-
 use std::error::Error;
 use std::io;
 use std::path::Path;
@@ -17,7 +15,7 @@ use rmux_proto::{
 
 const FILE_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn list_sessions_uses_shared_formatter_through_real_socket() -> Result<(), Box<dyn Error>> {
     let harness = TestHarness::new("listing-list-sessions");
     let handle = start_server(&harness).await?;
@@ -91,7 +89,7 @@ async fn list_sessions_uses_shared_formatter_through_real_socket() -> Result<(),
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn list_panes_uses_shared_formatter_through_real_socket() -> Result<(), Box<dyn Error>> {
     let harness = TestHarness::new("listing-list-panes");
     let handle = start_server(&harness).await?;
@@ -166,7 +164,7 @@ async fn list_panes_uses_shared_formatter_through_real_socket() -> Result<(), Bo
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn rename_session_round_trips_and_migrates_session_scoped_state() -> Result<(), Box<dyn Error>>
 {
     let harness = TestHarness::new("listing-rename-session");

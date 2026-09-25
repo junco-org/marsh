@@ -1140,11 +1140,9 @@ impl RequestHandler {
                     )
                     .await
                 {
-                    Ok(_previous_session_name) => {
-                        Response::SwitchClient(SwitchClientResponse {
-                            session_name: session_name.clone(),
-                        })
-                    }
+                    Ok(_previous_session_name) => Response::SwitchClient(SwitchClientResponse {
+                        session_name: session_name.clone(),
+                    }),
                     Err(error) => Response::Error(ErrorResponse { error }),
                 }
             }
@@ -1479,9 +1477,7 @@ mod tests {
     use std::sync::Arc;
     use tokio::sync::mpsc;
 
-    fn session_name(value: &str) -> SessionName {
-        SessionName::new(value).expect("valid session name")
-    }
+    use crate::test_names::session_name;
 
     const fn content_size_for_default_status(terminal_size: TerminalSize) -> TerminalSize {
         TerminalSize {

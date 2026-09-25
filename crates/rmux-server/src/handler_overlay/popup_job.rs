@@ -10,7 +10,7 @@
 //!
 //! | Was | Is |
 //! |---|---|
-//! | `rmux_pty::ChildCommand` + `spawn` | [`ShellIo::spawn`] with terminal I/O, under the admission lock |
+//! | `rmux_pty::ChildCommand` + `spawn` | [`ShellIo::open_shell`] with terminal I/O, under the admission lock |
 //! | a descriptor reader thread per popup | the daemon's one observation consumer, through [`RequestHandler::apply_popup_output`] |
 //! | `PtyIo::write_all` / `PtyIo::resize` | [`ShellIo::write_input`] / [`ShellIo::resize`] |
 //! | `SIGHUP` → `SIGTERM` → `SIGKILL` on a thread | [`ShellIo::stop`] with `force`, which retires the job and discards what it staged |
@@ -215,9 +215,7 @@ impl PopupJob {
         control
             .io
             .job(control.handle.id())
-            .is_some_and(|view| {
-                view.sandbox.uid == control.handle.sandbox().uid && !view.closing
-            })
+            .is_some_and(|view| view.sandbox.uid == control.handle.sandbox().uid && !view.closing)
     }
 
     /// Replaces this popup's I/O worker with one that reports every write to `writer`.
@@ -329,7 +327,7 @@ pub(in super::super) enum PopupDragMode {
 /// # The admission transaction
 ///
 /// The spawn and the route installation happen under one hold of [`ShellIo::admission_lock`]. That
-/// is not optional: the engine's `Opened` observation can reach the consumer *before* `spawn`
+/// is not optional: the engine's `Opened` observation can reach the consumer *before* `open_shell`
 /// returns here, and a job the consumer finds unrouted is treated as externally created and
 /// adopted as a window. Installing `Route::Popup` before the lock is released is what tells the
 /// consumer this job already has a surface — one that is emphatically not a pane.
@@ -350,7 +348,8 @@ pub(super) async fn spawn_popup_job(
 ) -> Result<(PopupJob, Vec<u8>), RmuxError> {
     let overrides = parse_environment_assignments(environment)?;
     let environment = popup_environment(profile, &overrides)?;
-    let directory = profile.seed_relative_dir(&io.executor_info())?;
+    // The profile's own directory, as a host path: the seed it lies in is the core's to discover,
+    // and translating a snapshot path back is its admission behaviour rather than this caller's.
     let geometry = TerminalGeometry {
         rows: size.rows.max(1),
         cols: size.cols.max(1),
@@ -359,15 +358,15 @@ pub(super) async fn spawn_popup_job(
     let handle = {
         let admission = io.admission_lock().lock().await;
         let handle = io
-            .spawn(
-                &directory,
-                None,
+            .open_shell(
+                profile.cwd(),
                 None,
                 SpawnOptions {
                     io: JobIo::Terminal {
                         geometry: Some(geometry),
                     },
                     environment: Some(environment),
+                    ..SpawnOptions::default()
                 },
             )
             .await
@@ -377,12 +376,14 @@ pub(super) async fn spawn_popup_job(
         handle
     };
 
-    // Admitted after the route, never before: a command that produced output while the job was
+    // Admitted after the route, never before: a command that produced output while the shell was
     // still unrouted would have its first bytes adopted into a window instead of this popup.
     let command = match shell_command {
         Some(text) => {
+            // Scheduled, not awaited: the popup is an overlay a user is looking at while its one
+            // line runs, and the status that closes it is read off the receipt.
             let started = io
-                .start_in(
+                .start_command(
                     &handle,
                     text,
                     CommandOptions {
@@ -391,14 +392,15 @@ pub(super) async fn spawn_popup_job(
                         // at admission so nothing can slip a second line into the gap between the
                         // command's last byte and its verdict.
                         close_on_finish: true,
+                        on_accept: None,
                     },
                 )
                 .await;
             match started {
                 Ok(command) => Some(command),
                 Err(error) => {
-                    // The job was admitted and will never run anything. Leaving it open would hold
-                    // a snapshot until the daemon shut down.
+                    // The shell was admitted and will never run anything. Leaving it open would
+                    // hold a snapshot until the daemon shut down.
                     let _ = io.stop(&handle, true).await;
                     io.forget_route(&handle.sandbox().uid);
                     return Err(crate::managed_workload::io_error(error));
@@ -590,11 +592,9 @@ impl RequestHandler {
         io.runtime().clone().spawn(async move {
             let status = match command {
                 Some(command) => match command.wait().await {
-                    Ok(completion) => gated_status(
-                        completion.exit_code,
-                        completion.is_published(),
-                        false,
-                    ),
+                    Ok(completion) => {
+                        gated_status(completion.exit_code, completion.is_published(), false)
+                    }
                     // No verdict was produced at all: teardown or a lost producer. There is no
                     // honest exit code for that, and `1` is what every other refusal reports.
                     Err(_) => 1,

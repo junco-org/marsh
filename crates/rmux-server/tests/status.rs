@@ -1,15 +1,11 @@
-#![cfg(unix)]
-
 mod common;
 
 use std::error::Error;
 use std::io;
-#[cfg(unix)]
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use common::{session_name, start_server, ClientConnection, TestHarness, PTY_TEST_LOCK};
-#[cfg(unix)]
 use rmux_proto::KillServerRequest;
 use rmux_proto::{
     AttachMessage, AttachSessionRequest, ListClientsRequest, NewSessionRequest, OptionName,
@@ -21,7 +17,7 @@ use tokio::time::{timeout, Instant};
 
 const STEP_TIMEOUT: Duration = Duration::from_secs(3);
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn attach_session_emits_status_row_for_single_pane_session() -> Result<(), Box<dyn Error>> {
     let _guard = PTY_TEST_LOCK.lock().await;
     let harness = TestHarness::new("status-attach");
@@ -56,7 +52,7 @@ async fn attach_session_emits_status_row_for_single_pane_session() -> Result<(),
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn attach_session_status_context_populates_session_attached() -> Result<(), Box<dyn Error>> {
     let _guard = PTY_TEST_LOCK.lock().await;
     let harness = TestHarness::new("status-session-attached");
@@ -106,8 +102,7 @@ async fn attach_session_status_context_populates_session_attached() -> Result<()
     Ok(())
 }
 
-#[cfg(unix)]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn kill_server_reaps_a_running_status_job_descendant() -> Result<(), Box<dyn Error>> {
     let _guard = PTY_TEST_LOCK.lock().await;
     let harness = TestHarness::new("status-job-stop");
@@ -164,7 +159,7 @@ async fn kill_server_reaps_a_running_status_job_descendant() -> Result<(), Box<d
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn status_interval_refreshes_time_formats_without_pane_output() -> Result<(), Box<dyn Error>>
 {
     let _guard = PTY_TEST_LOCK.lock().await;
@@ -245,7 +240,7 @@ async fn status_interval_refreshes_time_formats_without_pane_output() -> Result<
     .into())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn status_interval_does_not_refresh_suspended_attach_client() -> Result<(), Box<dyn Error>> {
     let _guard = PTY_TEST_LOCK.lock().await;
     let harness = TestHarness::new("status-interval-suspend");
@@ -458,13 +453,11 @@ async fn read_attach_message(
     }
 }
 
-#[cfg(unix)]
 struct StatusJobShutdownProbe {
     process_group: PathBuf,
     descendant: PathBuf,
 }
 
-#[cfg(unix)]
 impl StatusJobShutdownProbe {
     fn new(socket_path: &Path) -> Self {
         let root = socket_path.parent().expect("test socket has a parent");
@@ -498,7 +491,6 @@ impl StatusJobShutdownProbe {
     }
 }
 
-#[cfg(unix)]
 impl Drop for StatusJobShutdownProbe {
     fn drop(&mut self) {
         use rustix::process::{kill_process, kill_process_group, Pid, Signal};
@@ -518,12 +510,10 @@ impl Drop for StatusJobShutdownProbe {
     }
 }
 
-#[cfg(unix)]
 fn read_pid(path: &Path) -> Option<u32> {
     std::fs::read_to_string(path).ok()?.trim().parse().ok()
 }
 
-#[cfg(unix)]
 fn shell_quote_path(path: &Path) -> String {
     format!("'{}'", path.display().to_string().replace('\'', "'\"'\"'"))
 }

@@ -4,8 +4,6 @@ use std::time::Instant;
 
 use rmux_core::{key_code_lookup_bits, key_code_to_bytes, key_string_lookup_string};
 use rmux_proto::{OptionName, PaneTarget, RmuxError, Target};
-#[cfg(windows)]
-use crate::windows_console_input::WindowsConsoleKeyEvent;
 
 use super::super::{
     mode_tree_support::ModeTreeInputError,
@@ -87,11 +85,6 @@ fn ensure_target_session_identity(
 #[derive(Clone, Copy)]
 enum AttachedPaneForward<'a> {
     EncodedKey(PhantomData<&'a ()>),
-    #[cfg(windows)]
-    WindowsConsoleKey {
-        key: WindowsConsoleKeyEvent,
-        bytes: &'a [u8],
-    },
 }
 
 impl RequestHandler {
@@ -279,13 +272,12 @@ impl RequestHandler {
         // mode-tree, display-panes, no-job popups) treat a paste as literal
         // text. Strip embedded bracketed-paste markers before decoding —
         // otherwise the leading ESC of ESC[200~ cancels the overlay and the
-        // pasted body leaks to the pane's shell. On Windows the attach client
-        // wraps a console-input burst in these markers (issue #92); on Unix a
-        // real terminal paste into an ?2004h attach hits the same class, so
-        // the strip runs on every platform. Scrub the CONCATENATED buffer so
-        // a marker whose bytes straddle the pending_input / bytes seam
-        // (delivered across two socket reads or attach-input frames) still
-        // collapses to nothing.
+        // pasted body leaks to the pane's shell (issue #92). A real terminal
+        // paste into an ?2004h attach delivers exactly those markers, so the
+        // strip runs on every attached input path. Scrub the CONCATENATED
+        // buffer so a marker whose bytes straddle the pending_input / bytes
+        // seam (delivered across two socket reads or attach-input frames)
+        // still collapses to nothing.
         let new_input_at = pending_input.len();
         pending_input.extend_from_slice(bytes);
         bracketed_paste::strip_bracketed_paste_markers_after_append(pending_input, new_input_at);
@@ -1286,6 +1278,11 @@ fn is_mouse_prefix(bytes: &[u8]) -> bool {
     bytes.starts_with(b"\x1b[M") || bytes.starts_with(b"\x1b[<")
 }
 
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
 fn is_enter_key(key: rmux_core::KeyCode) -> bool {
     key_string_lookup_string("Enter")
         .is_some_and(|enter| key_code_lookup_bits(enter) == key_code_lookup_bits(key))

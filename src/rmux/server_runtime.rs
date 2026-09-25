@@ -4,8 +4,8 @@ use std::io;
 use std::num::NonZeroUsize;
 use std::time::Duration;
 
-use marsh::rmux::types::{ShellEnvironment, TerminalGeometry};
 use marsh::rmux::RmuxFrontend;
+use marsh::rmux::types::{ShellEnvironment, TerminalGeometry};
 use rmux_server::DaemonConfig;
 use tokio::runtime::{Builder, Runtime};
 
@@ -17,22 +17,21 @@ use tokio::runtime::{Builder, Runtime};
 /// kept one would never honour `exit-empty` or an idle shutdown, and the user would be left with a
 /// server they did not ask to keep.
 ///
-/// The seed is discovered from the process's own working directory, which is what makes
-/// `cd <seed> && rmux -D` the whole setup.
+/// The process's own working directory becomes the daemon's default starting directory — the one
+/// a request that names none gets — which is what makes `cd <seed> && rmux -D` the whole setup.
+/// Nothing is leased here: each shell's seed is discovered from its own starting directory.
 ///
 /// Errors are converted to [`io::Error`] here because this *is* the CLI boundary; inside the
 /// library they stay typed.
 ///
 /// # Errors
 ///
-/// Fails when the seed cannot be discovered, leased or recovered, when the socket is already held,
-/// and with whatever the daemon reported on its way out.
+/// Fails when the socket is already held, and with whatever the daemon reported on its way out.
 pub(crate) async fn run_daemon(config: DaemonConfig) -> io::Result<()> {
     let cwd = std::env::current_dir()?;
     let frontend = RmuxFrontend::open(
         config,
         &cwd,
-        marsh::PolicyValidator::global(),
         ShellEnvironment::default(),
         // A daemon with no attached client still has to open terminals at *some* size. The
         // classic default is the honest choice: a client that attaches resizes everything to its
@@ -83,4 +82,3 @@ fn daemon_worker_threads() -> usize {
         .map_or(DAEMON_MIN_WORKER_THREADS, NonZeroUsize::get)
         .clamp(DAEMON_MIN_WORKER_THREADS, DAEMON_MAX_WORKER_THREADS)
 }
-

@@ -2,7 +2,7 @@ use std::ffi::CStr;
 use std::io::ErrorKind;
 use std::path::Path;
 
-use rmux_client::{default_socket_path, ClientError};
+use rmux_client::{ClientError, default_socket_path};
 use rmux_proto::RmuxError;
 
 /// Renders a connect failure the way tmux words it, or `None` when the server is reachable.
@@ -40,8 +40,10 @@ pub(crate) fn tmux_cli_error_message(command_name: &str, error: &RmuxError) -> S
             if matches!(command_name, "link-window" | "move-window")
                 && reason == "window index already exists in session" =>
         {
-            window_index_from_target(value)
-                .map_or_else(|| error.to_string(), |index| format!("index in use: {index}"))
+            window_index_from_target(value).map_or_else(
+                || error.to_string(),
+                |index| format!("index in use: {index}"),
+            )
         }
         RmuxError::InvalidTarget { reason, .. } if reason.starts_with("can't find ") => {
             reason.clone()
@@ -154,7 +156,9 @@ fn io_error_message_without_code(error: &std::io::Error) -> String {
         let ptr = unsafe { libc::strerror(errno) };
         let message = (!ptr.is_null()).then(|| {
             // SAFETY: `ptr` is non-null here and points at that NUL-terminated message.
-            unsafe { CStr::from_ptr(ptr) }.to_string_lossy().into_owned()
+            unsafe { CStr::from_ptr(ptr) }
+                .to_string_lossy()
+                .into_owned()
         });
         if let Some(message) = message {
             return message;
@@ -170,9 +174,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn source_file_line_prefix_accepts_windows_drive_paths() {
+    fn source_file_line_prefix_accepts_a_colon_inside_the_path() {
         assert!(has_source_file_line_prefix(
-            r"C:\Users\RMUXUser\.tmux.conf:12: unknown command"
+            "/home/rmux/notes:drafts/.tmux.conf:12: unknown command"
         ));
     }
 
@@ -182,7 +186,7 @@ mod tests {
             "source-file failed: missing file"
         ));
         assert!(!has_source_file_line_prefix(
-            "C:\\Users\\RMUXUser\\.tmux.conf"
+            "/home/rmux/notes:drafts/.tmux.conf"
         ));
     }
 

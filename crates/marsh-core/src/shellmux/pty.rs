@@ -42,7 +42,10 @@ impl SuspendKeyGuard {
     ///
     /// Fails when `file` is not a terminal or its attributes cannot be read or written.
     pub fn new(file: OpenFile) -> Result<Self, brush_core::Error> {
-        let previous = replace_suspend_char(&file, nix::sys::termios::_POSIX_VDISABLE)?;
+        let previous = {
+            let fd = file.try_borrow_as_fd()?;
+            replace_suspend_char::<brush_core::Error>(fd, nix::sys::termios::_POSIX_VDISABLE)?
+        };
         Ok(Self { file, previous })
     }
 
@@ -60,7 +63,8 @@ impl SuspendKeyGuard {
     ///
     /// Fails when `file` is not a terminal or its attributes cannot be read or written.
     pub fn disable(file: &OpenFile) -> Result<(), brush_core::Error> {
-        replace_suspend_char(file, nix::sys::termios::_POSIX_VDISABLE)?;
+        let fd = file.try_borrow_as_fd()?;
+        replace_suspend_char::<brush_core::Error>(fd, nix::sys::termios::_POSIX_VDISABLE)?;
         Ok(())
     }
 }
@@ -68,9 +72,11 @@ impl SuspendKeyGuard {
 impl Drop for SuspendKeyGuard {
     fn drop(&mut self) {
         // Against freshly read attributes, so restoring one character does not undo whatever else
-        // the session changed. Best-effort: a terminal that has gone away is nothing a destructor
-        // can act on.
-        let _ = replace_suspend_char(&self.file, self.previous);
+        // the session changed. Best-effort throughout: a terminal that has gone away is nothing a
+        // destructor can act on, and neither is a file that can no longer lend a descriptor.
+        if let Ok(fd) = self.file.try_borrow_as_fd() {
+            let _ = replace_suspend_char::<brush_core::Error>(fd, self.previous);
+        }
     }
 }
 
@@ -79,29 +85,21 @@ impl Drop for SuspendKeyGuard {
 /// The attributes are read and written directly rather than through `brush_core::sys::terminal::
 /// Config`, whose `termios` field is private to brush-core: only one control character changes
 /// here, and a round trip through a settings struct would carry every other mode with it.
-fn replace_suspend_char(
-    file: &OpenFile,
+///
+/// Generic in the error because the same three syscalls serve two callers with two error domains:
+/// a session guard reporting [`brush_core::Error`], and a terminal still being assembled that has
+/// only [`std::io::Error`]. Both already convert from nix's `Errno`, so the conversion the `?`
+/// operators perform is the caller's own.
+fn replace_suspend_char<E: From<nix::errno::Errno>>(
+    fd: BorrowedFd<'_>,
     value: libc::cc_t,
-) -> Result<libc::cc_t, brush_core::Error> {
-    let fd = file.try_borrow_as_fd()?;
+) -> Result<libc::cc_t, E> {
     let mut termios = nix::sys::termios::tcgetattr(fd)?;
     let index = nix::sys::termios::SpecialCharacterIndices::VSUSP as usize;
     let previous = termios.control_chars[index];
     termios.control_chars[index] = value;
     nix::sys::termios::tcsetattr(fd, nix::sys::termios::SetArg::TCSANOW, &termios)?;
     Ok(previous)
-}
-
-/// Disables the suspend character on the terminal behind `fd`.
-///
-/// The descriptor-shaped counterpart of [`replace_suspend_char`], for a terminal that is still
-/// being assembled and has no [`OpenFile`] yet.
-fn disable_suspend_char(fd: BorrowedFd<'_>) -> std::io::Result<()> {
-    let mut termios = nix::sys::termios::tcgetattr(fd)?;
-    let index = nix::sys::termios::SpecialCharacterIndices::VSUSP as usize;
-    termios.control_chars[index] = nix::sys::termios::_POSIX_VDISABLE;
-    nix::sys::termios::tcsetattr(fd, nix::sys::termios::SetArg::TCSANOW, &termios)?;
-    Ok(())
 }
 
 /// Opens a private pseudoterminal pair sized `rows` by `cols`, returning `(master, slave)`.
@@ -160,7 +158,7 @@ pub fn open_pty(rows: u16, cols: u16) -> std::io::Result<(OwnedFd, OwnedFd)> {
     let slave = unsafe { OwnedFd::from_raw_fd(slave) };
 
     resize_pty(slave.as_fd(), rows, cols)?;
-    disable_suspend_char(slave.as_fd())?;
+    replace_suspend_char::<std::io::Error>(slave.as_fd(), nix::sys::termios::_POSIX_VDISABLE)?;
 
     Ok((master, slave))
 }

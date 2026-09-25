@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use clap::{ArgAction, ArgGroup, Args};
 use rmux_proto::WaitForMode;
 
-use super::{parse_command_args, parse_target_spec, QueuedCommand, TargetSpec};
+use super::{QueuedCommand, TargetSpec, parse_command_args, parse_target_spec};
 
 /// Parses `source-file` arguments, rejecting flags `clap` would otherwise absorb as file paths.
 pub(super) fn parse_source_file_args(
@@ -35,7 +35,11 @@ fn validate_source_file_options(arguments: &[String]) -> Result<(), clap::Error>
             continue;
         }
 
-        let mut chars = argument.strip_prefix('-').unwrap_or(argument).chars().peekable();
+        let mut chars = argument
+            .strip_prefix('-')
+            .unwrap_or(argument)
+            .chars()
+            .peekable();
         while let Some(flag) = chars.next() {
             match flag {
                 'F' | 'n' | 'q' | 'v' => {}

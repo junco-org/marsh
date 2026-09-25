@@ -2,9 +2,9 @@
 //!
 //! Unlike the sibling bracketed-paste suites, nothing here installs
 //! `RawPaneInputProbe`. That probe returns `PaneInputSink::CapturedForTest`
-//! before the starting-pane queue and before the Windows passthrough/legacy
-//! sink selection, so it cannot observe whether the real destination received
-//! the delimiters. Each test below runs a real child process in the pane and
+//! before the starting-pane queue and before the pane's real shell sink is
+//! resolved, so it cannot observe whether the real destination received the
+//! delimiters. Each test below runs a real child process in the pane and
 //! compares the bytes that child actually read from its standard input.
 //!
 //! The slot/child machinery lives in [`crate::test_shell::final_sink`] because
@@ -42,9 +42,8 @@ const ANNOUNCEMENT_TIMEOUT: Duration = Duration::from_secs(30);
 /// An expired wait reports what that transcript had actually observed. The
 /// deadline alone said only that the mode never changed, which reads the same
 /// for a pane that received no child output, one that received output carrying
-/// no announcement, and one whose console handed it the announcement as screen
-/// text — and a Windows 10 release execution costs a thirteen-minute
-/// compilation before it can say so.
+/// no announcement, and one whose terminal handed it the announcement as
+/// screen text.
 pub(super) async fn wait_for_bracketed_mode(
     handler: &RequestHandler,
     target: &PaneTarget,
@@ -175,12 +174,12 @@ async fn active_unaware_pane_child_receives_only_the_paste_body() {
     slot.assert_application_bytes("an unaware child must receive the body with no delimiters");
 }
 
-/// More UTF-16 code units than one `write_windows_console_utf8` record batch,
-/// with a surrogate pair and CR/LF inside, so a truncating, splitting or
-/// re-ordering writer becomes visible in the child's bytes.
-fn batch_crossing_body() -> String {
+/// A body of several kibibytes, with a supplementary character and CR/LF
+/// inside, so a truncating, splitting or re-ordering writer becomes visible in
+/// the child's bytes.
+fn multi_kibibyte_body() -> String {
     let mut body = String::from("β😀\r\n");
-    while body.encode_utf16().count() < 2_100 {
+    while body.len() < 2_100 {
         body.push_str("0123456789");
     }
     body.push_str("\r\nEND😀");
@@ -188,10 +187,10 @@ fn batch_crossing_body() -> String {
 }
 
 #[tokio::test]
-async fn bracketed_paste_child_receives_a_body_crossing_the_record_batch_boundary() {
+async fn bracketed_paste_child_receives_a_multi_kibibyte_body_whole() {
     let handler = RequestHandler::new();
     let session = session_name("final-sink-batch");
-    let expected = wrapped(batch_crossing_body().as_bytes());
+    let expected = wrapped(multi_kibibyte_body().as_bytes());
     let slot = FinalSinkSlot::new("batch", &expected, true);
 
     started_final_sink_pane(&handler, &session, &slot, true).await;
@@ -201,9 +200,7 @@ async fn bracketed_paste_child_receives_a_body_crossing_the_record_batch_boundar
         .await
         .expect("attached bracketed paste");
 
-    slot.assert_application_bytes(
-        "a payload longer than one console record batch must arrive whole",
-    );
+    slot.assert_application_bytes("a payload of several kibibytes must arrive whole");
 }
 
 #[tokio::test]
@@ -300,13 +297,9 @@ async fn synchronized_mixed_panes_recompute_mode_per_child_when_the_active_pane_
 
 /// Ordering is what the child read, not the order the server awaited.
 ///
-/// A keystroke and a pasted body do not share a transport. On Windows the
-/// keystroke is written to the pane's ConPTY input pipe while the paste is
-/// written as console records straight into that pane's input buffer, so the
-/// two reach the same console through different Win32 entry points and a
-/// correct await order alone does not settle what the child reads first. On
-/// Unix both take the pseudoterminal. Either way the child must observe
-/// `key -> paste -> key`.
+/// A keystroke and a pasted body both take the pane's pseudoterminal, but they
+/// are separate writes, so a correct await order alone does not settle what
+/// the child reads first. The child must observe `key -> paste -> key`.
 async fn assert_paste_arrives_between_the_keystrokes(label: &str, bracket_aware: bool) {
     let handler = RequestHandler::new();
     let session = session_name(label);

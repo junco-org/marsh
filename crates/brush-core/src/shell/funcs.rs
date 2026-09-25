@@ -109,6 +109,7 @@ impl<SE: extensions::ShellExtensions> crate::Shell<SE> {
             shell: self,
             command_name,
             params: params.clone(),
+            process_group_id: None,
         };
 
         let command_args = args

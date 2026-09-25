@@ -12,31 +12,10 @@ use super::*;
 use rmux_proto::{NewSessionExtRequest, PaneTarget, SessionName, TerminalSize};
 
 /// Async client end of the connection under test.
-#[cfg(unix)]
 pub(super) type TestClientStream = LocalStream;
-#[cfg(windows)]
-pub(super) type TestClientStream = rmux_ipc::WindowsPipeClient;
 
-#[cfg(unix)]
 pub(super) async fn connected_streams(_label: &str) -> io::Result<(LocalStream, TestClientStream)> {
     LocalStream::pair()
-}
-
-#[cfg(windows)]
-pub(super) async fn connected_streams(label: &str) -> io::Result<(LocalStream, TestClientStream)> {
-    let endpoint = rmux_ipc::endpoint_for_label(format!("{label}-{}", std::process::id()))?;
-    let listener = LocalListener::bind(&endpoint)?;
-    let client_endpoint = endpoint.clone();
-    let client = tokio::spawn(async move {
-        rmux_ipc::connect_windows_pipe(client_endpoint.as_pipe_name()).await
-    });
-    // The accepted peer identity is the test process itself; the connection is
-    // served under the peer identity the caller chose instead.
-    let (server, _accepted_peer) = listener.accept().await?;
-    let client = client
-        .await
-        .map_err(|error| io::Error::other(format!("named-pipe client task failed: {error}")))??;
-    Ok((server, client))
 }
 
 pub(super) fn spawn_connection(
@@ -132,25 +111,8 @@ where
     }
 }
 
-#[cfg(unix)]
 pub(super) fn quiet_command() -> Vec<String> {
     vec!["/bin/sh".to_owned(), "-c".to_owned(), "sleep 60".to_owned()]
-}
-
-#[cfg(windows)]
-pub(super) fn quiet_command() -> Vec<String> {
-    let system_root =
-        std::env::var_os("SystemRoot").unwrap_or_else(|| std::ffi::OsString::from(r"C:\Windows"));
-    let cmd = std::path::PathBuf::from(system_root)
-        .join("System32")
-        .join("cmd.exe");
-    vec![
-        cmd.to_string_lossy().into_owned(),
-        "/d".to_owned(),
-        "/q".to_owned(),
-        "/c".to_owned(),
-        "ping -n 120 127.0.0.1 >NUL".to_owned(),
-    ]
 }
 
 pub(super) async fn start_quiet_pane(handler: &Arc<RequestHandler>, name: &str) -> PaneTarget {

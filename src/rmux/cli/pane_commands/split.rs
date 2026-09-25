@@ -8,8 +8,8 @@ use rmux_proto::{
 
 use super::super::format_print::print_target_format;
 use super::super::{
-    cli_target_actions_enabled, resolve_current_pane_target, resolve_split_window_target_spec,
-    target_action_needs_legacy_retry, unexpected_response, ExitFailure,
+    ExitFailure, cli_target_actions_enabled, resolve_current_pane_target,
+    resolve_split_window_target_spec, target_action_needs_legacy_retry, unexpected_response,
 };
 use crate::cli_args::SplitWindowArgs;
 use crate::cli_response::tmux_cli_error_message;
@@ -78,7 +78,7 @@ pub(in crate::cli) fn run_split_window(
             return Err(ExitFailure::new(
                 1,
                 tmux_cli_error_message("split-window", &error),
-            ))
+            ));
         }
         other => return Err(unexpected_response("split-window", &other)),
     };
@@ -178,7 +178,7 @@ fn run_split_window_legacy_with_stdin(
     let pane = match response {
         Response::SplitWindow(response) => response.pane,
         Response::Error(ErrorResponse { error }) => {
-            return Err(ExitFailure::new(1, error.to_string()))
+            return Err(ExitFailure::new(1, error.to_string()));
         }
         other => return Err(unexpected_response("split-window", &other)),
     };

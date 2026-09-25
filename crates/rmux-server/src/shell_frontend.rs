@@ -23,8 +23,8 @@
 use std::sync::Arc;
 
 use marsh_core::shellmux::{
-    CommandCompletion, CommandHandle, FrontendEvent, JobEnd, OutputChannel, Sandbox, ShellFrontend,
-    ShellMux, Spawned, TerminalGeometry,
+    CommandCompletion, CommandHandle, FrontendEvent, JobEnd, OutputChannel, Sandbox, Shell,
+    ShellFrontend, ShellMux, TerminalGeometry,
 };
 
 /// One observation, owned, on its way to the daemon's consumer.
@@ -35,7 +35,7 @@ pub(crate) enum FrontendMessage {
     /// A job's streams and shell are open.
     Opened {
         /// The core handle.
-        job: Spawned,
+        job: Shell,
     },
     /// A command was admitted.
     CommandAccepted {

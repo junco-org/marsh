@@ -1253,10 +1253,7 @@ async fn list_clients_exposes_pid_and_tty_format_variables_for_attached_clients(
     assert_eq!(parts[3], "alpha");
     assert_eq!(parts[4], socket_path);
     assert_eq!(parts[5], config_files);
-    #[cfg(unix)]
     assert!(!parts[2].is_empty(), "client_tty should be populated");
-    #[cfg(windows)]
-    assert_eq!(parts[2], "");
 }
 
 #[tokio::test]

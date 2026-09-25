@@ -3,13 +3,11 @@ use rmux_core::Utf8Config;
 use rmux_proto::types::OptionScopeSelector;
 use rmux_proto::{
     ErrorResponse, NewSessionRequest, OptionName, PaneTarget, Request, Response, RmuxError,
-    ScopeSelector, SessionName, SetOptionByNameRequest, SetOptionMode, SetOptionRequest,
-    TerminalSize, WindowTarget,
+    ScopeSelector, SetOptionByNameRequest, SetOptionMode, SetOptionRequest, TerminalSize,
+    WindowTarget,
 };
 
-fn session_name(value: &str) -> SessionName {
-    SessionName::new(value).expect("valid session name")
-}
+use crate::test_names::session_name;
 
 async fn create_session(handler: &RequestHandler, name: &str) {
     let response = handler
@@ -77,7 +75,6 @@ async fn set_option_updates_the_store_and_session_values_override_global() {
     );
 }
 
-#[cfg(unix)]
 #[tokio::test]
 async fn typed_and_named_default_shell_mutations_reject_unsuitable_paths() {
     let handler = RequestHandler::new();

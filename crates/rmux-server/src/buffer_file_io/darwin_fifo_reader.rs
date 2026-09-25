@@ -320,9 +320,7 @@ impl Drop for HelperChild {
     }
 }
 
-fn errno_to_io(error: rustix::io::Errno) -> io::Error {
-    io::Error::from_raw_os_error(error.raw_os_error())
-}
+use super::errno_to_io;
 
 #[cfg(test)]
 mod tests {

@@ -1,5 +1,3 @@
-#![cfg(unix)]
-
 use std::collections::BTreeSet;
 use std::error::Error;
 use std::path::PathBuf;
@@ -21,7 +19,7 @@ use rmux_proto::{
 // `/proc/<pid>/task/*/children` under full-workspace test load.
 const PTY_TIMEOUT: Duration = Duration::from_secs(5);
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn window_management_requests_round_trip_through_the_socket() -> Result<(), Box<dyn Error>> {
     let harness = TestHarness::new("window-management");
     let socket_path = harness.socket_path().to_path_buf();
@@ -104,7 +102,7 @@ async fn window_management_requests_round_trip_through_the_socket() -> Result<()
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn kill_window_all_others_cleans_up_removed_window_ptys() -> Result<(), Box<dyn Error>> {
     let _guard = PTY_TEST_LOCK.lock().await;
     let harness = TestHarness::new("kill-window-pty-cleanup");
@@ -212,7 +210,7 @@ async fn kill_window_all_others_cleans_up_removed_window_ptys() -> Result<(), Bo
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn window_navigation_and_listing_requests_round_trip_through_the_socket(
 ) -> Result<(), Box<dyn Error>> {
     let harness = TestHarness::new("window-navigation-management");
@@ -376,7 +374,7 @@ async fn wait_for_session_pane_ttys(
     )
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn window_move_swap_and_rotate_requests_round_trip_through_the_socket(
 ) -> Result<(), Box<dyn Error>> {
     let _guard = PTY_TEST_LOCK.lock().await;

@@ -4,8 +4,8 @@ use std::fmt;
 use std::path::Path;
 
 use rmux_client::{
-    connect_or_absent, wait_for_server_endpoint_cleanup, ClientError, ConnectResult, Connection,
-    ServerConnectionProvenance,
+    ClientError, ConnectResult, Connection, ServerConnectionProvenance, connect_or_absent,
+    wait_for_server_endpoint_cleanup,
 };
 use rmux_proto::{OptionScopeSelector, Response, RmuxError};
 

@@ -44,7 +44,6 @@ async fn session_target_refreshes_follow_the_current_active_window() {
                 5,
                 crate::pane_terminals::WindowSpawnOptions {
                     start_directory: None,
-                    inherited_start_directory: false,
                     command: None,
                     socket_path: Path::new("/tmp/rmux-test.sock"),
                     spawn_environment: None,
@@ -128,7 +127,6 @@ async fn attach_session_upgrade_renders_only_the_active_window() {
             5,
             crate::pane_terminals::WindowSpawnOptions {
                 start_directory: None,
-                inherited_start_directory: false,
                 command: Some(&quiet_command),
                 socket_path: Path::new("/tmp/rmux-test.sock"),
                 spawn_environment: None,
@@ -174,27 +172,6 @@ async fn attach_session_upgrade_renders_only_the_active_window() {
         render_frame.contains("visible-active-pane"),
         "attach must replay the active pane screen, got {render_frame:?}"
     );
-    #[cfg(windows)]
-    {
-        let host_short = crate::host_name::local_hostname()
-            .and_then(|host| {
-                host.split('.')
-                    .next()
-                    .filter(|part| !part.is_empty())
-                    .map(ToOwned::to_owned)
-            })
-            .expect("host name");
-        let status_host: String = host_short.chars().take(21).collect();
-        assert!(
-            render_frame.contains(&format!("\"{status_host}\"")),
-            "attach status must render the host name, got {render_frame:?}"
-        );
-        assert!(
-            !render_frame.contains("\"pane-host\""),
-            "attach status must not render the pane title in status-right, got {render_frame:?}"
-        );
-    }
-    #[cfg(not(windows))]
     {
         assert!(
             render_frame.contains("\"pane-host\""),

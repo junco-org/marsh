@@ -6,15 +6,15 @@ use rmux_proto::{
     ErrorResponse, ListClientsRequest, PaneOutputSubscriptionId, PaneOutputSubscriptionStart,
     PaneTarget, ResolveTargetType, Response, SendKeysExt2Request, SendKeysExtRequest, Target,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::cli_args::{SendKeysArgs, SendKeysWaitMode, WaitPaneArgs};
 use crate::cli_response::{expect_command_success, tmux_cli_error_message};
 
 use super::super::ExitFailure;
 use super::common::{
-    check_disabled, connect_cli, duration_millis, elapsed_millis, find_visible_text,
-    sleep_poll_interval, timeout_deadline, visible_text, write_json, DEFAULT_STABLE_FOR,
+    DEFAULT_STABLE_FOR, check_disabled, connect_cli, duration_millis, elapsed_millis,
+    find_visible_text, sleep_poll_interval, timeout_deadline, visible_text, write_json,
 };
 use super::pane_exit::PaneExitStatus;
 use super::stream;
@@ -22,8 +22,7 @@ use super::wait_target::{self, StableWaitProcessState, StableWaitTarget};
 
 const CLIENT_FIELD_SEPARATOR: char = '\u{1f}';
 const CLIENT_ROW_SEPARATOR: char = '\u{1e}';
-const CLIENT_TARGET_FORMAT: &str =
-    "#{client_name}\u{1f}#{client_tty}\u{1f}#{client_pid}\u{1f}#{client_session}\u{1f}#{client_control_mode}\u{1e}";
+const CLIENT_TARGET_FORMAT: &str = "#{client_name}\u{1f}#{client_tty}\u{1f}#{client_pid}\u{1f}#{client_session}\u{1f}#{client_control_mode}\u{1e}";
 const PANE_EXIT_TOMBSTONE_HANDOFF_GRACE: Duration = Duration::from_millis(100);
 
 /// Runs the `wait-pane` CLI command, polling the resolved target until its condition holds.
@@ -801,7 +800,7 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        lag_json_value, observe_needle, send_keys_wait_exit_code, PaneExitStatus, WaitCondition,
+        PaneExitStatus, WaitCondition, lag_json_value, observe_needle, send_keys_wait_exit_code,
     };
 
     #[test]

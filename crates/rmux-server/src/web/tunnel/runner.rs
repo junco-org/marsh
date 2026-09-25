@@ -115,7 +115,7 @@ pub(super) async fn start(
     let environment = daemon_environment();
     let spec = managed_workload::spec(
         io,
-        &provider_directory(io)?,
+        &provider_directory(io),
         environment
             .iter()
             .map(|(name, value)| (name.as_os_str(), value.as_os_str())),
@@ -306,24 +306,11 @@ fn daemon_environment() -> Vec<(OsString, OsString)> {
 
 /// The directory a provider starts in.
 ///
-/// The daemon's own while it is inside the seed, which is what the provider inherited before. A
-/// daemon serving a seed it is not standing in falls back to the seed root instead of failing: a
-/// tunnel provider dials the network and resolves no relative path, so refusing to start one over
-/// a directory it never reads would be a pointless failure.
-///
-/// # Errors
-///
-/// Fails when this server has no seed at all, which is the one case where there is nowhere to run.
-fn provider_directory(io: &ShellIo) -> Result<PathBuf, RmuxError> {
-    let executor = io.executor_info();
-    let seed = executor.seed.clone().ok_or_else(|| {
-        RmuxError::Server("this server has no seed to start a tunnel provider in".to_owned())
-    })?;
-    let cwd = std::env::current_dir().unwrap_or_else(|_| seed.clone());
-    if crate::terminal::seed_relative_path(&executor, &cwd).is_ok() {
-        return Ok(cwd);
-    }
-    Ok(seed)
+/// This host's default, which is where the provider was inherited from before. A tunnel provider
+/// dials the network and resolves no relative path of its own, so there is nothing here to choose
+/// between seeds: whichever seed the default lies in is the one it opens on.
+fn provider_directory(io: &ShellIo) -> PathBuf {
+    io.default_dir().to_path_buf()
 }
 
 async fn wait_for_public_endpoint(preset: &TunnelPreset, url: &str) -> Result<(), RmuxError> {
@@ -568,7 +555,6 @@ mod tests {
     /// This is the whole start path end to end: argv admitted as a pipe job, its stdout streamed
     /// through the line reader, the URL matched, and the public endpoint probed. The probe target
     /// is a real listener, because a tunnel whose URL nothing answers on is not ready.
-    #[cfg(unix)]
     #[tokio::test]
     async fn runner_extracts_public_url_from_managed_output() {
         use super::start;

@@ -69,8 +69,8 @@ impl OverlayIdentity {
         active: &ActiveAttach,
         target: &Target,
     ) -> bool {
-        self.client.matches_active(active)
-            && active.session_id == self.client.session_id()
+        self.client
+            .matches_active_lifetime(active, self.client.session_id())
             && !active.suspended
             && !active.closing.load(std::sync::atomic::Ordering::SeqCst)
             && state
@@ -95,7 +95,7 @@ impl RequestHandler {
         attach_pid: u32,
         input_identity: Option<ActiveAttachIdentity>,
     ) -> Result<OverlayActionStatus, RmuxError> {
-        let retired = {
+        let retirement = {
             let state = self.state.lock().await;
             let mut active_attach = self.active_attach.lock().await;
             let Some(active) = active_attach.by_pid.get_mut(&attach_pid) else {
@@ -114,43 +114,59 @@ impl RequestHandler {
                 return Ok(OverlayActionStatus::Current);
             }
 
-            let popup_job = match active.overlay.take() {
-                Some(ClientOverlayState::Popup(popup)) => popup.job,
-                Some(ClientOverlayState::Menu(_)) | None => None,
-            };
-            active.overlay_generation = active.overlay_generation.saturating_add(1);
-            let transient_restore = active
-                .transient_message
-                .is_some()
-                .then(|| (active.identity(attach_pid), active.session_name.clone()));
-            Some((
-                active.control_tx.clone(),
-                active.render_generation,
-                active.overlay_generation,
-                popup_job,
-                transient_restore,
-            ))
+            take_overlay_retirement(active, attach_pid, true)
         };
 
-        if let Some((
-            control_tx,
-            render_generation,
-            overlay_generation,
-            popup_job,
-            transient_restore,
-        )) = retired
-        {
-            if let Some(job) = popup_job {
-                job.terminate();
-            }
-            let _ = control_tx.send(AttachControl::Overlay(OverlayFrame::persistent(
-                Vec::new(),
-                render_generation,
-                overlay_generation,
-            )));
-            self.restore_transient_message_after_persistent_clear(transient_restore)
-                .await;
-        }
+        self.publish_overlay_retirement(retirement).await;
         Ok(OverlayActionStatus::Retired)
+    }
+
+    pub(super) async fn publish_overlay_retirement(&self, retirement: OverlayRetirement) {
+        if let Some(job) = retirement.popup_job {
+            job.terminate();
+        }
+        let _ = retirement
+            .control_tx
+            .send(AttachControl::Overlay(OverlayFrame::persistent(
+                Vec::new(),
+                retirement.render_generation,
+                retirement.overlay_generation,
+            )));
+        self.restore_transient_message_after_persistent_clear(retirement.transient_restore)
+            .await;
+    }
+}
+
+/// State-locked half of an overlay retirement: clears the overlay and advances
+/// the overlay generation, leaving publication to run after every guard is
+/// dropped.
+pub(super) struct OverlayRetirement {
+    control_tx: crate::pane_io::AttachControlSender,
+    render_generation: u64,
+    overlay_generation: u64,
+    popup_job: Option<super::popup_job::PopupJob>,
+    transient_restore: Option<(ActiveAttachIdentity, rmux_proto::SessionName)>,
+}
+
+pub(super) fn take_overlay_retirement(
+    active: &mut ActiveAttach,
+    attach_pid: u32,
+    terminate_popup_job: bool,
+) -> OverlayRetirement {
+    let popup_job = match active.overlay.take() {
+        Some(ClientOverlayState::Popup(popup)) if terminate_popup_job => popup.job,
+        _ => None,
+    };
+    active.overlay_generation = active.overlay_generation.saturating_add(1);
+    let transient_restore = active
+        .transient_message
+        .is_some()
+        .then(|| (active.identity(attach_pid), active.session_name.clone()));
+    OverlayRetirement {
+        control_tx: active.control_tx.clone(),
+        render_generation: active.render_generation,
+        overlay_generation: active.overlay_generation,
+        popup_job,
+        transient_restore,
     }
 }

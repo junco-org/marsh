@@ -1,13 +1,13 @@
 use rmux_client::Connection;
 use rmux_proto::{
-    encode_internal_pane_exit_probe, PaneId, PaneSnapshotResponse, PaneTarget, PaneTargetRef,
-    ResolveTargetType, Response, SessionId, SessionName, Target,
+    PaneId, PaneSnapshotResponse, PaneTarget, PaneTargetRef, ResolveTargetType, Response,
+    SessionId, SessionName, Target, encode_internal_pane_exit_probe,
 };
 
 use crate::cli_args::TargetSpec;
 use crate::cli_response::tmux_cli_error_message;
 
-use super::super::{listed_pane_index_matches_target, ExitFailure};
+use super::super::{ExitFailure, listed_pane_index_matches_target};
 use super::common::{pane_snapshot, resolve_pane_slot};
 use super::pane_exit::PaneExitStatus;
 

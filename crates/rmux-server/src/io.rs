@@ -3,31 +3,37 @@
 //! # The layers, and who owns what
 //!
 //! ```text
-//!   one leased btrfs seed
-//!        └── one ShellMux            the shells, their snapshots, the publication gate
-//!             └── one ShellIo        this facade: admission, ownership, observation
-//!                  ├── ShellHandle   one generation of one named job
-//!                  ├── Execution     one managed command with real pipes
-//!                  ├── IoEventStream one observer's bounded view
-//!                  └── SDK handles   rmux sessions, windows, panes over this host's socket
+//!   one ShellMux                      the shells, their snapshots, the publication gate
+//!        ├── one leased btrfs seed    per distinct seed any of those shells discovered
+//!        └── one ShellIo              this facade: admission, ownership, observation
+//!             ├── ShellHandle         one generation of one named job
+//!             ├── Execution           one managed command with real pipes
+//!             ├── IoEventStream       one observer's bounded view
+//!             └── SDK handles         rmux sessions, windows, panes over this host's socket
 //! ```
 //!
-//! One leased seed, one managed multiplexer, one server and its I/O facade, and then as many
-//! shell, execution and observer handles as an application cares to hold. There is exactly one of
-//! each of the first three and no way to make a second: the seed's lease is exclusive, so a second
-//! mux over it cannot open at all, and a second facade over one mux would be a second admission
+//! One managed multiplexer, one server and its I/O facade, and then as many shell, execution and
+//! observer handles as an application cares to hold. There is exactly one of each of the first
+//! two and no way to make a second: a second facade over one mux would be a second admission
 //! path with its own idea of what is live. Handles are the plural layer — cloneable,
 //! generation-bound, and owning nothing the service does not already own.
+//!
+//! Seeds are the other plural layer, and they are **lazy**. The host itself leases nothing; it
+//! holds only a default directory for requests that name none. A shell's own `initial_dir`
+//! discovers its seed, so one mux can host shells over several seeds at once, each with its own
+//! exclusive lease, durable log and policy history. A seed already leased elsewhere therefore
+//! fails the *spawn* that wants it, not the construction of this host, and [`ShellIo::seeds`]
+//! answers empty until the first shell opens one.
 //!
 //! # Every capability, and the route to it
 //!
 //! | Multiplexer capability | Public application route |
 //! |---|---|
-//! | Construction, seed/lease ownership | [`RmuxFrontend::open`](crate::RmuxFrontend::open) plus [`ShellIo::executor_info`]; no raw spawner escape |
+//! | Construction, seed/lease ownership | [`RmuxFrontend::open`](crate::RmuxFrontend::open) plus [`ShellIo::seeds`]; no raw spawner escape |
 //! | Default directory, policy history | [`default_dir`](ShellIo::default_dir), [`history`](ShellIo::history) |
-//! | Jobs, one job, current selection | [`snapshot`](ShellIo::snapshot), [`jobs`](ShellIo::jobs), [`job`](ShellIo::job), [`current_job`](ShellIo::current_job), [`shell`](ShellIo::shell) |
-//! | Spawn and initial-command lifetime | [`spawn`](ShellIo::spawn), [`ShellHandle::initial_command`], [`keep`](ShellIo::keep) |
-//! | Submit a line and finish callback | [`start_in`](ShellIo::start_in), [`CommandHandle::wait`](marsh_core::shellmux::CommandHandle::wait), [`on_finish`](ShellIo::on_finish) |
+//! | Shells, one shell, current selection | [`snapshot`](ShellIo::snapshot), [`jobs`](ShellIo::jobs), [`job`](ShellIo::job), [`current_job`](ShellIo::current_job), [`shell`](ShellIo::shell) |
+//! | Create a shell | [`open_shell`](ShellIo::open_shell), [`keep`](ShellIo::keep) |
+//! | Run a line and get its verdict | [`ShellHandle::run_command`], [`on_finish`](ShellIo::on_finish) |
 //! | Selection, graceful/forced stop | [`switch`](ShellIo::switch), [`stop`](ShellIo::stop), [`ShellHandle::wait_closed`] |
 //! | Raw input and global resize | [`write_input`](ShellIo::write_input), [`resize`](ShellIo::resize), [`resize_all`](ShellIo::resize_all) |
 //! | Frontend output, lifecycle and errors | [`observe`](ShellIo::observe), [`output`](ShellIo::output), typed completion and closure watches |
@@ -46,7 +52,6 @@
 //! | `exit_code == Some(0)` | the process exited zero | nothing reached the seed |
 //! | [`Outcome::Published`](marsh_core::Outcome::Published) | the line's staged changes are in the seed | nothing about the exit code |
 //! | [`Outcome::Denied`](marsh_core::Outcome::Denied) | the policy refused a capability | nothing about the exit code |
-//! | [`Outcome::Stale`](marsh_core::Outcome::Stale) | another principal won a path first | that a retry will fail |
 //! | [`Outcome::Discarded`](marsh_core::Outcome::Discarded) | the work was thrown away unchecked | that it never ran or spawned |
 //! | pipe EOF | the program's write ends are gone | the command finished |
 //! | `Finished` | the gate decided | the job closed |
@@ -99,7 +104,6 @@ pub mod execution;
 /// Crate-internal: it is this server's own wiring between the core's frontend queue and its
 /// handlers, not something an application drives. Applications observe through
 /// [`ShellIo::observe`].
-#[cfg(any(unix, windows))]
 pub(crate) mod observation;
 pub mod protocol;
 /// Which runtime a mutation's work ends up on when the caller is not this daemon.
@@ -112,8 +116,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use marsh_core::shellmux::{
-    CommandHandle, CommandOptions, ExecutorInfo, JobEnd, JobView, MuxError, OutputChannel,
-    ShellId, Spawned, SpawnOptions, TerminalGeometry, WaitError,
+    CommandHandle, CommandOptions, JobEnd, JobView, MuxError, OutputChannel, RunError, Shell,
+    ShellId, SnapshotUid, SpawnOptions, TerminalGeometry, WaitError,
 };
 
 pub use events::{IoEnvelope, IoEvent, IoEventStream, IoPhase, IoSnapshot, Observation};
@@ -151,6 +155,13 @@ pub enum IoError {
     /// A wait ended without a verdict.
     #[error(transparent)]
     Wait(#[from] WaitError),
+    /// A line ran through this host and did not end in an approved publication.
+    ///
+    /// The whole typed answer, not a message: a refused admission, a policy denial carrying the
+    /// completion it refused, an unpublished conclusion carrying its original discriminant, and a
+    /// lost answer are four different facts and a caller acts differently on each.
+    #[error(transparent)]
+    Run(#[from] RunError),
     /// The service has closed and admits no work.
     #[error("the rmux I/O service is closed")]
     Closed,
@@ -219,22 +230,22 @@ impl From<std::io::Error> for IoError {
     }
 }
 
-/// A handle on one generation of one named job.
+/// A handle on one generation of one named shell.
 ///
 /// Opaque and generation-bound. A name is resolved exactly once, in [`ShellIo::shell`]; every
-/// action afterwards validates the retained instance inside the core's own admission, atomically
-/// with the action it authorises. A handle whose job has closed can never reach a job that later
+/// action afterwards acts through the retained core object, which owns its own live state and
+/// resolves no name at all. A handle whose shell has closed can never reach the shell that later
 /// took its name.
 #[derive(Clone, Debug)]
 pub struct ShellHandle {
     /// The host this handle came from, so one passed to another host is refused.
     origin: Arc<IoService>,
-    /// The core's generation-bound handle.
-    job: Spawned,
+    /// The core's generation-bound shell.
+    job: Shell,
 }
 
 impl ShellHandle {
-    /// The job's identity, which is also its capability principal.
+    /// The shell's identity, which is also its capability principal.
     #[must_use]
     pub fn id(&self) -> &ShellId {
         self.job.id()
@@ -246,29 +257,97 @@ impl ShellHandle {
         self.job.sandbox()
     }
 
-    /// Which output streams this job can produce. Fixed when it was admitted.
+    /// Which output streams this shell can produce. Fixed when it was admitted.
     ///
-    /// A terminal job answers `[Terminal]` and nothing else, and that is a statement about the
+    /// A terminal shell answers `[Terminal]` and nothing else, and that is a statement about the
     /// *descriptors*, not about this facade's plumbing: the program's standard output and
     /// standard error are the same pseudoterminal, so they were never two streams and nothing
     /// downstream can separate them again. The terminal's own replies are mixed in with them.
-    /// A pipe job answers `[Stdout, Stderr]`, which are genuinely independent — byte-exact,
+    /// A pipe shell answers `[Stdout, Stderr]`, which are genuinely independent — byte-exact,
     /// separately ordered, and with no relative order promised between the two.
     #[must_use]
     pub fn output_channels(&self) -> &'static [OutputChannel] {
         self.job.output_channels()
     }
 
-    /// The command this job was opened for, if it was opened for one.
+    /// Runs one line in this shell and answers with what the gate made of it.
     ///
-    /// Available the instant the spawn returns; it never answers `None` merely because a scheduled
-    /// launch has not run yet.
-    #[must_use]
-    pub fn initial_command(&self) -> Option<CommandHandle> {
-        self.job.initial_command()
+    /// Resolving is *completion*, never acceptance. `Ok` means and only means
+    /// [`Outcome::Published`](marsh_core::Outcome::Published): a line whose process exited
+    /// nonzero but whose effects were published is `Ok`, and a line that exited zero and was
+    /// refused is [`IoError::Run`] carrying [`RunError::Policy`].
+    ///
+    /// The command runs on this host's own runtime whoever calls, and belongs to it. Dropping
+    /// this future abandons the *answer*, never the work.
+    ///
+    /// A caller that has to act while the line runs — feed standard input, end that input,
+    /// signal it — supplies
+    /// [`CommandOptions::on_accept`](marsh_core::shellmux::CommandOptions::on_accept) and gets the
+    /// receipt at admission instead of waiting here.
+    ///
+    /// # Errors
+    ///
+    /// Fails with [`IoError::WrongHost`] for a foreign handle, [`IoError::Closed`] after
+    /// teardown, and [`IoError::Run`] with whatever the core made of the line.
+    ///
+    /// # Examples
+    ///
+    /// One persistent shell running several lines, each gated on its own. Needs a live host, a
+    /// directory inside a btrfs seed and real programs, so it is compiled rather than executed.
+    ///
+    /// ```no_run
+    /// use marsh_core::shellmux::{CommandOptions, JobIo, ShellId, SpawnOptions};
+    /// use rmux_server::io::{IoError, IoResult, ShellIo};
+    ///
+    /// # async fn build(io: &ShellIo) -> IoResult<()> {
+    /// let shell = io
+    ///     .open_shell(
+    ///         std::path::Path::new(""),
+    ///         Some(ShellId::from("builder")),
+    ///         SpawnOptions {
+    ///             io: JobIo::Terminal { geometry: None },
+    ///             ..SpawnOptions::default()
+    ///         },
+    ///     )
+    ///     .await?;
+    ///
+    /// // One shell, one principal, three lines. The shell outlives all of them, which is how an
+    /// // application accumulates approved state instead of inventing a principal per line.
+    /// for line in ["./configure --prefix=/usr", "make -j8", "make install"] {
+    ///     match shell.run_command(line, CommandOptions::default()).await {
+    ///         // The only success: the line's staged changes are in the seed. A zero exit code
+    ///         // never gets here on its own.
+    ///         Ok(_published) => {}
+    ///         // Ran, and changed nothing. Continuing would build on state that does not exist.
+    ///         Err(IoError::Run(_)) => break,
+    ///         Err(other) => return Err(other),
+    ///     }
+    /// }
+    ///
+    /// io.stop(&shell, false).await
+    /// # }
+    /// ```
+    pub async fn run_command(
+        &self,
+        cmd: &str,
+        options: CommandOptions,
+    ) -> IoResult<Arc<marsh_core::shellmux::CommandCompletion>> {
+        let io = ShellIo {
+            service: Arc::clone(&self.origin),
+            leased: false,
+        };
+        let _mux = io.service.admit()?;
+        let work = io.begin_operation();
+        let shell = self.job.clone();
+        let cmd = cmd.to_owned();
+        io.dispatch(async move {
+            let _work = work;
+            Ok(shell.run_command(&cmd, options).await?)
+        })
+        .await
     }
 
-    /// Waits for this job to close: every stream ended, snapshot reclaimed.
+    /// Waits for this shell to close: every stream ended, snapshot reclaimed.
     ///
     /// A later boundary than any command finishing.
     ///
@@ -280,13 +359,12 @@ impl ShellHandle {
         self.job.wait_closed().await
     }
 
-    /// The core handle, for this crate's own handlers.
+    /// The core shell, for this crate's own handlers.
     ///
-    /// Read-only server probes borrow this: the terminal's name, its foreground process group.
-    /// It is reached from `pane_terminals`, which still allocates its own pseudoterminal and so
-    /// has nothing to probe yet.
-    #[allow(dead_code, reason = "consumed when PaneTerminal is backed by a ShellHandle")]
-    pub(crate) const fn spawned(&self) -> &Spawned {
+    /// Read-only server probes borrow this: the terminal's name, its foreground process group,
+    /// and whether the generation has already closed. It is never an I/O route: input, resizing
+    /// and stopping all go back through the facade so a single host owns the ordering.
+    pub(crate) const fn shell(&self) -> &Shell {
         &self.job
     }
 }
@@ -315,6 +393,12 @@ pub(crate) struct IoService {
     activity: Activity,
     /// This host's socket, so every SDK connection is pinned to it rather than discovered.
     socket: PathBuf,
+    /// The absolute directory a request that names none starts its shell in.
+    ///
+    /// Captured at construction and never resolved against a seed: it is a plain host path, and
+    /// which seed it lies in — if any — is decided by the spawn that uses it. Answered after
+    /// shutdown too, because where the daemon was started is still a legitimate question.
+    default_dir: PathBuf,
     /// Retained bytes and registered readers, per job stream.
     streams: streams::Streams,
     /// Which rmux surface presents each job generation.
@@ -330,6 +414,17 @@ pub(crate) struct IoService {
     /// by one stable pane id — because an index, a name or an output generation on its own can
     /// each name a different thing after a move, a rename or a respawn.
     selection: std::sync::Mutex<Option<(marsh_core::shellmux::SnapshotUid, rmux_core::PaneId)>>,
+    /// The shell this front-end is looking at, with the generation that was selected.
+    ///
+    /// Selection is presentation, so it lives here and not in the engine: the collection indexes
+    /// shells by principal and has no opinion about what anyone is watching. The generation is
+    /// stored beside the name because a name comes back — a stopped shell's principal can be
+    /// reopened — and a stale selection must not silently follow the replacement.
+    ///
+    /// Deliberately not [`Self::selection`], which is the bidirectional echo-suppression claim
+    /// rather than an authoritative choice, and deliberately not a [`ShellHandle`], which would
+    /// hold an `Arc` back on this service and make the pair a cycle.
+    current_shell: std::sync::Mutex<Option<(ShellId, SnapshotUid)>>,
     /// The request handler this facade belongs to, once the daemon has installed it.
     ///
     /// Weak, and behind a lock because it is set after construction: the facade exists before the
@@ -352,7 +447,7 @@ pub(crate) struct IoService {
     /// A server-initiated spawn takes this, installs its route (or a failed-spawn tombstone), and
     /// only then releases it. The observation consumer takes it before treating an unmapped
     /// `Opened` as an externally created job. Without it, an `Opened` that arrives before its own
-    /// `spawn` call has returned would be adopted as a second, duplicate pane.
+    /// `open_shell` call has returned would be adopted as a second, duplicate pane.
     ///
     /// Safe to hold briefly: callbacks only queue, so nothing under this lock can wait on one.
     admission: tokio::sync::Mutex<()>,
@@ -372,12 +467,15 @@ impl std::fmt::Debug for IoService {
 }
 
 /// Read-only state that outlives the mux.
+///
+/// Only paths and events: no executor, no validator, no session handle. That is what makes a
+/// retained facade clone answer after shutdown without holding a single seed lease open.
 #[derive(Debug)]
 struct Frozen {
-    /// The executor metadata as of the last time it was readable.
-    executor: ExecutorInfo,
-    /// The policy history as of teardown.
-    history: Vec<marsh_core::policy::Event>,
+    /// Every seed the mux had opened, as of teardown.
+    seeds: Vec<marsh_core::shellmux::SeedInfo>,
+    /// Each of those seeds' policy history, as of teardown.
+    history: std::collections::BTreeMap<PathBuf, Vec<marsh_core::policy::Event>>,
 }
 
 /// What keeps this daemon from deciding it is idle.
@@ -511,7 +609,7 @@ impl IoService {
 }
 
 impl ShellIo {
-    /// Opens `seed`'s engine and builds the one service every handle of this daemon shares.
+    /// Builds the one service every handle of this daemon shares.
     ///
     /// This is the *only* place a mux is constructed in this crate, and it is why nothing has to
     /// check afterwards that a frontend belongs to a mux, that a queue was not already taken, or
@@ -519,26 +617,30 @@ impl ShellIo {
     ///
     /// In order, because no step may be reordered:
     ///
-    /// 1. open the seed's exclusive lease and recover its write-ahead log;
+    /// 1. capture the default starting directory, absolute and unresolved;
     /// 2. build the frontend queue, because the mux reads its geometry during construction;
     /// 3. freeze one profile, so every shell in the process holds the identical builtin set;
-    /// 4. build exactly one mux over that seed and that profile.
+    /// 4. build exactly one mux over that profile and that backend.
+    ///
+    /// No seed is discovered, leased or recovered: each shell's own starting directory selects
+    /// the seed it publishes into, so `initial_dir` here is only the default for requests that
+    /// name none. It is made absolute rather than canonicalized, so a listener may be started in
+    /// a directory that is not a subvolume at all and still serve a shell inside one.
     ///
     /// Returns the **unleased** facade and the queue's unique consumer end together, so the
     /// caller cannot end up with one and not the other.
     ///
     /// `runtime` is the runtime every managed operation and every task this facade creates lands
     /// on, including ones requested from a status thread, a foreign runtime or a detached command
-    /// queue. It must be the runtime this call is entered into: [`ShellMux::new`] captures the
-    /// ambient one for the job pumps.
+    /// queue. It must be the runtime this call is entered into: [`ShellMux::new_with`] captures
+    /// the ambient one for the job pumps.
     ///
     /// # Errors
     ///
-    /// Fails with [`IoError::Mux`] when the seed cannot be discovered, leased or recovered, and
-    /// when a dimension of `geometry` is zero.
+    /// Fails with [`IoError::Transport`] when `initial_dir` cannot be made absolute, and with
+    /// [`IoError::Mux`] when a dimension of `geometry` is zero.
     pub(crate) fn new(
-        seed: &std::path::Path,
-        validator: Arc<std::sync::Mutex<marsh_core::PolicyValidator>>,
+        initial_dir: &std::path::Path,
         environment: brush_core::env::ShellEnvironment,
         geometry: TerminalGeometry,
         filesystem: Arc<dyn marsh_btrfs::Subvolumes>,
@@ -550,8 +652,11 @@ impl ShellIo {
     )> {
         use marsh_core::shellmux::ShellFrontend as _;
 
-        let executor = marsh_core::MarshExecutor::open_with(seed, filesystem)
-            .map_err(|error| IoError::from(MuxError::from(error)))?;
+        let default_dir = std::path::absolute(if initial_dir.as_os_str().is_empty() {
+            std::path::Path::new(".")
+        } else {
+            initial_dir
+        })?;
 
         let mut frontend = crate::shell_frontend::FrontendQueue::new(geometry.rows, geometry.cols);
         let events = frontend
@@ -573,16 +678,15 @@ impl ShellIo {
             builtins,
         };
 
-        let mux = marsh_core::shellmux::ShellMux::new(
-            executor,
-            validator,
+        let mux = marsh_core::shellmux::ShellMux::new_with(
             profile,
             Arc::new(std::sync::Mutex::new(frontend)),
+            filesystem,
         )?;
 
         let frozen = Frozen {
-            executor: mux.executor_info(),
-            history: Vec::new(),
+            seeds: Vec::new(),
+            history: std::collections::BTreeMap::new(),
         };
         let io = Self {
             service: Arc::new(IoService {
@@ -593,9 +697,11 @@ impl ShellIo {
                 runtime,
                 activity: Activity::default(),
                 socket,
+                default_dir,
                 streams: streams::Streams::default(),
                 routes: std::sync::Mutex::new(std::collections::HashMap::new()),
                 selection: std::sync::Mutex::new(None),
+                current_shell: std::sync::Mutex::new(None),
                 handler: std::sync::Mutex::new(None),
                 admission: tokio::sync::Mutex::new(()),
                 pane_creation: Arc::new(tokio::sync::Mutex::new(())),
@@ -641,7 +747,10 @@ impl ShellIo {
     pub(crate) fn has_activity(&self) -> bool {
         let activity = &self.service.activity;
         activity.leases.load(std::sync::atomic::Ordering::Acquire) > 0
-            || activity.operations.load(std::sync::atomic::Ordering::Acquire) > 0
+            || activity
+                .operations
+                .load(std::sync::atomic::Ordering::Acquire)
+                > 0
             || !activity
                 .instances
                 .lock()
@@ -720,7 +829,7 @@ impl ShellIo {
     }
 
     /// Wraps a core handle as a host-bound one.
-    pub(crate) fn wrap(&self, job: Spawned) -> ShellHandle {
+    pub(crate) fn wrap(&self, job: Shell) -> ShellHandle {
         ShellHandle {
             origin: Arc::clone(&self.service),
             job,
@@ -731,13 +840,13 @@ impl ShellIo {
     ///
     /// Distinct from [`IoService::admit`]: this permits a service that is still *closing*, for
     /// operations that only observe. What it refuses is a service with no core at all, where the
-    /// honest answer is [`IoError::Closed`] rather than a handle onto nothing.
+    /// honest answer is [`IoError::Closed`] rather than a handle onto noShell
     pub(crate) fn ensure_open(&self) -> IoResult<()> {
         self.service.mux().map(drop)
     }
 
     /// Checks a handle came from this host.
-    pub(crate) fn owned<'a>(&self, job: &'a ShellHandle) -> IoResult<&'a Spawned> {
+    pub(crate) fn owned<'a>(&self, job: &'a ShellHandle) -> IoResult<&'a Shell> {
         if Arc::ptr_eq(&job.origin, &self.service) {
             Ok(&job.job)
         } else {
@@ -745,26 +854,27 @@ impl ShellIo {
         }
     }
 
-    /// Metadata about the executor this host was built over.
+    /// Every seed this host's shells have opened, in canonical-path order.
     ///
-    /// Answers after teardown too, from the frozen copy: where the seed was is still a legitimate
-    /// question once the lease is gone.
+    /// Empty before the first shell: a host leases nothing until a shell names a directory.
+    /// Answers after teardown too, from the frozen copy — where the seeds were is still a
+    /// legitimate question once their leases are gone.
+    ///
+    /// The live path only reads. Seed membership grows whenever any shell discovers a new one,
+    /// so a reader that also wrote its answer into the frozen copy could be pre-empted between
+    /// the two and land a stale list on top of the one [`IoService::release_core`] published —
+    /// permanently hiding a seed whose history the same facade still answers. `release_core` is
+    /// the sole writer, capturing the final membership once, after teardown has settled.
     #[must_use]
-    pub fn executor_info(&self) -> ExecutorInfo {
+    pub fn seeds(&self) -> Vec<marsh_core::shellmux::SeedInfo> {
         if let Some(mux) = self.service.mux_opt() {
-            let info = mux.executor_info();
-            self.service
-                .frozen
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .executor = info.clone();
-            return info;
+            return mux.seeds();
         }
         self.service
             .frozen
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .executor
+            .seeds
             .clone()
     }
 
@@ -778,32 +888,36 @@ impl ShellIo {
             .is_some_and(|mux| mux.has_builtin(name))
     }
 
-    /// The seed-relative directory a job starts in when none is named.
+    /// The absolute directory a request that names none starts its shell in.
+    ///
+    /// A plain host path, not a seed-relative label and not a seed: which seed it lies in — if
+    /// any — is decided by the spawn that uses it. Answered after shutdown too.
     #[must_use]
-    pub fn default_dir(&self) -> String {
-        self.service.mux_opt().map_or_else(String::new, |mux| {
-            let cwd = std::env::current_dir().unwrap_or_default();
-            mux.default_dir(&cwd).as_str().to_string()
-        })
+    pub fn default_dir(&self) -> &std::path::Path {
+        &self.service.default_dir
     }
 
-    /// The committed capability history, in grant order.
+    /// The committed capability history of `seed`, in grant order.
     ///
-    /// After teardown this is the copy captured before the mux was released.
+    /// `seed` is a canonical key, as [`Sandbox::seed`](marsh_core::shellmux::Sandbox) and
+    /// [`Self::seeds`] carry it. `None` says this host has not opened that seed, which is a
+    /// different answer from `Some(vec![])` — an opened seed that has granted nothing. After
+    /// teardown this is the copy captured before the mux was released.
     #[must_use]
-    pub fn history(&self) -> Vec<marsh_core::policy::Event> {
+    pub fn history(&self, seed: &std::path::Path) -> Option<Vec<marsh_core::policy::Event>> {
         if let Some(mux) = self.service.mux_opt() {
-            return mux.history();
+            return mux.history(seed);
         }
         self.service
             .frozen
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .history
-            .clone()
+            .get(seed)
+            .cloned()
     }
 
-    /// One consistent look at the service and the core behind it.
+    /// One consistent look at the service, the core behind it, and this front-end's selection.
     #[must_use]
     pub fn snapshot(&self) -> IoSnapshot {
         let registration = self.service.bus.registration();
@@ -811,21 +925,25 @@ impl ShellIo {
             || marsh_core::shellmux::MuxSnapshot {
                 jobs: Vec::new(),
                 commands: Vec::new(),
-                current: None,
                 default_geometry: TerminalGeometry { rows: 24, cols: 80 },
             },
             |mux| mux.snapshot(),
         );
         let next_event_sequence = *registration;
+        // Resolved against the very shells this snapshot returns, under the same registration
+        // boundary: a selection validated against a different read could name a shell this
+        // snapshot does not contain.
+        let current = self.selected_in(&state.jobs);
         drop(registration);
         IoSnapshot {
             phase: self.service.phase(),
             state,
+            current,
             next_event_sequence,
         }
     }
 
-    /// Every visible job, in creation order. Empty once the host has closed.
+    /// Every visible shell, in creation order. Empty once the host has closed.
     #[must_use]
     pub fn jobs(&self) -> Vec<JobView> {
         self.service
@@ -834,23 +952,64 @@ impl ShellIo {
             .unwrap_or_default()
     }
 
-    /// One job by name.
+    /// One shell's view by name.
     #[must_use]
     pub fn job(&self, id: &ShellId) -> Option<JobView> {
         self.service.mux_opt().and_then(|mux| mux.job(id))
     }
 
-    /// The selected job, if one is selected and still visible.
+    /// The selected shell, if one is selected and still visible as the generation that was
+    /// selected.
+    ///
+    /// Both halves are checked. A selected shell that was stopped and whose principal was then
+    /// reopened answers `None` rather than silently handing the replacement the selection its
+    /// predecessor earned.
     #[must_use]
     pub fn current_job(&self) -> Option<JobView> {
-        self.service.mux_opt().and_then(|mux| mux.current_job())
+        let (id, uid) = self.selected()?;
+        let view = self.job(&id)?;
+        (view.sandbox.uid == uid).then_some(view)
+    }
+
+    /// This front-end's stored selection, name and generation together.
+    fn selected(&self) -> Option<(ShellId, SnapshotUid)> {
+        self.service
+            .current_shell
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// The selected shell's name, as matched against exactly the `views` a caller is reporting.
+    fn selected_in(&self, views: &[JobView]) -> Option<ShellId> {
+        let (id, uid) = self.selected()?;
+        views
+            .iter()
+            .find(|view| view.id == id && view.sandbox.uid == uid)
+            .map(|view| view.id.clone())
+    }
+
+    /// Forgets the selection when it names `uid`.
+    ///
+    /// Generation-keyed on purpose: a late close of an older instance must not clear a selection
+    /// that has since moved to a newer one.
+    fn clear_selection_of(&self, uid: &SnapshotUid) {
+        let mut current = self
+            .service
+            .current_shell
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if current.as_ref().is_some_and(|(_, held)| held == uid) {
+            *current = None;
+        }
+        drop(current);
     }
 
     /// Resolves a name to a handle, once.
     ///
-    /// The *only* place a name becomes a handle. Every later action validates the handle rather
-    /// than re-resolving the name, which is what stops an action from reaching a different job
-    /// that took the name in between.
+    /// The *only* place a name becomes a handle. Every later action acts through that object
+    /// rather than re-resolving the name, which is what stops an action from reaching a different
+    /// shell that took the name in between.
     ///
     /// # Errors
     ///
@@ -858,51 +1017,61 @@ impl ShellIo {
     /// visible answers to `id`.
     pub fn shell(&self, id: &ShellId) -> IoResult<ShellHandle> {
         let mux = self.service.mux()?;
-        mux.handle(id)
+        mux.get_shell(id.principal())
             .map(|job| self.wrap(job))
             .ok_or_else(|| IoError::from(MuxError::NoSuchJob(id.clone())))
     }
 
-    /// Opens a job.
+    /// Opens a shell.
     ///
-    /// `dir` is seed-relative, and empty means the seed root. `id` is the job's name *and* its
-    /// capability principal; `None` draws the next automatic one. `cmd` opens the job *for* one
-    /// line, whose receipt is allocated before this call returns and is reachable through
-    /// [`ShellHandle::initial_command`]; such a job closes when that line ends unless
-    /// [`keep`](Self::keep) cancels the closure. `SpawnOptions::default()` is a terminal job at
-    /// this host's default geometry with no environment replacement.
+    /// `initial_dir` is a **host filesystem path** the shell starts in, and the seed it publishes
+    /// into is discovered from it: an empty path selects [`Self::default_dir`], a relative one is
+    /// joined onto that default, and an absolute one keeps its host meaning. One host therefore
+    /// serves shells over as many seeds as its callers name. `id` is the shell's name *and* its
+    /// capability principal; `None` draws the next automatic one. `SpawnOptions::default()` is a
+    /// terminal shell at this host's default geometry, with no environment replacement, that
+    /// persists across every command run in it.
     ///
-    /// Returning is *acceptance*: the job has a row, a principal and an identity, and its
-    /// resources may still be opening. Readiness is [`IoEvent::Opened`]; the end of its life is
+    /// This creates and nothing else. [`ShellHandle::run_command`] is how a line runs, and it is
+    /// a separate call because a caller frequently has to arm output receivers or install a route
+    /// between the two.
+    ///
+    /// Returning is *acceptance*: the shell has a principal and an identity, and its resources
+    /// may still be opening. Readiness is [`IoEvent::Opened`]; the end of its life is
     /// [`ShellHandle::wait_closed`]. Dropping this future after admission does not un-admit the
-    /// job — an admitted job belongs to the core, and it stays observable whether or not the
+    /// shell — an admitted shell belongs to the core, and it stays observable whether or not the
     /// caller waited for it.
     ///
-    /// Admission, and every task the new job owns, happen on this host's own runtime whoever
-    /// calls — a job admitted from a status thread or a foreign runtime does not die with it.
+    /// Admission, and every task the new shell owns, happen on this host's own runtime whoever
+    /// calls — a shell admitted from a status thread or a foreign runtime does not die with it.
     ///
     /// # Errors
     ///
     /// Fails with [`IoError::Closed`] once teardown has begun, and with whatever the core reported
-    /// about the name, the directory, the geometry or the shell.
-    pub async fn spawn(
+    /// about the name, the directory, the seed, the geometry or the shell.
+    pub async fn open_shell(
         &self,
-        dir: &str,
+        initial_dir: &std::path::Path,
         id: Option<ShellId>,
-        cmd: Option<&str>,
         options: SpawnOptions,
     ) -> IoResult<ShellHandle> {
         let mux = self.service.admit()?;
         let work = self.begin_operation();
-        let dir = dir.to_string();
-        let cmd = cmd.map(ToString::to_string);
+        // Resolved against this host's default before dispatch, because the default is the
+        // *host's* and the core knows only the process's own directory.
+        let initial_dir = if initial_dir.as_os_str().is_empty() {
+            self.service.default_dir.clone()
+        } else {
+            self.service.default_dir.join(initial_dir)
+        };
+        let principal = id.map(|id| id.principal().clone());
         // The instance is recorded inside the dispatched work, not after it: a caller that drops
-        // this future has still admitted a job, and the idle check has to see it either way.
+        // this future has still admitted a shell, and the idle check has to see it either way.
         let service = Arc::clone(&self.service);
         let job = self
             .dispatch(async move {
                 let _work = work;
-                let job = mux.spawn(&dir, id, cmd.as_deref(), options).await?;
+                let job = mux.open_shell(&initial_dir, principal, options).await?;
                 service
                     .activity
                     .instances
@@ -915,96 +1084,71 @@ impl ShellIo {
         Ok(self.wrap(job))
     }
 
-    /// Submits one line into an open job.
+    /// Schedules one line into an open shell and waits only for its *admission*.
     ///
-    /// `cmd` is one shell command line for the job's embedded brush interpreter — the unit the
-    /// publication gate works on. It is **not** an rmux control-command block: those are the
-    /// multiplexer's own scripted commands, arrive over the protocol, address sessions, windows
-    /// and panes, and never stage a filesystem change or reach the gate. The two vocabularies
-    /// overlap nowhere, and a caller wanting the second reaches it through the SDK handles or
-    /// [`open_protocol`](Self::open_protocol).
+    /// Server-private, and deliberately the only thing in this crate that still returns a receipt
+    /// instead of a verdict. A pane, a popup and an execution all have to go on doing something
+    /// while their line runs — draw a prompt, feed standard input, end that input so a program
+    /// reading to end of file can finish — and none of them can block on the completion to get
+    /// there. After this returns, the receipt and the existing observation events are the
+    /// authoritative completion; nothing here re-decides policy or runs an interpreter.
     ///
-    /// Returning is *acceptance*: the line has an identity, a receipt and a reservation in the
-    /// job's row, and nothing has run yet. Completion is [`CommandHandle::wait`], which is a
-    /// separate moment and the only one carrying a verdict. Dropping this future after the line
-    /// was admitted does not un-admit it.
-    ///
-    /// One command at a time per job: a second line submitted while one is running is refused
-    /// rather than queued. The task the line runs on belongs to this host's runtime, not the
-    /// caller's.
+    /// The run itself is owned by this host's runtime, not by the caller's future: dropping the
+    /// returned receipt cancels nothing.
     ///
     /// # Errors
     ///
     /// Fails with [`IoError::WrongHost`] for a foreign handle, [`IoError::Closed`] after teardown,
-    /// and with whatever the core reported about the job's state.
-    ///
-    /// # Examples
-    ///
-    /// One persistent shell running several lines, each gated on its own. Needs a live host over
-    /// a leased btrfs seed and real programs to run, so it is compiled rather than executed.
-    ///
-    /// ```no_run
-    /// use marsh_core::shellmux::{CommandOptions, JobIo, ShellId, SpawnOptions};
-    /// use rmux_server::io::{IoResult, ShellIo};
-    ///
-    /// # async fn build(io: &ShellIo) -> IoResult<()> {
-    /// let job = io
-    ///     .spawn(
-    ///         "",
-    ///         Some(ShellId::from("builder")),
-    ///         None,
-    ///         SpawnOptions {
-    ///             io: JobIo::Terminal { geometry: None },
-    ///             environment: None,
-    ///         },
-    ///     )
-    ///     .await?;
-    ///
-    /// // One job, one principal, three lines. The job outlives all of them, which is how an
-    /// // application accumulates approved state instead of inventing a principal per line.
-    /// for line in ["./configure --prefix=/usr", "make -j8", "make install"] {
-    ///     let command = io.start_in(&job, line, CommandOptions::default()).await?;
-    ///     // `start_in` returning is acceptance; this is completion. They are different
-    ///     // moments, and only the second one carries a verdict.
-    ///     let completion = command.wait().await?;
-    ///     // Not the exit code: a line can exit zero and publish nothing, so continuing on
-    ///     // status alone would build on state that never reached the seed.
-    ///     if !completion.is_published() {
-    ///         break;
-    ///     }
-    /// }
-    ///
-    /// io.stop(&job, false).await
-    /// # }
-    /// ```
-    pub async fn start_in(
+    /// and with whatever the core made of the line when it never reached admission at all.
+    pub(crate) async fn start_command(
         &self,
         job: &ShellHandle,
         cmd: &str,
         options: CommandOptions,
     ) -> IoResult<CommandHandle> {
-        let mux = self.service.admit()?;
-        let spawned = self.owned(job)?.clone();
+        self.service.admit()?;
+        let shell = self.owned(job)?.clone();
         let work = self.begin_operation();
-        let cmd = cmd.to_string();
-        self.dispatch(async move {
+        let cmd = cmd.to_owned();
+        let (accepted, admission) = tokio::sync::oneshot::channel();
+        let options = CommandOptions {
+            on_accept: Some(accepted),
+            ..options
+        };
+        let runtime = self.service.runtime.clone();
+        let run = runtime.spawn(async move {
             let _work = work;
-            Ok(mux.start_in(&spawned, &cmd, options).await?)
-        })
-        .await
+            shell.run_command(&cmd, options).await
+        });
+        match admission.await {
+            Ok(command) => Ok(command),
+            // The sender went away without admitting: the real reason is whatever the scheduled
+            // call is about to report, so it is awaited rather than guessed at. A completed run
+            // with no receipt is impossible by construction and is reported as the internal
+            // failure it would be rather than papered over with a fabricated handle.
+            Err(_) => match run.await {
+                Ok(Err(error)) => Err(IoError::Run(error)),
+                Ok(Ok(_)) => Err(IoError::from(MuxError::Task(
+                    "command finished without an admission receipt".to_owned(),
+                ))),
+                Err(join) if join.is_panic() => std::panic::resume_unwind(join.into_panic()),
+                Err(_) => Err(IoError::Closed),
+            },
+        }
     }
 
-    /// Cancels a job's automatic closure, so it outlives the command it was opened for.
+    /// Cancels a shell's automatic closure, so it outlives the command that would have ended it.
     ///
     /// `true` means the closure was still cancellable and has been cancelled. `false` means there
-    /// was none to cancel — the job was opened idle — or that its command already reached the
-    /// finish/close gate and the decision is made. Neither answer is an error, and `false` is
-    /// never a reason to retry.
+    /// was none to cancel — the shell was opened without
+    /// [`SpawnOptions::automatic_close`](marsh_core::shellmux::SpawnOptions::automatic_close) —
+    /// or that its command already reached the finish/close gate and the decision is made.
+    /// Neither answer is an error, and `false` is never a reason to retry.
     ///
-    /// Synchronous and immediate: there is no admitted work to wait for. Bound to one generation
-    /// of one job, so a handle whose job has closed cannot retain whatever later took its name.
-    /// Retaining is for terminal jobs, whose lifetime is a *shell*; a pipe job is one-shot by
-    /// construction and closes after its single command whatever this says.
+    /// Synchronous and immediate: there is no admitted work to wait for. Bound to one generation,
+    /// so a handle whose shell has closed cannot retain whatever later took its name. Retaining
+    /// is for terminal shells; a pipe shell is one-shot by construction and closes after its
+    /// single command whatever this says.
     ///
     /// # Errors
     ///
@@ -1012,41 +1156,34 @@ impl ShellIo {
     ///
     /// # Examples
     ///
-    /// A job opened *for* a command, its receipt taken before anything could run, and its
-    /// automatic closure cancelled so it stays open afterwards. Needs a live host over a leased
-    /// seed and a real program to run, so it is compiled rather than executed.
+    /// A shell opened with an automatic closure, its line scheduled, and that closure cancelled
+    /// so the shell stays open afterwards. Needs a live host, a directory inside a btrfs seed and
+    /// a real program to run, so it is compiled rather than executed.
     ///
     /// ```no_run
-    /// use marsh_core::shellmux::{JobIo, ShellId, SpawnOptions};
+    /// use marsh_core::shellmux::{CommandOptions, JobIo, ShellId, SpawnOptions};
     /// use rmux_server::io::{IoResult, ShellIo};
     ///
     /// # async fn watcher(io: &ShellIo) -> IoResult<()> {
     /// let job = io
-    ///     .spawn(
-    ///         "",
+    ///     .open_shell(
+    ///         std::path::Path::new(""),
     ///         Some(ShellId::from("watcher")),
-    ///         Some("cargo watch -x test"),
     ///         SpawnOptions {
     ///             io: JobIo::Terminal { geometry: None },
-    ///             environment: None,
+    ///             automatic_close: true,
+    ///             ..SpawnOptions::default()
     ///         },
     ///     )
     ///     .await?;
     ///
-    /// // The initial command's receipt exists the instant the spawn returns — before its launch
-    /// // task has run — so there is no window in which a caller holds a job it cannot wait on.
-    /// let initial = job.initial_command();
-    ///
-    /// // Without this, the job closes when that command ends. With it, the job is an ordinary
-    /// // persistent shell and closing it becomes the caller's job.
+    /// // Without this, the shell closes when the line below ends. With it, the shell is an
+    /// // ordinary persistent one and closing it becomes the caller's job.
     /// let retained = io.keep(&job)?;
     ///
-    /// if let Some(initial) = initial {
-    ///     let completion = initial.wait().await?;
-    ///     // A forced stop resolves here too, with `Outcome::Discarded` and no exit code. That
-    ///     // is the verdict, not the absence of one.
-    ///     let _ = (completion.exit_code, completion.is_published());
-    /// }
+    /// // Completion, with the verdict: a forced stop resolves here too, as an error carrying
+    /// // `Outcome::Discarded` and no exit code. That is the verdict, not the absence of one.
+    /// let _ = job.run_command("cargo watch -x test", CommandOptions::default()).await;
     ///
     /// if retained {
     ///     // Graceful: the shell finishes and its staged work is gated normally. `true` would
@@ -1057,27 +1194,31 @@ impl ShellIo {
     /// # }
     /// ```
     pub fn keep(&self, job: &ShellHandle) -> IoResult<bool> {
-        let mux = self.service.mux()?;
-        Ok(mux.keep(self.owned(job)?)?)
+        self.ensure_open()?;
+        Ok(self.owned(job)?.keep()?)
     }
 
-    /// Writes the job table to `out`, exactly as the console builtin renders it.
+    /// Writes the shell table to `out`, exactly as the console builtin renders it.
     ///
-    /// A forwarder rather than a second renderer. `jobctl::print_jobs` takes the multiplexer,
+    /// A forwarder rather than a second renderer. `jobctl::print_jobs` takes the collection,
     /// which this facade deliberately never hands out, so the one place that has it lends it for
     /// the length of the call — and the interactive prompt's `jobs` output stays byte for byte
     /// what `jobs` prints anywhere else instead of drifting into a private column layout.
     ///
+    /// The selection marker is this facade's, because selection is this facade's: the collection
+    /// has none to lend.
+    ///
     /// Writes nothing once the core has been released: there is no table left to print.
     pub(crate) fn print_jobs(&self, out: &mut dyn std::io::Write) {
         if let Some(mux) = self.service.mux_opt() {
-            marsh_core::shellmux::jobctl::print_jobs(&mux, out);
+            let current = self.current_job().map(|view| view.id);
+            marsh_core::shellmux::jobctl::print_jobs(&mux, current.as_ref(), out);
         }
     }
 
-    /// Registers the single legacy completion callback on a job.
+    /// Registers the single legacy completion callback on a shell.
     ///
-    /// **One slot, and it belongs to the job rather than to a command.** Registering a second
+    /// **One slot, and it belongs to the shell rather than to a command.** Registering a second
     /// callback replaces the first, which is what the `bool` reports: `true` means one was
     /// already installed and has been displaced. The callback receives only an `i32` — the
     /// completion's
@@ -1085,104 +1226,107 @@ impl ShellIo {
     /// execution result was obtained" onto `-1` — so through it a denied publication and a clean
     /// exit are indistinguishable. It runs once, on this host's runtime, outside every mux lock.
     ///
-    /// [`CommandHandle::wait`] is what everything else should use. It occupies no slot, any
-    /// number of holders may wait on one command before or after it ends, and each observes the
-    /// identical [`CommandCompletion`](marsh_core::shellmux::CommandCompletion) — with the
-    /// process status and the publication verdict kept apart.
+    /// [`ShellHandle::run_command`] is what everything else should use: it carries the whole
+    /// verdict, with the process status and the publication answer kept apart.
     ///
     /// # Errors
     ///
     /// Fails for a foreign or stale handle, and after teardown.
-    ///
-    /// # Examples
-    ///
-    /// The one slot taken, and two independent waiters on the same command beside it. Needs a
-    /// live host over a leased seed and a real program to run, so it is compiled rather than
-    /// executed.
-    ///
-    /// ```no_run
-    /// use marsh_core::shellmux::CommandOptions;
-    /// use rmux_server::io::{IoResult, ShellHandle, ShellIo};
-    ///
-    /// # async fn observe(io: &ShellIo, job: &ShellHandle) -> IoResult<()> {
-    /// let command = io.start_in(job, "make test", CommandOptions::default()).await?;
-    ///
-    /// // The slot. `displaced` being true means this just took someone else's callback away,
-    /// // which is precisely why a library should prefer the receipt below.
-    /// let displaced = io.on_finish(
-    ///     job,
-    ///     Box::new(|status| eprintln!("job finished with {status}")),
-    /// )?;
-    /// let _ = displaced;
-    ///
-    /// // Two waiters, neither occupying anything. Both resolve to the same completion, and a
-    /// // third attaching after the command had already ended would resolve to it immediately.
-    /// let reporter = command.clone();
-    /// let auditor = command.clone();
-    /// let (reported, audited) = tokio::join!(reporter.wait(), auditor.wait());
-    /// let (reported, audited) = (reported?, audited?);
-    ///
-    /// assert_eq!(reported.id, audited.id);
-    /// // The exit status is the process's; publication is the gate's. The callback above could
-    /// // only ever have carried the first of those two.
-    /// let _ = (reported.exit_code, audited.is_published());
-    /// # Ok(())
-    /// # }
-    /// ```
     pub fn on_finish(
         &self,
         job: &ShellHandle,
         done: marsh_core::shellmux::OnFinish,
     ) -> IoResult<bool> {
-        let mux = self.service.mux()?;
-        Ok(mux.on_finish(self.owned(job)?, done)?)
+        self.ensure_open()?;
+        Ok(self.owned(job)?.on_finish(done)?)
     }
 
-    /// Selects a terminal job.
+    /// Selects a terminal shell as the one this front-end is looking at.
+    ///
+    /// Selection is presentation and lives here: the engine indexes shells by principal and has
+    /// no opinion about what anyone is watching. Nothing is started, and the shell's own state is
+    /// unchanged apart from [`keep`](Self::keep) cancelling an automatic closure — a reader who
+    /// brought a shell up means to look at it, so it is no longer one the series may reclaim.
+    ///
+    /// The stored selection is the `(name, generation)` pair, checked again on every read: a
+    /// shell that was stopped and whose principal was reopened cannot inherit the selection its
+    /// predecessor earned.
     ///
     /// # Errors
     ///
-    /// Fails for a pipe job, a closing job, a foreign or stale handle, and after teardown.
+    /// Fails for a pipe shell, a closing shell, a foreign or stale handle, and after teardown.
     pub async fn switch(&self, job: &ShellHandle) -> IoResult<JobView> {
-        let mux = self.service.mux()?;
-        let spawned = self.owned(job)?.clone();
-        self.dispatch(async move { Ok(mux.switch(&spawned).await?) })
-            .await
+        self.ensure_open()?;
+        let shell = self.owned(job)?.clone();
+        let view = shell.view()?;
+        if !view.io.is_terminal() {
+            return Err(IoError::from(MuxError::NotTerminal(view.id)));
+        }
+        if view.closing {
+            return Err(IoError::from(MuxError::JobClosing(view.id)));
+        }
+        let _ = shell.keep()?;
+        // Outside every state lock, and before the recheck: a shell whose launch is still in
+        // flight is not yet something a display can present.
+        let view = self
+            .dispatch(async move { Ok(shell.wait_ready().await?) })
+            .await?;
+        if view.closing {
+            return Err(IoError::from(MuxError::StaleJob(view.id)));
+        }
+        {
+            let mut current = self
+                .service
+                .current_shell
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *current = Some((view.id.clone(), view.sandbox.uid.clone()));
+            drop(current);
+        }
+        // Published after the state moved, on the same bus a subscription registers against, so
+        // an observer cannot miss both the new state and the event announcing it.
+        self.service.bus.publish(IoEvent::Changed);
+        // Outside the lock: the reverse handler reads this facade back, and holding selection
+        // state across it would deadlock the first handler that asks what is selected.
+        if let Some(handler) = self.handler() {
+            handler.note_shell_state_changed();
+        }
+        Ok(view)
     }
 
-    /// Stops a job, gracefully or by force.
+    /// Stops a shell, gracefully or by force.
     ///
-    /// `force = false` closes the job's shell and lets whatever is running reach its ordinary
+    /// `force = false` closes the shell and lets whatever is running reach its ordinary
     /// boundary, so its staged work is gated as usual. `force = true` retires it: processes are
     /// killed, native workers are cancelled and joined, and the line's staged changes are
-    /// **discarded** — which resolves its receipt `Ok` with
+    /// **discarded** — which resolves its run as an error carrying
     /// [`Outcome::Discarded`](marsh_core::Outcome::Discarded) and no exit code. That is a
     /// verdict, not a lost one, and it is not evidence that nothing ran.
     ///
-    /// The cancel-versus-conclude decision is linearized under the job's own lock. A force
+    /// The cancel-versus-conclude decision is linearized under the shell's own lock. A force
     /// accepted before finalization discards; a force arriving once an approved publication has
     /// begun cannot undo it, and the completion that eventually lands is authoritative. No
     /// rollback of published effects is promised, because none is possible.
     ///
-    /// Returning is acceptance of the stop, not the job's closure: every stream still has to end
-    /// and the snapshot still has to be reclaimed. [`ShellHandle::wait_closed`] is that later
+    /// Returning is acceptance of the stop, not the shell's closure: every stream still has to
+    /// end and the snapshot still has to be reclaimed. [`ShellHandle::wait_closed`] is that later
     /// boundary.
     ///
     /// # Errors
     ///
-    /// Fails when a forced job's processes could not be signalled, for a foreign or stale handle,
-    /// and after teardown.
+    /// Fails when a forced shell's processes could not be signalled, for a foreign or stale
+    /// handle, and after teardown.
     pub async fn stop(&self, job: &ShellHandle, force: bool) -> IoResult<()> {
-        let mux = self.service.mux()?;
-        let spawned = self.owned(job)?.clone();
-        self.dispatch(async move { Ok(mux.stop(&spawned, force).await?) })
+        self.ensure_open()?;
+        let shell = self.owned(job)?.clone();
+        self.dispatch(async move { Ok(shell.stop(force).await?) })
             .await
     }
 
     /// Signals the processes the running command started.
     ///
     /// Only that command's own process groups; this is not an arbitrary-pid interface. Best
-    /// effort, and it does not retire the job: a command that catches the signal and finishes
+    /// effort, and it does not retire the shell: a command that catches the signal and finishes
     /// normally is gated normally.
     ///
     /// # Errors
@@ -1190,19 +1334,19 @@ impl ShellIo {
     /// Fails for a foreign or stale handle, after teardown, and when the signal could not be
     /// delivered for a reason other than the process already being gone.
     pub fn signal(&self, job: &ShellHandle, signal: marsh_core::Signal) -> IoResult<()> {
-        let mux = self.service.mux()?;
-        Ok(mux.signal(self.owned(job)?, signal)?)
+        self.ensure_open()?;
+        Ok(self.owned(job)?.signal(signal)?)
     }
 
-    /// Resizes one terminal job.
+    /// Resizes one terminal shell.
     ///
     /// # Errors
     ///
-    /// Fails for a zero dimension, a pipe job, a foreign or stale handle, and after teardown.
+    /// Fails for a zero dimension, a pipe shell, a foreign or stale handle, and after teardown.
     pub async fn resize(&self, job: &ShellHandle, size: TerminalGeometry) -> IoResult<()> {
-        let mux = self.service.mux()?;
-        let spawned = self.owned(job)?.clone();
-        self.dispatch(async move { Ok(mux.resize(&spawned, size).await?) })
+        self.ensure_open()?;
+        let shell = self.owned(job)?.clone();
+        self.dispatch(async move { Ok(shell.resize(size).await?) })
             .await
     }
 
@@ -1231,8 +1375,9 @@ impl ShellIo {
     ///
     /// # Examples
     ///
-    /// Keystrokes into a terminal job, then a resize the program actually observes. Needs a live
-    /// host over a leased seed and a real pseudoterminal, so it is compiled rather than executed.
+    /// Keystrokes into a terminal shell, then a resize the program actually observes. Needs a
+    /// live host, a seed directory and a real pseudoterminal, so it is compiled rather than
+    /// executed.
     ///
     /// ```no_run
     /// use marsh_core::shellmux::{JobIo, ShellId, SpawnOptions, TerminalGeometry};
@@ -1240,15 +1385,14 @@ impl ShellIo {
     ///
     /// # async fn drive(io: &ShellIo) -> IoResult<()> {
     /// let job = io
-    ///     .spawn(
-    ///         "",
+    ///     .open_shell(
+    ///         std::path::Path::new(""),
     ///         Some(ShellId::from("pane")),
-    ///         None,
     ///         SpawnOptions {
     ///             io: JobIo::Terminal {
     ///                 geometry: Some(TerminalGeometry { rows: 24, cols: 80 }),
     ///             },
-    ///             environment: None,
+    ///             ..SpawnOptions::default()
     ///         },
     ///     )
     ///     .await?;
@@ -1260,49 +1404,49 @@ impl ShellIo {
     /// // which is a different mechanism from `ShellIo::signal` addressing the running command's
     /// // own process groups.
     /// io.write_input(&job, b"\x03").await?;
-    /// // There is no end-of-file to send here at all: `close_input` refuses a terminal job, and
-    /// // Ctrl-D would be a keystroke rather than a writer going away.
+    /// // There is no end-of-file to send here at all: `close_input` refuses a terminal shell,
+    /// // and Ctrl-D would be a keystroke rather than a writer going away.
     ///
     /// // A real window-size change plus the SIGWINCH it implies, so a full-screen program
     /// // repaints. Zero in either dimension is refused rather than clamped.
     /// io.resize(&job, TerminalGeometry { rows: 50, cols: 132 }).await?;
-    /// // The same for every live terminal, and the default future ones open at. Pipe jobs are
+    /// // The same for every live terminal, and the default future ones open at. Pipe shells are
     /// // skipped rather than failed: they have no geometry to change.
     /// io.resize_all(TerminalGeometry { rows: 50, cols: 132 }).await
     /// # }
     /// ```
     pub async fn write_input(&self, job: &ShellHandle, bytes: &[u8]) -> IoResult<()> {
-        let mux = self.service.mux()?;
-        let spawned = self.owned(job)?;
+        self.ensure_open()?;
+        let shell = self.owned(job)?;
         // The one mutation with a borrowed payload, and the one this daemon performs per
         // keystroke: a caller already on this runtime writes the caller's own slice, and only a
         // foreign one pays for the copy a handed-over future needs to own.
         if self.on_bound_runtime() {
-            return Ok(mux.write_input(spawned, bytes).await?);
+            return Ok(shell.write_input(bytes).await?);
         }
-        let spawned = spawned.clone();
+        let shell = shell.clone();
         let bytes = bytes.to_vec();
-        self.dispatch(async move { Ok(mux.write_input(&spawned, &bytes).await?) })
+        self.dispatch(async move { Ok(shell.write_input(&bytes).await?) })
             .await
     }
 
-    /// Ends a pipe job's standard input.
+    /// Ends a pipe shell's standard input.
     ///
-    /// A real end-of-file, ordered after every accepted write, and idempotent. Not available for a
-    /// terminal job: a pseudoterminal has no half-close, and sending Ctrl-D instead would be a
-    /// keystroke, not an end of file.
+    /// A real end-of-file, ordered after every accepted write, and idempotent. Not available for
+    /// a terminal shell: a pseudoterminal has no half-close, and sending Ctrl-D instead would be
+    /// a keystroke, not an end of file.
     ///
     /// # Errors
     ///
-    /// Fails for a terminal job, a foreign or stale handle, and after teardown.
+    /// Fails for a terminal shell, a foreign or stale handle, and after teardown.
     pub async fn close_input(&self, job: &ShellHandle) -> IoResult<()> {
-        let mux = self.service.mux()?;
-        let spawned = self.owned(job)?.clone();
-        self.dispatch(async move { Ok(mux.close_input(&spawned).await?) })
+        self.ensure_open()?;
+        let shell = self.owned(job)?.clone();
+        self.dispatch(async move { Ok(shell.close_input().await?) })
             .await
     }
 
-    /// Leases a terminal job's slave side while no command is running in it.
+    /// Leases a terminal shell's slave side while no command is running in it.
     ///
     /// How an interactive prompt reads *this pane's* keyboard. Revoked the instant a command is
     /// admitted.
@@ -1312,31 +1456,31 @@ impl ShellIo {
     ///
     /// # Errors
     ///
-    /// Fails for a pipe job, a busy job, an outstanding lease, a foreign or stale handle, and
+    /// Fails for a pipe shell, a busy shell, an outstanding lease, a foreign or stale handle, and
     /// after teardown.
     pub async fn idle_terminal(
         &self,
         job: &ShellHandle,
     ) -> IoResult<marsh_core::shellmux::IdleTerminal> {
-        let mux = self.service.admit()?;
-        let spawned = self.owned(job)?.clone();
-        self.dispatch(async move { Ok(mux.idle_terminal(&spawned)?) })
+        self.service.admit()?;
+        let shell = self.owned(job)?.clone();
+        self.dispatch(async move { Ok(shell.idle_terminal()?) })
             .await
     }
 
-    /// Whether `line` is a complete shell command for this job's shell.
+    /// Whether `line` is a complete shell command for this shell's interpreter.
     ///
     /// `false` only for an incomplete tokenization or an end-of-input parse failure. Any other
     /// syntax error answers `true`, so the line runs and the shell produces its own diagnostic.
     ///
     /// # Errors
     ///
-    /// Fails for a busy job, a pipe job, a foreign or stale handle, and after teardown.
+    /// Fails for a busy shell, a pipe shell, a foreign or stale handle, and after teardown.
     pub async fn input_is_complete(&self, job: &ShellHandle, line: &str) -> IoResult<bool> {
-        let mux = self.service.mux()?;
-        let spawned = self.owned(job)?.clone();
+        self.ensure_open()?;
+        let shell = self.owned(job)?.clone();
         let line = line.to_string();
-        self.dispatch(async move { Ok(mux.input_is_complete(&spawned, &line).await?) })
+        self.dispatch(async move { Ok(shell.input_is_complete(&line).await?) })
             .await
     }
 
@@ -1351,8 +1495,8 @@ impl ShellIo {
     ///
     /// # Examples
     ///
-    /// Reconciling the snapshot with the events that continue from it. Needs a live host over a
-    /// leased seed, so it is compiled rather than executed.
+    /// Reconciling the snapshot with the events that continue from it. Needs a live host, so it
+    /// is compiled rather than executed.
     ///
     /// ```no_run
     /// use marsh_core::shellmux::ShellId;
@@ -1397,16 +1541,17 @@ impl ShellIo {
             || marsh_core::shellmux::MuxSnapshot {
                 jobs: Vec::new(),
                 commands: Vec::new(),
-                current: None,
                 default_geometry: TerminalGeometry { rows: 24, cols: 80 },
             },
             |mux| mux.snapshot(),
         );
+        let current = self.selected_in(&state.jobs);
         drop(registration);
         Observation {
             snapshot: IoSnapshot {
                 phase: self.service.phase(),
                 state,
+                current,
                 next_event_sequence,
             },
             events,
@@ -1424,7 +1569,10 @@ impl ShellIo {
         }
     }
 
-    /// Records that a job's instance has terminated, for the idle check.
+    /// Records that a shell's instance has terminated, for the idle check.
+    ///
+    /// The selection goes with it when it named *this* generation. A late close of an older
+    /// instance leaves a newer selection alone, which is why the check is keyed by uid.
     pub(crate) fn retire_instance(&self, uid: &marsh_core::shellmux::SnapshotUid) {
         self.service
             .activity
@@ -1432,6 +1580,7 @@ impl ShellIo {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(uid);
+        self.clear_selection_of(uid);
         self.service.activity.retirement.notify_waiters();
     }
 
@@ -1498,7 +1647,6 @@ impl ShellIo {
             .is_some_and(|rendered| rendered == command)
     }
 
-
     /// This host's socket, for the SDK connections pinned to it.
     pub(crate) fn socket(&self) -> &std::path::Path {
         &self.service.socket
@@ -1528,8 +1676,6 @@ impl ShellIo {
             .as_ref()
             .and_then(crate::handler::WeakRequestHandler::upgrade)
     }
-
-
 
     /// Retained bytes and registered readers, per job stream.
     pub(crate) fn streams(&self) -> &streams::Streams {
@@ -1705,8 +1851,16 @@ impl ShellIo {
     /// Called once by the facade's own teardown, so the last strong reference to the mux — and
     /// through it the seed's exclusive lease — is dropped even while application clones are still
     /// held. The host slice that owns `ShellIo::shutdown` is what reaches it.
+    ///
+    /// The selection goes too: with no collection left there is no shell to be looking at, and a
+    /// retained name would otherwise outlive every generation it could have meant.
     #[allow(dead_code, reason = "called by the facade teardown path")]
     pub(crate) fn release_core(&self) {
+        *self
+            .service
+            .current_shell
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         let mux = self
             .service
             .mux
@@ -1719,8 +1873,17 @@ impl ShellIo {
                 .frozen
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            frozen.executor = mux.executor_info();
-            frozen.history = mux.history();
+            // Every opened seed, captured before the mux goes: a retained clone then answers
+            // metadata and history out of plain values, holding no lease of its own.
+            let seeds = mux.seeds();
+            frozen.history = seeds
+                .iter()
+                .filter_map(|info| {
+                    mux.history(&info.seed)
+                        .map(|events| (info.seed.clone(), events))
+                })
+                .collect();
+            frozen.seeds = seeds;
             drop(frozen);
         }
     }
@@ -1760,45 +1923,54 @@ impl ShellIo {
     /// # Examples
     ///
     /// Tearing the service down while handles are still outstanding, and what each of them
-    /// answers afterwards. Needs a live host over a leased seed, so it is compiled rather than
+    /// answers afterwards. Needs a live host and a job on a seed, so it is compiled rather than
     /// executed.
     ///
     /// ```no_run
-    /// use marsh_core::shellmux::{JobIo, ShellId, SpawnOptions};
+    /// use marsh_core::shellmux::{CommandOptions, JobIo, ShellId, SpawnOptions};
     /// use rmux_server::io::{IoError, IoPhase, IoResult, ShellIo};
     ///
     /// # async fn teardown(io: &ShellIo) -> IoResult<()> {
     /// let job = io
-    ///     .spawn(
-    ///         "",
+    ///     .open_shell(
+    ///         std::path::Path::new(""),
     ///         Some(ShellId::from("worker")),
-    ///         Some("sleep 600"),
     ///         SpawnOptions {
     ///             io: JobIo::Terminal { geometry: None },
-    ///             environment: None,
+    ///             ..SpawnOptions::default()
     ///         },
     ///     )
     ///     .await?;
-    /// let command = job.initial_command();
     /// let observation = io.observe();
+    ///
+    /// // Owned by this host from its first poll, so the shutdown below pre-empts it rather than
+    /// // waiting for it. Its answer is abandoned here; the verdict still reaches every observer.
+    /// let running = job.clone();
+    /// let line = tokio::spawn(async move {
+    ///     running.run_command("sleep 600", CommandOptions::default()).await
+    /// });
     ///
     /// io.shutdown().await?;
     ///
     /// // Nothing was invalidated. What changed is what the outstanding handles answer.
     /// assert_eq!(io.snapshot().phase, IoPhase::Closed);
     /// assert!(io.jobs().is_empty());
-    /// // Frozen read-only state still answers: where the seed was is a fair question once its
-    /// // lease has gone.
-    /// let _ = io.executor_info().seed;
+    /// // Frozen read-only state still answers: which seeds this host's shells opened, and where
+    /// // they were, is a fair question once their leases have gone. The list was captured once,
+    /// // as the core was released — the live path never writes it.
+    /// for info in io.seeds() {
+    ///     let _ = (info.seed, info.snapshot_parent, info.recovery_required);
+    /// }
+    /// // A separate question, and not a seed: the directory a request naming none would have
+    /// // started in. It answers after teardown because it was never the mux's to begin with.
+    /// let _ = io.default_dir();
     /// // New work is refused rather than silently dropped.
     /// assert!(matches!(io.keep(&job), Err(IoError::Closed)));
     ///
-    /// if let Some(command) = command {
-    ///     // `WaitError::Shutdown`, not `Aborted`, and not a verdict: teardown pre-empted an
-    ///     // ordinary result. It does not prove the line had no effects, so it is not
-    ///     // permission to retry one.
-    ///     let _ = command.wait().await;
-    /// }
+    /// // `WaitError::Shutdown`, not `Aborted`, and not a verdict: teardown pre-empted an
+    /// // ordinary result. It does not prove the line had no effects, so it is not permission to
+    /// // retry one.
+    /// let _ = line.await;
     ///
     /// // The observer sees `PhaseChanged { phase: Closed }` and then end of stream — never a
     /// // stream that merely stops.

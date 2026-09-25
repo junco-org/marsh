@@ -8,10 +8,10 @@ use crate::cli_response::tmux_cli_error_message;
 
 use super::super::ExitFailure;
 use super::common::{
-    check_disabled, connect_cli, pane_process_state, pane_snapshot, resolve_pane_ref,
-    sleep_poll_interval, stdout_closed, visible_lines, visible_text, write_json, write_stderr_line,
-    write_stdout_bytes, write_stdout_bytes_or_broken_pipe, PaneProcessState, StdoutWrite,
-    SCHEMA_VERSION,
+    PaneProcessState, SCHEMA_VERSION, StdoutWrite, check_disabled, connect_cli, pane_process_state,
+    pane_snapshot, resolve_pane_ref, sleep_poll_interval, stdout_closed, visible_lines,
+    visible_text, write_json, write_stderr_line, write_stdout_bytes,
+    write_stdout_bytes_or_broken_pipe,
 };
 
 /// Maximum pane output events requested per `pane_output_cursor` poll.
@@ -422,7 +422,7 @@ where
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 mod tests {
-    use super::{flush_line_buffer_into, split_lines_bounded, LINE_BUFFER_MAX};
+    use super::{LINE_BUFFER_MAX, flush_line_buffer_into, split_lines_bounded};
 
     #[test]
     fn line_stream_buffer_is_force_flushed_at_fixed_limit() {

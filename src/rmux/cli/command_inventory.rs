@@ -6,10 +6,10 @@ use std::path::Path;
 #[cfg(test)]
 pub(super) use rmux_core::command_inventory::render_list_commands_line;
 
-use super::{write_lines_output, ExitFailure};
+use super::{ExitFailure, write_lines_output};
+use crate::cli_args::ListCommandsArgs;
 #[cfg(test)]
 use crate::cli_args::implemented_command_surface;
-use crate::cli_args::ListCommandsArgs;
 
 /// Runs `list-commands`, rendering the shared command inventory for the target socket.
 pub(super) fn run_list_commands(

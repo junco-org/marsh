@@ -1,5 +1,3 @@
-#![cfg(unix)]
-
 mod common;
 
 use std::error::Error;
@@ -12,7 +10,7 @@ use rmux_proto::{
 };
 use tokio::time::sleep;
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn capture_pane_reads_unattached_transcript() -> Result<(), Box<dyn Error>> {
     let _pty_guard = PTY_TEST_LOCK.lock().await;
     let harness = TestHarness::new("capture-unattached");

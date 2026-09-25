@@ -7,7 +7,7 @@
 use marsh_core::shellmux::repl;
 use rmux_core::Utf8Config;
 
-use super::{Action, Advance, Editing, caret, kill_line};
+use super::{caret, kill_line, Action, Advance, Editing};
 
 /// What the prompt would have done with a finished line.
 #[derive(Debug, PartialEq, Eq)]

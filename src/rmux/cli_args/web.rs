@@ -1,6 +1,6 @@
 use clap::{ArgAction, ArgGroup, Args, ValueEnum};
 
-use super::{parse_command_args, parse_target_spec, TargetSpec};
+use super::{TargetSpec, parse_command_args, parse_target_spec};
 
 pub(crate) const WEB_SHARE_TUNNEL_PROVIDERS: &[&str] = &[
     "localhost-run",

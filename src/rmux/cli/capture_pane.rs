@@ -1,13 +1,13 @@
 use std::path::Path;
 
-use rmux_client::{connect, Connection};
+use rmux_client::{Connection, connect};
 use rmux_proto::{CapturePaneRequest, CapturePaneTargetActionRequest, Response};
 
 use crate::cli_args::{CapturePaneArgs, TargetSpec};
 
 use super::{
-    capture_target_action_needs_legacy_retry, cli_target_actions_enabled,
-    resolve_pane_target_or_current, ExitFailure,
+    ExitFailure, capture_target_action_needs_legacy_retry, cli_target_actions_enabled,
+    resolve_pane_target_or_current,
 };
 
 /// A validated `capture-pane` invocation held until a target and transport are chosen.
@@ -134,9 +134,7 @@ pub(super) fn send_capture_pane_request(
 ) -> Result<Response, ExitFailure> {
     if !cli_target_actions_enabled() {
         let request = build_capture_pane_request(connection, request)?;
-        return connection
-            .capture_pane(request)
-            .map_err(ExitFailure::from);
+        return connection.capture_pane(request).map_err(ExitFailure::from);
     }
 
     let legacy_request = request.clone();

@@ -3,6 +3,38 @@ use tokio::time::{sleep, Duration, Instant};
 
 use super::RequestHandler;
 
+/// Services an attached client's control transport with the accounting a real
+/// client performs, and answers with the drain task's handle.
+///
+/// A simulated attach that holds its receiver without reading it leaves every
+/// refresh retained against the client's bounded control backlog, so the
+/// server legitimately closes it as overloaded. Plain controls need the
+/// explicit release below; deep/coalesced switches own their reservation and
+/// release it on drop, which is why each control is dropped after accounting.
+pub(in crate::handler) async fn spawn_accounted_attach_control_drain(
+    handler: &RequestHandler,
+    requester_pid: u32,
+    mut control_rx: tokio::sync::mpsc::UnboundedReceiver<crate::pane_io::AttachControl>,
+) -> tokio::task::JoinHandle<()> {
+    let control_backlog = {
+        let active_attach = handler.active_attach.lock().await;
+        active_attach
+            .by_pid
+            .get(&requester_pid)
+            .expect("attached client exists")
+            .control_backlog
+            .clone()
+    };
+    tokio::spawn(async move {
+        while let Some(control) = control_rx.recv().await {
+            crate::pane_io::release_attach_control_backlog(
+                &control_backlog,
+                control.received_backlog_units(),
+            );
+        }
+    })
+}
+
 impl RequestHandler {
     pub(crate) async fn wait_for_pane_terminal_for_test(&self, target: &PaneTarget) {
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -33,28 +65,13 @@ impl RequestHandler {
         loop {
             let ready = {
                 let state = self.state.lock().await;
-                let terminal_active = state
+                state
                     .pane_shell_if_alive(
                         target.session_name(),
                         target.window_index(),
                         target.pane_index(),
                     )
-                    .is_ok();
-                let still_starting = {
-                    #[cfg(windows)]
-                    {
-                        state.pane_is_starting_in_window(
-                            target.session_name(),
-                            target.window_index(),
-                            target.pane_index(),
-                        )
-                    }
-                    #[cfg(not(windows))]
-                    {
-                        false
-                    }
-                };
-                terminal_active && !still_starting
+                    .is_ok()
             };
             if ready {
                 return;

@@ -1,13 +1,11 @@
 use super::RequestHandler;
 use crate::pane_io::AttachControl;
 use rmux_core::command_parser::CommandParser;
-use rmux_proto::{NewSessionRequest, Request, Response, RmuxError, SessionName, TerminalSize};
+use rmux_proto::{NewSessionRequest, Request, Response, RmuxError, TerminalSize};
 use tokio::sync::mpsc;
 use tokio::time::{timeout, Duration};
 
-fn session_name(value: &str) -> SessionName {
-    SessionName::new(value).expect("valid session name")
-}
+use crate::test_names::session_name;
 
 async fn create_attached_session(
     handler: &RequestHandler,
@@ -80,11 +78,7 @@ async fn active_command_prompt_accepts_one_megabyte_frame_with_bounded_work() {
 
     let input = vec![b'a'; 1_000_000];
     timeout(
-        if cfg!(windows) {
-            Duration::from_secs(30)
-        } else {
-            Duration::from_secs(2)
-        },
+        Duration::from_secs(2),
         handler.handle_attached_live_input_for_test(requester_pid, &input),
     )
     .await

@@ -154,10 +154,7 @@ impl ShellIo {
     /// # Errors
     ///
     /// Fails when no such session exists, and for the reasons a connection can fail.
-    pub async fn session(
-        &self,
-        name: rmux_proto::SessionName,
-    ) -> IoResult<rmux_sdk::Session> {
+    pub async fn session(&self, name: rmux_proto::SessionName) -> IoResult<rmux_sdk::Session> {
         let sdk = self.sdk().await?;
         Ok(sdk.session(name).await?)
     }

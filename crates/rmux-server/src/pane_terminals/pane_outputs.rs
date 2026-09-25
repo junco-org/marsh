@@ -78,15 +78,6 @@ impl HandlerState {
         runtime_session_name: &SessionName,
         pane_id: PaneId,
     ) -> Result<Option<PaneExitMetadata>, RmuxError> {
-        #[cfg(windows)]
-        if self
-            .starting_panes
-            .get(runtime_session_name)
-            .is_some_and(|panes| panes.contains_key(&pane_id))
-        {
-            return Ok(None);
-        }
-
         if self
             .pane_target_for_runtime_pane(runtime_session_name, pane_id)
             .is_none()
@@ -231,54 +222,6 @@ impl HandlerState {
         Ok(())
     }
 
-    /// Publishes synthetic pane bytes and applies them to the transcript at
-    /// the same output-state linearization point as PTY output.
-    #[cfg(windows)]
-    pub(crate) fn publish_bytes_to_runtime_pane_transcript(
-        &mut self,
-        runtime_session_name: &SessionName,
-        pane_id: PaneId,
-        generation: Option<u64>,
-        bytes: Vec<u8>,
-    ) -> Result<bool, RmuxError> {
-        let transcript = self
-            .transcripts
-            .get(runtime_session_name)
-            .and_then(|panes| panes.get(&pane_id))
-            .cloned()
-            .ok_or_else(|| {
-                RmuxError::Server(format!(
-                    "missing pane transcript for pane id {} in session {}",
-                    pane_id.as_u32(),
-                    runtime_session_name
-                ))
-            })?;
-        let output = self
-            .pane_outputs
-            .get(runtime_session_name)
-            .and_then(|panes| panes.get(&pane_id))
-            .cloned()
-            .ok_or_else(|| {
-                RmuxError::Server(format!(
-                    "missing pane output for pane id {} in session {}",
-                    pane_id.as_u32(),
-                    runtime_session_name
-                ))
-            })?;
-        Ok(output
-            .publish_for_generation_with_invalidation(generation, bytes, |bytes| {
-                let append = transcript
-                    .lock()
-                    .expect("pane transcript mutex must not be poisoned")
-                    .append_bytes_with_effects(bytes);
-                let invalidation = append
-                    .recovery_rebase_required
-                    .then_some(crate::pane_io::PaneInvalidationReason::TranscriptMutation);
-                ((), Vec::new(), invalidation)
-            })
-            .is_some())
-    }
-
     pub(crate) fn pane_output_for_target(
         &self,
         session_name: &SessionName,
@@ -362,18 +305,6 @@ impl HandlerState {
             .get(runtime_session_name)
             .and_then(|panes| panes.get(&pane_id))
             .map(PaneOutputSender::subscribe)
-    }
-
-    #[cfg(windows)]
-    pub(crate) fn subscribe_runtime_pane_output_from_oldest(
-        &self,
-        runtime_session_name: &SessionName,
-        pane_id: PaneId,
-    ) -> Option<crate::pane_io::PaneOutputReceiver> {
-        self.pane_outputs
-            .get(runtime_session_name)
-            .and_then(|panes| panes.get(&pane_id))
-            .map(PaneOutputSender::subscribe_from_oldest)
     }
 
     pub(crate) fn runtime_pane_output_drain_handles(

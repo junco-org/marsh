@@ -308,9 +308,7 @@ fn window_scope_for_target<'a>(
 mod tests {
     use super::*;
 
-    fn session_name(value: &str) -> rmux_proto::SessionName {
-        rmux_proto::SessionName::new(value).expect("valid session name")
-    }
+    use crate::test_names::session_name;
 
     fn session() -> rmux_core::Session {
         rmux_core::Session::new(session_name("overlay"), TerminalSize { cols: 80, rows: 10 })

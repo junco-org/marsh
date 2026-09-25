@@ -20,8 +20,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use marsh_core::shellmux::{OutputChannel, SnapshotUid};
 use rmux_core::events::{
-    DEFAULT_OUTPUT_RING_CAPACITY, DEFAULT_RECENT_LIVE_BUFFER_CAPACITY, OutputCursor,
-    OutputCursorItem, OutputEvent, OutputRing,
+    OutputCursor, OutputCursorItem, OutputEvent, OutputRing, DEFAULT_OUTPUT_RING_CAPACITY,
+    DEFAULT_RECENT_LIVE_BUFFER_CAPACITY,
 };
 
 /// How many chunks an owner may fall behind before its job's pump waits.
@@ -148,7 +148,10 @@ impl Streams {
     ///
     /// The storage goes with it *only* when nobody is reading. An ended stream with observers
     /// still attached is kept until they drain, because those retained bytes are theirs.
-    pub(crate) fn end(&self, key: &StreamKey) -> Option<tokio::sync::mpsc::Sender<OutputCursorItem>> {
+    pub(crate) fn end(
+        &self,
+        key: &StreamKey,
+    ) -> Option<tokio::sync::mpsc::Sender<OutputCursorItem>> {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         let stream = state.streams.entry(key.clone()).or_insert_with(Stream::new);
         stream.ended = true;
@@ -195,8 +198,7 @@ impl Streams {
         // can miss a stream that ended in between. The tombstone closes exactly that window, but
         // it is bounded and an old entry is evicted. Together they are complete: a recently ended
         // stream is caught by the tombstone, an old one by the job's closure.
-        let already_ended =
-            job_closed || state.finished.iter().any(|known| *known == key);
+        let already_ended = job_closed || state.finished.iter().any(|known| *known == key);
         let stream = state.streams.entry(key).or_insert_with(Stream::new);
         if already_ended {
             stream.ended = true;
@@ -214,11 +216,7 @@ impl Streams {
     }
 
     /// Reads the next item for `cursor`, or reports that the stream has ended.
-    pub(crate) fn poll(
-        &self,
-        key: &StreamKey,
-        cursor: &mut OutputCursor,
-    ) -> Poll {
+    pub(crate) fn poll(&self, key: &StreamKey, cursor: &mut OutputCursor) -> Poll {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         let Some(stream) = state.streams.get_mut(key) else {
             drop(state);
@@ -230,7 +228,11 @@ impl Streams {
         }
         let ended = stream.ended;
         drop(state);
-        if ended { Poll::Ended } else { Poll::Pending }
+        if ended {
+            Poll::Ended
+        } else {
+            Poll::Pending
+        }
     }
 }
 

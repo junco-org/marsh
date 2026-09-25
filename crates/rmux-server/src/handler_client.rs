@@ -543,8 +543,6 @@ impl RequestHandler {
         };
         let client_size = client_geometry.size;
 
-        #[cfg(windows)]
-        self.wait_for_windows_deferred_all_pane_pids().await;
         let switch_window_target = expected_switch_target.map(SwitchTargetSelection::window_target);
         for _ in 0..4 {
             // This client owns no attach registration to renew, so its arrival

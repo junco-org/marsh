@@ -245,17 +245,7 @@ fn temporary_skill_path(path: &Path) -> PathBuf {
     path.with_file_name(format!(".{file_name}.rmux-tmp-{}", std::process::id()))
 }
 
-/// Renames `temp` over `path`, first removing `path` because Windows rename will not clobber.
-#[cfg(windows)]
-fn replace_file(temp: &Path, path: &Path) -> io::Result<()> {
-    if path.exists() {
-        fs::remove_file(path)?;
-    }
-    fs::rename(temp, path)
-}
-
 /// Renames `temp` over `path` atomically.
-#[cfg(not(windows))]
 fn replace_file(temp: &Path, path: &Path) -> io::Result<()> {
     fs::rename(temp, path)
 }
@@ -270,23 +260,7 @@ fn claude_skill_path() -> Result<PathBuf, ExitFailure> {
     })
 }
 
-/// Home directory from `USERPROFILE`, falling back to `HOME`.
-#[cfg(windows)]
-fn user_home() -> Result<PathBuf, ExitFailure> {
-    std::env::var_os("USERPROFILE")
-        .filter(|value| !value.is_empty())
-        .or_else(|| std::env::var_os("HOME").filter(|value| !value.is_empty()))
-        .map(PathBuf::from)
-        .ok_or_else(|| {
-            ExitFailure::new(
-                1,
-                "rmux claude install-skill: USERPROFILE or HOME is not set",
-            )
-        })
-}
-
 /// Home directory from `HOME`.
-#[cfg(not(windows))]
 fn user_home() -> Result<PathBuf, ExitFailure> {
     std::env::var_os("HOME")
         .filter(|value| !value.is_empty())
@@ -309,7 +283,7 @@ fn write_stdout(output: &str) -> Result<i32, ExitFailure> {
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 mod tests {
-    use super::{parse_invocation, ClaudeSkillInvocation, SKILL_CONTENT};
+    use super::{ClaudeSkillInvocation, SKILL_CONTENT, parse_invocation};
     use std::ffi::OsString;
 
     fn args(values: &[&str]) -> Vec<OsString> {

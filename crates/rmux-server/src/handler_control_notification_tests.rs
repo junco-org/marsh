@@ -16,9 +16,7 @@ use rmux_proto::{
 };
 use tokio::sync::mpsc;
 
-fn session_name(value: &str) -> SessionName {
-    SessionName::new(value).expect("valid session name")
-}
+use crate::test_names::session_name;
 
 async fn new_session(handler: &RequestHandler, session_name: &SessionName) {
     assert!(matches!(
@@ -303,10 +301,9 @@ async fn prepared_client_session_changed(
     handler
         .emit_for_session_identity(
             LifecycleEvent::ClientSessionChanged {
-                session_name: session_name.clone(),
+                session_name,
                 client_name: Some(client_name.to_owned()),
             },
-            &session_name,
             session_id,
         )
         .await;

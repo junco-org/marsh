@@ -66,20 +66,33 @@ impl PersistenceLayer {
         }
     }
 
-    /// Finds the seed containing `start` and derives the state directory beside it.
+    /// Finds the seed containing `initial_dir` and derives the state directory beside it.
     ///
-    /// Touches the filesystem only to canonicalize `start` and to ask `fs` whether each ancestor
-    /// is a subvolume; nothing is created here.
+    /// Returns the layer together with the canonicalized starting directory. The canonical form is
+    /// what the seed walk was run against, so a caller computing a seed-relative working directory
+    /// gets a path that actually strips against [`Self::seed`] — a symlinked spelling would not.
+    ///
+    /// Touches the filesystem only to canonicalize `initial_dir` and to ask `fs` whether each
+    /// ancestor is a subvolume; nothing is created, leased or recovered here.
     ///
     /// # Errors
     ///
-    /// Fails when `start` cannot be canonicalized, when no ancestor of it is a btrfs subvolume, or
-    /// when the seed is its mount's root — there would be nowhere beside it to keep state.
-    pub fn discover(start: &Path, fs: &dyn Subvolumes) -> Result<Self, Error> {
-        let start = start.canonicalize().map_err(|error| Error::SeedDir {
-            path: start.to_path_buf(),
+    /// Fails when `initial_dir` cannot be canonicalized or is not a directory, when no ancestor of
+    /// it is a btrfs subvolume, or when the seed is its mount's root — there would be nowhere
+    /// beside it to keep state.
+    pub fn discover(initial_dir: &Path, fs: &dyn Subvolumes) -> Result<(Self, PathBuf), Error> {
+        let start = initial_dir.canonicalize().map_err(|error| Error::SeedDir {
+            path: initial_dir.to_path_buf(),
             reason: error.to_string(),
         })?;
+        // A regular file canonicalizes fine and would otherwise seed off its parent, silently
+        // starting a shell somewhere the caller never named.
+        if !start.is_dir() {
+            return Err(Error::SeedDir {
+                path: initial_dir.to_path_buf(),
+                reason: "not a directory".to_owned(),
+            });
+        }
         let seed = find_seed(&start, &|candidate| fs.is_subvolume(candidate))
             .ok_or_else(|| Error::NoSubvolume(start.clone()))?;
         // Without this, a plain directory under a btrfs `/home` would resolve to `$SEED = /home`
@@ -96,7 +109,7 @@ impl PersistenceLayer {
                 .ok_or_else(|| Error::SeedIsMountRoot(seed.clone()))?;
             parent.join(STATE_DIR).join(name)
         };
-        Ok(Self::new(seed, root))
+        Ok((Self::new(seed, root), start))
     }
 
     /// Creates the state directory if it is not there yet.
@@ -315,20 +328,35 @@ mod tests {
     }
 
     /// Discovery is the seed walk plus the state-directory derivation: the state of a seed goes
-    /// *beside* it, named after it, so two sibling seeds keep separate histories.
+    /// *beside* it, named after it, so two sibling seeds keep separate histories. The canonical
+    /// starting directory comes back with it, because that is what a caller has to strip against
+    /// the seed to know where inside it a shell begins.
     #[test]
     fn discovery_puts_state_beside_the_nearest_enclosing_subvolume() {
         let (_dir, base) = scratch();
         let seed = base.join("seed");
         let start = seed.join("src/deep");
         std::fs::create_dir_all(&start).expect("start directory");
+        let alias = base.join("alias");
+        std::os::unix::fs::symlink(&seed, &alias).expect("alias to the seed");
 
-        let layer = PersistenceLayer::discover(&start, &subvolume_at(&seed)).expect("discovery");
+        let (layer, canonical) =
+            PersistenceLayer::discover(&start, &subvolume_at(&seed)).expect("discovery");
 
         assert_eq!(layer.seed, seed);
         assert_eq!(layer.root, base.join(STATE_DIR).join("seed"));
         assert_eq!(layer.snap(), layer.root.join("snap"));
         assert_eq!(layer.meta(), layer.root.join("meta"));
+        assert_eq!(canonical, start);
+
+        let (layer, canonical) =
+            PersistenceLayer::discover(&alias.join("src/deep"), &subvolume_at(&seed))
+                .expect("discovery through a symlink");
+        assert_eq!(layer.seed, seed);
+        assert_eq!(
+            canonical, start,
+            "the resolved directory strips against the seed; the alias spelling would not"
+        );
     }
 
     /// A seed that is its own mount root has no usable parent directory, so discovery refuses it
@@ -395,6 +423,24 @@ mod tests {
         assert!(
             matches!(&error, Error::SeedDir { path, reason }
                 if *path == start && !reason.is_empty()),
+            "got {error:?}"
+        );
+    }
+
+    /// A file is not a place a shell can start: it resolves, so without the check it would seed
+    /// off its parent directory and run somewhere nobody asked for.
+    #[test]
+    fn a_starting_path_that_is_not_a_directory_is_refused() {
+        let (_dir, base) = scratch();
+        let seed = base.join("seed");
+        std::fs::create_dir_all(&seed).expect("seed directory");
+        let file = seed.join("file");
+        std::fs::write(&file, b"not a directory").expect("a regular file");
+
+        let error = PersistenceLayer::discover(&file, &subvolume_at(&seed)).expect_err("refused");
+        assert!(
+            matches!(&error, Error::SeedDir { path, reason }
+                if *path == file && reason == "not a directory"),
             "got {error:?}"
         );
     }

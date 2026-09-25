@@ -80,9 +80,7 @@ async fn spawn_environment_child(display: &str) -> EnvironmentChild {
     child
 }
 
-fn session_name(value: &str) -> rmux_proto::SessionName {
-    rmux_proto::SessionName::new(value).expect("valid test session")
-}
+use crate::test_names::session_name;
 
 /// Answers `session` as it stands now, with ambient pane-activity timestamps taken from
 /// `reference` so a byte-for-byte comparison measures the switch rather than the clock.

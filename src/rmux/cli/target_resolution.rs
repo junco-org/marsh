@@ -2,10 +2,10 @@ use rmux_client::Connection;
 use rmux_proto::request::ListSessionsRequest;
 use rmux_proto::{ErrorResponse, ResolveTargetType, Response, RmuxError};
 
-use crate::cli_args::{parse_target_spec, TargetSpec};
+use crate::cli_args::{TargetSpec, parse_target_spec};
 use crate::cli_response::expect_command_output;
 
-use super::{unexpected_response, ExitFailure};
+use super::{ExitFailure, unexpected_response};
 
 /// Asks the server which session the current client is attached to.
 pub(super) fn resolve_current_session_target(

@@ -4,25 +4,6 @@ use std::time::{Duration, SystemTime};
 use super::*;
 use crate::handler::scripting_support::install_queue_exact_target_capture_pause;
 
-async fn retained_window_binding(
-    handler: &RequestHandler,
-    session_name: &SessionName,
-) -> (Option<Target>, std::sync::Arc<LifecycleTargetLease>) {
-    let mut state = handler.state.lock().await;
-    let event = super::super::super::prepare_lifecycle_event(
-        &mut state,
-        &rmux_core::LifecycleEvent::AlertActivity {
-            target: WindowTarget::with_window(session_name.clone(), 0),
-        },
-    );
-    (
-        event.current_target,
-        event
-            .retained_current_target
-            .expect("activity event captures a retained window"),
-    )
-}
-
 async fn session_with_spare_window(handler: &RequestHandler, name: &str) -> SessionName {
     let session_name = create_handler_session(handler, name).await;
     handler
@@ -35,12 +16,6 @@ async fn session_with_spare_window(handler: &RequestHandler, name: &str) -> Sess
         .create_window(terminal_size())
         .expect("create spare window");
     session_name
-}
-
-async fn wait_for_pause(pause: &crate::handler::scripting_support::QueueExactTargetCapturePause) {
-    tokio::time::timeout(Duration::from_secs(2), pause.reached.notified())
-        .await
-        .expect("special command reaches post-capture pause");
 }
 
 async fn retire_window_zero(handler: &RequestHandler, session_name: &SessionName, replace: bool) {
@@ -67,7 +42,7 @@ async fn run_paused_hook(
     command: String,
     replace: bool,
 ) -> Result<(), rmux_proto::RmuxError> {
-    let (current_target, lease) = retained_window_binding(handler, session_name).await;
+    let (current_target, lease) = retained_alert_binding(handler, session_name).await;
     let pause = install_queue_exact_target_capture_pause(handler, command_name);
     let queued_handler = handler.clone();
     let queued = tokio::spawn(async move {
@@ -80,7 +55,7 @@ async fn run_paused_hook(
             )
             .await
     });
-    wait_for_pause(&pause).await;
+    pause.wait_until_reached().await;
     retire_window_zero(handler, session_name, replace).await;
     pause.release.notify_one();
     queued.await.expect("special command task joins")
@@ -170,7 +145,7 @@ async fn source_file_missing_explicit_target_cuts_the_outer_lifecycle_lease() {
     handler
         .register_attach(requester_pid, beta.clone(), control_tx)
         .await;
-    let (current_target, lease) = retained_window_binding(&handler, &alpha).await;
+    let (current_target, lease) = retained_alert_binding(&handler, &alpha).await;
     let path = unique_temp_path("source-missing-target.conf");
     std::fs::write(&path, "rename-window fallback-beta\n").expect("write source fixture");
     let pause = install_queue_exact_target_capture_pause(&handler, "rename-window");
@@ -190,7 +165,7 @@ async fn source_file_missing_explicit_target_cuts_the_outer_lifecycle_lease() {
             .map(|result| (result, path))
     });
 
-    wait_for_pause(&pause).await;
+    pause.wait_until_reached().await;
     retire_window_zero(&handler, &alpha, false).await;
     pause.release.notify_one();
     let (_, path) = queued
@@ -249,7 +224,7 @@ async fn explicit_if_shell_target_cuts_the_lifecycle_lease_and_pins_beta() {
     let handler = RequestHandler::new();
     let alpha = session_with_spare_window(&handler, "special-explicit-alpha").await;
     let beta = create_handler_session(&handler, "special-explicit-beta").await;
-    let (current_target, lease) = retained_window_binding(&handler, &alpha).await;
+    let (current_target, lease) = retained_alert_binding(&handler, &alpha).await;
     retire_window_zero(&handler, &alpha, false).await;
 
     handler
@@ -278,7 +253,7 @@ async fn explicit_if_shell_target_rejects_same_name_slot_replacement() {
     let handler = RequestHandler::new();
     let alpha = session_with_spare_window(&handler, "special-explicit-aba-alpha").await;
     let beta = create_handler_session(&handler, "special-explicit-aba-beta").await;
-    let (current_target, lease) = retained_window_binding(&handler, &alpha).await;
+    let (current_target, lease) = retained_alert_binding(&handler, &alpha).await;
     let pause = install_queue_exact_target_capture_pause(&handler, "if-shell");
     let queued_handler = handler.clone();
     let beta_for_command = beta.clone();
@@ -292,7 +267,7 @@ async fn explicit_if_shell_target_rejects_same_name_slot_replacement() {
             )
             .await
     });
-    wait_for_pause(&pause).await;
+    pause.wait_until_reached().await;
     {
         let mut state = handler.state.lock().await;
         state.sessions.remove_session(&beta).expect("remove beta");
@@ -347,7 +322,7 @@ async fn special_mutations_reject_a_respawned_pane_with_the_same_pane_id() {
         let handler = RequestHandler::new();
         let session_name =
             create_handler_session(&handler, &format!("{command_name}-respawn")).await;
-        let (current_target, lease) = retained_window_binding(&handler, &session_name).await;
+        let (current_target, lease) = retained_alert_binding(&handler, &session_name).await;
         let pause = install_queue_exact_target_capture_pause(&handler, command_name);
         let queued_handler = handler.clone();
         let queued = tokio::spawn(async move {
@@ -360,7 +335,7 @@ async fn special_mutations_reject_a_respawned_pane_with_the_same_pane_id() {
                 )
                 .await
         });
-        wait_for_pause(&pause).await;
+        pause.wait_until_reached().await;
         let response = handler
             .handle(Request::RespawnPane(Box::new(RespawnPaneRequest {
                 target: PaneTarget::with_window(session_name.clone(), 0, 0),
@@ -393,7 +368,7 @@ async fn admitted_background_shell_finishes_after_its_lifecycle_target_retires()
     let started = unique_temp_path("shell-started");
     let finished = unique_temp_path("shell-finished");
     let shell_command = delayed_file_command(&started, &finished);
-    let (current_target, lease) = retained_window_binding(&handler, &session_name).await;
+    let (current_target, lease) = retained_alert_binding(&handler, &session_name).await;
 
     handler
         .execute_hook_command_with_target_binding(
@@ -433,33 +408,13 @@ async fn wait_for_file(path: &std::path::Path) {
 }
 
 fn background_shell_marker_timeout() -> Duration {
-    #[cfg(windows)]
-    {
-        // Hosted Windows can heavily delay a cold PowerShell process. This
-        // test checks eventual completion, not process-start latency.
-        Duration::from_secs(30)
-    }
-    #[cfg(not(windows))]
-    {
-        Duration::from_secs(10)
-    }
+    Duration::from_secs(10)
 }
 
 fn delayed_file_command(started: &std::path::Path, finished: &std::path::Path) -> String {
-    #[cfg(unix)]
-    {
-        format!(
-            "printf started > {}; sleep 0.2; printf finished > {}",
-            crate::test_shell::sh_quote_path(started),
-            crate::test_shell::sh_quote_path(finished)
-        )
-    }
-    #[cfg(windows)]
-    {
-        crate::test_shell::powershell_encoded_command(&format!(
-            "[IO.File]::WriteAllText({}, 'started'); Start-Sleep -Milliseconds 200; [IO.File]::WriteAllText({}, 'finished')",
-            crate::test_shell::powershell_quote_path(started),
-            crate::test_shell::powershell_quote_path(finished)
-        ))
-    }
+    format!(
+        "printf started > {}; sleep 0.2; printf finished > {}",
+        crate::test_shell::sh_quote_path(started),
+        crate::test_shell::sh_quote_path(finished)
+    )
 }

@@ -27,25 +27,8 @@ mod surface_test_support;
 
 const CONNECTION_ID: u64 = 41;
 
-#[cfg(unix)]
 fn quiet_command() -> Vec<String> {
     vec!["/bin/sh".to_owned(), "-c".to_owned(), "sleep 60".to_owned()]
-}
-
-#[cfg(windows)]
-fn quiet_command() -> Vec<String> {
-    let system_root =
-        std::env::var_os("SystemRoot").unwrap_or_else(|| std::ffi::OsString::from(r"C:\Windows"));
-    let cmd = std::path::PathBuf::from(system_root)
-        .join("System32")
-        .join("cmd.exe");
-    vec![
-        cmd.to_string_lossy().into_owned(),
-        "/d".to_owned(),
-        "/q".to_owned(),
-        "/c".to_owned(),
-        "ping -n 120 127.0.0.1 >NUL".to_owned(),
-    ]
 }
 
 async fn test_pane(
@@ -1767,9 +1750,9 @@ async fn assert_exit_commit_keeps_stream_source_available(
         "the fixture child may publish at most one additional EOF: {final_events:?}"
     );
     // This fixture injects an EOF while its quiet OS child is still running.
-    // Windows may synchronously emit terminal-mode teardown bytes and a second,
-    // real EOF after the commit pause. Every raw output sequence must still be
-    // new and strictly ordered before the logical-pane end.
+    // The child may still emit terminal-mode teardown bytes and a second, real
+    // EOF after the commit pause. Every raw output sequence must still be new
+    // and strictly ordered before the logical-pane end.
     if mode == PaneStreamMode::Raw {
         let raw_sequences = events
             .iter()

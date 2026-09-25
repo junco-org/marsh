@@ -777,8 +777,8 @@ mod tests {
     fn seeded_foreground_cache_exposes_first_transition() {
         let handler = RequestHandler::new();
         let pane_id = PaneId::new(7);
-        let old_state = foreground_state(10, "cmd", "C:/old");
-        let new_state = foreground_state(10, "cmd", "C:/new");
+        let old_state = foreground_state(10, "sh", "/old");
+        let new_state = foreground_state(10, "sh", "/new");
 
         handler.seed_foreground_state_cache(pane_id, 3, old_state.clone());
         handler.seed_foreground_state_cache(pane_id, 3, new_state.clone());
@@ -797,9 +797,9 @@ mod tests {
     fn stale_foreground_seed_does_not_replace_newer_generation() {
         let handler = RequestHandler::new();
         let pane_id = PaneId::new(8);
-        let old_state = foreground_state(10, "cmd", "C:/old");
-        let new_state = foreground_state(10, "cmd", "C:/new");
-        let latest_state = foreground_state(10, "cmd", "C:/latest");
+        let old_state = foreground_state(10, "sh", "/old");
+        let new_state = foreground_state(10, "sh", "/new");
+        let latest_state = foreground_state(10, "sh", "/latest");
 
         handler.seed_foreground_state_cache(pane_id, 5, new_state.clone());
         handler.seed_foreground_state_cache(pane_id, 4, old_state);
@@ -814,8 +814,8 @@ mod tests {
     fn stale_foreground_replace_does_not_overwrite_newer_generation() {
         let handler = RequestHandler::new();
         let pane_id = PaneId::new(9);
-        let stale_state = foreground_state(10, "cmd", "C:/stale");
-        let current_state = foreground_state(11, "cmd", "C:/current");
+        let stale_state = foreground_state(10, "sh", "/stale");
+        let current_state = foreground_state(11, "sh", "/current");
 
         handler.seed_foreground_state_cache(pane_id, 5, current_state.clone());
         let previous = handler.replace_foreground_state_cache(pane_id, 4, stale_state);
@@ -831,8 +831,8 @@ mod tests {
     fn same_generation_foreground_replace_updates_cache() {
         let handler = RequestHandler::new();
         let pane_id = PaneId::new(10);
-        let old_state = foreground_state(10, "cmd", "C:/old");
-        let next_state = foreground_state(10, "cmd", "C:/next");
+        let old_state = foreground_state(10, "sh", "/old");
+        let next_state = foreground_state(10, "sh", "/next");
 
         handler.seed_foreground_state_cache(pane_id, 5, old_state.clone());
         let previous = handler.replace_foreground_state_cache(pane_id, 5, next_state.clone());
@@ -848,8 +848,8 @@ mod tests {
     fn newer_generation_foreground_replace_advances_cache_without_transition() {
         let handler = RequestHandler::new();
         let pane_id = PaneId::new(11);
-        let old_state = foreground_state(10, "cmd", "C:/old");
-        let next_state = foreground_state(11, "cmd", "C:/next");
+        let old_state = foreground_state(10, "sh", "/old");
+        let next_state = foreground_state(11, "sh", "/next");
 
         handler.seed_foreground_state_cache(pane_id, 5, old_state.clone());
         let previous = handler.replace_foreground_state_cache(pane_id, 6, next_state.clone());
@@ -867,8 +867,8 @@ mod tests {
 
     #[test]
     fn foreground_cache_ignores_generation_reset_as_transition() {
-        let old_state = foreground_state(10, "cmd", "C:/old");
-        let new_state = foreground_state(11, "cmd", "C:/new");
+        let old_state = foreground_state(10, "sh", "/old");
+        let new_state = foreground_state(11, "sh", "/new");
 
         assert_eq!(
             foreground_change_from_previous(Some((2, old_state)), 3, &new_state),
@@ -878,8 +878,8 @@ mod tests {
 
     #[test]
     fn foreground_state_changed_observes_executable_path() {
-        let old_state = foreground_state_with_exe(10, "cmd", "C:/work", "C:/Windows/cmd.exe");
-        let new_state = foreground_state_with_exe(10, "cmd", "C:/work", "C:/Tools/cmd.exe");
+        let old_state = foreground_state_with_exe(10, "sh", "/work", "/bin/sh");
+        let new_state = foreground_state_with_exe(10, "sh", "/work", "/usr/local/bin/sh");
 
         assert!(foreground_state_changed(&old_state, &new_state));
     }

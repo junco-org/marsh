@@ -27,17 +27,16 @@
 //! created only by renaming a partial file that already holds exactly `N`
 //! bytes.
 //!
-//! The generator is platform-neutral so the shape of that protocol is checked
-//! wherever this crate's tests run. Executing the child is a separate matter:
-//! the `#[cfg(unix)]` cases at the bottom run `/bin/sh` for real, and they are
-//! the ones that carry the authority.
+//! The generator is kept apart from execution so the shape of that protocol is
+//! checked by plain unit cases. Executing the child is a separate matter: the
+//! `execution` cases at the bottom run `/bin/sh` for real, and they are the
+//! ones that carry the authority.
 
 /// The real child's raw-mode setup. A regression pins that the shipped script
 /// uses exactly this, so the substitutable seam below cannot leak into it.
 const RAW_SETUP_COMMAND: &str = "stty raw -echo 2>/dev/null";
 
 /// Runs the corrected capture protocol in the platform's own shell.
-#[cfg(unix)]
 pub(super) fn pane_command(slot: &super::FinalSinkSlot) -> Vec<String> {
     vec!["/bin/sh".to_owned(), "-c".to_owned(), script(slot)]
 }
@@ -304,13 +303,12 @@ mod tests {
     // -----------------------------------------------------------------------
     // Real `/bin/sh` execution.
     //
-    // These carry the authority for this correction and cannot run on Windows,
-    // so this attempt does not claim them; the targeted Unix job does. The
-    // read-only slot guard lives here too: it is Unix permission behaviour, and
-    // the case that needs it is one of these.
+    // These carry the authority for this correction: they run the shipped
+    // script through a real `/bin/sh`. The read-only slot guard lives here
+    // too, because it is Unix permission behaviour and the case that needs it
+    // is one of these.
     // -----------------------------------------------------------------------
 
-    #[cfg(unix)]
     mod execution {
         use super::*;
         use std::io::Write;

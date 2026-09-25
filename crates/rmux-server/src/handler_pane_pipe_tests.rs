@@ -5,15 +5,13 @@ use std::time::Duration;
 use super::RequestHandler;
 use rmux_proto::{
     DisplayMessageRequest, KillPaneRequest, NewSessionRequest, PaneTarget, PipePaneRequest,
-    Request, Response, SendKeysRequest, SessionName, Target, TerminalSize,
+    Request, Response, SendKeysRequest, Target, TerminalSize,
 };
 use tokio::time::sleep;
 
 const PANE_PIPE_TEST_TIMEOUT: Duration = Duration::from_secs(15);
 
-fn session_name(value: &str) -> SessionName {
-    SessionName::new(value).expect("valid session name")
-}
+use crate::test_names::session_name;
 
 /// A pipe command that logs the first line it is given and then exits.
 ///
@@ -26,18 +24,8 @@ fn session_name(value: &str) -> SessionName {
 /// where the log is staged and `<seed>/name` is where it appears once the gate approves. Handing
 /// the command an absolute `<seed>/name` instead names a path outside the tree it is running
 /// against, and the log is then written nowhere at all — not staged, not published.
-#[cfg(unix)]
 fn first_line_to_file_command(name: &str) -> String {
     format!("head -n 1 > {}", crate::test_shell::sh_quote(name))
-}
-
-#[cfg(windows)]
-fn first_line_to_file_command(name: &str) -> String {
-    crate::test_shell::powershell_encoded_command(&format!(
-        "$line=[Console]::In.ReadLine(); [System.IO.File]::WriteAllText((Join-Path \
-         (Get-Location).Path {}), $line)",
-        crate::test_shell::powershell_quote(name)
-    ))
 }
 
 /// A pipe command that logs everything it is given and never ends on its own.
@@ -47,32 +35,16 @@ fn first_line_to_file_command(name: &str) -> String {
 /// killed, so the only thing deciding the log's fate is how that teardown ends the job.
 ///
 /// `name` is relative for the reason given on [`first_line_to_file_command`].
-#[cfg(unix)]
 fn all_input_to_file_command(name: &str) -> String {
     format!("cat > {}", crate::test_shell::sh_quote(name))
-}
-
-#[cfg(windows)]
-fn all_input_to_file_command(name: &str) -> String {
-    crate::test_shell::powershell_encoded_command(&format!(
-        "$text=[Console]::In.ReadToEnd(); [System.IO.File]::WriteAllText((Join-Path \
-         (Get-Location).Path {}), $text)",
-        crate::test_shell::powershell_quote(name)
-    ))
 }
 
 fn pipe_discard_command() -> String {
     crate::test_shell::stdin_discard_command()
 }
 
-#[cfg(unix)]
 fn pane_print_command(text: &str) -> String {
     format!("printf '{}\\n'", text.replace('\'', r"'\''"))
-}
-
-#[cfg(windows)]
-fn pane_print_command(text: &str) -> String {
-    format!("echo {text}")
 }
 
 async fn create_session(handler: &RequestHandler, name: &str) {
@@ -223,7 +195,7 @@ async fn pipe_pane_once_closes_existing_pipe_without_reopening() {
     let Ok(io) = crate::managed_workload::handler_facade(&handler) else {
         return;
     };
-    let seed = io.executor_info().seed.expect("test engine has a seed");
+    let seed = io.default_dir().to_path_buf();
     let alpha = session_name("alpha");
     let target = PaneTarget::with_window(alpha.clone(), 0, 0);
     let first_output = seed.join("once-first");
@@ -312,11 +284,7 @@ async fn killing_a_pane_discards_its_pipe_log_instead_of_publishing_it() {
     let Ok(io) = crate::managed_workload::handler_facade(&handler) else {
         return;
     };
-    let info = io.executor_info();
-    let seed = info.seed.expect("test engine has a seed");
-    let snapshot_parent = info
-        .snapshot_parent
-        .expect("test engine stages jobs under a snapshot directory");
+    let seed = io.default_dir().to_path_buf();
     let alpha = session_name("alpha");
     let target = PaneTarget::with_window(alpha.clone(), 0, 0);
     let output = seed.join("killed-pipe-log");
@@ -336,6 +304,14 @@ async fn killing_a_pane_discards_its_pipe_log_instead_of_publishing_it() {
         "the pipe must be carrying the pane's output before its pane is killed"
     );
     send_pane_line(&handler, target.clone(), "pipe-killed").await;
+    // The seed is only opened once the pane's own job exists, so its snapshot parent is asked for
+    // here rather than before the session was created.
+    let snapshot_parent = io
+        .seeds()
+        .into_iter()
+        .find(|info| info.seed == seed)
+        .expect("the pane's seed is open")
+        .snapshot_parent;
     wait_for_staged_file_contains(&snapshot_parent, "killed-pipe-log", "pipe-killed").await;
     assert!(
         !output.exists(),

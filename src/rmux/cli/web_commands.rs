@@ -3,7 +3,7 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use chrono::DateTime;
-use rmux_client::{detect_context, ClientContext};
+use rmux_client::{ClientContext, detect_context};
 use rmux_proto::{
     CommandOutput, CreateWebShareRequest, ErrorResponse, KillSessionRequest, ListWebSharesRequest,
     LookupWebShareRequest, PaneTargetRef, Response, SessionName, StopAllWebSharesRequest,
@@ -13,13 +13,12 @@ use rmux_proto::{
 
 use super::web_share_display::created_share_terminal_output;
 use super::{
-    connect_with_startserver, finish_command_success, resolve_current_pane_target,
-    resolve_pane_target_spec, resolve_session_target_spec,
+    ExitFailure, StartupOptions, connect_with_startserver, finish_command_success,
+    resolve_current_pane_target, resolve_pane_target_spec, resolve_session_target_spec,
     terminal_theme::capture_terminal_palette, unexpected_response, write_command_output,
-    ExitFailure, StartupOptions,
 };
 use crate::cli_args::{
-    TargetSpec, WebShareArgs, WebShareTerminalThemeArg, WEB_SHARE_TUNNEL_PROVIDERS,
+    TargetSpec, WEB_SHARE_TUNNEL_PROVIDERS, WebShareArgs, WebShareTerminalThemeArg,
 };
 
 /// How many generated names are tried before auto web-share session naming gives up.
@@ -335,7 +334,7 @@ fn create_detached_web_share_session(
             Response::NewSession(created) => return Ok(created.session_name),
             Response::Error(ErrorResponse { error }) if session_already_exists(&error) => {}
             Response::Error(ErrorResponse { error }) => {
-                return Err(ExitFailure::new(1, error.to_string()))
+                return Err(ExitFailure::new(1, error.to_string()));
             }
             other => return Err(unexpected_response("new-session", &other)),
         }
@@ -464,7 +463,7 @@ mod tests {
         should_capture_terminal_palette, target_requests_pane_scope,
         validate_create_web_share_args, validate_web_share_args_without_daemon,
     };
-    use crate::cli_args::{parse_target_spec, WebShareArgs};
+    use crate::cli_args::{WebShareArgs, parse_target_spec};
 
     #[test]
     fn web_share_session_target_stays_session_scoped() {

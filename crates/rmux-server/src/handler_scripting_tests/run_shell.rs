@@ -5,7 +5,6 @@ use rmux_proto::{ErrorResponse, RmuxError};
 #[tokio::test]
 async fn run_shell_foreground_returns_stdout_like_tmux() {
     let handler = RequestHandler::new();
-    use_platform_test_shell(&handler).await;
 
     let response = handler
         .handle(run_shell(&shell_print_command("hello"), false))
@@ -23,7 +22,6 @@ async fn run_shell_foreground_returns_stdout_like_tmux() {
 #[tokio::test]
 async fn run_shell_nonzero_returns_stdout_and_returned_message() {
     let handler = RequestHandler::new();
-    use_platform_test_shell(&handler).await;
     let command = shell_print_then_exit_command("hidden", 7);
 
     let response = handler.handle(run_shell(&command, false)).await;
@@ -42,7 +40,6 @@ async fn run_shell_nonzero_returns_stdout_and_returned_message() {
 #[tokio::test]
 async fn run_shell_stderr_output_flag_merges_stdout_and_stderr_like_tmux() {
     let handler = RequestHandler::new();
-    use_platform_test_shell(&handler).await;
 
     let response = handler
         .handle(Request::RunShell(Box::new(RunShellRequest {
@@ -72,7 +69,6 @@ async fn run_shell_stderr_output_flag_merges_stdout_and_stderr_like_tmux() {
     }
 }
 
-#[cfg(unix)]
 #[tokio::test]
 async fn run_shell_uses_bin_sh_instead_of_default_shell_like_tmux() {
     let handler = RequestHandler::new();
@@ -382,7 +378,6 @@ async fn background_run_shell_expands_implicit_formats_after_attached_switch() {
 #[tokio::test]
 async fn background_run_shell_builds_environment_for_followed_attached_session() {
     let handler = RequestHandler::new();
-    use_platform_test_shell(&handler).await;
     let requester_pid = 424_311;
     let alpha = session_name("run-shell-environment-switch-alpha");
     let beta = session_name("run-shell-environment-switch-beta");
@@ -405,18 +400,16 @@ async fn background_run_shell_builds_environment_for_followed_attached_session()
         );
     }
 
+    // Two different places on purpose: the job's start directory is NAMED, so it must live in
+    // this handler's seed, while the probe it writes is an absolute host path written straight
+    // through and read back with plain `std::fs`.
+    let cwd = seed_scratch_dir(&handler, "run-shell-followed-environment");
     let root = temp_root("run-shell-followed-environment");
     std::fs::create_dir_all(&root).expect("background environment output root");
     let output_path = root.join("target.txt");
-    #[cfg(unix)]
     let shell_command = format!(
         "printf '%s' \"$RMUX_BG_TARGET\" > {}",
         shell_quote(&output_path)
-    );
-    #[cfg(windows)]
-    let shell_command = format!(
-        "[IO.File]::WriteAllText({}, $env:RMUX_BG_TARGET)",
-        crate::test_shell::powershell_quote_path(&output_path)
     );
 
     let (control_tx, _control_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -435,7 +428,7 @@ async fn background_run_shell_builds_environment_for_followed_attached_session()
                     as_commands: false,
                     show_stderr: true,
                     delay_seconds: Some(RunShellDelaySeconds(0.05)),
-                    start_directory: Some(root.clone()),
+                    start_directory: Some(cwd.path().to_path_buf()),
                     target: None,
                     source_depth: None,
                 },
@@ -505,13 +498,16 @@ async fn explicit_background_run_shell_target_survives_attached_switch() {
 #[tokio::test]
 async fn explicit_background_shell_target_survives_origin_attach_detach() {
     let handler = RequestHandler::new();
-    use_platform_test_shell(&handler).await;
     let requester_pid = 424_312;
     let origin = session_name("run-shell-explicit-detach-origin");
     let target = session_name("run-shell-explicit-detach-target");
     create_background_identity_session(&handler, origin.clone()).await;
     create_background_identity_session(&handler, target.clone()).await;
 
+    // Two different places on purpose: the job's start directory NAMES the seed it publishes
+    // into, so it must live in this handler's, while the probe it writes is an absolute host
+    // path written straight through and read back with plain `std::fs`.
+    let cwd = seed_scratch_dir(&handler, "run-shell-explicit-detach");
     let root = temp_root("run-shell-explicit-detach");
     std::fs::create_dir_all(&root).expect("explicit detach output root");
     let output_path = root.join("completed.txt");
@@ -534,7 +530,7 @@ async fn explicit_background_shell_target_survives_origin_attach_detach() {
                 as_commands: false,
                 show_stderr: true,
                 delay_seconds: Some(RunShellDelaySeconds(0.05)),
-                start_directory: Some(root.clone()),
+                start_directory: Some(cwd.path().to_path_buf()),
                 target: Some(PaneTarget::with_window(target, 0, 0)),
                 source_depth: None,
             },
@@ -556,7 +552,6 @@ async fn explicit_background_shell_target_survives_origin_attach_detach() {
 #[tokio::test]
 async fn explicit_background_shell_target_survives_same_pid_attach_replacement() {
     let handler = RequestHandler::new();
-    use_platform_test_shell(&handler).await;
     let requester_pid = 424_313;
     let origin = session_name("run-shell-explicit-reuse-origin");
     let replacement = session_name("run-shell-explicit-reuse-replacement");
@@ -565,6 +560,8 @@ async fn explicit_background_shell_target_survives_same_pid_attach_replacement()
     create_background_identity_session(&handler, replacement.clone()).await;
     create_background_identity_session(&handler, target.clone()).await;
 
+    // Start directory in the seed, probe on the host: see the detach case above.
+    let cwd = seed_scratch_dir(&handler, "run-shell-explicit-reuse");
     let root = temp_root("run-shell-explicit-reuse");
     std::fs::create_dir_all(&root).expect("explicit reuse output root");
     let output_path = root.join("completed.txt");
@@ -587,7 +584,7 @@ async fn explicit_background_shell_target_survives_same_pid_attach_replacement()
                 as_commands: false,
                 show_stderr: true,
                 delay_seconds: Some(RunShellDelaySeconds(0.05)),
-                start_directory: Some(root.clone()),
+                start_directory: Some(cwd.path().to_path_buf()),
                 target: Some(PaneTarget::with_window(target, 0, 0)),
                 source_depth: None,
             },
@@ -916,7 +913,6 @@ async fn queued_run_shell_accepts_empty_command_as_noop_like_tmux() {
 #[tokio::test]
 async fn run_shell_missing_explicit_target_is_nonfatal() {
     let handler = RequestHandler::new();
-    use_platform_test_shell(&handler).await;
 
     let response = handler
         .handle(Request::RunShell(Box::new(RunShellRequest {
@@ -941,7 +937,6 @@ async fn run_shell_missing_explicit_target_is_nonfatal() {
 #[tokio::test]
 async fn background_if_shell_still_emits_after_hooks_outside_hook_context() {
     let handler = RequestHandler::new();
-    use_platform_test_shell(&handler).await;
     create_named_session(&handler, "if-shell-after-hooks").await;
     execute_test_command(
         &handler,
@@ -964,7 +959,6 @@ async fn background_if_shell_still_emits_after_hooks_outside_hook_context() {
 #[tokio::test]
 async fn queued_background_if_shell_preserves_hook_formats_after_hook_scope_exits() {
     let handler = RequestHandler::new();
-    use_platform_test_shell(&handler).await;
     let branch = r#"if-shell -F '#{==:#{hook_pane},%1}' 'set-buffer -b bg-hook-if ok'"#;
     let parsed = CommandParser::new()
         .parse(&format!(
@@ -993,7 +987,6 @@ async fn queued_background_if_shell_preserves_hook_formats_after_hook_scope_exit
 #[tokio::test]
 async fn background_run_shell_preserves_hook_formats_after_hook_scope_exits() {
     let handler = RequestHandler::new();
-    use_platform_test_shell(&handler).await;
     let root = temp_root("run-shell-background-hook-formats");
     std::fs::create_dir_all(&root).expect("temp output root");
     let output_path = root.join("hook-pane.txt");
@@ -1029,7 +1022,6 @@ async fn background_run_shell_preserves_hook_formats_after_hook_scope_exits() {
 #[tokio::test]
 async fn run_shell_expands_socket_path_without_target() {
     let handler = RequestHandler::new();
-    use_platform_test_shell(&handler).await;
     handler.set_socket_path("/tmp/rmux-test.sock");
     let root = temp_root("run-shell-socket-path");
     std::fs::create_dir_all(&root).expect("temp output root");
@@ -1104,37 +1096,15 @@ async fn wait_for_file_text(path: &std::path::Path, expected: &str) {
 }
 
 fn write_literal_format_command(path: &std::path::Path, text: &str) -> String {
-    #[cfg(unix)]
-    {
-        format!(
-            "printf '%s' {} > {}",
-            command_quote(text),
-            shell_quote(path)
-        )
-    }
-    #[cfg(windows)]
-    {
-        format!(
-            "[IO.File]::WriteAllText({}, {})",
-            crate::test_shell::powershell_quote_path(path),
-            crate::test_shell::powershell_quote(text)
-        )
-    }
+    format!(
+        "printf '%s' {} > {}",
+        command_quote(text),
+        shell_quote(path)
+    )
 }
 
 fn write_text_command(path: &std::path::Path, text: &str) -> String {
-    #[cfg(unix)]
-    {
-        format!("printf {} > {}", command_quote(text), shell_quote(path))
-    }
-    #[cfg(windows)]
-    {
-        format!(
-            "[IO.File]::WriteAllText({}, {})",
-            crate::test_shell::powershell_quote_path(path),
-            crate::test_shell::powershell_quote(text)
-        )
-    }
+    format!("printf {} > {}", command_quote(text), shell_quote(path))
 }
 
 #[tokio::test]

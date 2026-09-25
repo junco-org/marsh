@@ -1,6 +1,6 @@
 use rmux_core::command_parser::{CommandArgument, ParsedCommand, ParsedCommands};
 
-/// Tracks the bounded Windows completion barrier after either form of EOF.
+/// Tracks the bounded completion barrier after either form of EOF.
 ///
 /// Once this stream has run `attach-session` and admitted work before the
 /// private stdin marker or raw transport close, its finite batch must complete.
@@ -23,7 +23,7 @@ impl ControlEofCompletion {
         self.active_command_attaches_session = false;
     }
 
-    #[cfg(any(windows, test))]
+    #[cfg(test)]
     pub(super) fn observe_stdin_eof_marker(
         &mut self,
         client_attached: bool,
@@ -32,7 +32,7 @@ impl ControlEofCompletion {
         self.observe_completion_eof(client_attached, admitted_work_pending);
     }
 
-    #[cfg(any(windows, test))]
+    #[cfg(test)]
     pub(super) fn observe_transport_eof(
         &mut self,
         client_attached: bool,
@@ -41,7 +41,7 @@ impl ControlEofCompletion {
         self.observe_completion_eof(client_attached, admitted_work_pending);
     }
 
-    #[cfg(any(windows, test))]
+    #[cfg(test)]
     fn observe_completion_eof(&mut self, client_attached: bool, admitted_work_pending: bool) {
         self.completion_eof_seen = true;
         if self.attach_session_seen && client_attached && admitted_work_pending {

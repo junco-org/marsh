@@ -128,8 +128,8 @@ impl ExitedPaneOutput {
 
 impl RequestHandler {
     pub(in crate::handler) async fn handle_pane_exit_event(&self, event: PaneExitEvent) {
-        // On Windows the child watcher may report exit before the ConPTY reader
-        // publishes its final bytes. Wait for that publication before draining
+        // The child watcher can report exit before the PTY reader publishes the
+        // last bytes the child wrote. Wait for that publication before draining
         // coalesced alerts, otherwise a trailing OSC 52 can be queued after the
         // pane has already been removed and will be discarded by the timer.
         let mut output = {
@@ -785,9 +785,9 @@ impl RequestHandler {
         };
 
         if output_rx.is_some() {
-            // On Windows the child-exit watcher can beat the ConPTY reader.
-            // Wait for the reader's EOF marker so a final echoed command can be
-            // stripped before the dead-pane message is appended.
+            // The child-exit watcher can beat the PTY reader. Wait for the
+            // reader's EOF marker so a final echoed command can be stripped
+            // before the dead-pane message is appended.
             wait_for_pane_output_eof(output_rx).await;
         }
 
@@ -1088,7 +1088,7 @@ mod tests {
 
         assert!(!output.ensure_eof(false).await);
         sender
-            .send_for_generation(generation, b"late-conpty-tail".to_vec())
+            .send_for_generation(generation, b"late-output-tail".to_vec())
             .expect("late output must remain publishable");
         sender
             .send_for_generation(generation, Vec::new())
@@ -1097,7 +1097,7 @@ mod tests {
         let OutputCursorItem::Event(tail) = stream_receiver.recv().await else {
             panic!("late output must not be preceded by a synthetic EOF");
         };
-        assert_eq!(tail.bytes(), b"late-conpty-tail");
+        assert_eq!(tail.bytes(), b"late-output-tail");
         let OutputCursorItem::Event(eof) = stream_receiver.recv().await else {
             panic!("reader EOF must follow late output");
         };

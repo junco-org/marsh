@@ -3,7 +3,7 @@ use rmux_proto::HookName;
 #[cfg(test)]
 use rmux_proto::{ScopeSelector, SessionName};
 
-use super::{parse_target_spec, TargetSpec};
+use super::{TargetSpec, parse_target_spec};
 
 /// Distinguishes the `set-option` and `set-window-option` spellings that share one argument type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

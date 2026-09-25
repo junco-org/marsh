@@ -402,8 +402,11 @@ impl RequestHandler {
         Factory: FnOnce() -> Fut + Send + 'static,
         Fut: Future<Output = ()> + 'static,
     {
-        self.background_tasks
-            .spawn(thread_name, self.background_task_runtime(thread_name)?, factory)
+        self.background_tasks.spawn(
+            thread_name,
+            self.background_task_runtime(thread_name)?,
+            factory,
+        )
     }
 
     #[cfg(test)]

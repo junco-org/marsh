@@ -11,21 +11,14 @@ use rmux_proto::{
     KillPaneResponse, KillWindowResponse, OptionName, PaneTarget, ProcessCommand, RmuxError,
     SessionName, TerminalPixels, WindowTarget,
 };
-#[cfg(windows)]
-use crate::windows_console_input::WindowsConsoleKeyEvent;
 
 use crate::pane_io::PaneOutputSender;
 use crate::pane_transcript::SharedPaneTranscript;
 use crate::pane_visible_geometry::visible_pane_content_geometry;
 use crate::status_jobs::StatusJobRuntime;
-#[cfg(windows)]
-use crate::terminal::TerminalProfile;
 
 #[path = "pane_terminals/applied_window_resize.rs"]
 mod applied_window_resize;
-#[cfg(windows)]
-#[path = "pane_terminals/deferred_initial.rs"]
-mod deferred_initial;
 #[path = "pane_terminals/lifecycle_state.rs"]
 mod lifecycle_state;
 #[path = "pane_terminals/marked_pane.rs"]
@@ -60,9 +53,9 @@ mod session_mutation;
 #[cfg(test)]
 #[path = "pane_terminals/test_engine.rs"]
 mod test_engine;
+pub(crate) use session_mutation::SessionTransferSnapshot;
 #[cfg(test)]
 pub(crate) use test_engine::{seed_scratch_dir, SeedScratch};
-pub(crate) use session_mutation::SessionTransferSnapshot;
 #[path = "pane_terminals/session_runtime.rs"]
 mod session_runtime;
 #[path = "pane_terminals/window_indices.rs"]
@@ -84,18 +77,17 @@ use lifecycle_state::PaneLifecycleSpawn;
 pub(crate) use lifecycle_state::PaneLifecycleState;
 use marked_pane::MarkedPane;
 pub(crate) use new_pane_command::resolve_new_pane_process_command;
+pub(in crate::pane_terminals) use pane_lifecycle::PlannedPaneTerminal;
 pub(in crate::pane_terminals) use pane_lifecycle::{
     terminate_removed_terminals, LinkedWindowTransferRemovalPlan, PlannedWindowTerminal,
     PreparedWindowTerminal, WindowTerminalCommit,
 };
-pub(in crate::pane_terminals) use pane_lifecycle::PlannedPaneTerminal;
 pub(crate) use pane_outputs::PaneExitMetadata;
 use pane_outputs::{AttachedSubmittedLine, PaneOutputSpawn, RemovedPaneOutputs};
 use pane_pipe::PanePipeStore;
-pub(crate) use pipes::PipePanePlan;
 use pane_terminal_store::PaneTerminalStore;
-#[cfg_attr(windows, allow(unused_imports))]
 pub(crate) use pane_transcripts::PaneCaptureRequest;
+pub(crate) use pipes::PipePanePlan;
 pub(crate) use window_links::WindowLinkOccurrenceId;
 use window_links::{WindowLinkGroup, WindowLinkSlot};
 
@@ -115,18 +107,9 @@ enum WindowNameApplication {
 /// user asked for: automatic closure that `keep` can cancel, and a name they already typed.
 #[derive(Clone)]
 pub(crate) struct WindowSpawnOptions<'a> {
+    /// The directory the pane starts in, or `None` to fall back to the session's and then this
+    /// host's default.
     pub(crate) start_directory: Option<&'a Path>,
-    /// Whether [`start_directory`](Self::start_directory) is a *replay* rather than a request.
-    ///
-    /// A respawn with no `-c` refills the directory from the retiring pane's provenance, which
-    /// for a pane nobody ever gave `-c` is whatever the daemon's own process directory resolved
-    /// to. Nobody asked for that place, so it must fall back to the seed root instead of failing
-    /// the spawn — see [`TerminalProfile::inherit_cwd`](crate::terminal::TerminalProfile::inherit_cwd).
-    ///
-    /// `false` is the strict answer and the right default: a directory the caller *named* and
-    /// that this daemon cannot reach is a request it genuinely cannot honour, and starting
-    /// somewhere else instead would run their command against the wrong tree.
-    pub(crate) inherited_start_directory: bool,
     pub(crate) command: Option<&'a ProcessCommand>,
     pub(crate) socket_path: &'a Path,
     pub(crate) spawn_environment: Option<&'a HashMap<String, String>>,
@@ -148,163 +131,21 @@ pub(crate) struct InitialPaneSpawnOptions<'a> {
     pub(crate) command: Option<&'a ProcessCommand>,
 }
 
-/// A Windows deferred initial pane's job, decided but not yet opened.
-///
-/// This is the deferred path's half of the three-phase pane creation every other path performs:
-/// planned with the handler's state lock held, opened with that lock released, committed with it
-/// taken again. What makes the deferred path different is that its *surface* already exists —
-/// `new-session` has answered, the pane is on screen as `Starting`, and anything typed at it
-/// meanwhile is held in that pane's [`StartingPane`] queue. So the plan carries only the two
-/// things the open itself needs, plus the identity of the surface waiting for the result.
-#[cfg(windows)]
-pub(crate) struct DeferredInitialPaneSpawn {
-    /// What the engine is asked for, including the route this job's bytes are stamped with.
-    request: crate::pane_terminal_process::PaneTerminalRequest,
-    /// The facade the job is admitted through, resolved while the state lock was still held.
-    io: crate::io::ShellIo,
-    /// The pane the opened job is committed into.
-    commit: DeferredInitialPaneCommit,
-}
-
-/// The pane a deferred open has to come back to, whether it succeeded or failed.
-///
-/// Separate from the plan because both outcomes need it: a pane whose job never opened is not
-/// rolled back like a half-created session, it is *told* — the failure is published into the
-/// transcript the prepare already installed, which the user is already looking at.
-#[cfg(windows)]
-pub(crate) struct DeferredInitialPaneCommit {
-    /// Where the pane's surface was installed, as a starting point rather than a trusted name:
-    /// a pane can be moved between runtime sessions while its job opens, so the commit
-    /// re-resolves this by identity.
-    runtime_session_name: SessionName,
-    /// The session a failure names when the pane itself has since disappeared.
-    visible_session_name: SessionName,
-    /// The pane, and the output generation this job's route was installed with.
-    identity: DeferredInitialPaneIdentity,
-}
-
-#[cfg(windows)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct DeferredInitialPaneIdentity {
-    pane_id: PaneId,
-    generation: u64,
-}
-
-#[cfg(windows)]
-impl DeferredInitialPaneIdentity {
-    fn new(pane_id: PaneId, generation: u64) -> Self {
-        Self {
-            pane_id,
-            generation,
-        }
-    }
-
-    pub(crate) fn pane_id(self) -> PaneId {
-        self.pane_id
-    }
-
-    pub(crate) fn generation(self) -> u64 {
-        self.generation
-    }
-}
-
-/// The Windows deferred-initial pane, once its terminal exists.
-///
-/// `input_shell` is the pane's managed facade and generation-bound job handle — the same
-/// `(ShellIo, ShellHandle)` pair every other input path in this daemon writes through, and the
-/// replacement for the pseudoterminal master this used to clone off the pane's PTY. `None` when
-/// nothing was queued while the pane was starting, because there is then nothing to write.
-///
-/// `pane_pid` is the foreground process group of the pane's terminal, and it is genuinely
-/// optional: the pane's shell is embedded in this daemon, so a pane running nothing has no OS
-/// process to name. Only the Windows console-record sinks need one; bytes take the managed
-/// route, which addresses the job rather than a pid.
-#[cfg(windows)]
-pub(crate) struct CompletedDeferredInitialPane {
-    pub(crate) runtime_session_name_hint: SessionName,
-    pub(crate) identity: DeferredInitialPaneIdentity,
-    pub(crate) pane_pid: Option<u32>,
-    pub(crate) input_shell: Option<(crate::io::ShellIo, crate::io::ShellHandle)>,
-    pub(crate) queued_input: Vec<DeferredInitialPaneInput>,
-}
-
-/// One drained batch of startup-queued input, and the pane to replay it into.
-#[cfg(windows)]
-pub(crate) struct DeferredInitialPaneInputFlush {
-    pub(crate) input_shell: (crate::io::ShellIo, crate::io::ShellHandle),
-    pub(crate) pane_pid: Option<u32>,
-    pub(crate) queued_input: Vec<DeferredInitialPaneInput>,
-}
-
-#[cfg(windows)]
-pub(crate) enum DeferredInitialPaneInputDrain {
-    Flush {
-        runtime_session_name: SessionName,
-        flush: DeferredInitialPaneInputFlush,
-    },
-    Finished {
-        runtime_session_name: SessionName,
-    },
-    Missing,
-}
-
-#[cfg(windows)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum DeferredInitialPaneConsoleInputAction {
-    Key(WindowsConsoleKeyEvent),
-    KeyThenInterrupt(WindowsConsoleKeyEvent),
-    Interrupt,
-}
-
 /// Whether a pasted payload carries the bracketed-paste delimiters.
 ///
 /// A pasted body must reach its destination byte for byte either way, so both
-/// dispositions take the same Windows paste sink; a legacy ConPTY parses and
-/// consumes control sequences written through the raw input pipe whether or
-/// not an envelope surrounds them. The disposition only decides what a payload
-/// the console records cannot represent means: losing an envelope leaves a
-/// paste the destination asked for delivered as live input, while a bare body
-/// has no envelope to lose and keeps the byte-oriented path.
+/// dispositions take the same pane input sink; a pane consumes control
+/// sequences written to its input whether or not an envelope surrounds them.
+/// The disposition only decides what a payload that cannot carry an envelope
+/// means: losing an envelope leaves a paste the destination asked for
+/// delivered as live input, while a bare body has no envelope to lose and
+/// keeps the byte-oriented path.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PasteDelimiters {
     /// The destination announced `?2004h`, so the payload is wrapped.
     Wrapped,
     /// The destination never announced it, so the payload is the bare body.
     Bare,
-}
-
-#[cfg(windows)]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum DeferredInitialPaneInput {
-    Bytes(Vec<u8>),
-    Paste {
-        bytes: Vec<u8>,
-        delimiters: PasteDelimiters,
-    },
-    Console {
-        action: DeferredInitialPaneConsoleInputAction,
-        byte_len: usize,
-    },
-}
-
-#[cfg(windows)]
-impl DeferredInitialPaneInput {
-    fn byte_len(&self) -> usize {
-        match self {
-            Self::Bytes(bytes) | Self::Paste { bytes, .. } => bytes.len(),
-            Self::Console { byte_len, .. } => *byte_len,
-        }
-    }
-}
-
-#[cfg(windows)]
-#[derive(Debug)]
-struct StartingPane {
-    profile: TerminalProfile,
-    runtime_window_name: Option<String>,
-    generation: u64,
-    queued_input: VecDeque<DeferredInitialPaneInput>,
-    queued_input_bytes: usize,
 }
 
 pub(crate) struct NewWindowOptions<'a> {
@@ -329,7 +170,7 @@ pub(crate) struct HandlerState {
     pub(crate) retained_lifecycle_targets:
         StdMutex<crate::handler::RetainedLifecycleTargetRegistry>,
     pub(crate) message_log: VecDeque<MessageEntry>,
-    /// Windows whose stored geometry this server changed and whose
+    /// Session windows whose stored geometry this server changed and whose
     /// `window-layout-changed` / `window-resized` notifications have not been
     /// published yet.
     ///
@@ -345,8 +186,6 @@ pub(crate) struct HandlerState {
     startup_config_files: String,
     next_message_number: u64,
     terminals: PaneTerminalStore,
-    #[cfg(windows)]
-    starting_panes: HashMap<SessionName, HashMap<PaneId, StartingPane>>,
     transcripts: HashMap<SessionName, HashMap<PaneId, SharedPaneTranscript>>,
     pane_outputs: HashMap<SessionName, HashMap<PaneId, PaneOutputSender>>,
     pane_output_generations: HashMap<SessionName, HashMap<PaneId, u64>>,
@@ -599,7 +438,6 @@ impl HandlerState {
         }
     }
 
-    #[cfg(unix)]
     pub(crate) fn continue_stopped_panes(&mut self) {
         self.terminals.continue_stopped_panes();
     }
@@ -715,13 +553,11 @@ mod tests {
     };
     use rmux_core::{PaneGeometry, Session};
     use rmux_proto::{
-        HookLifecycle, HookName, OptionName, PaneTarget, RmuxError, ScopeSelector, SessionName,
-        SetOptionMode, TerminalSize, WindowTarget,
+        HookLifecycle, HookName, OptionName, PaneTarget, RmuxError, ScopeSelector, SetOptionMode,
+        TerminalSize, WindowTarget,
     };
 
-    fn session_name(value: &str) -> SessionName {
-        SessionName::new(value).expect("valid session name")
-    }
+    use crate::test_names::session_name;
 
     #[test]
     fn session_content_rows_are_not_reconverted_from_terminal_status() {

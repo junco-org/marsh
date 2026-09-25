@@ -1,12 +1,8 @@
 use super::{CursorScope, OuterTerminal, OuterTerminalContext};
 use rmux_core::{OptionStore, Session};
-use rmux_proto::{
-    ClientTerminalContext, OptionName, ScopeSelector, SessionName, SetOptionMode, TerminalSize,
-};
+use rmux_proto::{ClientTerminalContext, OptionName, ScopeSelector, SetOptionMode, TerminalSize};
 
-fn session_name(value: &str) -> SessionName {
-    SessionName::new(value).expect("valid session name")
-}
+use crate::test_names::session_name;
 
 fn make_session() -> Session {
     Session::new(session_name("alpha"), TerminalSize { cols: 80, rows: 24 })
@@ -511,8 +507,8 @@ fn render_prelude_leaves_a_title_incapable_terminal_alone() {
     let options = OptionStore::new();
     let terminal = OuterTerminal::resolve(
         &options,
-        // No TERM at all: the Windows Terminal case from issue #182, where no
-        // terminal family and no XT flag supply a title capability.
+        // No TERM at all: the issue #182 case, where no terminal family and no
+        // XT flag supply a title capability.
         OuterTerminalContext::default(),
     );
     assert!(
@@ -689,8 +685,8 @@ fn title_capable_outer_terminal() -> OuterTerminal {
     title_capable_terminal(&title_capable_options())
 }
 
-/// No TERM at all: the Windows Terminal case from issue #182, where no terminal
-/// family and no XT flag supply a title capability.
+/// No TERM at all: the issue #182 case, where no terminal family and no XT flag
+/// supply a title capability.
 fn title_incapable_outer_terminal() -> OuterTerminal {
     OuterTerminal::resolve(&OptionStore::new(), OuterTerminalContext::default())
 }

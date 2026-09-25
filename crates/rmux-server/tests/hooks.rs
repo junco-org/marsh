@@ -1,5 +1,3 @@
-#![cfg(unix)]
-
 use std::error::Error;
 use std::fs;
 use std::io;
@@ -23,7 +21,7 @@ const ATTACH_SETTLE_DELAY: Duration = Duration::from_millis(50);
 const STEP_TIMEOUT: Duration = Duration::from_millis(150);
 const WAIT_TIMEOUT: Duration = Duration::from_secs(2);
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn persistent_client_attached_hooks_run_on_every_attach() -> Result<(), Box<dyn Error>> {
     let harness = TestHarness::new("persistent-client-attached-hook");
     let socket_path = harness.socket_path().to_path_buf();
@@ -48,7 +46,7 @@ async fn persistent_client_attached_hooks_run_on_every_attach() -> Result<(), Bo
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn one_shot_client_attached_hooks_are_removed_after_dispatch() -> Result<(), Box<dyn Error>> {
     let harness = TestHarness::new("oneshot-client-attached-hook");
     let socket_path = harness.socket_path().to_path_buf();
@@ -76,7 +74,7 @@ async fn one_shot_client_attached_hooks_are_removed_after_dispatch() -> Result<(
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn session_scoped_hooks_are_cleared_when_sessions_are_killed() -> Result<(), Box<dyn Error>> {
     let harness = TestHarness::new("session-hook-cleanup-on-kill");
     let socket_path = harness.socket_path().to_path_buf();
@@ -118,7 +116,7 @@ async fn session_scoped_hooks_are_cleared_when_sessions_are_killed() -> Result<(
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn session_created_hooks_run_only_after_successful_creates() -> Result<(), Box<dyn Error>> {
     let harness = TestHarness::new("session-created-hook");
     let socket_path = harness.socket_path().to_path_buf();
@@ -160,7 +158,7 @@ async fn session_created_hooks_run_only_after_successful_creates() -> Result<(),
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn slow_hooks_do_not_block_attach_completion() -> Result<(), Box<dyn Error>> {
     let harness = TestHarness::new("nonblocking-client-attached-hook");
     let socket_path = harness.socket_path().to_path_buf();
@@ -199,7 +197,7 @@ async fn slow_hooks_do_not_block_attach_completion() -> Result<(), Box<dyn Error
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn invalid_hook_event_wire_values_are_rejected() -> Result<(), Box<dyn Error>> {
     let harness = TestHarness::new("invalid-hook-event");
     let socket_path = harness.socket_path().to_path_buf();

@@ -8,8 +8,6 @@ use rmux_proto::{
     ShowEnvironmentResponse, ShowHooksResponse, ShowOptionsResponse, WindowTarget,
 };
 
-#[cfg(windows)]
-use super::pane_support::format_references_pane_pid;
 use super::RequestHandler;
 use crate::format_runtime::render_runtime_template;
 use crate::handler_support::{ensure_option_scope_exists, ensure_scope_session_exists};
@@ -40,11 +38,6 @@ impl RequestHandler {
 
         if let Err(error) = validate_set_environment_request(&request) {
             return Response::Error(ErrorResponse { error });
-        }
-
-        #[cfg(windows)]
-        if request.format && format_references_pane_pid(Some(&request.value)) {
-            self.wait_for_windows_deferred_all_pane_pids().await;
         }
 
         let mut state = self.state.lock().await;

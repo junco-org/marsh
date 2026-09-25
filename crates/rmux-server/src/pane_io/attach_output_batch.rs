@@ -1,19 +1,13 @@
-#[cfg(any(unix, windows))]
 use rmux_core::events::OutputCursorItem;
-#[cfg(any(unix, windows))]
 use rmux_core::TerminalPassthrough;
 
-#[cfg(any(unix, windows))]
 use super::types::PaneOutputReceiver;
-#[cfg(any(unix, windows))]
 use super::wire::warn_pane_output_gap;
 
-#[cfg(any(unix, windows))]
 const ATTACH_OUTPUT_BATCH_LIMIT: usize = 64;
 const ATTACH_SUSTAINED_OUTPUT_BATCH_BYTES: usize = 256 * 1024;
 const ATTACH_SUSTAINED_OUTPUT_BATCH_EVENTS: usize = ATTACH_OUTPUT_BATCH_LIMIT;
 
-#[cfg(any(unix, windows))]
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum AttachOutputBatch {
     Closed,
@@ -28,7 +22,6 @@ pub(super) enum AttachOutputBatch {
     },
 }
 
-#[cfg(any(unix, windows))]
 impl AttachOutputBatch {
     /// A same-source render refresh partitions output at its receiver start:
     /// the snapshot covers older bytes, while its new receiver owns bytes at
@@ -62,7 +55,6 @@ impl AttachOutputBatch {
     }
 }
 
-#[cfg(any(unix, windows))]
 pub(super) fn collect_attach_output_batch(
     first_item: OutputCursorItem,
     receiver: Option<&mut PaneOutputReceiver>,
@@ -70,7 +62,6 @@ pub(super) fn collect_attach_output_batch(
     collect_attach_output_batch_with_mode(first_item, receiver, ByteCollection::Collect)
 }
 
-#[cfg(any(unix, windows))]
 pub(super) fn collect_attach_output_batch_metadata(
     first_item: OutputCursorItem,
     receiver: Option<&mut PaneOutputReceiver>,
@@ -78,7 +69,6 @@ pub(super) fn collect_attach_output_batch_metadata(
     collect_attach_output_batch_with_mode(first_item, receiver, ByteCollection::Skip)
 }
 
-#[cfg(any(unix, windows))]
 fn collect_attach_output_batch_with_mode(
     first_item: OutputCursorItem,
     receiver: Option<&mut PaneOutputReceiver>,
@@ -106,7 +96,6 @@ fn collect_attach_output_batch_with_mode(
     batch.finish()
 }
 
-#[cfg(any(unix, windows))]
 #[derive(Default)]
 struct AttachOutputBatchBuilder {
     byte_collection: ByteCollection,
@@ -121,7 +110,6 @@ struct AttachOutputBatchBuilder {
     close_sequence: Option<u64>,
 }
 
-#[cfg(any(unix, windows))]
 impl AttachOutputBatchBuilder {
     fn new(byte_collection: ByteCollection) -> Self {
         Self {
@@ -203,7 +191,6 @@ impl AttachOutputBatchBuilder {
     }
 }
 
-#[cfg(any(unix, windows))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum ByteCollection {
     #[default]
@@ -211,13 +198,12 @@ enum ByteCollection {
     Skip,
 }
 
-#[cfg(any(unix, windows))]
 enum GapLog {
     AlreadyLogged,
     Log,
 }
 
-#[cfg(all(test, any(unix, windows)))]
+#[cfg(all(test, unix))]
 mod tests {
     use rmux_core::events::OutputCursorItem;
     use rmux_core::TerminalPassthrough;

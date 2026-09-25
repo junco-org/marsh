@@ -855,15 +855,12 @@ mod tests {
 
     use rmux_core::{input::InputParser, OptionStore, Screen, Session};
     use rmux_proto::{
-        OptionName, ScopeSelector, SessionName, SetOptionMode, SplitDirection, TerminalSize,
-        WindowTarget,
+        OptionName, ScopeSelector, SetOptionMode, SplitDirection, TerminalSize, WindowTarget,
     };
 
     use super::{PaneRenderDelta, PaneRenderSnapshot};
 
-    fn session_name(value: &str) -> SessionName {
-        SessionName::new(value).expect("valid session name")
-    }
+    use crate::test_names::session_name;
 
     fn screen_with(bytes: &[u8]) -> Screen {
         let mut screen = Screen::new(TerminalSize { cols: 10, rows: 3 }, 100);

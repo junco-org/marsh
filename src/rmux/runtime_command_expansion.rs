@@ -3,9 +3,8 @@ use std::fmt;
 
 use rmux_client::{ClientError, Connection};
 use rmux_proto::{
-    encode_internal_runtime_command_arguments, Response, RmuxError,
     CAPABILITY_CLI_RUNTIME_COMMAND_EXPANSION, INTERNAL_RUNTIME_COMMAND_EXPANSION_PATH,
-    RMUX_WIRE_VERSION,
+    RMUX_WIRE_VERSION, Response, RmuxError, encode_internal_runtime_command_arguments,
 };
 
 /// Why a server-side runtime command expansion attempt failed.

@@ -8,13 +8,11 @@ use rmux_core::{
     OptionStore, Screen, Session, Style, Utf8Config,
 };
 use rmux_proto::{
-    OptionName, ResizePaneAdjustment, ScopeSelector, SessionName, SetOptionMode, SplitDirection,
-    TerminalSize, WindowTarget,
+    OptionName, ResizePaneAdjustment, ScopeSelector, SetOptionMode, SplitDirection, TerminalSize,
+    WindowTarget,
 };
 
-fn session_name(value: &str) -> SessionName {
-    SessionName::new(value).expect("valid session name")
-}
+use crate::test_names::session_name;
 
 fn session_with_three_panes() -> Session {
     let mut session = Session::new(session_name("alpha"), TerminalSize { cols: 80, rows: 24 });
@@ -82,11 +80,7 @@ async fn render_until_contains(session: &Session, options: &OptionStore, needle:
 }
 
 fn status_job_test_deadline() -> std::time::Duration {
-    if cfg!(windows) {
-        std::time::Duration::from_secs(10)
-    } else {
-        std::time::Duration::from_secs(2)
-    }
+    std::time::Duration::from_secs(2)
 }
 
 fn copy_mode_summary_with_time(top_line_time: i64) -> CopyModeSummary {

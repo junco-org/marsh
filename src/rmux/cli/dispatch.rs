@@ -3,12 +3,12 @@ use std::path::Path;
 
 use rmux_client::connect;
 use rmux_proto::{
-    ClientTerminalContext, CopyModeRequest, ErrorResponse, LayoutName, Response,
-    INTERNAL_PARSE_TIME_ASSIGNMENTS_PATH,
+    ClientTerminalContext, CopyModeRequest, ErrorResponse, INTERNAL_PARSE_TIME_ASSIGNMENTS_PATH,
+    LayoutName, Response,
 };
 
 use super::attach_transport::{
-    queued_attach_session_is_active, QueuedAttachSession, QueuedAttachSessionResult,
+    QueuedAttachSession, QueuedAttachSessionResult, queued_attach_session_is_active,
 };
 use super::automation::{
     run_broadcast_keys, run_collect_pane_output, run_expect_pane, run_find_panes,
@@ -54,7 +54,7 @@ use super::window_commands::{
     run_new_window, run_next_window, run_previous_window, run_rename_window, run_resize_window,
     run_respawn_window, run_rotate_window, run_select_window, run_swap_window, run_unlink_window,
 };
-use super::{connect_with_startserver, ExitFailure, StartupOptions};
+use super::{ExitFailure, StartupOptions, connect_with_startserver};
 use crate::cli_args::{
     Command, NewSessionArgs, SelectLayoutMode, SetOptionCommandKind, ShowOptionsCommandKind,
 };
@@ -127,9 +127,9 @@ fn dispatch_commands(
         .any(|command| matches!(command, Command::StartServer(_)));
     for (index, command) in commands.iter().cloned().enumerate() {
         // A queued command may auto-start the daemon on a different endpoint
-        // than the one resolved at process start (Windows rotates a stale
-        // managed generation), so every later command follows the daemon the
-        // queue is actually talking to.
+        // than the one resolved at process start (auto-start rotates away from
+        // a stale managed generation), so every later command follows the
+        // daemon the queue is actually talking to.
         let current_socket_path = startup.socket_path();
         let socket_path = current_socket_path.as_path();
         let command_is_detach_client = matches!(&command, Command::DetachClient(_));
@@ -397,9 +397,7 @@ fn dispatch(
                         args.target.as_ref(),
                         "select-layout",
                     )?;
-                    connection
-                        .next_layout(target)
-                        .map_err(ExitFailure::from)
+                    connection.next_layout(target).map_err(ExitFailure::from)
                 });
             }
             if mode == Some(SelectLayoutMode::Previous) {
@@ -422,9 +420,7 @@ fn dispatch(
                             resolve_window_target_or_current(connection, None, "select-layout")?,
                         ),
                     };
-                    connection
-                        .spread_layout(target)
-                        .map_err(ExitFailure::from)
+                    connection.spread_layout(target).map_err(ExitFailure::from)
                 });
             }
             if mode == Some(SelectLayoutMode::Old) && args.layout.is_none() {
@@ -473,9 +469,7 @@ fn dispatch(
                     args.target.as_ref(),
                     "next-layout",
                 )?;
-                connection
-                    .next_layout(target)
-                    .map_err(ExitFailure::from)
+                connection.next_layout(target).map_err(ExitFailure::from)
             })
         }
         Command::PreviousLayout(args) => {
@@ -543,9 +537,7 @@ fn dispatch(
                     .as_ref()
                     .map(|target| resolve_pane_target_spec(connection, target))
                     .transpose()?;
-                connection
-                    .clock_mode(target)
-                    .map_err(ExitFailure::from)
+                connection.clock_mode(target).map_err(ExitFailure::from)
             })
         }
         Command::WaitPane(args) => run_wait_pane(&args, socket_path),

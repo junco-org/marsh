@@ -73,11 +73,7 @@ async fn live_attach_one_mebibyte_bracketed_paste_has_bounded_work() {
 
     let mut pending_input = Vec::new();
     tokio::time::timeout(
-        if cfg!(windows) {
-            Duration::from_secs(60)
-        } else {
-            Duration::from_secs(2)
-        },
+        Duration::from_secs(2),
         handler.handle_attached_live_input(requester_pid, &mut pending_input, &input),
     )
     .await

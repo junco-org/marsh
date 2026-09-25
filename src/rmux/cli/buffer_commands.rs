@@ -1,7 +1,7 @@
 use std::io::Read;
 use std::path::Path;
 
-use super::{run_command, run_payload_command, ExitFailure};
+use super::{ExitFailure, run_command, run_payload_command};
 use crate::cli_args::{LoadBufferArgs, SaveBufferArgs};
 
 /// Runs `load-buffer`, reading the buffer from stdin when the path is `-`.

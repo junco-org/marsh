@@ -135,12 +135,7 @@ fn split_top_level_prefix(arguments: &[OsString]) -> Option<usize> {
 }
 
 /// Reports whether `value` is a clustered short flag whose letters all appear in `allowed`.
-fn is_short_flag_cluster(value: &str, allowed: &str) -> bool {
-    value.len() > 2
-        && value.starts_with('-')
-        && !value.starts_with("--")
-        && value.chars().skip(1).all(|flag| allowed.contains(flag))
-}
+use super::is_short_flag_cluster;
 
 /// Prints whether this binary was invoked through a `tmux` shim, plus setup hints.
 fn run_doctor(argv0: Option<&OsString>) -> Result<i32, ExitFailure> {
@@ -171,7 +166,6 @@ fn run_doctor(argv0: Option<&OsString>) -> Result<i32, ExitFailure> {
 }
 
 /// Links `~/.local/bin/tmux` at the public `rmux` binary, refusing to clobber real files.
-#[cfg(unix)]
 fn run_setup_tmux_shim(argv0: Option<&OsString>) -> Result<i32, ExitFailure> {
     use std::fs;
     use std::os::unix::fs::symlink;
@@ -266,14 +260,12 @@ fn run_setup_tmux_shim(argv0: Option<&OsString>) -> Result<i32, ExitFailure> {
 }
 
 /// The shim's symlink destination plus the canonical `rmux` executable it resolves to.
-#[cfg(unix)]
 struct SetupTmuxShimTarget {
     link_target: std::path::PathBuf,
     executable: std::path::PathBuf,
 }
 
 /// Resolves the shim's link target, honouring the internal public-binary path override.
-#[cfg(unix)]
 fn setup_tmux_shim_target(argv0: Option<&OsString>) -> Result<SetupTmuxShimTarget, ExitFailure> {
     const PUBLIC_BINARY_OVERRIDE_ENV: &str = "RMUX_INTERNAL_PUBLIC_BINARY_PATH";
 
@@ -297,7 +289,6 @@ fn setup_tmux_shim_target(argv0: Option<&OsString>) -> Result<SetupTmuxShimTarge
 }
 
 /// Returns the stable `rmux` path that `argv0` names, when it is the same binary.
-#[cfg(unix)]
 fn stable_rmux_invocation_path(
     argv0: Option<&OsString>,
     public_binary: &Path,
@@ -320,7 +311,6 @@ fn stable_rmux_invocation_path(
 }
 
 /// Makes `path` absolute by joining the process cwd, without resolving symlinks.
-#[cfg(unix)]
 fn absolute_without_resolving_links(path: &Path) -> Option<std::path::PathBuf> {
     if path.is_absolute() {
         Some(path.to_path_buf())
@@ -330,7 +320,6 @@ fn absolute_without_resolving_links(path: &Path) -> Option<std::path::PathBuf> {
 }
 
 /// Reports whether `shim` points at an older `rmux` from the same package root.
-#[cfg(unix)]
 fn symlink_is_previous_packaged_rmux(shim: &Path, current_executable: &Path) -> bool {
     let Ok(target) = std::fs::read_link(shim) else {
         return false;
@@ -344,7 +333,6 @@ fn symlink_is_previous_packaged_rmux(shim: &Path, current_executable: &Path) -> 
 }
 
 /// The package manager tree a packaged `rmux` binary lives under.
-#[cfg(unix)]
 #[derive(Clone, Copy)]
 enum PackagedRmuxRoot<'a> {
     Homebrew(&'a Path),
@@ -352,7 +340,6 @@ enum PackagedRmuxRoot<'a> {
 }
 
 /// Reports whether both paths are packaged by the same manager under one root.
-#[cfg(unix)]
 fn same_packaged_rmux_lineage(left: &Path, right: &Path) -> bool {
     let roots = match (packaged_rmux_root(left), packaged_rmux_root(right)) {
         (Some(PackagedRmuxRoot::Homebrew(left)), Some(PackagedRmuxRoot::Homebrew(right)))
@@ -368,7 +355,6 @@ fn same_packaged_rmux_lineage(left: &Path, right: &Path) -> bool {
 }
 
 /// Classifies `binary` as a Homebrew Cellar or Nix store installation of `rmux`.
-#[cfg(unix)]
 fn packaged_rmux_root(binary: &Path) -> Option<PackagedRmuxRoot<'_>> {
     if binary.file_name()? != OsStr::new("rmux") {
         return None;
@@ -397,7 +383,6 @@ fn packaged_rmux_root(binary: &Path) -> Option<PackagedRmuxRoot<'_>> {
 }
 
 /// Reports whether a Nix store directory name is an `rmux` derivation.
-#[cfg(unix)]
 fn nix_derivation_is_rmux(name: &OsStr) -> bool {
     let Some(name) = name.to_str() else {
         return false;
@@ -420,7 +405,6 @@ fn nix_derivation_is_rmux(name: &OsStr) -> bool {
 }
 
 /// Atomically repoints `shim` at `target`, failing if the link changed meanwhile.
-#[cfg(unix)]
 fn replace_symlink(shim: &Path, target: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::symlink;
 
@@ -463,7 +447,6 @@ fn replace_symlink(shim: &Path, target: &Path) -> std::io::Result<()> {
 }
 
 /// Reports whether `shim` is a symlink resolving to `target`.
-#[cfg(unix)]
 fn symlink_points_to(shim: &Path, target: &Path) -> bool {
     let Ok(link_target) = std::fs::read_link(shim) else {
         return false;
@@ -479,7 +462,6 @@ fn symlink_points_to(shim: &Path, target: &Path) -> bool {
 }
 
 /// Reports whether both paths canonicalize to the same file.
-#[cfg(unix)]
 fn paths_resolve_to_same_file(left: &Path, right: &Path) -> bool {
     let Ok(left) = std::fs::canonicalize(left) else {
         return false;
@@ -488,15 +470,6 @@ fn paths_resolve_to_same_file(left: &Path, right: &Path) -> bool {
         return false;
     };
     left == right
-}
-
-/// Rejects shim setup on platforms without Unix symlink support.
-#[cfg(not(unix))]
-fn run_setup_tmux_shim(_argv0: Option<&OsString>) -> Result<i32, ExitFailure> {
-    Err(ExitFailure::new(
-        1,
-        "rmux setup tmux-shim is only supported on Unix-like systems",
-    ))
 }
 
 /// Writes `output` to stdout, treating a broken pipe as success.
@@ -514,11 +487,9 @@ fn write_stdout(output: &str, context: &str) -> Result<i32, ExitFailure> {
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 mod tests {
-    #[cfg(unix)]
     use super::same_packaged_rmux_lineage;
-    use super::{parse_invocation, DropinInvocation};
+    use super::{DropinInvocation, parse_invocation};
     use std::ffi::OsString;
-    #[cfg(unix)]
     use std::path::Path;
 
     fn args(values: &[&str]) -> Vec<OsString> {
@@ -554,12 +525,13 @@ mod tests {
 
     #[test]
     fn ignores_other_commands() {
-        assert!(parse_invocation(&args(&["list-sessions"]))
-            .expect("parse succeeds")
-            .is_none());
+        assert!(
+            parse_invocation(&args(&["list-sessions"]))
+                .expect("parse succeeds")
+                .is_none()
+        );
     }
 
-    #[cfg(unix)]
     #[test]
     fn recognizes_versions_of_the_same_homebrew_formula() {
         assert!(same_packaged_rmux_lineage(
@@ -572,7 +544,6 @@ mod tests {
         ));
     }
 
-    #[cfg(unix)]
     #[test]
     fn recognizes_versions_from_the_same_nix_store() {
         assert!(same_packaged_rmux_lineage(

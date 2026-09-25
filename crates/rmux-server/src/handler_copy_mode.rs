@@ -786,20 +786,7 @@ fn copy_mode_context(
             target.pane_index(),
         )
         .ok();
-    #[cfg(unix)]
     let default_shell = "/bin/sh".to_owned();
-    #[cfg(not(unix))]
-    let default_shell = pane_profile
-        .as_ref()
-        .map(|profile| profile.shell().to_string_lossy().into_owned())
-        .or_else(|| {
-            state
-                .options
-                .resolve(Some(target.session_name()), OptionName::DefaultShell)
-                .filter(|value| !value.is_empty())
-                .map(str::to_owned)
-        })
-        .unwrap_or_else(process_default_shell);
     let pane_cwd = pane_profile.map(|profile| profile.cwd().to_path_buf());
     let working_directory = state
         .sessions
@@ -895,8 +882,7 @@ fn percent_decode_path(path: &str) -> Option<String> {
             index += 1;
         }
     }
-    let decoded = String::from_utf8(decoded).ok()?;
-    Some(normalize_file_url_path_for_platform(decoded))
+    String::from_utf8(decoded).ok()
 }
 
 fn hex_value(byte: u8) -> Option<u8> {
@@ -906,28 +892,4 @@ fn hex_value(byte: u8) -> Option<u8> {
         b'A'..=b'F' => Some(byte - b'A' + 10),
         _ => None,
     }
-}
-
-#[cfg(windows)]
-fn normalize_file_url_path_for_platform(mut path: String) -> String {
-    let bytes = path.as_bytes();
-    if bytes.len() >= 3 && bytes[0] == b'/' && bytes[1].is_ascii_alphabetic() && bytes[2] == b':' {
-        path.remove(0);
-    }
-    path
-}
-
-#[cfg(not(windows))]
-fn normalize_file_url_path_for_platform(path: String) -> String {
-    path
-}
-
-#[cfg(windows)]
-fn process_default_shell() -> String {
-    std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_owned())
-}
-
-#[cfg(not(any(unix, windows)))]
-fn process_default_shell() -> String {
-    "sh".to_owned()
 }

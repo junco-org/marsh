@@ -4,7 +4,6 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
 use super::super::RequestHandler;
@@ -71,23 +70,8 @@ async fn create_session(handler: &RequestHandler, name: &str, size: TerminalSize
     PaneTarget::with_window(session_name, 0, 0)
 }
 
-#[cfg(unix)]
 fn quiet_copy_mode_command() -> Vec<String> {
     vec!["/bin/sh".to_owned(), "-c".to_owned(), "sleep 60".to_owned()]
-}
-
-#[cfg(windows)]
-fn quiet_copy_mode_command() -> Vec<String> {
-    let system_root =
-        std::env::var_os("SystemRoot").unwrap_or_else(|| std::ffi::OsString::from(r"C:\Windows"));
-    let cmd = PathBuf::from(system_root).join("System32").join("cmd.exe");
-    vec![
-        cmd.to_string_lossy().into_owned(),
-        "/d".to_owned(),
-        "/q".to_owned(),
-        "/c".to_owned(),
-        "ping -n 120 127.0.0.1 >NUL".to_owned(),
-    ]
 }
 
 async fn replace_transcript_contents(
@@ -303,27 +287,14 @@ async fn wait_for_file_contents(path: &Path, expected: &str) -> String {
     })
 }
 
-#[cfg(unix)]
 fn stdin_to_file_command(path: &Path) -> String {
     format!("cat > {}", crate::test_shell::sh_quote_path(path))
 }
 
-#[cfg(unix)]
 fn stdin_to_relative_file_command(name: &str) -> String {
     format!("cat > {}", crate::test_shell::sh_quote(name))
 }
 
-#[cfg(windows)]
-fn stdin_to_file_command(path: &Path) -> String {
-    let quoted_path = crate::test_shell::powershell_quote_path(path);
-    crate::test_shell::powershell_encoded_command(&format!(
-        "$inputStream=[Console]::OpenStandardInput(); \
-         $output=[System.IO.File]::Create({quoted_path}); \
-         try {{ $inputStream.CopyTo($output) }} finally {{ $output.Dispose() }}"
-    ))
-}
-
-#[cfg(unix)]
 fn file_url_path(path: &Path) -> String {
     path.to_string_lossy().replace(' ', "%20")
 }
@@ -348,7 +319,6 @@ async fn set_copy_command(handler: &RequestHandler, command: String) {
     );
 }
 
-#[cfg(unix)]
 async fn set_default_shell(handler: &RequestHandler, shell: &Path) {
     let response = handler
         .handle(Request::SetOptionByName(Box::new(SetOptionByNameRequest {
@@ -1067,7 +1037,6 @@ async fn copy_mode_buffer_yank_emits_clipboard_when_set_clipboard_enabled() {
     assert_eq!(bytes, b"\x1b]52;;bmVlZGxlIGNsaXBib2FyZA==\x07");
 }
 
-#[cfg(unix)]
 fn write_executable_script(path: &Path, contents: &str) {
     fs::write(path, contents).expect("write script");
     let mut permissions = fs::metadata(path).expect("script metadata").permissions();
@@ -1075,7 +1044,6 @@ fn write_executable_script(path: &Path, contents: &str) {
     fs::set_permissions(path, permissions).expect("script permissions");
 }
 
-#[cfg(unix)]
 #[tokio::test]
 async fn copy_pipe_uses_local_osc7_file_url_as_working_directory() {
     let handler = RequestHandler::new();
@@ -1146,7 +1114,6 @@ async fn copy_pipe_uses_local_osc7_file_url_as_working_directory() {
     assert!(output.contains("needle osc7 cwd"));
 }
 
-#[cfg(unix)]
 #[tokio::test]
 async fn copy_pipe_uses_bin_sh_instead_of_default_shell_like_tmux() {
     let handler = RequestHandler::new();

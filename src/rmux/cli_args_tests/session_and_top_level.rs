@@ -377,9 +377,11 @@ fn new_session_rejects_unknown_flags_before_shell_command() {
     let error = parse_args(&["new-session", "-d", "-Z", "-s", "alpha"]).unwrap_err();
 
     assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
-    assert!(error
-        .to_string()
-        .contains("command new-session: unknown flag -Z"));
+    assert!(
+        error
+            .to_string()
+            .contains("command new-session: unknown flag -Z")
+    );
 }
 
 #[test]

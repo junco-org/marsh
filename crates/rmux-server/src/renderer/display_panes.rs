@@ -456,12 +456,10 @@ mod tests {
     use super::*;
     use rmux_core::{OptionStore, Session};
     use rmux_proto::{
-        ResizePaneAdjustment, ScopeSelector, SessionName, SetOptionMode, TerminalSize, WindowTarget,
+        ResizePaneAdjustment, ScopeSelector, SetOptionMode, TerminalSize, WindowTarget,
     };
 
-    fn session_name(value: &str) -> SessionName {
-        SessionName::new(value).expect("valid session name")
-    }
+    use crate::test_names::session_name;
 
     #[test]
     fn display_panes_overlay_places_labels_at_pane_centers() {

@@ -1,4 +1,5 @@
 use super::*;
+use crate::handler::test_support::spawn_accounted_attach_control_drain;
 use rmux_core::{input::InputParser, Screen};
 
 const SIZE: TerminalSize = TerminalSize { cols: 20, rows: 5 };

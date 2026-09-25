@@ -9,8 +9,6 @@ use rmux_proto::{
 use super::super::control_support::{
     current_control_queue_identity, with_control_queue_identity, ControlClientIdentity,
 };
-#[cfg(windows)]
-use super::super::pane_support::format_references_pane_pid;
 use super::super::target_support::{pane_id_target, requester_environment_pane_id};
 use super::super::{
     attach_support::ActiveAttachIdentity, current_expected_attach_identity,
@@ -201,11 +199,16 @@ impl RequestHandler {
             let handler = self.clone();
             let hook_formats = current_hook_formats();
             let hook_execution = current_hook_execution();
+            let logged_command = request.command.clone();
             if let Err(error) = self.spawn_background_task("rmux-run-shell", move || async move {
                 let task = async move {
                     let _detached_request_guard = detached_request_guard;
                     let _requester_access_guard = requester_access_guard;
-                    let _ = handler
+                    // A background `run-shell` answered `background()` the moment it was accepted,
+                    // so its caller has no error channel left. Dropping the failure here is how a
+                    // command that never ran leaves no trace at all; the diagnostic log is the
+                    // only place an operator can still see it.
+                    if let Err(error) = handler
                         .run_shell_task(
                             requester_pid,
                             request,
@@ -214,7 +217,14 @@ impl RequestHandler {
                             target_missing_canfail,
                             queue_state,
                         )
-                        .await;
+                        .await
+                    {
+                        crate::diagnostic_log::record_workload_not_run(
+                            "run-shell-background",
+                            &logged_command,
+                            &error.to_string(),
+                        );
+                    }
                 };
                 with_background_client_identities(control_identity, attach_identity, async move {
                     match hook_execution {
@@ -454,12 +464,7 @@ impl RequestHandler {
         // caller reading its output has to be able to see that nothing reached the seed.
         let unapproved = (!output.completion.is_published())
             .then(|| crate::managed_workload::completion_report(&output.completion));
-        let mut stdout = run_shell_stdout_for_response(
-            output.stdout,
-            &command,
-            exit_status,
-            None,
-        );
+        let mut stdout = run_shell_stdout_for_response(output.stdout, &command, exit_status, None);
         if let Some(report) = unapproved {
             stdout.extend_from_slice(report.as_bytes());
         }
@@ -769,10 +774,6 @@ impl RequestHandler {
         client_name: Option<&str>,
         target_missing_canfail: bool,
     ) -> Result<String, RmuxError> {
-        #[cfg(windows)]
-        if format_references_pane_pid(Some(&request.command)) {
-            self.wait_for_windows_deferred_all_pane_pids().await;
-        }
         let target = request.target.as_ref();
         let attached_count = if let Some(target) = target {
             self.attached_count(target.session_name()).await
@@ -823,6 +824,9 @@ impl RequestHandler {
             .as_ref()
             .and_then(|target| base_environment_for_target(&state, target));
 
+        // The caller's own directory stays authoritative; this host's default is what is left
+        // when it named none.
+        let io = crate::managed_workload::handler_facade(self)?;
         TerminalProfile::for_run_shell(
             &state.environment,
             &state.options,
@@ -832,7 +836,12 @@ impl RequestHandler {
             base_environment.as_ref(),
             !self.config_loading_active(),
             None,
-            request.caller_cwd.as_deref(),
+            Some(
+                request
+                    .caller_cwd
+                    .as_deref()
+                    .unwrap_or_else(|| io.default_dir()),
+            ),
         )
     }
 
@@ -841,10 +850,6 @@ impl RequestHandler {
         request: &IfShellRequest,
         client_name: Option<&str>,
     ) -> Result<String, RmuxError> {
-        #[cfg(windows)]
-        if format_references_pane_pid(Some(&request.condition)) {
-            self.wait_for_windows_deferred_all_pane_pids().await;
-        }
         let fallback_target = if request.target.is_none() {
             self.preferred_session_name().await.ok()
         } else {
@@ -1165,6 +1170,8 @@ impl RequestHandler {
         let base_environment =
             target.and_then(|target| base_environment_for_target(&state, target));
 
+        // As above: the caller's directory first, this host's default only when it named none.
+        let io = crate::managed_workload::handler_facade(self)?;
         TerminalProfile::for_run_shell(
             &state.environment,
             &state.options,
@@ -1174,7 +1181,12 @@ impl RequestHandler {
             base_environment.as_ref(),
             !self.config_loading_active(),
             None,
-            command.caller_cwd.as_deref(),
+            Some(
+                command
+                    .caller_cwd
+                    .as_deref()
+                    .unwrap_or_else(|| io.default_dir()),
+            ),
         )
     }
 }

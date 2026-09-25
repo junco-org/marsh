@@ -623,7 +623,8 @@ async fn respawn_window_reuses_shell_command_cwd_and_private_environment() {
     // it, so a directory outside is one the daemon genuinely cannot open a job over. The probe's
     // *output* file stays on the host, where the test can read it back — a job writing an
     // absolute path reaches the host directly, which is the documented trust boundary.
-    let initial_cwd = crate::pane_terminals::seed_scratch_dir(&handler, "respawn-provenance-initial");
+    let initial_cwd =
+        crate::pane_terminals::seed_scratch_dir(&handler, "respawn-provenance-initial");
     let override_cwd =
         crate::pane_terminals::seed_scratch_dir(&handler, "respawn-provenance-override");
     let output = unique_window_temp_path("respawn-provenance-output");
@@ -752,7 +753,6 @@ async fn respawn_window_reuses_shell_command_cwd_and_private_environment() {
     let _ = fs::remove_file(output);
 }
 
-#[cfg(unix)]
 #[tokio::test]
 async fn respawn_window_keeps_the_original_resolved_shell_after_option_changes() {
     let handler = RequestHandler::new();

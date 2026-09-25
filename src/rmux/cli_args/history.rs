@@ -1,6 +1,6 @@
 use clap::{ArgAction, Args};
 
-use super::{parse_target_spec, TargetSpec};
+use super::{TargetSpec, parse_target_spec};
 
 /// Parsed arguments of `capture-pane`, selecting the line range and output encoding.
 #[derive(Debug, Clone, Args)]

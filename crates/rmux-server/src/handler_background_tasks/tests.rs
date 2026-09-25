@@ -3,7 +3,6 @@ use std::sync::mpsc;
 
 use super::*;
 
-#[cfg(unix)]
 use rmux_os::process_tree::ProcessTreeChild;
 
 /// The runtime these tests build their handler inside, and drive their closes on.
@@ -337,13 +336,11 @@ fn background_shutdown_drains_an_active_hook_lane_mutation() {
     runtime.block_on(handler.close_and_drain_lifecycle_producers());
 }
 
-#[cfg(unix)]
 #[test]
 fn shutdown_joins_a_task_between_process_spawn_and_registration() {
     assert_shutdown_joins_process_registration_race();
 }
 
-#[cfg(unix)]
 fn assert_shutdown_joins_process_registration_race() {
     let registry = BackgroundTaskRegistry::new();
     let race_runtime = tokio::runtime::Builder::new_current_thread()
@@ -398,7 +395,6 @@ fn assert_shutdown_joins_process_registration_race() {
 /// So the wait is on the kernel state itself. This does not grant a settling period: it returns
 /// the moment the predicate holds, and fails if it never does, which is what would distinguish a
 /// genuinely escaped descendant from one that is merely slow to be torn down.
-#[cfg(unix)]
 fn wait_until_not_live(pid: u32) {
     let deadline = Instant::now() + Duration::from_secs(10);
     while rmux_os::process::is_live(pid) {
@@ -410,7 +406,6 @@ fn wait_until_not_live(pid: u32) {
     }
 }
 
-#[cfg(unix)]
 fn run_process_registration_race(
     shell_processes: Arc<crate::handler::shell_processes::ShellProcessRegistry>,
     started: mpsc::Sender<(u32, u32)>,

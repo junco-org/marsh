@@ -98,9 +98,7 @@ impl PlannedPaneTerminal {
     ///
     /// Fails for the reasons [`open_pane_terminal`] fails. Nothing has been committed, so the
     /// caller's own rollback is all that is left to do.
-    pub(in crate::pane_terminals) async fn open(
-        self,
-    ) -> Result<PreparedWindowTerminal, RmuxError> {
+    pub(in crate::pane_terminals) async fn open(self) -> Result<PreparedWindowTerminal, RmuxError> {
         let Self {
             request,
             io,
@@ -314,15 +312,15 @@ impl HandlerState {
             false,
             false,
         );
-        // Named exactly when *this request* carried a directory. A window that fell back to the
-        // session's own recorded directory, and a respawn whose directory was replayed out of
-        // provenance, are both inherited: neither is a caller asking for a place, so neither may
-        // fail the spawn for being outside this daemon's seed.
-        let named_directory = spawn
+        // Before the profile, so a request that named no directory at all still has a real one:
+        // the choice below stays request → session, and the facade's default is only what is left
+        // when neither answered.
+        let io = self.require_shell_io()?;
+        let profile_cwd = spawn
             .start_directory
             .filter(|path| !path.as_os_str().is_empty())
-            .is_some()
-            && !spawn.inherited_start_directory;
+            .or(session.cwd())
+            .unwrap_or_else(|| io.default_dir());
         let mut profile = TerminalProfile::for_session(
             &self.environment,
             &self.options,
@@ -334,14 +332,8 @@ impl HandlerState {
             true,
             spawn.environment_overrides,
             Some(pane.id()),
-            spawn
-                .start_directory
-                .filter(|path| !path.as_os_str().is_empty())
-                .or(session.cwd()),
+            Some(profile_cwd),
         )?;
-        if !named_directory {
-            profile = profile.inherit_cwd();
-        }
         if let Some(shell) = spawn.respawn_shell {
             profile = profile.with_respawn_shell(shell.clone());
         }
@@ -350,7 +342,6 @@ impl HandlerState {
         let initial_title = profile.initial_pane_title();
         let lifecycle_cwd = profile.cwd().to_path_buf();
         let respawn_shell = profile.pane_shell().clone();
-        let io = self.require_shell_io()?;
         let runtime_session_name =
             self.runtime_session_name_for_window(session.name(), window_index);
         let generation = self.reserve_pane_output_generation(&runtime_session_name, pane.id());
@@ -484,7 +475,8 @@ impl HandlerState {
             true,
             None,
             Some(pane_id),
-            session.cwd(),
+            // The session's own directory, and this host's default only when it has none.
+            Some(session.cwd().unwrap_or_else(|| io.default_dir())),
         )?;
         let initial_title = profile.initial_pane_title();
         let lifecycle_cwd = profile.cwd().to_path_buf();
@@ -519,12 +511,7 @@ impl HandlerState {
             },
             pane_index: pane.index(),
         };
-        self.install_prepared_window_terminal(
-            &runtime_session_name,
-            window_index,
-            prepared,
-            None,
-        )?;
+        self.install_prepared_window_terminal(&runtime_session_name, window_index, prepared, None)?;
 
         Ok(AdoptedExternalJob {
             session_name,
@@ -544,10 +531,7 @@ impl HandlerState {
     /// # Errors
     ///
     /// Fails when a session has to be created and the session store refuses to create one.
-    fn session_for_adoption(
-        &mut self,
-        io: &crate::io::ShellIo,
-    ) -> Result<SessionName, RmuxError> {
+    fn session_for_adoption(&mut self, io: &crate::io::ShellIo) -> Result<SessionName, RmuxError> {
         let current = io
             .current_job()
             .and_then(|view| io.route_for(&view.sandbox))
@@ -607,7 +591,9 @@ impl HandlerState {
             pane_index,
         } = prepared;
         let pane_id = lifecycle.pane_id;
-        if let Err(error) = self.check_pane_commit_identity(runtime_session_name, pane_id, output.generation) {
+        if let Err(error) =
+            self.check_pane_commit_identity(runtime_session_name, pane_id, output.generation)
+        {
             terminal.terminate_in_background();
             return Err(error);
         }
@@ -674,10 +660,19 @@ impl HandlerState {
 
     /// Plans the terminal for a brand-new session's first pane.
     ///
+    /// The session's own recorded directory is authoritative whenever it has one — a
+    /// `new-session -c <dir>` keeps the place it named — and this host's default only fills the
+    /// gap left by a request that named no directory at all. The default is therefore applied
+    /// *after* the session's choice, not instead of it, and the facade is retrieved before the
+    /// profile so the choice is complete before any lifecycle metadata is derived from it. It
+    /// has to be: the profile's directory reaches the shell facade as a host path, so an unset
+    /// one would spawn the pane against the daemon's own process directory, which need not sit
+    /// on the same seed — or on any seed — as the session being created.
+    ///
     /// # Errors
     ///
-    /// Fails when the session or its initial pane is missing, and when the profile's environment
-    /// or directory cannot be resolved.
+    /// Fails when the session or its initial pane is missing, when no shell facade is bound, and
+    /// when the profile's environment or directory cannot be resolved.
     pub(crate) fn plan_initial_session_terminal(
         &mut self,
         session_name: &SessionName,
@@ -712,6 +707,11 @@ impl HandlerState {
                 ),
             )
         };
+        // Before the profile, so a session that named no directory still has a real one: the
+        // session's own directory answers first, and the facade's default is only what is left
+        // when it did not.
+        let io = self.require_shell_io()?;
+        let profile_cwd = requested_cwd.unwrap_or_else(|| io.default_dir());
         let profile = TerminalProfile::for_initial_session_pane(
             &self.environment,
             &self.options,
@@ -723,7 +723,7 @@ impl HandlerState {
             true,
             spawn.environment_overrides,
             Some(pane.id),
-            requested_cwd,
+            Some(profile_cwd),
         )?;
         let runtime_window_name = profile.runtime_window_name(spawn.command);
         let initial_window_name = if crate::automatic_rename::automatic_rename_enabled(
@@ -738,7 +738,6 @@ impl HandlerState {
         let initial_title = profile.initial_pane_title();
         let lifecycle_cwd = profile.cwd().to_path_buf();
         let respawn_shell = profile.pane_shell().clone();
-        let io = self.require_shell_io()?;
         let generation = self.reserve_pane_output_generation(&runtime_session_name, pane.id);
 
         Ok(PlannedInitialSessionTerminal {
@@ -902,7 +901,7 @@ impl HandlerState {
                             alternate_on,
                             copy_mode_active,
                         ),
-                        }
+                    }
                 })
                 .collect::<Vec<_>>();
             (runtime_session_name, pane_geometries)
@@ -961,7 +960,8 @@ impl HandlerState {
         let captured_base_environment =
             self.session_base_environment_for_window(session_name, window_index);
         let base_environment = base_environment_override.or(captured_base_environment.as_ref());
-        let plan = self.plan_window_terminal(&session, window_index, spawn.clone(), base_environment)?;
+        let plan =
+            self.plan_window_terminal(&session, window_index, spawn.clone(), base_environment)?;
         let initial_window_name = if crate::automatic_rename::automatic_rename_enabled(
             &self.options,
             session_name,
@@ -1270,18 +1270,6 @@ impl HandlerState {
             }
         }
 
-        #[cfg(windows)]
-        let terminal_pane_ids = committed_outcome
-            .removed_pane_ids()
-            .iter()
-            .copied()
-            .filter(|pane_id| {
-                self.terminals
-                    .ensure_panes_exist(&runtime_session_name, &[*pane_id])
-                    .is_ok()
-            })
-            .collect::<Vec<_>>();
-        #[cfg(not(windows))]
         let terminal_pane_ids = committed_outcome.removed_pane_ids().to_vec();
         let mut removed_terminals = if terminal_pane_ids.is_empty() {
             std::collections::HashMap::new()
@@ -1321,10 +1309,6 @@ impl HandlerState {
         }
         for pane_id in committed_outcome.removed_pane_ids() {
             self.clear_marked_pane_if_id(*pane_id);
-        }
-        #[cfg(windows)]
-        for pane_id in committed_outcome.removed_pane_ids() {
-            let _ = self.cancel_starting_pane(&runtime_session_name, *pane_id);
         }
         terminate_removed_terminals(&mut removed_terminals);
         self.remove_pane_lifecycles(committed_outcome.removed_pane_ids());
@@ -1465,11 +1449,6 @@ impl HandlerState {
                 .and_then(|provenance| provenance.process_command.clone())
         });
         validate_process_command(process_command.as_ref())?;
-        // Whether the *caller* named a directory, decided before any fallback fills one in. A
-        // provenance or session directory is a replay of what an earlier pane resolved to, not a
-        // request, and treating it as one makes a respawn refuse a directory the original pane
-        // was perfectly happy with.
-        let named_directory = start_directory.is_some();
         if start_directory.is_none() {
             start_directory = provenance
                 .as_ref()
@@ -1483,10 +1462,6 @@ impl HandlerState {
             environment = Some(respawn_environment.clone());
         }
 
-        #[cfg(windows)]
-        let pane_was_starting =
-            self.pane_is_starting_in_window(&session_name, window_index, pane_index);
-        #[cfg(not(windows))]
         let pane_was_starting = false;
 
         let pane_was_alive = !pane_was_starting
@@ -1497,6 +1472,14 @@ impl HandlerState {
             return Err(RmuxError::ProcessStillRunning);
         }
         let base_environment = self.session_base_environment_for_pane_target(&target);
+        // Before the profile, and last in the chain: request, then provenance, then the pane's
+        // own recorded directory, and only then this host's default. A respawn must not invent a
+        // place ahead of the one its original pane actually resolved to.
+        let io = self.require_shell_io()?;
+        let profile_cwd = start_directory
+            .as_deref()
+            .or(requested_cwd.as_deref())
+            .unwrap_or_else(|| io.default_dir());
         let mut profile = TerminalProfile::for_session(
             &self.environment,
             &self.options,
@@ -1508,14 +1491,8 @@ impl HandlerState {
             true,
             environment.as_deref(),
             Some(pane_id),
-            start_directory.as_deref().or(requested_cwd.as_deref()),
+            Some(profile_cwd),
         )?;
-        if !named_directory {
-            // The directory came from provenance or from the session, not from this request. It
-            // is a replay of what an earlier pane resolved to — frequently the daemon's own
-            // process cwd — so it must not be refused as if someone had asked for it.
-            profile = profile.inherit_cwd();
-        }
         if let Some(provenance) = provenance.as_ref() {
             profile = profile.with_respawn_shell(provenance.shell.clone());
         }
@@ -1524,7 +1501,7 @@ impl HandlerState {
         let initial_title = profile.initial_pane_title();
         let lifecycle_cwd = profile.cwd().to_path_buf();
         let respawn_shell = profile.pane_shell().clone();
-        let io = self.require_shell_io()?;
+
         let generation = self.reserve_pane_output_generation(&runtime_session_name, pane_id);
 
         Ok(PlannedPaneRespawn {
@@ -1625,23 +1602,6 @@ impl HandlerState {
         }
         let _ = pane_was_starting;
 
-        #[cfg(windows)]
-        if pane_was_starting {
-            // Keep the deferred pane and its accepted input intact until every fallible step for
-            // the replacement has succeeded. A rejected respawn must leave the original pane able
-            // to finish startup and flush its queued input.
-            let _ = self.cancel_starting_pane(&runtime_session_name, pane_id);
-            on_replaced_active_pane(
-                self,
-                &KilledPaneHookContext {
-                    target: target.clone(),
-                    pane_id: pane_id.as_u32(),
-                    window_id: window_id.as_u32(),
-                    window_name: window_name.clone(),
-                },
-            );
-        }
-
         if let Some(pipe) = self.remove_pane_pipe(&runtime_session_name, pane_id) {
             pipe.stop();
         }
@@ -1680,7 +1640,6 @@ impl HandlerState {
 
         Ok(RespawnPaneResponse { target })
     }
-
 }
 
 pub(in crate::pane_terminals) fn terminate_removed_terminals(
@@ -1707,9 +1666,7 @@ mod tests {
     use crate::handler::RequestHandler;
     use crate::io::{Route, ShellIo};
 
-    fn session_name(value: &str) -> SessionName {
-        SessionName::new(value).expect("valid session name")
-    }
+    use crate::test_names::session_name;
 
     async fn create_session(handler: &RequestHandler, value: &str) -> SessionName {
         let session = session_name(value);
@@ -1883,13 +1840,10 @@ mod tests {
         );
 
         // The seed root is named explicitly so this regression measures the output generation and
-        // nothing else. A unit-test engine leases a scratch seed while the daemon's own process
-        // directory is the crate being tested, and a respawn that inherits the latter is a
-        // separate concern from the one under test here.
-        let seed = io
-            .executor_info()
-            .seed
-            .expect("the test engine leases a seed");
+        // nothing else. A unit-test engine's default directory is a scratch seed while the
+        // daemon's own process directory is the crate being tested, and a respawn that inherits
+        // the latter is a separate concern from the one under test here.
+        let seed = io.default_dir().to_path_buf();
         let respawned = handler
             .handle(Request::RespawnPane(Box::new(RespawnPaneRequest {
                 target: target.clone(),

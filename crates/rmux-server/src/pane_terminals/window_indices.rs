@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 
 use rmux_proto::{OptionName, RmuxError, SessionName};
 
+use super::session_mutation::WindowMutationMetadataSnapshot;
 use super::{session_not_found, HandlerState};
 
 impl HandlerState {
@@ -67,12 +68,7 @@ impl HandlerState {
             .session(session_name)
             .cloned()
             .ok_or_else(|| session_not_found(session_name))?;
-        let previous_options = self.options.clone();
-        let previous_hooks = self.hooks.clone();
-        let previous_auto_named_windows = self.auto_named_windows.clone();
-        let previous_window_link_slots = self.window_link_slots.clone();
-        let previous_window_link_groups = self.window_link_groups.clone();
-        let previous_window_link_occurrences = self.window_link_occurrences.clone();
+        let previous_metadata = WindowMutationMetadataSnapshot::capture(self);
 
         let session = self
             .sessions
@@ -81,12 +77,7 @@ impl HandlerState {
         let index_map = session.reindex_windows_from(base_index)?;
         if let Err(error) = self.remap_reindexed_window_metadata(session_name, &index_map) {
             self.replace_session(session_name, previous_session)?;
-            self.options = previous_options;
-            self.hooks = previous_hooks;
-            self.auto_named_windows = previous_auto_named_windows;
-            self.window_link_slots = previous_window_link_slots;
-            self.window_link_groups = previous_window_link_groups;
-            self.window_link_occurrences = previous_window_link_occurrences;
+            previous_metadata.restore(self);
             return Err(error);
         }
         Ok(index_map)

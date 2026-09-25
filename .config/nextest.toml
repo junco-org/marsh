@@ -4,5 +4,20 @@ status-level = "slow"
 slow-timeout = { period = "5s", terminate-after = 3, grace-period = "2s" }
 fail-fast = false
 
+# Deliberately huge inputs, each pinning a bound that only shows up at the bound. The surface
+# cases build a 512x330 screen whose every cell holds the longest grapheme the wire format
+# admits, parse 3.5MB of it through the terminal emulator and bincode it twice, once per boundary
+# they pin; the prefix-chain cases drive a reroute chain long enough to prove it stays bounded and
+# iterative. All of them pass in 13-16s in a debug build, which the 15s default kills just short.
+# Named one by one on purpose: a blanket raise would hide a real hang everywhere else.
+[[profile.default.overrides]]
+filter = """
+test(/surface_budget::/)
+or test(/surface_review_regressions::/)
+or test(/live_attach_long_prefix_chain_is_processed_iteratively/)
+or test(/live_attach_active_prefix_table_keeps_large_reroute_chain_bounded/)
+"""
+slow-timeout = { period = "30s", terminate-after = 3, grace-period = "2s" }
+
 [profile.default.junit]
 path = "test-results.xml"

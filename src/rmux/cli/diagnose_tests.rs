@@ -68,10 +68,10 @@ fn config_message_filter_includes_source_file_location_diagnostics() {
     );
     assert_eq!(
         config_message_from_show_messages_line(
-            "123: C:\\Users\\RMUX\\.tmux.conf:16: unknown command: nope"
+            "123: /etc/rmux:site/.tmux.conf:16: unknown command: nope"
         )
-        .expect("windows source-file config diagnostic"),
-        "123: C:\\Users\\RMUX\\.tmux.conf:16: unknown command: nope"
+        .expect("source-file config diagnostic whose path contains a colon"),
+        "123: /etc/rmux:site/.tmux.conf:16: unknown command: nope"
     );
 }
 
@@ -92,10 +92,4 @@ fn config_message_filter_redacts_home_paths() {
         !redacted.contains(&home.display().to_string()),
         "{redacted}"
     );
-}
-
-#[cfg(windows)]
-#[test]
-fn detected_shell_uses_windows_resolver_module() {
-    assert_ne!(detected_shell(), "");
 }

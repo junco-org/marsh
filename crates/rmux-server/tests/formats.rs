@@ -1,5 +1,3 @@
-#![cfg(unix)]
-
 use std::error::Error;
 mod common;
 
@@ -49,7 +47,7 @@ fn is_unix_pty_path(path: &str) -> bool {
     path.starts_with("/dev/pts/") || path.starts_with("/dev/ttys")
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn list_windows_uses_shared_formatter_through_real_socket() -> Result<(), Box<dyn Error>> {
     let harness = TestHarness::new("formats-list-windows");
     let handle = start_server(&harness).await?;
@@ -126,7 +124,7 @@ async fn list_windows_uses_shared_formatter_through_real_socket() -> Result<(), 
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn nested_conditionals_expand_inner_templates_through_real_socket(
 ) -> Result<(), Box<dyn Error>> {
     let harness = TestHarness::new("formats-nested-conditionals");
@@ -192,7 +190,7 @@ async fn nested_conditionals_expand_inner_templates_through_real_socket(
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn display_message_session_target_includes_active_pane_runtime_context(
 ) -> Result<(), Box<dyn Error>> {
     let harness = TestHarness::new("formats-display-session-pane-context");
@@ -235,7 +233,14 @@ async fn display_message_session_target_includes_active_pane_runtime_context(
     assert_eq!(fields[1], "0");
     assert_eq!(fields[2], "0");
     assert!(!fields[3].is_empty(), "pane_current_path must be populated");
-    assert!(fields[4].parse::<u32>().is_ok(), "pane_pid must be numeric");
+    // A detached `new-session` pane is an idle embedded shell: it has no OS child, so it names no
+    // foreground process group. Empty is the honest answer, and it must stay empty rather than
+    // leak the daemon's own pid, which a caller could signal.
+    assert!(
+        fields[4].is_empty(),
+        "idle pane_pid must be empty, got {:?}",
+        fields[4]
+    );
     assert!(is_unix_pty_path(fields[5]), "pane_tty must be a pty");
     assert_eq!(fields[6], harness.socket_path().to_string_lossy());
 

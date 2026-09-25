@@ -6,8 +6,9 @@ use rmux_proto::{
 };
 
 use crate::cli::{
-    expect_command_output, resolve_current_pane_target, resolve_current_session_target,
-    resolve_target_spec, run_command_resolved, run_payload_command_resolved, ExitFailure,
+    ExitFailure, expect_command_output, resolve_current_pane_target,
+    resolve_current_session_target, resolve_target_spec, run_command_resolved,
+    run_payload_command_resolved,
 };
 use crate::cli_args::{SetHookArgs, ShowHooksArgs, TargetSpec};
 

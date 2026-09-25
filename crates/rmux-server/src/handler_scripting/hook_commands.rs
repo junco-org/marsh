@@ -268,6 +268,8 @@ impl RequestHandler {
             _ => (None, None),
         };
 
+        // A hook names no directory of its own, so it starts where this host does.
+        let io = crate::managed_workload::handler_facade(self)?;
         TerminalProfile::for_run_shell(
             &state.environment,
             &state.options,
@@ -277,7 +279,7 @@ impl RequestHandler {
             base_environment.as_ref(),
             !self.config_loading_active(),
             pane_id,
-            None,
+            Some(io.default_dir()),
         )
     }
 }

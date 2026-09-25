@@ -5,11 +5,9 @@ use super::{
 };
 use crate::format_runtime::RuntimeFormatContext;
 use rmux_core::{BoxLines, OptionStore, Session, Style};
-use rmux_proto::{OptionName, ScopeSelector, SessionName, SetOptionMode, TerminalSize};
+use rmux_proto::{OptionName, ScopeSelector, SetOptionMode, TerminalSize};
 
-fn session_name(value: &str) -> SessionName {
-    SessionName::new(value).expect("valid session name")
-}
+use crate::test_names::session_name;
 
 fn session_with_windows() -> Session {
     let mut session = Session::new(session_name("alpha"), TerminalSize { cols: 80, rows: 24 });

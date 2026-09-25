@@ -38,8 +38,6 @@ impl fmt::Debug for PrivatePaneEnvironment {
 pub(crate) enum PaneLifecycleProcessState {
     #[default]
     Unknown,
-    #[cfg(windows)]
-    Starting,
     Running {
         pid: Option<u32>,
     },
@@ -177,27 +175,6 @@ pub(in crate::pane_terminals) struct PaneLifecycleSpawn {
 }
 
 impl HandlerState {
-    #[cfg(windows)]
-    pub(crate) fn pane_start_command_for_id(&self, pane_id: PaneId) -> Option<&[String]> {
-        self.pane_lifecycle.get(&pane_id)?.command.as_deref()
-    }
-
-    #[cfg(windows)]
-    pub(crate) fn pane_start_process_command_for_id(
-        &self,
-        pane_id: PaneId,
-    ) -> Option<&ProcessCommand> {
-        self.pane_lifecycle.get(&pane_id)?.process_command.as_ref()
-    }
-
-    #[cfg(windows)]
-    pub(in crate::pane_terminals) fn record_pane_lifecycle_starting(
-        &mut self,
-        spawn: PaneLifecycleSpawn,
-    ) -> u64 {
-        self.record_pane_lifecycle_with_process(spawn, PaneLifecycleProcessState::Starting)
-    }
-
     pub(in crate::pane_terminals) fn record_pane_lifecycle_spawn(
         &mut self,
         spawn: PaneLifecycleSpawn,
@@ -259,22 +236,6 @@ impl HandlerState {
             },
         );
         generation
-    }
-
-    #[cfg(windows)]
-    pub(in crate::pane_terminals) fn mark_pane_lifecycle_running(
-        &mut self,
-        pane_id: PaneId,
-        pid: Option<u32>,
-    ) {
-        let Some(state) = self.pane_lifecycle.get_mut(&pane_id) else {
-            return;
-        };
-        if state.process == (PaneLifecycleProcessState::Running { pid }) {
-            return;
-        }
-        state.process = PaneLifecycleProcessState::Running { pid };
-        state.revision = state.revision.saturating_add(1);
     }
 
     pub(in crate::pane_terminals) fn update_pane_lifecycle_output_sequence(

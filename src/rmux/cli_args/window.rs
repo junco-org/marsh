@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use clap::{ArgAction, ArgGroup, Args};
 use rmux_proto::RotateWindowDirection;
 
-use super::{parse_command_args, parse_target_spec, QueuedCommand, TargetSpec};
+use super::{QueuedCommand, TargetSpec, parse_command_args, parse_target_spec};
 
 /// Parses `rename-window` arguments, rejecting anything but exactly one new name.
 pub(super) fn parse_rename_window_args(

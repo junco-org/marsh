@@ -664,52 +664,5 @@ fn push_existing_window(stack: &mut Vec<u32>, session: &Session, window_index: u
 }
 
 fn current_user_name() -> Option<String> {
-    user_name_from_env(|name| std::env::var(name).ok())
-}
-
-fn user_name_from_env(mut lookup: impl FnMut(&str) -> Option<String>) -> Option<String> {
-    lookup("USER")
-        .filter(|value| !value.is_empty())
-        .or_else(|| lookup("USERNAME").filter(|value| !value.is_empty()))
-}
-
-#[cfg(test)]
-mod tests {
-    use std::collections::HashMap;
-
-    use super::user_name_from_env;
-
-    fn lookup<'a>(values: &'a HashMap<&str, &str>) -> impl FnMut(&str) -> Option<String> + 'a {
-        |name| values.get(name).map(|value| (*value).to_owned())
-    }
-
-    #[test]
-    fn user_name_prefers_unix_user_when_present() {
-        let values = HashMap::from([("USER", "alice"), ("USERNAME", "windows-alice")]);
-
-        assert_eq!(
-            user_name_from_env(lookup(&values)).as_deref(),
-            Some("alice")
-        );
-    }
-
-    #[test]
-    fn user_name_falls_back_to_windows_username() {
-        let values = HashMap::from([("USERNAME", "rmux-user")]);
-
-        assert_eq!(
-            user_name_from_env(lookup(&values)).as_deref(),
-            Some("rmux-user")
-        );
-    }
-
-    #[test]
-    fn user_name_ignores_empty_values() {
-        let values = HashMap::from([("USER", ""), ("USERNAME", "rmux-user")]);
-
-        assert_eq!(
-            user_name_from_env(lookup(&values)).as_deref(),
-            Some("rmux-user")
-        );
-    }
+    std::env::var("USER").ok().filter(|value| !value.is_empty())
 }

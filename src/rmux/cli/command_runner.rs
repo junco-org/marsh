@@ -2,11 +2,12 @@ use std::cell::RefCell;
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 
-use rmux_client::{connect, ClientError, Connection};
+use rmux_client::{ClientError, Connection, connect};
 use rmux_proto::{
-    encode_internal_runtime_command_arguments, CommandOutput, PaneTarget, ResolveTargetType,
-    Response, RmuxError, Target, CAPABILITY_CLI_RUNTIME_COMMAND_EXPANSION,
+    CAPABILITY_CLI_RUNTIME_COMMAND_EXPANSION, CommandOutput,
     INTERNAL_CANONICAL_COMMAND_EXECUTION_PATH, INTERNAL_LIST_WINDOWS_ALL_EXECUTION_PATH,
+    PaneTarget, ResolveTargetType, Response, RmuxError, Target,
+    encode_internal_runtime_command_arguments,
 };
 
 use crate::cli_response::{expect_command_output, expect_command_success, response_name};

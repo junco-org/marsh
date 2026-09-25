@@ -125,10 +125,12 @@ pub(crate) fn handler_facade(
 
 /// Builds the specification for one workload.
 ///
-/// `cwd` is a host path — a pane's current directory, a caller's working directory — and becomes
-/// the seed-relative directory the job opens in. A path outside this daemon's seed is an ordinary
-/// error: there is one seed and one mux per daemon, and quietly starting the job at the seed root
-/// instead would run it somewhere the caller did not ask for.
+/// `cwd` is a host path — a pane's current directory, a caller's working directory — and is
+/// forwarded as the directory the job's shell starts in, which is also what selects the seed it
+/// publishes into. An empty one takes this host's default directory, because a workload helper's
+/// directory is *inherited*, never named: `run-shell`, `if-shell`, `pipe-pane` and the status
+/// `#()` commands have no `-c` in their grammar, so there is no request to honour when there is
+/// no path. A directory that was supplied is used as it stands, even on another seed.
 ///
 /// `id` names a *recurring slot*. A status-line producer or a cache entry keeps its own name so
 /// its approved state is updated under one principal across generations; a genuine one-off passes
@@ -137,7 +139,7 @@ pub(crate) fn handler_facade(
 ///
 /// # Errors
 ///
-/// Fails when `cwd` is outside the seed and when the environment holds non-UTF-8 data.
+/// Fails when the environment holds non-UTF-8 data.
 pub(crate) fn spec<'a, I>(
     io: &ShellIo,
     cwd: &Path,
@@ -148,21 +150,14 @@ pub(crate) fn spec<'a, I>(
 where
     I: IntoIterator<Item = (&'a OsStr, &'a OsStr)>,
 {
-    let executor = io.executor_info();
-    // A workload helper's directory is *inherited*, never named. `run-shell`, `if-shell`,
-    // `pipe-pane` and the status `#()` commands have no `-c` in their grammar, so the path here is
-    // whatever the daemon or the originating pane happened to be sitting in — frequently the
-    // daemon's own process cwd, which need not be inside the seed at all.
-    //
-    // Refusing it would fail a command for a directory nobody asked for: a server started outside
-    // its seed would see every `run-shell` error out. The seed root is the same answer
-    // `ShellMux::default_dir` gives, and for the same reason. `builtin_spec` already does this;
-    // `spec` not doing it was the asymmetry.
-    let directory = crate::terminal::seed_relative_path(&executor, cwd)
-        .unwrap_or_else(|_| io.default_dir());
+    let initial_dir = if cwd.as_os_str().is_empty() {
+        io.default_dir().to_path_buf()
+    } else {
+        cwd.to_path_buf()
+    };
     let environment = crate::terminal::shell_environment_from_pairs(environment)?;
     Ok(ExecutionSpec {
-        directory,
+        initial_dir,
         id,
         process,
         environment: Some(environment),
@@ -217,7 +212,11 @@ pub(crate) fn require_published(captured: &CapturedOutput) -> Result<(), RmuxErr
 
 /// The refusal diagnostic for a completion that was not published.
 pub(crate) fn unapproved_error(captured: &CapturedOutput) -> RmuxError {
-    RmuxError::Server(completion_report(&captured.completion).trim_end().to_owned())
+    RmuxError::Server(
+        completion_report(&captured.completion)
+            .trim_end()
+            .to_owned(),
+    )
 }
 
 /// The console's verdict text for one completion, as trailing lines.
@@ -226,9 +225,7 @@ pub(crate) fn unapproved_error(captured: &CapturedOutput) -> RmuxError {
 /// reads exactly like the one they would have seen at a pane prompt: the capabilities the line
 /// asked for, which were refused, and what would unblock them. A second vocabulary for the same
 /// decision would be one more thing to keep in step.
-pub(crate) fn completion_report(
-    completion: &marsh_core::shellmux::CommandCompletion,
-) -> String {
+pub(crate) fn completion_report(completion: &marsh_core::shellmux::CommandCompletion) -> String {
     let mut lines =
         marsh_core::shellmux::repl::report_lines(&completion.shell.id, completion.outcome.as_ref());
     if lines.is_empty() {
@@ -263,11 +260,7 @@ pub(crate) fn io_error(error: IoError) -> RmuxError {
 ///
 /// Fails when the engine refused the job, when the file could not be read, and when the gate did
 /// not approve the work.
-pub(crate) async fn read_file(
-    io: &ShellIo,
-    cwd: &Path,
-    path: &Path,
-) -> Result<Vec<u8>, RmuxError> {
+pub(crate) async fn read_file(io: &ShellIo, cwd: &Path, path: &Path) -> Result<Vec<u8>, RmuxError> {
     let line = crate::io::protocol::builtin_plan(&[
         crate::io::builtins::RMUX_IO_BUILTIN.to_owned(),
         "read".to_owned(),
@@ -318,7 +311,11 @@ pub(crate) async fn write_file(
     argv.push("--".to_owned());
     argv.push(path.to_string_lossy().into_owned());
 
-    let execution = start(io, builtin_spec(io, cwd, crate::io::protocol::builtin_plan(&argv))?).await?;
+    let execution = start(
+        io,
+        builtin_spec(io, cwd, crate::io::protocol::builtin_plan(&argv))?,
+    )
+    .await?;
     let input = execution.input();
     input.write_all(&content).await.map_err(io_error)?;
     // Before collecting: the builtin reads to end of file, so a collection that waited for the
@@ -336,12 +333,18 @@ pub(crate) async fn write_file(
 /// handling, identity checks, size limits and nesting rules are one implementation, called from
 /// inside the managed job.
 ///
+/// `cwd` resolves the *operand* patterns and is encoded as `--cwd`; `initial_dir` is where the
+/// helper job's own shell starts, and so which seed it opens on. They are separate because a
+/// relative source pattern must keep meaning what the caller meant by it even when the helper
+/// itself has to start somewhere else.
+///
 /// # Errors
 ///
 /// Fails when the engine refused the job, when the read failed, when the gate did not approve it,
 /// and when the encoded result could not be decoded.
 pub(crate) async fn source_files(
     io: &ShellIo,
+    initial_dir: &Path,
     cwd: &Path,
     patterns: &[String],
     quiet: bool,
@@ -363,7 +366,7 @@ pub(crate) async fn source_files(
 
     let captured = collect(
         io,
-        builtin_spec(io, cwd, crate::io::protocol::builtin_plan(&argv))?,
+        builtin_spec(io, initial_dir, crate::io::protocol::builtin_plan(&argv))?,
         COMPLETE,
     )
     .await?;
@@ -437,14 +440,16 @@ pub(crate) async fn preset_names(
 /// against. The name is automatic, because a file helper is a one-off; a recurring slot that wants
 /// a stable principal builds its own specification.
 fn builtin_spec(io: &ShellIo, cwd: &Path, line: String) -> Result<ExecutionSpec, RmuxError> {
-    let executor = io.executor_info();
-    // The helper's own directory only has to be somewhere in the seed: its operands are absolute
-    // or resolved against an explicit `--cwd`, so a caller's directory that has since disappeared
-    // must not stop a save from reaching a path that still exists.
-    let directory = crate::terminal::seed_relative_path(&executor, cwd)
-        .unwrap_or_else(|_| io.default_dir());
+    // The helper's own directory only has to exist: its operands are absolute or resolved against
+    // an explicit `--cwd`, so an omitted one falls back to this host's default rather than
+    // stopping a save that would have reached a path that still exists.
+    let initial_dir = if cwd.as_os_str().is_empty() {
+        io.default_dir().to_path_buf()
+    } else {
+        cwd.to_path_buf()
+    };
     Ok(ExecutionSpec {
-        directory,
+        initial_dir,
         id: None,
         process: ProcessCommand::Shell(line),
         environment: None,

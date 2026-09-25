@@ -7,9 +7,7 @@ use rmux_proto::{
     TerminalSize, WindowTarget,
 };
 
-fn session_name(value: &str) -> SessionName {
-    SessionName::new(value).expect("valid session name")
-}
+use crate::test_names::session_name;
 
 fn layout_string(body: &str) -> String {
     let mut checksum = 0_u16;

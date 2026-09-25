@@ -124,18 +124,14 @@ impl LivePaneRender {
 #[cfg(test)]
 mod tests {
     use rmux_core::{OptionStore, Session};
-    use rmux_proto::{
-        OptionName, ScopeSelector, SessionName, SetOptionMode, TerminalSize, WindowTarget,
-    };
+    use rmux_proto::{OptionName, ScopeSelector, SetOptionMode, TerminalSize, WindowTarget};
 
     use crate::pane_transcript::{PaneTranscript, SharedPaneTranscript};
     use crate::renderer::PaneRenderDelta;
 
     use super::LivePaneRender;
 
-    fn session_name(value: &str) -> SessionName {
-        SessionName::new(value).expect("valid session name")
-    }
+    use crate::test_names::session_name;
 
     #[derive(Clone, Copy)]
     enum PlainForwardingFixtureState {

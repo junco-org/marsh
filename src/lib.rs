@@ -28,7 +28,9 @@
 //! ```
 //!
 //! Several shells over one seed: [`MarshExecutor::open`] once, `executor.snapshot(principal)` per
-//! shell; a line that lost a race to another principal comes back as [`Outcome::Stale`].
+//! shell. A line that read something another principal published while it ran is evaluated again
+//! against the new seed; a line that wrote a path another principal owns unstaged comes back as
+//! [`Outcome::Denied`].
 //!
 //! The pieces are separate crates: `marsh-core` (this crate's implementation), `marsh-btrfs` (seed
 //! discovery, lease, snapshots), `marsh-wal` (diff and durable publication) and `marsh-instrument`
@@ -42,7 +44,7 @@
 pub use marsh_core::{
     Denial, GrantedAction, GrantedCapability, MarshError, MarshExecutor, MarshShellExtensions,
     Outcome, PolicyValidator, Publication, PublishMeta, Shell, ShellRef, Signal, SnapshotUid,
-    StalePath, builtins, input, policy, shellmux,
+    builtins, input, policy, shellmux,
 };
 
 pub mod rmux;

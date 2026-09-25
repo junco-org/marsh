@@ -77,11 +77,9 @@ fn match_display_panes_label(state: &DisplayPanesClientState) -> DisplayPanesMat
 mod tests {
     use super::*;
     use crate::handler::StableTargetIdentity;
-    use rmux_proto::{PaneTarget, SessionName, WindowTarget};
+    use rmux_proto::{PaneTarget, WindowTarget};
 
-    fn session_name(value: &str) -> SessionName {
-        SessionName::new(value).expect("valid session")
-    }
+    use crate::test_names::session_name;
 
     #[test]
     fn accepts_letter_alias_labels() {

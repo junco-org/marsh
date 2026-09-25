@@ -1,27 +1,10 @@
 use super::*;
 
-#[cfg(unix)]
 fn quiet_kill_session_command() -> Vec<String> {
     ["/bin/sh", "-c", "sleep 60"]
         .into_iter()
         .map(str::to_owned)
         .collect()
-}
-
-#[cfg(windows)]
-fn quiet_kill_session_command() -> Vec<String> {
-    let system_root =
-        std::env::var_os("SystemRoot").unwrap_or_else(|| std::ffi::OsString::from(r"C:\Windows"));
-    let cmd = std::path::PathBuf::from(system_root)
-        .join("System32")
-        .join("cmd.exe");
-    vec![
-        cmd.to_string_lossy().into_owned(),
-        "/d".to_owned(),
-        "/q".to_owned(),
-        "/c".to_owned(),
-        "ping -n 120 127.0.0.1 >NUL".to_owned(),
-    ]
 }
 
 async fn create_quiet_kill_session(handler: &RequestHandler, name: &str) -> SessionName {

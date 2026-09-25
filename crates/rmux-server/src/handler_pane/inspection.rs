@@ -20,8 +20,6 @@ use super::super::{
     current_expected_attach_identity, format_client_uid, format_client_user, ControlClientIdentity,
     ListClientSnapshot, RequestHandler,
 };
-#[cfg(windows)]
-use super::pane_deferred_wait::format_references_pane_pid;
 use crate::control_notifications::format_control_message_line;
 use crate::format_runtime::{render_runtime_template, RuntimeFormatContext};
 use crate::handler::attach_support::ActiveAttachIdentity;
@@ -541,11 +539,6 @@ impl RequestHandler {
         };
         let context_target =
             display_message_context_target(target, requester_environment_target, &session_name);
-        #[cfg(windows)]
-        if format_references_pane_pid(Some(template)) {
-            self.wait_for_windows_deferred_target_pane_pids(&context_target)
-                .await;
-        }
         let attached_count = self.attached_count(&session_name).await;
 
         let (expanded, duration, display_session_id) = {
@@ -722,16 +715,6 @@ impl RequestHandler {
             let active_attach = self.active_attach.lock().await;
             active_attach.attached_count(&request.target)
         };
-        #[cfg(windows)]
-        if format_references_pane_pid(request.format.as_deref())
-            || format_references_pane_pid(request.filter.as_deref())
-        {
-            self.wait_for_windows_deferred_list_pane_pids(
-                &request.target,
-                request.target_window_index,
-            )
-            .await;
-        }
         let mut state = self.state.lock().await;
         if let Err(error) =
             state.refresh_list_panes_exit_statuses(&request.target, request.target_window_index)

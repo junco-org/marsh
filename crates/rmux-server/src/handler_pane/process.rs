@@ -5,8 +5,6 @@ use super::super::{
     scripting_support::{format_context_for_target, render_start_directory_template},
     RequestHandler,
 };
-#[cfg(windows)]
-use super::format_references_pane_pid;
 use crate::format_runtime::render_runtime_template;
 use crate::hook_runtime::PendingInlineHookFormat;
 use crate::pane_terminal_lookup::pane_id_for_target;
@@ -44,13 +42,8 @@ impl RequestHandler {
                 None => None,
             };
 
-            match state.plan_pipe_pane(
-                &target,
-                command,
-                request.stdin,
-                write_to_pipe,
-                request.once,
-            ) {
+            match state.plan_pipe_pane(&target, command, request.stdin, write_to_pipe, request.once)
+            {
                 Ok(plan) => plan,
                 Err(error) => return Response::Error(ErrorResponse { error }),
             }
@@ -99,12 +92,6 @@ impl RequestHandler {
         requester_pid: u32,
         mut request: rmux_proto::RespawnPaneRequest,
     ) -> Response {
-        #[cfg(windows)]
-        if request.start_directory.as_ref().is_some_and(|path| {
-            format_references_pane_pid(Some(path.as_os_str().to_string_lossy().as_ref()))
-        }) {
-            self.wait_for_windows_deferred_all_pane_pids().await;
-        }
         let session_name = request.target.session_name().clone();
         let target = request.target.clone();
         let socket_path = self.socket_path();
@@ -143,21 +130,16 @@ impl RequestHandler {
                 Ok(pane_id) => pane_id,
                 Err(error) => return Response::Error(ErrorResponse { error }),
             };
-            let planned = match state.plan_pane_respawn(
-                request,
-                &socket_path,
-                spawn_environment.as_ref(),
-            ) {
-                Ok(planned) => planned,
-                Err(error) => return Response::Error(ErrorResponse { error }),
-            };
+            let planned =
+                match state.plan_pane_respawn(request, &socket_path, spawn_environment.as_ref()) {
+                    Ok(planned) => planned,
+                    Err(error) => return Response::Error(ErrorResponse { error }),
+                };
             drop(state);
             let opened = planned.open().await;
             let mut state = self.state.lock().await;
             let committed = match opened {
-                Ok((commit, prepared)) => {
-                    state.commit_pane_respawn(commit, prepared, |_, _| {})
-                }
+                Ok((commit, prepared)) => state.commit_pane_respawn(commit, prepared, |_, _| {}),
                 Err(error) => Err(error),
             };
             match committed {

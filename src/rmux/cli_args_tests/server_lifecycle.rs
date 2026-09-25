@@ -120,14 +120,16 @@ fn web_share_accepts_frontend_and_tunnel_url_flags() {
     };
     assert_eq!(args.tunnel_provider.as_deref(), Some(""));
 
-    assert!(parse_args(&[
-        "web-share",
-        "--tunnel-url",
-        "https://terminal.example.com",
-        "--tunnel-provider",
-        "srv-us",
-    ])
-    .is_err());
+    assert!(
+        parse_args(&[
+            "web-share",
+            "--tunnel-url",
+            "https://terminal.example.com",
+            "--tunnel-provider",
+            "srv-us",
+        ])
+        .is_err()
+    );
 }
 
 #[test]
@@ -300,9 +302,11 @@ fn server_access_rejects_combined_add_and_deny_flags() {
     let error = parse_args(&["server-access", "-a", "-d", "alice"]).unwrap_err();
 
     assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
-    assert!(error
-        .to_string()
-        .contains("-a and -d cannot be used together"));
+    assert!(
+        error
+            .to_string()
+            .contains("-a and -d cannot be used together")
+    );
 }
 
 #[test]
@@ -310,9 +314,11 @@ fn server_access_rejects_combined_read_and_write_flags() {
     let error = parse_args(&["server-access", "-r", "-w", "alice"]).unwrap_err();
 
     assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
-    assert!(error
-        .to_string()
-        .contains("-r and -w cannot be used together"));
+    assert!(
+        error
+            .to_string()
+            .contains("-r and -w cannot be used together")
+    );
 }
 
 #[test]
@@ -361,27 +367,35 @@ fn server_access_missing_user_is_a_runtime_error() {
 fn server_access_rejects_tmux_target_flag_like_tmux_runtime() {
     let error = parse_args(&["server-access", "-t", "%0", "-l"]).unwrap_err();
     assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
-    assert!(error
-        .to_string()
-        .contains("command server-access: unknown flag -t"));
+    assert!(
+        error
+            .to_string()
+            .contains("command server-access: unknown flag -t")
+    );
 
     let error = parse_args(&["server-access", "-t%0", "root"]).unwrap_err();
     assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
-    assert!(error
-        .to_string()
-        .contains("command server-access: unknown flag -t"));
+    assert!(
+        error
+            .to_string()
+            .contains("command server-access: unknown flag -t")
+    );
 
     let error = parse_args(&["server-access", "-xt", "root"]).unwrap_err();
     assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
-    assert!(error
-        .to_string()
-        .contains("command server-access: unknown flag -x"));
+    assert!(
+        error
+            .to_string()
+            .contains("command server-access: unknown flag -x")
+    );
 
     let error = parse_args(&["server-access", "--target", "%0", "root"]).unwrap_err();
     assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
-    assert!(error
-        .to_string()
-        .contains("command server-access: invalid flag --"));
+    assert!(
+        error
+            .to_string()
+            .contains("command server-access: invalid flag --")
+    );
 }
 
 #[test]
@@ -423,9 +437,11 @@ fn server_access_help_and_completion_omit_rejected_target_flag() {
 fn server_access_rejects_bare_dash() {
     let error = parse_args(&["server-access", "-"]).unwrap_err();
     assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
-    assert!(error
-        .to_string()
-        .contains("command server-access: invalid flag -"));
+    assert!(
+        error
+            .to_string()
+            .contains("command server-access: invalid flag -")
+    );
 }
 
 #[test]

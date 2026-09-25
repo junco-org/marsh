@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use clap::{ArgAction, Args};
 
-use super::{parse_session_name, parse_target_spec, TargetSpec};
+use super::{TargetSpec, parse_session_name, parse_target_spec};
 
 /// Shared help text for every flag parsed by [`parse_duration`].
 ///

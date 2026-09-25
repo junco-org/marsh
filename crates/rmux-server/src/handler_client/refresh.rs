@@ -218,8 +218,6 @@ impl RequestHandler {
         if let (Some(session_name), Some(session_id), Some(size)) =
             (session_name.as_ref(), session_id, control_size)
         {
-            #[cfg(windows)]
-            self.wait_for_windows_deferred_all_pane_pids().await;
             {
                 let mut state = self.state.lock().await;
                 let active_attach = self.active_attach.lock().await;

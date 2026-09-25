@@ -18,9 +18,7 @@ use rmux_proto::{
 use tokio::sync::{broadcast, mpsc};
 use tokio::time::{timeout, Duration};
 
-fn session_name(value: &str) -> SessionName {
-    SessionName::new(value).expect("valid session name")
-}
+use crate::test_names::session_name;
 
 pub(super) async fn create_session(
     handler: &RequestHandler,
@@ -63,23 +61,6 @@ pub(super) async fn create_session(
     target
 }
 
-#[cfg(windows)]
-fn quiet_clock_command(marker: &str) -> Vec<String> {
-    let system_root =
-        std::env::var_os("SystemRoot").unwrap_or_else(|| std::ffi::OsString::from(r"C:\Windows"));
-    let cmd = std::path::PathBuf::from(system_root)
-        .join("System32")
-        .join("cmd.exe");
-    vec![
-        cmd.to_string_lossy().into_owned(),
-        "/d".to_owned(),
-        "/q".to_owned(),
-        "/c".to_owned(),
-        format!("echo {marker} & ping -n 120 127.0.0.1 >NUL"),
-    ]
-}
-
-#[cfg(unix)]
 fn quiet_clock_command(marker: &str) -> Vec<String> {
     vec![
         "/bin/sh".to_owned(),

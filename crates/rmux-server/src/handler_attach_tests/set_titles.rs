@@ -195,7 +195,7 @@ async fn a_client_without_the_title_capability_receives_no_title() {
             std::process::id(),
             alpha.clone(),
             control_tx,
-            // No TERM: the Windows Terminal case from issue #182.
+            // No TERM: the issue #182 case.
             OuterTerminalContext::default(),
         )
         .await;

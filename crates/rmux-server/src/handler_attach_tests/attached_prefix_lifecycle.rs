@@ -1,15 +1,7 @@
 use super::*;
 
-#[cfg(windows)]
-const WINDOWS_ATTACH_EXIT_TIMEOUT: Duration = Duration::from_secs(20);
-
-#[cfg(unix)]
 const PROMPT_NEW_WINDOW_INPUT: &[u8] =
     b"\x02:new-window -- 'printf ISSUE8_WINDOW_READY; sleep 30'\r";
-
-#[cfg(windows)]
-const PROMPT_NEW_WINDOW_INPUT: &[u8] =
-    b"\x02:new-window -- cmd.exe /d /q /c \"echo ISSUE8_WINDOW_READY & ping -n 30 127.0.0.1 >NUL\"\r";
 
 async fn bind_attached_prompt_test_key(handler: &RequestHandler, key: &str, command: Vec<String>) {
     let response = handler
@@ -456,8 +448,6 @@ async fn targeted_attached_prompt_completion_rejects_replaced_binding_owner() {
 #[tokio::test]
 async fn attached_binding_run_shell_expands_client_name() {
     let handler = RequestHandler::new();
-    #[cfg(windows)]
-    set_windows_test_shell(&handler).await;
     let requester_pid = u32::MAX - 71;
     let alpha = session_name("alpha");
     let _control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
@@ -495,8 +485,6 @@ async fn attached_binding_run_shell_expands_client_name() {
 #[tokio::test]
 async fn attached_binding_new_window_shell_command_expands_client_name() {
     let handler = RequestHandler::new();
-    #[cfg(windows)]
-    set_windows_test_shell(&handler).await;
     let requester_pid = u32::MAX - 73;
     let alpha = session_name("alpha");
     let _control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
@@ -527,22 +515,12 @@ async fn attached_binding_new_window_shell_command_expands_client_name() {
         .expect("prefix V dispatches new-window binding");
 
     let expected_client = crate::handler::attached_client_name(requester_pid);
-    #[cfg(unix)]
     wait_for_file_contents(&output_path, &expected_client).await;
-    #[cfg(windows)]
-    wait_for_pane_lifecycle_command_containing(
-        &handler,
-        PaneTarget::with_window(alpha.clone(), 1, 0),
-        &expected_client,
-    )
-    .await;
 }
 
 #[tokio::test]
 async fn attached_binding_split_window_shell_command_expands_client_name() {
     let handler = RequestHandler::new();
-    #[cfg(windows)]
-    set_windows_test_shell(&handler).await;
     let requester_pid = u32::MAX - 74;
     let alpha = session_name("alpha");
     let _control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
@@ -573,15 +551,7 @@ async fn attached_binding_split_window_shell_command_expands_client_name() {
         .expect("prefix W dispatches split-window binding");
 
     let expected_client = crate::handler::attached_client_name(requester_pid);
-    #[cfg(unix)]
     wait_for_file_contents(&output_path, &expected_client).await;
-    #[cfg(windows)]
-    wait_for_pane_lifecycle_command_containing(
-        &handler,
-        PaneTarget::with_window(alpha.clone(), 0, 1),
-        &expected_client,
-    )
-    .await;
 }
 
 #[tokio::test]
@@ -627,8 +597,6 @@ async fn attached_binding_set_option_format_expands_client_name() {
 #[tokio::test]
 async fn attached_binding_source_file_preserves_client_context() {
     let handler = RequestHandler::new();
-    #[cfg(windows)]
-    set_windows_test_shell(&handler).await;
     let requester_pid = u32::MAX - 76;
     let alpha = session_name("alpha");
     let _control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
@@ -639,9 +607,7 @@ async fn attached_binding_source_file_preserves_client_context() {
     std::fs::create_dir_all(&root).expect("source-file client context temp root");
     let source_path = root.join("client-context.conf");
     let run_shell_path = root.join("run-shell-client-name.txt");
-    #[cfg(unix)]
     let new_window_path = root.join("new-window-client-name.txt");
-    #[cfg(unix)]
     let split_window_path = root.join("split-window-client-name.txt");
 
     let source = format!(
@@ -654,7 +620,6 @@ async fn attached_binding_source_file_preserves_client_context() {
         "set-buffer -b source-client-if-shell no",
         quote_command_argument(&client_name_file_shell_command(&run_shell_path)),
     );
-    #[cfg(unix)]
     let source = format!(
         "{source}new-window -d -- {}\n\
          split-window -d -- {}\n",
@@ -691,18 +656,13 @@ async fn attached_binding_source_file_preserves_client_context() {
     .await;
     wait_for_buffer_contents(&handler, "source-client-if-shell", b"yes").await;
     wait_for_file_contents(&run_shell_path, &expected_client).await;
-    #[cfg(unix)]
-    {
-        wait_for_file_contents(&new_window_path, &expected_client).await;
-        wait_for_file_contents(&split_window_path, &expected_client).await;
-    }
+    wait_for_file_contents(&new_window_path, &expected_client).await;
+    wait_for_file_contents(&split_window_path, &expected_client).await;
 }
 
 #[tokio::test]
 async fn attached_binding_two_clients_get_distinct_client_names() {
     let handler = RequestHandler::new();
-    #[cfg(windows)]
-    set_windows_test_shell(&handler).await;
     let first_pid = u32::MAX - 77;
     let second_pid = u32::MAX - 78;
     let alpha = session_name("alpha");
@@ -1359,7 +1319,25 @@ async fn attached_same_session_switch_race_uses_the_committed_pane_target() {
     let handler = RequestHandler::new();
     let requester_pid = u32::MAX - 83;
     let alpha = session_name("same-session-switch-race");
-    let _control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
+    let mut control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
+    let control_backlog = {
+        let active_attach = handler.active_attach.lock().await;
+        active_attach
+            .by_pid
+            .get(&requester_pid)
+            .expect("attached client exists")
+            .control_backlog
+            .clone()
+    };
+    // Service the fixture's attach transport while switch-response correlation is paused.
+    let control_drain = tokio::spawn(async move {
+        while let Some(control) = control_rx.recv().await {
+            crate::pane_io::release_attach_control_backlog(
+                &control_backlog,
+                control.received_backlog_units(),
+            );
+        }
+    });
     let split = handler
         .handle(Request::SplitWindow(SplitWindowRequest {
             target: SplitWindowTarget::Session(alpha.clone()),
@@ -1449,6 +1427,7 @@ async fn attached_same_session_switch_race_uses_the_committed_pane_target() {
         vec![pane_one_id],
         "a later same-session switch must not redirect the earlier queue tail"
     );
+    control_drain.abort();
 }
 
 #[tokio::test]
@@ -1848,7 +1827,6 @@ async fn attached_command_prompt_can_create_window_from_same_read() {
     );
 }
 
-#[cfg(unix)]
 #[tokio::test]
 async fn attached_exit_notifies_after_command_prompt_rename_session() {
     let handler = RequestHandler::new();
@@ -1882,43 +1860,6 @@ async fn attached_exit_notifies_after_command_prompt_rename_session() {
     })
     .await
     .expect("timed out waiting for attach exit notification after renamed exit");
-    wait_for_session_removed(&handler, &beta).await;
-}
-
-#[cfg(windows)]
-#[tokio::test]
-async fn attached_windows_input_exits_after_command_prompt_rename_session() {
-    // Windows consoles do not make byte 0x04 a reliable EOF signal, so this
-    // uses a controlled line protocol to verify the post-rename attach target.
-    let handler = RequestHandler::new();
-    let requester_pid = std::process::id();
-    let alpha = session_name("alpha");
-    let beta = session_name("beta");
-    let mut control_rx =
-        create_line_exiting_attached_session(&handler, requester_pid, &alpha).await;
-
-    handler
-        .handle_attached_live_input_for_test(requester_pid, b"\x02:rename-session beta\r")
-        .await
-        .expect("prefix command prompt input");
-
-    let _ = wait_for_switch_frame_containing(&mut control_rx, "[beta]").await;
-    handler
-        .handle_attached_live_input_for_test(requester_pid, b"RMUX_EXIT\r\n")
-        .await
-        .expect("Windows exit input after rename-session");
-
-    tokio::time::timeout(WINDOWS_ATTACH_EXIT_TIMEOUT, async {
-        loop {
-            match control_rx.recv().await {
-                Some(AttachControl::Exited) => break,
-                Some(_) => {}
-                None => panic!("attach control channel closed before exit notification"),
-            }
-        }
-    })
-    .await
-    .expect("timed out waiting for attach exit notification after renamed Windows input");
     wait_for_session_removed(&handler, &beta).await;
 }
 
@@ -2082,39 +2023,6 @@ async fn wait_for_file_contents(path: &Path, expected: &str) {
     }
 }
 
-#[cfg(windows)]
-async fn wait_for_pane_lifecycle_command_containing(
-    handler: &RequestHandler,
-    target: PaneTarget,
-    expected: &str,
-) {
-    let deadline = tokio::time::Instant::now() + ATTACH_LIFECYCLE_TIMEOUT;
-    let mut last_command = None;
-    loop {
-        {
-            let state = handler.state.lock().await;
-            let command = state
-                .sessions
-                .session(target.session_name())
-                .and_then(|session| session.window_at(target.window_index()))
-                .and_then(|window| window.pane(target.pane_index()))
-                .and_then(|pane| state.pane_lifecycle(pane.id()))
-                .and_then(|lifecycle| lifecycle.command().map(|command| command.to_vec()));
-            if let Some(command) = command {
-                if command.iter().any(|argument| argument.contains(expected)) {
-                    return;
-                }
-                last_command = Some(command);
-            }
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "timed out waiting for pane {target:?} lifecycle command to contain {expected:?}; last command: {last_command:?}"
-        );
-        sleep(Duration::from_millis(25)).await;
-    }
-}
-
 fn quote_command_argument(value: &str) -> String {
     crate::test_shell::command_quote(value)
 }
@@ -2128,68 +2036,14 @@ fn quote_command_arguments(values: &[String]) -> String {
 }
 
 fn client_name_file_shell_command(path: &Path) -> String {
-    #[cfg(unix)]
-    {
-        format!(
-            "printf %s \"#{{client_name}}\" > {}",
-            crate::test_shell::sh_quote_path(path)
-        )
-    }
-
-    #[cfg(windows)]
-    {
-        format!(
-            "[IO.File]::WriteAllText({}, '#{{client_name}}', [Text.UTF8Encoding]::new($false))",
-            crate::test_shell::powershell_quote_path(path),
-        )
-    }
+    format!(
+        "printf %s \"#{{client_name}}\" > {}",
+        crate::test_shell::sh_quote_path(path)
+    )
 }
 
 fn client_name_file_pane_command(path: &Path) -> Vec<String> {
-    #[cfg(unix)]
-    {
-        vec![client_name_file_shell_command(path)]
-    }
-
-    #[cfg(windows)]
-    {
-        vec![
-            windows_powershell_path(),
-            "-NoProfile".to_owned(),
-            "-NonInteractive".to_owned(),
-            "-Command".to_owned(),
-            "& { param([string]$path, [string]$value) [IO.File]::WriteAllText($path, $value, [Text.UTF8Encoding]::new($false)) }".to_owned(),
-            path.display().to_string(),
-            "#{client_name}".to_owned(),
-        ]
-    }
-}
-
-#[cfg(windows)]
-async fn set_windows_test_shell(handler: &RequestHandler) {
-    let mut state = handler.state.lock().await;
-    state
-        .options
-        .set(
-            ScopeSelector::Global,
-            OptionName::DefaultShell,
-            windows_powershell_path(),
-            SetOptionMode::Replace,
-        )
-        .expect("Windows test default-shell is valid");
-}
-
-#[cfg(windows)]
-fn windows_powershell_path() -> String {
-    let system_root =
-        std::env::var_os("SystemRoot").unwrap_or_else(|| std::ffi::OsString::from(r"C:\Windows"));
-    std::path::PathBuf::from(system_root)
-        .join("System32")
-        .join("WindowsPowerShell")
-        .join("v1.0")
-        .join("powershell.exe")
-        .to_string_lossy()
-        .into_owned()
+    vec![client_name_file_shell_command(path)]
 }
 
 async fn wait_for_switch_frame_containing(

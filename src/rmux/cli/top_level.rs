@@ -1,6 +1,6 @@
 use std::ffi::OsString;
 
-use crate::cli_args::{scan_top_level_command, Cli};
+use crate::cli_args::{Cli, scan_top_level_command};
 use crate::os_string::os_str_bytes;
 
 use super::ExitFailure;

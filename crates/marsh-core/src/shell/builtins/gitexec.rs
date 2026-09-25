@@ -1,858 +1,1282 @@
-//! Git operations, in this process, through libgit2.
+//! The system git, run through the shell's own external-command path, and what it did.
 //!
-//! Every git capability the mux understands is executed here: no `git` binary is ever spawned, so a
-//! git operation is a *builtin* invocation the shell can report through its instrumentation rather
-//! than a subprocess a tracer has to reverse-engineer from argv.
+//! [`run`] forwards a command line to the `git` found on the shell's `PATH` exactly as typed —
+//! same arguments, working directory, exported environment and descriptors — through brush's
+//! [`SimpleCommand`], so the process is started by the shell's spawner, recorded like any other,
+//! and traced like any other. Three things are added around it, all command-local: configuration
+//! outside the repository is switched off, repository discovery stops at the snapshot, and a
+//! repository or destination outside the snapshot is refused before anything is started.
 //!
-//! The contract is behavioural parity with the git 2.55 command-line for the pathspec-limited forms
-//! the capability model names — the same effect on worktree, index and refs, the same exit code, and
-//! a message of the same shape. Parity is not asserted from documentation: each refusal below was
-//! probed against the real CLI across the states a pooled path can be in (clean, worktree-modified,
-//! staged, staged-and-modified, worktree-deleted, staged-new, untracked, never-existed), and where
-//! the probe and the model disagreed, the probe won. The mux depends on this: its serializability
-//! argument assumes a command git refuses is a command the policy would deny.
-//!
-//! Everything here is synchronous and runs on the builtin's own thread, between that builtin's
-//! `begin` and `end` records. That is what makes the translator's span windows sound: no other task
-//! interleaves on the thread while a git operation is in flight.
+//! In a snapshot-attached shell the run is also *observed*. An inspection — whose classification
+//! the policy says only reads — is only checked afterwards for having changed repository state.
+//! Anything else runs alone in its snapshot and is bracketed by probes: read-only native git
+//! queries of the index, `HEAD` and status before and after it. The difference, together with the
+//! traced writes inside the run's window, is recorded as the git actions it performed on each
+//! path ([`GitEffectRecord`]). Those records, not the command line, are what the line's boundary
+//! later maps onto capability requests. A fact the attribution needs that cannot be read latches a
+//! failure instead, and the line is never published.
 
-use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsStr;
+use std::io::{Read, Write};
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 
-use git2::{FileMode, IndexEntry, IndexTime, Oid, Repository, Signature, Tree};
+use brush_core::commands::{CommandArg, ShellForCommand, SimpleCommand};
+use brush_core::env::EnvironmentScope;
+use brush_core::openfiles::{OpenFile, OpenFiles};
+use brush_core::processes::{ChildProcess, ProcessWaitResult};
+use brush_core::results::{ExecutionSpawnResult, ExecutionWaitResult};
+use brush_core::{
+    ExecutionContext, ExecutionParameters, ExecutionResult, ProcessGroupPolicy, Shell,
+    ShellExtensions, ShellVariable,
+};
 
-use super::gitcmd::{GitAction, GitInvocation};
+use super::git::SNAPSHOT_ROOT_VAR;
+use super::gitcmd::{self, GitAction, GitInvocation};
+use crate::shell::policy::capability_of;
+use crate::shell::session::{GitCohortKind, GitEffectRecord, GitGuard, Snapshot, end_process};
 
-/// Exit code git uses for `fatal:` conditions.
-const FATAL: i32 = 128;
-/// Exit code git uses for `error:` conditions and for "nothing happened".
-const REFUSED: i32 = 1;
+/// Exit code of a command the shell cannot find.
+const NOT_FOUND: u8 = 127;
+/// Exit code git uses for `fatal:` conditions, and this builtin for its own refusals.
+const FATAL: u8 = 128;
 
-/// The identity and timestamp one side of a commit is made with.
-pub(crate) struct GitEnvIdentity {
-    /// `GIT_{AUTHOR,COMMITTER}_NAME`.
-    pub name: String,
-    /// `GIT_{AUTHOR,COMMITTER}_EMAIL`.
-    pub email: String,
-    /// `GIT_{AUTHOR,COMMITTER}_DATE`, in git's raw `<epoch> <±HHMM>` form.
-    pub time: git2::Time,
-}
+/// Configuration outside the repository, which no git run here reads: a host `core.autocrlf` or
+/// alias would make a command's effect depend on who ran it rather than on the seed.
+const ISOLATION: [(&str, &str); 3] = [
+    ("GIT_CONFIG_NOSYSTEM", "1"),
+    ("GIT_CONFIG_SYSTEM", "/dev/null"),
+    ("GIT_CONFIG_GLOBAL", "/dev/null"),
+];
 
-/// Why a commit identity could not be read out of the environment.
+/// Options every probe adds after the command line's own global options: no pager, no lock taken
+/// for a stat refresh, no object fetched on demand, no filesystem monitor started.
+const PROBE_OPTIONS: [&str; 5] = [
+    "--no-pager",
+    "--no-optional-locks",
+    "--no-lazy-fetch",
+    "-c",
+    "core.fsmonitor=false",
+];
+
+/// Runs `argv` through the system git, observing it when `snapshot` is the tree it runs in.
 ///
-/// Every variant names the variable, because the fix is always to set it: a commit whose timestamp
-/// came from the wall clock would not be reproducible.
-#[derive(Debug, thiserror::Error)]
-pub(crate) enum IdentityError {
-    /// One of the three required variables is absent.
-    #[error("{0} is not set")]
-    Missing(String),
-    /// The date is not `<epoch> <±HHMM>`.
-    #[error("{variable} must be `<epoch> <±HHMM>`, got {value:?}")]
-    DateShape {
-        /// The variable that was read.
-        variable: String,
-        /// Its value.
-        value: String,
-    },
-    /// The epoch is not an integer.
-    #[error("{variable} epoch {value:?} is not a number")]
-    Epoch {
-        /// The variable that was read.
-        variable: String,
-        /// The epoch field as it was written.
-        value: String,
-    },
-    /// The offset is not four digits with an optional sign.
-    #[error("{variable} offset {value:?} must be four digits with an optional sign")]
-    OffsetShape {
-        /// The variable that was read.
-        variable: String,
-        /// The offset field as it was written.
-        value: String,
-    },
-    /// The offset's digits are not numeric.
-    #[error("{variable} offset {value:?} is not numeric")]
-    Offset {
-        /// The variable that was read.
-        variable: String,
-        /// The offset field as it was written.
-        value: String,
-    },
-}
-
-/// Reads one identity out of the environment.
+/// # Errors
 ///
-/// `who` is `"AUTHOR"` or `"COMMITTER"`. All three variables are required: a commit whose timestamp
-/// came from the wall clock would not be reproducible, and reproducible commits are what let a
-/// concurrent run be compared against its serial ground truth.
-pub(crate) fn identity_from_env(
-    get: impl Fn(&str) -> Option<String>,
-    who: &str,
-) -> Result<GitEnvIdentity, IdentityError> {
-    let read = |suffix: &str| {
-        let name = format!("GIT_{who}_{suffix}");
-        get(&name).ok_or(IdentityError::Missing(name))
-    };
-    let name = read("NAME")?;
-    let email = read("EMAIL")?;
-    let date = read("DATE")?;
-    let (epoch, offset) = date
-        .split_once(' ')
-        .ok_or_else(|| IdentityError::DateShape {
-            variable: format!("GIT_{who}_DATE"),
-            value: date.clone(),
-        })?;
-    let epoch = epoch
-        .trim()
-        .parse::<i64>()
-        .map_err(|_| IdentityError::Epoch {
-            variable: format!("GIT_{who}_DATE"),
-            value: epoch.to_string(),
-        })?;
-    let offset = offset.trim();
-    let (sign, digits) = if let Some(rest) = offset.strip_prefix('-') {
-        (-1, rest)
-    } else if let Some(rest) = offset.strip_prefix('+') {
-        (1, rest)
-    } else {
-        (1, offset)
-    };
-    if digits.len() != 4 || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
-        return Err(IdentityError::OffsetShape {
-            variable: format!("GIT_{who}_DATE"),
-            value: offset.to_string(),
-        });
-    }
-    let not_numeric = || IdentityError::Offset {
-        variable: format!("GIT_{who}_DATE"),
-        value: offset.to_string(),
-    };
-    let (hours, minutes) = digits.split_at_checked(2).ok_or_else(not_numeric)?;
-    let hours = hours.parse::<i32>().map_err(|_| not_numeric())?;
-    let minutes = minutes.parse::<i32>().map_err(|_| not_numeric())?;
-    Ok(GitEnvIdentity {
-        name,
-        email,
-        time: git2::Time::new(epoch, sign * (hours * 60 + minutes)),
-    })
-}
-
-/// Runs [`isolate_from_host_config`] exactly once per process.
-static ISOLATE_CONFIG: std::sync::Once = std::sync::Once::new();
-
-/// Cuts libgit2 off from every configuration file outside the repository.
-///
-/// The mux's environment asks the git *CLI* for this with `GIT_CONFIG_NOSYSTEM` and
-/// `GIT_CONFIG_GLOBAL=/dev/null`; libgit2 ignores both, and would happily read
-/// `~/.gitconfig`. That is not a cosmetic difference: a host `core.autocrlf` rewrites line endings
-/// while hashing, so the same worktree file would land in the object database as a different blob
-/// than the CLI produces. A command's effect must depend on the seed and the command alone.
-///
-/// Emptying the search path for the non-repository levels is libgit2's supported way to disable
-/// them. It is process-global state, so it is set once, before the first repository is opened.
-pub fn isolate_from_host_config() {
-    ISOLATE_CONFIG.call_once(|| {
-        for level in [
-            git2::ConfigLevel::ProgramData,
-            git2::ConfigLevel::System,
-            git2::ConfigLevel::XDG,
-            git2::ConfigLevel::Global,
-        ] {
-            // SAFETY: `git_libgit2_opts` mutates library-global state and is not thread-safe;
-            // `Once` serializes it, and it runs before any repository exists in this process.
-            unsafe {
-                let _ = git2::opts::set_search_path(level, "");
-            }
-        }
-    });
-}
-
-/// Executes one parsed git invocation in `workdir`, returning the exit code git would return.
-///
-/// `inv.pathspecs` must already be repo-relative, `/`-joined paths inside `workdir` — the builtin
-/// resolves them against the shell's working directory, because only it knows that directory.
-pub(crate) fn run(
-    inv: &GitInvocation,
-    workdir: &Path,
-    author: &GitEnvIdentity,
-    committer: &GitEnvIdentity,
-    stdout: &mut dyn Write,
-    stderr: &mut dyn Write,
-) -> i32 {
-    isolate_from_host_config();
-    let repo = match Repository::open(workdir) {
-        Ok(repo) => repo,
-        Err(error) => {
-            let _ = writeln!(stderr, "fatal: not a git repository: {}", error.message());
-            return FATAL;
-        }
-    };
-    let signatures = if let (Ok(author), Ok(committer)) = (
-        Signature::new(&author.name, &author.email, &author.time),
-        Signature::new(&committer.name, &committer.email, &committer.time),
-    ) {
-        (author, committer)
-    } else {
-        let _ = writeln!(stderr, "fatal: invalid author or committer identity");
-        return FATAL;
-    };
-
-    let outcome = match &inv.action {
-        GitAction::Stage => stage(&repo, workdir, &inv.pathspecs, stderr),
-        GitAction::Delete => delete(&repo, workdir, &inv.pathspecs, stdout, stderr),
-        GitAction::Commit { message } => commit(
-            &repo,
-            workdir,
-            &inv.pathspecs,
-            message.as_deref(),
-            &signatures.0,
-            &signatures.1,
-            stdout,
-            stderr,
-        ),
-        GitAction::Unstage => unstage(&repo, &inv.pathspecs, stderr),
-        GitAction::Checkout => checkout(&repo, workdir, &inv.pathspecs, stderr),
-        GitAction::Stash => stash(
-            &repo,
-            workdir,
-            &inv.pathspecs,
-            &signatures.1,
-            stdout,
-            stderr,
-        ),
-        GitAction::Clean => clean(&repo, workdir, &inv.pathspecs, stdout),
-        GitAction::Diff => diff(&repo, &inv.pathspecs, stdout),
-        GitAction::History => history(&repo, &inv.pathspecs, stdout),
-    };
-
-    match outcome {
-        Ok(code) => code,
-        Err(error) => {
-            let _ = writeln!(stderr, "fatal: {}", error.message());
-            FATAL
-        }
-    }
-}
-
-/// A path's content and mode in one of the three places git tracks it.
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct Blob {
-    /// Object id of the content.
-    id: Oid,
-    /// Git file mode.
-    mode: FileMode,
-}
-
-/// `git add`: index := worktree, for each pathspec.
-fn stage(
-    repo: &Repository,
-    workdir: &Path,
-    pathspecs: &[String],
-    stderr: &mut dyn Write,
-) -> Result<i32, git2::Error> {
-    let mut index = repo.index()?;
-    for spec in pathspecs {
-        let relative = Path::new(spec);
-        if workdir.join(relative).symlink_metadata().is_ok() {
-            index.add_path(relative)?;
-        } else if index.get_path(relative, 0).is_some() {
-            index.remove_path(relative)?;
-        } else {
-            // Neither in the worktree nor in the index: nothing this pathspec could name.
-            let _ = writeln!(stderr, "fatal: pathspec '{spec}' did not match any files");
-            return Ok(FATAL);
-        }
-    }
-    index.write()?;
-    Ok(0)
-}
-
-/// `git rm`: worktree and index entry both go away, unless that would lose work.
-///
-/// The three refusals are git's own (`builtin/rm.c`, `check_local_mod`), probed: staged content
-/// differing from *both* HEAD and the worktree, content merely staged, and content merely modified.
-/// A path already absent from the worktree is never refused — git skips the check when `lstat`
-/// fails.
-fn delete(
-    repo: &Repository,
-    workdir: &Path,
-    pathspecs: &[String],
-    stdout: &mut dyn Write,
-    stderr: &mut dyn Write,
-) -> Result<i32, git2::Error> {
-    let mut index = repo.index()?;
-    let head = head_tree(repo)?;
-    for spec in pathspecs {
-        let relative = Path::new(spec);
-        let Some(staged) = index_blob(&index, relative) else {
-            let _ = writeln!(stderr, "fatal: pathspec '{spec}' did not match any files");
-            return Ok(FATAL);
-        };
-        let committed = head.as_ref().and_then(|tree| tree_blob(tree, relative));
-        let working = worktree_blob(repo, workdir, relative)?;
-        let staged_changes = committed != Some(staged);
-        if let Some(working) = working {
-            let local_changes = working != staged;
-            let refusal = match (staged_changes, local_changes) {
-                (true, true) => Some((
-                    "the following file has staged content different from both the\nfile and the \
-                     HEAD:",
-                    "(use -f to force removal)",
-                )),
-                (true, false) => Some((
-                    "the following file has changes staged in the index:",
-                    "(use --cached to keep the file, or -f to force removal)",
-                )),
-                (false, true) => Some((
-                    "the following file has local modifications:",
-                    "(use --cached to keep the file, or -f to force removal)",
-                )),
-                (false, false) => None,
-            };
-            if let Some((reason, hint)) = refusal {
-                let _ = writeln!(stderr, "error: {reason}\n    {spec}\n{hint}");
-                return Ok(REFUSED);
-            }
-        }
-    }
-
-    for spec in pathspecs {
-        let relative = Path::new(spec);
-        let absolute = workdir.join(relative);
-        if absolute.symlink_metadata().is_ok() {
-            std::fs::remove_file(&absolute).map_err(|error| io_error(&error))?;
-        }
-        index.remove_path(relative)?;
-        let _ = writeln!(stdout, "rm '{spec}'");
-    }
-    index.write()?;
-    Ok(0)
-}
-
-/// `git commit -- <pathspec>`: commits the *worktree* state of the named paths, nothing else.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "one git command line's inputs; grouping them would only rename them"
+/// Fails when the shell cannot compose or wait for the command, or cannot write a diagnostic.
+/// Git's own failures are its exit status, never an error here.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one invocation's containment, admission, run and attribution are a single ordered \
+              sequence; splitting it would scatter the guard obligations it carries"
 )]
-fn commit(
-    repo: &Repository,
-    workdir: &Path,
-    pathspecs: &[String],
-    message: Option<&str>,
-    author: &Signature<'_>,
-    committer: &Signature<'_>,
-    stdout: &mut dyn Write,
-    stderr: &mut dyn Write,
-) -> Result<i32, git2::Error> {
-    let Some(message) = message else {
-        // No editor is reachable from a traced command, and a commit whose message came from
-        // somewhere other than the command line would not be the capability that was granted.
-        let _ = writeln!(stderr, "fatal: no commit message");
-        return Ok(FATAL);
+pub(crate) async fn run<SE: ShellExtensions>(
+    context: ExecutionContext<'_, SE>,
+    argv: Vec<String>,
+    snapshot: Option<Arc<Snapshot>>,
+) -> Result<ExecutionResult, brush_core::Error> {
+    let Some(git) = context
+        .shell
+        .find_first_executable_in_path("git")
+        .and_then(|path| path.to_str().map(str::to_string))
+    else {
+        writeln!(context.stderr(), "git: command not found")?;
+        return Ok(ExecutionResult::new(NOT_FOUND));
     };
-    // `git commit -m` stores the message under `--cleanup=whitespace`: trailing whitespace gone,
-    // exactly one trailing newline. Without this the commit *bytes* differ from the CLI's, and a
-    // merged history would stop being reproducible across engines.
-    let message = git2::message_prettify(message, None)?;
-    let Some(parent) = head_commit(repo)? else {
-        let _ = writeln!(stderr, "fatal: could not resolve 'HEAD'");
-        return Ok(FATAL);
+    let invocation = gitcmd::parse(&argv);
+    let kind = match invocation.action.clone().map(capability_of) {
+        Some(action) if action.is_read() && !action.is_write() => GitCohortKind::Inspect,
+        _ => GitCohortKind::Exclusive,
     };
-    let base = parent.tree()?;
-    let mut index = repo.index()?;
-
-    let mut updates = git2::build::TreeUpdateBuilder::new();
-    for spec in pathspecs {
-        let relative = Path::new(spec);
-        let known = index.get_path(relative, 0).is_some() || tree_blob(&base, relative).is_some();
-        if !known {
-            let _ = writeln!(
-                stderr,
-                "error: pathspec '{spec}' did not match any file(s) known to git"
-            );
-            return Ok(REFUSED);
-        }
-        match worktree_blob(repo, workdir, relative)? {
-            Some(blob) => {
-                updates.upsert(spec.as_str(), blob.id, blob.mode);
-            }
-            None => {
-                updates.remove(spec.as_str());
-            }
-        }
-    }
-    let tree_id = updates.create_updated(repo, &base)?;
-    if tree_id == base.id() {
-        let _ = writeln!(stdout, "no changes added to commit");
-        return Ok(REFUSED);
-    }
-
-    let tree = repo.find_tree(tree_id)?;
-    let oid = repo.commit(Some("HEAD"), author, committer, &message, &tree, &[&parent])?;
-
-    // A partial commit leaves the index agreeing with what was committed, which for these paths is
-    // the worktree state.
-    for spec in pathspecs {
-        let relative = Path::new(spec);
-        if workdir.join(relative).symlink_metadata().is_ok() {
-            index.add_path(relative)?;
-        } else {
-            index.remove_path(relative)?;
-        }
-    }
-    index.write()?;
-
-    let branch = branch_name(repo);
-    let subject = message.lines().next().unwrap_or_default();
-    let _ = writeln!(stdout, "[{branch} {}] {subject}", short(oid));
-    Ok(0)
-}
-
-/// `git restore --staged`: index := HEAD, for each pathspec.
-fn unstage(
-    repo: &Repository,
-    pathspecs: &[String],
-    stderr: &mut dyn Write,
-) -> Result<i32, git2::Error> {
-    let mut index = repo.index()?;
-    let head = head_tree(repo)?;
-    for spec in pathspecs {
-        let relative = Path::new(spec);
-        match head.as_ref().and_then(|tree| tree_blob(tree, relative)) {
-            Some(blob) => index.add(&index_entry(spec, blob))?,
-            None => {
-                if index.get_path(relative, 0).is_some() {
-                    index.remove_path(relative)?;
-                } else {
-                    let _ = writeln!(
-                        stderr,
-                        "error: pathspec '{spec}' did not match any file(s) known to git"
-                    );
-                    return Ok(REFUSED);
-                }
-            }
-        }
-    }
-    index.write()?;
-    Ok(0)
-}
-
-/// `git checkout HEAD -- <pathspec>`: worktree and index both := HEAD.
-///
-/// The named paths are written directly rather than through a libgit2 checkout: the operation is
-/// pathspec-limited by definition, and a checkout strategy could touch paths the capability does not
-/// name.
-fn checkout(
-    repo: &Repository,
-    workdir: &Path,
-    pathspecs: &[String],
-    stderr: &mut dyn Write,
-) -> Result<i32, git2::Error> {
-    let mut index = repo.index()?;
-    let head = head_tree(repo)?;
-    let mut restorable = Vec::with_capacity(pathspecs.len());
-    for spec in pathspecs {
-        let relative = Path::new(spec);
-        let Some(blob) = head.as_ref().and_then(|tree| tree_blob(tree, relative)) else {
-            let _ = writeln!(
-                stderr,
-                "error: pathspec '{spec}' did not match any file(s) known to git"
-            );
-            return Ok(REFUSED);
-        };
-        restorable.push((spec, blob));
-    }
-    for (spec, blob) in restorable {
-        write_blob(repo, workdir, Path::new(spec), blob)?;
-        index.add(&index_entry(spec, blob))?;
-    }
-    index.write()?;
-    Ok(0)
-}
-
-/// `git stash push -- <pathspec>`: the named paths' worktree and index state moves to `refs/stash`,
-/// and the paths themselves go back to HEAD.
-fn stash(
-    repo: &Repository,
-    workdir: &Path,
-    pathspecs: &[String],
-    committer: &Signature<'_>,
-    stdout: &mut dyn Write,
-    stderr: &mut dyn Write,
-) -> Result<i32, git2::Error> {
-    let Some(parent) = head_commit(repo)? else {
-        let _ = writeln!(stderr, "fatal: could not resolve 'HEAD'");
-        return Ok(FATAL);
+    let bound = match &snapshot {
+        Some(snapshot) => Some(snapshot.path().to_path_buf()),
+        None => context
+            .shell
+            .env_str(SNAPSHOT_ROOT_VAR)
+            .map(|root| physical(Path::new(&*root))),
     };
-    let base = parent.tree()?;
-    let mut index = repo.index()?;
 
-    let mut states = Vec::with_capacity(pathspecs.len());
-    let mut dirty = false;
-    for spec in pathspecs {
-        let relative = Path::new(spec);
-        let Some(staged) = index_blob(&index, relative) else {
-            let _ = writeln!(
-                stderr,
-                "error: pathspec '{spec}' did not match any file(s) known to git\n\
-                 Did you forget to 'git add'?"
-            );
-            return Ok(REFUSED);
-        };
-        let committed = tree_blob(&base, relative);
-        let working = worktree_blob(repo, workdir, relative)?;
-        dirty = dirty || committed != Some(staged) || working != Some(staged);
-        states.push((spec, staged, working));
-    }
-    if !dirty {
-        let _ = writeln!(stdout, "No local changes to save");
-        return Ok(0);
-    }
-
-    let branch = branch_name(repo);
-    let subject = parent
-        .summary()
-        .ok()
-        .flatten()
-        .unwrap_or_default()
-        .to_string();
-    let label = format!("on {branch}: {} {subject}", short(parent.id()));
-
-    let mut staged_updates = git2::build::TreeUpdateBuilder::new();
-    let mut working_updates = git2::build::TreeUpdateBuilder::new();
-    for (spec, staged, working) in &states {
-        staged_updates.upsert(spec.as_str(), staged.id, staged.mode);
-        match working {
-            Some(blob) => {
-                working_updates.upsert(spec.as_str(), blob.id, blob.mode);
-            }
-            None => {
-                working_updates.remove(spec.as_str());
-            }
-        }
-    }
-
-    let staged_tree = repo.find_tree(staged_updates.create_updated(repo, &base)?)?;
-    let staged_commit = repo.commit(
-        None,
-        committer,
-        committer,
-        &git2::message_prettify(format!("index {label}"), None)?,
-        &staged_tree,
-        &[&parent],
-    )?;
-    let working_tree = repo.find_tree(working_updates.create_updated(repo, &base)?)?;
-    let message = git2::message_prettify(format!("WIP {label}"), None)?;
-    let working_commit = repo.commit(
-        None,
-        committer,
-        committer,
-        &message,
-        &working_tree,
-        &[&parent, &repo.find_commit(staged_commit)?],
-    )?;
-
-    repo.reference("refs/stash", working_commit, true, &message)?;
-    // `git stash list` reads the reflog, not the ref; libgit2 only logs reference updates it
-    // considers loggable, so the entry is appended when it is missing.
-    let mut reflog = repo.reflog("refs/stash")?;
-    if reflog.is_empty() {
-        reflog.append(working_commit, committer, Some(&message))?;
-        reflog.write()?;
-    }
-
-    for (spec, _, _) in &states {
-        let relative = Path::new(spec);
-        if let Some(blob) = tree_blob(&base, relative) {
-            write_blob(repo, workdir, relative, blob)?;
-            index.add(&index_entry(spec, blob))?;
-        } else {
-            let absolute = workdir.join(relative);
-            if absolute.symlink_metadata().is_ok() {
-                std::fs::remove_file(&absolute).map_err(|error| io_error(&error))?;
-            }
-            index.remove_path(relative)?;
-        }
-    }
-    index.write()?;
-
-    let _ = writeln!(stdout, "Saved working directory and index state {message}");
-    Ok(0)
-}
-
-/// `git clean -f -- <pathspec>`: untracked content at the named paths is deleted.
-fn clean(
-    repo: &Repository,
-    workdir: &Path,
-    pathspecs: &[String],
-    stdout: &mut dyn Write,
-) -> Result<i32, git2::Error> {
-    let index = repo.index()?;
-    for spec in pathspecs {
-        let relative = Path::new(spec);
-        let absolute = workdir.join(relative);
-        if index.get_path(relative, 0).is_none() && absolute.symlink_metadata().is_ok() {
-            std::fs::remove_file(&absolute).map_err(|error| io_error(&error))?;
-            let _ = writeln!(stdout, "Removing {spec}");
-        }
-    }
-    Ok(0)
-}
-
-/// `git diff -- <pathspec>`: the index-to-worktree patch, limited to the named paths.
-fn diff(
-    repo: &Repository,
-    pathspecs: &[String],
-    stdout: &mut dyn Write,
-) -> Result<i32, git2::Error> {
-    let index = repo.index()?;
-    let mut options = git2::DiffOptions::new();
-    for spec in pathspecs {
-        options.pathspec(spec.as_str());
-    }
-    let diff = repo.diff_index_to_workdir(Some(&index), Some(&mut options))?;
-    diff.print(git2::DiffFormat::Patch, |_, _, line| {
-        match line.origin() {
-            '+' | '-' | ' ' => {
-                let _ = write!(stdout, "{}", line.origin());
-            }
-            _ => {}
-        }
-        let _ = stdout.write_all(line.content());
-        true
-    })?;
-    Ok(0)
-}
-
-/// `git log -- <pathspec>`: the commits in which one of the named paths changed.
-fn history(
-    repo: &Repository,
-    pathspecs: &[String],
-    stdout: &mut dyn Write,
-) -> Result<i32, git2::Error> {
-    if head_commit(repo)?.is_none() {
-        return Ok(0);
-    }
-    let mut walk = repo.revwalk()?;
-    walk.push_head()?;
-    for oid in walk {
-        let commit = repo.find_commit(oid?)?;
-        let tree = commit.tree()?;
-        let parents: Vec<Tree<'_>> = commit
-            .parents()
-            .map(|parent| parent.tree())
-            .collect::<Result<_, _>>()?;
-        let touched = pathspecs.iter().any(|spec| {
-            let relative = Path::new(spec);
-            let here = tree_blob(&tree, relative);
-            parents.is_empty() && here.is_some()
-                || !parents.is_empty()
-                    && parents
-                        .iter()
-                        .all(|parent| tree_blob(parent, relative) != here)
-        });
-        if !touched {
-            continue;
-        }
-        let author = commit.author();
-        let _ = writeln!(
-            stdout,
-            "commit {}\nAuthor: {} <{}>\n",
-            commit.id(),
-            author.name().unwrap_or_default(),
-            author.email().unwrap_or_default()
-        );
-        for line in commit.message().unwrap_or_default().lines() {
-            let _ = writeln!(stdout, "    {line}");
-        }
-        let _ = writeln!(stdout);
-    }
-    Ok(0)
-}
-
-/// The current branch's short name, or `HEAD` when it cannot be named.
-fn branch_name(repo: &Repository) -> String {
-    repo.head()
-        .ok()
-        .and_then(|reference| reference.shorthand().map(ToString::to_string).ok())
-        .unwrap_or_else(|| "HEAD".to_string())
-}
-
-/// The commit `HEAD` names, or `None` when the branch is unborn.
-fn head_commit(repo: &Repository) -> Result<Option<git2::Commit<'_>>, git2::Error> {
-    match repo.head() {
-        Ok(reference) => reference.peel_to_commit().map(Some),
-        Err(error)
-            if matches!(
-                error.code(),
-                git2::ErrorCode::UnbornBranch | git2::ErrorCode::NotFound
-            ) =>
-        {
-            Ok(None)
-        }
-        Err(error) => Err(error),
-    }
-}
-
-/// The tree `HEAD` names, or `None` when the branch is unborn.
-fn head_tree(repo: &Repository) -> Result<Option<Tree<'_>>, git2::Error> {
-    match head_commit(repo)? {
-        Some(commit) => commit.tree().map(Some),
-        None => Ok(None),
-    }
-}
-
-/// A path's content in a tree.
-fn tree_blob(tree: &Tree<'_>, relative: &Path) -> Option<Blob> {
-    let entry = tree.get_path(relative).ok()?;
-    Some(Blob {
-        id: entry.id(),
-        mode: file_mode(entry.filemode()),
-    })
-}
-
-/// A path's content in the index, at stage 0.
-fn index_blob(index: &git2::Index, relative: &Path) -> Option<Blob> {
-    let entry = index.get_path(relative, 0)?;
-    #[expect(
-        clippy::cast_possible_wrap,
-        reason = "index modes are the same small constants tree filemodes are"
-    )]
-    Some(Blob {
-        id: entry.id,
-        mode: file_mode(entry.mode as i32),
-    })
-}
-
-/// A path's content in the worktree, hashed into the object database, or `None` when the path is
-/// absent or is not a file.
-fn worktree_blob(
-    repo: &Repository,
-    workdir: &Path,
-    relative: &Path,
-) -> Result<Option<Blob>, git2::Error> {
-    let absolute = workdir.join(relative);
-    let metadata = match absolute.symlink_metadata() {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(io_error(&error)),
+    // One clone per invocation carries every overlay, so nothing set here can leak into the
+    // caller's shell, whatever becomes of this future.
+    let mut shell = context.shell.clone();
+    isolate(&mut shell, bound.as_deref(), kind)?;
+    let cwd = effective_cwd(shell.working_dir(), invocation.global_args);
+    let mut runner = Runner {
+        shell: &mut shell,
+        params: &context.params,
+        git: &git,
+        globals: invocation.global_args,
+        target: None,
     };
-    if metadata.file_type().is_symlink() {
-        let target = std::fs::read_link(&absolute).map_err(|error| io_error(&error))?;
-        let id = repo.blob(path_bytes(&target))?;
-        return Ok(Some(Blob {
-            id,
-            mode: FileMode::Link,
-        }));
-    }
-    if !metadata.is_file() {
-        return Ok(None);
-    }
-    let id = repo.blob_path(&absolute)?;
-    Ok(Some(Blob {
-        id,
-        mode: if is_executable(&metadata) {
-            FileMode::BlobExecutable
-        } else {
-            FileMode::Blob
+
+    let layout = match &bound {
+        None => None,
+        Some(bound) => match runner.contain(&invocation, &cwd, bound).await {
+            Ok(layout) => layout,
+            Err(refusal) => {
+                writeln!(context.stderr(), "fatal: {refusal}")?;
+                return Ok(ExecutionResult::new(FATAL));
+            }
         },
-    }))
+    };
+
+    let (Some(snapshot), Some(bound)) = (snapshot, bound) else {
+        let (result, _) = runner
+            .execute(&argv, context.process_group_id, None)
+            .await?;
+        return Ok(result);
+    };
+    let guard = match snapshot.begin_git(kind) {
+        Ok(guard) => guard,
+        Err(refusal) => {
+            writeln!(context.stderr(), "{refusal}")?;
+            return Ok(ExecutionResult::new(FATAL));
+        }
+    };
+
+    let before = match kind {
+        GitCohortKind::Inspect => None,
+        GitCohortKind::Exclusive => match runner.observe(&invocation, layout, true).await {
+            Ok(before) => Some(before),
+            Err(failure) => {
+                guard.fail(failure);
+                None
+            }
+        },
+    };
+    let started_at = marsh_instrument::now_micros();
+    let (result, stopped) = runner
+        .execute(&argv, context.process_group_id, Some(&guard))
+        .await?;
+    let finished_at = marsh_instrument::now_micros();
+    if stopped {
+        guard.fail("git: a managed git was stopped before it completed".to_string());
+    }
+
+    let window = match crate::shell::blocking_boundary(|| snapshot.drain_trace()) {
+        Ok(()) => snapshot.writes_between(started_at, finished_at),
+        Err(error) => {
+            guard.fail(format!("git: {error}"));
+            return Ok(result);
+        }
+    };
+    match (kind, before) {
+        (GitCohortKind::Inspect, _) => {
+            if window.iter().any(|path| changes_repository_state(path)) {
+                guard.fail("git: inspection changed repository state".to_string());
+            }
+            guard.finish();
+        }
+        (GitCohortKind::Exclusive, None) => {}
+        (GitCohortKind::Exclusive, Some(before)) => {
+            match runner
+                .attribute(&invocation, &before, &window, &bound)
+                .await
+            {
+                Ok((requests, metadata)) => guard.record(GitEffectRecord {
+                    started_at,
+                    finished_at,
+                    requests,
+                    metadata,
+                }),
+                Err(failure) => guard.fail(failure),
+            }
+        }
+    }
+    Ok(result)
 }
 
-/// Writes a blob's content to a worktree path, creating parents and honouring its mode.
-fn write_blob(
-    repo: &Repository,
-    workdir: &Path,
-    relative: &Path,
-    blob: Blob,
-) -> Result<(), git2::Error> {
-    let absolute = workdir.join(relative);
-    if let Some(parent) = absolute.parent() {
-        std::fs::create_dir_all(parent).map_err(|error| io_error(&error))?;
-    }
-    let content = repo.find_blob(blob.id)?;
-    if blob.mode == FileMode::Link {
-        if absolute.symlink_metadata().is_ok() {
-            std::fs::remove_file(&absolute).map_err(|error| io_error(&error))?;
+/// Adds the invocation's environment overlays to its own shell, in a command scope above
+/// everything the caller set.
+///
+/// Discovery stops at the snapshot's parent, so a repository at the snapshot root is still found
+/// from below it and nothing above it ever is. Automatic maintenance runs in the foreground, so
+/// what it rewrites is inside the run's window rather than done by a detached process nobody
+/// observes, after the boundary that judged the line. An inspection takes no optional lock, so it
+/// cannot rewrite the index while only reading it.
+fn isolate<SE: ShellExtensions>(
+    shell: &mut Shell<SE>,
+    bound: Option<&Path>,
+    kind: GitCohortKind,
+) -> Result<(), brush_core::Error> {
+    let mut overlays: Vec<(String, String)> = ISOLATION
+        .iter()
+        .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+        .collect();
+    if let Some(ceiling) = bound.and_then(Path::parent) {
+        let ceiling = ceiling.to_string_lossy();
+        let value = match shell.env_str("GIT_CEILING_DIRECTORIES") {
+            Some(existing) if !existing.is_empty() => format!("{ceiling}:{existing}"),
+            _ => ceiling.into_owned(),
+        };
+        overlays.push(("GIT_CEILING_DIRECTORIES".to_string(), value));
+        // Appended after whatever configuration the caller passed the same way.
+        let base: usize = shell
+            .env_str("GIT_CONFIG_COUNT")
+            .and_then(|count| count.parse().ok())
+            .unwrap_or(0);
+        for (offset, key) in ["maintenance.autoDetach", "gc.autoDetach"]
+            .into_iter()
+            .enumerate()
+        {
+            overlays.push((format!("GIT_CONFIG_KEY_{}", base + offset), key.to_string()));
+            overlays.push((
+                format!("GIT_CONFIG_VALUE_{}", base + offset),
+                "false".to_string(),
+            ));
         }
-        let target = PathBuf::from(String::from_utf8_lossy(content.content()).into_owned());
-        std::os::unix::fs::symlink(target, &absolute).map_err(|error| io_error(&error))?;
-        return Ok(());
+        overlays.push(("GIT_CONFIG_COUNT".to_string(), (base + 2).to_string()));
     }
-    std::fs::write(&absolute, content.content()).map_err(|error| io_error(&error))?;
-    let permissions = if blob.mode == FileMode::BlobExecutable {
-        0o755
-    } else {
-        0o644
-    };
-    std::fs::set_permissions(
-        &absolute,
-        std::os::unix::fs::PermissionsExt::from_mode(permissions),
-    )
-    .map_err(|error| io_error(&error))?;
+    if kind == GitCohortKind::Inspect {
+        overlays.push(("GIT_OPTIONAL_LOCKS".to_string(), "0".to_string()));
+    }
+    let environment = shell.env_mut();
+    environment.push_scope(EnvironmentScope::Command);
+    for (name, value) in overlays {
+        let mut variable = ShellVariable::new(value);
+        variable.export();
+        environment.add(name, variable, EnvironmentScope::Command)?;
+    }
     Ok(())
 }
 
-/// An index entry naming `blob` at `path`, with the stat cache zeroed.
+/// The directory git runs in once the command line's `-C` options have been applied, in order.
+fn effective_cwd<S: AsRef<str>>(start: &Path, globals: &[S]) -> PathBuf {
+    let mut cwd = start.to_path_buf();
+    let mut words = globals.iter().map(AsRef::as_ref);
+    while let Some(word) = words.next() {
+        match word {
+            "-C" => {
+                if let Some(directory) = words.next() {
+                    cwd = gitcmd::resolve(&cwd, directory);
+                }
+            }
+            "-c" | "--git-dir" | "--work-tree" | "--namespace" | "--config-env"
+            | "--attr-source" | "--shallow-file" => {
+                words.next();
+            }
+            _ => {}
+        }
+    }
+    cwd
+}
+
+/// The value of a global option that takes a path, from either spelling; the last one wins.
+fn global_path<'a, S: AsRef<str>>(globals: &'a [S], name: &str) -> Option<&'a str> {
+    let mut found = None;
+    let mut words = globals.iter().map(AsRef::as_ref);
+    while let Some(word) = words.next() {
+        if word == name {
+            found = words.next().or(found);
+        } else if let Some(value) = word
+            .strip_prefix(name)
+            .and_then(|rest| rest.strip_prefix('='))
+        {
+            found = Some(value);
+        } else if matches!(
+            word,
+            "-C" | "-c"
+                | "--git-dir"
+                | "--work-tree"
+                | "--namespace"
+                | "--config-env"
+                | "--attr-source"
+                | "--shallow-file"
+        ) {
+            words.next();
+        }
+    }
+    found
+}
+
+/// `path` with its longest existing ancestor resolved through the filesystem, so a symlink out
+/// of the snapshot cannot pass a prefix check that only compared spellings.
+fn physical(path: &Path) -> PathBuf {
+    let mut existing = path;
+    let mut rest: Vec<&OsStr> = Vec::new();
+    loop {
+        if let Ok(resolved) = existing.canonicalize() {
+            let mut out = resolved;
+            out.extend(rest.iter().rev());
+            return out;
+        }
+        match (existing.parent(), existing.file_name()) {
+            (Some(parent), Some(name)) => {
+                rest.push(name);
+                existing = parent;
+            }
+            _ => return path.to_path_buf(),
+        }
+    }
+}
+
+/// Whether a write at this snapshot-relative path changed what a repository says is staged or
+/// committed: its index, `HEAD`, or a ref.
+fn changes_repository_state(path: &Path) -> bool {
+    let mut components = path.components();
+    while let Some(component) = components.next() {
+        if component == Component::Normal(OsStr::new(".git")) {
+            return matches!(
+                components.next(),
+                Some(Component::Normal(name))
+                    if [OsStr::new("index"), OsStr::new("HEAD"), OsStr::new("packed-refs"), OsStr::new("refs")]
+                        .contains(&name)
+            );
+        }
+    }
+    false
+}
+
+/// Where a repository keeps its state, as git itself resolves it.
+struct Layout {
+    /// `--git-dir`.
+    git_dir: PathBuf,
+    /// `--git-common-dir`.
+    common_dir: PathBuf,
+    /// `--git-path index`: the index file, which `GIT_INDEX_FILE` may move.
+    index: PathBuf,
+    /// `--git-path objects`: the object store, which `GIT_OBJECT_DIRECTORY` may move.
+    objects: PathBuf,
+    /// `--show-toplevel`, absent for a bare repository.
+    worktree: Option<PathBuf>,
+    /// `--show-cdup`: the way up from where the probes run to [`Self::worktree`], as a pathspec
+    /// that names all of it. `ls-files` lists only what lies below its working directory.
+    to_top: String,
+}
+
+/// One reading of a repository's state, around an invocation.
+#[derive(Default)]
+struct Observation {
+    /// The repository, when there was one to read.
+    layout: Option<Layout>,
+    /// Index entries by repository-relative path: `<mode> <object> <stage>`, one per stage.
+    index: BTreeMap<Vec<u8>, Vec<Vec<u8>>>,
+    /// The commit `HEAD` names, when the attribution needs it and the branch is born.
+    head: Option<Vec<u8>>,
+    /// Paths whose index entry differs from `HEAD`, when the attribution needs it.
+    staged: BTreeSet<Vec<u8>>,
+}
+
+/// What a probe printed, and how it ended.
+struct Probe {
+    /// Its exit status.
+    status: u8,
+    /// Everything it wrote to standard output.
+    stdout: Vec<u8>,
+    /// Everything it wrote to standard error.
+    stderr: Vec<u8>,
+}
+
+impl Probe {
+    /// Standard output, when the probe succeeded; the probe's own complaint otherwise.
+    fn output(self, what: &str) -> Result<Vec<u8>, String> {
+        if self.status == 0 {
+            Ok(self.stdout)
+        } else {
+            Err(format!(
+                "git: could not read {what}: {}",
+                String::from_utf8_lossy(&self.stderr).trim_end()
+            ))
+        }
+    }
+}
+
+/// One invocation's native runs: the command itself and its probes, through one shell clone.
+struct Runner<'a, SE: ShellExtensions> {
+    /// The invocation's own shell, carrying its overlays.
+    shell: &'a mut Shell<SE>,
+    /// The builtin's parameters: its descriptors and process-group policy.
+    params: &'a ExecutionParameters,
+    /// The resolved `git` executable.
+    git: &'a str,
+    /// The command line's global options, which every probe repeats.
+    globals: &'a [String],
+    /// The repository a `git init` or `git clone` creates, which probes are pointed at instead of
+    /// the one the working directory is in.
+    target: Option<String>,
+}
+
+impl<SE: ShellExtensions> Runner<'_, SE> {
+    /// Runs the command line itself with the builtin's own descriptors.
+    ///
+    /// A process group the pipeline already established is joined; a process that would
+    /// otherwise land in the shell's own group gets one of its own, so a boundary can end it
+    /// without touching anything else. A process that stopped rather than exited is ended and
+    /// reaped here: the observation around it cannot wait for a job that may never resume.
+    ///
+    /// Returns the result and whether the process had to be ended.
+    async fn execute(
+        &mut self,
+        argv: &[String],
+        group: Option<i32>,
+        guard: Option<&GitGuard>,
+    ) -> Result<(ExecutionResult, bool), brush_core::Error> {
+        let mut params = self.params.clone();
+        if group.is_none()
+            && matches!(
+                params.process_group_policy,
+                ProcessGroupPolicy::SameProcessGroup
+            )
+        {
+            params.process_group_policy = ProcessGroupPolicy::NewProcessGroup;
+        }
+        let args = std::iter::once(self.git.to_string())
+            .chain(argv.iter().skip(1).cloned())
+            .map(CommandArg::String)
+            .collect();
+        let mut command = SimpleCommand::new(
+            ShellForCommand::ParentShell(self.shell),
+            params,
+            self.git.to_string(),
+            args,
+        );
+        command.use_functions = false;
+        command.argv0 = Some("git".to_string());
+        command.process_group_id = group;
+        let spawned = command.execute().await?;
+        if let (Some(guard), ExecutionSpawnResult::StartedProcess(child)) = (guard, &spawned)
+            && let Some(pid) = child.pid()
+        {
+            guard.spawned(pid, child.pgid());
+        }
+        match spawned.wait().await? {
+            ExecutionWaitResult::Completed(result) => Ok((result, false)),
+            ExecutionWaitResult::Stopped(child) => Ok((reap(child).await?, true)),
+        }
+    }
+
+    /// Runs one read-only query with the command line's global options and [`PROBE_OPTIONS`],
+    /// capturing what it prints.
+    ///
+    /// Both output pipes are drained while the probe runs, so an index larger than a pipe buffer
+    /// cannot stall it. The probe goes through the same spawner as the command, and is recorded
+    /// and traced like it: it is part of what this line ran.
+    async fn probe(&mut self, args: &[&str]) -> Result<Probe, String> {
+        let failure =
+            |error: &dyn std::fmt::Display| format!("git: a probe could not run: {error}");
+        let (out, out_writer) = std::io::pipe().map_err(|error| failure(&error))?;
+        let (err, err_writer) = std::io::pipe().map_err(|error| failure(&error))?;
+        let null = std::fs::File::open("/dev/null").map_err(|error| failure(&error))?;
+        let mut params = self.params.clone();
+        params.set_fd(OpenFiles::STDIN_FD, OpenFile::File(null));
+        params.set_fd(OpenFiles::STDOUT_FD, out_writer.into());
+        params.set_fd(OpenFiles::STDERR_FD, err_writer.into());
+        params.process_group_policy = ProcessGroupPolicy::NewProcessGroup;
+        let stdout = std::thread::spawn(move || read_all(out));
+        let stderr = std::thread::spawn(move || read_all(err));
+
+        let mut argv: Vec<CommandArg> = vec![CommandArg::String(self.git.to_string())];
+        argv.extend(
+            self.globals
+                .iter()
+                .map(|word| CommandArg::String(word.clone())),
+        );
+        if let Some(target) = &self.target {
+            argv.extend([
+                CommandArg::String("-C".to_string()),
+                CommandArg::String(target.clone()),
+            ]);
+        }
+        argv.extend(
+            PROBE_OPTIONS
+                .iter()
+                .chain(args)
+                .map(|word| CommandArg::String((*word).to_string())),
+        );
+        let mut command = SimpleCommand::new(
+            ShellForCommand::ParentShell(self.shell),
+            params,
+            self.git.to_string(),
+            argv,
+        );
+        command.use_functions = false;
+        command.argv0 = Some("git".to_string());
+        let status = match command.execute().await {
+            Ok(spawned) => match spawned.wait().await {
+                Ok(ExecutionWaitResult::Completed(result)) => Ok(result),
+                Ok(ExecutionWaitResult::Stopped(child)) => reap(child).await,
+                Err(error) => Err(error),
+            },
+            Err(error) => Err(error),
+        };
+        let stdout = stdout.join().unwrap_or_else(|_| Ok(Vec::new()));
+        let stderr = stderr.join().unwrap_or_else(|_| Ok(Vec::new()));
+        let status = status.map_err(|error| failure(&error))?;
+        Ok(Probe {
+            status: status.exit_code.into(),
+            stdout: stdout.map_err(|error| failure(&error))?,
+            stderr: stderr.map_err(|error| failure(&error))?,
+        })
+    }
+
+    /// Refuses an invocation that would use a repository, or create one, outside `bound`, and
+    /// returns the repository it runs in when there is one.
+    ///
+    /// Checked before anything is started, because a process that has created a directory
+    /// outside the snapshot cannot be taken back. `git init` and `git clone` are checked by their
+    /// destinations, parsed from the command line exactly as git parses them; every other
+    /// subcommand by the repository git itself discovers from the effective working directory.
+    /// Informational forms need no repository and write none, so nothing refuses them; the
+    /// repository they stand in is still returned, because it is what an observation of them
+    /// compares with afterwards. Sources — a clone's origin, an alternate — may be anywhere: only
+    /// what git writes has to be here.
+    async fn contain(
+        &mut self,
+        invocation: &GitInvocation<'_, String>,
+        cwd: &Path,
+        bound: &Path,
+    ) -> Result<Option<Layout>, String> {
+        let outside = |path: &Path| !physical(path).starts_with(bound);
+        let Some(subcommand) = invocation.subcommand.filter(|word| !word.starts_with('-')) else {
+            return self.layout().await;
+        };
+        if matches!(subcommand, "init" | "clone") {
+            let mut writes: Vec<PathBuf> = Vec::new();
+            let target = destination(subcommand, invocation.command_args, cwd)?;
+            for name in [
+                "GIT_DIR",
+                "GIT_WORK_TREE",
+                "GIT_COMMON_DIR",
+                "GIT_INDEX_FILE",
+                "GIT_OBJECT_DIRECTORY",
+            ] {
+                if let Some(value) = self.shell.env_str(name).filter(|value| !value.is_empty()) {
+                    writes.push(gitcmd::resolve(cwd, &value));
+                }
+            }
+            for name in ["--git-dir", "--work-tree"] {
+                if let Some(value) = global_path(self.globals, name) {
+                    writes.push(gitcmd::resolve(cwd, value));
+                }
+            }
+            let redirected = !writes.is_empty();
+            writes.extend(target.separate.iter().cloned());
+            writes.push(target.path.clone());
+            if let Some(escape) = writes.iter().find(|path| outside(path)) {
+                return Err(format!(
+                    "git {subcommand} would write {}, which is outside this snapshot ({})",
+                    escape.display(),
+                    bound.display()
+                ));
+            }
+            if !redirected {
+                self.target = Some(
+                    target
+                        .path
+                        .to_str()
+                        .ok_or_else(|| {
+                            format!(
+                                "git {subcommand}: destination {} is not UTF-8",
+                                target.path.display()
+                            )
+                        })?
+                        .to_string(),
+                );
+            }
+            let layout = self.layout().await?;
+            return Ok(layout.filter(|layout| {
+                let root = if target.bare {
+                    Some(&layout.git_dir)
+                } else {
+                    layout.worktree.as_ref()
+                };
+                redirected || root.is_some_and(|root| physical(root) == physical(&target.path))
+            }));
+        }
+        let Some(layout) = self.layout().await? else {
+            // No repository: git reports that itself, and has nothing of the seed to touch.
+            return Ok(None);
+        };
+        let used = [
+            Some(&layout.git_dir),
+            Some(&layout.common_dir),
+            Some(&layout.index),
+            Some(&layout.objects),
+            layout.worktree.as_ref(),
+        ];
+        if let Some(escape) = used.into_iter().flatten().find(|path| outside(path)) {
+            return Err(format!(
+                "the repository at {} is outside this snapshot ({}); git here may only use a \
+                 repository inside it",
+                escape.display(),
+                bound.display()
+            ));
+        }
+        Ok(Some(layout))
+    }
+
+    /// The repository the probes run in, or `None` when there is none.
+    ///
+    /// The four paths come from one query, each on its own line; a path with a line feed in it
+    /// would make that ambiguous, so it is refused rather than guessed at.
+    async fn layout(&mut self) -> Result<Option<Layout>, String> {
+        let dirs = self
+            .probe(&[
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-dir",
+                "--git-common-dir",
+                "--git-path",
+                "index",
+                "--git-path",
+                "objects",
+            ])
+            .await?;
+        if dirs.status != 0 {
+            return Ok(None);
+        }
+        let lines: Vec<&[u8]> = dirs
+            .stdout
+            .strip_suffix(b"\n")
+            .unwrap_or(&dirs.stdout)
+            .split(|byte| *byte == b'\n')
+            .collect();
+        let [git_dir, common_dir, index, objects] = lines.as_slice() else {
+            return Err("git: the repository's paths could not be read unambiguously".to_string());
+        };
+        let path = |bytes: &[u8]| PathBuf::from(OsStr::from_bytes(bytes));
+        let (git_dir, common_dir, index, objects) =
+            (path(git_dir), path(common_dir), path(index), path(objects));
+        // The way up is a run of `../` and cannot hold a line feed, so it goes first and the
+        // top-level directory is everything after it.
+        let top = self
+            .probe(&["rev-parse", "--show-cdup", "--show-toplevel"])
+            .await?;
+        let (to_top, worktree) = match top.stdout.strip_suffix(b"\n") {
+            Some(lines) if top.status == 0 => {
+                let end = lines
+                    .iter()
+                    .position(|byte| *byte == b'\n')
+                    .ok_or("git: the repository's top level could not be read")?;
+                let up = lines.get(..end).unwrap_or_default();
+                let top = lines.get(end + 1..).unwrap_or_default();
+                (
+                    format!("./{}", String::from_utf8_lossy(up)),
+                    Some(path(top)),
+                )
+            }
+            _ => (String::new(), None),
+        };
+        Ok(Some(Layout {
+            git_dir,
+            common_dir,
+            index,
+            objects,
+            worktree,
+            to_top,
+        }))
+    }
+
+    /// Reads the repository state the attribution of `invocation` needs.
+    ///
+    /// `layout` is the repository [`Self::contain`] already found for the reading before the
+    /// run; the reading after it looks again, because the run may have created or moved one.
+    async fn observe(
+        &mut self,
+        invocation: &GitInvocation<'_, String>,
+        layout: Option<Layout>,
+        before: bool,
+    ) -> Result<Observation, String> {
+        let layout = if before { layout } else { self.layout().await? };
+        let Some(present) = &layout else {
+            return Ok(Observation::default());
+        };
+        let mut observation = Observation::default();
+        if present.worktree.is_some() {
+            let everything = [
+                "ls-files",
+                "--stage",
+                "-z",
+                "--full-name",
+                "--",
+                &present.to_top,
+            ];
+            observation.index = parse_index(&self.probe(&everything).await?.output("the index")?);
+        }
+        let action = &invocation.action;
+        if matches!(action, Some(GitAction::Commit { .. })) || unknown(invocation) {
+            let head = self
+                .probe(&["rev-parse", "-q", "--verify", "HEAD^{commit}"])
+                .await?;
+            if head.status == 0 {
+                observation.head = Some(head.stdout.trim_ascii_end().to_vec());
+            }
+        }
+        if before && matches!(action, Some(GitAction::Unstage)) {
+            let born = self
+                .probe(&["rev-parse", "-q", "--verify", "HEAD^{commit}"])
+                .await?
+                .status
+                == 0;
+            observation.staged = if born {
+                nul_separated(
+                    &self
+                        .probe(&["diff-index", "--cached", "--name-only", "-z", "HEAD", "--"])
+                        .await?
+                        .output("the staged paths")?,
+                )
+            } else {
+                // An unborn branch: everything in the index is staged.
+                observation.index.keys().cloned().collect()
+            };
+        }
+        observation.layout = layout;
+        Ok(observation)
+    }
+
+    /// What the run did, as git actions on snapshot-relative paths, and the repository metadata
+    /// its window's writes belong to.
+    ///
+    /// # Errors
+    ///
+    /// Fails with a diagnostic when a fact the attribution needs cannot be read, or when the run
+    /// changed staged or committed state that its classification cannot name.
+    async fn attribute(
+        &mut self,
+        invocation: &GitInvocation<'_, String>,
+        before: &Observation,
+        window: &[PathBuf],
+        bound: &Path,
+    ) -> Result<(Vec<(GitAction, PathBuf)>, Vec<PathBuf>), String> {
+        let after = self.observe(invocation, None, false).await?;
+        let relative = |path: &Path| path.strip_prefix(bound).ok().map(Path::to_path_buf);
+        let metadata: Vec<PathBuf> = [&before.layout, &after.layout]
+            .into_iter()
+            .flatten()
+            .flat_map(|layout| [&layout.git_dir, &layout.common_dir])
+            .filter_map(|path| relative(&physical(path)))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let Some(top) = [&after.layout, &before.layout]
+            .into_iter()
+            .flatten()
+            .find_map(|layout| layout.worktree.as_deref())
+            .and_then(|top| relative(&physical(top)))
+        else {
+            // No worktree before or after: nothing a resource names changed.
+            return Ok((Vec::new(), metadata));
+        };
+        let written: BTreeSet<Vec<u8>> = window
+            .iter()
+            .filter(|path| !metadata.iter().any(|root| path.starts_with(root)))
+            .filter_map(|path| path.strip_prefix(&top).ok())
+            .filter(|path| !path.as_os_str().is_empty())
+            .map(|path| path.as_os_str().as_bytes().to_vec())
+            .collect();
+        let changed: BTreeSet<&Vec<u8>> = before
+            .index
+            .keys()
+            .chain(after.index.keys())
+            .filter(|path| before.index.get(*path) != after.index.get(*path))
+            .collect();
+        let requests = self
+            .transitions(invocation, before, &after, &changed, &written)
+            .await?
+            .into_iter()
+            .map(|(action, path)| (action, top.join(OsStr::from_bytes(&path))))
+            .collect();
+        Ok((requests, metadata))
+    }
+
+    /// The transitions a run made, by repository-relative path, read off the index entries it
+    /// `changed` and the worktree paths it `written` according to what it was classified as.
+    ///
+    /// # Errors
+    ///
+    /// Fails when a fact the attribution needs cannot be read, or when a run the grammar could
+    /// not decide — or one that should only have touched metadata — changed staged or committed
+    /// state.
+    async fn transitions(
+        &mut self,
+        invocation: &GitInvocation<'_, String>,
+        before: &Observation,
+        after: &Observation,
+        changed: &BTreeSet<&Vec<u8>>,
+        written: &BTreeSet<Vec<u8>>,
+    ) -> Result<Vec<(GitAction, Vec<u8>)>, String> {
+        let mut requests: Vec<(GitAction, Vec<u8>)> = Vec::new();
+        let mut request = |action: GitAction, path: &[u8]| requests.push((action, path.to_vec()));
+        match &invocation.action {
+            Some(GitAction::Stage) => {
+                for path in changed {
+                    if written.contains(*path) {
+                        request(GitAction::Edit, path);
+                    }
+                    request(GitAction::Stage, path);
+                }
+            }
+            Some(GitAction::Unstage) => {
+                for path in changed {
+                    let action = if before.staged.contains(*path) {
+                        GitAction::Unstage
+                    } else {
+                        // Not staged before: the committed base moved under unchanged content,
+                        // which leaves the resource modified rather than unstaged.
+                        GitAction::Edit
+                    };
+                    request(action, path);
+                }
+            }
+            Some(GitAction::Delete) => {
+                for path in changed {
+                    if !after.index.contains_key(*path) {
+                        request(GitAction::Delete, path);
+                    } else {
+                        if !before.index.contains_key(*path) {
+                            request(GitAction::Edit, path);
+                        }
+                        request(GitAction::Stage, path);
+                    }
+                }
+            }
+            Some(GitAction::Commit { .. }) => {
+                return self.commits(before, after, changed, written).await;
+            }
+            Some(GitAction::Checkout) => return self.settle(&after.index, changed, written).await,
+            Some(GitAction::Edit) if !unknown(invocation) => {
+                return self.settle(&after.index, changed, written).await;
+            }
+            Some(GitAction::Stash) => {
+                let mut stashed: BTreeSet<&[u8]> =
+                    changed.iter().map(|path| path.as_slice()).collect();
+                stashed.extend(written.iter().map(Vec::as_slice));
+                for path in stashed {
+                    request(GitAction::Stash, path);
+                }
+            }
+            Some(GitAction::Clean) => {
+                for path in written {
+                    request(GitAction::Clean, path);
+                }
+            }
+            Some(GitAction::Edit) | None => {
+                let moved_head = unknown(invocation) && before.head != after.head;
+                if !changed.is_empty() || moved_head {
+                    return Err("git: cannot attribute repository state changes".to_string());
+                }
+            }
+            Some(GitAction::Read | GitAction::Diff | GitAction::History) => {}
+        }
+        Ok(requests)
+    }
+
+    /// What a commit-making run did: each path the new `HEAD` changed is committed with that
+    /// commit's real message — edited first when the run itself rewrote it, staged first when the
+    /// committed entry is not the one the index held — and anything else it staged is staged.
+    /// A run that made no commit commits nothing.
+    async fn commits(
+        &mut self,
+        before: &Observation,
+        after: &Observation,
+        changed: &BTreeSet<&Vec<u8>>,
+        written: &BTreeSet<Vec<u8>>,
+    ) -> Result<Vec<(GitAction, Vec<u8>)>, String> {
+        let committed = match (&before.head, &after.head) {
+            (_, None) => Vec::new(),
+            (Some(old), Some(new)) if old == new => Vec::new(),
+            (old, Some(new)) => self.committed(old.as_deref(), new).await?,
+        };
+        let mut requests: Vec<(GitAction, Vec<u8>)> = Vec::new();
+        if let (Some(new), false) = (&after.head, committed.is_empty()) {
+            let message = self.message(new).await?;
+            for (path, entry) in &committed {
+                if written.contains(path) {
+                    requests.push((GitAction::Edit, path.clone()));
+                }
+                let staged = before
+                    .index
+                    .get(path)
+                    .and_then(|entries| entries.iter().find(|entry| entry.ends_with(b" 0")))
+                    .and_then(|entry| entry.get(..entry.len() - 2));
+                if staged != entry.as_deref() {
+                    requests.push((GitAction::Stage, path.clone()));
+                }
+                requests.push((
+                    GitAction::Commit {
+                        message: Some(message.clone()),
+                    },
+                    path.clone(),
+                ));
+            }
+        }
+        for path in changed {
+            if !committed.iter().any(|(committed, _)| committed == *path) {
+                requests.push((GitAction::Stage, (*path).clone()));
+            }
+        }
+        Ok(requests)
+    }
+
+    /// The per-path outcome of a run that puts repository content into the worktree: a
+    /// checkout, a switch, a merge, a rebase, a restoring reset, a clone, a popped stash.
+    ///
+    /// Every path the run wrote, whose index entry it changed, or that it left conflicted is
+    /// judged by where it ended up. Clean — worktree, index and `HEAD` agree — is a checkout;
+    /// staged — the index moved and the worktree with it — is an edit and a stage; anything else,
+    /// a conflict above all, is an edit that settles nothing.
+    async fn settle(
+        &mut self,
+        after: &BTreeMap<Vec<u8>, Vec<Vec<u8>>>,
+        changed: &BTreeSet<&Vec<u8>>,
+        written: &BTreeSet<Vec<u8>>,
+    ) -> Result<Vec<(GitAction, Vec<u8>)>, String> {
+        let conflicted = after
+            .iter()
+            .filter(|(_, entries)| entries.iter().any(|entry| !entry.ends_with(b" 0")))
+            .map(|(path, _)| path.as_slice());
+        let affected: BTreeSet<&[u8]> = changed
+            .iter()
+            .map(|path| path.as_slice())
+            .chain(written.iter().map(Vec::as_slice))
+            .chain(conflicted)
+            .collect();
+        if affected.is_empty() {
+            return Ok(Vec::new());
+        }
+        let status = parse_status(
+            &self
+                .probe(&[
+                    "status",
+                    "--porcelain=v2",
+                    "-z",
+                    "--untracked-files=all",
+                    "--ignored=matching",
+                    "--no-renames",
+                ])
+                .await?
+                .output("the worktree status")?,
+        );
+        let mut requests = Vec::new();
+        for path in affected {
+            match status.get(path) {
+                None => requests.push((GitAction::Checkout, path.to_vec())),
+                Some(Status::Staged) => {
+                    requests.push((GitAction::Edit, path.to_vec()));
+                    requests.push((GitAction::Stage, path.to_vec()));
+                }
+                Some(Status::Dirty) => requests.push((GitAction::Edit, path.to_vec())),
+            }
+        }
+        Ok(requests)
+    }
+
+    /// The entries a commit changed relative to `old`, by repository-relative path; an entry is
+    /// `<mode> <object>`, or `None` for a path the commit removed.
+    async fn committed(
+        &mut self,
+        old: Option<&[u8]>,
+        new: &[u8],
+    ) -> Result<Vec<(Vec<u8>, Option<Vec<u8>>)>, String> {
+        let new = std::str::from_utf8(new)
+            .map_err(|_| "git: HEAD is not a hexadecimal object name".to_string())?;
+        let Some(old) = old else {
+            let listing = self
+                .probe(&["ls-tree", "-r", "-z", "--full-tree", new])
+                .await?
+                .output("the committed tree")?;
+            return Ok(listing
+                .split(|byte| *byte == 0)
+                .filter(|record| !record.is_empty())
+                .filter_map(|record| {
+                    let tab = record.iter().position(|byte| *byte == b'\t')?;
+                    let fields: Vec<&[u8]> = record[..tab].split(|byte| *byte == b' ').collect();
+                    let [mode, _, object] = fields.as_slice() else {
+                        return None;
+                    };
+                    Some((
+                        record[tab + 1..].to_vec(),
+                        Some([*mode, b" ", *object].concat()),
+                    ))
+                })
+                .collect());
+        };
+        let old = std::str::from_utf8(old)
+            .map_err(|_| "git: HEAD is not a hexadecimal object name".to_string())?;
+        let raw = self
+            .probe(&["diff-tree", "-r", "-z", "--no-renames", old, new])
+            .await?
+            .output("the committed changes")?;
+        let mut fields = raw
+            .split(|byte| *byte == 0)
+            .filter(|field| !field.is_empty());
+        let mut committed = Vec::new();
+        while let (Some(meta), Some(path)) = (fields.next(), fields.next()) {
+            let parts: Vec<&[u8]> = meta.split(|byte| *byte == b' ').collect();
+            let [_, mode, _, object, _] = parts.as_slice() else {
+                return Err("git: the committed changes could not be read".to_string());
+            };
+            let removed = object.iter().all(|byte| *byte == b'0');
+            committed.push((
+                path.to_vec(),
+                (!removed).then(|| [*mode, b" ", *object].concat()),
+            ));
+        }
+        Ok(committed)
+    }
+
+    /// The message of `commit` as the object stores it, less exactly one terminating line feed.
+    async fn message(&mut self, commit: &[u8]) -> Result<String, String> {
+        let commit = std::str::from_utf8(commit)
+            .map_err(|_| "git: HEAD is not a hexadecimal object name".to_string())?;
+        let object = self
+            .probe(&["cat-file", "commit", commit])
+            .await?
+            .output("the commit")?;
+        let body = object
+            .windows(2)
+            .position(|pair| pair == b"\n\n")
+            .map_or(&[][..], |at| &object[at + 2..]);
+        let body = body.strip_suffix(b"\n").unwrap_or(body);
+        Ok(String::from_utf8_lossy(body).into_owned())
+    }
+}
+
+/// Whether `invocation` is a form the grammar could not decide — classified as an edit — rather
+/// than one whose edit is a known outcome, like a popped stash.
+fn unknown<S: AsRef<str>>(invocation: &GitInvocation<'_, S>) -> bool {
+    matches!(invocation.action, Some(GitAction::Edit)) && invocation.subcommand != Some("stash")
+}
+
+/// Ends a stopped process and waits for it to exit.
+async fn reap(mut child: ChildProcess) -> Result<ExecutionResult, brush_core::Error> {
+    if let Some(pid) = child.pid() {
+        end_process(pid, child.pgid());
+    }
+    loop {
+        if let ProcessWaitResult::Completed(output) = child.wait().await? {
+            return Ok(ExecutionResult::from(output));
+        }
+    }
+}
+
+/// Everything a pipe carries until its writers close it.
+fn read_all(mut pipe: std::io::PipeReader) -> std::io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    pipe.read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+/// NUL-terminated records, as a set.
+fn nul_separated(bytes: &[u8]) -> BTreeSet<Vec<u8>> {
+    bytes
+        .split(|byte| *byte == 0)
+        .filter(|record| !record.is_empty())
+        .map(<[u8]>::to_vec)
+        .collect()
+}
+
+/// `git ls-files --stage -z`: `<mode> <object> <stage>\t<path>\0` per entry.
+fn parse_index(bytes: &[u8]) -> BTreeMap<Vec<u8>, Vec<Vec<u8>>> {
+    let mut index: BTreeMap<Vec<u8>, Vec<Vec<u8>>> = BTreeMap::new();
+    for record in bytes
+        .split(|byte| *byte == 0)
+        .filter(|record| !record.is_empty())
+    {
+        if let Some(tab) = record.iter().position(|byte| *byte == b'\t') {
+            index
+                .entry(record[tab + 1..].to_vec())
+                .or_default()
+                .push(record[..tab].to_vec());
+        }
+    }
+    index
+}
+
+/// Where a path the status lists stands. A path it does not list is clean.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Status {
+    /// The index differs from `HEAD` and the worktree agrees with the index.
+    Staged,
+    /// The worktree differs from the index, or the path is conflicted, untracked or ignored.
+    Dirty,
+}
+
+/// `git status --porcelain=v2 -z --no-renames`, by repository-relative path.
 ///
-/// Zeroed stat data is what git writes when it puts a committed object into the index without
-/// touching the worktree (`git restore --staged`): the entry is "stat dirty", so the next status
-/// re-hashes the file instead of trusting a timestamp this process never observed.
-fn index_entry(path: &str, blob: Blob) -> IndexEntry {
-    #[expect(
-        clippy::cast_sign_loss,
-        reason = "git file modes are small positive constants"
-    )]
-    IndexEntry {
-        ctime: IndexTime::new(0, 0),
-        mtime: IndexTime::new(0, 0),
-        dev: 0,
-        ino: 0,
-        mode: i32::from(blob.mode) as u32,
-        uid: 0,
-        gid: 0,
-        file_size: 0,
-        id: blob.id,
-        flags: 0,
-        flags_extended: 0,
-        path: path.as_bytes().to_vec(),
+/// Ordinary entries (`1`) carry eight fields before the path and conflicted ones (`u`) ten;
+/// untracked (`?`) and ignored (`!`) entries carry the path alone. The path is everything after
+/// the fixed fields, bytes and all.
+fn parse_status(bytes: &[u8]) -> BTreeMap<Vec<u8>, Status> {
+    bytes
+        .split(|byte| *byte == 0)
+        .filter_map(status_entry)
+        .map(|(path, status)| (path.to_vec(), status))
+        .collect()
+}
+
+/// One porcelain-v2 record's path and standing, or `None` for a header or an unknown record.
+fn status_entry(record: &[u8]) -> Option<(&[u8], Status)> {
+    let fields = |count: usize| record.splitn(count + 1, |byte| *byte == b' ');
+    match record.first()? {
+        b'1' => {
+            let mut parts = fields(8);
+            let status = match parts.nth(1)? {
+                [index, b'.'] if *index != b'.' => Status::Staged,
+                _ => Status::Dirty,
+            };
+            Some((parts.nth(6)?, status))
+        }
+        b'u' => Some((fields(10).nth(10)?, Status::Dirty)),
+        b'?' | b'!' => Some((record.get(2..)?, Status::Dirty)),
+        _ => None,
     }
 }
 
-/// Classifies a raw git file mode.
-const fn file_mode(raw: i32) -> FileMode {
-    match raw {
-        0o120_000 => FileMode::Link,
-        0o100_755 => FileMode::BlobExecutable,
-        0o040_000 => FileMode::Tree,
-        0o160_000 => FileMode::Commit,
-        _ => FileMode::Blob,
+/// Where `git init` or `git clone` puts the repository it creates.
+struct Destination {
+    /// The directory it creates: the worktree, or the repository itself when bare.
+    path: PathBuf,
+    /// A `--separate-git-dir`, which is written too.
+    separate: Option<PathBuf>,
+    /// Whether the destination is a bare repository.
+    bare: bool,
+}
+
+/// The destination of `git init` or `git clone` run with `args` from `cwd`.
+///
+/// Operands are found with git's own option table, so a value that looks like a path belongs to
+/// the option before it. An omitted clone destination is named from the source the way git names
+/// it ([`clone_basename`]).
+fn destination<S: AsRef<str>>(
+    subcommand: &str,
+    args: &[S],
+    cwd: &Path,
+) -> Result<Destination, String> {
+    let grammar = if subcommand == "clone" {
+        &gitcmd::CLONE
+    } else {
+        &gitcmd::INIT
+    };
+    let scan = gitcmd::scan(args, grammar);
+    let bare = scan.has(None, "bare") || scan.has(None, "mirror");
+    let separate = scan
+        .value(None, "separate-git-dir")
+        .map(|value| gitcmd::resolve(cwd, value));
+    let path = if subcommand == "clone" {
+        let Some(source) = scan.positionals.first() else {
+            return Err("git clone names no repository to clone".to_string());
+        };
+        if let Some(explicit) = scan.positionals.get(1) {
+            gitcmd::resolve(cwd, explicit)
+        } else {
+            let name = clone_basename(source, is_bundle(source, cwd), bare).ok_or_else(|| {
+                "git clone: no directory name could be guessed from the source".to_string()
+            })?;
+            gitcmd::resolve(cwd, &name)
+        }
+    } else {
+        scan.positionals.first().map_or_else(
+            || cwd.to_path_buf(),
+            |explicit| gitcmd::resolve(cwd, explicit),
+        )
+    };
+    Ok(Destination {
+        path,
+        separate,
+        bare,
+    })
+}
+
+/// Whether a clone source names a bundle file, as `builtin/clone.c`'s `get_repo_path` decides:
+/// a local path whose repository spellings are not directories and whose bundle spellings are a
+/// regular file.
+fn is_bundle(source: &str, cwd: &Path) -> bool {
+    if source.contains("://") {
+        return false;
     }
+    let path = gitcmd::resolve(cwd, source);
+    let spelled = |suffix: &str| PathBuf::from(format!("{}{suffix}", path.display()));
+    if ["/.git", "", ".git/.git", ".git"]
+        .iter()
+        .any(|suffix| spelled(suffix).is_dir())
+    {
+        return false;
+    }
+    [".bundle", ""]
+        .iter()
+        .any(|suffix| spelled(suffix).is_file())
 }
 
-/// Whether a worktree entry carries any execute bit, which is what git records as mode 100755.
-fn is_executable(metadata: &std::fs::Metadata) -> bool {
-    std::os::unix::fs::MetadataExt::mode(metadata) & 0o111 != 0
-}
-
-/// A path's bytes, for storing a symlink target as blob content.
-fn path_bytes(path: &Path) -> &[u8] {
-    std::os::unix::ffi::OsStrExt::as_bytes(path.as_os_str())
-}
-
-/// The abbreviated object id git prints.
-fn short(oid: Oid) -> String {
-    oid.to_string().chars().take(7).collect()
-}
-
-/// Wraps an I/O failure as a libgit2 error so one error type reaches the exit-code mapping.
-fn io_error(error: &std::io::Error) -> git2::Error {
-    git2::Error::new(
-        git2::ErrorCode::GenericError,
-        git2::ErrorClass::Os,
-        error.to_string(),
-    )
+/// The directory `git clone` creates for `repo` when none is given: `dir.c`'s `git_url_basename`.
+///
+/// The scheme and any authentication are skipped; trailing slashes, whitespace and a `/.git` are
+/// stripped; a trailing port is dropped from a bare host; the last `/`- or `:`-separated component
+/// is kept, less a `.git` (or, for a bundle, `.bundle`) suffix; a bare clone gets `.git` back; and
+/// runs of control characters and whitespace become single spaces, trimmed at both ends.
+fn clone_basename(repo: &str, is_bundle: bool, is_bare: bool) -> Option<String> {
+    let bytes = repo.as_bytes();
+    let space = |byte: u8| matches!(byte, b' ' | b'\t' | b'\n' | b'\x0b' | b'\x0c' | b'\r');
+    let mut start = repo.find("://").map_or(0, |at| at + 3);
+    let mut end = bytes.len();
+    let mut at = start;
+    while at < end && bytes[at] != b'/' {
+        if bytes[at] == b'@' {
+            start = at + 1;
+        }
+        at += 1;
+    }
+    while start < end && (bytes[end - 1] == b'/' || space(bytes[end - 1])) {
+        end -= 1;
+    }
+    if end - start > 5 && bytes[end - 5] == b'/' && &bytes[end - 4..end] == b".git" {
+        end -= 5;
+        while start < end && bytes[end - 1] == b'/' {
+            end -= 1;
+        }
+    }
+    let host = &bytes[start..end];
+    if !host.contains(&b'/') && host.contains(&b':') {
+        let mut port = end;
+        while start < port && bytes[port - 1].is_ascii_digit() {
+            port -= 1;
+        }
+        if start < port && bytes[port - 1] == b':' {
+            end = port - 1;
+        }
+    }
+    let mut component = end;
+    while start < component && bytes[component - 1] != b'/' && bytes[component - 1] != b':' {
+        component -= 1;
+    }
+    let suffix: &[u8] = if is_bundle { b".bundle" } else { b".git" };
+    let mut len = end - component;
+    if bytes[component..end].ends_with(suffix) {
+        len -= suffix.len();
+    }
+    if len == 0 || (len == 1 && bytes[component] == b'/') {
+        return None;
+    }
+    let base = repo.get(component..component + len)?;
+    let dir = if is_bare {
+        format!("{base}.git")
+    } else {
+        base.to_string()
+    };
+    let mut out = String::with_capacity(dir.len());
+    let mut previous_space = true;
+    for character in dir.chars() {
+        let character = if u32::from(character) < 0x20 {
+            ' '
+        } else {
+            character
+        };
+        if character == ' ' {
+            if previous_space {
+                continue;
+            }
+            previous_space = true;
+        } else {
+            previous_space = false;
+        }
+        out.push(character);
+    }
+    if previous_space {
+        out.pop();
+    }
+    Some(out)
 }
 
 #[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
@@ -860,828 +1284,74 @@ fn io_error(error: &std::io::Error) -> git2::Error {
 mod tests {
     use super::*;
 
-    /// Hashes bytes as a blob without writing them, for tests that compare content.
-    fn hash_blob(bytes: &[u8]) -> Oid {
-        Oid::hash_object(git2::ObjectType::Blob, bytes).expect("hash blob")
-    }
-
-    /// The pinned identity every test commits with: the mux's own `git_env`, so a commit produced
-    /// here is byte-identical to one the mux would merge.
-    fn identity() -> GitEnvIdentity {
-        identity_from_env(
-            |name| {
-                Some(
-                    match name {
-                        "GIT_AUTHOR_NAME" | "GIT_COMMITTER_NAME" => "agent0",
-                        "GIT_AUTHOR_EMAIL" | "GIT_COMMITTER_EMAIL" => "agent0@marsh.local",
-                        _ => "1112911993 +0000",
-                    }
-                    .to_string(),
-                )
-            },
-            "AUTHOR",
-        )
-        .expect("identity")
-    }
-
-    /// A scratch repository with one commit containing `src/p.txt` and `src/.keep`.
-    ///
-    /// The guard owns an ordinary temporary directory: nothing here needs a snapshot, and the
-    /// repository is removed when the guard is dropped at the end of the test.
-    fn scratch(label: &str) -> tempfile::TempDir {
-        let directory = tempfile::Builder::new()
-            .prefix(&format!("gitexec-{label}-"))
-            .tempdir()
-            .expect("scratch directory");
-        let root = directory.path();
-        // The helper builds its seed commit with libgit2 directly, so it needs the same isolation
-        // `run` installs: a host `core.autocrlf` would otherwise hash the seed files differently.
-        isolate_from_host_config();
-        std::fs::create_dir_all(root.join("src")).expect("scratch dirs");
-        std::fs::write(root.join("src/p.txt"), b"seed\n").expect("seed file");
-        std::fs::write(root.join("src/.keep"), b"").expect("keep file");
-
-        let repo = Repository::init_opts(
-            root,
-            git2::RepositoryInitOptions::new().initial_head("main"),
-        )
-        .expect("init");
-        {
-            let mut index = repo.index().expect("index");
-            index.add_path(Path::new("src/p.txt")).expect("add p");
-            index.add_path(Path::new("src/.keep")).expect("add keep");
-            index.write().expect("write index");
-            let tree = repo
-                .find_tree(index.write_tree().expect("write tree"))
-                .expect("tree");
-            let id = identity();
-            let signature = Signature::new(&id.name, &id.email, &id.time).expect("signature");
-            repo.commit(Some("HEAD"), &signature, &signature, "seed\n", &tree, &[])
-                .expect("seed commit");
-        }
-        drop(repo);
-        directory
-    }
-
-    /// Runs one git command line in `root`, returning `(exit code, stdout, stderr)`.
-    fn exec(root: &Path, argv: &[&str]) -> (i32, String, String) {
-        let argv: Vec<String> = argv.iter().map(|arg| (*arg).to_string()).collect();
-        let invocation = super::super::gitcmd::parse(&argv).expect("parse");
-        let author = identity();
-        let committer = identity();
-        let mut out = Vec::new();
-        let mut err = Vec::new();
-        let code = run(&invocation, root, &author, &committer, &mut out, &mut err);
-        (
-            code,
-            String::from_utf8_lossy(&out).into_owned(),
-            String::from_utf8_lossy(&err).into_owned(),
-        )
-    }
-
-    /// The state of `src/p.txt` in HEAD, the index and the worktree.
-    fn state(root: &Path) -> (Option<Oid>, Option<Oid>, Option<Vec<u8>>) {
-        let repo = Repository::open(root).expect("open");
-        let relative = Path::new("src/p.txt");
-        let head = head_tree(&repo)
-            .expect("head")
-            .and_then(|tree| tree_blob(&tree, relative))
-            .map(|blob| blob.id);
-        let index = index_blob(&repo.index().expect("index"), relative).map(|blob| blob.id);
-        let worktree = std::fs::read(root.join(relative)).ok();
-        (head, index, worktree)
-    }
-
+    /// The guess is git's, byte for byte, across the spellings a source can take.
     #[test]
-    fn a_raw_epoch_date_becomes_a_git_time() {
-        let identity = identity();
-        assert_eq!(identity.time.seconds(), 1_112_911_993);
-        assert_eq!(identity.time.offset_minutes(), 0);
-        let shifted = identity_from_env(
-            |name| {
-                Some(match name {
-                    "GIT_AUTHOR_DATE" => "1112911993 -0530".to_string(),
-                    _ => "x".to_string(),
-                })
-            },
-            "AUTHOR",
-        )
-        .expect("identity");
-        assert_eq!(shifted.time.offset_minutes(), -330);
-        for bad in ["", "1112911993", "not-a-date +0000", "1112911993 +05"] {
-            let error = identity_from_env(
-                |name| {
-                    Some(if name == "GIT_AUTHOR_DATE" {
-                        bad.to_string()
-                    } else {
-                        "x".to_string()
-                    })
-                },
-                "AUTHOR",
-            )
-            .err()
-            .unwrap_or_else(|| panic!("{bad:?} accepted"))
-            .to_string();
-            assert!(error.contains("GIT_AUTHOR_DATE"), "{bad:?}: {error}");
-        }
-        assert!(
-            identity_from_env(|_| None, "COMMITTER")
-                .err()
-                .expect("rejected")
-                .to_string()
-                .contains("GIT_COMMITTER_NAME"),
-            "a missing identity is refused, never guessed"
-        );
-    }
-
-    #[test]
-    fn staging_moves_the_worktree_into_the_index() {
-        let directory = scratch("stage");
-        let root = directory.path();
-        std::fs::write(root.join("src/p.txt"), b"seed\nmod\n").expect("modify");
-        let (code, _, err) = exec(root, &["git", "add", "--", "src/p.txt"]);
-        assert_eq!((code, err.as_str()), (0, ""));
-        let (head, index, worktree) = state(root);
-        assert_eq!(index, Some(hash_blob(b"seed\nmod\n")));
-        assert_ne!(index, head, "the index moved ahead of HEAD");
-        assert_eq!(worktree.as_deref(), Some(&b"seed\nmod\n"[..]));
-
-        // A deleted worktree file stages its removal, exactly like the CLI.
-        std::fs::remove_file(root.join("src/p.txt")).expect("remove");
-        let (code, _, _) = exec(root, &["git", "add", "--", "src/p.txt"]);
-        assert_eq!(code, 0);
-        assert_eq!(state(root).1, None, "the index entry is gone");
-
-        // Absent from both worktree and index: nothing the pathspec could name.
-        let (code, _, err) = exec(root, &["git", "add", "--", "src/p.txt"]);
-        assert_eq!(code, FATAL);
-        assert!(err.contains("did not match any files"), "{err:?}");
-    }
-
-    #[test]
-    fn git_rm_refuses_exactly_what_the_cli_refuses() {
-        // (state setup, expected exit, expected message fragment)
-        let cases: [(&str, i32, &str); 5] = [
-            ("clean", 0, ""),
-            ("wt-modified", REFUSED, "local modifications"),
-            ("staged", REFUSED, "changes staged in the index"),
+    fn a_clone_destination_is_named_as_git_names_it() {
+        for (repo, bundle, bare, expected) in [
             (
-                "staged-and-modified",
-                REFUSED,
-                "staged content different from both",
+                "https://user@host.example/path/repo.git",
+                false,
+                false,
+                Some("repo"),
             ),
-            ("wt-deleted", 0, ""),
-        ];
-        for (setup, expected_code, fragment) in cases {
-            let directory = scratch(setup);
-            let root = directory.path();
-            let path = root.join("src/p.txt");
-            match setup {
-                "clean" => {}
-                "wt-modified" => std::fs::write(&path, b"seed\nmod\n").expect("modify"),
-                "staged" => {
-                    std::fs::write(&path, b"seed\nmod\n").expect("modify");
-                    assert_eq!(exec(root, &["git", "add", "--", "src/p.txt"]).0, 0);
-                }
-                "staged-and-modified" => {
-                    std::fs::write(&path, b"seed\nmod\n").expect("modify");
-                    assert_eq!(exec(root, &["git", "add", "--", "src/p.txt"]).0, 0);
-                    std::fs::write(&path, b"seed\nmod\nmore\n").expect("modify again");
-                }
-                "wt-deleted" => std::fs::remove_file(&path).expect("remove"),
-                other => panic!("unknown setup {other}"),
-            }
-            let (code, _, err) = exec(root, &["git", "rm", "--", "src/p.txt"]);
-            assert_eq!(code, expected_code, "{setup}: {err}");
-            if fragment.is_empty() {
-                assert_eq!(state(root).1, None, "{setup}: the index entry is gone");
-                assert!(!path.exists(), "{setup}: the worktree file is gone");
-            } else {
-                assert!(err.contains(fragment), "{setup} reported {err:?}");
-                assert!(
-                    state(root).1.is_some(),
-                    "{setup}: a refused removal changes nothing"
-                );
-            }
-        }
-
-        // Untracked, and never-tracked, are both `fatal:` — the pathspec matches no index entry.
-        let directory = scratch("rm-untracked");
-        let root = directory.path();
-        std::fs::write(root.join("src/new.txt"), b"new\n").expect("new file");
-        let (code, _, err) = exec(root, &["git", "rm", "--", "src/new.txt"]);
-        assert_eq!(code, FATAL);
-        assert!(err.contains("did not match any files"), "{err:?}");
-    }
-
-    #[test]
-    fn a_partial_commit_records_the_worktree_and_updates_the_index() {
-        let directory = scratch("commit");
-        let root = directory.path();
-        std::fs::write(root.join("src/p.txt"), b"seed\nmod\n").expect("modify");
-        let (code, out, err) = exec(root, &["git", "commit", "-m", "step 7", "--", "src/p.txt"]);
-        assert_eq!((code, err.as_str()), (0, ""));
-        assert!(out.starts_with("[main "), "got {out:?}");
-        let (head, index, worktree) = state(root);
-        assert_eq!(
-            head,
-            Some(hash_blob(b"seed\nmod\n")),
-            "HEAD has the worktree content"
-        );
-        assert_eq!(index, head, "the index agrees with what was committed");
-        assert_eq!(worktree.as_deref(), Some(&b"seed\nmod\n"[..]));
-
-        let repo = Repository::open(root).expect("open");
-        let commit = head_commit(&repo).expect("head").expect("a commit");
-        assert_eq!(commit.message().ok(), Some("step 7\n"));
-        assert_eq!(commit.author().name().ok(), Some("agent0"));
-        assert_eq!(commit.time().seconds(), 1_112_911_993);
-
-        // Nothing left to record for this path.
-        let (code, out, _) = exec(root, &["git", "commit", "-m", "again", "--", "src/p.txt"]);
-        assert_eq!(code, REFUSED);
-        assert!(out.contains("no changes added to commit"), "{out:?}");
-
-        // A path git knows nothing about cannot be committed, even when it exists.
-        std::fs::write(root.join("src/new.txt"), b"new\n").expect("new file");
-        let (code, _, err) = exec(root, &["git", "commit", "-m", "x", "--", "src/new.txt"]);
-        assert_eq!(code, REFUSED);
-        assert!(
-            err.contains("did not match any file(s) known to git"),
-            "{err:?}"
-        );
-
-        // A commit with no message is refused rather than opening an editor.
-        std::fs::write(root.join("src/p.txt"), b"seed\nmod\nmore\n").expect("modify");
-        let (code, _, err) = exec(root, &["git", "commit", "--", "src/p.txt"]);
-        assert_eq!(code, FATAL);
-        assert!(err.contains("no commit message"), "{err:?}");
-    }
-
-    /// The one hard equality against the real thing: commit *bytes*, not just commit effects.
-    ///
-    /// Both object ids below were recorded from git 2.55 driving the identical repository with the
-    /// mux's pinned environment (`git init -b main`, add `src/p.txt` + `src/.keep`, commit "seed",
-    /// rewrite `src/p.txt`, `git commit -m 'step 7' -- src/p.txt`). Reproducing them here proves
-    /// that a merged history is byte-identical whether it was produced by this code or by git — the
-    /// premise the tests' `rev-parse HEAD` comparisons rest on.
-    #[test]
-    fn commits_are_byte_identical_to_the_real_cli() {
-        const SEED: &str = "681dea4d4d7409e76584280a4fc75572688c51ed";
-        const STEP7: &str = "f2a5c42d5bbd80c29d86ff2c44ca798d3d1f424c";
-
-        let directory = scratch("oid");
-
-        let root = directory.path();
-        let repo = Repository::open(root).expect("open");
-        assert_eq!(
-            head_commit(&repo).expect("head").expect("a commit").id(),
-            Oid::from_str(SEED).expect("seed oid"),
-            "the scratch repository's root commit is the CLI's root commit"
-        );
-
-        std::fs::write(root.join("src/p.txt"), b"seed\nmod\n").expect("modify");
-        assert_eq!(
-            exec(root, &["git", "commit", "-m", "step 7", "--", "src/p.txt"]).0,
-            0
-        );
-        assert_eq!(
-            head_commit(&repo).expect("head").expect("a commit").id(),
-            Oid::from_str(STEP7).expect("step oid")
-        );
-    }
-
-    #[test]
-    fn a_deletion_can_be_committed() {
-        let directory = scratch("commit-delete");
-        let root = directory.path();
-        std::fs::remove_file(root.join("src/p.txt")).expect("remove");
-        let (code, _, err) = exec(root, &["git", "commit", "-m", "drop", "--", "src/p.txt"]);
-        assert_eq!((code, err.as_str()), (0, ""));
-        let (head, index, worktree) = state(root);
-        assert_eq!((head, index, worktree), (None, None, None));
-    }
-
-    #[test]
-    fn unstaging_resets_the_index_to_head() {
-        let directory = scratch("unstage");
-        let root = directory.path();
-        std::fs::write(root.join("src/p.txt"), b"seed\nmod\n").expect("modify");
-        assert_eq!(exec(root, &["git", "add", "--", "src/p.txt"]).0, 0);
-        let (code, _, err) = exec(root, &["git", "restore", "--staged", "--", "src/p.txt"]);
-        assert_eq!((code, err.as_str()), (0, ""));
-        let (head, index, worktree) = state(root);
-        assert_eq!(index, head, "the index is back at HEAD");
-        assert_eq!(
-            worktree.as_deref(),
-            Some(&b"seed\nmod\n"[..]),
-            "the worktree is untouched"
-        );
-
-        // A path staged but never committed leaves the index entirely.
-        std::fs::write(root.join("src/new.txt"), b"new\n").expect("new file");
-        assert_eq!(exec(root, &["git", "add", "--", "src/new.txt"]).0, 0);
-        let (code, _, _) = exec(root, &["git", "restore", "--staged", "--", "src/new.txt"]);
-        assert_eq!(code, 0);
-        let repo = Repository::open(root).expect("open");
-        assert!(
-            index_blob(&repo.index().expect("index"), Path::new("src/new.txt")).is_none(),
-            "the entry is gone, and the file is now untracked"
-        );
-
-        // A path in neither HEAD nor the index names nothing.
-        let (code, _, err) = exec(root, &["git", "restore", "--staged", "--", "src/new.txt"]);
-        assert_eq!(code, REFUSED);
-        assert!(
-            err.contains("did not match any file(s) known to git"),
-            "{err:?}"
-        );
-    }
-
-    #[test]
-    fn checkout_head_restores_worktree_and_index() {
-        let directory = scratch("checkout");
-        let root = directory.path();
-        std::fs::write(root.join("src/p.txt"), b"seed\nmod\n").expect("modify");
-        assert_eq!(exec(root, &["git", "add", "--", "src/p.txt"]).0, 0);
-        let (code, _, err) = exec(root, &["git", "checkout", "HEAD", "--", "src/p.txt"]);
-        assert_eq!((code, err.as_str()), (0, ""));
-        let (head, index, worktree) = state(root);
-        assert_eq!(index, head);
-        assert_eq!(worktree.as_deref(), Some(&b"seed\n"[..]));
-
-        // A deleted file comes back.
-        std::fs::remove_file(root.join("src/p.txt")).expect("remove");
-        assert_eq!(
-            exec(root, &["git", "checkout", "HEAD", "--", "src/p.txt"]).0,
-            0
-        );
-        assert_eq!(state(root).2.as_deref(), Some(&b"seed\n"[..]));
-
-        // A path HEAD does not have cannot be restored from it.
-        std::fs::write(root.join("src/new.txt"), b"new\n").expect("new file");
-        assert_eq!(exec(root, &["git", "add", "--", "src/new.txt"]).0, 0);
-        let (code, _, err) = exec(root, &["git", "checkout", "HEAD", "--", "src/new.txt"]);
-        assert_eq!(code, REFUSED);
-        assert!(
-            err.contains("did not match any file(s) known to git"),
-            "{err:?}"
-        );
-    }
-
-    #[test]
-    fn stash_push_saves_both_states_and_restores_head() {
-        let directory = scratch("stash");
-        let root = directory.path();
-        std::fs::write(root.join("src/p.txt"), b"seed\nstaged\n").expect("modify");
-        assert_eq!(exec(root, &["git", "add", "--", "src/p.txt"]).0, 0);
-        std::fs::write(root.join("src/p.txt"), b"seed\nstaged\nworking\n").expect("modify again");
-
-        let (code, out, err) = exec(root, &["git", "stash", "push", "--", "src/p.txt"]);
-        assert_eq!((code, err.as_str()), (0, ""));
-        assert!(
-            out.contains("Saved working directory and index state WIP on main:"),
-            "{out:?}"
-        );
-
-        let (head, index, worktree) = state(root);
-        assert_eq!(index, head, "the index is back at HEAD");
-        assert_eq!(
-            worktree.as_deref(),
-            Some(&b"seed\n"[..]),
-            "so is the worktree"
-        );
-
-        let repo = Repository::open(root).expect("open");
-        let wip = repo
-            .find_reference("refs/stash")
-            .expect("stash ref")
-            .peel_to_commit()
-            .expect("stash commit");
-        assert_eq!(wip.parent_count(), 2, "WIP commit is (HEAD, index state)");
-        assert_eq!(
-            tree_blob(&wip.tree().expect("wip tree"), Path::new("src/p.txt")).map(|blob| blob.id),
-            Some(hash_blob(b"seed\nstaged\nworking\n")),
-            "the WIP commit carries the worktree state"
-        );
-        let staged = wip.parent(1).expect("index commit");
-        assert_eq!(
-            tree_blob(&staged.tree().expect("index tree"), Path::new("src/p.txt"))
-                .map(|blob| blob.id),
-            Some(hash_blob(b"seed\nstaged\n")),
-            "its second parent carries the index state"
-        );
-        assert!(
-            staged
-                .message()
-                .unwrap_or_default()
-                .starts_with("index on main:"),
-            "got {:?}",
-            staged.message()
-        );
-        assert_eq!(
-            repo.reflog("refs/stash").expect("reflog").len(),
-            1,
-            "`git stash list` reads the reflog"
-        );
-
-        // Nothing to save, no ref update.
-        let before = wip.id();
-        let (code, out, _) = exec(root, &["git", "stash", "push", "--", "src/p.txt"]);
-        assert_eq!(code, 0);
-        assert!(out.contains("No local changes to save"), "{out:?}");
-        assert_eq!(
-            repo.find_reference("refs/stash")
-                .expect("stash ref")
-                .peel_to_commit()
-                .expect("commit")
-                .id(),
-            before,
-            "a clean stash leaves the ref alone"
-        );
-
-        // An untracked path is not stashable.
-        std::fs::write(root.join("src/new.txt"), b"new\n").expect("new file");
-        let (code, _, err) = exec(root, &["git", "stash", "push", "--", "src/new.txt"]);
-        assert_eq!(code, REFUSED);
-        assert!(err.contains("Did you forget to 'git add'?"), "{err:?}");
-    }
-
-    #[test]
-    fn a_stashed_new_file_is_removed_from_worktree_and_index() {
-        let directory = scratch("stash-new");
-        let root = directory.path();
-        std::fs::write(root.join("src/new.txt"), b"new\n").expect("new file");
-        assert_eq!(exec(root, &["git", "add", "--", "src/new.txt"]).0, 0);
-        let (code, _, err) = exec(root, &["git", "stash", "push", "--", "src/new.txt"]);
-        assert_eq!((code, err.as_str()), (0, ""));
-        assert!(
-            !root.join("src/new.txt").exists(),
-            "the file went into the stash"
-        );
-        let repo = Repository::open(root).expect("open");
-        assert!(
-            index_blob(&repo.index().expect("index"), Path::new("src/new.txt")).is_none(),
-            "and left the index"
-        );
-    }
-
-    #[test]
-    fn clean_deletes_untracked_content_only() {
-        let directory = scratch("clean");
-        let root = directory.path();
-        std::fs::write(root.join("src/new.txt"), b"new\n").expect("new file");
-        std::fs::write(root.join("src/p.txt"), b"seed\nmod\n").expect("modify tracked");
-        let (code, out, _) = exec(
-            root,
-            &["git", "clean", "-f", "--", "src/new.txt", "src/p.txt"],
-        );
-        assert_eq!(code, 0);
-        assert_eq!(
-            out, "Removing src/new.txt\n",
-            "only the untracked path is named"
-        );
-        assert!(!root.join("src/new.txt").exists());
-        assert_eq!(
-            state(root).2.as_deref(),
-            Some(&b"seed\nmod\n"[..]),
-            "a tracked file's modifications are not clean's business"
-        );
-    }
-
-    #[test]
-    fn diff_and_log_report_without_changing_anything() {
-        let directory = scratch("read-only");
-        let root = directory.path();
-        std::fs::write(root.join("src/p.txt"), b"seed\nmod\n").expect("modify");
-        let (code, out, err) = exec(root, &["git", "diff", "--", "src/p.txt"]);
-        assert_eq!((code, err.as_str()), (0, ""));
-        assert!(
-            out.contains("+mod"),
-            "the patch names the added line: {out:?}"
-        );
-        assert!(out.contains("src/p.txt"), "{out:?}");
-
-        assert_eq!(
-            exec(root, &["git", "commit", "-m", "step 1", "--", "src/p.txt"]).0,
-            0
-        );
-        let (code, out, err) = exec(root, &["git", "log", "--", "src/p.txt"]);
-        assert_eq!((code, err.as_str()), (0, ""));
-        assert!(
-            out.contains("Author: agent0 <agent0@marsh.local>"),
-            "{out:?}"
-        );
-        assert_eq!(
-            out.matches("commit ").count(),
-            2,
-            "the seed commit created the path and the second changed it: {out:?}"
-        );
-
-        let (code, out, _) = exec(root, &["git", "log", "--", "src/.keep"]);
-        assert_eq!(code, 0);
-        assert_eq!(
-            out.matches("commit ").count(),
-            1,
-            "an untouched path names only its creating commit: {out:?}"
-        );
-    }
-
-    /// A repository whose `HEAD` is unborn: an index, no commit.
-    fn unborn(label: &str) -> tempfile::TempDir {
-        let directory = tempfile::Builder::new()
-            .prefix(&format!("gitexec-{label}-"))
-            .tempdir()
-            .expect("scratch directory");
-        let root = directory.path();
-        isolate_from_host_config();
-        std::fs::write(root.join("a.txt"), b"new\n").expect("seed file");
-        let repo = Repository::init_opts(
-            root,
-            git2::RepositoryInitOptions::new().initial_head("main"),
-        )
-        .expect("init");
-        let mut index = repo.index().expect("index");
-        index.add_path(Path::new("a.txt")).expect("add");
-        index.write().expect("write index");
-        drop(repo);
-        directory
-    }
-
-    #[test]
-    fn an_offset_without_a_sign_is_east_of_utc() {
-        let identity = identity_from_env(
-            |name| {
-                Some(match name {
-                    "GIT_AUTHOR_DATE" => "1112911993 0530".to_string(),
-                    _ => "x".to_string(),
-                })
-            },
-            "AUTHOR",
-        )
-        .expect("identity");
-        assert_eq!(identity.time.offset_minutes(), 330);
-    }
-
-    /// Each refusal is printed verbatim after `fatal: `, so its wording is a user-facing contract.
-    #[test]
-    fn every_identity_refusal_names_the_variable_that_has_to_be_set() {
-        /// The sentence the builtin prints after `fatal: `.
-        fn refusal(get: impl Fn(&str) -> Option<String>, who: &str) -> String {
-            match identity_from_env(get, who) {
-                Ok(_) => panic!("{who} identity accepted"),
-                Err(error) => error.to_string(),
-            }
-        }
-        let with = |date: &'static str| {
-            move |name: &str| {
-                Some(if name == "GIT_AUTHOR_DATE" {
-                    date.to_string()
-                } else {
-                    "x".to_string()
-                })
-            }
-        };
-        assert_eq!(refusal(|_| None, "AUTHOR"), "GIT_AUTHOR_NAME is not set");
-        assert_eq!(
-            refusal(
-                |name| (name != "GIT_COMMITTER_EMAIL").then(|| "x".to_string()),
-                "COMMITTER"
-            ),
-            "GIT_COMMITTER_EMAIL is not set"
-        );
-        assert_eq!(
-            refusal(
-                |name| (name != "GIT_AUTHOR_DATE").then(|| "x".to_string()),
-                "AUTHOR"
-            ),
-            "GIT_AUTHOR_DATE is not set"
-        );
-        assert_eq!(
-            refusal(with("1112911993"), "AUTHOR"),
-            "GIT_AUTHOR_DATE must be `<epoch> <±HHMM>`, got \"1112911993\""
-        );
-        assert_eq!(
-            refusal(with("yesterday +0000"), "AUTHOR"),
-            "GIT_AUTHOR_DATE epoch \"yesterday\" is not a number"
-        );
-        assert_eq!(
-            refusal(with("1112911993 +12345"), "AUTHOR"),
-            "GIT_AUTHOR_DATE offset \"+12345\" must be four digits with an optional sign"
-        );
-    }
-
-    #[test]
-    fn a_directory_that_is_not_a_repository_is_fatal() {
-        let directory = tempfile::tempdir().expect("scratch directory");
-        let (code, out, err) = exec(directory.path(), &["git", "add", "--", "a.txt"]);
-        assert_eq!((code, out.as_str()), (FATAL, ""));
-        assert!(
-            err.starts_with("fatal: not a git repository: "),
-            "got {err:?}"
-        );
-    }
-
-    #[test]
-    fn an_identity_libgit2_will_not_sign_with_is_fatal_before_any_git_work() {
-        let directory = scratch("bad-signature");
-        let root = directory.path();
-        let argv: Vec<String> = ["git", "commit", "-m", "x", "--", "src/p.txt"]
-            .iter()
-            .map(|arg| (*arg).to_string())
-            .collect();
-        let invocation = super::super::gitcmd::parse(&argv).expect("parse");
-        let empty = GitEnvIdentity {
-            name: String::new(),
-            email: String::new(),
-            time: git2::Time::new(1_112_911_993, 0),
-        };
-        let before = state(root);
-        let mut out = Vec::new();
-        let mut err = Vec::new();
-        let code = run(&invocation, root, &empty, &identity(), &mut out, &mut err);
-        assert_eq!(code, FATAL);
-        assert_eq!(
-            String::from_utf8_lossy(&err),
-            "fatal: invalid author or committer identity\n"
-        );
-        assert_eq!(state(root), before, "nothing was written");
-    }
-
-    #[test]
-    fn an_unborn_branch_refuses_every_command_that_needs_head() {
-        let directory = unborn("unborn");
-        let root = directory.path();
-
-        let (code, _, err) = exec(root, &["git", "commit", "-m", "first", "--", "a.txt"]);
-        assert_eq!(
-            (code, err.as_str()),
-            (FATAL, "fatal: could not resolve 'HEAD'\n")
-        );
-
-        let (code, _, err) = exec(root, &["git", "stash", "push", "--", "a.txt"]);
-        assert_eq!(
-            (code, err.as_str()),
-            (FATAL, "fatal: could not resolve 'HEAD'\n")
-        );
-
-        let (code, _, err) = exec(root, &["git", "checkout", "HEAD", "--", "a.txt"]);
-        assert_eq!(
-            (code, err.as_str()),
             (
-                REFUSED,
-                "error: pathspec 'a.txt' did not match any file(s) known to git\n"
-            )
-        );
-
-        let (code, out, err) = exec(root, &["git", "log", "--", "a.txt"]);
-        assert_eq!(
-            (code, out.as_str(), err.as_str()),
-            (0, "", ""),
-            "there is no history to report yet"
-        );
+                "https://host.example/path/repo/.git/",
+                false,
+                false,
+                Some("repo"),
+            ),
+            ("host.example:path/repo.git", false, false, Some("repo")),
+            ("host.example:2222", false, false, Some("host.example")),
+            ("/foo/bar:2222.git", false, false, Some("2222")),
+            ("file:///srv/origin", false, false, Some("origin")),
+            ("/srv/origin", false, true, Some("origin.git")),
+            ("../backup.bundle", true, false, Some("backup")),
+            (
+                "/srv/with\ttab  and spaces ",
+                false,
+                false,
+                Some("with tab and spaces"),
+            ),
+            ("/", false, false, None),
+        ] {
+            assert_eq!(
+                clone_basename(repo, bundle, bare).as_deref(),
+                expected,
+                "{repo:?}"
+            );
+        }
     }
 
-    /// A libgit2 failure that is not one of the modelled refusals still has to leave the shell with
-    /// git's own `fatal:` line and exit code, not a panic.
+    /// The fixed fields end before the path, so a path with spaces in it is read whole.
     #[test]
-    fn an_unreadable_worktree_path_becomes_a_fatal_line() {
-        let directory = scratch("unreadable");
-        let root = directory.path();
-        std::fs::set_permissions(
-            root.join("src"),
-            std::os::unix::fs::PermissionsExt::from_mode(0o000),
-        )
-        .expect("seal the directory");
-        let (code, _, err) = exec(root, &["git", "commit", "-m", "x", "--", "src/p.txt"]);
-        std::fs::set_permissions(
-            root.join("src"),
-            std::os::unix::fs::PermissionsExt::from_mode(0o755),
-        )
-        .expect("unseal the directory");
-        assert_eq!(
-            (code, err.as_str()),
-            (FATAL, "fatal: Permission denied (os error 13)\n"),
-            "the operating system's refusal reaches the shell as git's own fatal line"
+    fn status_records_keep_their_whole_path() {
+        let status = parse_status(
+            b"1 M. N... 100644 100644 100644 a b staged file\0\
+              1 .M N... 100644 100644 100644 a a dirty\0\
+              u UU N... 100644 100644 100644 100644 a b c conflict\0\
+              ? new file\0\
+              ! ignored\0",
         );
+        assert_eq!(status.get(&b"staged file"[..]), Some(&Status::Staged));
+        assert_eq!(status.get(&b"dirty"[..]), Some(&Status::Dirty));
+        assert_eq!(status.get(&b"conflict"[..]), Some(&Status::Dirty));
+        assert_eq!(status.get(&b"new file"[..]), Some(&Status::Dirty));
+        assert_eq!(status.get(&b"ignored"[..]), Some(&Status::Dirty));
+        assert_eq!(status.len(), 5);
     }
 
+    /// Only state files count: an object fetched on demand is not a change of what is staged.
     #[test]
-    fn a_symlink_is_committed_and_restored_as_a_link() {
-        let directory = scratch("symlink");
-        let root = directory.path();
-        std::os::unix::fs::symlink("p.txt", root.join("src/link")).expect("symlink");
-        assert_eq!(exec(root, &["git", "add", "--", "src/link"]).0, 0);
-        assert_eq!(
-            exec(root, &["git", "commit", "-m", "link", "--", "src/link"]).0,
-            0
-        );
-
-        std::fs::remove_file(root.join("src/link")).expect("remove link");
-        std::fs::write(root.join("src/link"), b"a regular file now\n").expect("clobber");
-        let (code, _, err) = exec(root, &["git", "checkout", "HEAD", "--", "src/link"]);
-        assert_eq!((code, err.as_str()), (0, ""));
-
-        let restored = root.join("src/link");
-        assert!(
-            restored
-                .symlink_metadata()
-                .expect("metadata")
-                .file_type()
-                .is_symlink(),
-            "checkout restores the entry as a link, not as a file holding the target"
-        );
-        assert_eq!(
-            std::fs::read_link(&restored).expect("read link"),
-            Path::new("p.txt")
-        );
-    }
-
-    #[test]
-    fn the_executable_bit_survives_a_commit_and_a_checkout() {
-        let directory = scratch("executable");
-        let root = directory.path();
-        let script = root.join("src/run.sh");
-        std::fs::write(&script, b"#!/bin/sh\nexit 0\n").expect("script");
-        std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755))
-            .expect("chmod +x");
-        assert_eq!(exec(root, &["git", "add", "--", "src/run.sh"]).0, 0);
-        assert_eq!(
-            exec(root, &["git", "commit", "-m", "script", "--", "src/run.sh"]).0,
-            0
-        );
-
-        std::fs::write(&script, b"clobbered\n").expect("clobber");
-        std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o644))
-            .expect("chmod -x");
-        assert_eq!(
-            exec(root, &["git", "checkout", "HEAD", "--", "src/run.sh"]).0,
-            0
-        );
-
-        assert_eq!(
-            std::fs::read(&script).expect("read"),
-            b"#!/bin/sh\nexit 0\n"
-        );
-        let mode = std::os::unix::fs::MetadataExt::mode(&script.metadata().expect("metadata"));
-        assert_ne!(mode & 0o111, 0, "the restored file is executable again");
-    }
-
-    #[test]
-    fn stashing_a_deleted_path_records_its_absence_and_brings_it_back() {
-        let directory = scratch("stash-deleted");
-        let root = directory.path();
-        std::fs::remove_file(root.join("src/p.txt")).expect("delete");
-
-        let (code, out, err) = exec(root, &["git", "stash", "push", "--", "src/p.txt"]);
-        assert_eq!((code, err.as_str()), (0, ""));
-        assert!(out.starts_with("Saved working directory"), "{out:?}");
-        assert_eq!(
-            std::fs::read(root.join("src/p.txt")).expect("restored"),
-            b"seed\n",
-            "the path goes back to HEAD"
-        );
-
-        let repo = Repository::open(root).expect("open");
-        let stash = repo
-            .find_reference("refs/stash")
-            .expect("stash ref")
-            .peel_to_commit()
-            .expect("stash commit");
-        assert!(
-            tree_blob(&stash.tree().expect("tree"), Path::new("src/p.txt")).is_none(),
-            "the stashed worktree tree records the deletion"
-        );
-    }
-
-    /// Raw git modes are what a tree entry carries; every one of them has to keep its meaning, or a
-    /// restored entry would change kind.
-    #[test]
-    fn raw_git_modes_keep_their_kind() {
-        assert_eq!(file_mode(0o120_000), FileMode::Link);
-        assert_eq!(file_mode(0o100_755), FileMode::BlobExecutable);
-        assert_eq!(file_mode(0o040_000), FileMode::Tree);
-        assert_eq!(file_mode(0o160_000), FileMode::Commit);
-        assert_eq!(file_mode(0o100_644), FileMode::Blob);
-    }
-
-    /// A worktree entry that is not a regular file and not a symlink has no content git could
-    /// compare, so `git rm` finds no local modification to refuse over and removes it.
-    #[test]
-    fn a_worktree_entry_that_is_not_a_file_carries_no_content() {
-        let directory = scratch("not-a-file");
-        let root = directory.path();
-        let path = root.join("src/p.txt");
-        std::fs::remove_file(&path).expect("delete the file");
-        let socket = std::os::unix::net::UnixListener::bind(&path).expect("bind a socket");
-
-        let (code, out, err) = exec(root, &["git", "rm", "--", "src/p.txt"]);
-        assert_eq!(
-            (code, out.as_str(), err.as_str()),
-            (0, "rm 'src/p.txt'\n", "")
-        );
-        drop(socket);
-        assert!(!path.exists(), "the entry is gone from the worktree");
-        assert_eq!(state(root).1, None, "and gone from the index");
+    fn only_index_head_and_refs_are_repository_state() {
+        for (path, state) in [
+            ("repo/.git/index", true),
+            ("repo/.git/HEAD", true),
+            ("repo/.git/refs/heads/main", true),
+            ("repo/.git/packed-refs", true),
+            ("repo/.git/objects/ab/cdef", false),
+            ("repo/index", false),
+        ] {
+            assert_eq!(changes_repository_state(Path::new(path)), state, "{path}");
+        }
     }
 }

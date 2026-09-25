@@ -8,6 +8,7 @@ use super::super::{StablePaneOutputIdentity, StableTargetIdentity};
 use super::implicit_pane_target;
 use super::queue::{QueueExecutionContext, QueueInvocation};
 use super::queue_exact_target::has_short_option_value;
+use super::queue_lifecycle_target::require_live_parse_target;
 use crate::handler::RequestHandler;
 use crate::pane_terminals::HandlerState;
 
@@ -20,7 +21,6 @@ pub(super) struct QueueSpecialTargetPlan {
 #[derive(Debug, Clone)]
 pub(super) struct QueueSpecialTargetBinding {
     explicit: bool,
-    target: Option<Target>,
     target_identity: Option<StableTargetIdentity>,
     pane_output_identity: Option<StablePaneOutputIdentity>,
     retained_target: Option<Arc<LifecycleTargetLease>>,
@@ -65,17 +65,12 @@ impl QueueSpecialTargetPlan {
         let Some(retained_target) = retained_target else {
             return Ok(None);
         };
-        match retained_target.resolve(state) {
-            LeaseResolution::Live(target) => Ok(Some(target)),
-            LeaseResolution::Retired(_) => Err(RmuxError::Server(format!(
-                "queued {} lifecycle target retired before parsing",
-                self.command
-            ))),
-            LeaseResolution::Replaced => Err(RmuxError::Server(format!(
-                "queued {} lifecycle target was replaced before parsing",
-                self.command
-            ))),
-        }
+        require_live_parse_target(
+            retained_target.resolve(state),
+            self.command,
+            "before parsing",
+        )
+        .map(Some)
     }
 
     pub(super) fn bind(
@@ -98,21 +93,11 @@ impl QueueSpecialTargetPlan {
         let Some(retained_target) = retained_target else {
             return Ok(None);
         };
-        let retained_live_target = match retained_target.resolve(state) {
-            LeaseResolution::Live(target) => target,
-            LeaseResolution::Retired(_) => {
-                return Err(RmuxError::Server(format!(
-                    "queued {} lifecycle target retired during parsing",
-                    self.command
-                )))
-            }
-            LeaseResolution::Replaced => {
-                return Err(RmuxError::Server(format!(
-                    "queued {} lifecycle target was replaced during parsing",
-                    self.command
-                )))
-            }
-        };
+        let retained_live_target = require_live_parse_target(
+            retained_target.resolve(state),
+            self.command,
+            "during parsing",
+        )?;
         let target = match self.command {
             "if-shell" => retained_live_target.clone(),
             "source-file" | "run-shell" => Target::Pane(implicit_pane_target(
@@ -139,20 +124,17 @@ impl QueueSpecialTargetPending {
     ) -> Result<QueueSpecialTargetBinding, RmuxError> {
         let target_identity = self
             .target
-            .clone()
             .map(|target| StableTargetIdentity::capture(state, target))
             .transpose()?;
-        let pane_output_identity = self
-            .target
-            .as_ref()
-            .and_then(|target| StablePaneOutputIdentity::capture_for_target(state, target));
+        let pane_output_identity = target_identity.as_ref().and_then(|identity| {
+            StablePaneOutputIdentity::capture_for_target(state, identity.target())
+        });
         let retained_identity = self
             .retained_live_target
             .map(|target| StableTargetIdentity::capture(state, target))
             .transpose()?;
         Ok(QueueSpecialTargetBinding {
             explicit: self.explicit,
-            target: self.target,
             target_identity,
             pane_output_identity,
             retained_target: self.retained_target,
@@ -188,8 +170,8 @@ impl QueueSpecialTargetBinding {
                 }
             }
         }
-        if let (Some(identity), Some(target)) = (&self.target_identity, &self.target) {
-            identity.require(state, target, "queued special")?;
+        if let Some(identity) = self.target_identity.as_ref() {
+            identity.require(state, identity.target(), "queued special")?;
         }
         if let Some(identity) = self.pane_output_identity.as_ref() {
             identity.require(state, "queued special")?;
@@ -203,15 +185,19 @@ impl QueueSpecialTargetBinding {
     }
 
     pub(super) fn child_context(&self, context: &QueueExecutionContext) -> QueueExecutionContext {
+        let target = self
+            .target_identity
+            .as_ref()
+            .map(|identity| identity.target().clone());
         let context = if self.explicit {
             context
                 .clone()
-                .with_current_target(self.target.clone())
+                .with_current_target(target)
                 .without_retained_lifecycle_target()
         } else {
             context
                 .clone()
-                .with_implicit_current_target(self.target.clone())
+                .with_implicit_current_target(target)
                 .with_retained_lifecycle_target(self.retained_target.clone())
         };
         context

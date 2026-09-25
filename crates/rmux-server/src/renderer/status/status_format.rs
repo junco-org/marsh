@@ -74,7 +74,7 @@ struct StatusFormatVariables<'a, 'runtime> {
     session_name: &'a SessionName,
     options: &'a OptionStore,
     ttl: std::time::Duration,
-    profile: OnceCell<Option<crate::terminal::TerminalProfile>>,
+    profile: OnceCell<crate::status_jobs::StatusJobProfile>,
     status_left: OnceCell<Option<String>>,
     status_right: OnceCell<Option<String>>,
 }
@@ -97,13 +97,16 @@ impl<'a, 'runtime> StatusFormatVariables<'a, 'runtime> {
         }
     }
 
-    fn profile_for_template(&self, template: &str) -> Option<&crate::terminal::TerminalProfile> {
+    /// `None` only when this template has no `#(command)` at all, which leaves the cell
+    /// uninitialized for a later template that does have one.
+    fn profile_for_template(
+        &self,
+        template: &str,
+    ) -> Option<&crate::status_jobs::StatusJobProfile> {
         if !template.contains("#(") {
             return None;
         }
-        self.profile
-            .get_or_init(|| self.inner.status_job_profile())
-            .as_ref()
+        Some(self.profile.get_or_init(|| self.inner.status_job_profile()))
     }
 
     fn status_left(&self) -> Option<String> {

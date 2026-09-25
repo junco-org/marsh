@@ -441,7 +441,7 @@ fn session_name_for_id(state: &HandlerState, session_id: SessionId) -> Option<Se
 mod tests {
     use super::*;
     use crate::pane_io::pane_output_channel_with_limits;
-    use rmux_proto::{PaneId, SessionName};
+    use rmux_proto::PaneId;
 
     #[test]
     fn replacing_target_preserves_pane_lookup_and_updates_slot_lookup() {
@@ -743,7 +743,5 @@ mod tests {
         RetainedExitedPaneIdentities::new(SessionId::new(target), SessionId::new(runtime))
     }
 
-    fn session_name(name: &str) -> SessionName {
-        SessionName::new(name).expect("valid test session name")
-    }
+    use crate::test_names::session_name;
 }

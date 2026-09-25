@@ -1,21 +1,15 @@
 use std::path::Path;
 
-#[cfg(not(windows))]
-use rmux_client::connect;
 use rmux_client::ClientError;
-#[cfg(windows)]
-use rmux_client::{connect_for_server_shutdown, Connection};
-use rmux_client::{connect_or_absent, ConnectResult};
+use rmux_client::connect;
+use rmux_client::{ConnectResult, connect_or_absent};
 use rmux_proto::RmuxError;
-#[cfg(windows)]
-use rmux_proto::CAPABILITY_DAEMON_STATUS;
 use rmux_proto::{ListSessionsRequest, RMUX_WIRE_VERSION};
 
 use super::{
-    connect_with_startserver, expect_command_output, resolve_session_target_or_current,
-    run_command, run_command_resolved, run_payload_command, ExitFailure, StartupOptions,
+    ExitFailure, StartupOptions, connect_with_startserver, expect_command_output,
+    resolve_session_target_or_current, run_command, run_command_resolved, run_payload_command,
 };
-#[cfg(not(windows))]
 use super::{expect_command_success, write_command_output};
 use crate::cli_args::{ClientTargetArgs, ServerAccessArgs, SessionTargetArgs};
 
@@ -37,42 +31,7 @@ pub(super) fn run_start_server(
     Ok(0)
 }
 
-/// Runs `kill-server` on Windows, probing compatibility before requesting shutdown.
-#[cfg(windows)]
-pub(super) fn run_kill_server(socket_path: &Path) -> Result<i32, ExitFailure> {
-    let (mut connection, selected_socket_path) = connect_for_server_shutdown(socket_path)
-        .map_err(|error| ExitFailure::from_client_connect(socket_path, error))?;
-    match probe_kill_server_compatible(&mut connection) {
-        Ok(()) => {}
-        Err(error) if kill_server_connection_closed(&error) => {
-            drop(connection);
-            wait_for_killed_server_socket_cleanup(&selected_socket_path)?;
-            return Ok(0);
-        }
-        Err(error) => {
-            if let Some(wire_version) = legacy_shutdown_fallback_wire_version(&error) {
-                return run_legacy_wire_kill_server(&selected_socket_path, wire_version);
-            }
-            return Err(ExitFailure::from(error));
-        }
-    }
-    let shutdown = connection.kill_server_after_write();
-    drop(connection);
-    match shutdown {
-        Ok(()) => {
-            wait_for_killed_server_socket_cleanup(&selected_socket_path)?;
-            Ok(0)
-        }
-        Err(error) if kill_server_connection_closed(&error) => {
-            wait_for_killed_server_socket_cleanup(&selected_socket_path)?;
-            Ok(0)
-        }
-        Err(error) => Err(ExitFailure::from(error)),
-    }
-}
-
 /// Runs `kill-server`, tolerating the server closing the connection before replying.
-#[cfg(not(windows))]
 pub(super) fn run_kill_server(socket_path: &Path) -> Result<i32, ExitFailure> {
     let mut connection = connect(socket_path)
         .map_err(|error| ExitFailure::from_client_connect(socket_path, error))?;
@@ -100,14 +59,6 @@ pub(super) fn run_kill_server(socket_path: &Path) -> Result<i32, ExitFailure> {
             }
         }
     }
-}
-
-/// Checks that the connected server is new enough by querying its daemon-status capability.
-#[cfg(windows)]
-fn probe_kill_server_compatible(connection: &mut Connection) -> Result<(), ClientError> {
-    connection
-        .supports_capability(CAPABILITY_DAEMON_STATUS)
-        .map(|_| ())
 }
 
 /// Repeats `kill-server` over an older wire version when the server refused the current one.
@@ -175,9 +126,7 @@ pub(super) fn run_lock_session(
     run_command_resolved(socket_path, "lock-session", move |connection| {
         let target =
             resolve_session_target_or_current(connection, args.target.as_ref(), "lock-session")?;
-        connection
-            .lock_session(target)
-            .map_err(ExitFailure::from)
+        connection.lock_session(target).map_err(ExitFailure::from)
     })
 }
 

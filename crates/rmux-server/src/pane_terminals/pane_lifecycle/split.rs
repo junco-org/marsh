@@ -129,6 +129,20 @@ impl HandlerState {
                 self.session_base_environment_for_pane_target(target)
             }
         };
+        // Before the profile, so a split that inherited no directory still has a real one, and
+        // after the request/pane choice, which stays authoritative. Its rollback is the same one
+        // every other failure in this transaction takes.
+        let io = match self.require_shell_io() {
+            Ok(io) => io,
+            Err(error) => {
+                self.options = previous_options;
+                self.replace_session(&session_name, previous_session)?;
+                return Err(error);
+            }
+        };
+        let profile_cwd = start_directory
+            .or(requested_cwd.as_deref())
+            .unwrap_or_else(|| io.default_dir());
         let profile = match TerminalProfile::for_session(
             &self.environment,
             &self.options,
@@ -140,7 +154,7 @@ impl HandlerState {
             true,
             environment_overrides,
             Some(new_pane_id),
-            start_directory.or(requested_cwd.as_deref()),
+            Some(profile_cwd),
         ) {
             Ok(profile) => profile,
             Err(error) => {
@@ -153,14 +167,6 @@ impl HandlerState {
         let initial_title = profile.initial_pane_title();
         let lifecycle_cwd = profile.cwd().to_path_buf();
         let respawn_shell = profile.pane_shell().clone();
-        let io = match self.require_shell_io() {
-            Ok(io) => io,
-            Err(error) => {
-                self.options = previous_options;
-                self.replace_session(&session_name, previous_session)?;
-                return Err(error);
-            }
-        };
         let generation = self.reserve_pane_output_generation(&runtime_session_name, new_pane_id);
 
         Ok(PlannedSplitWindow {

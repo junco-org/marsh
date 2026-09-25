@@ -1,9 +1,9 @@
 use std::path::Path;
 
-use rmux_client::{connect, Connection};
+use rmux_client::{Connection, connect};
 use rmux_core::formats::{
-    is_truthy, DEFAULT_LIST_PANES_ALL_FORMAT, DEFAULT_LIST_PANES_SESSION_FORMAT,
-    DEFAULT_LIST_PANES_WINDOW_FORMAT,
+    DEFAULT_LIST_PANES_ALL_FORMAT, DEFAULT_LIST_PANES_SESSION_FORMAT,
+    DEFAULT_LIST_PANES_WINDOW_FORMAT, is_truthy,
 };
 use rmux_proto::{
     CommandOutput, ResizePaneAdjustment, ResizePaneRelativeDirection,
@@ -21,11 +21,11 @@ use super::json_output::{
     filter_delimited_json_output, list_panes_json_format, write_list_panes_json,
 };
 use super::{
-    cli_target_actions_enabled, expect_command_output, expect_command_success, list_session_names,
-    listed_pane_index_matches_target, resolve_current_pane_target, resolve_pane_target_or_current,
-    resolve_pane_target_spec, resolve_session_listing_target, resolve_target_spec,
-    resolve_window_target_or_current, run_command_resolved, shell_command_text,
-    target_action_needs_legacy_retry, write_lines_output, ExitFailure,
+    ExitFailure, cli_target_actions_enabled, expect_command_output, expect_command_success,
+    list_session_names, listed_pane_index_matches_target, resolve_current_pane_target,
+    resolve_pane_target_or_current, resolve_pane_target_spec, resolve_session_listing_target,
+    resolve_target_spec, resolve_window_target_or_current, run_command_resolved,
+    shell_command_text, target_action_needs_legacy_retry, write_lines_output,
 };
 use crate::cli_args::{
     LastPaneArgs, ListPanesArgs, PipePaneArgs, ResizePaneArgs, RespawnPaneArgs, SelectPaneArgs,
@@ -370,12 +370,10 @@ pub(super) fn run_resize_pane(
     if target_action_needs_legacy_retry(&response) {
         return run_resize_pane_legacy(args, socket_path);
     }
-    response
-        .map_err(ExitFailure::from)
-        .and_then(|response| {
-            expect_command_success(response, "resize-pane")?;
-            Ok(0)
-        })
+    response.map_err(ExitFailure::from).and_then(|response| {
+        expect_command_success(response, "resize-pane")?;
+        Ok(0)
+    })
 }
 
 /// Resizes a pane after resolving its target locally, as older servers require.

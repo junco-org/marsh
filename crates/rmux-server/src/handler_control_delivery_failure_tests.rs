@@ -22,9 +22,7 @@ struct AttachedControl {
     events: mpsc::Receiver<ControlServerEvent>,
 }
 
-fn session_name(value: &str) -> SessionName {
-    SessionName::new(value).expect("valid session name")
-}
+use crate::test_names::session_name;
 
 async fn new_session(handler: &RequestHandler, name: &SessionName) -> SessionId {
     let response = handler

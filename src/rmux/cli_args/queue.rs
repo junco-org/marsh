@@ -219,8 +219,9 @@ pub(super) fn command_from_parsed(command: &ParsedCommand) -> Result<Command, cl
         }
         "list-panes" => parse_command_args("list-panes", arguments).map(Command::ListPanes),
         "select-pane" => parse_select_pane_args(arguments).map(Command::SelectPane),
-        "copy-mode" => parse_command_args::<CopyModeArgs>("copy-mode", arguments)
-            .map(Command::CopyMode),
+        "copy-mode" => {
+            parse_command_args::<CopyModeArgs>("copy-mode", arguments).map(Command::CopyMode)
+        }
         "clock-mode" => parse_command_args("clock-mode", arguments).map(Command::ClockMode),
         "wait-pane" => parse_command_args::<WaitPaneArgs>("wait-pane", arguments)
             .and_then(WaitPaneArgs::validate)
@@ -322,8 +323,9 @@ pub(super) fn command_from_parsed(command: &ParsedCommand) -> Result<Command, cl
         "show-messages" => {
             parse_command_args("show-messages", arguments).map(Command::ShowMessages)
         }
-        "run-shell" => parse_command_args::<RunShellArgs>("run-shell", arguments)
-            .map(Command::RunShell),
+        "run-shell" => {
+            parse_command_args::<RunShellArgs>("run-shell", arguments).map(Command::RunShell)
+        }
         "source-file" => parse_source_file_args(arguments).map(Command::SourceFile),
         "if-shell" => parse_queue_command_args::<IfShellArgs>("if-shell", arguments)
             .map(|args| Command::IfShell(with_queue_command(args, queue_command))),

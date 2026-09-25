@@ -3,10 +3,10 @@
 //! Every other bracketed-paste suite in this crate observes
 //! `RawPaneInputProbe`, which short-circuits
 //! `prepare_pane_input_write_with_encoding` to `PaneInputSink::CapturedForTest`
-//! *before* the starting-pane queue and *before* the Windows passthrough/legacy
-//! sink selection. Those probes stay green when the legacy console sink is
-//! bypassed, so they cannot close the `AttachInput::bytes -> ... -> real child
-//! application bytes` obligation.
+//! *before* the starting-pane queue and *before* the pane's real shell sink is
+//! resolved. Those probes stay green even when nothing reaches that sink, so
+//! they cannot close the `AttachInput::bytes -> ... -> real child application
+//! bytes` obligation.
 //!
 //! A slot is a directory the harness and the child exchange files through:
 //!
@@ -23,7 +23,7 @@
 //! by the harness, so reading it back would make teardown believe in a child
 //! for every slot it ever touched.
 //!
-//! `out` means *complete*: both children create it only by renaming an
+//! `out` means *complete*: the child creates it only by renaming an
 //! `out.part` that already holds exactly the expected byte count, and any
 //! failure keeps `out.part` and writes `error` instead. A reported `error`
 //! therefore outranks everything the harness might otherwise infer from a
@@ -36,17 +36,16 @@
 //! With one, the failure names the exact bytes that arrived and the first
 //! offset at which they diverge.
 //!
-//! The child must read from a *raw* terminal: a cooked console or PTY line
-//! discipline treats the paste's leading `ESC` as an editing command and
-//! rewrites CR/LF, so the captured bytes would say nothing about the sink. The
-//! crate is `#![forbid(unsafe_code)]`, so the child cannot be this test binary
-//! re-executed — the Windows console-mode change needs FFI.
+//! The child must read from a *raw* terminal: a cooked PTY line discipline
+//! treats the paste's leading `ESC` as an editing command and rewrites CR/LF,
+//! so the captured bytes would say nothing about the sink. The crate is
+//! `#![forbid(unsafe_code)]`, so the harness cannot put the pane's terminal in
+//! raw mode itself.
 //!
-//! Unix therefore uses `/bin/sh`, which [`super`] already exists to build, and
-//! Windows uses a small pinned Rust program: its read boundary is the whole
-//! point of the R1 diagnostic, so it is the historical
-//! `stdin().lock().read(&mut [0_u8; 4096])` itself rather than an emulation of
-//! it. See [`byte_observer`] and [`windows_byte_child`].
+//! The child is therefore `/bin/sh`, which [`super`] already exists to build:
+//! it runs `stty raw -echo`, announces readiness, and reads the exact byte
+//! count with `dd`. See [`unix_child`] for that protocol and
+//! [`byte_observer`] for the read loop's own boundaries.
 
 use std::collections::hash_map::RandomState;
 use std::fs;
@@ -55,8 +54,8 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
-/// The historical standard-input byte boundary the Windows child reads through,
-/// compiled both into this binary and into that child.
+/// The standard-input byte boundary a final-sink child captures through: a
+/// fixed 4,096-byte buffer read until an exact byte count has arrived.
 ///
 /// Explicitly pathed, like this module itself: a `#[path]`-loaded module owns
 /// the directory its declaration names, not one named after itself.
@@ -66,13 +65,10 @@ mod byte_observer;
 /// child's announcement. Shared, because both final-sink siblings wait for it.
 #[path = "final_sink/pane_observation.rs"]
 pub(crate) mod pane_observation;
-/// The Unix child's capture protocol. Generated on every platform so its shape
-/// is checked wherever this crate's tests run, executed only on Unix.
+/// The Unix child's capture protocol: the script `/bin/sh` runs to put the
+/// pane's terminal in raw mode and read exactly the expected bytes.
 #[path = "final_sink/unix_child.rs"]
 mod unix_child;
-#[cfg(windows)]
-#[path = "final_sink/windows_byte_child.rs"]
-mod windows_byte_child;
 
 pub(crate) use pane_observation::{describe_missing_bracketed_mode, observe_pane_output};
 
@@ -147,8 +143,7 @@ pub(crate) struct FinalSinkSlot {
 
 impl FinalSinkSlot {
     /// `expected` is the exact byte sequence the child must read. It must be
-    /// valid UTF-8: the Windows child converts the console's UTF-16 to UTF-8
-    /// itself, and arbitrary non-UTF-8 bytes are a separate policy that this
+    /// valid UTF-8: arbitrary non-UTF-8 bytes are a separate policy that this
     /// harness deliberately does not exercise.
     pub(crate) fn new(label: &str, expected: &[u8], bracket_aware: bool) -> Self {
         Self::create(fresh_slot_directory(label), expected, bracket_aware)
@@ -337,9 +332,9 @@ impl FinalSinkSlot {
         }
     }
 
-    /// The bytes the child has received so far. `dd` on Unix and the Windows
-    /// child both grow `out.part` as input arrives, so this is the real
-    /// application-side prefix, not a reconstruction.
+    /// The bytes the child has received so far. `dd` grows `out.part` as input
+    /// arrives, so this is the real application-side prefix, not a
+    /// reconstruction.
     fn partial_bytes(&self) -> Vec<u8> {
         fs::read(self.directory.join(OUT_PARTIAL_FILE)).unwrap_or_default()
     }
@@ -399,40 +394,8 @@ impl FinalSinkSlot {
     /// Runs the checked `/bin/sh` capture protocol. `dd bs=1` writes each byte
     /// to `out.part` as it arrives, so a capture that never completes still
     /// exposes exactly what reached the child.
-    #[cfg(unix)]
     pub(crate) fn pane_command(&self) -> Vec<String> {
         unix_child::pane_command(self)
-    }
-
-    /// Runs the pinned Rust child, whose read boundary is the historical
-    /// `stdin().lock().read(&mut [0_u8; 4096])`.
-    ///
-    /// The slot files, expected byte count, awareness and park duration are
-    /// arguments rather than an interpolated script, so nothing about the
-    /// child's source varies between runs — which is what lets the Windows 10
-    /// A/B rebuild exactly this observer.
-    #[cfg(windows)]
-    pub(crate) fn pane_command(&self) -> Vec<String> {
-        let program = windows_byte_child::child_program().unwrap_or_else(|failure| {
-            panic!("the final-sink Windows child is unavailable: {failure}")
-        });
-        vec![
-            program.display().to_string(),
-            self.path(READY_FILE),
-            self.path(OUT_PARTIAL_FILE),
-            self.path(OUT_FILE),
-            self.path(ERROR_FILE),
-            self.path(STOP_FILE),
-            self.path(DONE_FILE),
-            self.expected.len().to_string(),
-            if self.bracket_aware {
-                "aware"
-            } else {
-                "unaware"
-            }
-            .to_owned(),
-            CHILD_PARK_SECONDS.to_string(),
-        ]
     }
 }
 
@@ -767,7 +730,7 @@ mod tests {
         let expected = b"\x1b[200~body\x1b[201~";
         let slot = FinalSinkSlot::new("short-capture", expected, true)
             .with_capture_bounds(Duration::from_secs(30), Duration::from_millis(200));
-        // Exactly what the legacy console path leaves behind: the body with
+        // Exactly what a delimiter-consuming sink leaves behind: the body with
         // both six-byte delimiters consumed.
         fs::write(slot.directory.join(OUT_PARTIAL_FILE), b"body").expect("stage the partial");
         stage_acknowledgement(&slot);
@@ -908,8 +871,8 @@ mod tests {
         assert!(!directory.exists(), "an acknowledged slot is removed");
     }
 
-    /// The F3 finding itself. Both children establish raw mode *before* they
-    /// signal readiness, so a setup failure writes `error`, parks, and writes
+    /// The F3 finding itself. The child establishes raw mode *before* it
+    /// signals readiness, so a setup failure writes `error`, parks, and writes
     /// `done` only once `stop` appears. Teardown used to read the missing
     /// `ready` as "never started" and let the slot be removed — discarding the
     /// `error` that was the only account of what went wrong.
@@ -919,7 +882,7 @@ mod tests {
             .with_teardown_timeout(Duration::from_millis(150));
         fs::write(
             slot.directory.join(ERROR_FILE),
-            b"GetConsoleMode failed: standard input is not a console",
+            b"raw mode could not be established: stty raw -echo failed",
         )
         .expect("stage the child's setup failure");
         let directory = slot.directory.clone();
@@ -933,7 +896,7 @@ mod tests {
                 launch_attempted: false,
                 child_artifacts: vec![ERROR_FILE],
                 child_error: Some(
-                    "GetConsoleMode failed: standard input is not a console".to_owned()
+                    "raw mode could not be established: stty raw -echo failed".to_owned()
                 ),
             },
             "a child that reported a setup failure must never be read as never launched"
@@ -945,7 +908,7 @@ mod tests {
         assert!(
             outcome.to_string().contains(
                 "child artifacts: [\"error\"]; \
-                 child error: GetConsoleMode failed: standard input is not a console"
+                 child error: raw mode could not be established: stty raw -echo failed"
             ),
             "the evidence and the child's own reason must reach the report: {outcome}"
         );

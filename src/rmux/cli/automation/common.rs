@@ -2,16 +2,16 @@ use std::io::{self, ErrorKind, Write};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use rmux_client::{connect, Connection};
+use rmux_client::{Connection, connect};
 use rmux_proto::{
     PaneId, PaneSnapshotCell, PaneSnapshotResponse, PaneTarget, PaneTargetRef, Response,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::cli_args::TargetSpec;
 use crate::cli_response::tmux_cli_error_message;
 
-use super::super::{listed_pane_index_matches_target, resolve_pane_target_or_current, ExitFailure};
+use super::super::{ExitFailure, listed_pane_index_matches_target, resolve_pane_target_or_current};
 use super::pane_exit::PaneExitStatus;
 
 pub(super) const SCHEMA_VERSION: u8 = 1;
@@ -231,7 +231,10 @@ fn literal_match_ranges(haystack: &str, needle: &str) -> Vec<(usize, usize)> {
     let mut ranges = Vec::new();
     let mut search_start = 0;
     while search_start <= haystack.len() {
-        let Some(relative) = haystack.get(search_start..).and_then(|tail| tail.find(needle)) else {
+        let Some(relative) = haystack
+            .get(search_start..)
+            .and_then(|tail| tail.find(needle))
+        else {
             break;
         };
         let start = search_start + relative;
@@ -273,7 +276,6 @@ pub(super) enum StdoutWrite {
 }
 
 /// Reports whether stdout has hung up, via a non-blocking `poll` status probe.
-#[cfg(unix)]
 pub(super) fn stdout_closed() -> bool {
     let mut pollfd = libc::pollfd {
         fd: libc::STDOUT_FILENO,
@@ -285,101 +287,6 @@ pub(super) fn stdout_closed() -> bool {
     // status probe of stdout.
     let ready = unsafe { libc::poll(&raw mut pollfd, 1, 0) };
     ready > 0 && pollfd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0
-}
-
-/// Reports whether stdout has hung up on non-Unix platforms.
-#[cfg(not(unix))]
-pub(super) fn stdout_closed() -> bool {
-    stdout_closed_impl()
-}
-
-/// Detects a broken Windows stdout pipe via a zero-byte `WriteFile` probe.
-#[cfg(windows)]
-fn stdout_closed_impl() -> bool {
-    use windows_sys::Win32::Foundation::{
-        GetLastError, ERROR_BROKEN_PIPE, ERROR_NO_DATA, ERROR_PIPE_NOT_CONNECTED,
-        INVALID_HANDLE_VALUE,
-    };
-    use windows_sys::Win32::Storage::FileSystem::{GetFileType, WriteFile, FILE_TYPE_PIPE};
-    use windows_sys::Win32::System::Console::{GetStdHandle, STD_OUTPUT_HANDLE};
-    use windows_sys::Win32::System::Pipes::{GetNamedPipeHandleStateW, PIPE_READMODE_MESSAGE};
-
-    // Windows does not expose poll(POLLOUT|POLLHUP) for anonymous stdout pipes.
-    // Anonymous shell pipes are byte-mode named pipes under the hood. Query the
-    // read mode first so the broken-pipe probe never sends a zero-byte message
-    // into a message-mode downstream reader.
-    // SAFETY: GetStdHandle reads the process stdout pseudo-handle and does not
-    // require ownership transfer from Rust.
-    let handle = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
-    if handle == INVALID_HANDLE_VALUE || handle.is_null() {
-        return true;
-    }
-    // SAFETY: `handle` was returned by GetStdHandle and is only queried.
-    if unsafe { GetFileType(handle) } != FILE_TYPE_PIPE {
-        return false;
-    }
-
-    let mut state = 0;
-    // SAFETY: `handle` is a pipe handle owned by the process stdout table.
-    // `state` is a valid out pointer, the other optional outputs are null, and
-    // no ownership transfer occurs.
-    let state_ok = unsafe {
-        GetNamedPipeHandleStateW(
-            handle,
-            &mut state,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            0,
-        )
-    };
-    if state_ok == 0 {
-        let error = {
-            // SAFETY: GetLastError reads the calling thread's last-error slot
-            // set by the immediately preceding GetNamedPipeHandleStateW call.
-            unsafe { GetLastError() }
-        };
-        if matches!(
-            error,
-            ERROR_BROKEN_PIPE | ERROR_NO_DATA | ERROR_PIPE_NOT_CONNECTED
-        ) {
-            return true;
-        }
-    } else if state & PIPE_READMODE_MESSAGE != 0 {
-        return false;
-    }
-
-    let byte = 0u8;
-    let mut written = 0u32;
-    // SAFETY: `handle` is the process stdout pipe; the buffer pointer is valid,
-    // and the byte count is zero so no memory is read from it. On byte-mode
-    // pipes this does not enqueue payload for the downstream reader, but it
-    // still reports broken-pipe state.
-    let ok = unsafe {
-        WriteFile(
-            handle,
-            &byte as *const u8,
-            0,
-            &mut written,
-            std::ptr::null_mut(),
-        )
-    };
-    if ok != 0 {
-        return false;
-    }
-    matches!(
-        // SAFETY: GetLastError reads the calling thread's last-error slot set
-        // by the immediately preceding WriteFile call.
-        unsafe { GetLastError() },
-        ERROR_BROKEN_PIPE | ERROR_NO_DATA | ERROR_PIPE_NOT_CONNECTED
-    )
-}
-
-/// Assumes stdout stays open on platforms with no hangup probe.
-#[cfg(not(any(unix, windows)))]
-fn stdout_closed_impl() -> bool {
-    false
 }
 
 /// Writes bytes to stdout, reporting a broken pipe as an outcome rather than an error.

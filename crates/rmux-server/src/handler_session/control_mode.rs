@@ -91,16 +91,14 @@ impl RequestHandler {
         if template_session.is_none() {
             let initial_window_linked = {
                 let mut state = self.state.lock().await;
-                let initial_window = state.sessions.iter().find_map(|(current_name, session)| {
-                    (session.id() == session_id).then(|| {
-                        (
-                            current_name.clone(),
-                            WindowTarget::with_window(
-                                current_name.clone(),
-                                session.active_window_index(),
-                            ),
-                        )
-                    })
+                let initial_window = state.sessions.session_by_id(session_id).map(|session| {
+                    (
+                        session.name().clone(),
+                        WindowTarget::with_window(
+                            session.name().clone(),
+                            session.active_window_index(),
+                        ),
+                    )
                 });
                 initial_window.map(|(current_name, target)| {
                     prepare_lifecycle_event(
@@ -120,7 +118,6 @@ impl RequestHandler {
             LifecycleEvent::SessionCreated {
                 session_name: session_name.clone(),
             },
-            session_name,
             session_id,
         )
         .await;
@@ -130,7 +127,6 @@ impl RequestHandler {
                     session_name: session_name.clone(),
                     client_name: Some(control_client_name(requester_pid)),
                 },
-                session_name,
                 session_id,
             )
             .await;

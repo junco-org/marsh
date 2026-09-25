@@ -297,26 +297,16 @@ impl IdleTerminal {
                 () = revoked => continue,
             };
             let mut ready = ready;
-            let attempt = ready.try_io(|inner| {
-                // SAFETY: `read` receives an open descriptor, a valid writable pointer and the
-                // length of the slice behind it.
-                let count = unsafe {
-                    libc::read(
-                        std::os::fd::AsRawFd::as_raw_fd(inner.get_ref()),
-                        buffer.as_mut_ptr().cast(),
-                        buffer.len(),
-                    )
-                };
-                if count < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(usize::try_from(count).unwrap_or(0))
+            let attempt = ready.try_io(|inner| match nix::unistd::read(inner.get_ref(), buffer) {
+                // A slave whose master is gone reports `EIO`; that is this stream's end of file.
+                Err(nix::errno::Errno::EIO) => Ok(0),
+                other => other.map_err(std::io::Error::from),
             });
             match attempt {
                 Ok(Ok(count)) => return Ok(Some(count)),
+                // Retried by the outer loop rather than here, so an interrupted read returns to
+                // the revocation check instead of waiting on a terminal nobody will write to.
                 Ok(Err(error)) if error.kind() == std::io::ErrorKind::Interrupted => {}
-                // A slave whose master is gone reports `EIO`; that is this stream's end of file.
-                Ok(Err(error)) if error.raw_os_error() == Some(libc::EIO) => return Ok(Some(0)),
                 Ok(Err(error)) => return Err(error),
                 Err(_would_block) => {}
             }
@@ -358,23 +348,12 @@ impl IdleTerminal {
             };
             let mut ready = ready;
             let attempt = ready.try_io(|inner| {
-                let slice = &bytes[written..];
-                // SAFETY: `write` receives an open descriptor, a valid pointer and the length of
-                // the slice behind it.
-                let count = unsafe {
-                    libc::write(
-                        std::os::fd::AsRawFd::as_raw_fd(inner.get_ref()),
-                        slice.as_ptr().cast(),
-                        slice.len(),
-                    )
-                };
-                if count < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(usize::try_from(count).unwrap_or(0))
+                nix::unistd::write(inner.get_ref(), &bytes[written..]).map_err(std::io::Error::from)
             });
             match attempt {
                 Ok(Ok(count)) => written += count,
+                // Retried by the outer loop, so an interrupted write returns to the revocation
+                // check rather than spinning inside the readiness callback.
                 Ok(Err(error)) if error.kind() == std::io::ErrorKind::Interrupted => {}
                 Ok(Err(error)) => return Err(error),
                 Err(_would_block) => {}
@@ -468,4 +447,143 @@ fn set_attributes(fd: BorrowedFd<'_>, attributes: &libc::termios) -> std::io::Re
         return Err(std::io::Error::last_os_error());
     }
     Ok(())
+}
+
+#[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
+#[cfg(test)]
+mod tests {
+    use std::pin::Pin;
+    use std::task::Poll;
+    use std::time::Duration;
+
+    use nix::sys::termios::FlowArg;
+
+    use super::*;
+
+    /// How long a test may wait on the kernel before it is a failure rather than a hang.
+    const LIMIT: Duration = Duration::from_secs(5);
+
+    /// One private terminal and a lease on it.
+    ///
+    /// Both ends of the pair are kept: a master or slave dropped here would hang the terminal up
+    /// and end the very read the revocation is supposed to end.
+    struct Fixture {
+        /// The master, held open for the lease's lifetime.
+        _master: OwnedFd,
+        /// The shell's own slave end, held for the same reason.
+        _slave: OwnedFd,
+        /// The revocation state the mux would drive.
+        state: Arc<LeaseState>,
+        /// The lease under test.
+        lease: IdleTerminal,
+    }
+
+    fn fixture() -> Fixture {
+        let (master, slave) =
+            crate::shellmux::pty::open_pty(24, 80).expect("a private pseudoterminal");
+        let state = Arc::new(LeaseState::default());
+        state.reserve().expect("a fresh terminal is free");
+        let lease =
+            IdleTerminal::grant(master.as_fd(), Arc::clone(&state)).expect("a granted lease");
+        Fixture {
+            _master: master,
+            _slave: slave,
+            state,
+            lease,
+        }
+    }
+
+    /// Polls `future` exactly once and leaves it alive, so a caller can establish that it is
+    /// waiting without consuming it.
+    async fn poll_once<F: Future>(mut future: Pin<&mut F>) -> Poll<F::Output> {
+        std::future::poll_fn(|cx| Poll::Ready(future.as_mut().poll(cx))).await
+    }
+
+    /// The lease's own descriptor, for the test's direct syscalls.
+    fn lease_fd(lease: &IdleTerminal) -> BorrowedFd<'_> {
+        lease
+            .fd
+            .as_ref()
+            .expect("a granted lease owns its descriptor")
+            .get_ref()
+            .as_fd()
+    }
+
+    /// A prompt blocked on its pane's keyboard is woken by the revocation itself: the command
+    /// being admitted is not going to type anything, and a lease that only noticed revocations
+    /// between reads would hold the terminal until someone did.
+    #[tokio::test]
+    async fn idle_read_is_woken_by_run_revocation() {
+        let fixture = fixture();
+        let mut buffer = [0_u8; 32];
+        let mut read = Box::pin(fixture.lease.read(&mut buffer));
+        assert!(
+            poll_once(read.as_mut()).await.is_pending(),
+            "nothing has been typed, so the read is waiting inside the terminal"
+        );
+
+        fixture.state.revoke(Revocation::Run);
+        let answer = tokio::time::timeout(LIMIT, read.as_mut())
+            .await
+            .expect("the revocation wakes the blocked read")
+            .expect("a revocation is not a read failure");
+        assert!(
+            answer.is_none(),
+            "a revoked read reports the revocation rather than bytes"
+        );
+    }
+
+    /// The other half: a write waiting for a terminal that cannot take it is woken by a close,
+    /// and reports the closure rather than resuming.
+    #[tokio::test]
+    async fn idle_write_is_woken_by_close_revocation() {
+        let fixture = fixture();
+        let fd = lease_fd(&fixture.lease);
+        // Suspending output is what makes the backpressure stable: the queue stops draining
+        // towards the master, so a full one stays full for as long as the test needs it.
+        nix::sys::termios::tcflow(fd, FlowArg::TCOOFF).expect("output suspended");
+        let mut refused = false;
+        for _ in 0..4096 {
+            match nix::unistd::write(fd, &[b'.'; 1024]) {
+                Ok(_) => {}
+                Err(nix::errno::Errno::EAGAIN) => {
+                    refused = true;
+                    break;
+                }
+                Err(nix::errno::Errno::EINTR) => {}
+                Err(other) => panic!("filling the suspended terminal failed: {other}"),
+            }
+        }
+        assert!(refused, "a suspended terminal stops accepting output");
+
+        let mut write = Box::pin(fixture.lease.write_all(b"x"));
+        assert!(
+            poll_once(write.as_mut()).await.is_pending(),
+            "the write is waiting for room the terminal does not have"
+        );
+
+        fixture.state.revoke(Revocation::Close);
+        let error = tokio::time::timeout(LIMIT, write.as_mut())
+            .await
+            .expect("the revocation wakes the blocked write")
+            .expect_err("a closing lease has no surface left to write to");
+        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+        assert_eq!(error.to_string(), "idle terminal lease was revoked");
+
+        // Put the terminal back before the fixture's restoration runs on it.
+        nix::sys::termios::tcflow(fd, FlowArg::TCOON).expect("output resumed");
+    }
+
+    /// A run revocation stops the reader and leaves the writer alone for exactly one thing: the
+    /// mode reset the outgoing prompt owes the terminal before the command starts.
+    #[tokio::test]
+    async fn a_run_revocation_still_admits_the_prompt_s_mode_reset() {
+        let fixture = fixture();
+        fixture.state.revoke(Revocation::Run);
+        tokio::time::timeout(LIMIT, fixture.lease.write_all(b"\x1b[0m"))
+            .await
+            .expect("the write completes")
+            .expect("a run revocation does not close the terminal");
+        assert!(fixture.lease.is_revoked());
+    }
 }

@@ -5,15 +5,6 @@ use rmux_proto::{
 };
 
 use super::super::RequestHandler;
-#[cfg(windows)]
-use super::pane_io_encoding::{
-    prepare_attached_pane_console_input_writes, tokens_emulate_windows_cmd_select_all,
-    tokens_route_windows_control_as_pty_bytes, windows_console_input_for_target_tokens,
-    write_windows_console_input_action_to_target_io, PaneConsoleInputWrite,
-    WindowsConsoleInputAction,
-};
-#[cfg(windows)]
-use super::pane_windows_console_sequence::prepare_windows_console_input_sequence;
 use super::{
     encode_key_for_target, encode_mouse_for_target, encode_tokens_for_target,
     expand_send_key_tokens, pane_id_for_input_target, prepare_pane_input_write,
@@ -26,8 +17,6 @@ use crate::limits::bounded_repeat_count;
 #[path = "send_keys/session_targets.rs"]
 mod session_targets;
 
-#[cfg(windows)]
-use session_targets::console_input_write_sessions;
 use session_targets::input_write_sessions;
 
 impl RequestHandler {
@@ -65,62 +54,6 @@ impl RequestHandler {
                 Ok(resolved) => resolved,
                 Err(error) => return Response::Error(ErrorResponse { error }),
             };
-            #[cfg(windows)]
-            if !tokens_emulate_windows_cmd_select_all(&state, &request.target, &keys) {
-                match prepare_windows_console_input_sequence(
-                    &mut state,
-                    &request.target,
-                    &keys,
-                    None,
-                ) {
-                    Ok(Some(steps)) => {
-                        drop(state);
-                        return self
-                            .write_windows_console_input_sequence_and_mark_interactive(
-                                steps, key_count,
-                            )
-                            .await;
-                    }
-                    Ok(None) => {}
-                    Err(error) => return Response::Error(ErrorResponse { error }),
-                }
-                if let Some((action, bytes)) =
-                    windows_console_input_for_target_tokens(&state, &request.target, &keys, 1)
-                {
-                    if tokens_route_windows_control_as_pty_bytes(&state, &request.target, &keys) {
-                        let writes = match prepare_synchronized_pane_input_writes(
-                            &mut state,
-                            &request.target,
-                            &bytes,
-                        ) {
-                            Ok(writes) => writes,
-                            Err(error) => return Response::Error(ErrorResponse { error }),
-                        };
-                        drop(state);
-                        return self
-                            .write_pane_input_and_mark_interactive(writes, bytes, key_count)
-                            .await;
-                    }
-                    let writes = match prepare_attached_pane_console_input_writes(
-                        &mut state,
-                        &request.target,
-                        &bytes,
-                        action,
-                    ) {
-                        Ok(writes) => writes,
-                        Err(error) => return Response::Error(ErrorResponse { error }),
-                    };
-                    drop(state);
-                    return self
-                        .write_windows_console_input_and_mark_interactive(
-                            writes,
-                            action,
-                            !bytes.is_empty(),
-                            key_count,
-                        )
-                        .await;
-                }
-            }
             let writes = match prepare_synchronized_pane_input_writes(
                 &mut state,
                 &request.target,
@@ -347,71 +280,6 @@ impl RequestHandler {
                     return Response::Error(ErrorResponse { error });
                 }
             }
-            #[cfg(windows)]
-            if !request.hex
-                && !request.literal
-                && !request.reset_terminal
-                && !tokens_emulate_windows_cmd_select_all(&state, &target, &tokens)
-            {
-                match prepare_windows_console_input_sequence(
-                    &mut state,
-                    &target,
-                    &tokens,
-                    request.repeat_count,
-                ) {
-                    Ok(Some(steps)) => {
-                        drop(state);
-                        return self
-                            .write_windows_console_input_sequence_and_mark_interactive(
-                                steps,
-                                request.keys.len(),
-                            )
-                            .await;
-                    }
-                    Ok(None) => {}
-                    Err(error) => return Response::Error(ErrorResponse { error }),
-                }
-                if let Some((action, bytes)) = windows_console_input_for_target_tokens(
-                    &state,
-                    &target,
-                    &tokens,
-                    bounded_repeat_count(request.repeat_count),
-                ) {
-                    let route_raw =
-                        tokens_route_windows_control_as_pty_bytes(&state, &target, &tokens);
-                    if route_raw {
-                        let writes = match prepare_synchronized_pane_input_writes(
-                            &mut state, &target, &bytes,
-                        ) {
-                            Ok(writes) => writes,
-                            Err(error) => return Response::Error(ErrorResponse { error }),
-                        };
-                        drop(state);
-                        return self
-                            .write_pane_input_and_mark_interactive(
-                                writes,
-                                bytes,
-                                request.keys.len(),
-                            )
-                            .await;
-                    }
-                    let writes = match prepare_attached_pane_console_input_writes(
-                        &mut state, &target, &bytes, action,
-                    ) {
-                        Ok(writes) => writes,
-                        Err(error) => return Response::Error(ErrorResponse { error }),
-                    };
-                    drop(state);
-                    return self
-                        .write_windows_console_input_and_mark_interactive(
-                            writes,
-                            action,
-                            !bytes.is_empty(),
-                            request.keys.len(),
-                        )
-                        .await;
-                }
-            }
 
             let mut bytes = Vec::new();
             if request.hex {
@@ -557,29 +425,5 @@ impl RequestHandler {
             }
         }
         response
-    }
-
-    #[cfg(windows)]
-    async fn write_windows_console_input_and_mark_interactive(
-        &self,
-        writes: Vec<PaneConsoleInputWrite>,
-        action: WindowsConsoleInputAction,
-        wrote_bytes: bool,
-        key_count: usize,
-    ) -> Response {
-        let sessions = console_input_write_sessions(&writes);
-        for write in writes {
-            if let Err(error) = write_windows_console_input_action_to_target_io(write, action).await
-            {
-                return Response::Error(ErrorResponse { error });
-            }
-        }
-        if wrote_bytes {
-            for session_name in sessions {
-                self.mark_attached_session_interactive_input(&session_name)
-                    .await;
-            }
-        }
-        Response::SendKeys(SendKeysResponse { key_count })
     }
 }

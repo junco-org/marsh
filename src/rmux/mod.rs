@@ -20,11 +20,11 @@
 //!
 //! | Multiplexer capability | Public application route |
 //! |---|---|
-//! | Construction, seed/lease ownership | [`RmuxFrontend::open`], [`RmuxFrontend::open_with`] plus [`ShellIo::executor_info`]; no raw spawner escape |
-//! | Default directory, policy history | [`ShellIo::default_dir`], [`ShellIo::history`] |
+//! | Construction, seed/lease ownership | [`RmuxFrontend::open`], [`RmuxFrontend::open_with`] plus [`ShellIo::seeds`]; no raw spawner escape |
+//! | Default directory, per-seed policy history | [`ShellIo::default_dir`], [`ShellIo::history`] |
 //! | Jobs, one job, current selection | [`ShellIo::snapshot`], [`ShellIo::jobs`], [`ShellIo::job`], [`ShellIo::current_job`], [`ShellIo::shell`] |
-//! | Spawn and initial-command lifetime | [`ShellIo::spawn`], [`ShellHandle::initial_command`], [`ShellIo::keep`] |
-//! | Submit a line and finish callback | [`ShellIo::start_in`], [`CommandHandle::wait`](types::CommandHandle::wait), [`ShellIo::on_finish`] |
+//! | Create a shell and keep it | [`ShellIo::open_shell`], [`ShellIo::keep`] |
+//! | Run a line, and the finish callback | [`ShellHandle::run_command`], [`ShellIo::on_finish`] |
 //! | Selection, graceful and forced stop | [`ShellIo::switch`], [`ShellIo::stop`], [`ShellHandle::wait_closed`] |
 //! | Raw input and resize | [`ShellIo::write_input`], [`ShellIo::resize`], [`ShellIo::resize_all`] |
 //! | Frontend output, lifecycle and errors | [`ShellIo::observe`], [`ShellIo::output`], typed completion and closure watches |
@@ -116,12 +116,12 @@ pub mod types {
     /// One retained chunk, or the explicit gap that says an observer fell behind.
     pub use rmux_core::events::{OutputCursorItem, OutputEvent};
 
-    /// The daemon's listening configuration and its startup config-file policy, for
-    /// [`RmuxFrontend::open`](super::RmuxFrontend::open).
-    pub use rmux_server::{ConfigFileSelection, ConfigLoadOptions, DaemonConfig};
     /// The snapshot backend an explicit
     /// [`RmuxFrontend::open_with`](super::RmuxFrontend::open_with) is handed.
     pub use rmux_server::Subvolumes;
+    /// The daemon's listening configuration and its startup config-file policy, for
+    /// [`RmuxFrontend::open`](super::RmuxFrontend::open).
+    pub use rmux_server::{ConfigFileSelection, ConfigLoadOptions, DaemonConfig};
 
     /// The whole rmux wire vocabulary, for
     /// [`ShellIo::open_protocol`](super::ShellIo::open_protocol).
@@ -132,9 +132,9 @@ pub mod types {
     /// A layout's name, for the SDK window handles.
     pub use rmux_proto::LayoutName;
 
+    pub use rmux_client::ClientError;
     /// A blocking protocol connection to this daemon's socket, and what it can fail with.
     pub use rmux_client::connection::Connection;
-    pub use rmux_client::ClientError;
 
     /// How much an observer may fall behind before it is told it has.
     pub use rmux_core::events::SubscriptionLimits;
@@ -150,14 +150,19 @@ pub mod types {
     /// What the gate produced, and the shell-layer failure underneath a
     /// [`MuxError::Marsh`].
     pub use marsh_core::{
-        Denial, GrantedAction, GrantedCapability, MarshError, Publication, StalePath,
+        Denial, GrantedAction, GrantedCapability, MarshError, Publication,
     };
 
-    /// The core vocabulary a job, a command and its verdict are spelled in.
+    /// The core vocabulary a shell, a command and its verdict are spelled in.
+    ///
+    /// [`RunError`] and [`PolicyError`] are here so a native caller can name what a line failed
+    /// with — a refused admission, a policy denial carrying the completion it refused, an
+    /// unpublished conclusion, a lost answer — without taking a dependency on the core crate.
     pub use marsh_core::shellmux::{
-        CommandCompletion, CommandHandle, CommandId, CommandOptions, ExecutorInfo, IdleTerminal,
-        JobDir, JobEnd, JobIo, JobView, MuxError, MuxSnapshot, OnFinish, OutputChannel,
-        RunningView, Sandbox, ShellId, SnapshotUid, SpawnOptions, TerminalGeometry, WaitError,
+        CommandCompletion, CommandHandle, CommandId, CommandOptions, IdleTerminal, JobDir, JobEnd,
+        JobIo, JobView, MuxError, MuxSnapshot, OnFinish, OutputChannel, PolicyError, RunError,
+        RunningView, Sandbox, SeedInfo, ShellId, SnapshotUid, SpawnOptions, TerminalGeometry,
+        WaitError,
     };
     /// What the gate made of a line, and the signals a running command can be sent.
     pub use marsh_core::{Outcome, Signal};

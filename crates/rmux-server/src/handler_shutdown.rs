@@ -100,7 +100,7 @@ impl RequestHandler {
         self.normal_request_admission.closing.send_replace(true);
     }
 
-    #[cfg(all(any(unix, windows), feature = "web"))]
+    #[cfg(all(unix, feature = "web"))]
     pub(crate) fn normal_request_shutdown_receiver(&self) -> watch::Receiver<bool> {
         self.normal_request_admission.closing.subscribe()
     }

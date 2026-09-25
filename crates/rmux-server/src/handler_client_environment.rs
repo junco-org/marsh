@@ -1,11 +1,8 @@
 use std::collections::HashMap;
 
-#[cfg(not(windows))]
 // SHELL is part of the session's initial environment. A later client may
 // refresh PATH for command lookup, but must not change that session identity.
 const CLIENT_SPAWN_ENVIRONMENT_NAMES: &[&str] = &["PATH"];
-#[cfg(windows)]
-const CLIENT_SPAWN_ENVIRONMENT_NAMES: &[&str] = &["PATH", "PATHEXT"];
 
 pub(in crate::handler) fn client_spawn_environment(
     client_environment: Option<&HashMap<String, String>>,
@@ -28,24 +25,12 @@ pub(in crate::handler) fn initial_session_spawn_environment(
     client_environment.cloned()
 }
 
-#[cfg(not(windows))]
 fn client_environment_entry<'a>(
     client_environment: &'a HashMap<String, String>,
     name: &str,
 ) -> Option<(&'a str, &'a str)> {
     client_environment
         .get_key_value(name)
-        .map(|(client_name, value)| (client_name.as_str(), value.as_str()))
-}
-
-#[cfg(windows)]
-fn client_environment_entry<'a>(
-    client_environment: &'a HashMap<String, String>,
-    name: &str,
-) -> Option<(&'a str, &'a str)> {
-    client_environment
-        .iter()
-        .find(|(client_name, _)| client_name.eq_ignore_ascii_case(name))
         .map(|(client_name, value)| (client_name.as_str(), value.as_str()))
 }
 
@@ -75,7 +60,6 @@ mod tests {
         assert!(!spawn_environment.contains_key("RMUX_CLIENT_ENV_SENTINEL"));
     }
 
-    #[cfg(unix)]
     #[test]
     fn client_spawn_environment_does_not_replace_the_session_shell() {
         let client_environment = HashMap::from([

@@ -1,20 +1,12 @@
 use super::RequestHandler;
 use rmux_proto::{
     DisplayMessageRequest, NewSessionRequest, OptionName, PaneTarget, Request, RespawnPaneRequest,
-    Response, ScopeSelector, SessionName, SetOptionMode, SetOptionRequest, Target, TerminalSize,
+    Response, ScopeSelector, SetOptionMode, SetOptionRequest, Target, TerminalSize,
 };
 use tokio::time::{sleep, Duration, Instant};
 
-fn session_name(value: &str) -> SessionName {
-    SessionName::new(value).expect("valid session name")
-}
+use crate::test_names::session_name;
 
-#[cfg(windows)]
-fn successful_exit_command() -> Vec<String> {
-    vec!["exit 0".to_owned()]
-}
-
-#[cfg(not(windows))]
 fn successful_exit_command() -> Vec<String> {
     vec!["true".to_owned()]
 }

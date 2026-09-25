@@ -241,11 +241,6 @@ impl LifecycleProducerRegistration {
         }
     }
 
-    #[cfg(windows)]
-    fn lane_is_closing(&self) -> bool {
-        *self.closing.borrow()
-    }
-
     /// Starts a bounded local mutation scope, linearized against lane closure.
     pub(in crate::handler) fn try_begin_mutation(&self) -> Option<LifecycleMutationGuard> {
         let state = self
@@ -458,14 +453,7 @@ pub(in crate::handler) fn current_lifecycle_producer_can_continue() -> bool {
         .unwrap_or(true)
 }
 
-#[cfg(windows)]
-pub(in crate::handler) fn current_lifecycle_producer_is_closing() -> bool {
-    CURRENT_LIFECYCLE_PRODUCER
-        .try_with(LifecycleProducerRegistration::lane_is_closing)
-        .unwrap_or(false)
-}
-
-#[cfg(any(windows, debug_assertions))]
+#[cfg(debug_assertions)]
 pub(in crate::handler) fn current_lifecycle_producer_is_mutating() -> bool {
     CURRENT_LIFECYCLE_PRODUCER
         .try_with(|registration| registration.execution.mutation_depth.load(Ordering::SeqCst) != 0)

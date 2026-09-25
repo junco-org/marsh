@@ -440,11 +440,11 @@ fn render_status_template_jobs(
     runtime: &RuntimeFormatContext<'_>,
     cache_ttl: Duration,
 ) -> String {
-    let profile = if template.contains("#(") {
-        runtime.status_job_profile()
-    } else {
-        None
-    };
+    // `None` here means the template has no producer to run at all, which is distinct from the
+    // `StatusJobProfile::Unset`/`Unusable` answers a real lookup gives.
+    let profile = template
+        .contains("#(")
+        .then(|| runtime.status_job_profile());
     render_status_template_jobs_with_profile(
         template,
         runtime,
@@ -458,7 +458,7 @@ fn render_status_template_jobs(
 pub(super) fn render_status_template_jobs_with_profile<V>(
     template: &str,
     variables: &V,
-    profile: Option<&crate::terminal::TerminalProfile>,
+    profile: Option<&crate::status_jobs::StatusJobProfile>,
     cache_ttl: Duration,
     status_jobs: Option<&crate::status_jobs::StatusJobRuntime>,
     shell_io: Option<&crate::io::ShellIo>,

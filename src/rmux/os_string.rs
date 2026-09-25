@@ -1,23 +1,12 @@
-//! Cross-platform helpers for top-level argument parsing.
+//! `OsStr` helpers for top-level argument parsing.
 
 use std::ffi::OsStr;
+use std::os::unix::ffi::OsStrExt;
 
 /// Returns an OS string as bytes for ASCII-only option parsing.
+///
+/// Those bytes are already the native `OsStr` representation, so this borrows rather than converts.
 #[must_use]
 pub(crate) fn os_str_bytes(value: &OsStr) -> Vec<u8> {
-    os_str_bytes_impl(value)
-}
-
-/// Unix bytes are already the native `OsStr` representation.
-#[cfg(unix)]
-fn os_str_bytes_impl(value: &OsStr) -> Vec<u8> {
-    use std::os::unix::ffi::OsStrExt;
-
     value.as_bytes().to_vec()
-}
-
-/// Windows has no byte view, so lossy UTF-8 is used for ASCII-only option parsing.
-#[cfg(windows)]
-fn os_str_bytes_impl(value: &OsStr) -> Vec<u8> {
-    value.to_string_lossy().as_bytes().to_vec()
 }

@@ -18,6 +18,7 @@ brush-builtins.workspace = true
 brush-interactive = "^0.4.0"
 clap = { version = "4.6.0", features = ["derive"] }
 marsh-btrfs = { path = "../marsh-btrfs" }
+marsh-lib = { path = "../marsh-lib", default-features = false, features = ["watch"] }
 marsh-wal = { path = "../marsh-wal" }
 marsh-instrument = { path = "../marsh-instrument" }
 serde = { version = "1.0", features = ["derive"] }
@@ -31,12 +32,9 @@ libc = "0.2"
 # so `nix::errno::Errno` converts into `brush_core::Error` through the impl brush-core provides.
 # `term` carries both `nix::sys::termios` and `nix::pty`.
 nix = { version = "0.31.2", features = ["fs", "term"] }
-# No ssh/https transports and no system libgit2: every repository the git builtin touches is a
-# local directory, and a vendored library is the only way the object database written here is
-# the one the git CLI would have written.
-git2 = { version = "0.21", default-features = false, features = ["vendored-libgit2"] }
-# The capability policy every staged line is checked against before it is published.
-junco-rust-validator = { git = "https://github.com/junco-org/junco-policy", branch = "main" }
+# The capability policy every staged line is checked against before it is published. The sibling
+# checkout is the authored source of the action predicates the git builtin classifies with.
+junco-rust-validator = { path = "../../../junco-policy" }
 
 [dev-dependencies]
 marsh-btrfs = { path = "../marsh-btrfs", features = ["fake"] }

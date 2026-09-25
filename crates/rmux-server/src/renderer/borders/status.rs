@@ -156,9 +156,7 @@ mod tests {
 
     use super::*;
 
-    fn session_name(value: &str) -> rmux_proto::SessionName {
-        rmux_proto::SessionName::new(value).expect("valid session name")
-    }
+    use crate::test_names::session_name;
 
     fn two_pane_session() -> Session {
         let mut session = Session::new(session_name("alpha"), TerminalSize { cols: 40, rows: 10 });

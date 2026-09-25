@@ -57,7 +57,11 @@ mod tests {
     use super::*;
 
     /// Walks `store`'s entries back one step, the way an editing prompt walks them.
-    fn up(store: &PromptHistoryStore, prompt_type: PromptType, index: &mut usize) -> Option<String> {
+    fn up(
+        store: &PromptHistoryStore,
+        prompt_type: PromptType,
+        index: &mut usize,
+    ) -> Option<String> {
         prompt_buffer::history_up(store.entries(prompt_type), index)
     }
 

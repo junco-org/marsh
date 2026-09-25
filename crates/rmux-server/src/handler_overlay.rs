@@ -18,6 +18,7 @@ use crate::pane_io::{AttachControl, OverlayFrame};
 mod commands;
 #[path = "handler_overlay/identity.rs"]
 mod identity;
+use identity::take_overlay_retirement;
 #[cfg(test)]
 #[path = "handler_overlay/identity_tests.rs"]
 mod identity_tests;
@@ -989,7 +990,7 @@ impl RequestHandler {
         expected_overlay_id: Option<u64>,
         terminate_popup_job: bool,
     ) -> Result<(), RmuxError> {
-        let (control_tx, render_generation, overlay_generation, popup_job, transient_restore) = {
+        let retirement = {
             let mut active_attach = self.active_attach.lock().await;
             let active = active_attach
                 .by_pid
@@ -1008,33 +1009,9 @@ impl RequestHandler {
             }) {
                 return Ok(());
             }
-            let popup_job = match active.overlay.take() {
-                Some(ClientOverlayState::Popup(popup)) if terminate_popup_job => popup.job,
-                _ => None,
-            };
-            active.overlay_generation = active.overlay_generation.saturating_add(1);
-            let transient_restore = active
-                .transient_message
-                .is_some()
-                .then(|| (active.identity(attach_pid), active.session_name.clone()));
-            (
-                active.control_tx.clone(),
-                active.render_generation,
-                active.overlay_generation,
-                popup_job,
-                transient_restore,
-            )
+            take_overlay_retirement(active, attach_pid, terminate_popup_job)
         };
-        if let Some(job) = popup_job {
-            job.terminate();
-        }
-        let _ = control_tx.send(AttachControl::Overlay(OverlayFrame::persistent(
-            Vec::new(),
-            render_generation,
-            overlay_generation,
-        )));
-        self.restore_transient_message_after_persistent_clear(transient_restore)
-            .await;
+        self.publish_overlay_retirement(retirement).await;
         Ok(())
     }
 
@@ -1100,33 +1077,10 @@ impl RequestHandler {
             }
             popup.job = None;
             let should_close = popup.close_on_exit || (popup.close_on_zero_exit && status == 0);
-            if !should_close {
-                None
-            } else {
-                let _ = active.overlay.take();
-                active.overlay_generation = active.overlay_generation.saturating_add(1);
-                Some((
-                    active.control_tx.clone(),
-                    active.render_generation,
-                    active.overlay_generation,
-                    active.transient_message.is_some().then(|| {
-                        (
-                            active.identity(identity.attach_pid()),
-                            active.session_name.clone(),
-                        )
-                    }),
-                ))
-            }
+            should_close.then(|| take_overlay_retirement(active, identity.attach_pid(), false))
         };
-        if let Some((control_tx, render_generation, overlay_generation, transient_restore)) = clear
-        {
-            let _ = control_tx.send(AttachControl::Overlay(OverlayFrame::persistent(
-                Vec::new(),
-                render_generation,
-                overlay_generation,
-            )));
-            self.restore_transient_message_after_persistent_clear(transient_restore)
-                .await;
+        if let Some(retirement) = clear {
+            self.publish_overlay_retirement(retirement).await;
         } else {
             self.refresh_popup_overlay_for_identity(identity, popup_id)
                 .await?;

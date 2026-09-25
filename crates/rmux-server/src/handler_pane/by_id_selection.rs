@@ -17,12 +17,10 @@ impl RequestHandler {
     ) -> Response {
         let session_name = request.target.session_name().clone();
         let title = request.title.clone();
-        #[cfg(windows)]
-        let mut waited_for_deferred_session = false;
 
-        // The retry is compiled only on Windows; other targets execute this
-        // body exactly once after the conditional branch is removed.
-        #[cfg_attr(not(windows), allow(clippy::never_loop))]
+        // The body below runs exactly once; the `loop` is kept only for its
+        // `break`-with-value binding of the tuple destructured here.
+        #[allow(clippy::never_loop)]
         let (response, pane_changed, window_index, title_changed_target, refresh_sessions) = loop {
             let mut state = self.state.lock().await;
             let target = match resolve_pane_target_ref(&state, &request.target) {
@@ -42,21 +40,6 @@ impl RequestHandler {
                     .session(&session_name)
                     .and_then(|session| session.window_at(window_index))
                     .is_some_and(|window| window.active_pane_index() != pane_index);
-
-            // A changed selection resizes every terminal in its window. On
-            // Windows, defer that mutation until ConPTY startup has settled.
-            // Keep the no-op decision and the mutation under this same state
-            // lock so a concurrent selection cannot slip between them.
-            #[cfg(windows)]
-            if pane_changed && !waited_for_deferred_session {
-                drop(state);
-                self.wait_for_windows_deferred_target_pane_pids(&Target::Session(
-                    session_name.clone(),
-                ))
-                .await;
-                waited_for_deferred_session = true;
-                continue;
-            }
 
             let mut title_changed_target = None;
             let mut title_state_event = None;
@@ -158,9 +141,9 @@ impl RequestHandler {
                 );
             }
             // See handle_select_pane in handler_pane/selection.rs: skip the
-            // refresh (and its Windows deferred-pane wait) when nothing is
-            // attached so a still-starting sibling cannot stall a detached
-            // select via the pane-id-typed SDK API either.
+            // refresh (and its deferred-pane wait) when nothing is attached so
+            // a still-starting sibling cannot stall a detached select via the
+            // pane-id-typed SDK API either.
             if refresh_sessions.is_empty() {
                 if self.attached_count(&session_name).await > 0 {
                     self.refresh_attached_session(&session_name).await;

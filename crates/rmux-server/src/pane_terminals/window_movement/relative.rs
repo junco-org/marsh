@@ -1,6 +1,6 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::BTreeMap;
 
-use rmux_core::{HookStore, OptionStore, Session};
+use rmux_core::Session;
 use rmux_proto::{
     MoveWindowRequest, MoveWindowResponse, MoveWindowTarget, RmuxError, SessionName, WindowTarget,
 };
@@ -8,6 +8,7 @@ use rmux_proto::{
 use super::{
     ensure_session_panes_exist, link_window_destination_index, session_not_found, HandlerState,
 };
+use crate::pane_terminals::session_mutation::WindowMutationMetadataSnapshot;
 
 impl HandlerState {
     pub(super) fn move_window_relative(
@@ -75,12 +76,7 @@ impl HandlerState {
         let rollback_state = MoveWindowRelativeCrossSessionRollbackState {
             source_session: previous_source_session.clone(),
             target_session: previous_target_session.clone(),
-            options: self.options.clone(),
-            hooks: self.hooks.clone(),
-            auto_named_windows: self.auto_named_windows.clone(),
-            window_link_slots: self.window_link_slots.clone(),
-            window_link_groups: self.window_link_groups.clone(),
-            window_link_occurrences: self.window_link_occurrences.clone(),
+            metadata: WindowMutationMetadataSnapshot::capture(self),
         };
 
         ensure_session_panes_exist(self, &source_session_name, &previous_source_session)?;
@@ -147,12 +143,7 @@ impl HandlerState {
             .ok_or_else(|| session_not_found(&session_name))?;
         let rollback_state = MoveWindowRelativeRollbackState {
             session: previous_session.clone(),
-            options: self.options.clone(),
-            hooks: self.hooks.clone(),
-            auto_named_windows: self.auto_named_windows.clone(),
-            window_link_slots: self.window_link_slots.clone(),
-            window_link_groups: self.window_link_groups.clone(),
-            window_link_occurrences: self.window_link_occurrences.clone(),
+            metadata: WindowMutationMetadataSnapshot::capture(self),
         };
 
         ensure_session_panes_exist(self, &session_name, &previous_session)?;
@@ -209,12 +200,7 @@ impl HandlerState {
     ) -> Result<(), RmuxError> {
         self.replace_session(source_session_name, rollback_state.source_session)?;
         self.replace_session(target_session_name, rollback_state.target_session)?;
-        self.options = rollback_state.options;
-        self.hooks = rollback_state.hooks;
-        self.auto_named_windows = rollback_state.auto_named_windows;
-        self.window_link_slots = rollback_state.window_link_slots;
-        self.window_link_groups = rollback_state.window_link_groups;
-        self.window_link_occurrences = rollback_state.window_link_occurrences;
+        rollback_state.metadata.restore(self);
         Ok(())
     }
 
@@ -224,12 +210,7 @@ impl HandlerState {
         rollback_state: MoveWindowRelativeRollbackState,
     ) -> Result<(), RmuxError> {
         self.replace_session(session_name, rollback_state.session)?;
-        self.options = rollback_state.options;
-        self.hooks = rollback_state.hooks;
-        self.auto_named_windows = rollback_state.auto_named_windows;
-        self.window_link_slots = rollback_state.window_link_slots;
-        self.window_link_groups = rollback_state.window_link_groups;
-        self.window_link_occurrences = rollback_state.window_link_occurrences;
+        rollback_state.metadata.restore(self);
         Ok(())
     }
 }
@@ -260,27 +241,11 @@ fn relative_move_winlink_alert_map(
 
 struct MoveWindowRelativeRollbackState {
     session: Session,
-    options: OptionStore,
-    hooks: HookStore,
-    auto_named_windows: HashSet<(SessionName, u32)>,
-    window_link_slots: HashMap<crate::pane_terminals::WindowLinkSlot, u64>,
-    window_link_groups: HashMap<u64, crate::pane_terminals::WindowLinkGroup>,
-    window_link_occurrences: HashMap<
-        crate::pane_terminals::WindowLinkSlot,
-        crate::pane_terminals::WindowLinkOccurrenceId,
-    >,
+    metadata: WindowMutationMetadataSnapshot,
 }
 
 struct MoveWindowRelativeCrossSessionRollbackState {
     source_session: Session,
     target_session: Session,
-    options: OptionStore,
-    hooks: HookStore,
-    auto_named_windows: HashSet<(SessionName, u32)>,
-    window_link_slots: HashMap<crate::pane_terminals::WindowLinkSlot, u64>,
-    window_link_groups: HashMap<u64, crate::pane_terminals::WindowLinkGroup>,
-    window_link_occurrences: HashMap<
-        crate::pane_terminals::WindowLinkSlot,
-        crate::pane_terminals::WindowLinkOccurrenceId,
-    >,
+    metadata: WindowMutationMetadataSnapshot,
 }

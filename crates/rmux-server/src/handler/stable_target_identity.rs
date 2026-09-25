@@ -53,21 +53,14 @@ impl StableTargetIdentity {
                 (session.id(), None, None, None, None)
             }
             Target::Window(window_target) => {
-                let occurrence_id = state
-                    .ensure_live_window_link_occurrence_id(
-                        window_target.session_name(),
-                        window_target.window_index(),
-                    )
-                    .ok_or_else(|| unavailable(&target))?;
-                let session = state
-                    .sessions
-                    .session(window_target.session_name())
-                    .ok_or_else(|| unavailable(&target))?;
-                let window = session
-                    .window_at(window_target.window_index())
-                    .ok_or_else(|| unavailable(&target))?;
+                let (session_id, occurrence_id, window) = capture_window_components(
+                    state,
+                    window_target.session_name(),
+                    window_target.window_index(),
+                )
+                .ok_or_else(|| unavailable(&target))?;
                 (
-                    session.id(),
+                    session_id,
                     Some(window.id()),
                     Some(occurrence_id),
                     None,
@@ -75,19 +68,13 @@ impl StableTargetIdentity {
                 )
             }
             Target::Pane(pane_target) => {
-                let occurrence_id = state
-                    .ensure_live_window_link_occurrence_id(
-                        pane_target.session_name(),
-                        pane_target.window_index(),
-                    )
-                    .ok_or_else(|| unavailable(&target))?;
-                let session = state
-                    .sessions
-                    .session(pane_target.session_name())
-                    .ok_or_else(|| unavailable(&target))?;
-                let window = session
-                    .window_at(pane_target.window_index())
-                    .ok_or_else(|| unavailable(&target))?;
+                let (session_id, occurrence_id, window) = capture_window_components(
+                    state,
+                    pane_target.session_name(),
+                    pane_target.window_index(),
+                )
+                .ok_or_else(|| unavailable(&target))?;
+                let window_id = window.id();
                 let pane_id = window
                     .pane(pane_target.pane_index())
                     .map(rmux_core::Pane::id)
@@ -95,8 +82,8 @@ impl StableTargetIdentity {
                 let pane_output_generation =
                     state.pane_output_generation_for_target(pane_target, pane_id);
                 (
-                    session.id(),
-                    Some(window.id()),
+                    session_id,
+                    Some(window_id),
                     Some(occurrence_id),
                     Some(pane_id),
                     Some(pane_output_generation),
@@ -123,19 +110,15 @@ impl StableTargetIdentity {
 
     fn matches_window(&self, state: &HandlerState, target: &WindowTarget) -> bool {
         matches!(&self.target, Target::Window(expected) if expected == target)
-            && self.matches_window_components(state, target)
+            && self
+                .matching_window(state, target.session_name(), target.window_index())
+                .is_some()
     }
 
     fn matches_pane(&self, state: &HandlerState, target: &PaneTarget) -> bool {
         matches!(&self.target, Target::Pane(expected) if expected == target)
-            && self.matches_window_components(
-                state,
-                &WindowTarget::with_window(target.session_name().clone(), target.window_index()),
-            )
-            && state
-                .sessions
-                .session(target.session_name())
-                .and_then(|session| session.window_at(target.window_index()))
+            && self
+                .matching_window(state, target.session_name(), target.window_index())
                 .and_then(|window| window.pane(target.pane_index()))
                 .is_some_and(|pane| Some(pane.id()) == self.pane_id)
             && self.pane_id.is_some_and(|pane_id| {
@@ -144,15 +127,20 @@ impl StableTargetIdentity {
             })
     }
 
-    fn matches_window_components(&self, state: &HandlerState, target: &WindowTarget) -> bool {
-        state
+    fn matching_window<'a>(
+        &self,
+        state: &'a HandlerState,
+        session_name: &SessionName,
+        window_index: u32,
+    ) -> Option<&'a rmux_core::Window> {
+        let window = state
             .sessions
-            .session(target.session_name())
-            .filter(|session| session.id() == self.session_id)
-            .and_then(|session| session.window_at(target.window_index()))
-            .is_some_and(|window| Some(window.id()) == self.window_id)
-            && state.window_link_occurrence_id(target.session_name(), target.window_index())
-                == self.occurrence_id
+            .session(session_name)
+            .filter(|session| session.id() == self.session_id)?
+            .window_at(window_index)
+            .filter(|window| Some(window.id()) == self.window_id)?;
+        (state.window_link_occurrence_id(session_name, window_index) == self.occurrence_id)
+            .then_some(window)
     }
 
     pub(in crate::handler) fn matches_target(&self, state: &HandlerState, target: &Target) -> bool {
@@ -201,20 +189,11 @@ impl StableTargetIdentity {
             self.session_id,
             self.window_id?,
         )?;
-        let pane_id = self.pane_id?;
-        let pane_index = state
-            .sessions
-            .session(window_target.session_name())?
-            .window_at(window_target.window_index())?
-            .panes()
-            .iter()
-            .find(|pane| pane.id() == pane_id)?
-            .index();
-        Some(PaneTarget::with_window(
-            window_target.session_name().clone(),
+        state.pane_target_for_id_in_window(
+            window_target.session_name(),
             window_target.window_index(),
-            pane_index,
-        ))
+            self.pane_id?,
+        )
     }
 
     pub(in crate::handler) fn resolve_current_pane_identity(
@@ -317,6 +296,17 @@ fn unavailable(target: &Target) -> RmuxError {
         target.to_string(),
         "stable target identity was unavailable during queue capture",
     )
+}
+
+fn capture_window_components<'a>(
+    state: &'a mut HandlerState,
+    session_name: &SessionName,
+    window_index: u32,
+) -> Option<(SessionId, WindowLinkOccurrenceId, &'a rmux_core::Window)> {
+    let occurrence_id = state.ensure_live_window_link_occurrence_id(session_name, window_index)?;
+    let session = state.sessions.session(session_name)?;
+    let window = session.window_at(window_index)?;
+    Some((session.id(), occurrence_id, window))
 }
 
 tokio::task_local! {

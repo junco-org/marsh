@@ -40,8 +40,8 @@ struct StartupEndpointState {
 ///
 /// * whether this invocation started the daemon, so an attach later in the
 ///   same queue still cleans up the empty daemon it created;
-/// * the endpoint actually serving the daemon, which Windows rotates when
-///   auto-start replaces a stale managed generation.
+/// * the endpoint actually serving the daemon, which auto-start rotates when
+///   it replaces a stale managed generation.
 #[derive(Debug, Clone)]
 pub(in crate::cli) struct StartupEndpoint {
     inner: Rc<RefCell<StartupEndpointState>>,

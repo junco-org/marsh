@@ -216,9 +216,9 @@ impl RequestHandler {
             return Err(attached_client_required("display-popup"));
         };
 
-        // Termination may touch a PTY or schedule ConPTY teardown, so keep it
-        // outside the attach-state mutex. The old popup id can no longer match
-        // the replacement, which makes its waiter and reader callbacks stale.
+        // Termination may touch a PTY, so keep it outside the attach-state
+        // mutex. The old popup id can no longer match the replacement, which
+        // makes its waiter and reader callbacks stale.
         if let Some(job) = replaced_popup_job {
             job.terminate();
         }
@@ -423,6 +423,9 @@ impl RequestHandler {
         let should_spawn_job =
             !command.no_job && (!command.close_any_key || command_text.is_some());
         if should_spawn_job {
+            // The facade first, because the rendered `-c` stays authoritative and its default is
+            // only what is left when the popup named no directory.
+            let io = crate::managed_workload::handler_facade(self)?;
             let profile = TerminalProfile::for_run_shell(
                 &state.environment,
                 &state.options,
@@ -435,9 +438,12 @@ impl RequestHandler {
                 None,
                 !self.config_loading_active(),
                 None,
-                rendered_start_directory.as_deref(),
+                Some(
+                    rendered_start_directory
+                        .as_deref()
+                        .unwrap_or_else(|| io.default_dir()),
+                ),
             )?;
-            let io = crate::managed_workload::handler_facade(self)?;
             let (job, initial_bytes) = spawn_popup_job(
                 &io,
                 content_size,

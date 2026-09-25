@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use rmux_core::key_code_lookup_bits;
+use rmux_core::{key_code_is_mouse_move, key_code_lookup_bits};
 use rmux_proto::{OptionName, PaneTarget, RmuxError, Target};
 use tracing::warn;
 
@@ -205,10 +205,15 @@ impl RequestHandler {
                     lookup_key_table_binding
                 };
                 let mut binding = lookup_binding(&state, &table_name, lookup_key);
-                if repeat_active
-                    && table_name != default_table
-                    && binding.as_ref().is_some_and(|binding| !binding.repeat())
-                {
+                // tmux retries the default table for any key the repeat table
+                // does not keep repeating: a match without `-r`, and an
+                // ordinary key it does not bind at all. Unbound mouse movement
+                // stays on its own path.
+                let leaves_repeat_table = match binding.as_ref() {
+                    Some(binding) => !binding.repeat(),
+                    None => !key_code_is_mouse_move(lookup_key),
+                };
+                if repeat_active && table_name != default_table && leaves_repeat_table {
                     table_name = default_table.clone();
                     binding = lookup_binding(&state, &table_name, lookup_key);
                     should_clear = true;
@@ -279,9 +284,14 @@ impl RequestHandler {
         }
 
         let Some(binding) = binding else {
-            if current_table_name
-                .as_deref()
-                .is_some_and(|table_name| should_drop_unbound_prefix_key(table_name, lookup_key))
+            // Only a still-current prefix miss is swallowed. Once the retry
+            // above, or a repeat/prefix timeout, has moved the lookup to the
+            // default table, the snapshot's `prefix` is stale and the key has
+            // to fall through to the reset branch so live input forwards it.
+            if !should_clear_before_dispatch
+                && current_table_name.as_deref().is_some_and(|table_name| {
+                    should_drop_unbound_prefix_key(table_name, lookup_key)
+                })
             {
                 let commit = self
                     .set_attached_key_table_for_dispatch(key_table_commit, None, None)

@@ -36,7 +36,7 @@ async fn send_attach_bytes(
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn attach_stream_forwards_bytes_resize_and_client_eof() -> Result<(), Box<dyn Error>> {
     let _guard = PTY_TEST_LOCK.lock().await;
     let harness = TestHarness::new("attach-forwarding");
@@ -107,7 +107,7 @@ async fn attach_stream_forwards_bytes_resize_and_client_eof() -> Result<(), Box<
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn attach_stream_emits_border_frames_for_multi_pane_sessions() -> Result<(), Box<dyn Error>> {
     let _guard = PTY_TEST_LOCK.lock().await;
     let harness = TestHarness::new("attach-borders");
@@ -233,7 +233,7 @@ async fn attach_stream_emits_border_frames_for_multi_pane_sessions() -> Result<(
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn attach_stream_preserves_bytes_sent_with_the_upgrade_request() -> Result<(), Box<dyn Error>>
 {
     let _guard = PTY_TEST_LOCK.lock().await;
@@ -289,7 +289,7 @@ async fn attach_stream_preserves_bytes_sent_with_the_upgrade_request() -> Result
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn attach_stream_terminates_when_the_session_is_killed() -> Result<(), Box<dyn Error>> {
     let _guard = PTY_TEST_LOCK.lock().await;
     let harness = TestHarness::new("attach-pane-eof");
@@ -337,7 +337,7 @@ async fn attach_stream_terminates_when_the_session_is_killed() -> Result<(), Box
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn detach_client_closes_the_attach_stream() -> Result<(), Box<dyn Error>> {
     let _guard = PTY_TEST_LOCK.lock().await;
     let harness = TestHarness::new("detach-client");
@@ -398,7 +398,7 @@ async fn detach_client_closes_the_attach_stream() -> Result<(), Box<dyn Error>> 
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn attached_prefix_d_emits_detached_message_and_closes_stream() -> Result<(), Box<dyn Error>>
 {
     let _guard = PTY_TEST_LOCK.lock().await;
@@ -454,7 +454,7 @@ async fn attached_prefix_d_emits_detached_message_and_closes_stream() -> Result<
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn pane_exit_emits_bracketed_exited_and_closes_attach_stream() -> Result<(), Box<dyn Error>> {
     let _guard = PTY_TEST_LOCK.lock().await;
     let harness = TestHarness::new("attached-pane-exit");
@@ -490,7 +490,7 @@ async fn pane_exit_emits_bracketed_exited_and_closes_attach_stream() -> Result<(
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn detach_client_clears_the_active_attach_state() -> Result<(), Box<dyn Error>> {
     let _guard = PTY_TEST_LOCK.lock().await;
     let harness = TestHarness::new("detach-client-clears-state");

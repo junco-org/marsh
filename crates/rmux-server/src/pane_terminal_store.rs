@@ -1,14 +1,11 @@
 use std::collections::HashMap;
-#[cfg(unix)]
 use std::os::fd::BorrowedFd;
-#[cfg(unix)]
 use std::path::PathBuf;
 
 use rmux_core::PaneId;
-use rmux_proto::{PaneTarget, RmuxError, SessionName};
 #[cfg(test)]
 use rmux_proto::TerminalSize;
-#[cfg(unix)]
+use rmux_proto::{PaneTarget, RmuxError, SessionName};
 use tracing::debug;
 
 use crate::io::{ShellHandle, ShellIo};
@@ -45,25 +42,6 @@ impl PaneTerminalStore {
         let previous = self
             .sessions
             .insert(session_name.clone(), HashMap::from([(pane_id, terminal)]));
-        debug_assert!(previous.is_none());
-        let previous_environment = self.session_environments.insert(session_name, environment);
-        debug_assert!(previous_environment.is_none());
-        Ok(())
-    }
-
-    #[cfg(windows)]
-    pub(super) fn insert_pending_session(
-        &mut self,
-        session_name: SessionName,
-        environment: SessionBaseEnvironment,
-    ) -> Result<(), RmuxError> {
-        if self.sessions.contains_key(&session_name) {
-            return Err(RmuxError::Server(format!(
-                "pane terminals already exist for session {session_name}"
-            )));
-        }
-
-        let previous = self.sessions.insert(session_name.clone(), HashMap::new());
         debug_assert!(previous.is_none());
         let previous_environment = self.session_environments.insert(session_name, environment);
         debug_assert!(previous_environment.is_none());
@@ -175,7 +153,6 @@ impl PaneTerminalStore {
     }
 
     /// A borrowed descriptor on one pane's terminal, for metadata probes only.
-    #[cfg(unix)]
     pub(super) fn pane_terminal_fd(
         &self,
         session_name: &SessionName,
@@ -294,7 +271,6 @@ impl PaneTerminalStore {
         Ok(terminal.pid())
     }
 
-    #[cfg(unix)]
     pub(super) fn pane_tty_path(
         &self,
         session_name: &SessionName,
@@ -545,7 +521,6 @@ impl PaneTerminalStore {
     ///
     /// Follows engine state rather than reaping anything: the request goes to the running
     /// command's own process groups, and a pane with no running command has nothing to resume.
-    #[cfg(unix)]
     pub(super) fn continue_stopped_panes(&self) {
         for (session_name, panes) in &self.sessions {
             for (pane_id, terminal) in panes {

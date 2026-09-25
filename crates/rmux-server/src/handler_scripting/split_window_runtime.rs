@@ -19,8 +19,6 @@ impl RequestHandler {
         mut command: ParsedSplitWindowCommand,
         context: &QueueExecutionContext,
     ) -> Result<QueueCommandAction, RmuxError> {
-        #[cfg(windows)]
-        self.wait_for_windows_deferred_all_pane_pids().await;
         command.request =
             split_window_with_caller_cwd(command.request, context.caller_cwd.as_deref());
         command.request = self

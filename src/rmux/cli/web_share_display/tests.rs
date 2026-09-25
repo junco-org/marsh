@@ -2,11 +2,10 @@ use ratatui::style::Color;
 use rmux_proto::{CommandOutput, WebShareCreatedResponse, WebShareScope};
 
 use super::qr;
-use super::support::{url_label, LinkMode, OutputStyle, UrlLabel};
+use super::support::{LinkMode, OutputStyle, UrlLabel, url_label};
 use super::{
-    cards_fit_width, created_share_terminal_output, full_links_output,
+    ShareCard, cards_fit_width, created_share_terminal_output, full_links_output,
     full_links_output_with_copy_fallback, render_created_share_with_style, should_stack_cards,
-    ShareCard,
 };
 
 #[test]
@@ -96,13 +95,15 @@ fn terminal_fallback_prints_raw_links_even_when_card_urls_fit() {
         limit: None,
     };
 
-    assert!(full_links_output_with_copy_fallback(
-        120,
-        std::slice::from_ref(&card),
-        LinkMode::PlainUrl,
-        false
-    )
-    .is_empty());
+    assert!(
+        full_links_output_with_copy_fallback(
+            120,
+            std::slice::from_ref(&card),
+            LinkMode::PlainUrl,
+            false
+        )
+        .is_empty()
+    );
 
     let links = full_links_output_with_copy_fallback(120, &[card], LinkMode::PlainUrl, true);
     assert!(links.contains("Full web-share URLs:"));

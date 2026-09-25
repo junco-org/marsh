@@ -11,23 +11,11 @@ use super::super::pane_io_encoding::{
     prepare_pane_input_write, synchronized_input_targets, write_attached_bytes_to_target_io,
     PaneInputLiveness, PaneInputWrite,
 };
-#[cfg(windows)]
-use super::super::pane_io_encoding::{
-    prepare_pane_console_input_write, should_emulate_windows_cmd_select_all,
-    should_route_windows_control_as_pty_bytes, windows_console_input_for_attached_key,
-    write_attached_windows_console_input_action_to_target_io, PaneConsoleInputWrite,
-    WindowsConsoleInputAction,
-};
 
 pub(super) enum PreparedAttachedPaneForward {
     EncodedKey {
         write: PaneInputWrite,
         bytes: Vec<u8>,
-    },
-    #[cfg(windows)]
-    WindowsConsoleKey {
-        write: PaneConsoleInputWrite,
-        action: WindowsConsoleInputAction,
     },
 }
 
@@ -43,22 +31,6 @@ pub(super) fn prepare_attached_key_forwards(
         match forward {
             AttachedPaneForward::EncodedKey(_) => {
                 append_encoded_key_forward(state, &target, key, &mut prepared)?;
-            }
-            #[cfg(windows)]
-            AttachedPaneForward::WindowsConsoleKey {
-                key: console_key,
-                bytes,
-            } => {
-                let route_bytes = should_emulate_windows_cmd_select_all(state, &target, key)
-                    || should_route_windows_control_as_pty_bytes(state, &target, key);
-                if route_bytes {
-                    append_encoded_key_forward(state, &target, key, &mut prepared)?;
-                } else {
-                    let action =
-                        windows_console_input_for_attached_key(state, &target, key, console_key);
-                    let write = prepare_pane_console_input_write(state, &target, bytes, action)?;
-                    prepared.push(PreparedAttachedPaneForward::WindowsConsoleKey { write, action });
-                }
             }
         }
     }
@@ -119,10 +91,6 @@ pub(super) async fn write_prepared_attached_pane_forwards(
         match forward {
             PreparedAttachedPaneForward::EncodedKey { write, bytes } => {
                 write_attached_bytes_to_target_io(write, bytes).await?;
-            }
-            #[cfg(windows)]
-            PreparedAttachedPaneForward::WindowsConsoleKey { write, action } => {
-                write_attached_windows_console_input_action_to_target_io(write, action).await?;
             }
         }
     }

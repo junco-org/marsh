@@ -106,7 +106,6 @@ async fn if_shell_format_mode_ignores_background_flag_like_tmux() {
 #[tokio::test]
 async fn background_if_shell_keeps_detached_write_access_after_response() {
     let handler = RequestHandler::new();
-    use_platform_test_shell(&handler).await;
     let requester_pid = 424_006;
 
     {
@@ -139,7 +138,6 @@ async fn background_if_shell_keeps_detached_write_access_after_response() {
 #[tokio::test]
 async fn background_if_shell_request_rejects_a_reused_control_registration() {
     let handler = RequestHandler::new();
-    use_platform_test_shell(&handler).await;
     let requester_pid = 424_106;
     let original = session_name("if-shell-request-control-original");
     let replacement = session_name("if-shell-request-control-replacement");
@@ -185,7 +183,6 @@ async fn background_if_shell_request_rejects_a_reused_control_registration() {
 #[tokio::test]
 async fn queued_background_if_shell_keeps_detached_write_access_after_response() {
     let handler = RequestHandler::new();
-    use_platform_test_shell(&handler).await;
     let requester_pid = 424_007;
     let parsed = CommandParser::new()
         .parse(&format!(
@@ -236,7 +233,6 @@ async fn queued_if_shell_rejects_unknown_option_before_condition() {
 #[tokio::test]
 async fn queued_background_if_shell_rejects_a_reused_control_registration() {
     let handler = RequestHandler::new();
-    use_platform_test_shell(&handler).await;
     let requester_pid = 424_107;
     let original = session_name("if-shell-queue-control-original");
     let replacement = session_name("if-shell-queue-control-replacement");
@@ -269,7 +265,6 @@ async fn queued_background_if_shell_rejects_a_reused_control_registration() {
 
 async fn assert_background_if_shell_rejects_reused_attach_registration(queued: bool) {
     let handler = RequestHandler::new();
-    use_platform_test_shell(&handler).await;
     let requester_pid = if queued { 424_208 } else { 424_207 };
     let suffix = if queued { "queue" } else { "request" };
     let original = session_name(&format!("if-shell-{suffix}-attach-original"));
@@ -362,7 +357,6 @@ async fn background_if_shell_rejects_a_reused_attach_registration() {
 #[tokio::test]
 async fn background_if_shell_queue_survives_a_same_registration_session_switch() {
     let handler = RequestHandler::new();
-    use_platform_test_shell(&handler).await;
     let requester_pid = 424_308;
     let alpha = session_name("if-shell-attach-switch-alpha");
     let beta = session_name("if-shell-attach-switch-beta");
@@ -425,7 +419,6 @@ async fn background_if_shell_queue_survives_a_same_registration_session_switch()
 
 async fn assert_explicit_background_if_shell_target_survives_switch(queued: bool) {
     let handler = RequestHandler::new();
-    use_platform_test_shell(&handler).await;
     let requester_pid = if queued { 424_310 } else { 424_309 };
     let suffix = if queued { "queue" } else { "request" };
     let alpha = session_name(&format!("if-shell-explicit-{suffix}-alpha"));
@@ -520,12 +513,8 @@ async fn explicit_background_if_shell_targets_survive_attached_switch() {
 #[tokio::test]
 async fn background_if_shell_is_tracked_as_detached_request_until_finished() {
     let handler = RequestHandler::new();
-    use_platform_test_shell(&handler).await;
 
-    #[cfg(unix)]
     let condition = "sleep 0.2; true".to_owned();
-    #[cfg(windows)]
-    let condition = "Start-Sleep -Milliseconds 200; exit 0".to_owned();
 
     let response = handler
         .handle(Request::IfShell(Box::new(IfShellRequest {
@@ -708,7 +697,11 @@ async fn if_shell_missing_explicit_target_is_nonfatal() {
 #[tokio::test]
 async fn source_file_if_shell_true_executes_brace_command_list() {
     let handler = RequestHandler::new();
-    let root = temp_root("if-shell-true-brace");
+    // The caller cwd starts both the managed reader that resolves `main.conf` and the sourced
+    // `if-shell` condition, so it has to name a directory inside this handler's own seed.
+    let root = seed_scratch_dir(&handler, "if-shell-true-brace")
+        .path()
+        .to_path_buf();
     let config = root.join("main.conf");
     write_config(&config, "if-shell true { set-buffer -b chosen selected }\n");
 
@@ -735,8 +728,6 @@ async fn source_file_if_shell_true_executes_brace_command_list() {
             .stdout(),
         b"selected"
     );
-
-    let _ = fs::remove_dir_all(root);
 }
 
 #[tokio::test]
@@ -1065,7 +1056,6 @@ async fn scripted_pane_commands_accept_session_targets_like_tmux() {
     assert_eq!(output.stdout(), b"1\n");
 }
 
-#[cfg(unix)]
 #[tokio::test]
 async fn if_shell_shell_mode_uses_bin_sh_environment_and_caller_cwd() {
     let handler = RequestHandler::new();
@@ -1161,85 +1151,6 @@ async fn if_shell_shell_mode_uses_bin_sh_environment_and_caller_cwd() {
     assert!(
         !marker.exists(),
         "if-shell should not execute default-shell for tmux jobs"
-    );
-}
-
-#[cfg(windows)]
-#[tokio::test]
-async fn if_shell_shell_mode_uses_windows_shell_environment_and_caller_cwd() {
-    let handler = RequestHandler::new();
-    let alpha = session_name("alpha");
-    let root = temp_root("if-shell-shell-mode");
-    fs::create_dir_all(&root).expect("caller cwd");
-    let cmd = std::env::var_os("COMSPEC")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("cmd.exe"));
-
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: alpha.clone(),
-                detached: true,
-                size: Some(TerminalSize { cols: 80, rows: 24 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
-    assert!(matches!(
-        handler
-            .handle(Request::SetOption(SetOptionRequest {
-                scope: ScopeSelector::Global,
-                option: OptionName::DefaultShell,
-                value: cmd.to_string_lossy().into_owned(),
-                mode: SetOptionMode::Replace,
-            }))
-            .await,
-        Response::SetOption(_)
-    ));
-    assert!(matches!(
-        handler
-            .handle(Request::SetEnvironment(Box::new(SetEnvironmentRequest {
-                scope: ScopeSelector::Session(alpha.clone()),
-                name: "FOO".to_owned(),
-                value: "bar".to_owned(),
-                mode: None,
-                hidden: false,
-                format: false,
-            })))
-            .await,
-        Response::SetEnvironment(_)
-    ));
-
-    let root = root.to_string_lossy().into_owned();
-    let response = handler
-        .handle(Request::IfShell(Box::new(IfShellRequest {
-            condition: format!(
-                "if not \"%FOO%\"==\"bar\" exit /b 1 & if not \"%CD%\"==\"{root}\" exit /b 1 & exit /b 0"
-            ),
-            format_mode: false,
-            then_command: "set-buffer -b chosen yes".to_owned(),
-            else_command: Some("set-buffer -b chosen no".to_owned()),
-            target: Some(Target::Session(alpha)),
-            caller_cwd: Some(PathBuf::from(root)),
-            background: false,
-        })))
-        .await;
-
-    assert_eq!(
-        response,
-        Response::IfShell(rmux_proto::IfShellResponse::no_output())
-    );
-    assert_eq!(
-        handler
-            .handle(Request::ShowBuffer(ShowBufferRequest {
-                name: Some("chosen".to_owned()),
-            }))
-            .await
-            .command_output()
-            .expect("show-buffer output")
-            .stdout(),
-        b"yes"
     );
 }
 

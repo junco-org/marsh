@@ -1,5 +1,4 @@
 use std::fs;
-#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
@@ -31,9 +30,7 @@ use rmux_proto::{
     INTERNAL_RUNTIME_COMMAND_EXPANSION_PATH,
 };
 
-fn session_name(value: &str) -> SessionName {
-    SessionName::new(value).expect("valid session name")
-}
+use crate::test_names::session_name;
 
 fn wait_for(channel: &str, mode: WaitForMode) -> Request {
     Request::WaitFor(WaitForRequest {
@@ -118,12 +115,9 @@ fn write_config(path: &Path, contents: &str) {
 
 fn write_executable_script(path: &Path, contents: &str) {
     write_config(path, contents);
-    #[cfg(unix)]
-    {
-        let mut permissions = fs::metadata(path).expect("script metadata").permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(path, permissions).expect("script permissions");
-    }
+    let mut permissions = fs::metadata(path).expect("script metadata").permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(path, permissions).expect("script permissions");
 }
 
 fn shell_quote(path: &Path) -> String {
@@ -132,36 +126,6 @@ fn shell_quote(path: &Path) -> String {
 
 fn command_quote(command: &str) -> String {
     crate::test_shell::command_quote(command)
-}
-
-async fn use_platform_test_shell(handler: &RequestHandler) {
-    #[cfg(not(windows))]
-    let _ = handler;
-
-    #[cfg(windows)]
-    {
-        let powershell = std::env::var_os("SystemRoot")
-            .map(PathBuf::from)
-            .map(|root| {
-                root.join("System32")
-                    .join("WindowsPowerShell")
-                    .join("v1.0")
-                    .join("powershell.exe")
-            })
-            .unwrap_or_else(|| PathBuf::from("powershell.exe"));
-
-        assert!(matches!(
-            handler
-                .handle(Request::SetOption(SetOptionRequest {
-                    scope: ScopeSelector::Global,
-                    option: OptionName::DefaultShell,
-                    value: powershell.to_string_lossy().into_owned(),
-                    mode: SetOptionMode::Replace,
-                }))
-                .await,
-            Response::SetOption(_)
-        ));
-    }
 }
 
 async fn wait_for_named_buffer(handler: &RequestHandler, name: &str, expected: &[u8]) {
@@ -202,20 +166,10 @@ async fn wait_for_detached_request_count(handler: &RequestHandler, expected: usi
 }
 
 fn background_shell_test_timeout() -> std::time::Duration {
-    #[cfg(windows)]
-    {
-        // A cold Windows PowerShell process can start slowly when hosted CI is
-        // compiling and running several test shards. This is a liveness bound,
-        // not a process-start latency assertion.
-        std::time::Duration::from_secs(30)
-    }
-    #[cfg(not(windows))]
-    {
-        // Background shell startup competes with thousands of async tests in
-        // the full server suite. Keep this as a bounded liveness budget, not a
-        // scheduler-latency assertion.
-        std::time::Duration::from_secs(8)
-    }
+    // Background shell startup competes with thousands of async tests in
+    // the full server suite. Keep this as a bounded liveness budget, not a
+    // scheduler-latency assertion.
+    std::time::Duration::from_secs(8)
 }
 
 async fn register_control_for_session(
@@ -330,67 +284,28 @@ async fn assert_sessions_survive_background_control_reuse(
     );
 }
 
-#[cfg(unix)]
 fn delayed_true_shell_condition() -> String {
     "sleep 0.05; true".to_owned()
-}
-
-#[cfg(windows)]
-fn delayed_true_shell_condition() -> String {
-    "Start-Sleep -Milliseconds 50; exit 0".to_owned()
 }
 
 fn builtin_true_shell_condition() -> &'static str {
     "true"
 }
 
-#[cfg(unix)]
 fn shell_print_command(text: &str) -> String {
     format!("printf {}", command_quote(text))
 }
 
-#[cfg(windows)]
-fn shell_print_command(text: &str) -> String {
-    format!(
-        "[Console]::Out.Write({})",
-        crate::test_shell::powershell_quote(text)
-    )
-}
-
-#[cfg(unix)]
 fn shell_print_then_exit_command(text: &str, code: u8) -> String {
     format!("printf {}; exit {code}", command_quote(text))
 }
 
-#[cfg(windows)]
-fn shell_print_then_exit_command(text: &str, code: u8) -> String {
-    format!(
-        "[Console]::Out.Write({}); exit {code}",
-        crate::test_shell::powershell_quote(text)
-    )
-}
-
-#[cfg(unix)]
 fn shell_stderr_command(text: &str) -> String {
     format!("printf {} >&2", command_quote(text))
 }
 
-#[cfg(windows)]
-fn shell_stderr_command(text: &str) -> String {
-    format!(
-        "[Console]::Error.Write({})",
-        crate::test_shell::powershell_quote(text)
-    )
-}
-
-#[cfg(unix)]
 fn shell_success_command() -> String {
     "true".to_owned()
-}
-
-#[cfg(windows)]
-fn shell_success_command() -> String {
-    crate::test_shell::powershell_encoded_command("exit 0")
 }
 
 #[path = "handler_scripting_tests/run_shell.rs"]

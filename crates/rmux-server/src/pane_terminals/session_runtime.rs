@@ -16,11 +16,6 @@ fn pane_base_environment_with_starting_fallback(
     let base = state
         .terminals
         .pane_base_environment(runtime_session_name, pane_id);
-    #[cfg(windows)]
-    {
-        base.or_else(|| state.starting_pane_base_environment(runtime_session_name, pane_id))
-    }
-    #[cfg(not(windows))]
     {
         base
     }
@@ -212,8 +207,6 @@ impl HandlerState {
             self.clear_marked_pane();
         }
 
-        #[cfg(windows)]
-        let _ = self.starting_panes.remove(session_name);
         for pipe in self.remove_session_pipes(session_name).into_values() {
             pipe.stop();
         }
@@ -359,20 +352,12 @@ impl HandlerState {
                 "pane output generations already exist for session {new_name}"
             )));
         }
-        #[cfg(windows)]
-        if self.starting_panes.contains_key(new_name) {
-            return Err(RmuxError::Server(format!(
-                "starting panes already exist for session {new_name}"
-            )));
-        }
 
         self.pipes.rename_session(session_name, new_name)?;
 
         let mut transcripts = std::mem::take(&mut self.transcripts);
         let mut pane_outputs = std::mem::take(&mut self.pane_outputs);
         let mut pane_output_generations = std::mem::take(&mut self.pane_output_generations);
-        #[cfg(windows)]
-        let mut starting_panes = std::mem::take(&mut self.starting_panes);
         let mut dead_panes = std::mem::take(&mut self.dead_panes);
         let mut attached_submitted_rows = std::mem::take(&mut self.attached_submitted_rows);
 
@@ -385,8 +370,6 @@ impl HandlerState {
         let session_output_generations = pane_output_generations
             .remove(session_name)
             .unwrap_or_default();
-        #[cfg(windows)]
-        let session_starting_panes = starting_panes.remove(session_name).unwrap_or_default();
         let session_dead_panes = dead_panes.remove(session_name).unwrap_or_default();
         let session_attached_rows = attached_submitted_rows
             .remove(session_name)
@@ -402,11 +385,6 @@ impl HandlerState {
             let previous_generations =
                 pane_output_generations.insert(new_name.clone(), session_output_generations);
             debug_assert!(previous_generations.is_none());
-        }
-        #[cfg(windows)]
-        if !session_starting_panes.is_empty() {
-            let previous_starting = starting_panes.insert(new_name.clone(), session_starting_panes);
-            debug_assert!(previous_starting.is_none());
         }
         if !session_dead_panes.is_empty() {
             let previous_dead_panes = dead_panes.insert(new_name.clone(), session_dead_panes);
@@ -431,10 +409,6 @@ impl HandlerState {
         self.transcripts = transcripts;
         self.pane_outputs = pane_outputs;
         self.pane_output_generations = pane_output_generations;
-        #[cfg(windows)]
-        {
-            self.starting_panes = starting_panes;
-        }
         self.dead_panes = dead_panes;
         self.attached_submitted_rows = attached_submitted_rows;
         self.auto_named_windows = auto_named_windows;

@@ -10,9 +10,6 @@ mod pane_broadcast;
 mod pane_by_id;
 #[path = "handler_pane/by_id_selection.rs"]
 mod pane_by_id_selection;
-#[cfg(windows)]
-#[path = "handler_pane/deferred_wait.rs"]
-mod pane_deferred_wait;
 #[path = "handler_pane/display_panes.rs"]
 mod pane_display_panes;
 #[path = "handler_pane/exit_probe.rs"]
@@ -49,9 +46,6 @@ mod pane_split_effects;
 mod pane_timer_mutations;
 #[path = "handler_pane/transfer.rs"]
 mod pane_transfer;
-#[cfg(windows)]
-#[path = "handler_pane/windows_console_sequence.rs"]
-mod pane_windows_console_sequence;
 
 pub(in crate::handler) use pane_attached_input::bracketed_paste::{
     strip_bracketed_paste_markers, strip_bracketed_paste_markers_after_append,
@@ -62,8 +56,6 @@ pub(in crate::handler) use pane_attached_input::{
     PaneBoundTerminalStringDecode, TerminalResponseDecode,
 };
 pub(super) use pane_by_id::resolve_pane_target_ref;
-#[cfg(windows)]
-pub(in crate::handler) use pane_deferred_wait::format_references_pane_pid;
 pub(super) use pane_inspection::{
     attached_status_message_for_error, command_output_from_lines, display_time,
 };
@@ -75,10 +67,6 @@ use pane_io_encoding::{
 pub(super) use pane_io_encoding::{
     prepare_pane_bracketed_paste_write, prepare_pane_input_write,
     write_attached_bytes_to_target_io, write_bytes_to_target_io, PaneInputLiveness,
-};
-#[cfg(windows)]
-pub(super) use pane_io_encoding::{
-    windows_paste_sink, WindowsPasteSink, LEGACY_CONPTY_NON_UTF8_BRACKETED_PASTE_ERROR,
 };
 pub(in crate::handler) use pane_management::{SplitWindowParts, SplitWindowResponseMode};
 pub(super) use pane_prompt_input::decode_prompt_input_event;

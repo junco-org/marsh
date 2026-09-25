@@ -9,13 +9,11 @@ use rmux_core::LifecycleEvent;
 use rmux_proto::{
     DisplayMessageRequest, DisplayPanesRequest, DisplayPanesResponse, NewSessionRequest,
     NewWindowRequest, PaneTarget, Request, ResizePaneAdjustment, ResizePaneRequest, Response,
-    SelectWindowRequest, SessionName, SplitDirection, SplitWindowRequest, SplitWindowTarget,
-    Target, TerminalSize, WindowTarget,
+    SelectWindowRequest, SplitDirection, SplitWindowRequest, SplitWindowTarget, Target,
+    TerminalSize, WindowTarget,
 };
 
-fn session_name(value: &str) -> SessionName {
-    SessionName::new(value).expect("valid session name")
-}
+use crate::test_names::session_name;
 
 async fn rendered_window_layouts(handler: &RequestHandler, target: PaneTarget) -> (String, String) {
     let response = handler

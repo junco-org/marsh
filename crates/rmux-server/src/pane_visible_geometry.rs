@@ -97,9 +97,7 @@ mod tests {
 
     use super::*;
 
-    fn session_name(value: &str) -> SessionName {
-        SessionName::new(value).expect("valid session name")
-    }
+    use crate::test_names::session_name;
 
     fn options_with_border_status(value: &str) -> (OptionStore, SessionName) {
         let session = session_name("alpha");

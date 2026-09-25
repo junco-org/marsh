@@ -1,8 +1,8 @@
 //! The builtins an attached shell registers over stock `brush-builtins`, one file each.
 //!
-//! `git` is performed in-process through libgit2, so every git effect happens on the shell's own
-//! thread where it can be attributed; `exec` runs its program through the spawner and exits the
-//! shell instead of replacing the process. [`all`] is the table
+//! `git` forwards to the system git through the shell's recorded spawner and, in an attached
+//! shell, observes what it did; `exec` runs its program through the spawner and exits the shell
+//! instead of replacing the process. [`all`] is the table
 //! [`Shell::attach`](super::Shell::attach) registers; adding a builtin is one file and one
 //! line here.
 
@@ -17,7 +17,8 @@ pub mod gitcmd;
 mod gitexec;
 
 pub use exec::exec_builtins;
-pub use git::{GIT_VARIANTS, SNAPSHOT_ROOT_VAR, git_builtins, repo_root};
+pub(crate) use git::managed_registration;
+pub use git::{SNAPSHOT_ROOT_VAR, git_builtins};
 
 /// Every builtin of this module, keyed by name.
 #[must_use]

@@ -40,6 +40,9 @@ pub struct ExecutionContext<'a, SE: ShellExtensions = extensions::DefaultShellEx
     pub command_name: String,
     /// The parameters for the execution.
     pub params: ExecutionParameters,
+    /// The process group an external command started from this context joins, when its
+    /// pipeline already established one; `None` leaves the parameters' policy to decide.
+    pub process_group_id: Option<i32>,
 }
 
 impl<SE: ShellExtensions> ExecutionContext<'_, SE> {
@@ -436,6 +439,7 @@ impl<'a, SE: extensions::ShellExtensions> SimpleCommand<'a, SE> {
                     builtin,
                     self.command_name,
                     self.args,
+                    self.process_group_id,
                 ))
             }
             ShellForCommand::ParentShell(..) => {
@@ -450,6 +454,7 @@ impl<'a, SE: extensions::ShellExtensions> SimpleCommand<'a, SE> {
         builtin: builtins::Registration<SE>,
         command_name: String,
         args: Vec<CommandArg>,
+        process_group_id: Option<i32>,
     ) -> ExecutionSpawnResult {
         let last_arg = Self::take_last_arg(&args);
         let join_handle = tokio::task::spawn_blocking(move || {
@@ -457,6 +462,7 @@ impl<'a, SE: extensions::ShellExtensions> SimpleCommand<'a, SE> {
                 shell: &mut shell,
                 command_name,
                 params,
+                process_group_id,
             };
 
             let rt = tokio::runtime::Handle::current();
@@ -482,6 +488,7 @@ impl<'a, SE: extensions::ShellExtensions> SimpleCommand<'a, SE> {
             shell: &mut shell,
             command_name: self.command_name,
             params: self.params,
+            process_group_id: self.process_group_id,
         };
 
         let result = execute_builtin_command(&builtin, cmd_context, self.args).await;
@@ -509,6 +516,7 @@ impl<'a, SE: extensions::ShellExtensions> SimpleCommand<'a, SE> {
             shell: &mut shell,
             command_name: self.command_name,
             params: self.params,
+            process_group_id: self.process_group_id,
         };
 
         // Strip the function name off args.
@@ -535,6 +543,7 @@ impl<'a, SE: extensions::ShellExtensions> SimpleCommand<'a, SE> {
             shell: &mut shell,
             command_name: self.command_name,
             params: self.params,
+            process_group_id: self.process_group_id,
         };
 
         let resolved_path = path.to_string_lossy();

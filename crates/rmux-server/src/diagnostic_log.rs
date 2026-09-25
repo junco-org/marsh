@@ -38,7 +38,12 @@ pub(crate) fn record_shell_stream_error(shell: &str, uid: &str, channel: &str, e
 /// Only unapproved verdicts are written. A published line is the ordinary case and says nothing an
 /// operator reading this log is looking for; a denial, a stale snapshot, a discard or an
 /// infrastructure failure is why a workload that exited zero changed nothing.
-pub(crate) fn record_shell_command_unapproved(shell: &str, uid: &str, command: &str, verdict: &str) {
+pub(crate) fn record_shell_command_unapproved(
+    shell: &str,
+    uid: &str,
+    command: &str,
+    verdict: &str,
+) {
     record_line(&format!(
         "time_ms={} process_pid={} event=shell-command-unapproved shell={shell} uid={uid} \
          verdict={verdict} command={command}",

@@ -117,7 +117,7 @@ async fn new_session_uses_default_command_when_request_omits_command() {
     // Keep the initial pane alive until its lifecycle metadata is inspected.
     // A short-lived `printf` may exit and remove the detached session first
     // when the full test suite runs under load.
-    let default_command = if cfg!(windows) { "more" } else { "cat" };
+    let default_command = "cat";
     let response = handler
         .handle(Request::SetOption(SetOptionRequest {
             scope: ScopeSelector::Global,
@@ -210,8 +210,8 @@ async fn failed_new_session_spawn_does_not_leak_environment_into_reused_name() {
             kill_other_clients: false,
             flags: None,
             window_name: None,
-            // Keep the spawn synchronous on Windows so this regression covers
-            // both rollback branches instead of the deferred startup path.
+            // Keep the spawn synchronous so this regression covers both
+            // rollback branches instead of the deferred startup path.
             print_session_info: true,
             print_format: None,
             command: None,

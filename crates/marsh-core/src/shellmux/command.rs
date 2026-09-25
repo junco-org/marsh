@@ -16,6 +16,8 @@
 
 use std::sync::Arc;
 
+use marsh_lib::{WaitState, wait_for_completion};
+
 use crate::Outcome;
 use crate::shellmux::error::MuxError;
 use crate::shellmux::mux::Sandbox;
@@ -75,8 +77,8 @@ pub enum WaitError {
 ///   result was obtained at all — the line never ran, or the interpreter itself failed. A gate or
 ///   storage failure that happens *after* a real exit does not erase the exit code it already has.
 /// * `outcome` is the *publication* verdict: [`Outcome::Published`], [`Outcome::Denied`],
-///   [`Outcome::Stale`], [`Outcome::Discarded`], [`Outcome::Detached`], or an infrastructure
-///   [`MuxError`]. A command can exit zero and be denied.
+///   [`Outcome::Discarded`], [`Outcome::Detached`], or an infrastructure [`MuxError`]. A command
+///   can exit zero and be denied.
 #[derive(Debug)]
 pub struct CommandCompletion {
     /// Which command this is the verdict for.
@@ -114,17 +116,6 @@ impl CommandCompletion {
     }
 }
 
-/// The state one command's watch carries.
-#[derive(Clone, Debug)]
-pub(crate) enum CommandState {
-    /// Admitted; no verdict yet.
-    Pending,
-    /// Concluded, with the verdict every waiter shares.
-    Done(Arc<CommandCompletion>),
-    /// The mux was torn down before a verdict could be produced.
-    Shutdown,
-}
-
 /// A receipt for one admitted command.
 ///
 /// Cloneable and cheap. Any number of holders may wait on the same command, before or after it
@@ -140,7 +131,7 @@ pub struct CommandHandle {
     /// The line as submitted.
     pub(crate) text: Arc<str>,
     /// The shared verdict.
-    pub(crate) state: tokio::sync::watch::Receiver<CommandState>,
+    pub(crate) state: tokio::sync::watch::Receiver<WaitState<CommandCompletion, WaitError>>,
 }
 
 impl CommandHandle {
@@ -167,7 +158,7 @@ impl CommandHandle {
     /// A cheap, non-blocking look. `false` is only a statement about this instant.
     #[must_use]
     pub fn is_finished(&self) -> bool {
-        !matches!(*self.state.borrow(), CommandState::Pending)
+        !matches!(*self.state.borrow(), WaitState::Pending)
     }
 
     /// Waits for this command's verdict.
@@ -184,22 +175,165 @@ impl CommandHandle {
     /// be produced, and with [`WaitError::Aborted`] when the producer was lost unexpectedly.
     pub async fn wait(&self) -> Result<Arc<CommandCompletion>, WaitError> {
         let mut state = self.state.clone();
-        loop {
-            {
-                let current = state.borrow_and_update();
-                match &*current {
-                    CommandState::Done(completion) => {
-                        let completion = Arc::clone(completion);
-                        drop(current);
-                        return Ok(completion);
-                    }
-                    CommandState::Shutdown => return Err(WaitError::Shutdown),
-                    CommandState::Pending => {}
-                }
-            }
-            // The sender going away with the value still `Pending` is the producer being lost:
-            // nothing will ever resolve this, and a waiter must not hang on it.
-            state.changed().await.map_err(|_| WaitError::Aborted)?;
+        // The sender going away with the value still pending is the producer being lost: nothing
+        // will ever resolve this, and a waiter must not hang on it.
+        wait_for_completion(&mut state, || WaitError::Aborted).await
+    }
+}
+
+/// A command the publication gate refused.
+///
+/// Carries the completion whole rather than a message: the command's identity, its principal and
+/// generation, its *actual* process exit code, the capabilities it requested and the
+/// [`Denial`](crate::Denial)s it collected are all still there, because "the program exited zero
+/// and the policy refused it" is a different fact from "the program failed" and a caller
+/// frequently has to report both.
+pub struct PolicyError {
+    /// The refused command's verdict, shared with every receipt on it.
+    completion: Arc<CommandCompletion>,
+}
+
+impl PolicyError {
+    /// Wraps one denied completion.
+    ///
+    /// Private: the only thing that may construct this is the boundary that observed
+    /// [`Outcome::Denied`], so a caller can never manufacture a denial that never happened.
+    pub(crate) const fn new(completion: Arc<CommandCompletion>) -> Self {
+        Self { completion }
+    }
+
+    /// The refused command's completion.
+    #[must_use]
+    pub const fn completion(&self) -> &Arc<CommandCompletion> {
+        &self.completion
+    }
+}
+
+impl std::fmt::Debug for PolicyError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PolicyError")
+            .field("completion", &self.completion)
+            .finish()
+    }
+}
+
+impl std::fmt::Display for PolicyError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "command {} was denied by policy",
+            self.completion.id
+        )
+    }
+}
+
+impl std::error::Error for PolicyError {}
+
+/// Why running one line did not end in an approved publication.
+///
+/// The four reasons are kept apart because a caller acts differently on each, and collapsing any
+/// two of them loses a real difference:
+///
+/// * [`Admission`](Self::Admission) — the line was never accepted, so nothing ran at all.
+/// * [`Policy`](Self::Policy) — it ran, and the gate refused it. The exit code it carries is the
+///   program's own and says nothing about the refusal.
+/// * [`Unpublished`](Self::Unpublished) — it ran and reached a boundary that published nothing:
+///   [`Outcome::Discarded`], [`Outcome::Detached`], or an infrastructure failure. The discriminant
+///   stays inspectable in [`CommandCompletion::outcome`]; a discard is not a retry permit.
+/// * [`Wait`](Self::Wait) — *this caller* lost the answer. It is not evidence that nothing
+///   happened, so it is never permission to rerun an effectful command.
+pub enum RunError {
+    /// The line was refused before anything could run.
+    Admission(MuxError),
+    /// The line ran and the publication gate refused it.
+    Policy(PolicyError),
+    /// The line concluded without an approved publication, for a reason that is not a denial.
+    Unpublished {
+        /// The completion, whose `outcome` carries the original discriminant or error.
+        completion: Arc<CommandCompletion>,
+    },
+    /// The answer was lost: teardown, or a producer that went away.
+    Wait(WaitError),
+}
+
+impl RunError {
+    /// The completion behind this failure, when the line got far enough to have one.
+    ///
+    /// `Some` for a denial and for an unpublished conclusion; `None` for a refused admission and
+    /// for a lost answer, neither of which produced a verdict at all.
+    #[must_use]
+    pub const fn completion(&self) -> Option<&Arc<CommandCompletion>> {
+        match self {
+            Self::Policy(denied) => Some(denied.completion()),
+            Self::Unpublished { completion } => Some(completion),
+            Self::Admission(_) | Self::Wait(_) => None,
         }
+    }
+
+    /// The infrastructure failure an unpublished conclusion carries, when it carries one.
+    fn infrastructure(&self) -> Option<&MuxError> {
+        match self {
+            Self::Unpublished { completion } => completion.outcome.as_ref().as_ref().err(),
+            Self::Admission(_) | Self::Policy(_) | Self::Wait(_) => None,
+        }
+    }
+}
+
+impl std::fmt::Debug for RunError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Admission(error) => formatter.debug_tuple("Admission").field(error).finish(),
+            Self::Policy(denied) => formatter.debug_tuple("Policy").field(denied).finish(),
+            Self::Unpublished { completion } => formatter
+                .debug_struct("Unpublished")
+                .field("completion", completion)
+                .finish(),
+            Self::Wait(error) => formatter.debug_tuple("Wait").field(error).finish(),
+        }
+    }
+}
+
+impl std::fmt::Display for RunError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Admission(error) => write!(formatter, "{error}"),
+            Self::Policy(denied) => write!(formatter, "{denied}"),
+            Self::Unpublished { completion } => match self.infrastructure() {
+                Some(error) => write!(formatter, "{error}"),
+                None => write!(
+                    formatter,
+                    "command {} completed without an approved publication",
+                    completion.id
+                ),
+            },
+            Self::Wait(error) => write!(formatter, "{error}"),
+        }
+    }
+}
+
+impl std::error::Error for RunError {
+    /// The failure underneath, never flattened into this one's message.
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Admission(error) => Some(error),
+            Self::Policy(denied) => Some(denied),
+            Self::Unpublished { .. } => self
+                .infrastructure()
+                .map(|error| error as &dyn std::error::Error),
+            Self::Wait(error) => Some(error),
+        }
+    }
+}
+
+impl From<MuxError> for RunError {
+    fn from(error: MuxError) -> Self {
+        Self::Admission(error)
+    }
+}
+
+impl From<WaitError> for RunError {
+    fn from(error: WaitError) -> Self {
+        Self::Wait(error)
     }
 }

@@ -23,6 +23,14 @@ a Rust program.
   links against `btrfsutil`. On Debian/Ubuntu that is `clang libclang-dev libbtrfsutil-dev`; on
   Fedora, `clang-devel libbtrfsutil-devel`.
 * **Git** and **btrfs-progs** for the setup commands below.
+* **`strace`**, and permission for the daemon to trace itself. Which files a line touched is
+  observed through one tracer attached to the host, and a host that cannot attach one fails
+  closed rather than publishing work it never saw. Under `kernel.yama.ptrace_scope=1` — the
+  common default — nothing has to be configured: the daemon names its own tracer through
+  `PR_SET_PTRACER`. Under `ptrace_scope=2` or `3`, or inside a sandbox that forbids `ptrace`
+  outright, marsh will not start a shell. The tracer's output is spooled through private,
+  already-unlinked files in `/tmp`, which must support `fallocate` hole punching (tmpfs, ext4,
+  xfs and btrfs do); the kernel must be Linux 5.3 or newer, for pidfds.
 * A writable **btrfs mount carrying `user_subvol_rm_allowed`**, so an unprivileged user can
   reclaim job snapshots. Check it with `findmnt -T <path> -o FSTYPE,OPTIONS`.
 
@@ -56,8 +64,11 @@ cd "$WORK/seed"
 somewhere that is. If Cargo writes to a custom target directory, set `RMUX` to that directory's
 `release/rmux` instead.
 
-Git is initialized **before** the managed shell starts, deliberately: the managed `git` builtin
-serves policy operations over explicit paths — staging, checkout, stash — not repository creation.
+The example initializes Git **before** the managed shell starts only to give it a first commit.
+The managed `git` builtin runs the system `git` — any subcommand, `init` and `clone` included —
+through the shell's recorded spawner, inside the pane's snapshot: host Git configuration is
+ignored, nothing outside the snapshot is written, and what each invocation did to each path is
+requested from the policy before the line is published.
 `-f /dev/null` isolates the example from your own rmux configuration. The socket is deliberately
 outside the seed, so it is never part of what a workload could publish.
 
@@ -105,12 +116,29 @@ State lives beside the seed:
 | --- | --- |
 | `<seed-parent>/.marsh/<seed-name>/snap/` | one btrfs snapshot per live job |
 | `<seed-parent>/.marsh/<seed-name>/meta/wal.jsonl` | the write-ahead log every publication goes through |
-| `<seed-parent>/.marsh/<seed-name>/meta/runs/<uid>/` | one job's spawn and builtin record streams |
+| `<seed-parent>/.marsh/<seed-name>/meta/runs/<uid>/` | one job's spawn, builtin and file-access record streams |
 
 Each submitted shell line is staged in its job's snapshot. After the line ends, its filesystem
 effects are diffed against the seed, its `git` requests are translated into capability events, and
 the policy either grants **all** of them — the transaction is logged and applied to the seed — or
 refuses, in which case the snapshot is retaken from the seed and the line's changes are gone.
+
+Which files a line actually read and wrote is observed rather than guessed at: a `strace` attached
+to the host reports every path-taking syscall of every shell and every process they start, and each
+job's share is written to `meta/runs/<uid>/trace.log` beside its other record streams. Tracing is
+required — a host that may not `ptrace` itself fails with the prerequisite rather than publishing
+unobserved work.
+
+That is what makes two panes over one seed independent rather than merely serialized:
+
+* A line that **read** a file another pane publishes while it is still running is unwound and
+  evaluated again against the new bytes. Its abandoned attempt requests nothing, and its own
+  output, stdin consumption and writes outside the snapshot may repeat — a replay is the same
+  line run again, not a rollback.
+* A line that **wrote** a file another pane owns unstaged is refused, because running it a second
+  time would be refused for the same reason. That is an ownership decision, and the capability
+  policy is what makes it.
+* Lines that touch disjoint files never wait for each other, whatever order they publish in.
 
 This staging is *not* Git's index. `git add -- path` is a runtime **Stage** request: it releases
 that path's unstaged ownership so another principal may edit it. `printf hello > greeting.txt`
@@ -121,10 +149,12 @@ Two consequences worth planning for:
 
 * A refused line leaves the seed unchanged **even when its process exited zero**. The exit status
   is the program's; the approval is the gate's.
-* Published grants are durable and belong to the snapshot that earned them, never to a job name.
-  A path left unstaged when the daemon stops stays owned by a principal that no longer exists, and
-  restarting does not hand the next holder that stake. Stage what you want released before
-  shutting down.
+* Published grants are durable and belong to the snapshot that earned them, never to a reusable
+  job name. A path left unstaged when the daemon stops stays owned by a principal that no longer
+  exists, and restarting does not hand the next holder that stake. Stage what you want released
+  before shutting down. A library caller that controls a stable agent identity may instead open
+  its shell with `SpawnOptions { durable: true, .. }`, whose grants that same name resumes after a
+  reopen; rmux panes never do.
 
 ## Using `RmuxFrontend` as a library
 

@@ -3,8 +3,8 @@ use ratatui::{
     style::{Color, Modifier},
 };
 
-use super::support::{compact_url, LinkMode};
-use super::{ansi_bg, ansi_fg, OSC8_URL_LABEL_WIDTH};
+use super::support::{LinkMode, compact_url};
+use super::{OSC8_URL_LABEL_WIDTH, ansi_bg, ansi_fg};
 
 /// Renders a ratatui `Buffer` as ANSI text, hyperlinking the given `links` per `link_mode`.
 pub(super) fn buffer_to_ansi_string(
@@ -222,8 +222,8 @@ fn cell_is_meaningful(cell: &Cell) -> bool {
 mod tests {
     use ratatui::{buffer::Buffer, layout::Rect};
 
-    use super::super::support::{compact_url, LinkMode};
     use super::super::OSC8_URL_LABEL_WIDTH;
+    use super::super::support::{LinkMode, compact_url};
     use super::buffer_to_ansi_string;
 
     #[test]

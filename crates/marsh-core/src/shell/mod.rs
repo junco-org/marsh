@@ -15,6 +15,7 @@ use brush_core::extensions::ShellExtensions;
 use brush_core::{ExecutionResult, ProfileLoadBehavior, RcLoadBehavior, SourceInfo};
 
 pub mod builtins;
+mod access;
 mod error;
 mod executor;
 pub mod input;
@@ -24,10 +25,11 @@ mod signal;
 
 pub use error::MarshError;
 pub use executor::{MarshExecutor, MarshShellExtensions};
+/// The native workers of one logical command, owned where a line is evaluated rather than where
+/// it is scheduled.
+pub(crate) use executor::Workers;
 pub use policy::{Denial, PolicyValidator};
-pub use session::{
-    GrantedAction, GrantedCapability, Publication, PublishMeta, SnapshotUid, StalePath,
-};
+pub use session::{GrantedAction, GrantedCapability, Publication, PublishMeta, SnapshotUid};
 pub use signal::Signal;
 
 use policy::{Event, Principal};
@@ -52,14 +54,6 @@ pub enum Outcome {
         requested: Vec<Event>,
         /// The subset that was refused, with the policy's explanations.
         denials: Vec<Denial>,
-    },
-    /// Another principal published one of this line's paths after its snapshot was taken: the
-    /// line was discarded and the snapshot retaken from the seed; rerun it.
-    Stale {
-        /// Everything the line asked for.
-        requested: Vec<Event>,
-        /// The paths someone else won, and the transaction that won them.
-        stale: Vec<StalePath>,
     },
     /// The line was thrown away unchecked, at the caller's request (a forced stop): the snapshot
     /// was retaken from the seed and nothing was published or recorded in the history.
@@ -243,7 +237,10 @@ impl<SE: ShellExtensions<ExternalCommandSpawner = MarshExecutor>> Shell<SE> {
     /// Runs one line, then concludes it: the result is the line's, the outcome the gate's.
     ///
     /// The snapshot is refreshed first — retaken from the seed when another principal published
-    /// since the last boundary — so a line always starts from the current seed.
+    /// since the last boundary — so a line always starts from the current seed. If the line reads
+    /// something another principal publishes while it is running, it is unwound, the snapshot is
+    /// resynchronized and the *same* line is evaluated again; the result and outcome are the last
+    /// evaluation's, which is the only one that ever asked for a capability.
     ///
     /// # Errors
     ///
@@ -251,41 +248,59 @@ impl<SE: ShellExtensions<ExternalCommandSpawner = MarshExecutor>> Shell<SE> {
     /// reasons the gate fails.
     pub async fn run(&self, line: &str) -> Result<(ExecutionResult, Outcome), MarshError> {
         let mut shell = self.inner.lock().await;
-        self.refresh(&mut shell)?;
-        let params = shell.default_exec_params();
-        let result = shell
-            .run_string(line, &SourceInfo::default(), &params)
-            .await?;
-        let outcome = self.conclude(&mut shell, line)?;
+        let mut last = None;
+        let settled = self.settle(&mut shell, line, None, false, &mut last).await;
         drop(shell);
-        Ok((result, outcome))
+        // `unwrap_or_default` is unreachable: `settle` was told the line had not run, so it ran it
+        // at least once before it could answer.
+        Ok((last.unwrap_or_default(), settled?))
+    }
+
+    /// The same, with the native workers of one logical command.
+    ///
+    /// The multiplexer above this owns admission, receipts and the terminal; the workers a line's
+    /// builtins register are owned here, because joining them is part of evaluating the line and a
+    /// replay has to join the abandoned evaluation's before it may reseed the tree.
+    ///
+    /// # Errors
+    ///
+    /// Fails for the reasons [`Self::run`] does.
+    pub(crate) async fn run_with_workers(
+        &self,
+        line: &str,
+        workers: Arc<Workers>,
+    ) -> (Option<ExecutionResult>, Result<Outcome, MarshError>) {
+        let mut shell = self.inner.lock().await;
+        let mut last = None;
+        let settled = self
+            .settle(&mut shell, line, Some(&workers), false, &mut last)
+            .await;
+        drop(shell);
+        // The pair, not a `Result` of one: a boundary that broke has no verdict and the line still
+        // ran. What it asked the shell to do — `exit`, above all — is recorded by the caller from
+        // this result, and a failure here may not swallow that request.
+        (last, settled)
     }
 
     /// The boundary after a line the caller ran itself (brush-interactive's loop runs its own
     /// lines).
     ///
-    /// Translates what the line left, checks it, publishes or discards. After a discard the shell
-    /// may be standing in a directory the line created: it is moved back to the snapshot root.
+    /// Translates what the line left, checks it, publishes or discards. A line whose reads were
+    /// invalidated while it ran is evaluated again here, through this same shell, because the
+    /// caller has already consumed its input and cannot re-offer the line. After a discard the
+    /// shell may be standing in a directory the line created: it is moved back to the snapshot
+    /// root.
     ///
     /// # Errors
     ///
     /// Fails when the trees cannot be compared, when the transaction cannot be logged or applied,
     /// when the snapshot cannot be retaken, or when the shell refuses the snapshot root.
-    pub fn conclude(
+    pub async fn conclude(
         &self,
         shell: &mut brush_core::Shell<SE>,
         cmd: &str,
     ) -> Result<Outcome, MarshError> {
-        blocking_boundary(|| {
-            let outcome = self.gate(cmd)?;
-            if let (Outcome::Denied { .. } | Outcome::Stale { .. }, Some(root)) =
-                (&outcome, self.executor.snapshot_root())
-                && !shell.working_dir().exists()
-            {
-                shell.set_working_dir(root)?;
-            }
-            Ok(outcome)
-        })
+        self.settle(shell, cmd, None, true, &mut None).await
     }
 
     /// The boundary for a line the caller cut short — a forced stop — instead of concluding
@@ -308,6 +323,8 @@ impl<SE: ShellExtensions<ExternalCommandSpawner = MarshExecutor>> Shell<SE> {
             let Some(snapshot) = self.executor.attached() else {
                 return Ok(Outcome::Detached);
             };
+            // A forced stop is allowed to reclaim a tree whose evidence is incomplete: nothing it
+            // observed is about to become a grant, so an unresolved call costs nothing.
             snapshot.pending(cmd)?.discard()?;
             if !shell.working_dir().exists() {
                 shell.set_working_dir(snapshot.path())?;
@@ -316,18 +333,132 @@ impl<SE: ShellExtensions<ExternalCommandSpawner = MarshExecutor>> Shell<SE> {
         })
     }
 
-    /// Translate → check for a lost race → check the policy → publish or discard.
+    /// Evaluate → gate → resynchronize and evaluate again, until the gate answers.
+    ///
+    /// `ran` says whether the caller already ran `cmd` itself once. The loop is the whole
+    /// read-dependency mechanism: everything below it — the tracer, the snapshot's read set, the
+    /// interruption flag — exists to decide when to go round again.
+    ///
+    /// `last` receives each evaluation's result as it is produced, and therefore survives a
+    /// boundary failure: a line that asked the shell to exit said so before the boundary broke,
+    /// and losing that would leave the shell open on a request it had already made. It stays
+    /// `None` only when the caller ran the line itself and no replay was needed.
+    async fn settle(
+        &self,
+        shell: &mut brush_core::Shell<SE>,
+        cmd: &str,
+        workers: Option<&Arc<Workers>>,
+        ran: bool,
+        last: &mut Option<ExecutionResult>,
+    ) -> Result<Outcome, MarshError> {
+        let mut ran = ran;
+        loop {
+            if !ran {
+                self.refresh(shell)?;
+                *last = Some(self.evaluate(shell, cmd).await?);
+            }
+            if let Some(workers) = workers {
+                // Before the boundary, and with the interpreter still held: a native worker that
+                // outlived this would be writing into a tree the gate is about to reset.
+                workers.finish().await;
+                // A forced stop outranks everything below. The line is thrown away unchecked —
+                // the attempt happened and its records are still dumped — and it is never
+                // evaluated again, because a caller that asked for this command to end did not
+                // ask for it to run a second time.
+                if workers.cancellation_requested() {
+                    return self.discard(shell, cmd);
+                }
+            }
+            // An interrupted evaluation is not gated at all: what it observed is already known to
+            // be out of date, and translating it would request capabilities for a line that is
+            // about to be run again.
+            let settled = if self.executor.interrupted() {
+                self.resynchronize(cmd)?;
+                None
+            } else {
+                blocking_boundary(|| self.gate(cmd))?
+            };
+            // Every ending but a publication retook the tree, so the shell may be standing in a
+            // directory that no longer exists.
+            self.recover_directory(shell)?;
+            if let Some(outcome) = settled {
+                return Ok(outcome);
+            }
+            // Invalidated: the tree is the seed's again and the abandoned evaluation's footprint
+            // has been forgotten. Only admission is left to reopen.
+            if let Some(workers) = workers {
+                workers.reopen();
+            }
+            ran = false;
+        }
+    }
+
+    /// Runs `cmd` once, under this shell's trace scope, signalling its processes if it is
+    /// invalidated while it runs.
+    ///
+    /// The scope is what attributes the syscalls to this snapshot; the signal is what stops an
+    /// external command that would otherwise run to completion into a tree about to be retaken.
+    /// Brush is left to unwind and reap its own foreground work — this never waits for a process
+    /// itself, because the interpreter already does.
+    async fn evaluate(
+        &self,
+        shell: &mut brush_core::Shell<SE>,
+        cmd: &str,
+    ) -> Result<ExecutionResult, MarshError> {
+        let params = shell.default_exec_params();
+        let mark = self.executor.spawn_record_count();
+        // Boxed for the same reason a mux's is: an interpreter run's state machine is as deep as
+        // the script it is running, and storing it inline would push that depth into every frame
+        // above it.
+        let source = SourceInfo::default();
+        let line = Box::pin(shell.run_string(cmd, &source, &params));
+        let mut line = marsh_instrument::Scoped::new(line, self.executor.scope());
+        let result = tokio::select! {
+            result = &mut line => result,
+            () = self.executor.interruption() => {
+                // One signal, to this evaluation's own processes only. Brush's own wait is what
+                // observes them ending, and the interpreter unwinds from there.
+                let _ = self.executor.signal_since(mark, Signal::Interrupt);
+                line.await
+            }
+        };
+        Ok(result?)
+    }
+
+    /// Throws away an interrupted evaluation and puts the tree back at the current seed.
+    ///
+    /// The evidence is still dumped — the attempt happened — and the footprint it was decided
+    /// from is forgotten, so the replay starts with an empty read and write set.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the records cannot be dumped or the snapshot cannot be retaken.
+    fn resynchronize(&self, cmd: &str) -> Result<(), MarshError> {
+        blocking_boundary(|| {
+            let Some(snapshot) = self.executor.attached() else {
+                return Ok(());
+            };
+            snapshot.pending(cmd)?.discard()
+        })
+    }
+
+    /// Drain the evidence → translate → check the policy → publish or discard.
+    ///
+    /// `None` is loop control, not an outcome: this line read something another principal has
+    /// since published, the staged tree has been discarded and retaken, and the caller must
+    /// evaluate the line again.
     ///
     /// Lock order everywhere: the seed's authority and the snapshot's state (both inside
-    /// `Pending`), then the validator; the validator lock is never held across an await.
+    /// `Pending`), then the validator; the validator lock is never held across an await, and the
+    /// instrumentation is drained *before* the authority is taken, never under it.
     #[allow(
         clippy::significant_drop_tightening,
         reason = "`pending` holds the seed's authority for the whole boundary on purpose, and \
                   every arm consumes it rather than letting it fall out of scope"
     )]
-    fn gate(&self, cmd: &str) -> Result<Outcome, MarshError> {
+    fn gate(&self, cmd: &str) -> Result<Option<Outcome>, MarshError> {
         let Some(snapshot) = self.executor.attached() else {
-            return Ok(Outcome::Detached);
+            return Ok(Some(Outcome::Detached));
         };
         // Before anything is diffed: a session whose approved publication failed may have a seed
         // that is neither its old state nor its new one, and a boundary taken against that would
@@ -336,33 +467,58 @@ impl<SE: ShellExtensions<ExternalCommandSpawner = MarshExecutor>> Shell<SE> {
         if snapshot.session().recovery_required() {
             return Err(MarshError::RecoveryRequired);
         }
+        // Outside every publication lock: this waits on the decoder, and the decoder classifies
+        // under the very authority a boundary holds.
+        self.executor.drain()?;
+
         let pending = snapshot.pending(cmd)?;
-        let requested = policy::translate(
-            &self.principal,
-            snapshot.path(),
-            pending.ops(),
-            pending.builtins(),
-        );
-        let stale = pending.stale(&requested);
-        if !stale.is_empty() {
+        if pending.needs_sync() {
             pending.discard()?;
-            return Ok(Outcome::Stale { requested, stale });
+            return Ok(None);
         }
+        // Before anything is translated: a git whose effects are unknown or unattributable left
+        // this tree, so nothing in it can be requested, and nothing enters the history.
+        if let Some(failure) = pending.git_failure() {
+            let failure = std::io::Error::other(failure.to_string());
+            pending.discard()?;
+            return Err(MarshError::Io(failure));
+        }
+        let requested =
+            match policy::translate(&self.principal, pending.edits(), pending.git_records()) {
+                Ok(requested) => requested,
+                Err(error) => {
+                    pending.discard()?;
+                    return Err(error);
+                }
+            };
         let verdict = self
             .validator
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .check(&requested);
-        match verdict {
-            Ok(()) => Ok(Outcome::Published {
+        Ok(Some(match verdict {
+            Ok(()) => Outcome::Published {
                 publication: pending.publish(&requested)?,
                 granted: requested,
-            }),
+            },
             Err(denials) => {
                 pending.discard()?;
-                Ok(Outcome::Denied { requested, denials })
+                Outcome::Denied { requested, denials }
             }
+        }))
+    }
+
+    /// Puts the shell back at the snapshot root when the directory it was standing in is gone.
+    ///
+    /// Every boundary that did not publish retakes the tree from the seed, which can remove a
+    /// directory the line itself created.
+    fn recover_directory(&self, shell: &mut brush_core::Shell<SE>) -> Result<(), MarshError> {
+        if let Some(root) = self.executor.snapshot_root()
+            && !shell.working_dir().exists()
+        {
+            shell.set_working_dir(root)?;
         }
+        Ok(())
     }
 }
 
@@ -373,6 +529,10 @@ impl<SE: ShellExtensions<ExternalCommandSpawner = MarshExecutor>> Drop for Shell
     /// arrived after the last line — a background job's late write — is translated and checked
     /// here exactly as a line would be. It is still a *gate*: the validator decides, and a denied
     /// leftover is discarded.
+    ///
+    /// Nothing is ever *replayed* here. A leftover has no submitted line to run again — the gate
+    /// judges it under the empty command — so an invalidated one is safely discarded instead,
+    /// which is what the best-effort contract of a destructor allows.
     ///
     /// A mux-owned shell has already concluded every command it ran. What a gate could find here
     /// is only what an abort, a shutdown or a forced stop left, and publishing that would grant a
@@ -408,9 +568,7 @@ impl<SE: ShellExtensions<ExternalCommandSpawner = MarshExecutor>> Drop for Shell
 /// shell in one unabortable blocking closure would make a forced stop unable to interrupt it.
 fn blocking_boundary<T>(operation: impl FnOnce() -> T) -> T {
     match tokio::runtime::Handle::try_current() {
-        Ok(handle)
-            if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread =>
-        {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
             tokio::task::block_in_place(operation)
         }
         _ => operation(),

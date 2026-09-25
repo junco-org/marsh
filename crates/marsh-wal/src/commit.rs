@@ -56,6 +56,14 @@ pub enum WalRecord<M> {
         /// `sha1` of the content being moved, so a replay can tell an applied record from an
         /// interrupted one after the snapshot it came from was swept.
         sha1: String,
+        /// Permission bits when the source is a directory, which is then the whole entry: a
+        /// directory is its path and its mode, and a replay recreates it from those two alone.
+        ///
+        /// Absent for a file or a symlink, so their records keep the shape — and the content
+        /// hash — they always had; its presence, not the empty content's digest, is what says
+        /// the entry is a directory.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        directory_mode: Option<u32>,
     },
     /// Delete a path from the seed.
     Delete {
@@ -71,10 +79,16 @@ pub enum WalRecord<M> {
 
 impl<M> WalRecord<M> {
     /// The commit operation this record performs, or `None` for the framing records.
-    fn operation(&self) -> Option<CommitOp> {
+    ///
+    /// Takes the record by value: the destination of a `Move` and the path of a `Delete` are
+    /// exactly what the returned operation carries, so they are moved out rather than cloned into
+    /// it. What is left behind — the source path, the content hash — owns nothing whose
+    /// destructor releases a resource beyond its own allocation, so dropping it here is not a
+    /// reordering of anything observable.
+    fn into_operation(self) -> Option<CommitOp> {
         match self {
-            Self::Move { to, .. } => Some(CommitOp::Write(to.clone())),
-            Self::Delete { path } => Some(CommitOp::Remove(path.clone())),
+            Self::Move { to, .. } => Some(CommitOp::Write(to)),
+            Self::Delete { path } => Some(CommitOp::Remove(path)),
             Self::Begin { .. } | Self::End { .. } => None,
         }
     }
@@ -142,11 +156,18 @@ pub fn apply<M: Serialize>(
         records.push(match op {
             CommitOp::Remove(path) => WalRecord::Delete { path: path.clone() },
             // `from` and `to` are equal in practice; both are logged so a record reads on its own.
-            CommitOp::Write(path) => WalRecord::Move {
-                from: path.clone(),
-                to: path.clone(),
-                sha1: content_hash(&work.join(path))?,
-            },
+            CommitOp::Write(path) => {
+                let source = work.join(path);
+                let metadata = source.symlink_metadata()?;
+                WalRecord::Move {
+                    from: path.clone(),
+                    to: path.clone(),
+                    sha1: content_hash(&source, &metadata)?,
+                    directory_mode: metadata.is_dir().then(|| {
+                        std::os::unix::fs::PermissionsExt::mode(&metadata.permissions()) & 0o7777
+                    }),
+                }
+            }
         });
     }
 
@@ -176,9 +197,12 @@ pub fn apply<M: Serialize>(
 ///
 /// # Errors
 ///
-/// Fails with [`Error::Wal`] when the log is corrupt, when a transaction's declared operation count
-/// does not match its contents, when an unfinished legacy transaction carries no count, or when a
-/// record can neither be applied nor recognized as already applied.
+/// Fails with [`Error::Wal`] when a transaction's declared operation count does not match its
+/// contents, when an unfinished legacy transaction carries no count, or when a record can
+/// neither be applied nor recognized as already applied. A log with a decoding failure in it —
+/// malformed JSON, or JSON that does not typecheck as a record — is not one of these: reading it
+/// resets it to empty first, so recovery sees no history rather than failing on it. Fails with
+/// [`Error::Io`] when the log cannot be read, or when resetting it fails.
 pub fn recover<M: Serialize + DeserializeOwned>(
     seed: &Path,
     snap: &Path,
@@ -237,6 +261,22 @@ pub fn recover<M: Serialize + DeserializeOwned>(
             }
             Some(_) | None => {}
         }
+        for record in &frame.records {
+            if let WalRecord::Move {
+                to,
+                directory_mode: Some(mode),
+                ..
+            } = record
+                && mode & !0o7777 != 0
+            {
+                return Err(Error::Wal(format!(
+                    "transaction {} records directory {} with mode {mode:#o}, which carries bits \
+                     outside the permission mask",
+                    frame.seq,
+                    to.display()
+                )));
+            }
+        }
     }
 
     let mut handle: JsonLog<WalRecord<M>> = JsonLog::open(log)?;
@@ -261,8 +301,8 @@ pub fn recover<M: Serialize + DeserializeOwned>(
             meta: frame.meta,
             ops: frame
                 .records
-                .iter()
-                .filter_map(WalRecord::operation)
+                .into_iter()
+                .filter_map(WalRecord::into_operation)
                 .collect(),
         });
     }
@@ -274,12 +314,23 @@ pub fn recover<M: Serialize + DeserializeOwned>(
 /// Idempotent, which is what lets a replay re-run a transaction that may have partly happened: a
 /// write replaces whatever is there and a removal tolerates an absent path. A write whose source is
 /// gone is not an error when the destination already carries the content the record named — that is
-/// a transaction which completed and whose snapshot was swept.
+/// a transaction which completed and whose snapshot was swept. A directory needs no source at all:
+/// its record is the whole of it.
 fn apply_record<M>(seed: &Path, work: &Path, record: &WalRecord<M>) -> Result<(), Error> {
     match record {
         WalRecord::Begin { .. } | WalRecord::End { .. } => Ok(()),
         WalRecord::Delete { path } => log::apply_remove(seed, &seed.join(path)),
-        WalRecord::Move { from, to, sha1 } => write(seed, work, from, to, sha1),
+        WalRecord::Move {
+            to,
+            directory_mode: Some(mode),
+            ..
+        } => log::apply_directory(&seed.join(to), *mode),
+        WalRecord::Move {
+            from,
+            to,
+            sha1,
+            directory_mode: None,
+        } => write(seed, work, from, to, sha1),
     }
 }
 
@@ -290,7 +341,9 @@ fn write(seed: &Path, work: &Path, from: &Path, to: &Path, sha1: &str) -> Result
     if source.symlink_metadata().is_ok() {
         return log::apply_write(&source, &target);
     }
-    if target.symlink_metadata().is_ok() && content_hash(&target)? == sha1 {
+    if let Ok(metadata) = target.symlink_metadata()
+        && content_hash(&target, &metadata)? == sha1
+    {
         return Ok(());
     }
     Err(Error::Wal(format!(
@@ -311,10 +364,9 @@ fn digest(bytes: &[u8]) -> String {
 
 /// The `sha1` a record carries for a path: the bytes of a file, or the target of a symlink.
 ///
-/// Anything else — a fifo, a socket, a device node — has no content to read; its mode is the whole
-/// entry, and the diff already compared that.
-fn content_hash(path: &Path) -> Result<String, Error> {
-    let metadata = path.symlink_metadata()?;
+/// Anything else — a directory, a fifo, a socket, a device node — has no content to read; its mode
+/// is the whole entry, and the diff already compared that.
+fn content_hash(path: &Path, metadata: &std::fs::Metadata) -> Result<String, Error> {
     if metadata.file_type().is_symlink() {
         Ok(digest(
             std::fs::read_link(path)?.as_os_str().as_encoded_bytes(),
@@ -330,6 +382,7 @@ fn content_hash(path: &Path) -> Result<String, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::diff::diff_trees;
 
     /// A caller's metadata, of the shape a shell multiplexer records: who asked, and for what.
     #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -395,6 +448,7 @@ mod tests {
                     from: PathBuf::from(path),
                     to: PathBuf::from(path),
                     sha1: digest(contents),
+                    directory_mode: None,
                 },
             ])
             .expect("append");
@@ -559,6 +613,161 @@ mod tests {
         );
     }
 
+    /// A tree's full shape — empty directories, their modes, and a path that changes kind in
+    /// either direction — survives a diff and an apply: diffing again afterwards finds nothing,
+    /// and a sibling no operation named is left exactly as it was.
+    #[test]
+    fn empty_directories_and_changes_of_kind_round_trip() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("scratch directory");
+        let layout = scratch(temp.path());
+        let work = layout.work("job0");
+        let seed = &layout.seed;
+        for tree in [seed, &work] {
+            std::fs::create_dir_all(tree.join("keep")).expect("an untouched empty directory");
+            std::fs::write(tree.join("sibling.txt"), b"sibling\n").expect("an untouched file");
+        }
+        std::fs::create_dir_all(seed.join("gone")).expect("an empty directory that vanishes");
+        std::fs::create_dir_all(seed.join("emptied")).expect("a directory that empties");
+        std::fs::write(seed.join("emptied/x.txt"), b"x\n").expect("its only file");
+        std::fs::create_dir_all(seed.join("filled")).expect("an empty directory that fills");
+        std::fs::create_dir_all(work.join("filled")).expect("the filled directory");
+        std::fs::write(work.join("filled/y.txt"), b"y\n").expect("what fills it");
+        std::fs::write(seed.join("to_dir"), b"file\n").expect("a file that becomes a directory");
+        std::fs::create_dir_all(work.join("to_dir/inner")).expect("the directory it becomes");
+        std::fs::create_dir_all(seed.join("to_file/inner"))
+            .expect("a directory that becomes a file");
+        std::fs::write(work.join("to_file"), b"file\n").expect("the file it becomes");
+        std::fs::create_dir_all(work.join("emptied")).expect("the emptied directory");
+        std::fs::create_dir_all(work.join("repo/.git/objects")).expect("an empty object store");
+        std::fs::create_dir_all(work.join("repo/.git/refs/heads")).expect("an empty ref tree");
+        std::fs::write(work.join("repo/.git/HEAD"), b"ref: refs/heads/main\n").expect("HEAD");
+        std::fs::create_dir_all(work.join("private")).expect("a private directory");
+        std::fs::set_permissions(work.join("private"), std::fs::Permissions::from_mode(0o700))
+            .expect("chmod");
+
+        let ops = diff_trees(seed, &work).expect("diff");
+        apply(seed, &work, &layout.log, "job0", 1, &meta("reshape"), &ops).expect("apply");
+
+        assert_eq!(
+            diff_trees(seed, &work).expect("diff again"),
+            Vec::new(),
+            "the seed now has the snapshot's shape: {ops:?}"
+        );
+        assert_eq!(
+            std::fs::symlink_metadata(seed.join("private"))
+                .expect("the private directory")
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o700
+        );
+        assert!(
+            seed.join("repo/.git/objects").is_dir() && seed.join("repo/.git/refs/heads").is_dir()
+        );
+        assert_eq!(
+            std::fs::read(seed.join("sibling.txt")).expect("the sibling"),
+            b"sibling\n"
+        );
+    }
+
+    /// A directory's record is its path and mode, so an unfinished transaction replays it even
+    /// after the snapshot it came from is gone — which a file's record could not survive.
+    #[test]
+    fn an_unfinished_directory_move_replays_without_its_snapshot() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("scratch directory");
+        let layout = scratch(temp.path());
+        std::fs::write(layout.seed.join("objects"), b"a file in the way\n").expect("a file");
+        JsonLog::open(&layout.log)
+            .expect("open log")
+            .append(&[
+                WalRecord::Begin {
+                    seq: 1,
+                    uid: "job0".to_string(),
+                    op_count: Some(1),
+                    meta: meta("git init"),
+                },
+                WalRecord::Move {
+                    from: PathBuf::from("objects"),
+                    to: PathBuf::from("objects"),
+                    sha1: digest(&[]),
+                    directory_mode: Some(0o750),
+                },
+            ])
+            .expect("append");
+
+        let recovered: Vec<Transaction<Meta>> =
+            recover(&layout.seed, &layout.snap, &layout.log).expect("recover");
+        assert_eq!(
+            recovered[0].ops,
+            vec![CommitOp::Write(PathBuf::from("objects"))]
+        );
+        let metadata = std::fs::symlink_metadata(layout.seed.join("objects")).expect("replayed");
+        assert!(
+            metadata.is_dir(),
+            "the file in the way was replaced by the directory"
+        );
+        assert_eq!(metadata.permissions().mode() & 0o7777, 0o750);
+    }
+
+    /// A record written before directories were recorded carries no mode, and still decodes as
+    /// the file move it always was; a file move written now has the same shape as then.
+    #[test]
+    fn a_move_without_a_directory_mode_is_a_file_move() {
+        let legacy = r#"{"op":"MOVE","from":"a.txt","to":"a.txt","sha1":"00"}"#;
+        let parsed: WalRecord<Meta> = serde_json::from_str(legacy).expect("a legacy MOVE");
+        assert!(matches!(
+            &parsed,
+            WalRecord::Move {
+                directory_mode: None,
+                ..
+            }
+        ));
+        assert_eq!(serde_json::to_string(&parsed).expect("serialize"), legacy);
+    }
+
+    /// A mode outside the permission mask is refused before any record of the log is applied.
+    #[test]
+    fn a_directory_mode_outside_the_mask_is_refused_before_replay() {
+        let temp = tempfile::tempdir().expect("scratch directory");
+        let layout = scratch(temp.path());
+        std::fs::write(layout.work("job0").join("a.txt"), b"first\n").expect("snapshot file");
+        JsonLog::open(&layout.log)
+            .expect("open log")
+            .append(&[
+                WalRecord::Begin {
+                    seq: 1,
+                    uid: "job0".to_string(),
+                    op_count: Some(2),
+                    meta: meta("mixed"),
+                },
+                WalRecord::Move {
+                    from: PathBuf::from("a.txt"),
+                    to: PathBuf::from("a.txt"),
+                    sha1: digest(b"first\n"),
+                    directory_mode: None,
+                },
+                WalRecord::Move {
+                    from: PathBuf::from("d"),
+                    to: PathBuf::from("d"),
+                    sha1: digest(&[]),
+                    directory_mode: Some(0o40_755),
+                },
+            ])
+            .expect("append");
+
+        let error = recover::<Meta>(&layout.seed, &layout.snap, &layout.log)
+            .expect_err("an impossible mode");
+        assert!(matches!(error, Error::Wal(_)), "got {error:?}");
+        assert!(
+            !layout.seed.join("a.txt").exists(),
+            "no record was applied before the refusal"
+        );
+    }
+
     /// A counted prefix that lacks operations is abandoned without touching the seed, and is not
     /// reported to the caller either — nothing about it was ever durable.
     #[test]
@@ -579,6 +788,7 @@ mod tests {
                     from: PathBuf::from("a.txt"),
                     to: PathBuf::from("a.txt"),
                     sha1: digest(b"not durable\n"),
+                    directory_mode: None,
                 },
             ])
             .expect("append prefix");
@@ -612,6 +822,7 @@ mod tests {
                     from: PathBuf::from("a.txt"),
                     to: PathBuf::from("a.txt"),
                     sha1: digest(b"applied\n"),
+                    directory_mode: None,
                 },
                 WalRecord::End { seq: 1 },
             ])
@@ -638,6 +849,7 @@ mod tests {
                     from: PathBuf::from("a.txt"),
                     to: PathBuf::from("a.txt"),
                     sha1: digest(b"retained\n"),
+                    directory_mode: None,
                 },
             ])
             .expect("append unfinished legacy transaction");
@@ -692,19 +904,35 @@ mod tests {
         assert!(recovered.is_empty());
     }
 
-    /// A line that is durable and unparsable is corruption: recovery stops rather than publishing
-    /// a transaction it only half understands.
+    /// A durable but undecodable line resets the whole log rather than being treated as
+    /// corruption recovery must fail on: a valid pending move that precedes it must not replay
+    /// just because it came first, and the seed is left exactly as it was.
     #[test]
-    fn a_corrupt_log_line_stops_recovery() {
+    fn a_parse_error_discards_pending_recovery() {
         let temp = tempfile::tempdir().expect("scratch directory");
         let layout = scratch(temp.path());
-        std::fs::write(&layout.log, b"{\"op\":\"NOPE\"}\n").expect("write a corrupt log");
+        std::fs::write(layout.seed.join("a.txt"), b"seed\n").expect("seed file");
+        std::fs::write(layout.work("job0").join("a.txt"), b"pending\n").expect("snapshot file");
+        unfinished_log(&layout, "job0", "a.txt", b"pending\n");
+        let mut raw = std::fs::read(&layout.log).expect("read log");
+        raw.extend_from_slice(b"{\"op\":\"NOPE\"}\n");
+        std::fs::write(&layout.log, raw).expect("append the undecodable record");
 
-        let error = recover::<Meta>(&layout.seed, &layout.snap, &layout.log)
-            .expect_err("an unparsable record is corruption");
+        let recovered: Vec<Transaction<Meta>> = recover(&layout.seed, &layout.snap, &layout.log)
+            .expect("a parse error resets rather than errors");
         assert!(
-            matches!(&error, Error::Wal(message) if message.starts_with("corrupt record ")),
-            "got {error:?}"
+            recovered.is_empty(),
+            "the pending move is not replayed just because it preceded the bad record"
+        );
+        assert_eq!(
+            std::fs::read(layout.seed.join("a.txt")).expect("read the seed"),
+            b"seed\n",
+            "the seed is untouched"
+        );
+        assert_eq!(
+            std::fs::read(&layout.log).expect("reread the log"),
+            Vec::<u8>::new(),
+            "the log is reset to empty"
         );
     }
 
@@ -727,6 +955,7 @@ mod tests {
                     from: PathBuf::from("a.txt"),
                     to: PathBuf::from("a.txt"),
                     sha1: digest(b"published\n"),
+                    directory_mode: None,
                 },
                 WalRecord::End { seq: 4 },
             ])
@@ -804,6 +1033,7 @@ mod tests {
                     from: PathBuf::from("real.txt"),
                     to: PathBuf::from("real.txt"),
                     sha1: digest(b"real\n"),
+                    directory_mode: None,
                 },
             ])
             .expect("append an orphaned record ahead of a transaction");

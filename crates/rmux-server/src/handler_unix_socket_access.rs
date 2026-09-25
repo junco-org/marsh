@@ -1,9 +1,7 @@
 use rmux_proto::RmuxError;
 
 use super::RequestHandler;
-#[cfg(unix)]
 use crate::unix_socket::{BoundUnixListener, SocketFileIdentity, UnixTransportAccess};
-#[cfg(unix)]
 use crate::unix_socket_access::UnixSocketAccessController;
 
 impl RequestHandler {
@@ -11,37 +9,28 @@ impl RequestHandler {
         &self,
         allow_listed: bool,
     ) -> Result<(), RmuxError> {
-        #[cfg(unix)]
-        {
-            let mut transport = self
-                .unix_socket_access
-                .lock()
-                .expect("Unix socket access mutex must not be poisoned");
-            let Some(transport) = transport.as_mut() else {
-                #[cfg(test)]
-                return Ok(());
-                #[cfg(not(test))]
-                return Err(RmuxError::Server(
-                    "Unix socket access controller is not initialized".to_owned(),
-                ));
-            };
-            let target = if allow_listed {
-                UnixTransportAccess::AllowListed
-            } else {
-                UnixTransportAccess::OwnerOnly
-            };
-            transport.transition(target).map_err(|error| {
-                RmuxError::Server(format!("failed to update Unix socket access: {error}"))
-            })
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = allow_listed;
-            Ok(())
-        }
+        let mut transport = self
+            .unix_socket_access
+            .lock()
+            .expect("Unix socket access mutex must not be poisoned");
+        let Some(transport) = transport.as_mut() else {
+            #[cfg(test)]
+            return Ok(());
+            #[cfg(not(test))]
+            return Err(RmuxError::Server(
+                "Unix socket access controller is not initialized".to_owned(),
+            ));
+        };
+        let target = if allow_listed {
+            UnixTransportAccess::AllowListed
+        } else {
+            UnixTransportAccess::OwnerOnly
+        };
+        transport.transition(target).map_err(|error| {
+            RmuxError::Server(format!("failed to update Unix socket access: {error}"))
+        })
     }
 
-    #[cfg(unix)]
     pub(crate) fn install_unix_socket_access_controller(
         &self,
         controller: UnixSocketAccessController,
@@ -72,7 +61,6 @@ impl RequestHandler {
         )?)
     }
 
-    #[cfg(unix)]
     pub(crate) async fn rebind_unix_socket(
         &self,
         socket_path: &std::path::Path,
@@ -101,7 +89,6 @@ impl RequestHandler {
         Ok(rebound)
     }
 
-    #[cfg(unix)]
     pub(crate) async fn restore_owner_only_unix_transport(&self) -> std::io::Result<()> {
         let _mutation = self.server_access_mutation.lock().await;
         let mut transport = self

@@ -298,9 +298,7 @@ async fn source_file_target_client_follows_the_same_registration_after_switch() 
             ))
             .await
     });
-    tokio::time::timeout(std::time::Duration::from_secs(2), pause.reached.notified())
-        .await
-        .expect("source-file display reaches the post-capture pause");
+    pause.wait_until_reached().await;
 
     let response = handler
         .dispatch(
@@ -341,7 +339,11 @@ async fn source_file_background_run_shell_preserves_its_implicit_target() {
     let expected_window_name = "source-background-fixed-target";
     create_background_identity_session(&handler, alpha.clone()).await;
 
-    let root = temp_root("background-implicit-target");
+    // The sourced file's directory NAMES the seed the queued `run-shell` publishes into, so it
+    // has to live in this handler's. A host temp path is outside every seed and the source fails
+    // before the queued command is ever captured.
+    let scratch = seed_scratch_dir(&handler, "background-implicit-target");
+    let root = scratch.path().to_path_buf();
     write_config(
         &root.join("background.conf"),
         &format!("run-shell -b -d 0.2 -C 'rename-window {expected_window_name}'\n"),
@@ -352,9 +354,20 @@ async fn source_file_background_run_shell_preserves_its_implicit_target() {
             Some(root.clone()),
         ))
         .await;
-    assert!(matches!(response, Response::SourceFile(_)), "{response:?}");
+    let Response::SourceFile(sourced) = &response else {
+        panic!("expected source-file response, got {response:?}");
+    };
+    // Pinned, not merely matched on the variant: a source that failed still answers `SourceFile`,
+    // and the queued command this test is about would then never have been captured at all.
+    assert_eq!(
+        sourced.exit_status(),
+        None,
+        "source-file failed: {}",
+        String::from_utf8_lossy(&sourced.stderr)
+    );
 
     create_background_identity_session(&handler, beta.clone()).await;
+
     wait_for_active_window_name(&handler, &alpha, expected_window_name).await;
     let state = handler.state.lock().await;
     assert_ne!(
@@ -2821,10 +2834,13 @@ async fn source_file_grouped_new_window_insertion_preserves_and_arms_silence_tim
     let root = temp_root("grouped-new-window-silence-timers");
     let config_path = root.join("new-window.conf");
     write_config(&config_path, &format!("new-window -b -d -t {owner}:0\n"));
+    // The config path is an absolute operand, but the caller's directory becomes the new pane's
+    // start directory, and a pane opens over a snapshot of the seed that directory lies in.
+    let caller_cwd = seed_scratch_dir(&handler, "grouped-new-window-silence-timers");
     let response = handler
         .handle(source_file_request(
             vec![config_path.to_string_lossy().into_owned()],
-            Some(std::env::temp_dir()),
+            Some(caller_cwd.path().to_path_buf()),
         ))
         .await;
     fs::remove_dir_all(root).expect("remove grouped new-window config root");
@@ -2919,21 +2935,6 @@ async fn create_quiet_source_timer_session(
     session
 }
 
-#[cfg(unix)]
 fn quiet_source_timer_window_command() -> Vec<String> {
     vec!["/bin/sh".to_owned(), "-c".to_owned(), "sleep 60".to_owned()]
-}
-
-#[cfg(windows)]
-fn quiet_source_timer_window_command() -> Vec<String> {
-    let system_root =
-        std::env::var_os("SystemRoot").unwrap_or_else(|| std::ffi::OsString::from(r"C:\Windows"));
-    let cmd = PathBuf::from(system_root).join("System32").join("cmd.exe");
-    vec![
-        cmd.to_string_lossy().into_owned(),
-        "/d".to_owned(),
-        "/q".to_owned(),
-        "/c".to_owned(),
-        "ping -n 120 127.0.0.1 >NUL".to_owned(),
-    ]
 }

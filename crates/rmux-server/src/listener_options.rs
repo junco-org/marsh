@@ -1,9 +1,7 @@
 use rmux_core::events::SubscriptionLimits;
 
 use crate::signals::SignalWatcher;
-#[cfg(unix)]
 use crate::unix_socket::SocketFileIdentity;
-#[cfg(unix)]
 use crate::unix_socket_access::UnixSocketAccessController;
 use crate::ConfigLoadOptions;
 
@@ -16,9 +14,7 @@ pub(crate) struct ServeOptions {
     pub(crate) web_port: u16,
     pub(crate) web_port_explicit: bool,
     pub(crate) web_required: bool,
-    #[cfg(unix)]
     pub(crate) socket_identity: Option<SocketFileIdentity>,
-    #[cfg(unix)]
     pub(crate) socket_access: Option<UnixSocketAccessController>,
     /// The daemon's in-process I/O facade, shared by every handler.
     ///
@@ -45,9 +41,7 @@ impl ServeOptions {
             web_port: 9777,
             web_port_explicit: false,
             web_required: false,
-            #[cfg(unix)]
             socket_identity: None,
-            #[cfg(unix)]
             socket_access: None,
             io: None,
             events: None,
@@ -79,7 +73,6 @@ impl ServeOptions {
         self
     }
 
-    #[cfg(unix)]
     pub(crate) fn with_socket_identity(
         mut self,
         socket_identity: Option<SocketFileIdentity>,
@@ -88,13 +81,11 @@ impl ServeOptions {
         self
     }
 
-    #[cfg(unix)]
     pub(crate) fn with_socket_access(mut self, socket_access: UnixSocketAccessController) -> Self {
         self.socket_access = Some(socket_access);
         self
     }
 
-    #[cfg(unix)]
     pub(crate) fn with_server_signals(mut self, server_signals: SignalWatcher) -> Self {
         self.server_signals = Some(server_signals);
         self

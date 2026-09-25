@@ -11,7 +11,6 @@ use rmux_core::{
     AlertFlags, OptionStore, PaneGeometry, PaneId, WINDOW_ACTIVITY, WINLINK_ACTIVITY, WINLINK_BELL,
     WINLINK_SILENCE,
 };
-#[cfg(unix)]
 use rmux_proto::SendKeysRequest;
 use rmux_proto::{
     DisplayMessageRequest, HookLifecycle, HookName, KillWindowRequest, LinkWindowRequest,
@@ -27,16 +26,11 @@ use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc};
 use tokio::time::{timeout, Duration};
 
-#[cfg(windows)]
-const ALERT_TEST_EVENT_TIMEOUT: Duration = Duration::from_secs(5);
-#[cfg(not(windows))]
 const ALERT_TEST_EVENT_TIMEOUT: Duration = Duration::from_millis(500);
 const ACTIVITY_BASELINE_SETTLE: Duration = Duration::from_millis(1200);
 const ACTIVITY_BASELINE_TIMEOUT: Duration = Duration::from_secs(10);
 
-fn session_name(value: &str) -> SessionName {
-    SessionName::new(value).expect("valid session name")
-}
+use crate::test_names::session_name;
 
 async fn create_session(handler: &RequestHandler, name: &str) -> SessionName {
     let session = session_name(name);
@@ -339,28 +333,11 @@ async fn wait_for_silence_timer_to_settle(
     }
 }
 
-#[cfg(unix)]
 fn quiet_alert_command() -> Vec<String> {
     ["/bin/sh", "-c", "sleep 60"]
         .into_iter()
         .map(str::to_owned)
         .collect()
-}
-
-#[cfg(windows)]
-fn quiet_alert_command() -> Vec<String> {
-    let system_root =
-        std::env::var_os("SystemRoot").unwrap_or_else(|| std::ffi::OsString::from(r"C:\Windows"));
-    let cmd = std::path::PathBuf::from(system_root)
-        .join("System32")
-        .join("cmd.exe");
-    vec![
-        cmd.to_string_lossy().into_owned(),
-        "/d".to_owned(),
-        "/q".to_owned(),
-        "/c".to_owned(),
-        "ping -n 120 127.0.0.1 >NUL".to_owned(),
-    ]
 }
 
 async fn display_message(handler: &RequestHandler, target: Target, message: &str) -> String {
@@ -968,7 +945,7 @@ async fn pane_alert_batch_coalesces_bell_across_two_panes_in_one_window() {
 async fn pane_alert_callback_can_be_invoked_from_reader_thread() {
     let handler = RequestHandler::new();
     // Keep the real pane reader quiescent so this test observes only the
-    // callback invoked below. In particular, an interactive Windows shell can
+    // callback invoked below. In particular, an interactive login shell can
     // publish an initial title/activity event concurrently and consume the
     // one-shot activity alert before the synthetic reader-thread event runs.
     let session = create_quiet_session(&handler, "alerts-reader-thread").await;
@@ -2559,7 +2536,6 @@ async fn pane_mouse_mode_alert_refreshes_the_active_attached_pane() {
     );
 }
 
-
 #[tokio::test]
 async fn pane_alert_event_updates_automatic_window_name_without_disabling_auto_rename() {
     let handler = RequestHandler::new();
@@ -2770,7 +2746,6 @@ async fn pane_alert_event_updates_grouped_session_window_names() {
     }
 }
 
-#[cfg(unix)]
 #[tokio::test]
 async fn shell_input_updates_window_name_and_foreground_process_formats() {
     let handler = RequestHandler::new();
@@ -3576,14 +3551,14 @@ async fn link_window_after_moves_silence_expiry_to_new_target_without_delay() {
         "4",
     )
     .await;
-    // ConPTY can deliver the final quiet-command startup activity after pane
-    // startup itself has completed. Establish the timer baseline only after
-    // that coalesced activity has drained; this test exercises structural
-    // rekeying, not startup scheduling latency.
+    // The pane reader can deliver the final quiet-command startup activity
+    // after pane startup itself has completed. Establish the timer baseline
+    // only after that coalesced activity has drained; this test exercises
+    // structural rekeying, not startup scheduling latency.
     let _ = wait_for_silence_timer_to_settle(&handler, &shifted_target).await;
     tokio::time::sleep(Duration::from_secs(1)).await;
     // Capture the reference deadline immediately before the link. The quiet
-    // pane's ConPTY startup output can be processed late under suite load and
+    // pane's startup output can be processed late under suite load and
     // legally re-arm the silence timer through the activity reset (activity
     // restarts the idle clock, tmux parity), so a deadline captured before the
     // sleep conflates that re-arm with the rekey restart this test guards

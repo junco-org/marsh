@@ -80,30 +80,6 @@ fuzzing = []
 # holding a lockfile. Widen it again when `rmux-client` moves off that module.
 rustix = { version = "=1.1.4", features = ["event", "fs", "net", "process"] }
 
-[target.'cfg(windows)'.dependencies]
-# NOT the pane/popup backend, and no longer `rmux-pty` at all. The backend is gone: every pane,
-# popup and workload helper in this daemon now runs on the shared `marsh-core` ShellMux, and this
-# crate contains no `PtyMaster`, `PtyChild`, `ChildCommand`, descriptor reader loop or ConPTY
-# fallback for them any more.
-#
-# What is left is a different mechanic that merely happened to live in the same upstream crate:
-# injecting keystrokes and UTF-8 into a *Windows console* process, used by
-# `handler_pane/io_encoding.rs`, `handler_pane/attached_input*`, `handler_session.rs`,
-# `pane_terminals.rs` and `web/protocol/mod.rs`, all under `#[cfg(windows)]`. It is the console
-# analogue of the `rmux_os::process` probes — a platform input primitive the shell engine has no
-# equivalent for, not a second execution path.
-#
-# It is vendored from rmux-pty at 1f4571e into `rmux-windows-console`, a crate of its own rather
-# than a module here, because its Win32 bindings are `unsafe` and this crate is
-# `#![forbid(unsafe_code)]`. Downgrading that lint to `deny` so one module could `#[allow]` its
-# way out would re-open unsafe code to the whole daemon; a separate crate gives the FFI an owner
-# and a six-item boundary instead. `windows-sys` is that crate's dependency, not this one's.
-#
-# There is deliberately no entry in `[dependencies]` either: on unix this crate does not link the
-# console mechanic at all, and nothing on any platform may reintroduce rmux-pty as a way to spawn
-# a workload.
-rmux-windows-console = { path = "../rmux-windows-console" }
-
 [dev-dependencies]
 # The daemon's tests build their mux over a plain directory tree rather than a real btrfs seed,
 # so they run on any filesystem.
@@ -115,12 +91,10 @@ static_assertions = "1.1"
 tempfile = "3"
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "test-util"] }
 # The ONLY `rmux-pty` entry left in this manifest, and the only one permitted: the runtime
-# dependency is gone entirely — not narrowed to Windows, not moved, removed — now that the console
-# mechanic it was still being linked for moved out to the `rmux-windows-console` crate.
+# dependency is gone entirely — not narrowed, not moved, removed.
 #
 # This one is a test client-terminal harness, which the migration plan explicitly allows:
 # `handler_attach_tests*` drives a real attached client through a pseudoterminal, and
-# `terminal/tests.rs`/`tests/status_windows.rs` do the same on Windows. Exercising the daemon the
-# way a terminal emulator does needs a real terminal. It is not a server runtime dependency and
-# must not become one again.
+# `terminal/tests.rs` does the same. Exercising the daemon the way a terminal emulator does
+# needs a real terminal. It is not a server runtime dependency and must not become one again.
 rmux-pty.workspace = true

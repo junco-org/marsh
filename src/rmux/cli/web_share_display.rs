@@ -1,12 +1,12 @@
 use std::io;
 
 use ratatui::{
+    Terminal,
     backend::TestBackend,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
     widgets::{Block, Borders, Paragraph},
-    Terminal,
 };
 use rmux_proto::{CommandOutput, WebShareCreatedResponse};
 
@@ -28,8 +28,8 @@ mod support;
 mod tests;
 
 use support::{
-    compact_middle, display_url, expiry_label, frontend_label, provider_label, role_limit,
-    terminal_needs_qr_fallback, terminal_width, url_label, LinkMode, OutputStyle, UrlLabel,
+    LinkMode, OutputStyle, UrlLabel, compact_middle, display_url, expiry_label, frontend_label,
+    provider_label, role_limit, terminal_needs_qr_fallback, terminal_width, url_label,
 };
 
 const DEFAULT_WIDTH: u16 = 110;

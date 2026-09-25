@@ -14,9 +14,7 @@ use super::{QueuedLifecycleEvent, RequestHandler};
 use crate::control::{ControlModeUpgrade, ControlServerEvent, CONTROL_SERVER_EVENT_CAPACITY};
 use crate::pane_io::PaneAlertEvent;
 
-fn session_name(value: &str) -> SessionName {
-    SessionName::new(value).expect("valid session name")
-}
+use crate::test_names::session_name;
 
 async fn create_session(handler: &RequestHandler, name: &str) -> SessionName {
     let session = session_name(name);
@@ -48,28 +46,11 @@ async fn create_session(handler: &RequestHandler, name: &str) -> SessionName {
     session
 }
 
-#[cfg(unix)]
 fn quiet_command() -> Vec<String> {
     ["/bin/sh", "-c", "sleep 60"]
         .into_iter()
         .map(str::to_owned)
         .collect()
-}
-
-#[cfg(windows)]
-fn quiet_command() -> Vec<String> {
-    let system_root =
-        std::env::var_os("SystemRoot").unwrap_or_else(|| std::ffi::OsString::from(r"C:\Windows"));
-    let cmd = std::path::PathBuf::from(system_root)
-        .join("System32")
-        .join("cmd.exe");
-    vec![
-        cmd.to_string_lossy().into_owned(),
-        "/d".to_owned(),
-        "/q".to_owned(),
-        "/c".to_owned(),
-        "ping -n 120 127.0.0.1 >NUL".to_owned(),
-    ]
 }
 
 async fn link_window(handler: &RequestHandler, source: WindowTarget, target: WindowTarget) {

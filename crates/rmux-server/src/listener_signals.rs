@@ -3,7 +3,6 @@ use std::sync::Arc;
 
 use rmux_ipc::LocalListener;
 use tracing::debug;
-#[cfg(unix)]
 use tracing::warn;
 
 use crate::daemon::ShutdownHandle;
@@ -15,7 +14,6 @@ pub(crate) fn poll_server_signal(server_signals: &Option<SignalWatcher>) -> Opti
     server_signals.as_ref().and_then(SignalWatcher::poll)
 }
 
-#[cfg(unix)]
 pub(crate) async fn wait_server_signal(
     server_signals: &Option<SignalWatcher>,
 ) -> std::io::Result<()> {
@@ -23,13 +21,6 @@ pub(crate) async fn wait_server_signal(
         Some(watcher) => watcher.wait().await,
         None => std::future::pending().await,
     }
-}
-
-#[cfg(not(unix))]
-pub(crate) async fn wait_server_signal(
-    _server_signals: &Option<SignalWatcher>,
-) -> std::io::Result<()> {
-    std::future::pending().await
 }
 
 pub(crate) async fn handle_server_signal(
@@ -55,7 +46,6 @@ pub(crate) async fn handle_server_signal(
     }
 }
 
-#[cfg(unix)]
 async fn recreate_listener_after_signal(
     handler: &RequestHandler,
     socket_path: &Path,
@@ -75,13 +65,4 @@ async fn recreate_listener_after_signal(
             warn!(path = %socket_path.display(), "failed to recreate Unix daemon socket after signal: {error}");
         }
     }
-}
-
-#[cfg(not(unix))]
-async fn recreate_listener_after_signal(
-    _handler: &RequestHandler,
-    _socket_path: &Path,
-    _listener: &mut LocalListener,
-    _cleanup: &mut SocketCleanup,
-) {
 }

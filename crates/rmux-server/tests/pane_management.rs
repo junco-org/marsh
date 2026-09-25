@@ -1,5 +1,3 @@
-#![cfg(unix)]
-
 use std::error::Error;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -17,7 +15,7 @@ use rmux_proto::{
     SessionName, SplitWindowRequest, SplitWindowTarget, TerminalSize, WindowTarget,
 };
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn pane_management_requests_round_trip_through_the_socket() -> Result<(), Box<dyn Error>> {
     let _guard = PTY_TEST_LOCK.lock().await;
     let harness = TestHarness::new("pane-management");
@@ -160,7 +158,7 @@ async fn pane_management_requests_round_trip_through_the_socket() -> Result<(), 
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn horizontal_split_and_kill_pane_round_trip_through_the_socket() -> Result<(), Box<dyn Error>>
 {
     let _guard = PTY_TEST_LOCK.lock().await;
@@ -231,7 +229,7 @@ async fn horizontal_split_and_kill_pane_round_trip_through_the_socket() -> Resul
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn select_layout_even_layouts_resize_panes_through_the_socket() -> Result<(), Box<dyn Error>>
 {
     let _guard = PTY_TEST_LOCK.lock().await;
@@ -434,7 +432,7 @@ fn wait_for_tty_sizes(
     .into())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn killing_the_last_pane_destroys_the_window_and_session_targets_fall_back(
 ) -> Result<(), Box<dyn Error>> {
     let _guard = PTY_TEST_LOCK.lock().await;
@@ -522,7 +520,7 @@ async fn killing_the_last_pane_destroys_the_window_and_session_targets_fall_back
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn killing_the_last_pane_in_the_only_window_removes_the_session_over_the_socket(
 ) -> Result<(), Box<dyn Error>> {
     let _guard = PTY_TEST_LOCK.lock().await;
@@ -562,7 +560,7 @@ async fn killing_the_last_pane_in_the_only_window_removes_the_session_over_the_s
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn pty_eof_before_child_exit_eventually_removes_the_session() -> Result<(), Box<dyn Error>> {
     let _guard = PTY_TEST_LOCK.lock().await;
     let harness = TestHarness::new("pty-eof-before-child-exit");

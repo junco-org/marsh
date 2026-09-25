@@ -336,8 +336,7 @@ impl RequestHandler {
             }
             if !matches!(adjustment, ResizePaneAdjustment::NoOp) {
                 // See handle_select_pane: skip the refresh (and its
-                // deferred-pane wait on Windows) when nothing is attached to
-                // the session.
+                // deferred-pane wait) when nothing is attached to the session.
                 if refresh_sessions.is_empty() {
                     if self.attached_count(&session_name).await > 0 {
                         self.refresh_attached_session(&session_name).await;

@@ -355,7 +355,8 @@ impl<SE: extensions::ShellExtensions> Shell<SE> {
         }
     }
 
-    pub(crate) const fn external_command_spawner(&self) -> &SE::ExternalCommandSpawner {
+    /// The spawner every external command of this shell is started through.
+    pub const fn external_command_spawner(&self) -> &SE::ExternalCommandSpawner {
         &self.external_command_spawner
     }
 

@@ -10,9 +10,9 @@ use rmux_proto::{
 };
 
 use super::super::{switch_client_target_find_type, target_support::pane_id_target};
+use super::signed_window_target_session_part;
 use super::tokens::{short_option_prefix_len, short_option_takes_next_value};
 use super::values::{missing_argument, parse_u32};
-
 pub(super) fn resolve_queue_target_arguments(
     command_name: &str,
     arguments: Vec<String>,
@@ -403,25 +403,6 @@ fn has_explicit_window_part(value: &str) -> bool {
         .map(|(_, window)| !window.is_empty())
         .unwrap_or(false)
 }
-
-fn signed_window_target_session_part(raw_target: &str) -> Option<Option<&str>> {
-    if signed_window_index_target(raw_target) {
-        return Some(None);
-    }
-    let (session, window) = raw_target.split_once(':')?;
-    if session.is_empty() || !signed_window_index_target(window) {
-        return None;
-    }
-    Some(Some(session))
-}
-
-fn signed_window_index_target(value: &str) -> bool {
-    let Some(rest) = value.strip_prefix(['+', '-']) else {
-        return false;
-    };
-    rest.is_empty() || rest.bytes().all(|byte| byte.is_ascii_digit())
-}
-
 pub(super) fn new_window_target_is_session(value: &str) -> bool {
     !value.contains(':')
         && !value.contains('.')
@@ -915,9 +896,7 @@ pub(super) fn parse_layout_name(value: &str) -> Result<rmux_proto::LayoutName, R
 mod tests {
     use super::*;
 
-    fn session_name(value: &str) -> SessionName {
-        SessionName::new(value).expect("valid session name")
-    }
+    use crate::test_names::session_name;
 
     fn session_store_with_alpha_beta() -> SessionStore {
         let mut sessions = SessionStore::new();

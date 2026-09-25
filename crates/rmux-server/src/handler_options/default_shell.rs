@@ -48,15 +48,9 @@ fn validate_new_value(value: Option<&str>) -> Result<(), RmuxError> {
     }
 }
 
-#[cfg(unix)]
 fn validate_value(value: &str) -> Result<(), RmuxError> {
     if !value.is_empty() && !crate::terminal::is_suitable_shell(std::path::Path::new(value)) {
         return Err(RmuxError::Message(format!("not a suitable shell: {value}")));
     }
-    Ok(())
-}
-
-#[cfg(windows)]
-fn validate_value(_value: &str) -> Result<(), RmuxError> {
     Ok(())
 }

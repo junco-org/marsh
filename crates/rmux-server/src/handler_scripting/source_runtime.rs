@@ -13,8 +13,6 @@ use rmux_proto::{
     SourceFileResponse, Target,
 };
 
-#[cfg(windows)]
-use super::super::pane_support::format_references_pane_pid;
 use super::super::target_support::{
     pane_id_target, requester_environment_context, requester_environment_pane_id,
 };
@@ -804,8 +802,15 @@ impl RequestHandler {
             None => std::env::current_dir().unwrap_or_default(),
         };
         let patterns = [path.to_owned()];
+        // The operand `cwd` above and the helper's own starting directory are separate questions,
+        // and this is the reason they are separate parameters. The pattern keeps meaning what the
+        // caller meant by it; the helper starts where this host does, because a starting directory
+        // is what selects the seed a shell opens on and a caller's directory is an operand, not a
+        // seed. Handing `caller_cwd` to both would refuse every `source-file` issued from outside
+        // a subvolume — which is most of them — for a read that never opens over that directory.
         let mut reads = managed_workload::source_files(
             &io,
+            io.default_dir(),
             &cwd,
             &patterns,
             command.quiet,
@@ -873,10 +878,6 @@ impl RequestHandler {
         target: Option<&PaneTarget>,
         current_file: Option<&str>,
     ) -> Result<String, RmuxError> {
-        #[cfg(windows)]
-        if format_references_pane_pid(Some(path)) {
-            self.wait_for_windows_deferred_all_pane_pids().await;
-        }
         let attached_count = if let Some(target) = target {
             self.attached_count(target.session_name()).await
         } else {
@@ -1935,7 +1936,6 @@ fn source_error_location_for_loaded(
 mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
-    #[cfg(unix)]
     use std::time::Duration;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1948,10 +1948,10 @@ mod tests {
     use rmux_proto::{OptionName, OptionScopeSelector};
 
     #[test]
-    fn execution_error_prefix_stripping_handles_windows_paths() {
+    fn execution_error_prefix_stripping_skips_colons_inside_the_path() {
         assert_eq!(
             super::strip_source_file_line_prefix(
-                r"C:\tmp\rmux\main.conf:12: invalid option: xyzzy"
+                "/tmp/rmux:scratch/main.conf:12: invalid option: xyzzy"
             ),
             "invalid option: xyzzy"
         );
@@ -2167,7 +2167,6 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn startup_readiness_remains_busy_until_blocking_run_shell_finishes() {
         let _lock = crate::test_env::lock_async().await;
@@ -2291,7 +2290,6 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn explicit_dev_null_startup_config_is_silent() {
         let _lock = crate::test_env::lock_async().await;
@@ -2393,7 +2391,6 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn tmux_fallback_executes_runtime_config_when_no_rmux_config_exists() {
         let _lock = crate::test_env::lock_async().await;
@@ -2433,7 +2430,6 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn tmux_fallback_loads_symlinked_legacy_config_without_discarding_file() {
         let _lock = crate::test_env::lock_async().await;
@@ -2589,22 +2585,10 @@ mod tests {
         home.join(".tmux.conf")
     }
 
-    #[cfg(windows)]
-    fn first_tmux_fallback_path(_home: &Path, xdg: &Path, _appdata: &Path) -> PathBuf {
-        xdg.join("tmux").join("tmux.conf")
-    }
-
-    #[cfg(not(windows))]
     fn first_tmux_fallback_path(home: &Path, _xdg: &Path, _appdata: &Path) -> PathBuf {
         home.join(".tmux.conf")
     }
 
-    #[cfg(windows)]
-    fn later_tmux_fallback_path(home: &Path, _xdg: &Path, _appdata: &Path) -> PathBuf {
-        home.join(".tmux.conf")
-    }
-
-    #[cfg(not(windows))]
     fn later_tmux_fallback_path(_home: &Path, xdg: &Path, _appdata: &Path) -> PathBuf {
         xdg.join("tmux").join("tmux.conf")
     }
@@ -2623,7 +2607,6 @@ mod tests {
         fs::write(path, contents).expect("test config file");
     }
 
-    #[cfg(unix)]
     fn shell_quote_path(path: &Path) -> String {
         let value = path.to_string_lossy();
         format!("'{}'", value.replace('\'', "'\\''"))

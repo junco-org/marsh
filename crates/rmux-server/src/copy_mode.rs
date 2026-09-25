@@ -28,7 +28,6 @@ use text::{
     classify_word_char, is_owner_position, line_char, owner_positions, pattern_looks_like_regex,
     WordClass,
 };
-#[cfg_attr(windows, allow(unused_imports))]
 pub(crate) use types::{
     CopyBufferTarget, CopyModeCommandContext, CopyModeCommandOutcome, CopyModeMouseContext,
     CopyModeOverlayRange, CopyModePipeCommand, CopyModePrefixBehavior, CopyModeRenderOverlays,

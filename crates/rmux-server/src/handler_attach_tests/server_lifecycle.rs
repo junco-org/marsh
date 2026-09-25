@@ -215,7 +215,7 @@ async fn shutdown_if_idle_refuses_in_flight_detached_requests() {
     assert!(!handler.request_shutdown_if_pending());
 }
 
-#[cfg(all(any(unix, windows), feature = "web"))]
+#[cfg(all(unix, feature = "web"))]
 #[tokio::test]
 async fn shutdown_if_idle_refuses_an_admitted_persistent_web_listener() {
     let handler = RequestHandler::new();

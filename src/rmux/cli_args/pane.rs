@@ -4,7 +4,7 @@ use clap::{ArgAction, ArgGroup, Args};
 use rmux_core::tmux_precedence;
 use rmux_proto::{SelectPaneDirection, SplitDirection};
 
-use super::{parse_command_args, parse_target_spec, TargetSpec};
+use super::{TargetSpec, parse_command_args, parse_target_spec};
 
 /// Validates and parses `split-window` arguments from the tmux command line.
 pub(super) fn parse_split_window_args(
@@ -410,8 +410,9 @@ fn normalize_resize_pane_no_direction_trailing_adjustment(
 
     let mut normalized = arguments;
     if let Some(value) = normalized.pop() {
-        parse_resize_pane_delta(&value)
-            .map_err(|message| clap::Error::raw(clap::error::ErrorKind::ValueValidation, message))?;
+        parse_resize_pane_delta(&value).map_err(|message| {
+            clap::Error::raw(clap::error::ErrorKind::ValueValidation, message)
+        })?;
     }
     Ok(normalized)
 }

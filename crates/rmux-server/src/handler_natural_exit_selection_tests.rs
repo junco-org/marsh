@@ -57,11 +57,8 @@ struct SelectionFixture {
     _target_client: TargetClientGuard,
 }
 
-fn session_name(value: &str) -> SessionName {
-    SessionName::new(value).expect("valid session name")
-}
+use crate::test_names::session_name;
 
-#[cfg(unix)]
 fn sleeping_process() -> ProcessCommand {
     ProcessCommand::Argv(vec![
         "/bin/sh".to_owned(),
@@ -70,45 +67,11 @@ fn sleeping_process() -> ProcessCommand {
     ])
 }
 
-#[cfg(windows)]
-fn windows_cmd() -> String {
-    let system_root =
-        std::env::var_os("SystemRoot").unwrap_or_else(|| std::ffi::OsString::from(r"C:\Windows"));
-    std::path::PathBuf::from(system_root)
-        .join("System32")
-        .join("cmd.exe")
-        .to_string_lossy()
-        .into_owned()
-}
-
-#[cfg(windows)]
-fn sleeping_process() -> ProcessCommand {
-    ProcessCommand::Argv(vec![
-        windows_cmd(),
-        "/d".to_owned(),
-        "/q".to_owned(),
-        "/c".to_owned(),
-        "ping -n 120 127.0.0.1 >NUL".to_owned(),
-    ])
-}
-
-#[cfg(unix)]
 fn exiting_process() -> ProcessCommand {
     ProcessCommand::Argv(vec![
         "/bin/sh".to_owned(),
         "-c".to_owned(),
         "exit 0".to_owned(),
-    ])
-}
-
-#[cfg(windows)]
-fn exiting_process() -> ProcessCommand {
-    ProcessCommand::Argv(vec![
-        windows_cmd(),
-        "/d".to_owned(),
-        "/q".to_owned(),
-        "/c".to_owned(),
-        "exit /b 0".to_owned(),
     ])
 }
 

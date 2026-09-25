@@ -1,17 +1,17 @@
 use std::path::Path;
 
 use rmux_proto::{PaneBroadcastInputRequest, Response};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::cli_args::{
     BroadcastKeysArgs, ExpectPaneArgs, FindPanesArgs, FindSessionsArgs, LocatorArgs,
 };
 use crate::cli_response::tmux_cli_error_message;
 
-use super::super::{list_session_names, resolve_pane_target_spec, ExitFailure};
+use super::super::{ExitFailure, list_session_names, resolve_pane_target_spec};
 use super::common::{
-    connect_cli, find_visible_text, matches_json, pane_snapshot, resolve_pane_ref,
-    stable_pane_ref_for_slot, write_json, write_stdout_bytes, write_stdout_line, SCHEMA_VERSION,
+    SCHEMA_VERSION, connect_cli, find_visible_text, matches_json, pane_snapshot, resolve_pane_ref,
+    stable_pane_ref_for_slot, write_json, write_stdout_bytes, write_stdout_line,
 };
 
 /// Unit separator between fields of one `find-panes` format record.
@@ -259,8 +259,15 @@ fn parse_pane_row(line: &str) -> Option<PaneRow> {
         return None;
     }
     let fields = line.split(FIND_PANES_FIELD_SEPARATOR).collect::<Vec<_>>();
-    let [session_name, window_index, pane_index, pane_id, title, current_command, cwd] =
-        fields.as_slice()
+    let [
+        session_name,
+        window_index,
+        pane_index,
+        pane_id,
+        title,
+        current_command,
+        cwd,
+    ] = fields.as_slice()
     else {
         return None;
     };

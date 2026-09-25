@@ -15,16 +15,19 @@
 //!
 //! | UI action | Mux call |
 //! |---|---|
-//! | Add a shell | [`ShellMux::spawn`] |
-//! | Remove a shell | [`ShellMux::stop`] with `force` |
-//! | Graceful close | [`ShellMux::stop`] without it |
-//! | Select a tab | [`ShellMux::switch`] |
-//! | Submit a command line | [`ShellMux::start_in`] |
-//! | Raw input, terminal reply | [`ShellMux::write_input`] |
-//! | End a pipe job's input | [`ShellMux::close_input`] |
-//! | Resize one job | [`ShellMux::resize`] |
+//! | Add a shell | [`ShellMux::open_shell`] |
+//! | Find a shell by principal | [`ShellMux::get_shell`] |
+//! | Remove a shell | [`Shell::stop`] with `force` |
+//! | Graceful close | [`Shell::stop`] without it |
+//! | Submit a command line | [`Shell::run_command`] |
+//! | Raw input, terminal reply | [`Shell::write_input`] |
+//! | End a pipe shell's input | [`Shell::close_input`] |
+//! | Resize one shell | [`Shell::resize`] |
 //! | Resize everything | [`ShellMux::resize_all`] |
-//! | Read one job's keyboard | [`ShellMux::idle_terminal`] |
+//! | Read one shell's keyboard | [`Shell::idle_terminal`] |
+//!
+//! Selecting a tab is deliberately absent: which shell a display is looking at is the frontend's
+//! own state, not the collection's.
 //!
 //! There is no second controller and no snapshot type in the event stream:
 //! [`FrontendEvent::Changed`] says the display is out of date, and [`ShellMux::snapshot`] answers
@@ -33,7 +36,7 @@
 //! # Backpressure
 //!
 //! Every callback is synchronous and short, and its borrowed data is valid only until it returns.
-//! None of them runs under a job-table or background-task lock, so a callback may queue work with
+//! None of them runs under a registry or live-state lock, so a callback may queue work with
 //! Tokio — but it must not synchronously reenter a mutating mux method, and the frontend's own
 //! mutex must be released before awaiting one.
 //!
@@ -50,7 +53,7 @@ use std::sync::{Mutex, MutexGuard, PoisonError, Weak};
 use crate::shellmux::command::{CommandCompletion, CommandHandle};
 use crate::shellmux::jobs::JobEnd;
 use crate::shellmux::types::{OutputChannel, TerminalGeometry};
-use crate::shellmux::{Sandbox, ShellMux, Spawned};
+use crate::shellmux::{Sandbox, Shell, ShellMux};
 
 /// A receipt a frontend returns to slow one output stream to its own pace.
 pub type OutputReceipt = tokio::sync::oneshot::Receiver<()>;
@@ -82,7 +85,7 @@ pub trait ShellFrontend: Send + 'static {
     /// construction: the caller holds the original `Arc<Mutex<V>>`. An empty weak reference means
     /// detached, and a failed [`upgrade`](Weak::upgrade) is an absent session rather than an error.
     ///
-    /// On detach a frontend releases the live [`Spawned`] handles and per-session buffers it holds;
+    /// On detach a frontend releases the live [`Shell`] objects and per-session buffers it holds;
     /// a recorder may keep its historical observations.
     fn bind(&mut self, mux: Weak<ShellMux>);
 
@@ -100,24 +103,22 @@ pub trait ShellFrontend: Send + 'static {
 /// (`Arc`) may be retained.
 #[derive(Debug)]
 pub enum FrontendEvent<'a> {
-    /// The job table or the selection moved on, so the display is out of date.
+    /// The shell collection moved on, so the display is out of date.
     ///
     /// Carries no state: [`ShellMux::snapshot`] is what a frontend reads afterwards, and a queued
     /// snapshot would only be a second, staler answer to the same question. Redundant deliveries
     /// are harmless and coalescing them is allowed.
     Changed,
-    /// A job is open, with the handle its input and its waits go through.
+    /// A shell is open, with the object its input and its waits go through.
     ///
-    /// Delivered once the job's streams and shell are published and its geometry is settled, and
-    /// before any command the job was opened for is launched. A job whose construction *failed*
-    /// never produces this: its failure arrives as [`Self::Closed`] carrying the error.
-    Opened(&'a Spawned),
-    /// A command was admitted into a job.
+    /// Delivered once the shell's streams and interpreter are published and its geometry is
+    /// settled. A shell whose construction *failed* never produces this: its failure arrives as
+    /// [`Self::Closed`] carrying the error.
+    Opened(&'a Shell),
+    /// A command was admitted into a shell.
     ///
     /// Delivered before the command can produce output or finish, so a frontend that wants to
-    /// correlate a job's bytes with the command that caused them has the receipt first. For a job
-    /// spawned *with* a command, the reservation already exists when
-    /// [`Self::Opened`] is delivered, and this follows it.
+    /// correlate a shell's bytes with the command that caused them has the receipt first.
     CommandAccepted {
         /// The receipt for the admitted command.
         command: &'a CommandHandle,

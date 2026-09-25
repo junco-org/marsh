@@ -7,7 +7,7 @@ use std::sync::OnceLock;
 use clap::{ArgAction, Args, CommandFactory, FromArgMatches, Parser};
 use rmux_core::{
     command_inventory::RMUX_EXTENSION_COMMANDS,
-    command_parser::{CommandEntry, ParsedCommands, COMMAND_TABLE},
+    command_parser::{COMMAND_TABLE, CommandEntry, ParsedCommands},
     tmux_precedence,
 };
 
@@ -90,18 +90,18 @@ pub(crate) use overlay::{DisplayMenuArgs, DisplayPopupArgs};
 #[path = "cli_args/targets.rs"]
 mod targets;
 use targets::parse_session_name;
-pub(crate) use targets::{parse_target_spec, TargetSpec};
+pub(crate) use targets::{TargetSpec, parse_target_spec};
 /// Clap argument structs and hand-written parsers for the pane commands.
 #[path = "cli_args/pane.rs"]
 mod pane;
-use pane::{
-    parse_join_pane_args, parse_resize_pane_args, parse_select_layout_args, parse_select_pane_args,
-    parse_split_window_args,
-};
 pub(crate) use pane::{
     BreakPaneArgs, ClockModeArgs, CopyModeArgs, DisplayPanesArgs, JoinPaneArgs, LastPaneArgs,
     ListPanesArgs, PaneTargetArgs, PipePaneArgs, ResizePaneArgs, ResizePaneSize, RespawnPaneArgs,
     SelectLayoutArgs, SelectLayoutMode, SelectPaneArgs, SplitWindowArgs, SwapPaneArgs,
+};
+use pane::{
+    parse_join_pane_args, parse_resize_pane_args, parse_select_layout_args, parse_select_pane_args,
+    parse_split_window_args,
 };
 /// Clap argument structs for the session commands.
 #[path = "cli_args/session.rs"]
@@ -113,16 +113,16 @@ pub(crate) use session::{
 /// Clap argument structs and hand-written parsers for the window commands.
 #[path = "cli_args/window.rs"]
 mod window;
-use window::{parse_rename_window_args, parse_select_window_args, parse_swap_window_args};
 pub(crate) use window::{
     FindWindowArgs, KillWindowArgs, LinkWindowArgs, ListWindowsArgs, MoveWindowArgs, NewWindowArgs,
     RenameWindowArgs, ResizeWindowArgs, RespawnWindowArgs, RotateWindowArgs, SelectWindowArgs,
     SwapWindowArgs, UnlinkWindowArgs, WindowTargetArgs,
 };
+use window::{parse_rename_window_args, parse_select_window_args, parse_swap_window_args};
 /// Clap argument structs for the `web-share` extension command.
 #[path = "cli_args/web.rs"]
 mod web;
-pub(crate) use web::{WebShareArgs, WebShareTerminalThemeArg, WEB_SHARE_TUNNEL_PROVIDERS};
+pub(crate) use web::{WEB_SHARE_TUNNEL_PROVIDERS, WebShareArgs, WebShareTerminalThemeArg};
 
 /// One built-in command alias advertised in `--help` and expanded before dispatch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

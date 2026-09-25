@@ -84,20 +84,12 @@ impl QueueLifecycleTargetPlan {
         if !self.uses_any_role() {
             return Ok(None);
         }
-        match retained_target.resolve(state) {
+        let resolution = retained_target.resolve(state);
+        if self.uses_implicit_role() {
+            return require_live_parse_target(resolution, self.command, "before parsing").map(Some);
+        }
+        match resolution {
             LeaseResolution::Live(target) => Ok(Some(target)),
-            LeaseResolution::Retired(_) if self.uses_implicit_role() => {
-                Err(RmuxError::Server(format!(
-                    "queued {} lifecycle target retired before parsing",
-                    self.command
-                )))
-            }
-            LeaseResolution::Replaced if self.uses_implicit_role() => {
-                Err(RmuxError::Server(format!(
-                    "queued {} lifecycle target was replaced before parsing",
-                    self.command
-                )))
-            }
             LeaseResolution::Retired(_) | LeaseResolution::Replaced => Ok(None),
         }
     }
@@ -138,23 +130,12 @@ impl QueueLifecycleTargetPlan {
         retained_target: Arc<LifecycleTargetLease>,
     ) -> Result<QueueLifecycleTargetCapture, RmuxError> {
         let retained_identity = if self.uses_implicit_role() {
-            match retained_target.resolve(state) {
-                LeaseResolution::Live(target) => {
-                    Some(StableTargetIdentity::capture(state, target)?)
-                }
-                LeaseResolution::Retired(_) => {
-                    return Err(RmuxError::Server(format!(
-                        "queued {} lifecycle target retired during parsing",
-                        self.command
-                    )))
-                }
-                LeaseResolution::Replaced => {
-                    return Err(RmuxError::Server(format!(
-                        "queued {} lifecycle target was replaced during parsing",
-                        self.command
-                    )))
-                }
-            }
+            let target = require_live_parse_target(
+                retained_target.resolve(state),
+                self.command,
+                "during parsing",
+            )?;
+            Some(StableTargetIdentity::capture(state, target)?)
         } else {
             None
         };
@@ -253,6 +234,22 @@ impl QueueLifecycleTargetCapture {
             self.retained_target,
             self.retained_identity,
         )
+    }
+}
+
+pub(super) fn require_live_parse_target(
+    resolution: LeaseResolution,
+    command: &str,
+    phase: &'static str,
+) -> Result<Target, RmuxError> {
+    match resolution {
+        LeaseResolution::Live(target) => Ok(target),
+        LeaseResolution::Retired(_) => Err(RmuxError::Server(format!(
+            "queued {command} lifecycle target retired {phase}"
+        ))),
+        LeaseResolution::Replaced => Err(RmuxError::Server(format!(
+            "queued {command} lifecycle target was replaced {phase}"
+        ))),
     }
 }
 

@@ -33,7 +33,7 @@ use brush_core::{
 use marsh::policy::{Action, Event, Principal};
 use marsh::{
     Denial, MarshError, MarshExecutor, MarshShellExtensions, Outcome, PolicyValidator, Publication,
-    PublishMeta, Shell, Signal, SnapshotUid, StalePath,
+    PublishMeta, Shell, Signal, SnapshotUid,
 };
 use marsh_btrfs::fake::CopyTree;
 use marsh_btrfs::{LibBtrfs, Subvolumes};
@@ -82,6 +82,19 @@ impl Fixture {
         Shell::build(self.open().expect("attach to the seed"), validator())
             .await
             .expect("build the shell")
+    }
+
+    /// A path beside the seed rather than inside it.
+    ///
+    /// Everything a concurrency test uses to control a command — a barrier the command waits on, a
+    /// counter it appends to once per evaluation — has to live here. Inside the snapshot it would
+    /// be part of the footprint under test, and a barrier that was itself a publication would be
+    /// measuring the mechanism with itself.
+    fn outside(&self, name: &str) -> PathBuf {
+        self.seed
+            .parent()
+            .expect("the seed has a parent")
+            .join(name)
     }
 
     /// The write-ahead log's path.
@@ -146,24 +159,1108 @@ fn init_repository(work: &Path) {
         .expect("root commit");
 }
 
-/// Exports the pinned git identities libgit2 reads out of the shell's environment.
+/// The environment every native `git` of this file runs with, fixture setup and managed shell
+/// alike: no host configuration, a fixed identity and clock, a stable locale, and no automatic
+/// maintenance — a detached `git maintenance` would still be rewriting `.git/` while the next
+/// snapshot of it is taken.
+const NATIVE_GIT_ENV: [(&str, &str); 16] = [
+    ("GIT_CONFIG_NOSYSTEM", "1"),
+    ("GIT_CONFIG_SYSTEM", "/dev/null"),
+    ("GIT_CONFIG_GLOBAL", "/dev/null"),
+    ("GIT_CONFIG_COUNT", "2"),
+    ("GIT_CONFIG_KEY_0", "gc.auto"),
+    ("GIT_CONFIG_VALUE_0", "0"),
+    ("GIT_CONFIG_KEY_1", "maintenance.auto"),
+    ("GIT_CONFIG_VALUE_1", "false"),
+    ("LC_ALL", "C"),
+    ("GIT_AUTHOR_NAME", "Test"),
+    ("GIT_AUTHOR_EMAIL", "test@example.com"),
+    ("GIT_AUTHOR_DATE", "1112911993 +0000"),
+    ("GIT_COMMITTER_NAME", "Test"),
+    ("GIT_COMMITTER_EMAIL", "test@example.com"),
+    ("GIT_COMMITTER_DATE", "1112911993 +0000"),
+    ("GIT_TERMINAL_PROMPT", "0"),
+];
+
+/// Exports [`NATIVE_GIT_ENV`] into the shell, which is where a managed `git` reads it from.
 async fn export_git_identity(shell: &Shell) {
     let mut guard = shell.shell_ref().lock().await;
-    for who in ["AUTHOR", "COMMITTER"] {
-        for (suffix, value) in [
-            ("NAME", "Test"),
-            ("EMAIL", "test@example.com"),
-            ("DATE", "1112911993 +0000"),
-        ] {
-            let mut variable = ShellVariable::new(value);
-            variable.export();
-            guard
-                .env_mut()
-                .set_global(format!("GIT_{who}_{suffix}"), variable)
-                .expect("set a git identity variable");
-        }
+    for (name, value) in NATIVE_GIT_ENV {
+        let mut variable = ShellVariable::new(value);
+        variable.export();
+        guard
+            .env_mut()
+            .set_global(name, variable)
+            .expect("set a git environment variable");
     }
     drop(guard);
+}
+
+/// Runs the system `git` in `dir` outside every managed shell, for fixture setup and inspection,
+/// and returns its standard output. Fails the test when git does.
+fn native_git(dir: &Path, args: &[&str]) -> String {
+    let output = std::process::Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .envs(NATIVE_GIT_ENV)
+        .output()
+        .expect("run the system git");
+    assert!(
+        output.status.success(),
+        "git {args:?} in {} failed: {}",
+        dir.display(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).expect("git printed UTF-8")
+}
+
+/// A repository at `dir` on branch `main`, with one commit holding `files`.
+fn committed_repository(dir: &Path, files: &[(&str, &str)]) {
+    std::fs::create_dir_all(dir).expect("the repository directory");
+    native_git(dir, &["init", "-q", "-b", "main"]);
+    commit_files(dir, files, "initial");
+}
+
+/// Writes `files` into the repository at `dir` and commits them as `subject`.
+fn commit_files(dir: &Path, files: &[(&str, &str)], subject: &str) {
+    for (path, contents) in files {
+        let path = dir.join(path);
+        std::fs::create_dir_all(path.parent().expect("a parent")).expect("parents");
+        std::fs::write(path, contents).expect("a committed file");
+    }
+    native_git(dir, &["add", "-A"]);
+    native_git(dir, &["commit", "-q", "--allow-empty", "-m", subject]);
+}
+
+/// Runs a setup line that must succeed and publish, returning what it was granted.
+async fn checked(shell: &Shell, line: &str) -> Vec<Event> {
+    let (code, outcome) = run(shell, line).await;
+    assert_eq!(code, 0, "`{line}` exits 0");
+    match outcome {
+        Outcome::Published { granted, .. } => granted,
+        other => panic!("`{line}` was not published: {other:?}"),
+    }
+}
+
+/// A shell over `fixture` with the fixture git environment, standing in `repo`.
+async fn repository_shell(fixture: &Fixture) -> Shell {
+    let shell = fixture.shell().await;
+    export_git_identity(&shell).await;
+    checked(&shell, "cd repo").await;
+    shell
+}
+
+#[tokio::test]
+#[serial]
+async fn git_command_status() {
+    let fixture = Fixture::new();
+    let repo = fixture.seed.join("repo");
+    committed_repository(
+        &repo,
+        &[
+            ("staged.txt", "old\n"),
+            ("tracked.txt", "old\n"),
+            ("sub/inner.txt", "inner\n"),
+            (".gitignore", "ignored.txt\n"),
+        ],
+    );
+    let shell = repository_shell(&fixture).await;
+    checked(&shell, "printf 'new\\n' > staged.txt; git add -- staged.txt").await;
+    checked(
+        &shell,
+        "printf 'changed\\n' > tracked.txt; printf 'u\\n' > untracked.txt; printf 'i\\n' > ignored.txt",
+    )
+    .await;
+
+    let human = fixture.outside("status.txt");
+    let porcelain = fixture.outside("porcelain.txt");
+    let child = fixture.outside("child.txt");
+    let unset = "unset GIT_AUTHOR_NAME GIT_AUTHOR_EMAIL GIT_AUTHOR_DATE GIT_COMMITTER_NAME \
+                 GIT_COMMITTER_EMAIL GIT_COMMITTER_DATE";
+    for line in [
+        format!("{unset}; git status > {}", human.display()),
+        format!("git status --porcelain=v1 > {}", porcelain.display()),
+        format!(
+            "cd sub && git status --porcelain=v1 > {}; cd ..",
+            child.display()
+        ),
+    ] {
+        assert_eq!(
+            checked(&shell, &line).await,
+            Vec::new(),
+            "`{line}` inspects without requesting anything"
+        );
+    }
+
+    let human = std::fs::read_to_string(human).expect("the human status");
+    for expected in [
+        "On branch main",
+        "Changes to be committed:",
+        "modified:   staged.txt",
+        "Changes not staged for commit:",
+        "modified:   tracked.txt",
+        "Untracked files:",
+        "untracked.txt",
+    ] {
+        assert!(human.contains(expected), "{expected:?} in {human}");
+    }
+    assert!(!human.contains("ignored.txt"), "ignored paths are not listed: {human}");
+    let rows = "M  staged.txt\n M tracked.txt\n?? untracked.txt\n";
+    assert_eq!(std::fs::read_to_string(porcelain).expect("porcelain"), rows);
+    assert_eq!(
+        std::fs::read_to_string(child).expect("porcelain from a child directory"),
+        rows,
+        "porcelain v1 paths are repository-relative from a subdirectory"
+    );
+}
+
+/// What native git prints in `dir`, less its final line feed.
+fn git_out(dir: &Path, args: &[&str]) -> String {
+    native_git(dir, args).trim_end().to_string()
+}
+
+/// Whether native git exits 0 in `dir`.
+fn git_ok(dir: &Path, args: &[&str]) -> bool {
+    std::process::Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .envs(NATIVE_GIT_ENV)
+        .output()
+        .expect("run the system git")
+        .status
+        .success()
+}
+
+/// A file's contents.
+fn read(path: &Path) -> String {
+    std::fs::read_to_string(path).unwrap_or_else(|error| panic!("read {}: {error}", path.display()))
+}
+
+/// The requests `shell`'s principal makes, one per `(action, seed-relative path)`.
+fn events(shell: &Shell, requests: &[(Action, &str)]) -> Vec<Event> {
+    requests
+        .iter()
+        .map(|(action, path)| event(shell, action.clone(), path))
+        .collect()
+}
+
+/// Runs a line that must exit with `code` and publish, returning what it was granted.
+async fn exits(shell: &Shell, line: &str, code: u8) -> Vec<Event> {
+    let (exit, outcome) = run(shell, line).await;
+    assert_eq!(exit, code, "`{line}` exits {code}");
+    published(outcome).1
+}
+
+#[tokio::test]
+#[serial]
+async fn git_command_clone() {
+    let fixture = Fixture::new();
+    let origin = fixture.outside("origin");
+    committed_repository(&origin, &[("p", "cloned\n")]);
+    let vacant = fixture.outside("vacant.git");
+    native_git(
+        &fixture.seed,
+        &["init", "-q", "--bare", vacant.to_str().expect("UTF-8")],
+    );
+    std::fs::create_dir_all(fixture.seed.join("repo")).expect("a directory with no repository");
+    let shell = repository_shell(&fixture).await;
+
+    let line = format!("git clone -q --no-local {} cloned", origin.display());
+    assert_eq!(
+        checked(&shell, &line).await,
+        events(&shell, &[(Action::Checkout, "repo/cloned/p")])
+    );
+    let cloned = fixture.seed.join("repo/cloned");
+    assert_eq!(
+        git_out(&cloned, &["rev-parse", "HEAD"]),
+        git_out(&origin, &["rev-parse", "HEAD"])
+    );
+    assert_eq!(read(&cloned.join("p")), "cloned\n");
+    assert_eq!(git_out(&cloned, &["ls-files"]), "p");
+    assert!(git_ok(&cloned, &["diff", "--quiet", "HEAD"]), "index and worktree are HEAD's");
+    assert_eq!(
+        git_out(&cloned, &["config", "remote.origin.url"]),
+        origin.display().to_string()
+    );
+
+    // An empty origin clones to an unborn repository: nothing but directories and metadata.
+    let line = format!("git clone -q {} vacant 2>/dev/null", vacant.display());
+    assert_eq!(checked(&shell, &line).await, Vec::new());
+    let empty = fixture.seed.join("repo/vacant");
+    assert_eq!(git_out(&empty, &["rev-parse", "--git-dir"]), ".git");
+    assert!(git_ok(&empty, &["status"]));
+}
+
+#[tokio::test]
+#[serial]
+async fn git_command_init() {
+    let fixture = Fixture::new();
+    let repo = fixture.seed.join("repo");
+    std::fs::create_dir_all(&repo).expect("an empty directory");
+    {
+        let shell = repository_shell(&fixture).await;
+        assert_eq!(checked(&shell, "git init -q -b main").await, Vec::new());
+    }
+    assert_eq!(git_out(&repo, &["rev-parse", "--git-dir"]), ".git");
+    assert_eq!(git_out(&repo, &["symbolic-ref", "HEAD"]), "refs/heads/main");
+    assert!(!git_ok(&repo, &["rev-parse", "-q", "--verify", "HEAD"]), "an unborn branch");
+    assert!(repo.join(".git/objects").is_dir() && repo.join(".git/refs/heads").is_dir());
+    let names: Vec<_> = std::fs::read_dir(&repo)
+        .expect("list the repository")
+        .map(|entry| entry.expect("an entry").file_name())
+        .collect();
+    assert_eq!(names, [".git"], "no working file was invented");
+
+    // A new session over the published seed: the repository works from there.
+    let shell = repository_shell(&fixture).await;
+    checked(&shell, "git status > /dev/null").await;
+    assert_eq!(
+        checked(
+            &shell,
+            "printf 'first\\n' > a.txt; git add -- a.txt; git commit -q -m first"
+        )
+        .await,
+        events(
+            &shell,
+            &[
+                (Action::Edit, "repo/a.txt"),
+                (Action::Stage, "repo/a.txt"),
+                (Action::commit("first"), "repo/a.txt"),
+            ]
+        )
+    );
+    assert_eq!(git_out(&repo, &["log", "--format=%s"]), "first");
+}
+
+#[tokio::test]
+#[serial]
+async fn git_command_add() {
+    let fixture = Fixture::new();
+    let repo = fixture.seed.join("repo");
+    committed_repository(
+        &repo,
+        &[("p", "v1\n"), ("gone", "gone\n"), (".gitignore", "ignored.txt\n")],
+    );
+    let shell = repository_shell(&fixture).await;
+    checked(&shell, "printf 'v2\\n' > p; printf 'i\\n' > ignored.txt").await;
+
+    assert_eq!(
+        checked(&shell, "git add -- p").await,
+        events(&shell, &[(Action::Stage, "repo/p")])
+    );
+    assert_eq!(git_out(&repo, &["show", ":p"]), "v2");
+    assert_eq!(read(&repo.join("p")), "v2\n");
+    assert_eq!(git_out(&repo, &["ls-files", "ignored.txt"]), "");
+
+    // A deletion is staged like any other change.
+    assert_eq!(
+        checked(&shell, "rm gone; git add -- gone").await,
+        events(&shell, &[(Action::Edit, "repo/gone"), (Action::Stage, "repo/gone")])
+    );
+    assert!(!git_ok(&repo, &["cat-file", "-e", ":gone"]));
+
+    // A file git cannot read is git's refusal, and nothing is staged.
+    let root = std::os::unix::fs::MetadataExt::uid(
+        &std::fs::metadata("/proc/self").expect("this process"),
+    ) == 0;
+    if !root {
+        let code = fixture.outside("unreadable-code");
+        checked(
+            &shell,
+            &format!(
+                "printf s > secret; chmod 000 secret; git add -- secret 2>/dev/null; \
+                 echo $? > {}; chmod 600 secret",
+                code.display()
+            ),
+        )
+        .await;
+        assert_eq!(read(&code), "128\n");
+        assert!(!git_ok(&repo, &["cat-file", "-e", ":secret"]));
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn git_command_mv() {
+    let fixture = Fixture::new();
+    let repo = fixture.seed.join("repo");
+    committed_repository(&repo, &[("p", "moved\n"), ("dst/keep", "k\n")]);
+    let shell = repository_shell(&fixture).await;
+
+    assert_eq!(
+        checked(&shell, "git mv -- p dst/q").await,
+        events(
+            &shell,
+            &[
+                (Action::Edit, "repo/dst/q"),
+                (Action::Stage, "repo/dst/q"),
+                (Action::Delete, "repo/p"),
+            ]
+        )
+    );
+    assert!(!repo.join("p").exists());
+    assert!(!git_ok(&repo, &["cat-file", "-e", ":p"]));
+    assert_eq!(read(&repo.join("dst/q")), "moved\n");
+    assert_eq!(git_out(&repo, &["show", ":dst/q"]), "moved");
+}
+
+#[tokio::test]
+#[serial]
+async fn git_command_restore() {
+    let fixture = Fixture::new();
+    let repo = fixture.seed.join("repo");
+    committed_repository(&repo, &[("p", "old\n")]);
+    let head = git_out(&repo, &["rev-parse", "HEAD"]);
+    let shell = repository_shell(&fixture).await;
+    checked(&shell, "printf 'new\\n' > p; git add -- p").await;
+
+    assert_eq!(
+        checked(&shell, "git restore --staged -- p").await,
+        events(&shell, &[(Action::Unstage, "repo/p")])
+    );
+    assert_eq!(git_out(&repo, &["show", ":p"]), "old");
+    assert_eq!(read(&repo.join("p")), "new\n");
+
+    assert_eq!(
+        checked(&shell, "git restore -- p").await,
+        events(&shell, &[(Action::Checkout, "repo/p")])
+    );
+    assert_eq!(read(&repo.join("p")), "old\n", "the worktree came back from the index");
+    assert_eq!(git_out(&repo, &["show", ":p"]), "old");
+    assert_eq!(git_out(&repo, &["rev-parse", "HEAD"]), head);
+}
+
+#[tokio::test]
+#[serial]
+async fn git_command_rm() {
+    let fixture = Fixture::new();
+    let repo = fixture.seed.join("repo");
+    committed_repository(
+        &repo,
+        &[("p", "p\n"), ("m", "m\n"), ("s", "s\n"), ("sm", "sm\n")],
+    );
+    let shell = repository_shell(&fixture).await;
+
+    assert_eq!(
+        checked(&shell, "git rm -q -- p").await,
+        events(&shell, &[(Action::Delete, "repo/p")])
+    );
+    assert!(!repo.join("p").exists());
+    assert!(!git_ok(&repo, &["cat-file", "-e", ":p"]));
+    assert!(git_ok(&repo, &["cat-file", "-e", "HEAD:p"]));
+
+    // Git's own safety boundary: a modified, a staged, and a staged-then-modified path.
+    checked(
+        &shell,
+        "printf 'x\\n' > m; printf 'x\\n' > s; git add -- s; printf 'y\\n' > sm; git add -- sm; \
+         printf 'z\\n' > sm",
+    )
+    .await;
+    for path in ["m", "s", "sm"] {
+        let before = (read(&repo.join(path)), git_out(&repo, &["show", &format!(":{path}")]));
+        assert_eq!(
+            exits(&shell, &format!("git rm -q -- {path} 2>/dev/null"), 1).await,
+            Vec::new(),
+            "{path}"
+        );
+        let after = (read(&repo.join(path)), git_out(&repo, &["show", &format!(":{path}")]));
+        assert_eq!(before, after, "{path} is untouched");
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn git_command_bisect() {
+    let fixture = Fixture::new();
+    let repo = fixture.seed.join("repo");
+    committed_repository(&repo, &[("p", "0\n")]);
+    for step in 1..=4 {
+        commit_files(&repo, &[("p", &format!("{step}\n"))], &format!("step {step}"));
+    }
+    let tip = git_out(&repo, &["rev-parse", "HEAD"]);
+    let shell = repository_shell(&fixture).await;
+
+    assert_eq!(checked(&shell, "git bisect start").await, Vec::new());
+    assert_eq!(checked(&shell, "git bisect bad HEAD").await, Vec::new());
+    assert_eq!(
+        checked(&shell, "git bisect good HEAD~4 > /dev/null").await,
+        events(&shell, &[(Action::Checkout, "repo/p")])
+    );
+    let chosen = read(&repo.join("p"));
+    assert!(["1\n", "2\n", "3\n"].contains(&chosen.as_str()), "{chosen:?}");
+    assert_eq!(
+        git_out(&repo, &["rev-parse", "refs/bisect/bad"]),
+        tip,
+        "the bisection's bound is recorded"
+    );
+
+    assert_eq!(
+        checked(&shell, "git bisect reset 2>/dev/null").await,
+        events(&shell, &[(Action::Checkout, "repo/p")])
+    );
+    assert_eq!(git_out(&repo, &["rev-parse", "HEAD"]), tip);
+    assert_eq!(read(&repo.join("p")), "4\n");
+}
+
+#[tokio::test]
+#[serial]
+async fn git_command_diff() {
+    let fixture = Fixture::new();
+    committed_repository(&fixture.seed.join("repo"), &[("p", "old\n")]);
+    let shell = repository_shell(&fixture).await;
+    checked(&shell, "printf 'new\\n' > p").await;
+
+    let capture = fixture.outside("diff.txt");
+    assert_eq!(
+        checked(&shell, &format!("git diff -- p > {}", capture.display())).await,
+        Vec::new()
+    );
+    let patch = read(&capture);
+    assert!(patch.contains("\n-old\n") && patch.contains("\n+new\n"), "{patch}");
+}
+
+#[tokio::test]
+#[serial]
+async fn git_command_grep() {
+    let fixture = Fixture::new();
+    committed_repository(&fixture.seed.join("repo"), &[("p", "alpha\nbeta\n")]);
+    let shell = repository_shell(&fixture).await;
+
+    let capture = fixture.outside("grep.txt");
+    assert_eq!(
+        checked(&shell, &format!("git grep -n beta -- p > {}", capture.display())).await,
+        Vec::new()
+    );
+    assert_eq!(read(&capture), "p:2:beta\n");
+    assert_eq!(
+        exits(&shell, "git grep -n gamma -- p", 1).await,
+        Vec::new(),
+        "no match is git's own exit 1, not a refusal"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn git_command_log() {
+    let fixture = Fixture::new();
+    let repo = fixture.seed.join("repo");
+    committed_repository(&repo, &[("u", "u\n")]);
+    commit_files(&repo, &[("p", "one\n")], "p one");
+    commit_files(&repo, &[("u", "u2\n")], "unrelated");
+    commit_files(&repo, &[("p", "two\n")], "p two");
+    let shell = repository_shell(&fixture).await;
+
+    let capture = fixture.outside("log.txt");
+    assert_eq!(
+        checked(&shell, &format!("git log --oneline -- p > {}", capture.display())).await,
+        Vec::new()
+    );
+    let subjects: Vec<String> = read(&capture)
+        .lines()
+        .map(|line| line.split_once(' ').expect("hash and subject").1.to_string())
+        .collect();
+    assert_eq!(subjects, ["p two", "p one"]);
+}
+
+#[tokio::test]
+#[serial]
+async fn git_command_show() {
+    let fixture = Fixture::new();
+    let repo = fixture.seed.join("repo");
+    committed_repository(&repo, &[("p", "old\n")]);
+    commit_files(&repo, &[("p", "new\n")], "update");
+    let shell = repository_shell(&fixture).await;
+    checked(&shell, "printf 'dirty\\n' > p").await;
+
+    let capture = fixture.outside("show.txt");
+    assert_eq!(
+        checked(&shell, &format!("git show HEAD:p > {}", capture.display())).await,
+        Vec::new()
+    );
+    assert_eq!(read(&capture), "new\n", "the committed bytes, not the worktree's");
+}
+
+#[tokio::test]
+#[serial]
+async fn git_command_backfill() {
+    let fixture = Fixture::new();
+    let origin = fixture.outside("origin");
+    committed_repository(&origin, &[("a", "a1\n")]);
+    commit_files(&origin, &[("a", "a2\n"), ("b", "b1\n")], "second");
+    native_git(&origin, &["config", "uploadpack.allowFilter", "true"]);
+    native_git(&origin, &["config", "uploadpack.allowAnySHA1InWant", "true"]);
+    let repo = fixture.seed.join("repo");
+    native_git(
+        &fixture.seed,
+        &[
+            "clone",
+            "-q",
+            "--filter=blob:none",
+            "--no-checkout",
+            &format!("file://{}", origin.display()),
+            "repo",
+        ],
+    );
+    native_git(&repo, &["config", "protocol.file.allow", "always"]);
+    let missing = || -> Vec<String> {
+        native_git(
+            &repo,
+            &["--no-lazy-fetch", "rev-list", "--objects", "--all", "--missing=print"],
+        )
+        .lines()
+        .filter_map(|line| line.strip_prefix('?'))
+        .map(str::to_string)
+        .collect()
+    };
+    let absent = missing();
+    assert!(!absent.is_empty(), "a real partial clone has promised blobs");
+    let head = git_out(&repo, &["rev-parse", "HEAD"]);
+    let shell = repository_shell(&fixture).await;
+
+    assert_eq!(
+        checked(&shell, "git backfill --min-batch-size=1 2>/dev/null").await,
+        Vec::new()
+    );
+    assert_eq!(missing(), Vec::<String>::new(), "every promised blob arrived");
+    for object in &absent {
+        assert!(git_ok(&repo, &["--no-lazy-fetch", "cat-file", "-e", object]), "{object}");
+    }
+    assert_eq!(git_out(&repo, &["rev-parse", "HEAD"]), head);
+    let names: Vec<_> = std::fs::read_dir(&repo)
+        .expect("list the repository")
+        .map(|entry| entry.expect("an entry").file_name())
+        .collect();
+    assert_eq!(names, [".git"], "nothing was checked out");
+}
+
+#[tokio::test]
+#[serial]
+async fn git_command_branch() {
+    let fixture = Fixture::new();
+    let repo = fixture.seed.join("repo");
+    committed_repository(&repo, &[("p", "p\n")]);
+    let shell = repository_shell(&fixture).await;
+
+    assert_eq!(checked(&shell, "git branch feature").await, Vec::new());
+    assert_eq!(
+        git_out(&repo, &["rev-parse", "feature"]),
+        git_out(&repo, &["rev-parse", "HEAD"])
+    );
+    let capture = fixture.outside("branches.txt");
+    checked(&shell, &format!("git branch --list > {}", capture.display())).await;
+    assert!(read(&capture).contains("feature"));
+    assert_eq!(checked(&shell, "git branch -q -d feature").await, Vec::new());
+    assert!(!git_ok(&repo, &["rev-parse", "-q", "--verify", "refs/heads/feature"]));
+    assert!(git_ok(&repo, &["diff", "--quiet", "HEAD"]), "no content moved");
+}
+
+#[tokio::test]
+#[serial]
+async fn git_command_commit() {
+    let fixture = Fixture::new();
+    let repo = fixture.seed.join("repo");
+    committed_repository(
+        &repo,
+        &[("p", "v1\n"), ("q", "q1\n"), ("r", "r1\n"), ("d", "d\n")],
+    );
+    let shell = repository_shell(&fixture).await;
+    checked(&shell, "printf 'v2\\n' > p; git add -- p").await;
+
+    assert_eq!(
+        checked(&shell, "git commit -q -m saved").await,
+        events(&shell, &[(Action::commit("saved"), "repo/p")])
+    );
+    assert_eq!(git_out(&repo, &["log", "-1", "--format=%s"]), "saved");
+    assert_eq!(git_out(&repo, &["show", "HEAD:p"]), "v2");
+    assert!(git_ok(&repo, &["diff", "--cached", "--quiet"]), "the index is clean");
+    assert_eq!(
+        git_out(&repo, &["log", "-1", "--format=%an <%ae> %at %cn <%ce> %ct"]),
+        "Test <test@example.com> 1112911993 Test <test@example.com> 1112911993"
+    );
+
+    // A partial commit takes the named path's worktree state, stages it first, and leaves the
+    // other staged entry staged.
+    checked(&shell, "printf 'r2\\n' > r; git add -- r; printf 'q2\\n' > q").await;
+    assert_eq!(
+        checked(&shell, "git commit -q -m partial -- q").await,
+        events(
+            &shell,
+            &[(Action::Stage, "repo/q"), (Action::commit("partial"), "repo/q")]
+        )
+    );
+    assert_eq!(git_out(&repo, &["show", "HEAD:q"]), "q2");
+    assert_eq!(git_out(&repo, &["show", "HEAD:r"]), "r1");
+    assert_eq!(git_out(&repo, &["show", ":r"]), "r2");
+
+    // A deletion is committed like any other change.
+    checked(&shell, "rm d; git add -- d").await;
+    assert_eq!(
+        checked(&shell, "git commit -q -m gone -- d").await,
+        events(&shell, &[(Action::commit("gone"), "repo/d")])
+    );
+    assert!(!git_ok(&repo, &["cat-file", "-e", "HEAD:d"]));
+}
+
+#[tokio::test]
+#[serial]
+async fn git_command_history() {
+    let fixture = Fixture::new();
+    let repo = fixture.seed.join("repo");
+    committed_repository(&repo, &[("u", "u1\n")]);
+    commit_files(&repo, &[("p", "p1\n")], "add p");
+    commit_files(&repo, &[("u", "u2\n")], "change u");
+    let target = git_out(&repo, &["rev-parse", "HEAD~1"]);
+    let child = git_out(&repo, &["rev-parse", "HEAD"]);
+    let shell = repository_shell(&fixture).await;
+    checked(&shell, "printf 'p2\\n' > p; git add -- p").await;
+
+    assert_eq!(
+        checked(&shell, "git history fixup HEAD~1").await,
+        events(&shell, &[(Action::commit("change u"), "repo/p")])
+    );
+    assert_ne!(git_out(&repo, &["rev-parse", "HEAD~1"]), target);
+    assert_ne!(git_out(&repo, &["rev-parse", "HEAD"]), child);
+    assert_eq!(git_out(&repo, &["log", "-1", "--format=%s", "HEAD~1"]), "add p");
+    assert_eq!(git_out(&repo, &["show", "HEAD~1:p"]), "p2");
+    assert_eq!(git_out(&repo, &["show", "HEAD:u"]), "u2");
+    assert_eq!(read(&repo.join("p")), "p2\n");
+}
+
+#[tokio::test]
+#[serial]
+async fn git_command_merge() {
+    let fixture = Fixture::new();
+    let repo = fixture.seed.join("repo");
+    committed_repository(&repo, &[("p", "p\n")]);
+    native_git(&repo, &["switch", "-q", "-c", "feature"]);
+    commit_files(&repo, &[("q", "q\n")], "add q");
+    native_git(&repo, &["switch", "-q", "main"]);
+    let shell = repository_shell(&fixture).await;
+
+    assert_eq!(
+        checked(&shell, "git merge -q --ff-only feature").await,
+        events(&shell, &[(Action::Checkout, "repo/q")])
+    );
+    assert_eq!(
+        git_out(&repo, &["rev-parse", "HEAD"]),
+        git_out(&repo, &["rev-parse", "feature"])
+    );
+    assert_eq!(read(&repo.join("q")), "q\n");
+    assert_eq!(git_out(&repo, &["show", ":q"]), "q");
+}
+
+#[tokio::test]
+#[serial]
+async fn git_command_rebase() {
+    let fixture = Fixture::new();
+    let repo = fixture.seed.join("repo");
+    committed_repository(&repo, &[("base", "b\n")]);
+    native_git(&repo, &["switch", "-q", "-c", "topic"]);
+    commit_files(&repo, &[("t", "t\n")], "topic change");
+    native_git(&repo, &["switch", "-q", "main"]);
+    commit_files(&repo, &[("m", "m\n")], "main change");
+    native_git(&repo, &["switch", "-q", "topic"]);
+    let old = git_out(&repo, &["rev-parse", "HEAD"]);
+    let shell = repository_shell(&fixture).await;
+
+    let granted = checked(&shell, "git rebase -q main").await;
+    assert!(
+        granted.contains(&event(&shell, Action::Checkout, "repo/m"))
+            && granted.iter().all(|event| event.action == Action::Checkout),
+        "{granted:?}"
+    );
+    assert_ne!(git_out(&repo, &["rev-parse", "HEAD"]), old);
+    assert!(git_ok(&repo, &["merge-base", "--is-ancestor", "main", "HEAD"]));
+    assert_eq!((read(&repo.join("t")), read(&repo.join("m"))), ("t\n".into(), "m\n".into()));
+    assert!(git_ok(&repo, &["diff", "--quiet", "HEAD"]), "the index is clean");
+}
+
+#[tokio::test]
+#[serial]
+async fn git_command_reset() {
+    let fixture = Fixture::new();
+    for name in ["repo", "soft", "mixed"] {
+        let dir = fixture.seed.join(name);
+        committed_repository(&dir, &[("p", "one\n"), ("r", "r\n")]);
+        commit_files(&dir, &[("p", "two\n"), ("q", "q\n")], "second");
+    }
+    let repo = fixture.seed.join("repo");
+    let first = git_out(&repo, &["rev-parse", "HEAD~1"]);
+    let shell = repository_shell(&fixture).await;
+    checked(
+        &shell,
+        "printf 'staged\\n' > p; git add -- p; printf 'unstaged\\n' > r",
+    )
+    .await;
+
+    assert_eq!(
+        checked(&shell, "git reset -q --hard HEAD~1").await,
+        events(
+            &shell,
+            &[
+                (Action::Checkout, "repo/p"),
+                (Action::Checkout, "repo/q"),
+                (Action::Checkout, "repo/r"),
+            ]
+        )
+    );
+    assert_eq!(git_out(&repo, &["rev-parse", "HEAD"]), first);
+    assert_eq!((read(&repo.join("p")), read(&repo.join("r"))), ("one\n".into(), "r\n".into()));
+    assert!(!repo.join("q").exists());
+    assert!(git_ok(&repo, &["diff", "--quiet", "HEAD"]));
+
+    // --soft moves HEAD alone, and claims no resource.
+    let soft = fixture.seed.join("soft");
+    let soft_first = git_out(&soft, &["rev-parse", "HEAD~1"]);
+    assert_eq!(checked(&shell, "cd ../soft; git reset -q --soft HEAD~1").await, Vec::new());
+    assert_eq!(git_out(&soft, &["rev-parse", "HEAD"]), soft_first);
+    assert_eq!(git_out(&soft, &["show", ":p"]), "two");
+    assert_eq!(read(&soft.join("p")), "two\n");
+
+    // The default moves HEAD and the index, and leaves the worktree modified.
+    let mixed = fixture.seed.join("mixed");
+    let mixed_first = git_out(&mixed, &["rev-parse", "HEAD~1"]);
+    assert_eq!(
+        checked(&shell, "cd ../mixed; git reset -q HEAD~1").await,
+        events(&shell, &[(Action::Edit, "mixed/p"), (Action::Edit, "mixed/q")])
+    );
+    assert_eq!(git_out(&mixed, &["rev-parse", "HEAD"]), mixed_first);
+    assert_eq!(git_out(&mixed, &["show", ":p"]), "one");
+    assert_eq!(read(&mixed.join("p")), "two\n");
+    assert_eq!(read(&mixed.join("q")), "q\n");
+}
+
+#[tokio::test]
+#[serial]
+async fn git_command_switch() {
+    let fixture = Fixture::new();
+    let repo = fixture.seed.join("repo");
+    committed_repository(&repo, &[("p", "main\n")]);
+    native_git(&repo, &["switch", "-q", "-c", "feature"]);
+    commit_files(&repo, &[("p", "feature\n")], "feature p");
+    native_git(&repo, &["switch", "-q", "main"]);
+    let shell = repository_shell(&fixture).await;
+
+    assert_eq!(
+        checked(&shell, "git switch -q feature").await,
+        events(&shell, &[(Action::Checkout, "repo/p")])
+    );
+    assert_eq!(git_out(&repo, &["symbolic-ref", "HEAD"]), "refs/heads/feature");
+    assert_eq!(read(&repo.join("p")), "feature\n");
+    assert_eq!(git_out(&repo, &["show", ":p"]), "feature");
+
+    // A switch that would overwrite a dirty file is git's refusal, and changes nothing.
+    checked(&shell, "printf 'dirty\\n' > p").await;
+    assert_eq!(exits(&shell, "git switch -q main 2>/dev/null", 1).await, Vec::new());
+    assert_eq!(git_out(&repo, &["symbolic-ref", "HEAD"]), "refs/heads/feature");
+    assert_eq!(read(&repo.join("p")), "dirty\n");
+}
+
+#[tokio::test]
+#[serial]
+async fn git_command_tag() {
+    let fixture = Fixture::new();
+    let repo = fixture.seed.join("repo");
+    committed_repository(&repo, &[("p", "p\n")]);
+    let shell = repository_shell(&fixture).await;
+
+    assert_eq!(checked(&shell, "git tag v1").await, Vec::new());
+    assert_eq!(
+        git_out(&repo, &["rev-parse", "v1"]),
+        git_out(&repo, &["rev-parse", "HEAD"])
+    );
+    assert_eq!(checked(&shell, "git tag -d v1 > /dev/null").await, Vec::new());
+    assert!(!git_ok(&repo, &["rev-parse", "-q", "--verify", "refs/tags/v1"]));
+    assert!(git_ok(&repo, &["diff", "--quiet", "HEAD"]), "no content moved");
+}
+
+/// A remote outside the seed, a client clone of it at `seed/repo`, and one more commit on the
+/// remote that the client does not have yet.
+fn advanced_remote(fixture: &Fixture) -> (PathBuf, PathBuf) {
+    let origin = fixture.outside("origin");
+    committed_repository(&origin, &[("p", "p\n")]);
+    native_git(
+        &fixture.seed,
+        &["clone", "-q", origin.to_str().expect("UTF-8"), "repo"],
+    );
+    commit_files(&origin, &[("new", "n\n")], "advance");
+    (origin, fixture.seed.join("repo"))
+}
+
+#[tokio::test]
+#[serial]
+async fn git_command_fetch() {
+    let fixture = Fixture::new();
+    let (origin, repo) = advanced_remote(&fixture);
+    let head = git_out(&repo, &["rev-parse", "HEAD"]);
+    let shell = repository_shell(&fixture).await;
+
+    assert_eq!(checked(&shell, "git fetch -q origin").await, Vec::new());
+    assert_eq!(
+        git_out(&repo, &["rev-parse", "origin/main"]),
+        git_out(&origin, &["rev-parse", "HEAD"])
+    );
+    assert_eq!(git_out(&repo, &["rev-parse", "HEAD"]), head);
+    assert!(!repo.join("new").exists());
+    assert!(git_ok(&repo, &["diff", "--quiet", "HEAD"]));
+}
+
+#[tokio::test]
+#[serial]
+async fn git_command_pull() {
+    let fixture = Fixture::new();
+    let (origin, repo) = advanced_remote(&fixture);
+    let shell = repository_shell(&fixture).await;
+
+    assert_eq!(
+        checked(&shell, "git pull -q --ff-only origin main").await,
+        events(&shell, &[(Action::Checkout, "repo/new")])
+    );
+    assert_eq!(
+        git_out(&repo, &["rev-parse", "HEAD"]),
+        git_out(&origin, &["rev-parse", "HEAD"])
+    );
+    assert_eq!(read(&repo.join("new")), "n\n");
+    assert!(git_ok(&repo, &["diff", "--quiet", "HEAD"]));
+}
+
+#[tokio::test]
+#[serial]
+async fn git_command_push() {
+    let fixture = Fixture::new();
+    let origin = fixture.outside("origin.git");
+    native_git(
+        &fixture.seed,
+        &["init", "-q", "--bare", origin.to_str().expect("UTF-8")],
+    );
+    let repo = fixture.seed.join("repo");
+    committed_repository(&repo, &[("p", "p\n")]);
+    native_git(&repo, &["remote", "add", "origin", origin.to_str().expect("UTF-8")]);
+    native_git(&repo, &["push", "-q", "origin", "main"]);
+    let shell = repository_shell(&fixture).await;
+    checked(
+        &shell,
+        "printf 'n\\n' > n; git add -- n; git commit -q -m pushed",
+    )
+    .await;
+
+    assert_eq!(checked(&shell, "git push -q origin main").await, Vec::new());
+    let pushed = git_out(&repo, &["rev-parse", "HEAD"]);
+    assert_eq!(git_out(&origin, &["rev-parse", "main"]), pushed);
+    assert!(git_ok(&origin, &["cat-file", "-e", &format!("{pushed}:n")]));
+}
+
+#[tokio::test]
+#[serial]
+async fn git_command_stage() {
+    let fixture = Fixture::new();
+    let repo = fixture.seed.join("repo");
+    committed_repository(&repo, &[("p", "v1\n")]);
+    let shell = repository_shell(&fixture).await;
+    checked(&shell, "printf 'v2\\n' > p").await;
+
+    assert_eq!(
+        checked(&shell, "git stage -- p").await,
+        events(&shell, &[(Action::Stage, "repo/p")])
+    );
+    assert_eq!(git_out(&repo, &["show", ":p"]), "v2");
+}
+
+#[tokio::test]
+#[serial]
+async fn git_command_checkout() {
+    let fixture = Fixture::new();
+    let repo = fixture.seed.join("repo");
+    committed_repository(
+        &repo,
+        &[("p", "committed\n"), ("target", "t\n"), ("run.sh", "#!/bin/sh\n")],
+    );
+    std::os::unix::fs::symlink("target", repo.join("link")).expect("a symlink");
+    std::fs::set_permissions(
+        repo.join("run.sh"),
+        std::os::unix::fs::PermissionsExt::from_mode(0o755),
+    )
+    .expect("chmod");
+    native_git(&repo, &["add", "-A"]);
+    native_git(&repo, &["commit", "-q", "-m", "kinds"]);
+    let shell = repository_shell(&fixture).await;
+
+    checked(&shell, "printf 'dirty\\n' > p").await;
+    assert_eq!(
+        checked(&shell, "git checkout HEAD -- p").await,
+        events(&shell, &[(Action::Checkout, "repo/p")])
+    );
+    assert_eq!(read(&repo.join("p")), "committed\n");
+
+    // A restored symlink is a link to the same target, and an executable stays executable.
+    checked(&shell, "rm link; ln -s p link; chmod -x run.sh").await;
+    assert_eq!(
+        checked(&shell, "git checkout HEAD -- link run.sh").await,
+        events(
+            &shell,
+            &[(Action::Checkout, "repo/link"), (Action::Checkout, "repo/run.sh")]
+        )
+    );
+    assert_eq!(
+        std::fs::read_link(repo.join("link")).expect("a symlink"),
+        Path::new("target")
+    );
+    let mode = std::os::unix::fs::PermissionsExt::mode(
+        &std::fs::metadata(repo.join("run.sh")).expect("run.sh").permissions(),
+    );
+    assert_ne!(mode & 0o111, 0, "{mode:o}");
+}
+
+#[tokio::test]
+#[serial]
+async fn git_command_stash() {
+    let fixture = Fixture::new();
+    let repo = fixture.seed.join("repo");
+    committed_repository(&repo, &[("p", "clean\n"), ("d", "d\n")]);
+    let shell = repository_shell(&fixture).await;
+    checked(&shell, "printf 'dirty\\n' > p; printf 'new\\n' > n; rm d").await;
+
+    assert_eq!(
+        checked(&shell, "git stash push -q -u").await,
+        events(
+            &shell,
+            &[
+                (Action::Stash, "repo/d"),
+                (Action::Stash, "repo/n"),
+                (Action::Stash, "repo/p"),
+            ]
+        )
+    );
+    assert_eq!((read(&repo.join("p")), read(&repo.join("d"))), ("clean\n".into(), "d\n".into()));
+    assert!(!repo.join("n").exists());
+    assert_eq!(git_out(&repo, &["stash", "list"]).lines().count(), 1);
+
+    let capture = fixture.outside("stash.txt");
+    assert_eq!(
+        checked(
+            &shell,
+            &format!("git stash show -p --include-untracked > {}", capture.display())
+        )
+        .await,
+        Vec::new()
+    );
+    let shown = read(&capture);
+    assert!(shown.contains("+dirty") && shown.contains("+new"), "{shown}");
+
+    assert_eq!(
+        checked(&shell, "git stash pop -q").await,
+        events(
+            &shell,
+            &[(Action::Edit, "repo/d"), (Action::Edit, "repo/n"), (Action::Edit, "repo/p")]
+        )
+    );
+    assert_eq!((read(&repo.join("p")), read(&repo.join("n"))), ("dirty\n".into(), "new\n".into()));
+    assert!(!repo.join("d").exists());
+    assert_eq!(git_out(&repo, &["stash", "list"]), "");
+}
+
+#[tokio::test]
+#[serial]
+async fn git_command_clean() {
+    let fixture = Fixture::new();
+    let repo = fixture.seed.join("repo");
+    committed_repository(&repo, &[("p", "tracked\n")]);
+    let shell = repository_shell(&fixture).await;
+    checked(&shell, "printf 's\\n' > scratch.txt; printf 'k\\n' > keep.txt").await;
+
+    let capture = fixture.outside("clean.txt");
+    assert_eq!(
+        checked(&shell, &format!("git clean -n > {}", capture.display())).await,
+        Vec::new()
+    );
+    assert!(read(&capture).contains("Would remove scratch.txt"));
+    assert!(repo.join("scratch.txt").exists() && repo.join("keep.txt").exists());
+
+    assert_eq!(
+        checked(&shell, "git clean -f -q -- scratch.txt").await,
+        events(&shell, &[(Action::Clean, "repo/scratch.txt")])
+    );
+    assert!(!repo.join("scratch.txt").exists());
+    assert_eq!(read(&repo.join("keep.txt")), "k\n");
+    assert_eq!(read(&repo.join("p")), "tracked\n", "tracked files are never cleaned");
+}
+
+/// A shell of its own over `seed`, acting as `principal`, sharing `validator`'s history.
+async fn shell_as(
+    seed: &MarshExecutor,
+    validator: &Arc<Mutex<PolicyValidator>>,
+    principal: &str,
+) -> Shell {
+    Shell::build(
+        seed.snapshot(Principal::from(principal))
+            .unwrap_or_else(|error| panic!("{principal}'s snapshot: {error}")),
+        validator.clone(),
+    )
+    .await
+    .unwrap_or_else(|error| panic!("build {principal}: {error}"))
+}
+
+/// A control file outside every seed that a held command waits for.
+///
+/// Explicit, because a test that held a command with `sleep 2` would be asserting about a
+/// duration rather than about an order: the barrier is opened when the other half of the scenario
+/// has provably finished, and never a moment earlier.
+struct Gate(PathBuf);
+
+impl Gate {
+    fn new(fixture: &Fixture, name: &str) -> Self {
+        Self(fixture.outside(name))
+    }
+
+    /// The shell fragment that blocks until the gate is opened.
+    fn wait(&self) -> String {
+        format!(
+            "while [ ! -e {} ]; do sleep 0.02; done",
+            self.0.display()
+        )
+    }
+
+    fn open(&self) {
+        std::fs::write(&self.0, b"").expect("open the gate");
+    }
+}
+
+/// A file outside every seed that a line appends to once per evaluation.
+///
+/// This is how a test tells "the line ran again" from "the line took longer": nothing inside the
+/// snapshot can answer that, because a replay throws the snapshot away.
+struct Attempts(PathBuf);
+
+impl Attempts {
+    fn new(fixture: &Fixture, name: &str) -> Self {
+        Self(fixture.outside(name))
+    }
+
+    /// The shell fragment that records one evaluation.
+    fn record(&self) -> String {
+        format!("printf 'x\\n' >> {}", self.0.display())
+    }
+
+    fn count(&self) -> usize {
+        std::fs::read_to_string(&self.0).map_or(0, |text| text.lines().count())
+    }
+}
+
+/// Waits for `condition`, failing the test rather than hanging when it never holds.
+async fn until(what: &str, mut condition: impl FnMut() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !condition() {
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// The capabilities a denied line was refused.
+fn denied(outcome: &Outcome) -> &[Denial] {
+    match outcome {
+        Outcome::Denied { denials, .. } => denials,
+        other => panic!("expected a denied line, got {other:?}"),
+    }
 }
 
 /// The `BEGIN` record of the transaction numbered `seq`.
@@ -182,12 +1279,18 @@ fn begin(records: &[WalRecord<PublishMeta>], seq: u64) -> (&PublishMeta, &str) {
         .unwrap_or_else(|| panic!("expected a BEGIN for seq {seq} in {records:?}"))
 }
 
-/// Every seed-relative destination the log's `MOVE` records name.
+/// Every seed-relative destination the log's file and symlink `MOVE` records name.
+///
+/// A directory's `MOVE` is a change of shape, not of content, and is left out.
 fn moved(records: &[WalRecord<PublishMeta>]) -> Vec<PathBuf> {
     records
         .iter()
         .filter_map(|record| match record {
-            WalRecord::Move { to, .. } => Some(to.clone()),
+            WalRecord::Move {
+                to,
+                directory_mode: None,
+                ..
+            } => Some(to.clone()),
             _ => None,
         })
         .collect()
@@ -864,12 +1967,13 @@ async fn a_stage_taken_before_a_reopen_still_releases_the_path_after_it() {
     );
 }
 
-/// A seed whose log says nothing owes nobody anything. A log that cannot be *read* says nothing
-/// either, and the two must never be confused: the first is an unowned seed, the second is a seed
-/// no session may be opened over at all.
+/// A newline-terminated record that fails to parse or typecheck resets the whole WAL: the
+/// history and ownership it carried are gone, publication restarts at sequence 1, and the seed
+/// keeps whatever it already had. An actual I/O failure reading the log is a different thing
+/// entirely, and must still refuse to open a session.
 #[tokio::test]
 #[serial]
-async fn an_absent_log_is_unowned_and_an_unreadable_one_is_refused() {
+async fn wal_parse_errors_reset_history_but_io_errors_still_fail() {
     let fixture = Fixture::new();
     assert!(!fixture.log().exists(), "a fresh seed has no log");
 
@@ -883,13 +1987,38 @@ async fn an_absent_log_is_unowned_and_an_unreadable_one_is_refused() {
     );
     drop(shell);
 
-    std::fs::write(fixture.log(), b"{ this is not a record }\n").expect("corrupt the log");
+    let mut raw = std::fs::read(fixture.log()).expect("read the valid log");
+    raw.extend_from_slice(b"{ this is not a record }\n");
+    std::fs::write(fixture.log(), raw).expect("append a record that fails to parse");
+
+    let shell = fixture.shell().await;
+    assert_eq!(
+        std::fs::read(fixture.seed.join("owned")).expect("the seed's file"),
+        b"first",
+        "the seed keeps what was already published"
+    );
+    let (code, outcome) = run(&shell, "printf second > owned").await;
+    assert_eq!(code, 0);
+    assert_eq!(
+        published(outcome).0,
+        Publication { seq: 1, ops: 1 },
+        "the reset log's history and ownership are gone, so publication restarts at sequence 1"
+    );
+    assert_eq!(
+        std::fs::read(fixture.seed.join("owned")).expect("the seed's file"),
+        b"second",
+        "the new shell could publish over the formerly owned path"
+    );
+    drop(shell);
+
+    std::fs::remove_file(fixture.log()).expect("remove the WAL");
+    std::fs::create_dir(fixture.log()).expect("put a directory where the WAL was");
     let error = fixture
         .open()
         .expect_err("a log that cannot be read yields no session");
     assert!(
-        matches!(error, MarshError::Wal(_)),
-        "an unreadable log is a refusal, not an open gate: got {error:?}"
+        matches!(error, MarshError::Wal(marsh_wal::Error::Io(_))),
+        "an I/O failure reading the log is a refusal, not a parse error to reset: got {error:?}"
     );
 }
 
@@ -970,6 +2099,7 @@ async fn recovery_replays_an_unfinished_transaction_then_sweeps() {
             from: PathBuf::from("a.txt"),
             to: PathBuf::from("a.txt"),
             sha1: hex::encode(Sha1::digest(b"seed\n")),
+            directory_mode: None,
         },
     ])
     .expect("append an unfinished transaction");
@@ -1093,24 +2223,65 @@ async fn two_principals_publish_concurrently_over_one_seed() {
     );
 }
 
+/// The reported conflict, exactly as two terminals produce it: one shell writes an unstaged file
+/// and the next shell's append to the *same* file is refused.
+///
+/// Both snapshots exist before either line runs, which is what makes this a concurrency question
+/// rather than a sequence of edits by one owner. The refusal is a capability decision — the second
+/// shell may not edit a resource the first holds unstaged — and it is final: there is nothing to
+/// rerun, because rerunning would be refused for the same reason.
 #[tokio::test]
 #[serial]
-async fn a_line_that_lost_the_race_is_stale() {
+async fn an_unstaged_file_another_shell_owns_cannot_be_edited() {
     let fixture = Fixture::new();
     let validator = validator();
     let seed = fixture.open().expect("attach to the seed");
-    let a = Shell::build(
-        seed.snapshot(Principal::from("a")).expect("a's snapshot"),
-        validator.clone(),
-    )
-    .await
-    .expect("build a");
-    let b = Shell::build(
-        seed.snapshot(Principal::from("b")).expect("b's snapshot"),
-        validator.clone(),
-    )
-    .await
-    .expect("build b");
+    let first = shell_as(&seed, &validator, "first").await;
+    let second = shell_as(&seed, &validator, "second").await;
+
+    let (code, outcome) = run(&first, "echo foo > test.txt").await;
+    assert_eq!(code, 0);
+    assert_eq!(published(outcome).0, Publication { seq: 1, ops: 1 });
+
+    let (code, outcome) = run(&second, "echo foo2 >> test.txt").await;
+    assert_eq!(code, 0, "the program itself succeeded");
+    let denials = denied(&outcome);
+    assert_eq!(
+        denials.iter().map(|denial| &denial.event).collect::<Vec<_>>(),
+        vec![&event(&second, Action::Edit, "test.txt")],
+        "the refusal names this shell's edit of the file the other one owns"
+    );
+
+    assert_eq!(
+        std::fs::read_to_string(fixture.seed.join("test.txt")).expect("the seed's file"),
+        "foo\n",
+        "the seed carries the owner's bytes and nothing appended to them"
+    );
+    assert_eq!(
+        validator.lock().expect("the history").history(),
+        [Event::new(Principal::from("first"), Action::Edit, ["test.txt"])],
+        "a denial grants nothing"
+    );
+    assert_eq!(
+        fixture.wal().iter().filter(|record| matches!(record, WalRecord::Begin { .. })).count(),
+        1,
+        "and publishes nothing"
+    );
+}
+
+/// Two shells truncating the same file: the loser is denied, not asked to try again.
+///
+/// A truncating write depends on nothing that was there before, so there is no read to
+/// resynchronize and nothing a second evaluation would decide differently. What is left is the
+/// ownership question, and the capability policy is what answers it.
+#[tokio::test]
+#[serial]
+async fn a_concurrent_unstaged_edit_is_denied() {
+    let fixture = Fixture::new();
+    let validator = validator();
+    let seed = fixture.open().expect("attach to the seed");
+    let a = shell_as(&seed, &validator, "a").await;
+    let b = shell_as(&seed, &validator, "b").await;
 
     // Behind the gate's back, so b's line is staged but unconcluded when a's boundary lands.
     let mut guard = b.shell_ref().lock().await;
@@ -1128,17 +2299,15 @@ async fn a_line_that_lost_the_race_is_stale() {
     let mut guard = b.shell_ref().lock().await;
     let outcome = b
         .conclude(&mut guard, "printf y > p.txt")
+        .await
         .expect("conclude b's line");
     drop(guard);
-    let Outcome::Stale { stale, .. } = &outcome else {
-        panic!("expected a stale line, got {outcome:?}");
-    };
     assert_eq!(
-        stale,
-        &vec![StalePath {
-            path: PathBuf::from("p.txt"),
-            merged_seq: 1,
-        }]
+        denied(&outcome)
+            .iter()
+            .map(|denial| &denial.event)
+            .collect::<Vec<_>>(),
+        vec![&event(&b, Action::Edit, "p.txt")],
     );
 
     assert_eq!(
@@ -1161,6 +2330,730 @@ async fn a_line_that_lost_the_race_is_stale() {
         validator.lock().expect("the history").history(),
         [Event::new(Principal::from("a"), Action::Edit, ["p.txt"])],
         "only the winner's edit was ever granted"
+    );
+}
+
+/// A line that *read* a file another shell republishes while it ran is evaluated again, against
+/// the bytes that are now current.
+///
+/// The proof is the attempt counter reaching two while the line is still held at its second
+/// barrier: the replay is a reaction to the observed read, not something that happens once a line
+/// finishes and is found to be out of date.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn a_read_of_a_republished_file_is_evaluated_again() {
+    let fixture = Fixture::new();
+    std::fs::write(fixture.seed.join("foo.txt"), b"old\n").expect("seed foo.txt");
+    let validator = validator();
+    let seed = fixture.open().expect("attach to the seed");
+    let reader = Arc::new(shell_as(&seed, &validator, "reader").await);
+    let writer = shell_as(&seed, &validator, "writer").await;
+
+    let attempts = Attempts::new(&fixture, "reader-attempts");
+    let before = Gate::new(&fixture, "before-read");
+    let after = Gate::new(&fixture, "after-read");
+    let line = format!(
+        "{}; {}; /bin/cat foo.txt > observed.txt; {}",
+        attempts.record(),
+        before.wait(),
+        after.wait()
+    );
+
+    let held = tokio::spawn({
+        let reader = Arc::clone(&reader);
+        let line = line.clone();
+        async move { reader.run(&line).await }
+    });
+    until("the reader's first evaluation", || attempts.count() >= 1).await;
+
+    let (code, outcome) = run(&writer, "printf 'new\n' > foo.txt").await;
+    assert_eq!(code, 0);
+    assert_eq!(published(outcome).0.seq, 1);
+
+    // Only the first barrier: the reader must react to the read it then makes, while it is still
+    // held at the second one.
+    before.open();
+    until("the reader's second evaluation", || attempts.count() >= 2).await;
+    assert!(
+        !fixture.seed.join("observed.txt").exists(),
+        "the abandoned evaluation published nothing"
+    );
+
+    after.open();
+    let (_, outcome) = held.await.expect("join the reader").expect("the reader's line");
+    let (publication, granted) = published(outcome);
+    assert_eq!(publication.ops, 1, "only its own file: {publication:?}");
+    assert_eq!(
+        granted,
+        vec![event(&reader, Action::Edit, "observed.txt")],
+        "the replay requested what it wrote, and the abandoned attempt requested nothing"
+    );
+    assert_eq!(
+        attempts.count(),
+        2,
+        "one invalidation, one replay — not a loop"
+    );
+    assert_eq!(
+        std::fs::read_to_string(fixture.seed.join("observed.txt")).expect("the observation"),
+        "new\n",
+        "the line saw the bytes that are current, not the ones it started against"
+    );
+}
+
+/// The same dependency, read by the shell itself rather than by a program it started.
+///
+/// A redirection and a `read` builtin never reach the spawner, so this is the case a
+/// command-line-shaped rule would miss entirely: what says the file was read is the syscall.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn an_in_process_read_is_a_dependency_too() {
+    let fixture = Fixture::new();
+    std::fs::write(fixture.seed.join("foo.txt"), b"old\n").expect("seed foo.txt");
+    let validator = validator();
+    let seed = fixture.open().expect("attach to the seed");
+    let reader = Arc::new(shell_as(&seed, &validator, "reader").await);
+    let writer = shell_as(&seed, &validator, "writer").await;
+
+    let attempts = Attempts::new(&fixture, "reader-attempts");
+    let before = Gate::new(&fixture, "before-read");
+    let after = Gate::new(&fixture, "after-read");
+    let line = format!(
+        "{}; {}; read -r seen < foo.txt; printf '%s\\n' \"$seen\" > observed.txt; {}",
+        attempts.record(),
+        before.wait(),
+        after.wait()
+    );
+
+    let held = tokio::spawn({
+        let reader = Arc::clone(&reader);
+        async move { reader.run(&line).await }
+    });
+    until("the reader's first evaluation", || attempts.count() >= 1).await;
+
+    run(&writer, "printf 'new\n' > foo.txt").await;
+    before.open();
+    until("the reader's second evaluation", || attempts.count() >= 2).await;
+    after.open();
+
+    let (_, outcome) = held.await.expect("join the reader").expect("the reader's line");
+    published(outcome);
+    assert_eq!(
+        std::fs::read_to_string(fixture.seed.join("observed.txt")).expect("the observation"),
+        "new\n"
+    );
+}
+
+/// A publication of a file this line never touched changes nothing about it.
+///
+/// Concurrency is the point of the design: two shells doing unrelated work must both make
+/// progress, and a whole-seed version number would make every publication invalidate every other
+/// shell.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn a_publication_of_another_file_does_not_replay_a_reader() {
+    let fixture = Fixture::new();
+    std::fs::write(fixture.seed.join("foo.txt"), b"old\n").expect("seed foo.txt");
+    let validator = validator();
+    let seed = fixture.open().expect("attach to the seed");
+    let reader = Arc::new(shell_as(&seed, &validator, "reader").await);
+    let writer = shell_as(&seed, &validator, "writer").await;
+
+    let attempts = Attempts::new(&fixture, "reader-attempts");
+    let before = Gate::new(&fixture, "before-read");
+    let after = Gate::new(&fixture, "after-read");
+    let line = format!(
+        "{}; {}; /bin/cat foo.txt > observed.txt; {}",
+        attempts.record(),
+        before.wait(),
+        after.wait()
+    );
+
+    let held = tokio::spawn({
+        let reader = Arc::clone(&reader);
+        async move { reader.run(&line).await }
+    });
+    until("the reader's first evaluation", || attempts.count() >= 1).await;
+
+    // A different file entirely, published while the reader is held.
+    let (code, outcome) = run(&writer, "printf 'bar\n' > bar.txt").await;
+    assert_eq!(code, 0);
+    assert_eq!(published(outcome).0.ops, 1);
+
+    before.open();
+    after.open();
+    let (_, outcome) = held.await.expect("join the reader").expect("the reader's line");
+    published(outcome);
+    assert_eq!(
+        attempts.count(),
+        1,
+        "an unrelated publication is not a dependency"
+    );
+    assert_eq!(
+        std::fs::read_to_string(fixture.seed.join("observed.txt")).expect("the observation"),
+        "old\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(fixture.seed.join("bar.txt")).expect("the writer's file"),
+        "bar\n"
+    );
+}
+
+/// Staging a file releases it, and the older shell's append to it is then evaluated against the
+/// staged bytes rather than refused.
+///
+/// The replay here is driven by the append's own read of `foo.txt`; the publication it then makes
+/// has to carry both lines, which is what proves it started again from the new content instead of
+/// merging over it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn a_released_file_is_appended_to_after_resynchronizing() {
+    let fixture = Fixture::new();
+    init_repository(&fixture.seed);
+    std::fs::write(fixture.seed.join("foo.txt"), b"first\n").expect("seed foo.txt");
+    let validator = validator();
+    let seed = fixture.open().expect("attach to the seed");
+    let reader = Arc::new(shell_as(&seed, &validator, "reader").await);
+    let writer = shell_as(&seed, &validator, "writer").await;
+    export_git_identity(&reader).await;
+    export_git_identity(&writer).await;
+
+    let attempts = Attempts::new(&fixture, "reader-attempts");
+    let before = Gate::new(&fixture, "before-append");
+    let line = format!(
+        "{}; {}; printf 'second\\n' >> foo.txt",
+        attempts.record(),
+        before.wait()
+    );
+
+    let held = tokio::spawn({
+        let reader = Arc::clone(&reader);
+        async move { reader.run(&line).await }
+    });
+    until("the reader's first evaluation", || attempts.count() >= 1).await;
+
+    // The writer edits and then stages, which is what releases the resource.
+    run(&writer, "printf 'staged\n' > foo.txt").await;
+    let (code, outcome) = run(&writer, "git add -- foo.txt").await;
+    assert_eq!(code, 0);
+    published(outcome);
+
+    before.open();
+    let (_, outcome) = held.await.expect("join the reader").expect("the reader's line");
+    published(outcome);
+    assert!(
+        attempts.count() >= 2,
+        "the append read a file the writer had republished: {}",
+        attempts.count()
+    );
+    assert_eq!(
+        std::fs::read_to_string(fixture.seed.join("foo.txt")).expect("the seed's file"),
+        "staged\nsecond\n",
+        "the append started again from the staged bytes"
+    );
+}
+
+/// Two shells staging *different* files: both entries survive, because the dependency that forces
+/// the replay is the index each one actually read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn concurrent_staging_of_different_files_keeps_both_entries() {
+    let fixture = Fixture::new();
+    init_repository(&fixture.seed);
+    let validator = validator();
+    let seed = fixture.open().expect("attach to the seed");
+    let held_shell = Arc::new(shell_as(&seed, &validator, "held").await);
+    let other = shell_as(&seed, &validator, "other").await;
+    export_git_identity(&held_shell).await;
+    export_git_identity(&other).await;
+
+    let attempts = Attempts::new(&fixture, "held-attempts");
+    let before = Gate::new(&fixture, "before-add");
+    let line = format!(
+        "{}; printf 'held\\n' > held.txt; {}; git add -- held.txt",
+        attempts.record(),
+        before.wait()
+    );
+
+    let held = tokio::spawn({
+        let shell = Arc::clone(&held_shell);
+        async move { shell.run(&line).await }
+    });
+    until("the held shell's first evaluation", || attempts.count() >= 1).await;
+
+    run(&other, "printf 'other\n' > other.txt").await;
+    let (code, outcome) = run(&other, "git add -- other.txt").await;
+    assert_eq!(code, 0);
+    published(outcome);
+
+    before.open();
+    let (_, outcome) = held.await.expect("join the held shell").expect("its line");
+    published(outcome);
+
+    let repository = git2::Repository::open(&fixture.seed).expect("open the seed's repository");
+    let index = repository.index().expect("the index");
+    let staged: Vec<String> = index
+        .iter()
+        .map(|entry| String::from_utf8_lossy(&entry.path).into_owned())
+        .collect();
+    assert!(
+        staged.contains(&"held.txt".to_string()) && staged.contains(&"other.txt".to_string()),
+        "both staged entries survive: {staged:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(fixture.seed.join("held.txt")).expect("held.txt"),
+        "held\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(fixture.seed.join("other.txt")).expect("other.txt"),
+        "other\n"
+    );
+}
+
+/// A shell over `seed` for `principal` with the fixture git environment, standing in `repo`.
+async fn repository_shell_as(
+    seed: &MarshExecutor,
+    validator: &Arc<Mutex<PolicyValidator>>,
+    principal: &str,
+) -> Shell {
+    let shell = shell_as(seed, validator, principal).await;
+    export_git_identity(&shell).await;
+    checked(&shell, "cd repo").await;
+    shell
+}
+
+/// A git read that another principal's publication made stale is evaluated again against the
+/// current bytes — its local edit and its in-snapshot output redirection with it — and observing
+/// a resource claims nothing: the next principal may still delete what was read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn git_policy_a_fresh_grep_claims_nothing() {
+    let fixture = Fixture::new();
+    committed_repository(
+        &fixture.seed.join("repo"),
+        &[("remote.txt", "needle old\n"), ("other.txt", "needle other\n")],
+    );
+    let validator = validator();
+    let seed = fixture.open().expect("attach to the seed");
+    let reader = Arc::new(repository_shell_as(&seed, &validator, "reader").await);
+    let writer = repository_shell_as(&seed, &validator, "writer").await;
+
+    let attempts = Attempts::new(&fixture, "reader-attempts");
+    let gate = Gate::new(&fixture, "before-grep");
+    let line = format!(
+        "{}; printf 'local\\n' > local.txt; {}; git grep -h needle -- remote.txt > found.txt",
+        attempts.record(),
+        gate.wait()
+    );
+    let held = tokio::spawn({
+        let reader = Arc::clone(&reader);
+        async move { reader.run(&line).await }
+    });
+    until("the reader's first evaluation", || attempts.count() >= 1).await;
+    checked(&writer, "printf 'needle new\\n' > remote.txt").await;
+    gate.open();
+
+    let (_, outcome) = held.await.expect("join the reader").expect("the reader's line");
+    assert_eq!(
+        published(outcome).1,
+        events(
+            &reader,
+            &[(Action::Edit, "repo/local.txt"), (Action::Edit, "repo/found.txt")]
+        ),
+        "the grep itself requested nothing"
+    );
+    assert!(attempts.count() >= 2, "the stale read was evaluated again");
+    let repo = fixture.seed.join("repo");
+    assert_eq!(read(&repo.join("found.txt")), "needle new\n");
+    assert_eq!(read(&repo.join("local.txt")), "local\n");
+    assert!(
+        validator
+            .lock()
+            .expect("the history")
+            .history()
+            .iter()
+            .all(|event| !event.action.is_read()),
+        "no read claim entered the history"
+    );
+
+    checked(&reader, "git grep -q needle -- other.txt").await;
+    assert_eq!(
+        checked(&writer, "git rm -q -- other.txt").await,
+        events(&writer, &[(Action::Delete, "repo/other.txt")]),
+        "a path somebody only read is still anybody's to delete"
+    );
+}
+
+/// A read whose line also edited a path another principal has since edited is evaluated again,
+/// and the replay's edit is then refused: nothing of the line — its edit, its git state — reaches
+/// the seed or the history.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn git_policy_a_read_after_a_conflicting_edit_is_denied() {
+    let fixture = Fixture::new();
+    committed_repository(&fixture.seed.join("repo"), &[("p", "base\n")]);
+    let validator = validator();
+    let seed = fixture.open().expect("attach to the seed");
+    let reader = Arc::new(repository_shell_as(&seed, &validator, "reader").await);
+    let writer = repository_shell_as(&seed, &validator, "writer").await;
+
+    let attempts = Attempts::new(&fixture, "reader-attempts");
+    let gate = Gate::new(&fixture, "before-grep");
+    let line = format!(
+        "{}; printf 'reader\\n' > p; {}; git grep -q reader -- p",
+        attempts.record(),
+        gate.wait()
+    );
+    let held = tokio::spawn({
+        let reader = Arc::clone(&reader);
+        async move { reader.run(&line).await }
+    });
+    until("the reader's first evaluation", || attempts.count() >= 1).await;
+    checked(&writer, "printf 'writer\\n' > p").await;
+    let history = validator.lock().expect("the history").history().to_vec();
+    gate.open();
+
+    let (_, outcome) = held.await.expect("join the reader").expect("the reader's line");
+    assert_eq!(
+        denied(&outcome)
+            .iter()
+            .map(|denial| denial.event.clone())
+            .collect::<Vec<_>>(),
+        events(&reader, &[(Action::Edit, "repo/p")])
+    );
+    assert_eq!(read(&fixture.seed.join("repo/p")), "writer\n");
+    assert_eq!(validator.lock().expect("the history").history(), history.as_slice());
+}
+
+/// A hard reset in one principal's tree is a checkout of every path it restores: refused over
+/// another principal's unstaged edit — seed, repository and history untouched — and granted to
+/// the owner, after which the path is anybody's again.
+#[tokio::test]
+#[serial]
+async fn git_policy_a_hard_reset_cannot_discard_another_principals_edit() {
+    let fixture = Fixture::new();
+    let repo = fixture.seed.join("repo");
+    committed_repository(&repo, &[("p", "base\n")]);
+    let validator = validator();
+    let seed = fixture.open().expect("attach to the seed");
+    let owner = repository_shell_as(&seed, &validator, "owner").await;
+    let other = repository_shell_as(&seed, &validator, "other").await;
+    checked(&owner, "printf 'owned\\n' > p").await;
+    let index = git_out(&repo, &["ls-files", "--stage"]);
+    let history = validator.lock().expect("the history").history().to_vec();
+
+    let (code, outcome) = run(&other, "git reset -q --hard").await;
+    assert_eq!(code, 0, "git itself succeeded in the other principal's tree");
+    assert_eq!(
+        denied(&outcome)
+            .iter()
+            .map(|denial| denial.event.clone())
+            .collect::<Vec<_>>(),
+        events(&other, &[(Action::Checkout, "repo/p")])
+    );
+    assert_eq!(read(&repo.join("p")), "owned\n");
+    assert_eq!(git_out(&repo, &["ls-files", "--stage"]), index);
+    assert_eq!(validator.lock().expect("the history").history(), history.as_slice());
+
+    assert_eq!(
+        checked(&owner, "git reset -q --hard").await,
+        events(&owner, &[(Action::Checkout, "repo/p")]),
+        "the owner's reset restores its own edit"
+    );
+    assert_eq!(read(&repo.join("p")), "base\n");
+    assert_eq!(
+        checked(&other, "printf 'next\\n' > p").await,
+        events(&other, &[(Action::Edit, "repo/p")])
+    );
+}
+
+/// Metadata a git command creates is never an edit, and never hides one: the files a line wrote
+/// before `git init --bare` turned their directory into a repository are still requested.
+#[tokio::test]
+#[serial]
+async fn git_policy_metadata_hides_no_ordinary_write() {
+    let fixture = Fixture::new();
+    std::fs::create_dir_all(fixture.seed.join("repo")).expect("a directory");
+    let shell = repository_shell(&fixture).await;
+
+    assert_eq!(
+        checked(
+            &shell,
+            "mkdir meta; printf 'x\\n' > meta/notes; git init -q --bare meta"
+        )
+        .await,
+        events(&shell, &[(Action::Edit, "repo/meta/notes")])
+    );
+    assert_eq!(
+        git_out(&fixture.seed.join("repo/meta"), &["rev-parse", "--is-bare-repository"]),
+        "true"
+    );
+    assert_eq!(
+        checked(
+            &shell,
+            "git init -q --separate-git-dir=separate work; printf 'w\\n' > work/w"
+        )
+        .await,
+        events(&shell, &[(Action::Edit, "repo/work/w")])
+    );
+}
+
+/// Every request is a real transition of a real path: an implicit `add -A` over an index larger
+/// than a pipe asks only for what changed, repeated transitions of one path survive in order,
+/// two commits in one line keep their own messages, a write undone within its line asks for
+/// nothing, and a write after a checkout is an edit after it.
+#[tokio::test]
+#[serial]
+async fn git_policy_requests_are_exact_footprints() {
+    let fixture = Fixture::new();
+    let repo = fixture.seed.join("repo");
+    let files: Vec<(String, String)> = (0..3000)
+        .map(|n| (format!("f/{n:04}"), format!("{n}\n")))
+        .collect();
+    let borrowed: Vec<(&str, &str)> = files
+        .iter()
+        .map(|(path, contents)| (path.as_str(), contents.as_str()))
+        .collect();
+    committed_repository(&repo, &borrowed);
+    commit_files(&repo, &[("p", "p\n"), ("q", "q\n")], "two more");
+    assert!(git_out(&repo, &["ls-files", "--stage", "-z"]).len() > 64 * 1024);
+    let shell = repository_shell(&fixture).await;
+
+    assert_eq!(
+        checked(&shell, "printf 'x\\n' > f/0007; git add -A").await,
+        events(&shell, &[(Action::Edit, "repo/f/0007"), (Action::Stage, "repo/f/0007")])
+    );
+    assert_eq!(
+        checked(
+            &shell,
+            "printf a > p; git add -- p; printf b > p; git add -- p"
+        )
+        .await,
+        events(
+            &shell,
+            &[
+                (Action::Edit, "repo/p"),
+                (Action::Stage, "repo/p"),
+                (Action::Edit, "repo/p"),
+                (Action::Stage, "repo/p"),
+            ]
+        )
+    );
+    assert_eq!(
+        checked(
+            &shell,
+            "git commit -q -m one; printf 'q2\\n' > q; git add -- q; git commit -q -m two"
+        )
+        .await,
+        events(
+            &shell,
+            &[
+                (Action::commit("one"), "repo/f/0007"),
+                (Action::commit("one"), "repo/p"),
+                (Action::Edit, "repo/q"),
+                (Action::Stage, "repo/q"),
+                (Action::commit("two"), "repo/q"),
+            ]
+        )
+    );
+    assert_eq!(checked(&shell, "printf z > z; rm z").await, Vec::new());
+    checked(&shell, "printf 'dirty\\n' > p").await;
+    assert_eq!(
+        checked(&shell, "git checkout HEAD -- p; printf 'later\\n' > p").await,
+        events(&shell, &[(Action::Checkout, "repo/p"), (Action::Edit, "repo/p")])
+    );
+}
+
+/// A merge that stops on a conflict exits 1 and still changed the tree: its conflict markers and
+/// unmerged index are published, as the edit they are.
+#[tokio::test]
+#[serial]
+async fn git_policy_a_conflicted_merge_is_an_edit() {
+    let fixture = Fixture::new();
+    let repo = fixture.seed.join("repo");
+    committed_repository(&repo, &[("p", "base\n")]);
+    native_git(&repo, &["switch", "-q", "-c", "feature"]);
+    commit_files(&repo, &[("p", "feature\n")], "feature p");
+    native_git(&repo, &["switch", "-q", "main"]);
+    commit_files(&repo, &[("p", "main\n")], "main p");
+    let shell = repository_shell(&fixture).await;
+
+    assert_eq!(
+        exits(&shell, "git merge feature > /dev/null", 1).await,
+        events(&shell, &[(Action::Edit, "repo/p")])
+    );
+    assert!(read(&repo.join("p")).contains("<<<<<<<"));
+    assert!(!git_out(&repo, &["ls-files", "-u"]).is_empty(), "the index is unmerged");
+}
+
+/// Git runs through the shell's recorded spawner — the command and its probes are spawn records
+/// like any other — and two inspections can share a pipeline, however much one feeds the other:
+/// the consumer reads every byte of an output far larger than a pipe holds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn git_policy_git_runs_are_recorded_and_inspections_pipe() {
+    let fixture = Fixture::new();
+    let lines = (0..20_000).fold(String::new(), |mut lines, n| {
+        lines.push_str("needle ");
+        lines.push_str(&n.to_string());
+        lines.push('\n');
+        lines
+    });
+    assert!(lines.len() > 64 * 1024);
+    committed_repository(&fixture.seed.join("repo"), &[("p", &lines), ("q", &lines)]);
+    let shell = repository_shell(&fixture).await;
+    let mark = shell.executor().spawn_records().len();
+
+    assert_eq!(
+        checked(
+            &shell,
+            "git grep -h needle -- p | git diff --no-index --exit-code - q"
+        )
+        .await,
+        Vec::new(),
+        "the consumer saw exactly what the producer printed"
+    );
+
+    checked(&shell, "printf 'n\\n' > n; git add -- n").await;
+    let gits: Vec<Vec<String>> = shell.executor().spawn_records()[mark..]
+        .iter()
+        .filter_map(|record| match record {
+            SpawnRecord::Spawned { request, .. } if request.program.ends_with("git") => {
+                Some(request.args.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(
+        gits.iter().any(|args| args.first().map(String::as_str) == Some("add")),
+        "the command itself: {gits:?}"
+    );
+    assert!(
+        gits.iter().any(|args| args.iter().any(|arg| arg == "ls-files")),
+        "and the probes around it: {gits:?}"
+    );
+}
+
+/// Two state-changing gits at once in one tree cannot be told apart, so the second is refused
+/// without running and the line fails whole; a git still running at the boundary is ended and
+/// fails its line the same way. Neither leaves anything in the seed or the history, and the
+/// shell goes on working.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn git_policy_unattributable_gits_fail_their_line() {
+    let fixture = Fixture::new();
+    let repo = fixture.seed.join("repo");
+    committed_repository(&repo, &[("p", "p\n")]);
+    let started = fixture.outside("hook-started");
+    let gate = Gate::new(&fixture, "hook-gate");
+    let hook = repo.join(".git/hooks/pre-commit");
+    std::fs::write(
+        &hook,
+        format!("#!/bin/sh\ntouch {}\n{}\n", started.display(), gate.wait()),
+    )
+    .expect("a hook");
+    std::fs::set_permissions(&hook, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+        .expect("chmod the hook");
+    let validator = validator();
+    let shell = Shell::build(fixture.open().expect("attach"), Arc::clone(&validator))
+        .await
+        .expect("build the shell");
+    export_git_identity(&shell).await;
+    checked(&shell, "cd repo").await;
+    checked(&shell, "printf 'p2\\n' > p; git add -- p").await;
+    let history = validator.lock().expect("the history").history().to_vec();
+    let head = git_out(&repo, &["rev-parse", "HEAD"]);
+
+    let tag_code = fixture.outside("tag-code");
+    let overlapping = format!(
+        "git commit -q -m held & while [ ! -e {} ]; do sleep 0.02; done; git tag v1 2>/dev/null; \
+         echo $? > {}; touch {}; wait",
+        started.display(),
+        tag_code.display(),
+        gate.0.display()
+    );
+    let Err(error) = shell.run(&overlapping).await else {
+        panic!("an unattributable line has no verdict");
+    };
+    assert!(error.to_string().contains("overlapping"), "{error}");
+    assert_eq!(read(&tag_code), "128\n", "the second git never ran");
+    assert_eq!(git_out(&repo, &["rev-parse", "HEAD"]), head);
+    assert!(!git_ok(&repo, &["rev-parse", "-q", "--verify", "refs/tags/v1"]));
+    assert_eq!(validator.lock().expect("the history").history(), history.as_slice());
+
+    std::fs::remove_file(&started).expect("reset the hook's marker");
+    std::fs::remove_file(&gate.0).expect("close the gate");
+    let Err(error) = shell
+        .run(&format!(
+            "git commit -q -m background & while [ ! -e {} ]; do sleep 0.02; done",
+            started.display()
+        ))
+        .await
+    else {
+        panic!("a git still running at the boundary fails its line");
+    };
+    assert!(error.to_string().contains("still running"), "{error}");
+    assert_eq!(git_out(&repo, &["rev-parse", "HEAD"]), head);
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        match shell.run("printf 'ok\\n' > ok.txt").await {
+            Ok((_, outcome)) => {
+                assert_eq!(published(outcome).1, events(&shell, &[(Action::Edit, "repo/ok.txt")]));
+                break;
+            }
+            Err(error) => {
+                assert!(Instant::now() < deadline, "the shell never recovered: {error}");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+    }
+}
+
+/// A published line leaves nothing behind to publish again: a following line that changes
+/// nothing — an inspection included — writes no transaction and requests nothing.
+#[tokio::test]
+#[serial]
+async fn git_policy_a_published_line_is_not_republished() {
+    let fixture = Fixture::new();
+    committed_repository(&fixture.seed.join("repo"), &[("p", "p\n")]);
+    let shell = repository_shell(&fixture).await;
+    checked(&shell, "printf 'x\\n' > x").await;
+    let records = fixture.wal().len();
+    for line in [
+        "true",
+        "git status > /dev/null",
+        "git grep -q p -- p",
+        "git --version > /dev/null",
+        "git > /dev/null; true",
+        "true",
+    ] {
+        let (code, outcome) = run(&shell, line).await;
+        assert_eq!(code, 0, "{line}");
+        let (publication, granted) = published(outcome);
+        assert_eq!((publication.ops, granted), (0, Vec::new()), "{line}");
+    }
+    assert_eq!(fixture.wal().len(), records, "no transaction was logged");
+}
+
+/// The host's git configuration reaches a managed git no more than a stock one.
+#[tokio::test]
+#[serial]
+async fn git_policy_host_configuration_is_isolated() {
+    let fixture = Fixture::new();
+    committed_repository(&fixture.seed.join("repo"), &[("p", "p\n")]);
+    let hostile = fixture.outside("hostile.gitconfig");
+    std::fs::write(&hostile, "[alias]\n\tst = status\n[core]\n\tautocrlf = true\n")
+        .expect("a hostile configuration");
+    let shell = repository_shell(&fixture).await;
+    let exports = format!(
+        "export GIT_CONFIG_GLOBAL={0} GIT_CONFIG_SYSTEM={0} GIT_CONFIG_NOSYSTEM=",
+        hostile.display()
+    );
+    checked(&shell, &exports).await;
+    assert_eq!(exits(&shell, "git st 2>/dev/null", 1).await, Vec::new());
+    assert_eq!(
+        exits(&shell, "git config --get core.autocrlf", 1).await,
+        Vec::new()
     );
 }
 

@@ -459,24 +459,7 @@ fn exact_current_session_window_name_target(
     ))
 }
 
-fn signed_window_target_session_part(raw_target: &str) -> Option<Option<&str>> {
-    if signed_window_index_target(raw_target) {
-        return Some(None);
-    }
-    let (session, window) = raw_target.split_once(':')?;
-    if session.is_empty() || !signed_window_index_target(window) {
-        return None;
-    }
-    Some(Some(session))
-}
-
-fn signed_window_index_target(value: &str) -> bool {
-    let Some(rest) = value.strip_prefix(['+', '-']) else {
-        return false;
-    };
-    rest.is_empty() || rest.bytes().all(|byte| byte.is_ascii_digit())
-}
-
+use super::super::signed_window_target_session_part;
 pub(in crate::handler::scripting_support) fn parse_swap_window(
     mut args: CommandTokens,
     sessions: &SessionStore,

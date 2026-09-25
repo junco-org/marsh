@@ -1874,21 +1874,10 @@ fn attach_target_for_session_with_prompt(
             .unwrap_or_else(|| rmux_core::PaneGeometry::new(0, 0, 0, 0))
         },
     );
-    let active_pane_is_starting = {
-        #[cfg(windows)]
-        {
-            state.active_pane_is_starting(session_name)
-        }
-        #[cfg(not(windows))]
-        {
-            false
-        }
-    };
-    let terminal_passthrough_allowed = !active_pane_is_starting
-        && active_pane.as_ref().is_some_and(|pane| {
-            !state.pane_in_mode(session_name, pane.id())
-                && pane_passthrough_enabled(session, &state.options, pane)
-        });
+    let terminal_passthrough_allowed = active_pane.as_ref().is_some_and(|pane| {
+        !state.pane_in_mode(session_name, pane.id())
+            && pane_passthrough_enabled(session, &state.options, pane)
+    });
     let kitty_graphics_passthrough =
         terminal_passthrough_allowed && outer_terminal.supports_kitty_graphics();
     let sixel_passthrough = terminal_passthrough_allowed && outer_terminal.supports_sixel();
@@ -1896,7 +1885,7 @@ fn attach_target_for_session_with_prompt(
     Ok(AttachTarget {
         session_name: session_name.clone(),
         live_pane_handover: match options.master {
-            AttachTargetMaster::Clone if !active_pane_is_starting => {
+            AttachTargetMaster::Clone => {
                 // Still resolved rather than simply asserted: the pane-master clone this
                 // replaces refused an attach whose active pane had no terminal, and a client
                 // told it owns the live pane when there is no pane behind it would watch
@@ -1908,7 +1897,7 @@ fn attach_target_for_session_with_prompt(
                 )?;
                 true
             }
-            AttachTargetMaster::Clone | AttachTargetMaster::Omit => false,
+            AttachTargetMaster::Omit => false,
         },
         pane_output,
         pane_output_start_sequence,

@@ -14,9 +14,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Barrier;
 
-fn session_name(value: &str) -> rmux_proto::SessionName {
-    rmux_proto::SessionName::new(value).expect("valid session name")
-}
+use crate::test_names::session_name;
 
 fn set_buffer_request(name: Option<&str>, content: &[u8]) -> SetBufferRequest {
     SetBufferRequest {

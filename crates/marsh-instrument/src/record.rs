@@ -22,9 +22,13 @@
 //! streams into one ordered sequence well defined.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, PoisonError};
+use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use marsh_lib::Recorder;
+
+use crate::strace::{TraceObserver, TraceScope, Tracing};
 
 /// One builtin lifecycle record.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -70,39 +74,157 @@ impl BuiltinRecord {
     }
 }
 
-/// The canonical [`crate::BuiltinHook`]: records every builtin lifecycle in memory.
+/// The host's one shared recorder, kept alive only by the sessions using it.
+///
+/// A weak slot rather than a `LazyLock`: a process that opened a seed, closed it and opened
+/// another must start a *new* tracer, because stopping the first one released every root. What
+/// the cache guarantees is the other half — that two sessions alive at the same time share one
+/// recorder, one tracer and one decoder.
+static SHARED: Mutex<Weak<RecordingHook>> = Mutex::new(Weak::new());
+
+/// The canonical [`crate::BuiltinHook`]: records every builtin lifecycle in memory, and — when it
+/// is the host's shared one — observes every file access its registered snapshots make.
+///
+/// The record log is a [`Recorder`], the same one [`SpawnRecorder`] keeps: builtin lifecycles and
+/// spawn attempts differ in their record vocabulary, not in how a record log is allocated,
+/// appended to and observed.
+///
+/// [`Default`] is an independent, *nontracing* recorder. That is what an instrumentation test or
+/// an embedder that only wants builtin records gets, and it is why constructing one never starts a
+/// tracer. [`Self::shared`] is the other constructor, and the one a gated session uses.
 #[derive(Default)]
 pub struct RecordingHook {
-    records: Mutex<Vec<BuiltinRecord>>,
-    next: AtomicU64,
+    /// The builtin lifecycle log.
+    builtins: Recorder<BuiltinRecord>,
+    /// The tracer and its decoder, for a shared recorder only.
+    tracing: Option<Arc<Tracing>>,
 }
 
 impl RecordingHook {
-    /// Every record collected so far, in the order the shell produced them.
+    /// The host's shared recorder, made on first use and dropped with its last holder.
     ///
-    /// Poisoning is recovered rather than propagated: the guarded code is a `clone` and a `push`,
-    /// neither of which can panic, so a poisoned lock could only come from an unrelated thread
-    /// dying — and losing the whole record log to that would defeat the instrumentation.
-    pub fn records(&self) -> Vec<BuiltinRecord> {
-        self.records
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone()
+    /// Instrumentation is installed process-wide and keeps only the newest hook, so sessions over
+    /// different seeds must report to one recorder or opening the second would silence the first.
+    /// Records are told apart by the snapshot path they were made in, which is unique per shell
+    /// whatever seed it came from.
+    #[must_use]
+    pub fn shared() -> Arc<Self> {
+        let mut slot = SHARED.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(hook) = slot.upgrade() {
+            return hook;
+        }
+        let hook = Arc::new(Self {
+            builtins: Recorder::default(),
+            tracing: Some(Arc::new(Tracing::new())),
+        });
+        *slot = Arc::downgrade(&hook);
+        drop(slot);
+        hook
     }
 
-    /// Appends one record, with the same poisoning recovery as [`Self::records`].
-    fn push(&self, record: BuiltinRecord) {
-        self.records
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push(record);
+    /// Every record collected so far, in the order the shell produced them.
+    pub fn records(&self) -> Vec<BuiltinRecord> {
+        self.builtins.records()
+    }
+
+    /// Starts observing the file accesses made inside `root`.
+    ///
+    /// `interrupted` is the flag `root`'s evaluation is asked to stop through, and `observe` is
+    /// its classifier — called with every attributed line, outside every lock this module holds,
+    /// so it may take the caller's own. The first root starts the tracer.
+    ///
+    /// # Errors
+    ///
+    /// Fails when `root` is already registered, when the tracer cannot be started or cannot
+    /// attach, and when this recorder does not trace at all.
+    pub fn register_root(
+        &self,
+        root: &Path,
+        interrupted: Arc<AtomicBool>,
+        observe: TraceObserver,
+    ) -> std::io::Result<()> {
+        let Some(tracing) = &self.tracing else {
+            return Err(std::io::Error::other(
+                "file access tracing failed: this recorder does not trace",
+            ));
+        };
+        tracing.register_root(root, interrupted, observe)
+    }
+
+    /// Stops observing `root`, stopping the tracer when it was the last.
+    ///
+    /// A root that is not registered is a teardown no-op, which is what a snapshot dropped after a
+    /// failed registration needs.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the tracer could not be stopped or its decoder could not be joined.
+    pub fn unregister_root(&self, root: &Path) -> std::io::Result<()> {
+        match &self.tracing {
+            None => Ok(()),
+            Some(tracing) => tracing.unregister_root(root),
+        }
+    }
+
+    /// Waits until every syscall issued so far has been decoded.
+    ///
+    /// A proof, not a quiet period: a marker is emitted and the decoder has to report it. An
+    /// untraced recorder has nothing outstanding and returns at once.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the evidence stream is broken or the decoder does not keep up.
+    pub fn drain(&self) -> std::io::Result<()> {
+        match &self.tracing {
+            None => Ok(()),
+            Some(tracing) => tracing.drain(),
+        }
+    }
+
+    /// A bracket attributing the work inside it to `root`, or — when `root` is `None` — marking it
+    /// as the implementation's own and therefore nobody's footprint.
+    ///
+    /// The internal form is not optional bookkeeping. A tree diff, a log write, a subvolume copy
+    /// and a record dump all name the snapshot tree by path, so a boundary that did not say so
+    /// would observe itself reading every file in the tree and writing back every file it copied.
+    ///
+    /// `None` when nothing is being traced or `root` is not registered: an untraced shell emits no
+    /// markers rather than markers nobody can attribute.
+    #[must_use]
+    pub fn scope(&self, root: Option<&Path>) -> Option<TraceScope> {
+        self.tracing
+            .as_ref()
+            .and_then(|tracing| tracing.scope(root))
+    }
+
+    /// Whether a tracer is attached to this host.
+    #[must_use]
+    pub fn tracing(&self) -> bool {
+        self.tracing.as_ref().is_some_and(|tracing| tracing.attached())
+    }
+
+    /// Whether a call of `root`'s that names a path has an entry but no return yet.
+    ///
+    /// A publication may not be built on one: the path is known and the effect is not.
+    #[must_use]
+    pub fn unresolved(&self, root: &Path) -> bool {
+        self.tracing
+            .as_ref()
+            .is_some_and(|tracing| tracing.unresolved(root))
+    }
+
+    /// Forgets `root`'s unfinished calls, for an evaluation that was cut short.
+    pub fn retire_unresolved(&self, root: &Path) {
+        if let Some(tracing) = &self.tracing {
+            tracing.retire_unresolved(root);
+        }
     }
 }
 
 impl crate::BuiltinHook for RecordingHook {
     fn begin(&self, name: &str, argv: &[String], cwd: &Path) -> u64 {
-        let id = self.next.fetch_add(1, Ordering::Relaxed);
-        self.push(BuiltinRecord::Begin {
+        let id = self.builtins.next_id();
+        self.builtins.push(BuiltinRecord::Begin {
             id,
             ts: now_micros(),
             tid: current_tid(),
@@ -114,12 +236,18 @@ impl crate::BuiltinHook for RecordingHook {
     }
 
     fn end(&self, id: u64, exit: u8) {
-        self.push(BuiltinRecord::End {
+        self.builtins.push(BuiltinRecord::End {
             id,
             ts: now_micros(),
             tid: current_tid(),
             exit,
         });
+    }
+
+    fn interrupted(&self, cwd: &Path, waker: &std::task::Waker) -> bool {
+        self.tracing
+            .as_ref()
+            .is_some_and(|tracing| tracing.interrupted(cwd, waker))
     }
 }
 
@@ -270,20 +398,16 @@ impl SpawnRecord {
 /// Records every spawn attempt an `ExternalCommandSpawner` makes, in memory.
 ///
 /// The counterpart of [`RecordingHook`] one level up, and deliberately not a trait: a spawner owns
-/// its recorder, where a builtin hook has to be reachable from a process-global installation.
+/// its recorder, where a builtin hook has to be reachable from a process-global installation. The
+/// log is the same shared [`Recorder`] the hook keeps, over this level's record vocabulary.
 #[derive(Default)]
-pub struct SpawnRecorder {
-    /// The log, in attempt order.
-    records: Mutex<Vec<SpawnRecord>>,
-    /// The next attempt id.
-    next: AtomicU64,
-}
+pub struct SpawnRecorder(Recorder<SpawnRecord>);
 
 impl SpawnRecorder {
     /// Records a started process and returns the attempt's id.
     pub fn spawned(&self, request: SpawnRequest, pid: Option<u32>) -> u64 {
-        let id = self.next.fetch_add(1, Ordering::Relaxed);
-        self.push(SpawnRecord::Spawned {
+        let id = self.0.next_id();
+        self.0.push(SpawnRecord::Spawned {
             id,
             ts: now_micros(),
             tid: current_tid(),
@@ -295,8 +419,8 @@ impl SpawnRecorder {
 
     /// Records a spawn that started no process, and returns the attempt's id.
     pub fn failed(&self, request: SpawnRequest, error: &std::io::Error) -> u64 {
-        let id = self.next.fetch_add(1, Ordering::Relaxed);
-        self.push(SpawnRecord::Failed {
+        let id = self.0.next_id();
+        self.0.push(SpawnRecord::Failed {
             id,
             ts: now_micros(),
             tid: current_tid(),
@@ -308,21 +432,47 @@ impl SpawnRecorder {
 
     /// Every record collected so far, in the order the spawner produced them.
     ///
-    /// Poisoning is recovered rather than propagated, for the reason [`RecordingHook::records`]
-    /// gives.
+    /// A snapshot, and the expensive observation: every program path, argument vector and rendered
+    /// error is cloned. A caller that only needs how far the log has got, or the pids in it, wants
+    /// [`Self::record_count`] or [`Self::spawned_pids_since`] instead.
     pub fn records(&self) -> Vec<SpawnRecord> {
-        self.records
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone()
+        self.0.records()
     }
 
-    /// Appends one record, with the same poisoning recovery as [`Self::records`].
-    fn push(&self, record: SpawnRecord) {
-        self.records
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push(record);
+    /// How many records have been appended.
+    ///
+    /// The mark a later [`Self::spawned_pids_since`] is taken against: take it before starting
+    /// something, and the projection afterwards reports exactly what that something spawned.
+    ///
+    /// Not the next id. Ids are allocated before their record is appended, so a concurrent
+    /// producer that has taken an id but not yet pushed makes the two differ — reading the id
+    /// series as a count would name records that are not in the log yet.
+    pub fn record_count(&self) -> usize {
+        self.0.with_records(<[SpawnRecord]>::len)
+    }
+
+    /// The pids of the processes that actually started at or after `start`, in append order.
+    ///
+    /// `start` indexes **all appended records**, failures included: it is a [`Self::record_count`]
+    /// taken earlier, not an attempt id and not a count of successful spawns. A `start` past the
+    /// end of the log yields an empty vector rather than refusing, because a mark taken against a
+    /// recorder that then recorded nothing is the ordinary case.
+    ///
+    /// Failures and started processes whose pid the platform did not report are skipped; a pid
+    /// repeated by the kernel after a reaped child is reported as many times as it was recorded,
+    /// because the caller signalling these is entitled to the log's own multiplicity.
+    pub fn spawned_pids_since(&self, start: usize) -> Vec<u32> {
+        self.0.with_records(|records| {
+            records
+                .get(start..)
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|record| match record {
+                    SpawnRecord::Spawned { pid, .. } => *pid,
+                    SpawnRecord::Failed { .. } => None,
+                })
+                .collect()
+        })
     }
 }
 
@@ -501,6 +651,76 @@ mod tests {
 
         assert_eq!(taken.len(), 1, "the snapshot does not grow with the log");
         assert_eq!(recorder.records().len(), 2);
+    }
+
+    #[test]
+    fn the_record_count_counts_every_appended_attempt() {
+        let recorder = SpawnRecorder::default();
+        assert_eq!(recorder.record_count(), 0);
+
+        recorder.spawned(request(), Some(11));
+        recorder.failed(
+            request(),
+            &std::io::Error::from(std::io::ErrorKind::NotFound),
+        );
+        recorder.spawned(request(), None);
+
+        assert_eq!(
+            recorder.record_count(),
+            3,
+            "a refused spawn and a pidless one are attempts like any other"
+        );
+        assert_eq!(
+            recorder.record_count(),
+            recorder.records().len(),
+            "the count and the snapshot report the same log"
+        );
+        assert_eq!(
+            recorder
+                .records()
+                .iter()
+                .filter(|record| matches!(record, SpawnRecord::Spawned { .. }))
+                .count(),
+            2,
+            "the count is not a count of successful spawns"
+        );
+    }
+
+    #[test]
+    fn spawned_pids_since_a_mark_preserves_order_and_duplicates() {
+        let recorder = SpawnRecorder::default();
+        recorder.spawned(request(), Some(11));
+        let mark = recorder.record_count();
+        recorder.failed(
+            request(),
+            &std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+        );
+        recorder.spawned(request(), None);
+        // The kernel reuses a pid once its previous holder is reaped, so the log may legitimately
+        // name one twice; the projection is not entitled to collapse that.
+        recorder.spawned(request(), Some(22));
+        recorder.spawned(request(), Some(22));
+
+        assert_eq!(
+            recorder.spawned_pids_since(0),
+            vec![11, 22, 22],
+            "append order, with the failure and the pidless spawn skipped"
+        );
+        assert_eq!(
+            recorder.spawned_pids_since(mark),
+            vec![22, 22],
+            "a mark taken before the failure still indexes it, and drops what came earlier"
+        );
+        assert_eq!(
+            recorder.spawned_pids_since(recorder.record_count()),
+            Vec::<u32>::new(),
+            "a mark at the end names nothing yet recorded"
+        );
+        assert_eq!(
+            recorder.spawned_pids_since(recorder.record_count() + 7),
+            Vec::<u32>::new(),
+            "a mark past the end is empty, not a panic"
+        );
     }
 
     #[test]

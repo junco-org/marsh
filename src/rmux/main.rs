@@ -38,7 +38,6 @@ use rmux_server::{ConfigFileSelection as ServerConfigFileSelection, DaemonConfig
 
 /// Process entrypoint: sets up the locale, dispatches, and exits with the chosen status.
 fn main() {
-    #[cfg(unix)]
     if let Some(exit_code) =
         rmux_server::run_internal_fifo_reader_helper(std::env::args_os().skip(1))
     {
@@ -276,7 +275,6 @@ fn run_hidden_daemon(args: InternalDaemonArgs) -> io::Result<()> {
     if let Some(frontend) = args.web_frontend {
         config = config.with_web_frontend(frontend);
     }
-    #[cfg(target_os = "linux")]
     if let Some(ready_fd) = args.startup_ready_fd {
         config = config.with_startup_ready_fd(ready_fd);
     }

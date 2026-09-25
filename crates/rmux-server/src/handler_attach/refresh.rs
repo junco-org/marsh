@@ -11,9 +11,6 @@ impl RequestHandler {
         let _refresh_span = crate::perf_instrument::span("attach_refresh")
             .with_str("scope", "session")
             .with_str("session", session_name.as_str());
-        #[cfg(windows)]
-        self.wait_for_windows_deferred_session_pane_pids(session_name)
-            .await;
         let removed_stale_clients = self
             .prune_stale_attached_clients_for_session(session_name)
             .await;
@@ -267,9 +264,6 @@ impl RequestHandler {
             .with_str("scope", "client")
             .with_u64("attach_pid", u64::from(attach_pid))
             .with_str("session", session_name.as_str());
-        #[cfg(windows)]
-        self.wait_for_windows_deferred_session_pane_pids(session_name)
-            .await;
         let attached_count = self.attached_count(session_name).await;
         let snapshot = {
             let active_attach = self.active_attach.lock().await;

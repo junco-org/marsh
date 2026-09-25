@@ -109,7 +109,7 @@ mod web_share_display;
 #[path = "cli/window_commands.rs"]
 mod window_commands;
 
-use crate::cli_args::{parse, parse_with_runtime_command_groups, scan_top_level_command, Cli};
+use crate::cli_args::{Cli, parse, parse_with_runtime_command_groups, scan_top_level_command};
 use crate::cli_response::{expect_command_output, expect_command_success};
 use attach_transport::{attach_with_connection, require_attach_terminal};
 use client_commands::{
@@ -133,15 +133,15 @@ use dispatch::default_client_command;
 use dispatch::{command_has_start_server_flag, dispatch_command_queue};
 pub(crate) use error::{ExitFailure, ExitMessageTermination};
 use rmux_client::{
-    connect, ensure_server_running_with_config_outcome, resolve_socket_path,
-    resolve_tmux_compatible_socket_path, Connection,
+    Connection, connect, ensure_server_running_with_config_outcome, resolve_socket_path,
+    resolve_tmux_compatible_socket_path,
 };
 use shell_startup::run_shell_startup;
 #[cfg(test)]
 use startup::ServerStartupConfig;
 use startup::{
-    run_foreground_server, startup_config_from_cli, startup_config_from_top_level_scan,
-    StartServerConnection, StartupEndpoint, StartupOptions,
+    StartServerConnection, StartupEndpoint, StartupOptions, run_foreground_server,
+    startup_config_from_cli, startup_config_from_top_level_scan,
 };
 use target_resolution::{
     list_session_names, listed_pane_index_matches_target, resolve_current_pane_target,
@@ -252,10 +252,35 @@ where
         invoked_as_tmux(&args),
         cli.socket_name(),
         cli.socket_path(),
-    )?;
+    )
+    .map_err(|error| error.with_startup_context("resolve socket", None))?;
 
     if let Some(crate::cli_args::Command::AttachSession(args)) = cli.command.as_ref() {
         validate_nested_attach_before_connect(args, &socket_path)?;
+    }
+
+    // A normal application startup replaces the daemon on the selected endpoint. Every
+    // implicit launch takes this route — `rmux`, `cargo run`, and a foreground `rmux -D` —
+    // so the executable that was just built always becomes the daemon, and a stale one never
+    // keeps serving the socket. Stopping it closes its panes and terminates their commands,
+    // which is why explicit subcommands, `-c` workloads, control mode, and `-N` are excluded:
+    // those are control requests against sessions that must survive. `-D` is not excluded,
+    // because a foreground server is an application startup that has to bind this endpoint.
+    if !command_was_provided
+        && cli.shell_command.is_none()
+        && cli.control_mode == 0
+        && !cli.no_start_server
+    {
+        // A cold endpoint is the expected case on a first launch, so only an absent daemon is
+        // tolerated. A permission error, protocol failure, or endpoint-cleanup timeout means
+        // the old daemon may still own the socket, and starting over it would race it.
+        if let Err(error) = server_commands::run_kill_server(&socket_path)
+            && !error.is_server_absent()
+        {
+            return Err(error
+                .with_startup_context("stop previous daemon", Some(&socket_path))
+                .with_socket_context(&socket_path));
+        }
     }
 
     // A start-server command may create the daemon that loads command-alias
@@ -278,7 +303,11 @@ where
             startup_config.auto_start.clone(),
         )
         .map_err(ExitFailure::from)
-        .map_err(|error| error.with_socket_context(&socket_path))?;
+        .map_err(|error| {
+            error
+                .with_startup_context("start or connect to daemon", Some(&socket_path))
+                .with_socket_context(&socket_path)
+        })?;
         let endpoint = StartupEndpoint::prestarted(outcome);
         let selected_socket_path = endpoint.socket_path();
         let cold_resolution = endpoint.with_connection_mut(|connection| {
@@ -380,7 +409,11 @@ fn parse_cold_alias_queue_after_startup(
     let outcome =
         ensure_server_running_with_config_outcome(&socket_path, startup_config.auto_start)
             .map_err(ExitFailure::from)
-            .map_err(|error| error.with_socket_context(&socket_path))?;
+            .map_err(|error| {
+                error
+                    .with_startup_context("start or connect to daemon", Some(&socket_path))
+                    .with_socket_context(&socket_path)
+            })?;
     let endpoint = StartupEndpoint::prestarted(outcome);
     let selected_socket_path = endpoint.socket_path();
     let resolution = endpoint.with_connection_mut(|connection| {
@@ -396,8 +429,7 @@ fn parse_cold_alias_queue_after_startup(
     if let alias_fallback::RuntimeCommandResolution::LegacyServerDispatch(exit_code) = resolution {
         return Ok(ColdAliasParseOutcome::Dispatched(exit_code));
     }
-    let cli =
-        parse_with_runtime_resolution(args, Some(&resolution)).map_err(ExitFailure::from)?;
+    let cli = parse_with_runtime_resolution(args, Some(&resolution)).map_err(ExitFailure::from)?;
     Ok(ColdAliasParseOutcome::Parsed(Box::new(cli), endpoint))
 }
 
@@ -663,7 +695,8 @@ fn connect_with_startserver_outcome(
     } = startup;
     if no_start_server {
         let connection = connect(socket_path)
-            .map_err(|error| ExitFailure::from_client_connect(socket_path, error))?;
+            .map_err(|error| ExitFailure::from_client_connect(socket_path, error))
+            .map_err(|error| error.with_startup_context("connect to daemon", Some(socket_path)))?;
         return Ok(StartServerConnection {
             connection,
             provenance: endpoint.provenance(),
@@ -676,7 +709,10 @@ fn connect_with_startserver_outcome(
         });
     }
     let outcome = ensure_server_running_with_config_outcome(socket_path, config)
-        .map_err(ExitFailure::from)?;
+        .map_err(ExitFailure::from)
+        .map_err(|error| {
+            error.with_startup_context("start or connect to daemon", Some(socket_path))
+        })?;
     endpoint.record_ensured(outcome.socket_path(), outcome.provenance());
     Ok(StartServerConnection {
         connection: outcome.into_connection(),
@@ -702,16 +738,22 @@ fn shell_command_token(token: &str) -> String {
     format!("'{}'", token.replace('\'', "'\\''"))
 }
 
+fn is_short_flag_cluster(value: &str, allowed: &str) -> bool {
+    value.len() > 2
+        && value.starts_with('-')
+        && !value.starts_with("--")
+        && value.chars().skip(1).all(|flag| allowed.contains(flag))
+}
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 mod tests {
     use super::{
-        command_has_start_server_flag, default_client_command, render_list_commands_line, run,
-        startup_config_from_cli, top_level_parse_failure, ServerStartupConfig,
+        ServerStartupConfig, command_has_start_server_flag, default_client_command,
+        render_list_commands_line, run, startup_config_from_cli, top_level_parse_failure,
     };
     use crate::cli_args::{
-        parse as parse_cli, parse_target_spec, AttachSessionArgs, Command, ListSessionsArgs,
-        NewWindowArgs, StartServerArgs,
+        AttachSessionArgs, Command, ListSessionsArgs, NewWindowArgs, StartServerArgs,
+        parse as parse_cli, parse_target_spec,
     };
     use std::ffi::OsString;
     use std::path::PathBuf;
@@ -752,14 +794,18 @@ mod tests {
 
     #[test]
     fn top_level_preparse_rejects_invalid_clusters_with_tmux_unknown_option() {
-        assert!(top_level_parse_failure(&args(&["-xh"]))
-            .expect("expected invalid cluster to fail before clap")
-            .message()
-            .contains("unknown option -- x"));
-        assert!(top_level_parse_failure(&args(&["-Nxh"]))
-            .expect("expected invalid cluster to fail before clap")
-            .message()
-            .contains("unknown option -- x"));
+        assert!(
+            top_level_parse_failure(&args(&["-xh"]))
+                .expect("expected invalid cluster to fail before clap")
+                .message()
+                .contains("unknown option -- x")
+        );
+        assert!(
+            top_level_parse_failure(&args(&["-Nxh"]))
+                .expect("expected invalid cluster to fail before clap")
+                .message()
+                .contains("unknown option -- x")
+        );
     }
 
     #[test]

@@ -23,7 +23,7 @@ async fn send_attach_command(
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn switch_client_reroutes_attach_input_and_output() -> Result<(), Box<dyn Error>> {
     let _guard = PTY_TEST_LOCK.lock().await;
     let harness = TestHarness::new("switch-client");
@@ -127,7 +127,7 @@ async fn switch_client_reroutes_attach_input_and_output() -> Result<(), Box<dyn 
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn switch_client_to_multi_pane_session_emits_border_frame_before_forwarding_io(
 ) -> Result<(), Box<dyn Error>> {
     let _guard = PTY_TEST_LOCK.lock().await;
@@ -293,7 +293,7 @@ async fn switch_client_to_multi_pane_session_emits_border_frame_before_forwardin
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn switch_client_to_missing_session_keeps_the_current_attach_stream(
 ) -> Result<(), Box<dyn Error>> {
     let _guard = PTY_TEST_LOCK.lock().await;

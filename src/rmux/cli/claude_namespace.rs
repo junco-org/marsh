@@ -31,10 +31,8 @@ use std::path::{Path, PathBuf};
 
 use rmux_proto::SessionName;
 
-use super::managed_io::{
-    CLAUDE_ENDPOINT_ENV, CLAUDE_MAIN_SESSION_ENV, CLAUDE_SWARM_SESSION_ENV,
-};
 use super::ExitFailure;
+use super::managed_io::{CLAUDE_ENDPOINT_ENV, CLAUDE_MAIN_SESSION_ENV, CLAUDE_SWARM_SESSION_ENV};
 
 /// Socket-label prefix Claude Code derives from its own process id for teammate calls.
 const SWARM_SOCKET_PREFIX: &str = "claude-swarm-";
@@ -207,9 +205,10 @@ pub(super) fn rewrite_target(raw: &str) -> String {
 pub(super) fn rewrite_session_name(session_name: SessionName) -> SessionName {
     ACTIVE
         .with(|active| {
-            active.borrow().as_ref().and_then(|namespace| {
-                namespace.rewrite_component(session_name.as_str()).cloned()
-            })
+            active
+                .borrow()
+                .as_ref()
+                .and_then(|namespace| namespace.rewrite_component(session_name.as_str()).cloned())
         })
         .unwrap_or(session_name)
 }
@@ -238,7 +237,7 @@ mod tests {
 
     use rmux_proto::SessionName;
 
-    use super::{rewrite_with, same_endpoint, ClaudeNamespace};
+    use super::{ClaudeNamespace, rewrite_with, same_endpoint};
 
     fn namespace() -> ClaudeNamespace {
         ClaudeNamespace {
@@ -253,7 +252,10 @@ mod tests {
         let namespace = namespace();
 
         assert_eq!(rewrite_with(&namespace, "rmux-claude"), "marsh-io-abc");
-        assert_eq!(rewrite_with(&namespace, "claude-swarm:0"), "marsh-io-abc-swarm:0");
+        assert_eq!(
+            rewrite_with(&namespace, "claude-swarm:0"),
+            "marsh-io-abc-swarm:0"
+        );
         assert_eq!(
             rewrite_with(&namespace, "=rmux-claude:1.2"),
             "=marsh-io-abc:1.2"

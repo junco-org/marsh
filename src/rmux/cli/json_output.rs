@@ -3,7 +3,7 @@ use std::io::{self, ErrorKind, Write};
 
 use rmux_core::formats::is_truthy;
 use rmux_proto::{CommandOutput, ListClientsResponse, ListWindowsResponse};
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 use super::ExitFailure;
 
@@ -467,9 +467,9 @@ fn write_json_value(value: &Value, command_name: &'static str) -> Result<i32, Ex
 #[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 mod tests {
     use super::{
+        LIST_PANES_FIELDS, LIST_SESSIONS_FIELDS, LIST_WINDOWS_JSON_FIELDS,
         list_sessions_json_format, list_windows_json_format, parse_delimited_rows,
-        parse_length_prefixed_rows, LIST_PANES_FIELDS, LIST_SESSIONS_FIELDS,
-        LIST_WINDOWS_JSON_FIELDS,
+        parse_length_prefixed_rows,
     };
 
     #[test]
@@ -521,8 +521,10 @@ mod tests {
     )]
     #[test]
     fn list_windows_length_prefix_preserves_all_user_control_characters() {
-        assert!(list_windows_json_format()
-            .starts_with("#{n:session_name}:#{session_name}#{n:window_index}:#{window_index}"));
+        assert!(
+            list_windows_json_format()
+                .starts_with("#{n:session_name}:#{session_name}#{n:window_index}:#{window_index}")
+        );
         let values = [
             "alpha",
             "0",

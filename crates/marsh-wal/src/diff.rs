@@ -29,12 +29,22 @@ impl CommitOp {
     }
 }
 
-/// A non-directory tree entry, at the granularity differences are detected.
+/// A tree entry, at the granularity differences are detected.
 enum Entry {
     /// A regular file: what it is, plus the identity that says whether it needs reading.
     File(FileMeta),
     /// A symbolic link, compared by target.
     Symlink(PathBuf),
+    /// A directory: its permission bits, and whether anything lives inside it.
+    ///
+    /// Only an *empty* directory is ever an operation of its own. A nonempty one is carried by
+    /// the writes of what it contains, which create it, and pruned by the removals that empty it.
+    Directory {
+        /// Permission bits.
+        mode: u32,
+        /// Whether the walk found no entry beneath it.
+        empty: bool,
+    },
     /// Anything else — fifo, socket, device — compared by mode alone.
     Other(u32),
 }
@@ -59,9 +69,12 @@ struct FileMeta {
 
 /// Computes the changes that turn `seed` into `work`.
 ///
-/// Directories are implicit: a [`CommitOp::Write`] creates the parents it needs, and directories
-/// left empty by a [`CommitOp::Remove`] are pruned. A command that creates an *empty* directory and
-/// nothing else therefore merges as a no-op — the one tree shape this representation cannot carry.
+/// Nonempty directories are implicit: a [`CommitOp::Write`] creates the parents it needs, and
+/// directories left empty by a [`CommitOp::Remove`] are pruned. An *empty* directory is the one
+/// shape that neither of those carries, so it is an operation of its own: a [`CommitOp::Write`]
+/// of a directory that is new, changed its mode, lost its last entry, or replaced a file; and a
+/// [`CommitOp::Remove`] of one that vanished. A directory's own write comes after every removal,
+/// so a directory emptied here survives the pruning of its former contents.
 ///
 /// Ordering is total and deterministic: removals first, deepest paths first (so a directory is
 /// emptied before it is pruned), then writes shallowest first (so parents exist before children).
@@ -77,19 +90,40 @@ pub fn diff_trees(seed: &Path, work: &Path) -> Result<Vec<CommitOp>, Error> {
     let mut writes: Vec<PathBuf> = Vec::new();
 
     for (path, seed_entry) in &seed_entries {
-        match work_entries.get(path) {
-            None => removes.push(path.clone()),
-            Some(work_entry) => {
+        match (seed_entry, work_entries.get(path)) {
+            // A vanished nonempty directory goes with the removals of its contents.
+            (Entry::Directory { empty: false, .. }, None) => {}
+            (_, None) => removes.push(path.clone()),
+            (
+                Entry::Directory {
+                    mode: seed_mode,
+                    empty: seed_empty,
+                },
+                Some(Entry::Directory {
+                    mode: work_mode,
+                    empty: true,
+                }),
+            ) => {
+                if !seed_empty || seed_mode != work_mode {
+                    writes.push(path.clone());
+                }
+            }
+            // Still a directory with something in it: what it holds carries it.
+            (Entry::Directory { .. }, Some(Entry::Directory { empty: false, .. })) => {}
+            (_, Some(work_entry)) => {
                 if changed(seed_entry, work_entry, &seed.join(path), &work.join(path))? {
                     writes.push(path.clone());
                 }
             }
         }
     }
-    for path in work_entries.keys() {
-        if !seed_entries.contains_key(path) {
-            writes.push(path.clone());
+    for (path, work_entry) in &work_entries {
+        if seed_entries.contains_key(path)
+            || matches!(work_entry, Entry::Directory { empty: false, .. })
+        {
+            continue;
         }
+        writes.push(path.clone());
     }
 
     removes.sort_by(|left, right| depth_key(right).cmp(&depth_key(left)));
@@ -106,44 +140,59 @@ fn depth_key(path: &Path) -> (usize, &Path) {
     (path.components().count(), path)
 }
 
-/// Indexes every non-directory entry of `root` by its `root`-relative path.
+/// Indexes every entry of `root` by its `root`-relative path.
 ///
 /// The relative path is accumulated as the walk descends rather than recovered by stripping `root`
 /// off an absolute path: a relative [`PathBuf`] is what the key is, and building it directly keeps
-/// every byte of every component, which a string round-trip would not.
+/// every byte of every component, which a string round-trip would not. That accumulated prefix is
+/// exactly the per-directory state [`marsh_lib::walk_directory`] carries, so the traversal itself
+/// is the shared walker and only the classification below — one `metadata` call per entry, and
+/// what it decides — is this crate's.
+///
+/// A directory is recorded empty when the walk reaches it and marked nonempty by its first
+/// child: the walk visits a directory's own entry before descending into it, so the parent is
+/// always indexed by the time a child names it.
 fn collect(root: &Path) -> Result<BTreeMap<PathBuf, Entry>, Error> {
     use std::os::unix::fs::MetadataExt;
 
     let mut entries = BTreeMap::new();
-    let mut stack = vec![(root.to_path_buf(), PathBuf::new())];
-    while let Some((directory, prefix)) = stack.pop() {
-        for entry in std::fs::read_dir(&directory)? {
-            let entry = entry?;
-            let relative = prefix.join(entry.file_name());
-            let metadata = entry.metadata()?;
-            let file_type = metadata.file_type();
-            if file_type.is_dir() {
-                stack.push((entry.path(), relative));
-            } else if file_type.is_symlink() {
-                entries.insert(relative, Entry::Symlink(std::fs::read_link(entry.path())?));
-            } else if file_type.is_file() {
-                entries.insert(
-                    relative,
-                    Entry::File(FileMeta {
-                        len: metadata.len(),
-                        mode: mode(&metadata),
-                        id: (
-                            metadata.ino(),
-                            (metadata.mtime(), metadata.mtime_nsec()),
-                            (metadata.ctime(), metadata.ctime_nsec()),
-                        ),
-                    }),
-                );
-            } else {
-                entries.insert(relative, Entry::Other(mode(&metadata)));
-            }
+    marsh_lib::walk_directory::<_, Error>(root, PathBuf::new(), |entry, prefix| {
+        if let Some(Entry::Directory { empty, .. }) = entries.get_mut(prefix) {
+            *empty = false;
         }
-    }
+        let relative = prefix.join(entry.file_name());
+        let metadata = entry.metadata()?;
+        let file_type = metadata.file_type();
+        if file_type.is_dir() {
+            entries.insert(
+                relative.clone(),
+                Entry::Directory {
+                    mode: mode(&metadata),
+                    empty: true,
+                },
+            );
+            return Ok(Some(relative));
+        }
+        if file_type.is_symlink() {
+            entries.insert(relative, Entry::Symlink(std::fs::read_link(entry.path())?));
+        } else if file_type.is_file() {
+            entries.insert(
+                relative,
+                Entry::File(FileMeta {
+                    len: metadata.len(),
+                    mode: mode(&metadata),
+                    id: (
+                        metadata.ino(),
+                        (metadata.mtime(), metadata.mtime_nsec()),
+                        (metadata.ctime(), metadata.ctime_nsec()),
+                    ),
+                }),
+            );
+        } else {
+            entries.insert(relative, Entry::Other(mode(&metadata)));
+        }
+        Ok(None)
+    })?;
     Ok(entries)
 }
 
@@ -487,6 +536,47 @@ mod tests {
         assert_eq!(
             CommitOp::Remove(PathBuf::from("src/b.txt")).path(),
             Path::new("src/b.txt")
+        );
+    }
+
+    /// An empty directory is the one tree shape no file operation carries, so it is written and
+    /// removed as itself; a nonempty one stays implicit in the operations on what it holds.
+    #[test]
+    fn empty_directories_are_operations_and_nonempty_ones_are_not() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let scratch = tempfile::tempdir().expect("scratch directory");
+        let root = scratch.path();
+        let seed = root.join("seed");
+        let work = root.join("work");
+        for tree in [&seed, &work] {
+            std::fs::create_dir_all(tree.join("keep")).expect("an unchanged empty directory");
+            std::fs::create_dir_all(tree.join("mode")).expect("a directory whose mode changes");
+        }
+        std::fs::create_dir_all(seed.join("gone")).expect("an empty directory that vanishes");
+        write(&seed, "emptied/x.txt", "x");
+        std::fs::create_dir_all(work.join("emptied")).expect("a directory left empty");
+        std::fs::create_dir_all(seed.join("filled")).expect("an empty directory that fills");
+        write(&work, "filled/y.txt", "y");
+        write(&seed, "was_file", "file");
+        std::fs::create_dir_all(work.join("was_file")).expect("a file replaced by a directory");
+        std::fs::create_dir_all(work.join("new")).expect("a new empty directory");
+        write(&work, "newparent/child.txt", "child");
+        std::fs::set_permissions(work.join("mode"), std::fs::Permissions::from_mode(0o700))
+            .expect("chmod");
+
+        assert_eq!(
+            diff_trees(&seed, &work).expect("diff"),
+            vec![
+                CommitOp::Remove(PathBuf::from("emptied/x.txt")),
+                CommitOp::Remove(PathBuf::from("gone")),
+                CommitOp::Write(PathBuf::from("emptied")),
+                CommitOp::Write(PathBuf::from("mode")),
+                CommitOp::Write(PathBuf::from("new")),
+                CommitOp::Write(PathBuf::from("was_file")),
+                CommitOp::Write(PathBuf::from("filled/y.txt")),
+                CommitOp::Write(PathBuf::from("newparent/child.txt")),
+            ]
         );
     }
 }

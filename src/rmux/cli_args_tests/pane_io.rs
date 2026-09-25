@@ -537,7 +537,9 @@ fn copy_mode_accepts_tmux_page_down_and_scrollbar_flags() {
 fn pane_commands_accept_session_or_window_targets_like_tmux() {
     let capture = parse_args(&["capture-pane", "-p", "-t", "alpha"]).unwrap();
     match capture.command.expect("parsed command") {
-        super::super::Command::CapturePane(args) => assert_eq!(target_text(args.target.as_ref()), "alpha"),
+        super::super::Command::CapturePane(args) => {
+            assert_eq!(target_text(args.target.as_ref()), "alpha");
+        }
         _ => panic!("expected CapturePane command"),
     }
 

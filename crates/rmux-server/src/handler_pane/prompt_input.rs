@@ -1,9 +1,7 @@
 use super::super::prompt_support::{decode_prompt_key, PromptInputEvent};
 use crate::input_keys::{decode_extended_key, decode_mouse, ExtendedKeyDecode, MouseDecode};
 
-pub(crate) fn decode_prompt_input_event(
-    bytes: &[u8],
-) -> Option<(PromptInputEvent, usize)> {
+pub(crate) fn decode_prompt_input_event(bytes: &[u8]) -> Option<(PromptInputEvent, usize)> {
     if bytes.is_empty() {
         return None;
     }

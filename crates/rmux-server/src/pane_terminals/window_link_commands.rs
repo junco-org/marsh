@@ -279,9 +279,7 @@ impl HandlerState {
                         let mut removed_terminals = self
                             .terminals
                             .remove_pane_batch(runtime_session_name, pane_ids)?;
-                        crate::pane_terminals::terminate_removed_terminals(
-                            &mut removed_terminals,
-                        );
+                        crate::pane_terminals::terminate_removed_terminals(&mut removed_terminals);
                         for pane_id in pane_ids {
                             if let Some(pipe) =
                                 self.remove_pane_pipe(runtime_session_name, *pane_id)

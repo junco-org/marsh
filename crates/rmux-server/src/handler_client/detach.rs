@@ -160,11 +160,10 @@ impl RequestHandler {
                 .await
             {
                 let event = LifecycleEvent::ClientDetached {
-                    session_name: outcome.session_name.clone(),
+                    session_name: outcome.session_name,
                     client_name: Some(outcome.client_name),
                 };
-                self.emit_for_session_identity(event, &outcome.session_name, session_id)
-                    .await;
+                self.emit_for_session_identity(event, session_id).await;
             }
         }
         self.reconcile_attached_window_identity_size_and_emit(session_id, active_window_id)
@@ -265,10 +264,9 @@ impl RequestHandler {
                 {
                     self.emit_for_session_identity(
                         LifecycleEvent::ClientDetached {
-                            session_name: outcome.session_name.clone(),
+                            session_name: outcome.session_name,
                             client_name: Some(outcome.client_name),
                         },
-                        &outcome.session_name,
                         session_id,
                     )
                     .await;

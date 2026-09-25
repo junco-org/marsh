@@ -6,8 +6,16 @@ use super::super::super::RequestHandler;
 
 #[derive(Debug, Default)]
 pub(crate) struct QueueExactTargetCapturePause {
-    pub(crate) reached: Notify,
+    reached: Notify,
     pub(crate) release: Notify,
+}
+
+impl QueueExactTargetCapturePause {
+    pub(crate) async fn wait_until_reached(&self) {
+        tokio::time::timeout(std::time::Duration::from_secs(2), self.reached.notified())
+            .await
+            .expect("queued command reaches the exact-target capture pause");
+    }
 }
 
 static PAUSES: Mutex<Vec<(usize, String, Arc<QueueExactTargetCapturePause>)>> =

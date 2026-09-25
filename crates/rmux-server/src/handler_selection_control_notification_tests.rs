@@ -10,9 +10,7 @@ use tokio::sync::mpsc;
 use super::RequestHandler;
 use crate::control::{ControlModeUpgrade, ControlServerEvent, CONTROL_SERVER_EVENT_CAPACITY};
 
-fn session_name(value: &str) -> SessionName {
-    SessionName::new(value).expect("valid session name")
-}
+use crate::test_names::session_name;
 
 async fn new_session(handler: &RequestHandler, name: &SessionName) {
     assert!(matches!(

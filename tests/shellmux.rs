@@ -5,8 +5,8 @@
     clippy::tests_outside_test_module,
     reason = "an integration test file is the test module"
 )]
-//! Jobs as a front-end drives them: `spawn`, `start_in`, `stop` and `on_finish`, over the
-//! pseudoterminal every job owns, with the frontend the mux delivers all of it to.
+//! Shells as a front-end drives them: `open_shell`, `run_command`, `stop` and `on_finish`, over
+//! the pseudoterminal every terminal shell owns, with the frontend the mux delivers all of it to.
 //!
 //! The claim under test is that owning the wait changes nothing about the transaction: each job's
 //! line runs through the job's own [`marsh::Shell::run`] exactly as an interactive line would, with
@@ -22,16 +22,16 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use brush_core::env::ShellEnvironment;
-use marsh::policy::{Action, Event, Resource};
+use marsh::policy::{Action, Event, Principal, Resource};
 use marsh::shellmux::{
-    CommandCompletion, CommandOptions, FrontendEvent, JobView, MuxError, MuxProfile, OnFinish,
-    OutputChannel, ShellFrontend, ShellId, ShellMux, SnapshotUid, SpawnOptions, Spawned,
-    TerminalGeometry,
+    CommandCompletion, CommandHandle, CommandOptions, FrontendEvent, JobCloseMode, JobView,
+    MuxError, MuxProfile, OnFinish, OutputChannel, RunError, Shell, ShellFrontend, ShellId,
+    ShellMux, SnapshotUid, SpawnOptions, TerminalGeometry,
 };
-use marsh::{MarshError, MarshExecutor, Outcome, PolicyValidator, Publication};
+use marsh::{MarshError, MarshExecutor, Outcome, Publication};
 use marsh_btrfs::fake::CopyTree;
 use serial_test::serial;
 use tempfile::TempDir;
@@ -85,14 +85,17 @@ struct Recorder {
     size: (u16, u16),
     /// The mux this recorder is bound to; empty before binding and after detaching.
     mux: Weak<ShellMux>,
-    /// The fixture's `state/snap` directory, for [`Self::closed_with_storage`].
-    snap: PathBuf,
+    /// Each admitted job's own snapshot root, by uid, for [`Self::closed_with_storage`].
+    ///
+    /// Filled from every [`JobView`] a `Changed` carries rather than from one fixed directory: a
+    /// mux hosts jobs over several seeds, so there is no single `snap` to check a closing job
+    /// against. Recorded at admission — before the row has resources — so a job whose
+    /// construction fails is covered too.
+    snapshot_roots: HashMap<SnapshotUid, PathBuf>,
     /// Live job handles, by identity; removed once [`FrontendEvent::Closed`] names the same uid.
-    handles: HashMap<ShellId, Spawned>,
+    handles: HashMap<ShellId, Shell>,
     /// The job table as of the last [`FrontendEvent::Changed`].
     observed_jobs: Vec<JobView>,
-    /// The selected job as of the last [`FrontendEvent::Changed`].
-    observed_current: Option<ShellId>,
     /// Unconsumed output bytes, by sandbox uid and then by the stream that carried them.
     output: HashMap<SnapshotUid, HashMap<OutputChannel, Vec<u8>>>,
     /// Every completion delivered, in delivery order.
@@ -112,44 +115,19 @@ struct Recorder {
 }
 
 impl Recorder {
-    /// A recorder reporting `rows` × `cols`, checking closed storage against `snap`.
-    fn at(rows: u16, cols: u16, snap: PathBuf) -> Self {
-        Self {
-            size: (rows, cols),
-            mux: Weak::new(),
-            snap,
-            handles: HashMap::new(),
-            observed_jobs: Vec::new(),
-            observed_current: None,
-            output: HashMap::new(),
-            finished: Vec::new(),
-            consumed: HashMap::new(),
-            closed: HashSet::new(),
-            closed_with_storage: HashSet::new(),
-            errors: HashMap::new(),
-            resized: HashMap::new(),
-            signal: Arc::new(Notify::new()),
-        }
-    }
-
     /// The mux this recorder is bound to, when it is bound to one.
     fn mux(&self) -> Option<Arc<ShellMux>> {
         self.mux.upgrade()
     }
 
     /// The live handle for job `id`, when one is open under that name.
-    fn handle(&self, id: &ShellId) -> Option<Spawned> {
+    fn handle(&self, id: &ShellId) -> Option<Shell> {
         self.handles.get(id).cloned()
     }
 
     /// The job table as this recorder last observed it.
     fn observed_jobs(&self) -> &[JobView] {
         &self.observed_jobs
-    }
-
-    /// The selected job as this recorder last observed it.
-    const fn observed_current(&self) -> Option<&ShellId> {
-        self.observed_current.as_ref()
     }
 
     /// Every byte buffered for `uid`'s terminal stream, removing it from this recorder.
@@ -226,7 +204,21 @@ impl Recorder {
 
 impl ShellFrontend for Recorder {
     fn new(rows: u16, cols: u16) -> Self {
-        Self::at(rows, cols, PathBuf::new())
+        Self {
+            size: (rows, cols),
+            mux: Weak::new(),
+            snapshot_roots: HashMap::new(),
+            handles: HashMap::new(),
+            observed_jobs: Vec::new(),
+            output: HashMap::new(),
+            finished: Vec::new(),
+            consumed: HashMap::new(),
+            closed: HashSet::new(),
+            closed_with_storage: HashSet::new(),
+            errors: HashMap::new(),
+            resized: HashMap::new(),
+            signal: Arc::new(Notify::new()),
+        }
     }
 
     fn size(&self) -> (u16, u16) {
@@ -248,15 +240,24 @@ impl ShellFrontend for Recorder {
             FrontendEvent::Changed => {
                 if let Some(mux) = self.mux.upgrade() {
                     self.observed_jobs = mux.jobs();
-                    self.observed_current = mux.current_job().map(|job| job.id);
+                    // Every row, admitted ones included: a job whose construction later fails
+                    // still has to be checked for a leftover snapshot when it closes, and by then
+                    // its row is gone.
+                    for view in &self.observed_jobs {
+                        if let Some(root) = view.snapshot_root.clone() {
+                            self.snapshot_roots
+                                .entry(view.sandbox.uid.clone())
+                                .or_insert(root);
+                        }
+                    }
                 }
             }
-            FrontendEvent::Opened(spawned) => {
-                self.handles.insert(spawned.id().clone(), spawned.clone());
+            FrontendEvent::Opened(opened) => {
+                self.handles.insert(opened.id().clone(), opened.clone());
             }
             FrontendEvent::CommandAccepted { .. } => {
                 // The admission receipt is the caller's: every test that needs it holds the
-                // `CommandHandle` `spawn` or `start_in` handed it.
+                // `CommandHandle` its own `on_accept` sender was given.
             }
             FrontendEvent::Output {
                 shell,
@@ -275,14 +276,16 @@ impl ShellFrontend for Recorder {
             }
             FrontendEvent::Closed { end } => {
                 let shell = &end.shell;
-                if self.snap.join(shell.uid.as_str()).exists() {
-                    self.closed_with_storage.insert(shell.uid.clone());
+                if let Some(root) = self.snapshot_roots.remove(&shell.uid) {
+                    if root.exists() {
+                        self.closed_with_storage.insert(shell.uid.clone());
+                    }
                 }
                 self.closed.insert(shell.uid.clone());
                 if self
                     .handles
                     .get(&shell.id)
-                    .is_some_and(|spawned| spawned.sandbox().uid == shell.uid)
+                    .is_some_and(|held| held.sandbox().uid == shell.uid)
                 {
                     self.handles.remove(&shell.id);
                 }
@@ -310,11 +313,13 @@ impl ShellFrontend for Recorder {
 struct Fixture {
     /// Kept alive so the scratch directory outlives the test.
     _scratch: TempDir,
-    /// The tree the mux's session publishes into.
+    /// The canonical scratch root both the seed and its state directory live under.
+    root: PathBuf,
+    /// The tree this fixture's first shell publishes into.
     seed: PathBuf,
     /// `<scratch>/.marsh/seed`: where snapshots and the log live.
     state: PathBuf,
-    /// The btrfs stand-in the session takes snapshots through.
+    /// The btrfs stand-in every seed of this fixture is reached through.
     fs: Arc<CopyTree>,
     /// The mux under test; taken by [`Self::finish_mux`], which every test not left mid-panic
     /// calls before returning.
@@ -337,27 +342,49 @@ impl Fixture {
         fs.register(&seed);
         let state = root.join(".marsh/seed");
 
-        let frontend = Arc::new(Mutex::new(Recorder::at(ROWS, COLS, state.join("snap"))));
-        let executor = MarshExecutor::open_with(&seed, fs.clone()).expect("open the seed");
-        let mux = ShellMux::new(
-            executor,
-            Arc::new(Mutex::new(PolicyValidator::default())),
+        let frontend = Arc::new(Mutex::new(Recorder::new(ROWS, COLS)));
+        let mux = ShellMux::new_with(
             MuxProfile {
                 environment: ShellEnvironment::new(),
                 ..MuxProfile::default()
             },
             Arc::clone(&frontend),
+            fs.clone(),
         )
         .expect("build the mux");
 
         Self {
             _scratch: scratch,
+            root,
             seed,
             state,
             fs,
             mux: Some(mux),
             frontend,
         }
+    }
+
+    /// Registers a second seed named `name` beside the first, containing `src/`.
+    ///
+    /// A sibling rather than a nested tree, so the two keep separate `.marsh` state directories —
+    /// which is the layout two independent seeds actually have.
+    fn sibling_seed(&self, name: &str) -> PathBuf {
+        let seed = self.root.join(name);
+        std::fs::create_dir_all(seed.join("src")).expect("sibling seed tree");
+        self.fs.register(&seed);
+        seed
+    }
+
+    /// `<state root>/snap` for a seed registered by [`Self::sibling_seed`].
+    fn sibling_snap(&self, name: &str) -> PathBuf {
+        self.root.join(".marsh").join(name).join("snap")
+    }
+
+    /// An existing directory under no subvolume at all.
+    fn scratch_dir(&self, name: &str) -> PathBuf {
+        let path = self.root.join(name);
+        std::fs::create_dir_all(&path).expect("an unregistered scratch directory");
+        path
     }
 
     /// The mux under test.
@@ -415,7 +442,10 @@ impl Fixture {
 
 /// Whether `haystack` contains `needle` as one contiguous run of bytes.
 fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
-    !needle.is_empty() && haystack.windows(needle.len()).any(|window| window == needle)
+    !needle.is_empty()
+        && haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
 }
 
 /// Waits until `observe` yields something from `fixture`'s recorder, or [`TIMEOUT`] passes.
@@ -445,7 +475,9 @@ async fn wait_for<T>(
 
 /// [`wait_for`] for a plain predicate.
 async fn wait_until(fixture: &Fixture, mut ready: impl FnMut(&mut Recorder) -> bool) -> bool {
-    wait_for(fixture, |recorder| ready(recorder).then_some(())).await.is_some()
+    wait_for(fixture, |recorder| ready(recorder).then_some(()))
+        .await
+        .is_some()
 }
 
 /// Waits until `predicate` holds, or [`TIMEOUT`] passes.
@@ -510,7 +542,7 @@ async fn wait_for_close(fixture: &Fixture, uid: &SnapshotUid) {
 /// [`TIMEOUT`] passes first.
 async fn drain_output(
     fixture: &Fixture,
-    job: &Spawned,
+    job: &Shell,
     label: &str,
     done: impl Fn(&[u8]) -> bool + Send + Sync,
 ) -> Vec<u8> {
@@ -532,16 +564,45 @@ async fn drain_output(
     .unwrap_or_else(|| panic!("{label}: timed out waiting for {uid}'s output"))
 }
 
-/// Starts `cmd` in `job`, then waits until its terminal has produced `started`.
+/// Admits `cmd` into `job` and answers with its receipt, leaving the line running.
+///
+/// What a test that has to act *while* a line runs uses. [`Shell::run_command`] resolves with the
+/// completed verdict, which is far too late to feed standard input, force-stop the line or watch a
+/// callback fire; `on_accept` is the admission itself.
+///
+/// The run future is polled only until that admission and then dropped, which is exactly what the
+/// contract says it is for: the collection owns the work from the first poll, so dropping this
+/// abandons the *answer* and nothing else. Every test here reads that answer from the frontend's
+/// own [`FrontendEvent::Finished`] instead, through [`concluded`].
+///
+/// # Panics
+///
+/// Panics if the line is never admitted.
+async fn schedule(job: &Shell, cmd: &str, options: CommandOptions) -> CommandHandle {
+    let (accepted, receipt) = tokio::sync::oneshot::channel();
+    let running = job.run_command(
+        cmd,
+        CommandOptions {
+            on_accept: Some(accepted),
+            ..options
+        },
+    );
+    // Biased, so the receipt is always read first. A line fast enough to conclude before this
+    // polls would otherwise leave both arms ready at once, and a random choice between them would
+    // report an admitted command as one that was never admitted.
+    tokio::select! {
+        biased;
+        admitted = receipt => admitted.expect("the line was admitted"),
+        outcome = running => panic!("the line ended without ever being admitted: {outcome:?}"),
+    }
+}
+
+/// Schedules `cmd` in `job`, then waits until its terminal has produced `started`.
 ///
 /// The primitive behind [`start_held`]; called directly by the two race tests, which hold their
 /// job open only briefly rather than for [`HELD`]'s whole duration.
-async fn start_marked(fixture: &Fixture, job: &Spawned, cmd: &str, options: CommandOptions) {
-    fixture
-        .mux()
-        .start_in(job, cmd, options)
-        .await
-        .expect("start the marked line");
+async fn start_marked(fixture: &Fixture, job: &Shell, cmd: &str, options: CommandOptions) {
+    schedule(job, cmd, options).await;
     drain_output(fixture, job, "start_marked", |bytes| {
         contains_subslice(bytes, b"started")
     })
@@ -549,7 +610,7 @@ async fn start_marked(fixture: &Fixture, job: &Spawned, cmd: &str, options: Comm
 }
 
 /// [`start_marked`] with `prefix` in front of [`HELD`].
-async fn start_held(fixture: &Fixture, job: &Spawned, prefix: &str, options: CommandOptions) {
+async fn start_held(fixture: &Fixture, job: &Shell, prefix: &str, options: CommandOptions) {
     start_marked(fixture, job, &format!("{prefix}{HELD}"), options).await;
 }
 
@@ -558,44 +619,36 @@ async fn start_held(fixture: &Fixture, job: &Spawned, prefix: &str, options: Com
 /// # Panics
 ///
 /// Panics if the line does not publish.
-async fn run_line(fixture: &Fixture, job: &Spawned, cmd: &str) -> String {
-    fixture
-        .mux()
-        .start_in(job, cmd, CommandOptions::default())
+async fn run_line(fixture: &Fixture, job: &Shell, cmd: &str) -> String {
+    let published = job
+        .run_command(cmd, CommandOptions::default())
         .await
-        .expect("start the line");
+        .expect("the line publishes");
     let bytes = drain_output(fixture, job, "run_line", |bytes| bytes.contains(&b'\n')).await;
-    let completion = concluded(fixture, &job.sandbox().uid).await;
-    assert!(
-        matches!(verdict(&completion.outcome), Outcome::Published { .. }),
-        "expected a published line, got {:?}",
-        verdict(&completion.outcome)
+    let delivered = concluded(fixture, &job.sandbox().uid).await;
+    assert_eq!(
+        delivered.id, published.id,
+        "the verdict the frontend was given is this line's own"
     );
     let first_line = bytes.split(|&byte| byte == b'\n').next().unwrap_or(&[]);
     String::from_utf8_lossy(first_line).trim().to_string()
 }
 
 /// The terminal geometry `job` reports, as `"<rows> <cols>"`.
-async fn size_of_job(fixture: &Fixture, job: &Spawned) -> String {
+async fn size_of_job(fixture: &Fixture, job: &Shell) -> String {
     run_line(fixture, job, "stty size").await
 }
 
 /// Runs `cmd` in `job`, waits for `marker` on its terminal, and reports the process status it
 /// ended with.
 ///
-/// What [`run_line`] cannot do: that one rejects anything but a published line and hands back a
-/// trimmed line, while this returns the raw exit code for a command that ends non-zero on purpose.
-async fn run_to_marker(
-    fixture: &Fixture,
-    job: &Spawned,
-    cmd: &str,
-    marker: &[u8],
-) -> Option<i32> {
-    fixture
-        .mux()
-        .start_in(job, cmd, CommandOptions::default())
+/// What [`run_line`] cannot do: that one hands back a trimmed line, while this returns the raw
+/// exit code for a command that ends non-zero on purpose — and still requires the run itself to
+/// have *succeeded*, because a process status is not a publication verdict.
+async fn run_to_marker(fixture: &Fixture, job: &Shell, cmd: &str, marker: &[u8]) -> Option<i32> {
+    job.run_command(cmd, CommandOptions::default())
         .await
-        .expect("start the line");
+        .expect("the line publishes, whatever its process exited with");
     let marker = marker.to_vec();
     drain_output(fixture, job, "run_to_marker", move |bytes| {
         contains_subslice(bytes, &marker)
@@ -609,7 +662,7 @@ async fn run_to_marker(
 ///
 /// The recorder's view, not a fresh [`ShellMux::jobs`] call: a state the mux reached without
 /// announcing it fails here instead of passing on a poll a real frontend would never make.
-fn observed_ready(fixture: &Fixture, opened: &Spawned) {
+fn observed_ready(fixture: &Fixture, opened: &Shell) {
     let recorder = fixture.recorder();
     let ready = recorder
         .observed_jobs()
@@ -628,7 +681,23 @@ fn history_intact(fixture: &Fixture, uid: &SnapshotUid, exits: &[i32]) {
     let buffer_empty = recorder.terminal_bytes(uid).is_empty();
     drop(recorder);
     assert_eq!(codes, exits, "{uid}'s history changed");
-    assert!(buffer_empty, "{uid}'s buffer was written to after it closed");
+    assert!(
+        buffer_empty,
+        "{uid}'s buffer was written to after it closed"
+    );
+}
+
+/// Where `job`'s shell currently stands, as the mux reports it.
+///
+/// # Panics
+///
+/// Panics when the job is not in the table.
+fn job_cwd(fixture: &Fixture, job: &Shell) -> PathBuf {
+    fixture
+        .mux()
+        .job(job.id())
+        .expect("the job is open")
+        .working_directory
 }
 
 /// Appends whatever the recorder still holds for `uid` to `terminal`.
@@ -645,14 +714,16 @@ async fn a_job_command_publishes_like_a_shell_line() {
     let mut fixture = Fixture::new();
     let job = fixture
         .mux()
-        .spawn(
-            "",
-            Some(ShellId::from("1")),
-            Some("printf 'one\\n' > src/file0.txt"),
+        .open_shell(
+            &fixture.seed,
+            Some(Principal::from("1")),
             SpawnOptions::default(),
         )
         .await
-        .expect("spawn a job with a command");
+        .expect("open a shell");
+    job.run_command("printf 'one\\n' > src/file0.txt", CommandOptions::default())
+        .await
+        .expect("the line publishes");
 
     let completion = concluded(&fixture, &job.sandbox().uid).await;
     assert_eq!(completion.exit_code, Some(0));
@@ -681,18 +752,23 @@ async fn a_jobs_snapshot_outlives_its_lines_and_goes_with_the_job() {
     let mut fixture = Fixture::new();
     let job = fixture
         .mux()
-        .spawn("", Some(ShellId::from("1")), None, SpawnOptions::default())
+        .open_shell(
+            &fixture.seed,
+            Some(Principal::from("1")),
+            SpawnOptions::default(),
+        )
         .await
-        .expect("spawn a job");
+        .expect("open a shell");
 
-    fixture
-        .mux()
-        .start_in(&job, "printf 'x\\n' > src/file0.txt", CommandOptions::default())
+    job.run_command("printf 'x\\n' > src/file0.txt", CommandOptions::default())
         .await
-        .expect("start the line");
+        .expect("the line publishes");
     let completion = concluded(&fixture, &job.sandbox().uid).await;
     assert_eq!(completion.exit_code, Some(0));
-    assert!(matches!(verdict(&completion.outcome), Outcome::Published { .. }));
+    assert!(matches!(
+        verdict(&completion.outcome),
+        Outcome::Published { .. }
+    ));
 
     assert!(
         fixture.snap().join(job.sandbox().uid.as_str()).is_dir(),
@@ -707,12 +783,11 @@ async fn a_jobs_snapshot_outlives_its_lines_and_goes_with_the_job() {
         vec![std::ffi::OsString::from(job.sandbox().uid.as_str())]
     );
 
-    fixture.mux().stop(&job, false).await.expect("stop the job");
+    job.stop(false).await.expect("stop the shell");
     wait_for_close(&fixture, &job.sandbox().uid).await;
 
     assert!(
-        std::fs::read_dir(fixture.snap())
-            .map_or(true, |mut entries| entries.next().is_none()),
+        std::fs::read_dir(fixture.snap()).map_or(true, |mut entries| entries.next().is_none()),
         "the snapshot is gone once the job closes"
     );
     assert!(
@@ -734,9 +809,13 @@ async fn ctrl_c_at_the_terminal_reaches_the_line_which_is_then_gated() {
     let mut fixture = Fixture::new();
     let job = fixture
         .mux()
-        .spawn("", Some(ShellId::from(MAIN)), None, SpawnOptions::default())
+        .open_shell(
+            &fixture.seed,
+            Some(Principal::from(MAIN)),
+            SpawnOptions::default(),
+        )
         .await
-        .expect("spawn a job");
+        .expect("open a shell");
     start_held(
         &fixture,
         &job,
@@ -745,11 +824,7 @@ async fn ctrl_c_at_the_terminal_reaches_the_line_which_is_then_gated() {
     )
     .await;
 
-    fixture
-        .mux()
-        .write_input(&job, b"\x03")
-        .await
-        .expect("send ctrl-c");
+    job.write_input(b"\x03").await.expect("send ctrl-c");
 
     let completion = concluded(&fixture, &job.sandbox().uid).await;
     assert_eq!(
@@ -780,19 +855,23 @@ async fn a_job_has_exactly_three_standard_streams() {
     let mut fixture = Fixture::new();
     let job = fixture
         .mux()
-        .spawn("", Some(ShellId::from(MAIN)), None, SpawnOptions::default())
+        .open_shell(
+            &fixture.seed,
+            Some(Principal::from(MAIN)),
+            SpawnOptions::default(),
+        )
         .await
-        .expect("spawn a job");
+        .expect("open a shell");
 
-    let command = fixture
-        .mux()
-        .start_in(&job, "echo x >&3", CommandOptions::default())
-        .await
-        .expect("start the line");
-    let awaited = tokio::time::timeout(TIMEOUT, command.wait())
-        .await
-        .expect("the command's receipt timed out")
-        .expect("the command concluded");
+    // A failed redirection is a published line with no filesystem effect, so the run succeeds and
+    // answers with the completion whose nonzero status is the *process's*, not a verdict.
+    let awaited = tokio::time::timeout(
+        TIMEOUT,
+        job.run_command("echo x >&3", CommandOptions::default()),
+    )
+    .await
+    .expect("the command timed out")
+    .expect("the line publishes");
     assert_eq!(awaited.exit_code, Some(1));
 
     let bytes = drain_output(&fixture, &job, "fd3", |bytes| {
@@ -823,44 +902,64 @@ async fn terminal_output_is_preserved_byte_for_byte() {
 
     let job = fixture
         .mux()
-        .spawn(
-            "",
-            Some(ShellId::from(MAIN)),
-            Some(PAYLOAD_CMD),
+        .open_shell(
+            &fixture.seed,
+            Some(Principal::from(MAIN)),
             SpawnOptions::default(),
         )
         .await
-        .expect("spawn a job with a command");
+        .expect("open a shell");
+    job.run_command(PAYLOAD_CMD, CommandOptions::default())
+        .await
+        .expect("the line publishes");
 
-    let mut output =
-        drain_output(&fixture, &job, "payload", |bytes| bytes.len() >= PAYLOAD.len()).await;
+    let mut output = drain_output(&fixture, &job, "payload", |bytes| {
+        bytes.len() >= PAYLOAD.len()
+    })
+    .await;
 
     let completion = concluded(&fixture, &job.sandbox().uid).await;
     assert_eq!(completion.exit_code, Some(0));
 
-    fixture.mux().stop(&job, false).await.expect("stop the job");
+    job.stop(false).await.expect("stop the shell");
     wait_for_close(&fixture, &job.sandbox().uid).await;
     complete_tails(&fixture, &job.sandbox().uid, &mut output);
 
-    assert_eq!(output, PAYLOAD, "the terminal carries the payload byte for byte");
+    assert_eq!(
+        output, PAYLOAD,
+        "the terminal carries the payload byte for byte"
+    );
 
     fixture.finish_mux().await;
 }
 
+/// Two jobs truncating one file: the loser is refused a capability, not told to rerun.
+///
+/// A truncating write reads nothing, so there is no dependency to resynchronize and a second
+/// evaluation would be refused for exactly the same reason. The mux reports the shell's verdict
+/// unchanged — what it adds is the receipt, not the decision.
 #[tokio::test]
 #[serial]
-async fn concurrent_job_commands_race_like_tabs() {
+async fn concurrent_writers_report_capability_denial() {
     let mut fixture = Fixture::new();
     let slow = fixture
         .mux()
-        .spawn("", Some(ShellId::from("slow")), None, SpawnOptions::default())
+        .open_shell(
+            &fixture.seed,
+            Some(Principal::from("slow")),
+            SpawnOptions::default(),
+        )
         .await
-        .expect("spawn slow");
+        .expect("open slow");
     let quick = fixture
         .mux()
-        .spawn("", Some(ShellId::from("quick")), None, SpawnOptions::default())
+        .open_shell(
+            &fixture.seed,
+            Some(Principal::from("quick")),
+            SpawnOptions::default(),
+        )
         .await
-        .expect("spawn quick");
+        .expect("open quick");
 
     start_marked(
         &fixture,
@@ -870,15 +969,13 @@ async fn concurrent_job_commands_race_like_tabs() {
     )
     .await;
 
-    fixture
-        .mux()
-        .start_in(
-            &quick,
+    quick
+        .run_command(
             "printf 'quick\\n' > src/file1.txt",
             CommandOptions::default(),
         )
         .await
-        .expect("start quick's line");
+        .expect("quick's line publishes");
     let quick_completion = concluded(&fixture, &quick.sandbox().uid).await;
     assert_eq!(quick_completion.exit_code, Some(0));
     assert!(matches!(
@@ -888,11 +985,14 @@ async fn concurrent_job_commands_race_like_tabs() {
 
     let slow_completion = concluded(&fixture, &slow.sandbox().uid).await;
     match verdict(&slow_completion.outcome) {
-        Outcome::Stale { stale, .. } => assert!(
-            stale.iter().any(|path| path.path == Path::new("src/file1.txt")),
-            "the loser names the path the winner published: {stale:?}"
+        Outcome::Denied { denials, .. } => assert!(
+            denials.iter().any(|denial| {
+                denial.event.action == Action::Edit
+                    && denial.event.resource.segments() == ["src", "file1.txt"]
+            }),
+            "the loser is refused its edit of the path the winner owns: {denials:?}"
         ),
-        other => panic!("expected the slow line to lose the race, got {other:?}"),
+        other => panic!("expected the slow line to be denied, got {other:?}"),
     }
 
     assert_eq!(
@@ -900,38 +1000,55 @@ async fn concurrent_job_commands_race_like_tabs() {
         b"quick\n"
     );
 
-    fixture.mux().stop(&slow, true).await.expect("stop slow");
+    slow.stop(true).await.expect("stop slow");
     fixture.finish_mux().await;
 }
 
+/// Two jobs writing *different* files both publish, and each sees the other's result afterwards.
+///
+/// The held command must run exactly once: a publication elsewhere in the seed is not a
+/// dependency, and a design that reran every older snapshot's line would serialize the whole host.
 #[tokio::test]
 #[serial]
-async fn a_publication_invalidates_every_older_snapshot() {
+async fn disjoint_concurrent_writes_both_publish() {
     let mut fixture = Fixture::new();
     let slow = fixture
         .mux()
-        .spawn("", Some(ShellId::from("slow")), None, SpawnOptions::default())
+        .open_shell(
+            &fixture.seed,
+            Some(Principal::from("slow")),
+            SpawnOptions::default(),
+        )
         .await
-        .expect("spawn slow");
+        .expect("open slow");
     let quick = fixture
         .mux()
-        .spawn("", Some(ShellId::from("quick")), None, SpawnOptions::default())
+        .open_shell(
+            &fixture.seed,
+            Some(Principal::from("quick")),
+            SpawnOptions::default(),
+        )
         .await
-        .expect("spawn quick");
+        .expect("open quick");
 
+    // Outside every seed: a counter inside the snapshot would be part of the footprint under test,
+    // and a replay would throw it away along with everything else.
+    let attempts = fixture.seed.parent().expect("a scratch root").join("slow-attempts");
     start_marked(
         &fixture,
         &slow,
-        &format!("printf 'b\\n' > src/b.txt; {RACE_HOLD}"),
+        &format!(
+            "printf 'x\\n' >> {}; printf 'b\\n' > src/b.txt; {RACE_HOLD}",
+            attempts.display()
+        ),
         CommandOptions::default(),
     )
     .await;
 
-    fixture
-        .mux()
-        .start_in(&quick, "printf 'a\\n' > src/a.txt", CommandOptions::default())
+    quick
+        .run_command("printf 'a\\n' > src/a.txt", CommandOptions::default())
         .await
-        .expect("start quick's line");
+        .expect("quick's line publishes");
     let quick_completion = concluded(&fixture, &quick.sandbox().uid).await;
     assert_eq!(quick_completion.exit_code, Some(0));
     assert!(matches!(
@@ -941,20 +1058,142 @@ async fn a_publication_invalidates_every_older_snapshot() {
 
     let slow_completion = concluded(&fixture, &slow.sandbox().uid).await;
     match verdict(&slow_completion.outcome) {
-        Outcome::Stale { stale, .. } => assert!(
-            stale.iter().any(|path| path.path == Path::new("src/a.txt")),
-            "the loser's write set names the winner's new file: {stale:?}"
+        Outcome::Published { granted, .. } => assert!(
+            granted.iter().all(|event| {
+                event.action == Action::Edit && event.resource.segments() == ["src", "b.txt"]
+            }),
+            "the held line asked only for what it wrote: {granted:?}"
         ),
-        other => panic!("expected the slow line to lose the race, got {other:?}"),
+        other => panic!("expected the held line to publish, got {other:?}"),
     }
 
     assert_eq!(
-        std::fs::read(fixture.seed("src/a.txt")).expect("read the seed file"),
+        std::fs::read(fixture.seed("src/a.txt")).expect("read a"),
         b"a\n"
     );
-    assert!(!fixture.seed("src/b.txt").exists());
+    assert_eq!(
+        std::fs::read(fixture.seed("src/b.txt")).expect("read b"),
+        b"b\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&attempts)
+            .expect("the attempt counter")
+            .lines()
+            .count(),
+        1,
+        "a disjoint publication is not a dependency, so nothing was run twice"
+    );
 
-    fixture.mux().stop(&slow, true).await.expect("stop slow");
+    // The held shell's own snapshot was retaken after it published, so it can now see the file
+    // the other job wrote while it was running.
+    assert_eq!(
+        run_line(&fixture, &slow, "cat src/a.txt").await,
+        "a",
+        "the publisher's tree is the current seed afterwards"
+    );
+
+    slow.stop(true).await.expect("stop slow");
+    fixture.finish_mux().await;
+}
+
+/// A forced stop while a line is being evaluated again ends it once, unchecked.
+///
+/// The replay is the shell's own business, so the mux must still see exactly one command: one
+/// receipt, one completion, and a discard that publishes nothing. A caller that asked for the
+/// command to end did not ask for it to be run a third time.
+#[tokio::test]
+#[serial]
+async fn a_forced_stop_during_a_replay_discards_the_command_once() {
+    let mut fixture = Fixture::new();
+    std::fs::write(fixture.seed("src/foo.txt"), b"old\n").expect("seed foo.txt");
+    let victim = fixture
+        .mux()
+        .open_shell(
+            &fixture.seed,
+            Some(Principal::from("victim")),
+            SpawnOptions::default(),
+        )
+        .await
+        .expect("open victim");
+    let writer = fixture
+        .mux()
+        .open_shell(
+            &fixture.seed,
+            Some(Principal::from("writer")),
+            SpawnOptions::default(),
+        )
+        .await
+        .expect("open writer");
+
+    // Outside every seed: a replay throws the snapshot away, so nothing inside one can count how
+    // many times the line ran.
+    let scratch = fixture.seed.parent().expect("a scratch root");
+    let attempts = scratch.join("victim-attempts");
+    let gate = scratch.join("victim-gate");
+    start_marked(
+        &fixture,
+        &victim,
+        &format!(
+            "printf 'x\\n' >> {}; echo started; while [ ! -e {} ]; do sleep 0.02; done; \
+             /bin/cat src/foo.txt > src/observed.txt; sh -c 'echo held; sleep 30'",
+            attempts.display(),
+            gate.display()
+        ),
+        CommandOptions::default(),
+    )
+    .await;
+
+    writer
+        .run_command("printf 'new\\n' > src/foo.txt", CommandOptions::default())
+        .await
+        .expect("the writer publishes");
+    concluded(&fixture, &writer.sandbox().uid).await;
+
+    // Releasing the barrier is what makes the victim read the file the writer has republished.
+    std::fs::write(&gate, b"").expect("open the gate");
+    let attempted = |count: usize| {
+        std::fs::read_to_string(&attempts).map_or(0, |text| text.lines().count()) >= count
+    };
+    let deadline = Instant::now() + TIMEOUT;
+    while !attempted(2) {
+        assert!(Instant::now() < deadline, "the victim never ran a second time");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // The replay's own child announcing itself, so the stop below has something live to reach:
+    // waiting a duration instead would be measuring the machine rather than the order.
+    drain_output(&fixture, &victim, "the replay's hold", |bytes| {
+        contains_subslice(bytes, b"held")
+    })
+    .await;
+
+    victim.stop(true).await.expect("force-stop the victim");
+    let completion = concluded(&fixture, &victim.sandbox().uid).await;
+    assert!(
+        matches!(verdict(&completion.outcome), Outcome::Discarded),
+        "a forced stop outranks the replay: {:?}",
+        completion.outcome
+    );
+    assert!(
+        !fixture.seed("src/observed.txt").exists(),
+        "a discarded command publishes nothing"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&attempts)
+            .expect("the attempt counter")
+            .lines()
+            .count(),
+        2,
+        "one invalidation, one replay, then the stop — never a third evaluation"
+    );
+    assert!(
+        fixture
+            .recorder()
+            .take_result(&victim.sandbox().uid)
+            .is_none(),
+        "one logical command, one completion"
+    );
+
+    writer.stop(true).await.expect("stop the writer");
     fixture.finish_mux().await;
 }
 
@@ -964,20 +1203,23 @@ async fn one_terminal_size_governs_every_job() {
     let mut fixture = Fixture::new();
     let nested_job = fixture
         .mux()
-        .spawn(
-            "src",
-            Some(ShellId::from("nested")),
-            None,
+        .open_shell(
+            &fixture.seed("src"),
+            Some(Principal::from("nested")),
             SpawnOptions::default(),
         )
         .await
-        .expect("spawn a nested job");
+        .expect("open a nested shell");
     observed_ready(&fixture, &nested_job);
     let root_job = fixture
         .mux()
-        .spawn("", Some(ShellId::from("root")), None, SpawnOptions::default())
+        .open_shell(
+            &fixture.seed,
+            Some(Principal::from("root")),
+            SpawnOptions::default(),
+        )
         .await
-        .expect("spawn a root job");
+        .expect("open a root shell");
     observed_ready(&fixture, &root_job);
 
     assert_eq!(size_of_job(&fixture, &nested_job).await, "24 80");
@@ -985,7 +1227,10 @@ async fn one_terminal_size_governs_every_job() {
 
     let nested_dir = run_line(&fixture, &nested_job, "pwd").await;
     let root_dir = run_line(&fixture, &root_job, "pwd").await;
-    assert!(nested_dir.ends_with("/src"), "nested job works in src: {nested_dir}");
+    assert!(
+        nested_dir.ends_with("/src"),
+        "nested job works in src: {nested_dir}"
+    );
     assert!(
         !root_dir.ends_with("/src"),
         "root job works at the seed root: {root_dir}"
@@ -1001,9 +1246,14 @@ async fn one_terminal_size_governs_every_job() {
 
     let spawn_task = tokio::spawn({
         let mux = Arc::clone(fixture.mux());
+        let seed = fixture.seed.clone();
         async move {
-            mux.spawn("", Some(ShellId::from("late")), None, SpawnOptions::default())
-                .await
+            mux.open_shell(
+                &seed,
+                Some(Principal::from("late")),
+                SpawnOptions::default(),
+            )
+            .await
         }
     });
     let resize_task = tokio::spawn({
@@ -1017,8 +1267,12 @@ async fn one_terminal_size_governs_every_job() {
         }
     });
     let (spawned, resized) = tokio::join!(spawn_task, resize_task);
-    let late_job = spawned.expect("join the spawn task").expect("spawn a late job");
-    resized.expect("join the resize task").expect("resize the mux");
+    let late_job = spawned
+        .expect("join the spawn task")
+        .expect("spawn a late job");
+    resized
+        .expect("join the resize task")
+        .expect("resize the mux");
     observed_ready(&fixture, &late_job);
 
     // One pass moves the default *and* every terminal that was already open: each job's own
@@ -1064,69 +1318,97 @@ async fn one_terminal_size_governs_every_job() {
 #[serial]
 async fn a_zero_dimension_is_refused_before_the_mux_is_built() {
     let mut fixture = Fixture::new();
+    // A shell first, so the mux actually holds the seed's lease when it is torn down.
+    let job = fixture
+        .mux()
+        .open_shell(
+            &fixture.seed,
+            Some(Principal::from("1")),
+            SpawnOptions::default(),
+        )
+        .await
+        .expect("open a shell");
+    observed_ready(&fixture, &job);
     fixture.finish_mux().await;
 
-    let result = ShellMux::new(
-        fixture.open_executor().expect("reopen the seed"),
-        Arc::new(Mutex::new(PolicyValidator::default())),
+    let result = ShellMux::new_with(
         MuxProfile {
             environment: ShellEnvironment::new(),
             ..MuxProfile::default()
         },
         Arc::new(Mutex::new(Recorder::new(0, COLS))),
+        fixture.fs.clone(),
     );
     assert!(matches!(
         result,
-        Err(MuxError::InvalidTerminalSize { rows: 0, cols: COLS })
+        Err(MuxError::InvalidTerminalSize {
+            rows: 0,
+            cols: COLS
+        })
     ));
 
     assert!(
         fixture.open_executor().is_ok(),
-        "the consumed executor released its lease"
+        "the shut-down mux released the seed's lease"
     );
 }
 
 #[tokio::test]
 #[serial]
-async fn a_job_opened_for_a_command_is_in_the_table_before_it_starts() {
+async fn a_shell_is_in_the_table_before_its_command_is_admitted() {
     let mut fixture = Fixture::new();
     let job = fixture
         .mux()
-        .spawn(
-            "",
-            Some(ShellId::from("bg")),
-            Some("printf 'done\\n' > src/file0.txt"),
+        .open_shell(
+            &fixture.seed,
+            Some(Principal::from("bg")),
             SpawnOptions::default(),
         )
         .await
-        .expect("spawn a job with a command");
+        .expect("open a shell");
 
-    // Inspected before anything is awaited: the receipt is reserved under the same lock that
-    // admitted the job, so it cannot be missing merely because the launch task has not run.
-    let reserved = job
-        .initial_command()
-        .expect("the command's receipt exists the instant spawn returns");
-    assert_eq!(reserved.text(), "printf 'done\\n' > src/file0.txt");
-
+    // Opening runs nothing at all: the row is there, idle, before any command has been submitted
+    // into it — which is what makes a shell a sandbox rather than a command.
     let view = fixture
         .mux()
         .job(job.id())
-        .expect("the row exists before the launch runs");
-    assert!(view.starting, "the row is reserved before anything ran");
-    assert!(view.running.is_none());
+        .expect("the row exists before any command does");
+    assert!(!view.starting, "nothing is being launched into it");
+    assert!(view.running.is_none(), "and nothing is running in it");
 
     assert!(matches!(
         fixture
             .mux()
-            .spawn("", Some(job.id().clone()), None, SpawnOptions::default())
+            .open_shell(
+                &fixture.seed,
+                Some(job.principal().clone()),
+                SpawnOptions::default()
+            )
             .await,
         Err(MuxError::JobExists(_))
     ));
 
+    // The receipt is reserved as the line is admitted, before it can emit a byte or finish, so a
+    // caller correlating a shell's output with the command that caused it has it first.
+    let reserved = schedule(
+        &job,
+        "printf 'done\\n' > src/file0.txt",
+        CommandOptions::default(),
+    )
+    .await;
+    assert_eq!(reserved.text(), "printf 'done\\n' > src/file0.txt");
+
     let completion = concluded(&fixture, &job.sandbox().uid).await;
-    assert_eq!(completion.id, reserved.id(), "the reserved receipt is the one that resolved");
+    assert_eq!(
+        completion.id,
+        reserved.id(),
+        "the reserved receipt is the one that resolved"
+    );
     assert_eq!(completion.exit_code, Some(0));
-    assert!(matches!(verdict(&completion.outcome), Outcome::Published { .. }));
+    assert!(matches!(
+        verdict(&completion.outcome),
+        Outcome::Published { .. }
+    ));
     assert_eq!(
         std::fs::read(fixture.seed("src/file0.txt")).expect("read the seed file"),
         b"done\n"
@@ -1137,26 +1419,28 @@ async fn a_job_opened_for_a_command_is_in_the_table_before_it_starts() {
 
 #[tokio::test]
 #[serial]
-async fn graceful_stop_requested_while_starting_finishes_and_closes() {
+async fn a_graceful_stop_lets_the_running_line_finish_and_then_closes() {
     let mut fixture = Fixture::new();
     let job = fixture
         .mux()
-        .spawn(
-            "",
-            Some(ShellId::from("1")),
-            Some("printf 'done\\n' > src/file0.txt"),
+        .open_shell(
+            &fixture.seed,
+            Some(Principal::from("1")),
             SpawnOptions::default(),
         )
         .await
-        .expect("spawn a job with a command");
+        .expect("open a shell");
+    start_marked(
+        &fixture,
+        &job,
+        &format!("printf 'done\\n' > src/file0.txt; {RACE_HOLD}"),
+        CommandOptions::default(),
+    )
+    .await;
 
-    fixture
-        .mux()
-        .stop(&job, false)
-        .await
-        .expect("graceful stop while starting");
+    job.stop(false).await.expect("graceful stop while running");
     assert!(
-        !fixture.mux().keep(&job).expect("the job is still live"),
+        !job.keep().expect("the shell is still live"),
         "an explicit stop is not a closure keep may quietly revoke"
     );
 
@@ -1165,16 +1449,17 @@ async fn graceful_stop_requested_while_starting_finishes_and_closes() {
         "a graceful stop does not retire the row"
     );
     assert!(matches!(
-        fixture
-            .mux()
-            .start_in(&job, "echo too-late", CommandOptions::default())
+        job.run_command("echo too-late", CommandOptions::default())
             .await,
-        Err(MuxError::JobClosing(_))
+        Err(RunError::Admission(MuxError::JobClosing(_)))
     ));
 
     let completion = concluded(&fixture, &job.sandbox().uid).await;
     assert_eq!(completion.exit_code, Some(0));
-    assert!(matches!(verdict(&completion.outcome), Outcome::Published { .. }));
+    assert!(matches!(
+        verdict(&completion.outcome),
+        Outcome::Published { .. }
+    ));
     assert_eq!(
         std::fs::read(fixture.seed("src/file0.txt")).expect("read the seed file"),
         b"done\n"
@@ -1187,58 +1472,53 @@ async fn graceful_stop_requested_while_starting_finishes_and_closes() {
     })
     .await;
 
-    // The handle outlived its job, so it names an instance that is gone rather than a name that
+    // The handle outlived its shell, so it names an instance that is gone rather than a name that
     // is merely free: it can never reach whatever takes the name next.
-    assert!(matches!(
-        fixture.mux().stop(&job, false).await,
-        Err(MuxError::StaleJob(_))
-    ));
+    assert!(matches!(job.stop(false).await, Err(MuxError::StaleJob(_))));
 
     fixture.finish_mux().await;
 }
 
 #[tokio::test]
 #[serial]
-async fn force_stop_requested_while_starting_discards_the_line() {
+async fn a_forced_stop_retires_the_shell_and_frees_its_name() {
     let mut fixture = Fixture::new();
     let job = fixture
         .mux()
-        .spawn(
-            "",
-            Some(ShellId::from("forced")),
-            Some("printf 'partial\\n' > src/file0.txt; sleep 60"),
+        .open_shell(
+            &fixture.seed,
+            Some(Principal::from("forced")),
             SpawnOptions::default(),
         )
         .await
-        .expect("spawn a job with a command");
+        .expect("open a shell");
+    start_held(
+        &fixture,
+        &job,
+        "printf 'partial\\n' > src/file0.txt; ",
+        CommandOptions::default(),
+    )
+    .await;
 
-    fixture
-        .mux()
-        .stop(&job, true)
-        .await
-        .expect("force stop while starting");
+    job.stop(true).await.expect("force stop the running line");
 
+    // Retired the moment force was accepted, while the line it discarded, that line's verdict and
+    // its name all remain its own until the reclamation `wait_for_close` below waits out.
     assert!(
         fixture.mux().job(job.id()).is_none(),
-        "the job left public view at once"
+        "the shell left public view at once"
     );
     assert!(!fixture.mux().jobs().iter().any(|view| &view.id == job.id()));
     assert!(
-        matches!(
-            fixture
-                .mux()
-                .spawn("", Some(job.id().clone()), None, SpawnOptions::default())
-                .await,
-            Err(MuxError::JobExists(_))
-        ),
-        "the row still exists until the launch task runs"
+        fixture.mux().get_shell(job.principal()).is_none(),
+        "a retired principal answers to nothing"
     );
 
     let completion = concluded(&fixture, &job.sandbox().uid).await;
-    assert!(
-        completion.exit_code.is_none(),
-        "nothing ran, so there is no process status to report: {:?}",
-        completion.exit_code
+    assert_eq!(
+        completion.exit_code,
+        Some(137),
+        "the external was killed by SIGKILL"
     );
     assert!(matches!(verdict(&completion.outcome), Outcome::Discarded));
 
@@ -1256,7 +1536,11 @@ async fn force_stop_requested_while_starting_discards_the_line() {
     assert!(
         fixture
             .mux()
-            .spawn("", Some(job.id().clone()), None, SpawnOptions::default())
+            .open_shell(
+                &fixture.seed,
+                Some(job.principal().clone()),
+                SpawnOptions::default()
+            )
             .await
             .is_ok(),
         "the name is free again"
@@ -1271,9 +1555,13 @@ async fn a_forced_stop_kills_the_running_line_and_discards_it() {
     let mut fixture = Fixture::new();
     let job = fixture
         .mux()
-        .spawn("", Some(ShellId::from(MAIN)), None, SpawnOptions::default())
+        .open_shell(
+            &fixture.seed,
+            Some(Principal::from(MAIN)),
+            SpawnOptions::default(),
+        )
         .await
-        .expect("spawn a job");
+        .expect("open a shell");
 
     let (tx, rx) = tokio::sync::oneshot::channel();
     let done: OnFinish = Box::new(move |code| {
@@ -1290,11 +1578,7 @@ async fn a_forced_stop_kills_the_running_line_and_discards_it() {
     )
     .await;
 
-    fixture
-        .mux()
-        .stop(&job, true)
-        .await
-        .expect("force stop the running line");
+    job.stop(true).await.expect("force stop the running line");
 
     let killed_code = tokio::time::timeout(TIMEOUT, rx)
         .await
@@ -1313,8 +1597,7 @@ async fn a_forced_stop_kills_the_running_line_and_discards_it() {
 
     wait_for_close(&fixture, &job.sandbox().uid).await;
     assert!(
-        std::fs::read_dir(fixture.snap())
-            .map_or(true, |mut entries| entries.next().is_none()),
+        std::fs::read_dir(fixture.snap()).map_or(true, |mut entries| entries.next().is_none()),
         "the snapshot is gone"
     );
 
@@ -1327,26 +1610,27 @@ async fn a_finish_callback_reports_each_command_once() {
     let mut fixture = Fixture::new();
     let job = fixture
         .mux()
-        .spawn("", Some(ShellId::from(MAIN)), None, SpawnOptions::default())
+        .open_shell(
+            &fixture.seed,
+            Some(Principal::from(MAIN)),
+            SpawnOptions::default(),
+        )
         .await
-        .expect("spawn a job");
+        .expect("open a shell");
 
     let (tx1, rx1) = tokio::sync::oneshot::channel();
     let done1: OnFinish = Box::new(move |code| {
         let _ = tx1.send(code);
     });
-    fixture
-        .mux()
-        .start_in(
-            &job,
-            "sh -c 'exit 3'",
-            CommandOptions {
-                on_finish: Some(done1),
-                ..CommandOptions::default()
-            },
-        )
-        .await
-        .expect("start the first line");
+    job.run_command(
+        "sh -c 'exit 3'",
+        CommandOptions {
+            on_finish: Some(done1),
+            ..CommandOptions::default()
+        },
+    )
+    .await
+    .expect("a nonzero exit under an approved publication is a successful run");
     let code1 = tokio::time::timeout(TIMEOUT, rx1)
         .await
         .expect("the first callback timed out")
@@ -1374,18 +1658,11 @@ async fn a_finish_callback_reports_each_command_once() {
         let _ = tx_extra.send(code);
     });
     assert!(
-        !fixture
-            .mux()
-            .on_finish(&job, extra)
-            .expect("the job is still live"),
+        !job.on_finish(extra).expect("the shell is still live"),
         "a callback is already registered for the running command"
     );
 
-    fixture
-        .mux()
-        .stop(&job, true)
-        .await
-        .expect("force stop the held line");
+    job.stop(true).await.expect("force stop the held line");
     let code2 = tokio::time::timeout(TIMEOUT, rx2)
         .await
         .expect("the second callback timed out")
@@ -1397,7 +1674,10 @@ async fn a_finish_callback_reports_each_command_once() {
         first.id, second.id,
         "each line has a receipt of its own; no completion is stolen"
     );
-    assert_eq!(fixture.recorder().exit_codes(&job.sandbox().uid), vec![3, 137]);
+    assert_eq!(
+        fixture.recorder().exit_codes(&job.sandbox().uid),
+        vec![3, 137]
+    );
 
     fixture.finish_mux().await;
 }
@@ -1408,32 +1688,40 @@ async fn a_callback_nobody_can_register_is_dropped_at_once() {
     let mut fixture = Fixture::new();
     let job = fixture
         .mux()
-        .spawn("", Some(ShellId::from(MAIN)), None, SpawnOptions::default())
+        .open_shell(
+            &fixture.seed,
+            Some(Principal::from(MAIN)),
+            SpawnOptions::default(),
+        )
         .await
-        .expect("spawn a job");
+        .expect("open a shell");
 
     let (tx_idle, rx_idle) = tokio::sync::oneshot::channel();
     let idle: OnFinish = Box::new(move |code| {
         let _ = tx_idle.send(code);
     });
     assert!(
-        !fixture
-            .mux()
-            .on_finish(&job, idle)
-            .expect("the job is live"),
-        "the job is idle: nothing to report"
+        !job.on_finish(idle).expect("the shell is live"),
+        "the shell is idle: nothing to report"
     );
-    assert!(rx_idle.await.is_err(), "the callback was dropped, not called");
+    assert!(
+        rx_idle.await.is_err(),
+        "the callback was dropped, not called"
+    );
 
     // A handle whose job has closed names an instance that is gone. Registering through it is
     // refused outright rather than silently attached to whatever holds the name now.
     let ghost = fixture
         .mux()
-        .spawn("", Some(ShellId::from("ghost")), None, SpawnOptions::default())
+        .open_shell(
+            &fixture.seed,
+            Some(Principal::from("ghost")),
+            SpawnOptions::default(),
+        )
         .await
-        .expect("spawn ghost");
+        .expect("open ghost");
     let ghost_uid = ghost.sandbox().uid.clone();
-    fixture.mux().stop(&ghost, true).await.expect("stop ghost");
+    ghost.stop(true).await.expect("stop ghost");
     wait_for_close(&fixture, &ghost_uid).await;
 
     let (tx_unknown, rx_unknown) = tokio::sync::oneshot::channel();
@@ -1441,7 +1729,7 @@ async fn a_callback_nobody_can_register_is_dropped_at_once() {
         let _ = tx_unknown.send(code);
     });
     assert!(matches!(
-        fixture.mux().on_finish(&ghost, unknown),
+        ghost.on_finish(unknown),
         Err(MuxError::StaleJob(_))
     ));
     assert!(rx_unknown.await.is_err());
@@ -1466,29 +1754,22 @@ async fn a_callback_nobody_can_register_is_dropped_at_once() {
         let _ = tx_refused.send(code);
     });
     assert!(matches!(
-        fixture
-            .mux()
-            .start_in(
-                &job,
-                "echo too-late",
-                CommandOptions {
-                    on_finish: Some(refused),
-                    ..CommandOptions::default()
-                },
-            )
-            .await,
-        Err(MuxError::JobBusy(_))
+        job.run_command(
+            "echo too-late",
+            CommandOptions {
+                on_finish: Some(refused),
+                ..CommandOptions::default()
+            },
+        )
+        .await,
+        Err(RunError::Admission(MuxError::JobBusy(_)))
     ));
     assert!(
         rx_refused.await.is_err(),
         "the refused callback was never registered"
     );
 
-    fixture
-        .mux()
-        .stop(&job, true)
-        .await
-        .expect("force stop the held line");
+    job.stop(true).await.expect("force stop the held line");
     let code = tokio::time::timeout(TIMEOUT, rx_first)
         .await
         .expect("the first callback timed out")
@@ -1506,14 +1787,22 @@ async fn shutdown_discards_running_lines_and_drops_waiting_callbacks() {
     let mut fixture = Fixture::new();
     let _idle = fixture
         .mux()
-        .spawn("", Some(ShellId::from("idle")), None, SpawnOptions::default())
+        .open_shell(
+            &fixture.seed,
+            Some(Principal::from("idle")),
+            SpawnOptions::default(),
+        )
         .await
-        .expect("spawn idle");
+        .expect("open idle");
     let busy = fixture
         .mux()
-        .spawn("", Some(ShellId::from("busy")), None, SpawnOptions::default())
+        .open_shell(
+            &fixture.seed,
+            Some(Principal::from("busy")),
+            SpawnOptions::default(),
+        )
         .await
-        .expect("spawn busy");
+        .expect("open busy");
 
     let (tx, mut rx) = tokio::sync::oneshot::channel();
     let done: OnFinish = Box::new(move |code| {
@@ -1540,10 +1829,7 @@ async fn shutdown_discards_running_lines_and_drops_waiting_callbacks() {
         Err(tokio::sync::oneshot::error::TryRecvError::Closed)
     ));
     assert!(!fixture.seed("src/g.txt").exists());
-    assert!(
-        std::fs::read_dir(fixture.snap())
-            .map_or(true, |mut entries| entries.next().is_none())
-    );
+    assert!(std::fs::read_dir(fixture.snap()).map_or(true, |mut entries| entries.next().is_none()));
     assert!(fixture.recorder().mux().is_none());
     assert!(
         fixture.recorder().results(&busy_uid).is_empty(),
@@ -1557,75 +1843,63 @@ async fn owned_job_futures_progress_while_another_job_is_blocked() {
     let mut fixture = Fixture::new();
     let blocked = fixture
         .mux()
-        .spawn(
-            "",
-            Some(ShellId::from("blocked")),
-            None,
+        .open_shell(
+            &fixture.seed,
+            Some(Principal::from("blocked")),
             SpawnOptions::default(),
         )
         .await
-        .expect("spawn the blocked job");
-    fixture
-        .mux()
-        .start_in(&blocked, "cat", CommandOptions::default())
-        .await
-        .expect("start cat");
+        .expect("open the blocked shell");
+    // Scheduled, not awaited: `cat` only ends at the end of file this test sends it much later.
+    schedule(&blocked, "cat", CommandOptions::default()).await;
 
     let worker = fixture
         .mux()
-        .spawn(
-            "",
-            Some(ShellId::from("worker")),
-            None,
+        .open_shell(
+            &fixture.seed,
+            Some(Principal::from("worker")),
             SpawnOptions::default(),
         )
         .await
-        .expect("spawn the worker job");
+        .expect("open the worker shell");
 
-    fixture.mux().switch(&worker).await.expect("switch to the worker");
-    assert_eq!(
-        fixture.mux().current_job().map(|view| view.id),
-        Some(worker.id().clone())
-    );
     assert_eq!(fixture.mux().jobs().len(), 2);
-    assert!(fixture.mux().history().is_empty());
+    assert_eq!(
+        fixture.mux().history(&fixture.seed),
+        Some(Vec::new()),
+        "an opened seed with no grants answers an empty history, not `None`"
+    );
 
     fixture
         .mux()
         .resize_all(TerminalGeometry { rows: 28, cols: 96 })
         .await
-        .expect("resize while a job is blocked");
+        .expect("resize while a shell is blocked");
 
-    fixture
-        .mux()
-        .start_in(
-            &worker,
-            "printf 'x\\n' > src/file0.txt",
-            CommandOptions::default(),
-        )
+    worker
+        .run_command("printf 'x\\n' > src/file0.txt", CommandOptions::default())
         .await
-        .expect("start the worker's line");
+        .expect("the worker's line publishes");
     let worker_completion = concluded(&fixture, &worker.sandbox().uid).await;
     assert_eq!(worker_completion.exit_code, Some(0));
     assert!(matches!(
         verdict(&worker_completion.outcome),
         Outcome::Published { .. }
     ));
-    assert_eq!(fixture.mux().history().len(), 1);
+    assert_eq!(
+        fixture
+            .mux()
+            .history(&fixture.seed)
+            .expect("the seed is open")
+            .len(),
+        1
+    );
 
-    fixture
-        .mux()
-        .write_input(&blocked, b"\x04")
-        .await
-        .expect("send eof to cat");
+    blocked.write_input(b"\x04").await.expect("send eof to cat");
     let blocked_completion = concluded(&fixture, &blocked.sandbox().uid).await;
     assert_eq!(blocked_completion.exit_code, Some(0));
 
-    fixture
-        .mux()
-        .stop(&blocked, false)
-        .await
-        .expect("stop the blocked job");
+    blocked.stop(false).await.expect("stop the blocked shell");
     wait_for_close(&fixture, &blocked.sandbox().uid).await;
 
     let mux = fixture.mux.take().expect("the mux is still present");
@@ -1640,19 +1914,24 @@ async fn an_unselected_job_needs_no_reader() {
     let mut fixture = Fixture::new();
     let job = fixture
         .mux()
-        .spawn(
-            "",
-            Some(ShellId::from(MAIN)),
-            Some("dd if=/dev/zero bs=65536 count=16 2>/dev/null"),
+        .open_shell(
+            &fixture.seed,
+            Some(Principal::from(MAIN)),
             SpawnOptions::default(),
         )
         .await
-        .expect("spawn a job with a command");
+        .expect("open a shell");
+    job.run_command(
+        "dd if=/dev/zero bs=65536 count=16 2>/dev/null",
+        CommandOptions::default(),
+    )
+    .await
+    .expect("the line publishes");
 
     let completion = concluded(&fixture, &job.sandbox().uid).await;
     assert_eq!(completion.exit_code, Some(0));
 
-    fixture.mux().stop(&job, false).await.expect("stop the job");
+    job.stop(false).await.expect("stop the shell");
     wait_for_close(&fixture, &job.sandbox().uid).await;
 
     let output = fixture.recorder().take_terminal(&job.sandbox().uid);
@@ -1669,7 +1948,11 @@ async fn a_bound_frontend_drives_the_table_it_observes() {
     let mut fixture = Fixture::new();
     assert_eq!(
         std::ptr::from_ref::<ShellMux>(
-            fixture.recorder().mux().expect("the frontend is bound").as_ref()
+            fixture
+                .recorder()
+                .mux()
+                .expect("the frontend is bound")
+                .as_ref()
         ),
         Arc::as_ptr(fixture.mux()),
         "the frontend is bound to this fixture's own mux"
@@ -1677,15 +1960,23 @@ async fn a_bound_frontend_drives_the_table_it_observes() {
 
     let alpha = fixture
         .mux()
-        .spawn("", Some(ShellId::from("alpha")), None, SpawnOptions::default())
+        .open_shell(
+            &fixture.seed,
+            Some(Principal::from("alpha")),
+            SpawnOptions::default(),
+        )
         .await
-        .expect("spawn alpha");
+        .expect("open alpha");
     observed_ready(&fixture, &alpha);
     let beta = fixture
         .mux()
-        .spawn("", Some(ShellId::from("beta")), None, SpawnOptions::default())
+        .open_shell(
+            &fixture.seed,
+            Some(Principal::from("beta")),
+            SpawnOptions::default(),
+        )
         .await
-        .expect("spawn beta");
+        .expect("open beta");
     observed_ready(&fixture, &beta);
 
     let ids: Vec<_> = fixture
@@ -1696,40 +1987,85 @@ async fn a_bound_frontend_drives_the_table_it_observes() {
         .collect();
     assert_eq!(ids, vec![alpha.id().clone(), beta.id().clone()]);
 
-    fixture.mux().switch(&beta).await.expect("switch to beta");
-    assert_eq!(fixture.recorder().observed_current(), Some(beta.id()));
-
     assert!(matches!(
         fixture
             .mux()
-            .spawn("", Some(alpha.id().clone()), None, SpawnOptions::default())
+            .open_shell(
+                &fixture.seed,
+                Some(alpha.principal().clone()),
+                SpawnOptions::default()
+            )
             .await,
         Err(MuxError::JobExists(_))
     ));
+    // An existing directory that no subvolume contains: the seed walk finds nothing, so the
+    // admission fails before a name or a descriptor is reserved.
+    let unregistered = fixture.scratch_dir("unregistered");
     let escape = ShellId::from("escape");
     assert!(matches!(
         fixture
             .mux()
-            .spawn(
-                "../outside",
-                Some(escape.clone()),
-                None,
+            .open_shell(
+                &unregistered,
+                Some(escape.principal().clone()),
                 SpawnOptions::default()
             )
             .await,
-        Err(MuxError::SandboxDir { .. })
+        Err(MuxError::Marsh(MarshError::Btrfs(
+            marsh_btrfs::Error::NoSubvolume(_)
+        )))
     ));
 
     assert!(fixture.recorder().handle(&escape).is_none());
+    assert!(
+        fixture
+            .recorder()
+            .observed_jobs()
+            .iter()
+            .all(|job| job.id != escape),
+        "a refused discovery admits no shell"
+    );
+    // The name was never reserved, so a valid creation may still take it — free *and* idle: the
+    // retaken name accepts a command of its own, and that command is the only one it concludes.
+    let reused = fixture
+        .mux()
+        .open_shell(
+            &fixture.seed,
+            Some(escape.principal().clone()),
+            SpawnOptions::default(),
+        )
+        .await
+        .expect("the refused name is free");
+    observed_ready(&fixture, &reused);
+    reused
+        .run_command(
+            "printf 'taken\\n' > src/taken.txt",
+            CommandOptions::default(),
+        )
+        .await
+        .expect("the retaken name publishes its own line");
+    let taken = concluded(&fixture, &reused.sandbox().uid).await;
+    assert_eq!(taken.exit_code, Some(0));
+    assert_eq!(
+        std::fs::read(fixture.seed("src/taken.txt")).expect("the retaken shell's file"),
+        b"taken\n"
+    );
+    reused.stop(true).await.expect("stop the retaken shell");
+    wait_for_close(&fixture, &reused.sandbox().uid).await;
+    assert_eq!(
+        fixture.recorder().exit_codes(&reused.sandbox().uid),
+        vec![0],
+        "no stranded reservation ran a second line"
+    );
     assert_eq!(
         fixture
             .recorder()
             .handle(alpha.id())
-            .map(|spawned| spawned.sandbox().uid.clone()),
+            .map(|shell| shell.sandbox().uid.clone()),
         Some(alpha.sandbox().uid.clone())
     );
 
-    fixture.mux().stop(&beta, true).await.expect("force stop beta");
+    beta.stop(true).await.expect("force stop beta");
     let ids: Vec<_> = fixture
         .recorder()
         .observed_jobs()
@@ -1737,7 +2073,6 @@ async fn a_bound_frontend_drives_the_table_it_observes() {
         .map(|job| job.id.clone())
         .collect();
     assert_eq!(ids, vec![alpha.id().clone()]);
-    assert!(fixture.recorder().observed_current().is_none());
 
     fixture.finish_mux().await;
 }
@@ -1748,35 +2083,34 @@ async fn input_reaches_a_job_and_every_result_is_delivered_once() {
     let mut fixture = Fixture::new();
     let job = fixture
         .mux()
-        .spawn(
-            "",
-            Some(ShellId::from(MAIN)),
-            Some("stty -echo; printf READY; cat"),
+        .open_shell(
+            &fixture.seed,
+            Some(Principal::from(MAIN)),
             SpawnOptions::default(),
         )
         .await
-        .expect("spawn a job with a command");
+        .expect("open a shell");
+    // Scheduled rather than awaited: this line ends only at the end of file the test itself sends,
+    // so its receipt — not its verdict — is what says it is running.
+    schedule(
+        &job,
+        "stty -echo; printf READY; cat",
+        CommandOptions::default(),
+    )
+    .await;
 
     drain_output(&fixture, &job, "ready marker", |bytes| {
         contains_subslice(bytes, b"READY")
     })
     .await;
 
-    fixture
-        .mux()
-        .write_input(&job, b"roundtrip\n")
-        .await
-        .expect("write to cat");
+    job.write_input(b"roundtrip\n").await.expect("write to cat");
     drain_output(&fixture, &job, "roundtrip echo", |bytes| {
         contains_subslice(bytes, b"roundtrip\r\n")
     })
     .await;
 
-    fixture
-        .mux()
-        .write_input(&job, b"\x04")
-        .await
-        .expect("send eof");
+    job.write_input(b"\x04").await.expect("send eof");
     let completion = concluded(&fixture, &job.sandbox().uid).await;
     assert_eq!(completion.exit_code, Some(0));
     assert_eq!(fixture.recorder().exit_codes(&job.sandbox().uid), vec![0]);
@@ -1789,16 +2123,23 @@ async fn input_reaches_a_job_and_every_result_is_delivered_once() {
     )
     .await;
     assert_eq!(second, Some(7));
-    assert_eq!(fixture.recorder().exit_codes(&job.sandbox().uid), vec![0, 7]);
+    assert_eq!(
+        fixture.recorder().exit_codes(&job.sandbox().uid),
+        vec![0, 7]
+    );
 
-    fixture.mux().stop(&job, false).await.expect("stop the job");
+    job.stop(false).await.expect("stop the shell");
     wait_for_close(&fixture, &job.sandbox().uid).await;
     history_intact(&fixture, &job.sandbox().uid, &[0, 7]);
     assert!(fixture.recorder().handle(job.id()).is_none());
 
     let reopened = fixture
         .mux()
-        .spawn("", Some(ShellId::from(MAIN)), None, SpawnOptions::default())
+        .open_shell(
+            &fixture.seed,
+            Some(Principal::from(MAIN)),
+            SpawnOptions::default(),
+        )
         .await
         .expect("reopen the name");
     assert_ne!(reopened.sandbox().uid, job.sandbox().uid);
@@ -1814,8 +2155,170 @@ async fn input_reaches_a_job_and_every_result_is_delivered_once() {
         fixture
             .recorder()
             .handle(reopened.id())
-            .map(|spawned| spawned.sandbox().uid.clone()),
+            .map(|shell| shell.sandbox().uid.clone()),
         Some(reopened.sandbox().uid.clone())
+    );
+
+    fixture.finish_mux().await;
+}
+
+/// A principal names a shell, and the shell it names is the one already open.
+///
+/// The collection is an index rather than a factory: [`ShellMux::get_shell`] answers with the live
+/// generation — the same interpreter, carrying the same variables — and never opens a second one.
+/// A principal nothing answers to is `None` and stays that way; a principal a live shell holds is
+/// refused to a second creation; and an object whose generation was stopped can never reach the
+/// replacement that took its name.
+#[tokio::test]
+#[serial]
+async fn principals_index_independent_shells() {
+    let mut fixture = Fixture::new();
+    let alpha_name = Principal::from("alpha");
+    let beta_name = Principal::from("beta");
+    let alpha = fixture
+        .mux()
+        .open_shell(
+            &fixture.seed,
+            Some(alpha_name.clone()),
+            SpawnOptions::default(),
+        )
+        .await
+        .expect("open alpha");
+    observed_ready(&fixture, &alpha);
+    let beta = fixture
+        .mux()
+        .open_shell(
+            &fixture.seed,
+            Some(beta_name.clone()),
+            SpawnOptions::default(),
+        )
+        .await
+        .expect("open beta");
+    observed_ready(&fixture, &beta);
+
+    assert_eq!(
+        run_line(&fixture, &alpha, "VALUE=alpha; printf 'set\\n'").await,
+        "set"
+    );
+    // Fetched rather than reopened: only the very interpreter the first line ran in still holds
+    // what that line set, so reading it back is what proves the lookup is an index.
+    let fetched = fixture
+        .mux()
+        .get_shell(&alpha_name)
+        .expect("alpha answers to its principal");
+    assert_eq!(
+        fetched.sandbox().uid,
+        alpha.sandbox().uid,
+        "the fetched shell is alpha's own generation"
+    );
+    assert_eq!(
+        run_line(&fixture, &fetched, "printf '%s\\n' \"$VALUE\"").await,
+        "alpha"
+    );
+
+    assert_eq!(
+        run_line(&fixture, &beta, "VALUE=beta; printf 'set\\n'").await,
+        "set"
+    );
+    let beta_again = fixture
+        .mux()
+        .get_shell(&beta_name)
+        .expect("beta answers to its principal");
+    assert_eq!(
+        run_line(&fixture, &beta_again, "printf '%s\\n' \"$VALUE\"").await,
+        "beta"
+    );
+    assert_eq!(
+        run_line(&fixture, &fetched, "printf '%s\\n' \"$VALUE\"").await,
+        "alpha",
+        "two principals are two independent shells"
+    );
+
+    let open = fixture.mux().jobs().len();
+    assert!(
+        fixture
+            .mux()
+            .get_shell(&Principal::from("missing"))
+            .is_none(),
+        "a principal nothing answers to resolves to nothing"
+    );
+    assert_eq!(
+        fixture.mux().jobs().len(),
+        open,
+        "and a lookup that found nothing opened nothing"
+    );
+
+    assert!(
+        matches!(
+            fixture
+                .mux()
+                .open_shell(
+                    &fixture.seed,
+                    Some(alpha_name.clone()),
+                    SpawnOptions::default()
+                )
+                .await,
+            Err(MuxError::JobExists(_))
+        ),
+        "a live principal is not creatable twice"
+    );
+
+    // The name comes back; the object that held it does not come with it.
+    let first_uid = alpha.sandbox().uid.clone();
+    alpha.stop(true).await.expect("stop alpha");
+    wait_for_close(&fixture, &first_uid).await;
+    assert!(
+        fixture.mux().get_shell(&alpha_name).is_none(),
+        "a stopped principal answers to nothing"
+    );
+
+    let reopened = fixture
+        .mux()
+        .open_shell(
+            &fixture.seed,
+            Some(alpha_name.clone()),
+            SpawnOptions::default(),
+        )
+        .await
+        .expect("reopen alpha");
+    observed_ready(&fixture, &reopened);
+    assert_ne!(
+        reopened.sandbox().uid,
+        first_uid,
+        "a reused name is a new generation"
+    );
+
+    let refused = alpha
+        .run_command(
+            "printf 'stale\\n' > src/stale-handle.txt",
+            CommandOptions::default(),
+        )
+        .await;
+    assert!(
+        matches!(refused, Err(RunError::Admission(MuxError::StaleJob(_)))),
+        "the retained handle names an instance that is gone: {refused:?}"
+    );
+    assert!(
+        !fixture.seed("src/stale-handle.txt").exists(),
+        "the stale handle's line reached no seed"
+    );
+    assert!(
+        !fixture
+            .snap()
+            .join(reopened.sandbox().uid.as_str())
+            .join("src/stale-handle.txt")
+            .exists(),
+        "nor the replacement's own snapshot"
+    );
+    assert_eq!(
+        run_line(
+            &fixture,
+            &reopened,
+            "if [ -z \"$VALUE\" ]; then printf 'unset\\n'; else printf '%s\\n' \"$VALUE\"; fi",
+        )
+        .await,
+        "unset",
+        "the replacement starts with none of the old shell's state"
     );
 
     fixture.finish_mux().await;
@@ -1827,25 +2330,27 @@ async fn shutdown_detaches_frontend_without_retaining_session() {
     let mut fixture = Fixture::new();
     let idle = fixture
         .mux()
-        .spawn("", Some(ShellId::from("idle")), None, SpawnOptions::default())
-        .await
-        .expect("spawn idle");
-    let worked = fixture
-        .mux()
-        .spawn(
-            "",
-            Some(ShellId::from("worked")),
-            None,
+        .open_shell(
+            &fixture.seed,
+            Some(Principal::from("idle")),
             SpawnOptions::default(),
         )
         .await
-        .expect("spawn worked");
-
-    fixture
+        .expect("open idle");
+    let worked = fixture
         .mux()
-        .start_in(&worked, "printf 'done\\n'", CommandOptions::default())
+        .open_shell(
+            &fixture.seed,
+            Some(Principal::from("worked")),
+            SpawnOptions::default(),
+        )
         .await
-        .expect("start the line");
+        .expect("open worked");
+
+    worked
+        .run_command("printf 'done\\n'", CommandOptions::default())
+        .await
+        .expect("the line publishes");
     let completion = concluded(&fixture, &worked.sandbox().uid).await;
     assert_eq!(completion.exit_code, Some(0));
 
@@ -1856,7 +2361,10 @@ async fn shutdown_detaches_frontend_without_retaining_session() {
     assert!(fixture.recorder().mux().is_none());
     assert!(fixture.recorder().handle(idle.id()).is_none());
     assert!(fixture.recorder().handle(worked.id()).is_none());
-    assert_eq!(fixture.recorder().exit_codes(&worked.sandbox().uid), vec![0]);
+    assert_eq!(
+        fixture.recorder().exit_codes(&worked.sandbox().uid),
+        vec![0]
+    );
 
     assert!(
         fixture.open_executor().is_ok(),
@@ -1864,47 +2372,116 @@ async fn shutdown_detaches_frontend_without_retaining_session() {
     );
 }
 
+/// A collection dropped without a shutdown still gives its seed back.
+///
+/// The other half of the teardown contract above, and a different path through it: nothing here
+/// calls [`ShellMux::shutdown`], and the shell object is deliberately still held when the last
+/// reference to the collection goes. A retained shell whose collection is gone is a dead object —
+/// it must keep neither the seed's lease nor a snapshot alive, and it must run nothing.
+#[tokio::test]
+#[serial]
+async fn dropping_collection_releases_seed_with_retained_shell() {
+    let mut fixture = Fixture::new();
+    let idle = fixture
+        .mux()
+        .open_shell(
+            &fixture.seed,
+            Some(Principal::from("idle")),
+            SpawnOptions::default(),
+        )
+        .await
+        .expect("open an idle shell");
+    observed_ready(&fixture, &idle);
+    assert!(
+        fixture.snap().join(idle.sandbox().uid.as_str()).is_dir(),
+        "the shell holds a snapshot to release"
+    );
+
+    // Dropped, never shut down, while `idle` is still held.
+    let mux = fixture.mux.take().expect("the mux is still present");
+    drop(mux);
+
+    assert!(
+        fixture.open_executor().is_ok(),
+        "the dropped collection released the seed's lease"
+    );
+    let refused = idle
+        .run_command("printf 'x\\n' > src/file0.txt", CommandOptions::default())
+        .await;
+    assert!(
+        matches!(refused, Err(RunError::Admission(MuxError::ShuttingDown))),
+        "a shell whose collection is gone runs nothing: {refused:?}"
+    );
+    assert_eq!(
+        std::fs::read(fixture.seed("src/file0.txt")).expect("read the seed file"),
+        b"zero\n",
+        "and reaches no seed"
+    );
+}
+
 #[tokio::test]
 #[serial]
 async fn a_denial_is_atomic_and_a_claim_outlives_its_job() {
     let mut fixture = Fixture::new();
-    let owner = fixture
-        .mux()
-        .spawn("", Some(ShellId::from("owner")), None, SpawnOptions::default())
-        .await
-        .expect("spawn owner");
-    let other = fixture
-        .mux()
-        .spawn("", Some(ShellId::from("other")), None, SpawnOptions::default())
-        .await
-        .expect("spawn other");
-
+    let owner_name = Principal::from("owner");
+    let other_name = Principal::from("other");
     fixture
         .mux()
-        .start_in(
-            &owner,
+        .open_shell(
+            &fixture.seed,
+            Some(owner_name.clone()),
+            SpawnOptions::default(),
+        )
+        .await
+        .expect("open owner");
+    fixture
+        .mux()
+        .open_shell(
+            &fixture.seed,
+            Some(other_name.clone()),
+            SpawnOptions::default(),
+        )
+        .await
+        .expect("open other");
+
+    // Both are reached by principal rather than through the object creation handed back: the
+    // collection is an index, and a line runs through whatever that index answers with.
+    let owner = fixture
+        .mux()
+        .get_shell(&owner_name)
+        .expect("owner answers to its principal");
+    let other = fixture
+        .mux()
+        .get_shell(&other_name)
+        .expect("other answers to its principal");
+
+    let owner_completion = owner
+        .run_command(
             "printf 'owned\\n' > src/file1.txt",
             CommandOptions::default(),
         )
         .await
-        .expect("start owner's line");
-    let owner_completion = concluded(&fixture, &owner.sandbox().uid).await;
+        .expect("owner's line publishes");
     assert_eq!(owner_completion.exit_code, Some(0));
     assert!(matches!(
         verdict(&owner_completion.outcome),
         Outcome::Published { .. }
     ));
 
-    fixture
-        .mux()
-        .start_in(
-            &other,
+    // The refusal is the *return value*, not something a test has to go looking for in an event
+    // stream: a line the gate denied never answers `Ok`, whatever its process did.
+    let refusal = other
+        .run_command(
             "printf 'new\\n' > src/new.txt; printf 'bad\\n' > src/file1.txt",
             CommandOptions::default(),
         )
         .await
-        .expect("start other's line");
-    let other_completion = concluded(&fixture, &other.sandbox().uid).await;
+        .expect_err("the gate refuses other's line");
+    let denied = match refusal {
+        RunError::Policy(denied) => denied,
+        unexpected => panic!("expected a policy refusal, got {unexpected:?}"),
+    };
+    let other_completion = denied.completion();
     assert_eq!(
         other_completion.exit_code,
         Some(0),
@@ -1934,7 +2511,10 @@ async fn a_denial_is_atomic_and_a_claim_outlives_its_job() {
     );
 
     assert_eq!(
-        fixture.mux().history(),
+        fixture
+            .mux()
+            .history(&fixture.seed)
+            .expect("the seed is open"),
         vec![Event::new(
             "owner",
             Action::Edit,
@@ -1943,12 +2523,16 @@ async fn a_denial_is_atomic_and_a_claim_outlives_its_job() {
         "the granted first edit of the denied line is not recorded"
     );
 
-    fixture.mux().stop(&owner, true).await.expect("force stop owner");
+    owner.stop(true).await.expect("force stop owner");
     assert!(fixture.mux().job(owner.id()).is_none());
     assert_eq!(
-        fixture.mux().history().len(),
+        fixture
+            .mux()
+            .history(&fixture.seed)
+            .expect("the seed is open")
+            .len(),
         1,
-        "the claim outlives the job that earned it"
+        "the claim outlives the shell that earned it"
     );
 
     fixture.finish_mux().await;
@@ -1972,48 +2556,55 @@ async fn a_prompt_leases_its_terminal_again_after_every_line() {
     let mut fixture = Fixture::new();
     let job = fixture
         .mux()
-        .spawn("", Some(ShellId::from("1")), None, SpawnOptions::default())
+        .open_shell(
+            &fixture.seed,
+            Some(Principal::from("1")),
+            SpawnOptions::default(),
+        )
         .await
-        .expect("spawn a job");
+        .expect("open a shell");
 
     // A line the front-end answers itself: `jobs`, `fg`, an invalid line. Nothing is admitted, so
     // nothing reaps the reservation on an admission's behalf.
-    let lease = fixture
-        .mux()
-        .idle_terminal(&job)
-        .expect("lease the idle terminal");
+    let lease = job.idle_terminal().expect("lease the idle terminal");
     assert!(!lease.is_revoked(), "a fresh lease starts live");
     drop(lease);
 
     // The prompt asks for its own terminal back. This is the iteration that used to be refused
     // with `TerminalBusy` forever.
-    let lease = fixture
-        .mux()
-        .idle_terminal(&job)
+    let lease = job
+        .idle_terminal()
         .expect("lease again after releasing without admitting a command");
-    assert!(read_through(&fixture, &job, &lease, b"typed\n").await);
+    assert!(read_through(&job, &lease, b"typed\n").await);
     drop(lease);
 
     assert_eq!(
-        run_line(&fixture, &job, "printf 'one\\n' > src/file0.txt; printf 'ok1\\n'").await,
+        run_line(
+            &fixture,
+            &job,
+            "printf 'one\\n' > src/file0.txt; printf 'ok1\\n'"
+        )
+        .await,
         "ok1"
     );
 
     // And again after a command, which is the iteration the un-lowered run-revocation used to
     // leave granted-but-deaf: the lease was handed over, and every read answered `None`.
-    let lease = fixture
-        .mux()
-        .idle_terminal(&job)
-        .expect("lease again after a command");
+    let lease = job.idle_terminal().expect("lease again after a command");
     assert!(
         !lease.is_revoked(),
         "the finished command's revocation was lowered"
     );
-    assert!(read_through(&fixture, &job, &lease, b"typed again\n").await);
+    assert!(read_through(&job, &lease, b"typed again\n").await);
     drop(lease);
 
     assert_eq!(
-        run_line(&fixture, &job, "printf 'two\\n' > src/file1.txt; printf 'ok2\\n'").await,
+        run_line(
+            &fixture,
+            &job,
+            "printf 'two\\n' > src/file1.txt; printf 'ok2\\n'"
+        )
+        .await,
         "ok2"
     );
 
@@ -2038,15 +2629,8 @@ async fn a_prompt_leases_its_terminal_again_after_every_line() {
 /// The whole point of a lease: the keyboard of one pane, read by that pane's prompt and by nothing
 /// else. A revoked lease answers `None` instead, which is what a prompt granted a terminal it
 /// cannot read looks like.
-async fn read_through(
-    fixture: &Fixture,
-    job: &Spawned,
-    lease: &marsh::shellmux::IdleTerminal,
-    bytes: &[u8],
-) -> bool {
-    fixture
-        .mux()
-        .write_input(job, bytes)
+async fn read_through(job: &Shell, lease: &marsh::shellmux::IdleTerminal, bytes: &[u8]) -> bool {
+    job.write_input(bytes)
         .await
         .expect("write to the leased terminal");
     let mut seen = Vec::new();
@@ -2066,4 +2650,696 @@ async fn read_through(
     })
     .await
     .unwrap_or(false)
+}
+
+/// A repository with a root commit already in it, so `git add` has an index to stage into.
+fn init_repository(work: &Path) {
+    let repository = git2::Repository::init(work).expect("init a repository");
+    let who = git2::Signature::new(
+        "Test",
+        "test@example.com",
+        &git2::Time::new(1_112_911_993, 0),
+    )
+    .expect("signature");
+    let empty = repository
+        .index()
+        .expect("index")
+        .write_tree()
+        .expect("write the empty tree");
+    let tree = repository.find_tree(empty).expect("find the empty tree");
+    repository
+        .commit(Some("HEAD"), &who, &who, "root\n", &tree, &[])
+        .expect("root commit");
+}
+
+/// Two shells started in two different seeds are two sessions, and stay apart.
+///
+/// The three things one mux over several seeds can silently break, all in one run:
+///
+/// * **Policy.** A resource carries no seed identity, so a shared validator would let A's claim on
+///   `src/shared.txt` deny B's identical path. Both writes must publish.
+/// * **Instrumentation.** The builtin hook is installed process-wide and keeps only the newest
+///   one, so per-session recorders would leave the first seed's `git add` unobserved and its
+///   capability unrequested. Both stages must reach both histories.
+/// * **Storage.** Each seed keeps its own state beside itself, so each job's snapshot must lie
+///   under its *own* seed's state parent.
+///
+/// Before either shell exists the mux holds nothing at all, which is the other half of the claim:
+/// a host opens no seed until a shell names one.
+#[tokio::test]
+#[serial]
+async fn initial_directories_select_independent_seeds() {
+    let mut fixture = Fixture::new();
+    let other = fixture.sibling_seed("other");
+    init_repository(&fixture.seed);
+    init_repository(&other);
+
+    assert!(fixture.mux().seeds().is_empty(), "no shell, no seed");
+    assert!(
+        !fixture.state.exists() && !fixture.root.join(".marsh/other").exists(),
+        "neither state directory exists before a shell asks for one"
+    );
+
+    let a = fixture
+        .mux()
+        .open_shell(
+            &fixture.seed("src"),
+            Some(Principal::from("a")),
+            SpawnOptions::default(),
+        )
+        .await
+        .expect("open a in the first seed");
+    observed_ready(&fixture, &a);
+    let b = fixture
+        .mux()
+        .open_shell(
+            &other.join("src"),
+            Some(Principal::from("b")),
+            SpawnOptions::default(),
+        )
+        .await
+        .expect("open b in the second seed");
+    observed_ready(&fixture, &b);
+
+    assert_eq!(a.sandbox().seed, fixture.seed);
+    assert_eq!(b.sandbox().seed, other);
+    assert_eq!(a.sandbox().dir.as_str(), "src");
+    assert_eq!(b.sandbox().dir.as_str(), "src");
+
+    // The same relative path in both, written by both: a shared validator denies the second.
+    //
+    // Each line ends in a quoted `printf` so the escape reaches `printf` itself: unquoted, the
+    // shell would strip the backslash and the terminal would never see the newline the line
+    // reader waits for.
+    assert_eq!(
+        run_line(&fixture, &a, "printf A > shared.txt; printf 'done\\n'").await,
+        "done"
+    );
+    assert_eq!(
+        run_line(&fixture, &b, "printf B > shared.txt; printf 'done\\n'").await,
+        "done"
+    );
+    // A git capability comes only from the instrumented builtin, so a silenced recorder makes
+    // this line request nothing and publish nothing.
+    assert_eq!(
+        run_line(&fixture, &a, "git add -- shared.txt; printf 'done\\n'").await,
+        "done"
+    );
+    assert_eq!(
+        run_line(&fixture, &b, "git add -- shared.txt; printf 'done\\n'").await,
+        "done"
+    );
+
+    assert_eq!(
+        std::fs::read(fixture.seed("src/shared.txt")).expect("the first seed's file"),
+        b"A"
+    );
+    assert_eq!(
+        std::fs::read(other.join("src/shared.txt")).expect("the second seed's file"),
+        b"B"
+    );
+
+    let a_history = fixture
+        .mux()
+        .history(&fixture.seed)
+        .expect("the first seed is open");
+    let b_history = fixture
+        .mux()
+        .history(&other)
+        .expect("the second seed is open");
+    let stage_of = |history: &[Event], principal: &str| {
+        history.iter().any(|event| {
+            event.action == Action::Stage
+                && event.principal.as_str() == principal
+                && event.resource == Resource::from(vec!["src", "shared.txt"])
+        })
+    };
+    assert!(
+        stage_of(&a_history, "a"),
+        "the first seed records its own stage: {a_history:?}"
+    );
+    assert!(
+        stage_of(&b_history, "b"),
+        "the second seed records its own stage: {b_history:?}"
+    );
+    assert!(
+        !a_history
+            .iter()
+            .any(|event| event.principal.as_str() == "b"),
+        "the second seed's principal is absent from the first seed's history: {a_history:?}"
+    );
+    assert!(
+        !b_history
+            .iter()
+            .any(|event| event.principal.as_str() == "a"),
+        "the first seed's principal is absent from the second seed's history: {b_history:?}"
+    );
+
+    // Each job stages into its own seed's state tree, never the other's.
+    let a_cwd = job_cwd(&fixture, &a);
+    let b_cwd = job_cwd(&fixture, &b);
+    assert!(
+        a_cwd.starts_with(fixture.snap()) && a_cwd.ends_with("src"),
+        "{} is not under the first seed's snapshots",
+        a_cwd.display()
+    );
+    assert!(
+        b_cwd.starts_with(fixture.sibling_snap("other")) && b_cwd.ends_with("src"),
+        "{} is not under the second seed's snapshots",
+        b_cwd.display()
+    );
+
+    let opened: Vec<PathBuf> = fixture
+        .mux()
+        .seeds()
+        .into_iter()
+        .map(|info| info.seed)
+        .collect();
+    let mut expected = vec![fixture.seed.clone(), other.clone()];
+    expected.sort();
+    assert_eq!(
+        opened, expected,
+        "both seeds are reported, in canonical order"
+    );
+
+    fixture.finish_mux().await;
+}
+
+/// Two shells started at two spellings of one tree share that tree's single session.
+///
+/// A symlinked alias and a different subdirectory are two ways of naming the same seed. Both must
+/// resolve to one canonical key, because a second key would mean a second lease — and because
+/// policy only works if both shells are judged against the same history. The claim outliving the
+/// jobs is the other half: a later job on that seed must still find the first one's.
+#[tokio::test]
+#[serial]
+async fn different_directories_share_one_seed_session() {
+    let mut fixture = Fixture::new();
+    std::fs::create_dir_all(fixture.seed("other")).expect("a second directory in the seed");
+    let alias = fixture.root.join("alias");
+    std::os::unix::fs::symlink(&fixture.seed, &alias).expect("an alias to the seed");
+
+    // Both request paths are bound before the join: a temporary built inside the macro's argument
+    // list is dropped before the futures it lends to are polled.
+    let a_dir = fixture.seed("src");
+    let b_dir = alias.join("other");
+    let (a, b) = tokio::join!(
+        fixture
+            .mux()
+            .open_shell(&a_dir, Some(Principal::from("a")), SpawnOptions::default()),
+        fixture
+            .mux()
+            .open_shell(&b_dir, Some(Principal::from("b")), SpawnOptions::default())
+    );
+    let a = a.expect("open a");
+    let b = b.expect("open b");
+    observed_ready(&fixture, &a);
+    observed_ready(&fixture, &b);
+
+    assert_eq!(a.sandbox().seed, fixture.seed);
+    assert_eq!(
+        b.sandbox().seed,
+        fixture.seed,
+        "an alias resolves to the same canonical seed"
+    );
+    assert_ne!(
+        a.sandbox().uid,
+        b.sandbox().uid,
+        "one seed, two jobs, two snapshots"
+    );
+    assert_eq!(
+        fixture.mux().seeds().len(),
+        1,
+        "two spellings of one tree opened one session"
+    );
+
+    // `visible` is published *with* its newline: `cat` is what b reads it back through, and a
+    // file with no terminator would leave b's line reader waiting for one forever.
+    assert_eq!(
+        run_line(
+            &fixture,
+            &a,
+            "printf 'shared\\n' > visible; printf 'done\\n'"
+        )
+        .await,
+        "done"
+    );
+    assert_eq!(
+        run_line(&fixture, &b, "cat ../src/visible").await,
+        "shared",
+        "b's refreshed snapshot carries a's publication"
+    );
+
+    let refused = b
+        .run_command("printf stolen > ../src/visible", CommandOptions::default())
+        .await;
+    assert!(
+        matches!(refused, Err(RunError::Policy(_))),
+        "a's claim is in force for b: {refused:?}"
+    );
+    let denied = concluded(&fixture, &b.sandbox().uid).await;
+    let visible = Resource::from(vec!["src", "visible"]);
+    let Outcome::Denied { denials, .. } = verdict(&denied.outcome) else {
+        panic!(
+            "a's claim is in force for b: {:?}",
+            verdict(&denied.outcome)
+        )
+    };
+    assert!(
+        denials
+            .iter()
+            .any(|denial| denial.event.resource == visible),
+        "b was refused a's exact path, judged against a's history: {denials:?}"
+    );
+
+    a.stop(true).await.expect("stop a");
+    b.stop(true).await.expect("stop b");
+    wait_for_close(&fixture, &a.sandbox().uid).await;
+    wait_for_close(&fixture, &b.sandbox().uid).await;
+
+    // The session outlives both jobs, and so does what they earned in it.
+    let history = fixture
+        .mux()
+        .history(&fixture.seed)
+        .expect("the seed stays open after its last job closes");
+    assert!(
+        history.contains(&Event::new("a", Action::Edit, visible.clone())),
+        "a's grant is still the seed's live history: {history:?}"
+    );
+
+    let later = fixture
+        .mux()
+        .open_shell(
+            &fixture.seed("src"),
+            Some(Principal::from("later")),
+            SpawnOptions::default(),
+        )
+        .await
+        .expect("open a later shell on the same seed");
+    observed_ready(&fixture, &later);
+    assert_eq!(
+        later.sandbox().seed,
+        fixture.seed,
+        "the later shell joined the one existing session"
+    );
+    assert_eq!(fixture.mux().seeds().len(), 1, "still one session");
+    let still_refused = later
+        .run_command("printf later > visible", CommandOptions::default())
+        .await;
+    assert!(
+        matches!(still_refused, Err(RunError::Policy(_))),
+        "the live claim outlives the shell that earned it: {still_refused:?}"
+    );
+    let still_denied = concluded(&fixture, &later.sandbox().uid).await;
+    let Outcome::Denied { denials, .. } = verdict(&still_denied.outcome) else {
+        panic!(
+            "the live claim outlives the job that earned it: {:?}",
+            verdict(&still_denied.outcome)
+        )
+    };
+    assert!(
+        denials
+            .iter()
+            .any(|denial| denial.event.resource == visible),
+        "the later job was refused the same path: {denials:?}"
+    );
+    assert_eq!(
+        std::fs::read(fixture.seed("src/visible")).expect("the published file"),
+        b"shared\n"
+    );
+
+    fixture.finish_mux().await;
+}
+
+/// A failed publication blocks the seed it happened on, and nothing else.
+///
+/// Recovery is armed before the log is opened, so a directory where `meta/wal.jsonl` belongs makes
+/// an approved publication fail after the point of no return. Every job over *that* seed then
+/// refuses — including a brand-new one — while the other seed of the same mux keeps working.
+#[tokio::test]
+#[serial]
+async fn a_failed_publication_blocks_only_its_seed() {
+    let mut fixture = Fixture::new();
+    let other = fixture.sibling_seed("healthy");
+
+    let a = fixture
+        .mux()
+        .open_shell(
+            &fixture.seed("src"),
+            Some(Principal::from("a")),
+            SpawnOptions::default(),
+        )
+        .await
+        .expect("open a");
+    observed_ready(&fixture, &a);
+    let a2 = fixture
+        .mux()
+        .open_shell(
+            &fixture.seed("src"),
+            Some(Principal::from("a2")),
+            SpawnOptions::default(),
+        )
+        .await
+        .expect("open a second shell on the same seed");
+    observed_ready(&fixture, &a2);
+    let b = fixture
+        .mux()
+        .open_shell(
+            &other.join("src"),
+            Some(Principal::from("b")),
+            SpawnOptions::default(),
+        )
+        .await
+        .expect("open b");
+    observed_ready(&fixture, &b);
+
+    // A directory where the log file belongs: `JsonLog::open` fails, and the boundary has already
+    // armed recovery by then.
+    let log = fixture.state.join("meta/wal.jsonl");
+    std::fs::create_dir_all(&log).expect("obstruct the first seed's log");
+
+    // `exit 7` on the end: the publication breaks *after* the line asked the shell to close, so
+    // this also pins that a boundary failure cannot swallow the request.
+    let broke = a
+        .run_command(
+            "printf failed > needs-recovery; exit 7",
+            CommandOptions::default(),
+        )
+        .await;
+    assert!(
+        matches!(broke, Err(RunError::Unpublished { .. })),
+        "a publication that broke is not an approved one: {broke:?}"
+    );
+    let failed = concluded(&fixture, &a.sandbox().uid).await;
+    assert_eq!(
+        failed.exit_code, None,
+        "a publication that broke produced no verdict at all"
+    );
+    assert!(
+        matches!(
+            failed.outcome.as_ref(),
+            Err(MuxError::Marsh(MarshError::Wal(marsh_wal::Error::Io(_))))
+        ),
+        "the unwritable log surfaces as the write-ahead layer's own I/O failure: {:?}",
+        failed.outcome
+    );
+
+    // Both ways into the poisoned seed refuse: an existing job's next command, and a brand-new
+    // job's admission.
+    assert!(matches!(
+        a2.run_command("printf blocked > x", CommandOptions::default())
+            .await,
+        Err(RunError::Admission(MuxError::RecoveryRequired))
+    ));
+    assert!(matches!(
+        fixture
+            .mux()
+            .open_shell(
+                &fixture.seed("src"),
+                Some(Principal::from("a3")),
+                SpawnOptions::default()
+            )
+            .await,
+        Err(MuxError::RecoveryRequired)
+    ));
+    assert!(
+        !fixture.seed("src/x").exists(),
+        "the refused command never reached the seed"
+    );
+
+    // Neither way into the healthy seed is affected.
+    assert_eq!(
+        run_line(&fixture, &b, "printf healthy > healthy; printf 'done\\n'").await,
+        "done",
+        "the other seed of the same mux is untouched"
+    );
+    assert_eq!(
+        std::fs::read(other.join("src/healthy")).expect("the healthy seed's file"),
+        b"healthy"
+    );
+    let b2 = fixture
+        .mux()
+        .open_shell(
+            &other.join("src"),
+            Some(Principal::from("b2")),
+            SpawnOptions::default(),
+        )
+        .await
+        .expect("the healthy seed still admits new shells");
+    observed_ready(&fixture, &b2);
+    assert_eq!(b2.sandbox().seed, other);
+    b2.stop(true).await.expect("stop b2");
+    wait_for_close(&fixture, &b2.sandbox().uid).await;
+
+    let poisoned = fixture
+        .mux()
+        .seeds()
+        .into_iter()
+        .find(|info| info.seed == fixture.seed)
+        .expect("the poisoned seed is open");
+    let healthy = fixture
+        .mux()
+        .seeds()
+        .into_iter()
+        .find(|info| info.seed == other)
+        .expect("the healthy seed is open");
+    assert!(poisoned.recovery_required);
+    assert!(!healthy.recovery_required);
+
+    let a_uid = a.sandbox().uid.clone();
+    let b_uid = b.sandbox().uid.clone();
+    // `a` is never stopped: its own `exit` closes it, and an explicit stop here would be a stale
+    // handle. The request was recorded before the boundary ran, so the failure at that boundary
+    // did not lose it.
+    b.stop(true).await.expect("stop b");
+    let a_end = tokio::time::timeout(TIMEOUT, a.wait_closed())
+        .await
+        .expect("a closes on its own `exit`, with nothing stopping it")
+        .expect("a's end");
+    assert_eq!(
+        a_end.close_mode,
+        Some(JobCloseMode::Graceful),
+        "a closed because its line exited, not because anything retired it"
+    );
+    let b_end = tokio::time::timeout(TIMEOUT, b.wait_closed())
+        .await
+        .expect("b closes")
+        .expect("b's end");
+    assert!(a_end.recovery_required, "a's seed still owes a replay");
+    assert!(!b_end.recovery_required, "b's seed owes nothing");
+    // `wait_closed` resolves from the job's own end-of-life, which reclamation settles *before*
+    // the frontend is told; the recorder's flags are only final once its `Closed` callback has
+    // actually run for that uid.
+    wait_for_close(&fixture, &a_uid).await;
+    wait_for_close(&fixture, &b_uid).await;
+    assert!(
+        fixture.recorder().closed_with_storage(&a_uid),
+        "the failed snapshot is retained as the recovery source"
+    );
+    assert!(
+        !fixture.recorder().closed_with_storage(&b_uid),
+        "a healthy job's snapshot is reclaimed"
+    );
+    assert!(
+        fixture.snap().join(a_uid.as_str()).exists(),
+        "a's tree is still on disk for a replay to read"
+    );
+    assert!(
+        !fixture
+            .sibling_snap("healthy")
+            .join(b_uid.as_str())
+            .exists(),
+        "b's tree is gone"
+    );
+
+    a2.stop(true).await.expect("stop a2");
+    fixture.finish_mux().await;
+}
+
+/// A line that exits the shell closes its own job, after its publication, and nothing else's.
+///
+/// `exit` is brush's own builtin, run inside the job's interpreter: the status it is handed is the
+/// line's status, and everything written before it is published exactly as any other line's writes
+/// are. The request is recorded on the running command, so the closure lands at the same boundary
+/// a one-shot command's does — after the verdict, never instead of it.
+///
+/// The job here is a persistent terminal nobody asked to close ([`SpawnOptions::default`],
+/// [`CommandOptions::default`]): the one-shot path already closed correctly, so it would prove
+/// nothing.
+#[tokio::test]
+#[serial]
+async fn exit_shell_closes_persistent_job_after_publication() {
+    let mut fixture = Fixture::new();
+    let exiting = fixture
+        .mux()
+        .open_shell(
+            &fixture.seed,
+            Some(Principal::from("exiting")),
+            SpawnOptions::default(),
+        )
+        .await
+        .expect("open the exiting shell");
+    observed_ready(&fixture, &exiting);
+    let sibling = fixture
+        .mux()
+        .open_shell(
+            &fixture.seed,
+            Some(Principal::from("sibling")),
+            SpawnOptions::default(),
+        )
+        .await
+        .expect("open a sibling shell");
+    observed_ready(&fixture, &sibling);
+    let uid = exiting.sandbox().uid.clone();
+
+    let ran = exiting
+        .run_command(
+            "printf EXIT_BEFORE; printf final > src/file0.txt; exit 7; printf EXIT_AFTER",
+            CommandOptions::default(),
+        )
+        .await
+        .expect("the line publishes, whatever its process exited with");
+    assert_eq!(
+        ran.exit_code,
+        Some(7),
+        "the builtin's argument is the line's status, not a discarded one"
+    );
+    let completion = concluded(&fixture, &uid).await;
+    assert_eq!(
+        completion.id, ran.id,
+        "the verdict the frontend was given is this line's own"
+    );
+    match verdict(&completion.outcome) {
+        Outcome::Published { publication, .. } => assert_eq!(publication.ops, 1),
+        other => panic!("the writes before `exit` are published: {other:?}"),
+    }
+
+    let end = tokio::time::timeout(TIMEOUT, exiting.wait_closed())
+        .await
+        .expect("the job closes on its own `exit`")
+        .expect("its end");
+    assert_eq!(
+        end.close_mode,
+        Some(JobCloseMode::Graceful),
+        "a shell that exited closed gracefully, not by being retired"
+    );
+    let final_verdict = end
+        .completion
+        .as_ref()
+        .expect("the end carries the line that closed it");
+    assert_eq!(final_verdict.id, ran.id);
+    assert_eq!(
+        final_verdict.exit_code,
+        Some(7),
+        "the closure carries the status the shell exited with"
+    );
+
+    wait_for_close(&fixture, &uid).await;
+    assert_eq!(
+        fixture.recorder().take_terminal(&uid),
+        b"EXIT_BEFORE",
+        "the line stopped at `exit`: nothing after it ran"
+    );
+    assert_eq!(
+        std::fs::read(fixture.seed("src/file0.txt")).expect("read the seed file"),
+        b"final"
+    );
+    assert!(
+        fixture.mux().job(exiting.id()).is_none(),
+        "the exited job left the table"
+    );
+    assert!(
+        !fixture.recorder().closed_with_storage(&uid),
+        "a healthy job's snapshot is reclaimed rather than kept for a replay"
+    );
+    assert!(
+        !fixture.snap().join(uid.as_str()).exists(),
+        "the exited job's snapshot is gone"
+    );
+    let refused = exiting
+        .run_command("printf 'again\\n'", CommandOptions::default())
+        .await;
+    assert!(
+        matches!(refused, Err(RunError::Admission(MuxError::StaleJob(_)))),
+        "the retained handle names a generation that exited: {refused:?}"
+    );
+
+    assert_eq!(
+        run_line(&fixture, &sibling, "printf 'ALIVE\\n'").await,
+        "ALIVE",
+        "one shell's exit is not another's"
+    );
+
+    fixture.finish_mux().await;
+}
+
+/// A subshell's exit is the subshell's, and a bare `exit` leaves with the status the shell last
+/// saw.
+///
+/// Both are the builtin's own semantics rather than this collection's — brush strips a subshell's
+/// control flow at its boundary, and `exit` with no argument reuses the last status. What is under
+/// test is that the job boundary honours exactly the request that survives: `(exit 23)` leaves the
+/// pane open holding 23, and the bare `exit` submitted next closes it with that same 23.
+#[tokio::test]
+#[serial]
+async fn subshell_exit_keeps_parent_open_and_bare_exit_reuses_status() {
+    let mut fixture = Fixture::new();
+    let job = fixture
+        .mux()
+        .open_shell(
+            &fixture.seed,
+            Some(Principal::from("sub")),
+            SpawnOptions::default(),
+        )
+        .await
+        .expect("open a shell");
+    observed_ready(&fixture, &job);
+    let uid = job.sandbox().uid.clone();
+
+    let inner = job
+        .run_command("(exit 23)", CommandOptions::default())
+        .await
+        .expect("the line publishes, whatever its process exited with");
+    assert_eq!(
+        inner.exit_code,
+        Some(23),
+        "the subshell's status is still the line's"
+    );
+    assert_eq!(concluded(&fixture, &uid).await.id, inner.id);
+    assert!(
+        !job.is_closed(),
+        "a subshell's exit is the subshell's, not the shell's"
+    );
+    assert!(
+        fixture.mux().job(job.id()).is_some(),
+        "the pane is still open after a subshell exited"
+    );
+
+    let bare = job
+        .run_command("exit", CommandOptions::default())
+        .await
+        .expect("the line publishes, whatever its process exited with");
+    assert_eq!(
+        bare.exit_code,
+        Some(23),
+        "bare `exit` leaves with the status the shell last saw"
+    );
+    let end = tokio::time::timeout(TIMEOUT, job.wait_closed())
+        .await
+        .expect("the job closes on its bare `exit`")
+        .expect("its end");
+    assert_eq!(end.close_mode, Some(JobCloseMode::Graceful));
+    assert_eq!(
+        end.completion.as_ref().and_then(|last| last.exit_code),
+        Some(23),
+        "the closure carries the reused status"
+    );
+
+    wait_for_close(&fixture, &uid).await;
+    assert!(
+        fixture.mux().job(job.id()).is_none(),
+        "the exited job left the table"
+    );
+
+    fixture.finish_mux().await;
 }

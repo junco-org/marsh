@@ -70,7 +70,9 @@ pub(crate) async fn consume(
             FrontendMessage::Opened { job } => {
                 let handle = io.wrap(job);
                 handles.insert(handle.sandbox().uid.clone(), handle.clone());
-                io.bus().publish(IoEvent::Opened { job: handle.clone() });
+                io.bus().publish(IoEvent::Opened {
+                    job: handle.clone(),
+                });
                 // Adoption takes the handler's state and may refresh a client. This loop is the
                 // sole ingress for every pane and every job, so it must not wait for that: an
                 // owned task does the work and this gate is what keeps the job's own bytes
@@ -191,7 +193,9 @@ pub(crate) async fn consume(
                     // floor and every observer's stream simply ends without it. The event carries
                     // the whole `JobEnd`, so forgetting the route first costs it nothing.
                     closer.forget_route(&end.shell.uid);
-                    closer.bus().publish(IoEvent::Closed { end: Arc::clone(&end) });
+                    closer.bus().publish(IoEvent::Closed {
+                        end: Arc::clone(&end),
+                    });
                     closer.retire_instance(&end.shell.uid);
                 });
             }
@@ -227,7 +231,7 @@ pub(crate) async fn consume(
 /// Gives a newly opened job a surface, unless something already claimed one for it.
 ///
 /// The admission lock is what makes this safe: a server-initiated spawn installs its route before
-/// releasing that lock, so an `Opened` that races ahead of its own `spawn` call returning finds
+/// releasing that lock, so an `Opened` that races ahead of its own `open_shell` call returning finds
 /// the route already there and does nothing. Without it, every server-created pane would race to
 /// become a second, duplicate pane.
 ///
@@ -385,19 +389,17 @@ async fn deliver(
                         // the idle-terminal lease and carries on; when it is later stopped,
                         // `JobEnd::completion` still names that same last command, so rendering
                         // unconditionally would print it a second time long after the user saw it.
-                        if let Some(completion) = end
-                            .completion
-                            .as_ref()
-                            .filter(|completion| {
-                                !io.report_was_rendered(&end.shell.uid, completion.id)
-                            })
-                        {
+                        if let Some(completion) = end.completion.as_ref().filter(|completion| {
+                            !io.report_was_rendered(&end.shell.uid, completion.id)
+                        }) {
                             for line in marsh_core::shellmux::repl::report_lines(
                                 &end.shell.id,
                                 &completion.outcome,
                             ) {
                                 let bytes = format!("{line}\r\n");
-                                handler.apply_final_report(&end.shell, bytes.as_bytes()).await;
+                                handler
+                                    .apply_final_report(&end.shell, bytes.as_bytes())
+                                    .await;
                             }
                         }
                     }

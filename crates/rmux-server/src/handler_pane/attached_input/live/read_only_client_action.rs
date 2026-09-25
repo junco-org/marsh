@@ -68,7 +68,6 @@ impl RequestHandler {
         pending_input: &mut Vec<u8>,
         bytes: &[u8],
         backspace: Option<u8>,
-        mut key_override: Option<KeyCode>,
     ) -> io::Result<()> {
         let Some(snapshot) = self.read_only_client_action_snapshot(identity).await? else {
             pending_input.clear();
@@ -151,7 +150,6 @@ impl RequestHandler {
                 break;
             }
             offset += size;
-            let key = key_override.take().unwrap_or(key);
             let lookup_key = key_code_lookup_bits(key);
             if next_table_name.as_deref() == Some(PREFIX_TABLE) {
                 next_table_name = None;

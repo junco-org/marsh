@@ -337,11 +337,7 @@ fn find_opaque_terminator(input: &[u8], mut offset: usize, bell_terminated: bool
     None
 }
 
-fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack
-        .windows(needle.len())
-        .position(|window| window == needle)
-}
+use super::find_subslice;
 
 #[cfg(test)]
 mod tests {

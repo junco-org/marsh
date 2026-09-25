@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use crate::pane_terminals::HandlerState;
+use crate::status_jobs::StatusJobProfile;
 use chrono::Local;
 use rmux_core::formats::{
     expand_time_tokens, render_template, render_template_preserving_jobs, FormatContext,
@@ -116,11 +117,26 @@ impl<'a> RuntimeFormatContext<'a> {
         self.with_named_value("socket_path", socket_path.to_string_lossy().into_owned())
     }
 
-    pub(crate) fn status_job_profile(&self) -> Option<crate::terminal::TerminalProfile> {
-        let state = self.state?;
-        let options = self.options?;
-        let session = self.session?;
-        let socket_path = PathBuf::from(self.base.format_value_by_name("socket_path")?);
+    /// The profile this context's status `#(command)` producers run under.
+    ///
+    /// Answers [`StatusJobProfile::Unusable`] rather than "no profile" when a profile was chosen
+    /// and could not be built: `resolve_working_directory` refuses a named directory that is
+    /// missing or is not a directory, and discarding that error here would hand the producer to
+    /// [`crate::status_jobs::status_job_spec`]'s profile-less branch, which starts it in the
+    /// host's default directory with no environment — a different seed for a pane that named its
+    /// own. The genuinely profile-less answers below stay [`StatusJobProfile::Unset`].
+    pub(crate) fn status_job_profile(&self) -> StatusJobProfile {
+        let (Some(state), Some(options), Some(session)) = (self.state, self.options, self.session)
+        else {
+            return StatusJobProfile::Unset;
+        };
+        let Some(socket_path) = self
+            .base
+            .format_value_by_name("socket_path")
+            .map(PathBuf::from)
+        else {
+            return StatusJobProfile::Unset;
+        };
         let session_name = session.name();
         let target = self
             .window_index
@@ -132,12 +148,19 @@ impl<'a> RuntimeFormatContext<'a> {
             .as_ref()
             .and_then(|target| state.session_base_environment_for_pane_target(target))
             .or_else(|| state.session_base_environment_for_active_pane(session_name));
+        // The pane's own directory first; this host's default fills only a *missing* one, and
+        // only when a facade is bound. The default never replaces a pane directory that turns out
+        // to be unusable — that is the `Unusable` answer below. Without a facade there is nothing
+        // to schedule against either way, so the profile is built exactly as before and the
+        // caller renders its cached value without scheduling.
+        let facade = self.shell_io();
         let cwd = self
             .pane_screen_path()
             .or_else(|| self.pane_start_path())
-            .map(PathBuf::from);
+            .map(PathBuf::from)
+            .or_else(|| facade.as_ref().map(|io| io.default_dir().to_path_buf()));
 
-        crate::terminal::TerminalProfile::for_run_shell(
+        match crate::terminal::TerminalProfile::for_run_shell(
             &state.environment,
             options,
             Some(session_name),
@@ -147,8 +170,10 @@ impl<'a> RuntimeFormatContext<'a> {
             false,
             self.pane.map(Pane::id),
             cwd.as_deref(),
-        )
-        .ok()
+        ) {
+            Ok(profile) => StatusJobProfile::Chosen(profile),
+            Err(reason) => StatusJobProfile::Unusable(reason),
+        }
     }
 
     pub(crate) fn status_jobs(&self) -> Option<&crate::status_jobs::StatusJobRuntime> {
@@ -351,7 +376,6 @@ impl<'a> RuntimeFormatContext<'a> {
             .map(|pid| pid.to_string())
     }
 
-    #[cfg(unix)]
     fn pane_tty(&self) -> Option<String> {
         let session_name = self.session_name()?;
         let window_index = self.window_index?;
@@ -360,11 +384,6 @@ impl<'a> RuntimeFormatContext<'a> {
             .pane_tty_path_in_window(session_name, window_index, pane.index())
             .ok()
             .map(|path| path.to_string_lossy().into_owned())
-    }
-
-    #[cfg(windows)]
-    fn pane_tty(&self) -> Option<String> {
-        None
     }
 
     fn pane_exit_metadata(&self) -> Option<crate::pane_terminals::PaneExitMetadata> {

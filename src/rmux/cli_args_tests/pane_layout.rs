@@ -452,9 +452,11 @@ fn split_window_rejects_unknown_flag_before_trailing_command() {
     let error = parse_args(&["split-window", "-Q", "printf ok"]).unwrap_err();
 
     assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
-    assert!(error
-        .to_string()
-        .contains("command split-window: unknown flag -Q"));
+    assert!(
+        error
+            .to_string()
+            .contains("command split-window: unknown flag -Q")
+    );
 }
 
 #[test]

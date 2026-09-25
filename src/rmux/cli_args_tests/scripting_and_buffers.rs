@@ -64,9 +64,11 @@ fn display_message_rejects_multiple_message_arguments() {
     let error = parse_args(&["display-message", "a", "b", "c"]).unwrap_err();
 
     assert_eq!(error.kind(), clap::error::ErrorKind::TooManyValues);
-    assert!(error
-        .to_string()
-        .contains("command display-message: too many arguments (need at most 1)"));
+    assert!(
+        error
+            .to_string()
+            .contains("command display-message: too many arguments (need at most 1)")
+    );
 }
 
 #[test]
@@ -104,9 +106,11 @@ fn display_message_rejects_unknown_flags_before_message() {
     let error = parse_args(&["display-message", "-Q", "hello"]).unwrap_err();
 
     assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
-    assert!(error
-        .to_string()
-        .contains("command display-message: unknown flag -Q"));
+    assert!(
+        error
+            .to_string()
+            .contains("command display-message: unknown flag -Q")
+    );
 }
 
 #[test]
@@ -159,9 +163,11 @@ fn if_shell_rejects_unknown_flags_before_condition() {
     let error = parse_args(&["if-shell", "-Q", "true", "display-message ok"]).unwrap_err();
 
     assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
-    assert!(error
-        .to_string()
-        .contains("command if-shell: unknown flag -Q"));
+    assert!(
+        error
+            .to_string()
+            .contains("command if-shell: unknown flag -Q")
+    );
 }
 
 #[test]
@@ -169,9 +175,11 @@ fn run_shell_rejects_unknown_flags_before_shell_text() {
     let error = parse_args(&["run-shell", "-b", "-printf", "ok"]).unwrap_err();
 
     assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
-    assert!(error
-        .to_string()
-        .contains("command run-shell: unknown flag -p"));
+    assert!(
+        error
+            .to_string()
+            .contains("command run-shell: unknown flag -p")
+    );
 }
 
 #[test]
@@ -253,9 +261,11 @@ fn source_file_rejects_unknown_flags_before_paths() {
     let error = parse_args(&["source-file", "-N", "/tmp/missing.conf"]).unwrap_err();
 
     assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
-    assert!(error
-        .to_string()
-        .contains("command source-file: unknown flag -N"));
+    assert!(
+        error
+            .to_string()
+            .contains("command source-file: unknown flag -N")
+    );
 }
 
 #[test]

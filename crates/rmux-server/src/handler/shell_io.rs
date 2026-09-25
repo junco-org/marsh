@@ -21,9 +21,7 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use marsh_core::shellmux::{
-    CommandCompletion, JobEnd, MuxError, OutputChannel, Sandbox, ShellId,
-};
+use marsh_core::shellmux::{CommandCompletion, JobEnd, MuxError, OutputChannel, Sandbox, ShellId};
 use marsh_core::Outcome;
 use rmux_core::LifecycleEvent;
 use rmux_proto::{ProcessCommand, RmuxError, SessionName, WindowTarget};
@@ -110,10 +108,10 @@ impl RequestHandler {
     /// performed here; coalescing two of these into one refresh is harmless, which is exactly why
     /// the engine is allowed to coalesce them in the first place.
     ///
-    /// The engine's *selection* is carried on this same observation, because `table.current` only
-    /// ever moves in [`ShellIo::switch`] and `switch` announces exactly this. So the mux-to-rmux
-    /// half of selection synchronisation is applied here, before the refresh, so the refresh that
-    /// follows already renders the selection it caused.
+    /// The *selection* is applied on the same observation, because [`ShellIo::switch`] publishes
+    /// exactly this event and then calls here. Selection is the facade's own state — the engine
+    /// indexes shells by principal and has no current one — so this is where the native-to-rmux
+    /// half lands, before the refresh, so that refresh already renders the selection it caused.
     pub(crate) fn note_shell_state_changed(&self) {
         let handler = self.clone();
         self.spawn_shell_task("shell state refresh", async move {
@@ -122,11 +120,11 @@ impl RequestHandler {
         });
     }
 
-    /// A native `switch` chose a job; select the rmux pane that presents it.
+    /// A native `switch` chose a shell; select the rmux pane that presents it.
     ///
-    /// This is the mux-to-rmux half of plan line 347. Only a `switch` moves the engine's current
-    /// job, so anything found here was chosen deliberately — by the pane prompt's `fg`, by a
-    /// library consumer, or by this daemon's own opposite-direction push.
+    /// This is the native-to-rmux half of selection synchronisation. Only [`ShellIo::switch`]
+    /// moves the facade's current shell, so anything found here was chosen deliberately — by the
+    /// pane prompt's `fg`, by a library consumer, or by this daemon's own opposite-direction push.
     ///
     /// That last case is why the claim is taken before anything else: the push stored the
     /// identity it was about to install, so its own echo arrives here, matches, and stops. The
@@ -602,11 +600,11 @@ impl RequestHandler {
     /// * **The window is detached**, and nothing here selects it or calls
     ///   [`ShellIo::switch`](crate::io::ShellIo::switch). `sd` and `&` add a job; they do not
     ///   move the user to it. `fg` is the line that does.
-    /// * **`follow_mux_lifetime` is `true`**, so the command reaches `spawn` rather than being
-    ///   reserved afterwards with `close_on_finish`. That is what preserves the engine's
-    ///   anonymous-job rules the user asked for: an unnamed `&` closes itself when its command
-    ///   ends, and `keep` can still cancel that closure. A one-shot reservation would take
-    ///   `keep` away.
+    /// * **`follow_mux_lifetime` is `true`**, so the shell is opened with core's cancellable
+    ///   `automatic_close` rather than its line carrying `close_on_finish`. That is what
+    ///   preserves the engine's anonymous-shell rules the user asked for: an unnamed `&` closes
+    ///   itself when its command ends, and `keep` can still cancel that closure. A one-shot
+    ///   command's own closure would take `keep` away.
     /// * **`default-command` is not applied.** The prompt's own grammar already says what to
     ///   run: `&` carries a command and `sd` carries none. Substituting rmux's configured
     ///   command would run something nobody typed, and for an unnamed `sd` it would turn an idle
@@ -617,7 +615,7 @@ impl RequestHandler {
     ///
     /// # Errors
     ///
-    /// Fails when this server has no seed, when the directory names nothing in it, when the
+    /// Fails when the directory escapes the prompt's seed or names nothing in it, when the
     /// prompt's own pane no longer has a session to open beside, and for every reason planning,
     /// opening or committing a window fails. A window whose job never opened is rolled back, so
     /// a failure leaves no empty window on screen.
@@ -629,7 +627,7 @@ impl RequestHandler {
         dir: &str,
         cmd: Option<&str>,
     ) -> Result<ShellId, RmuxError> {
-        let start_directory = repl_start_directory(io, dir)?;
+        let start_directory = repl_start_directory(prompt, dir)?;
         let command = cmd.map(|cmd| ProcessCommand::Shell(cmd.to_owned()));
         // A named job's name is its identity, so the window wears it and stops renaming itself
         // after whatever it happens to be running. An unnamed `&` has no name yet — the engine
@@ -668,7 +666,6 @@ impl RequestHandler {
                     detached: true,
                     spawn: WindowSpawnOptions {
                         start_directory: Some(&start_directory),
-                        inherited_start_directory: false,
                         command: command.as_ref(),
                         socket_path: &socket_path,
                         spawn_environment: None,
@@ -783,29 +780,26 @@ fn prompt_window_session(
 
 /// The host path a prompt's seed-relative directory names, for the profile to be resolved over.
 ///
-/// The prompt speaks in seed-relative directories — that is what `repl::job_dir` produces and
-/// what [`ShellIo::spawn`](crate::io::ShellIo::spawn) consumes — while the window transaction
-/// resolves a profile over a host path and converts it back with
-/// [`seed_relative_path`](crate::terminal::seed_relative_path). Joining onto the seed is the
-/// exact inverse of that conversion, so the job still opens over the directory that was typed.
-/// A leading `/` is the prompt's spelling of the seed root, never the filesystem's, so it is
-/// stripped rather than allowed to replace the seed.
+/// The prompt speaks in seed-relative directories — that is what `repl::job_dir` produces — while
+/// [`ShellIo::open_shell`](crate::io::ShellIo::open_shell) takes host paths. The root a leading `/` names
+/// is the **originating shell's** seed, not the daemon's default directory: a pane backed by one
+/// seed must not have `sd /src` silently open a job somewhere else.
+///
+/// Normalization is the mux's own lexical grammar, so a `..` that climbs past the root is refused
+/// before any path is built from it rather than escaping onto the host filesystem.
 ///
 /// The existence check is here because the profile's own directory resolution is built to *fall
-/// back*: an inherited directory that does not exist quietly becomes the home directory, which
-/// is right for a pane nobody gave a directory to and wrong for one the user named. Without this
-/// the diagnostic for `sd api nope` would name the fallback instead of `nope`.
+/// back* when nobody named a directory, and a typed one must name itself in its diagnostic.
+/// Without this the message for `sd api nope` would name the fallback instead of `nope`.
 ///
 /// # Errors
 ///
-/// Fails when this server has no seed, and when the directory names nothing inside it.
-fn repl_start_directory(io: &ShellIo, dir: &str) -> Result<PathBuf, RmuxError> {
-    let Some(seed) = io.executor_info().seed else {
-        return Err(RmuxError::Server(
-            "this server has no seed to open a job directory under".to_owned(),
-        ));
+/// Fails when the directory escapes the seed and when it names nothing inside it.
+fn repl_start_directory(job: &ShellHandle, dir: &str) -> Result<PathBuf, RmuxError> {
+    let Some(relative) = marsh_core::shellmux::repl::seed_relative(dir) else {
+        return Err(RmuxError::Server(format!("{dir}: escapes the seed")));
     };
-    let requested = seed.join(dir.trim_start_matches('/'));
+    let requested = job.sandbox().seed.join(relative);
     if !requested.is_dir() {
         return Err(RmuxError::Server(format!(
             "{dir}: no such directory in the seed"
@@ -823,7 +817,7 @@ fn repl_start_directory(io: &ShellIo, dir: &str) -> Result<PathBuf, RmuxError> {
 ///   there is no honest code for "the machinery broke";
 /// * a job that closed without ever running a command is `0` — nothing was refused;
 /// * a known nonzero process status is preserved as itself, because that is what the program said;
-/// * otherwise the *gate* answers: `0` when the line was published, `1` when it was denied, stale,
+/// * otherwise the *gate* answers: `0` when the line was published, `1` when it was denied,
 ///   discarded, detached or failed.
 ///
 /// A zero exit with a refused publication therefore reports `1`. That is the point: the workload
@@ -856,7 +850,6 @@ const fn verdict_label(outcome: &Result<Outcome, MuxError>) -> &'static str {
     match outcome {
         Ok(Outcome::Published { .. }) => "published",
         Ok(Outcome::Denied { .. }) => "denied",
-        Ok(Outcome::Stale { .. }) => "stale",
         Ok(Outcome::Discarded) => "discarded",
         Ok(Outcome::Detached) => "detached",
         Err(_) => "failed",

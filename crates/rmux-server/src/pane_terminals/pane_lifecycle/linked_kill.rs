@@ -5,8 +5,9 @@ use rmux_proto::{KillPaneResponse, PaneTarget, RmuxError, SessionName, WindowTar
 
 use super::super::{
     session_not_found, terminate_removed_terminals, HandlerState, KilledPaneHookContext,
-    KilledPaneResult, RemovedPaneOutputs, WindowLinkGroup, WindowLinkSlot,
+    KilledPaneResult, RemovedPaneOutputs, WindowLinkSlot,
 };
+use crate::pane_terminals::session_mutation::WindowMutationMetadataSnapshot;
 
 #[derive(Debug)]
 struct LinkedWindowRemoval {
@@ -27,46 +28,30 @@ pub(in crate::pane_terminals) struct DestroyedLinkedSessionRuntime {
     next_runtime_owner: Option<SessionName>,
 }
 
+/// The linked-kill transaction holds an exclusive borrow from `capture` through
+/// commit or rollback, and that interval only detaches, rekeys and synchronizes
+/// existing links. It never reaches `attach_window_link_slot` or occurrence
+/// ensure/renew, so no window-link group or occurrence id can be allocated and
+/// the id counters need no rollback.
 struct LinkedKillSnapshot {
     sessions: SessionStore,
-    options: rmux_core::OptionStore,
     environment: rmux_core::EnvironmentStore,
-    hooks: rmux_core::HookStore,
-    auto_named_windows: HashSet<(SessionName, u32)>,
-    window_link_groups: HashMap<u64, WindowLinkGroup>,
-    window_link_slots: HashMap<WindowLinkSlot, u64>,
-    window_link_occurrences: HashMap<WindowLinkSlot, super::super::WindowLinkOccurrenceId>,
-    next_window_link_group_id: u64,
-    next_window_link_occurrence_id: u64,
+    metadata: WindowMutationMetadataSnapshot,
 }
 
 impl LinkedKillSnapshot {
     fn capture(state: &HandlerState) -> Self {
         Self {
             sessions: state.sessions.clone(),
-            options: state.options.clone(),
             environment: state.environment.clone(),
-            hooks: state.hooks.clone(),
-            auto_named_windows: state.auto_named_windows.clone(),
-            window_link_groups: state.window_link_groups.clone(),
-            window_link_slots: state.window_link_slots.clone(),
-            window_link_occurrences: state.window_link_occurrences.clone(),
-            next_window_link_group_id: state.next_window_link_group_id,
-            next_window_link_occurrence_id: state.next_window_link_occurrence_id,
+            metadata: WindowMutationMetadataSnapshot::capture(state),
         }
     }
 
     fn restore(self, state: &mut HandlerState) {
         state.sessions = self.sessions;
-        state.options = self.options;
         state.environment = self.environment;
-        state.hooks = self.hooks;
-        state.auto_named_windows = self.auto_named_windows;
-        state.window_link_groups = self.window_link_groups;
-        state.window_link_slots = self.window_link_slots;
-        state.window_link_occurrences = self.window_link_occurrences;
-        state.next_window_link_group_id = self.next_window_link_group_id;
-        state.next_window_link_occurrence_id = self.next_window_link_occurrence_id;
+        self.metadata.restore(state);
     }
 }
 
@@ -86,21 +71,9 @@ impl HandlerState {
         self.ensure_window_panes_exist(&session_name, window_index, &[pane_id])?;
 
         let snapshot = LinkedKillSnapshot::capture(self);
-        #[cfg(windows)]
-        let terminal_pane_ids = self
+        let mut removed_terminals = self
             .terminals
-            .ensure_panes_exist(&runtime_session_name, &[pane_id])
-            .is_ok()
-            .then_some(vec![pane_id])
-            .unwrap_or_default();
-        #[cfg(not(windows))]
-        let terminal_pane_ids = vec![pane_id];
-        let mut removed_terminals = if terminal_pane_ids.is_empty() {
-            HashMap::new()
-        } else {
-            self.terminals
-                .remove_pane_batch(&runtime_session_name, &terminal_pane_ids)?
-        };
+            .remove_pane_batch(&runtime_session_name, &[pane_id])?;
         let removed_outputs = self.remove_pane_outputs(&runtime_session_name, &[pane_id]);
 
         let mut affected_sessions = removals
@@ -147,8 +120,6 @@ impl HandlerState {
         };
 
         self.clear_marked_pane_if_id(pane_id);
-        #[cfg(windows)]
-        let _ = self.cancel_starting_pane(&runtime_session_name, pane_id);
         if let Some(pipe) = self.remove_pane_pipe(&runtime_session_name, pane_id) {
             pipe.stop();
         }
@@ -346,8 +317,6 @@ impl HandlerState {
 
     fn remove_destroyed_linked_session_runtime(&mut self, session_name: &SessionName) {
         self.remove_window_link_session_slots(session_name);
-        #[cfg(windows)]
-        let _ = self.starting_panes.remove(session_name);
         for pipe in self.remove_session_pipes(session_name).into_values() {
             pipe.stop();
         }

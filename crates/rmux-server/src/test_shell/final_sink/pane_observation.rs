@@ -10,11 +10,10 @@
 //! When the wait expires the proof is over, but the diagnosis has to start. The
 //! wait used to report only that the mode was never reached, which is the same
 //! sentence for a pane that received nothing at all, a pane that received output
-//! carrying no announcement, and a pane whose console deposited the
-//! announcement as screen text instead of interpreting it as a sequence. Two
-//! Windows 10 release executions, each behind a thirteen-minute compilation,
-//! produced exactly that sentence and could not say which of those had
-//! happened.
+//! carrying no announcement, and a pane whose terminal deposited the
+//! announcement as screen text instead of interpreting it as a sequence. Real
+//! release executions produced exactly that sentence and could not say which
+//! of those had happened.
 //!
 //! Everything here is read from production state — the transcript's
 //! applied-output count, its screen mode, its cursor and its rendered screen —
@@ -87,7 +86,7 @@ impl ObservedPaneOutput {
             }
             Some(_) if self.announcement_is_on_screen() => {
                 "the announcement reached this pane as screen text, \
-                 so the child's console never interpreted it as a sequence"
+                 so the child's terminal never interpreted it as a sequence"
             }
             Some(_) => "this pane applied child output, but never the announcement itself",
         }
@@ -231,8 +230,8 @@ mod tests {
         );
     }
 
-    /// The Windows case this correction exists for: a console that never
-    /// interpreted the sequence leaves it legible on the screen instead.
+    /// The case this correction exists for: a terminal that never interpreted
+    /// the sequence leaves it legible on the screen instead.
     #[test]
     fn an_announcement_that_arrived_as_screen_text_is_named_as_such() {
         let report = describe_missing_bracketed_mode(
@@ -245,7 +244,7 @@ mod tests {
         assert!(
             report.contains(
                 "reached this pane as screen text, \
-                 so the child's console never interpreted it as a sequence"
+                 so the child's terminal never interpreted it as a sequence"
             ),
             "{report}"
         );

@@ -64,40 +64,6 @@ fn hex_value(byte: u8) -> Option<u8> {
     }
 }
 
-#[cfg(windows)]
-fn platform_path_from_file_uri(host: &str, path: &str) -> String {
-    let path = path
-        .strip_prefix('/')
-        .filter(|path| has_drive_prefix(path))
-        .unwrap_or(path);
-    if !is_local_file_uri_host(host) && !has_drive_prefix(path) {
-        return format!(
-            "\\\\{}\\{}",
-            host,
-            path.trim_start_matches('/').replace('/', "\\")
-        );
-    }
-
-    path.replace('/', "\\")
-}
-
-#[cfg(windows)]
-fn has_drive_prefix(path: &str) -> bool {
-    let bytes = path.as_bytes();
-    bytes.len() >= 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic()
-}
-
-#[cfg(windows)]
-fn is_local_file_uri_host(host: &str) -> bool {
-    if host.is_empty() || host.eq_ignore_ascii_case("localhost") {
-        return true;
-    }
-
-    std::env::var("COMPUTERNAME")
-        .is_ok_and(|computer_name| host.eq_ignore_ascii_case(&computer_name))
-}
-
-#[cfg(not(windows))]
 fn platform_path_from_file_uri(_host: &str, path: &str) -> String {
     path.to_owned()
 }
@@ -120,30 +86,11 @@ mod tests {
         assert_eq!(pane_path_from_osc7("   "), None);
     }
 
-    #[cfg(unix)]
     #[test]
     fn unix_file_uri_decodes_path_and_ignores_host() {
         assert_eq!(
             pane_path_from_osc7("file://host.example/tmp/space%20dir").as_deref(),
             Some("/tmp/space dir")
-        );
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn windows_file_uri_decodes_drive_path() {
-        assert_eq!(
-            pane_path_from_osc7("file:///C:/Users/RMUXUser%20Space").as_deref(),
-            Some("C:\\Users\\RMUXUser Space")
-        );
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn windows_file_uri_decodes_unc_path() {
-        assert_eq!(
-            pane_path_from_osc7("file://server/share/RMUXUser%20Space").as_deref(),
-            Some("\\\\server\\share\\RMUXUser Space")
         );
     }
 }

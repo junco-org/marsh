@@ -191,18 +191,7 @@ async fn session_path_stays_at_session_cwd_when_pane_cwds_differ() {
 }
 
 fn canonical_context_path(path: &std::path::Path) -> std::path::PathBuf {
-    let canonical = std::fs::canonicalize(path).expect("canonicalize context directory");
-    #[cfg(windows)]
-    {
-        let rendered = canonical.to_string_lossy();
-        if let Some(rest) = rendered.strip_prefix(r"\\?\UNC\") {
-            return std::path::PathBuf::from(format!(r"\\{rest}"));
-        }
-        if let Some(rest) = rendered.strip_prefix(r"\\?\") {
-            return std::path::PathBuf::from(rest);
-        }
-    }
-    canonical
+    std::fs::canonicalize(path).expect("canonicalize context directory")
 }
 
 fn rendered_context_path(path: &std::path::Path) -> String {

@@ -27,5 +27,5 @@ pub(crate) use wait::{run_send_keys_with_wait, run_wait_pane};
 // primitives the automation commands use: one pane-output subscription, one stable `%id`
 // reference, and the same fail-closed exit-status reading. Re-exported rather than duplicated
 // so both paths keep observing panes the same way.
-pub(in crate::cli) use common::{pane_process_state, stable_pane_ref_for_slot, PaneProcessState};
+pub(in crate::cli) use common::{PaneProcessState, pane_process_state, stable_pane_ref_for_slot};
 pub(in crate::cli) use pane_exit::PaneExitStatus;

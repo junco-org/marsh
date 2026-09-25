@@ -1,5 +1,3 @@
-#![cfg(unix)]
-
 use std::error::Error;
 use std::fs;
 use std::io;
@@ -18,7 +16,7 @@ use rmux_proto::{
 
 const FILE_TIMEOUT: Duration = Duration::from_secs(15);
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn break_pane_last_source_window_to_other_session_removes_source_session(
 ) -> Result<(), Box<dyn Error>> {
     let _guard = PTY_TEST_LOCK.lock().await;
@@ -100,7 +98,7 @@ async fn break_pane_last_source_window_to_other_session_removes_source_session(
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn break_pane_last_grouped_source_removes_entire_source_group() -> Result<(), Box<dyn Error>>
 {
     let _guard = PTY_TEST_LOCK.lock().await;
@@ -191,7 +189,7 @@ async fn break_pane_last_grouped_source_removes_entire_source_group() -> Result<
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn join_pane_last_source_window_to_other_session_removes_source_session(
 ) -> Result<(), Box<dyn Error>> {
     let _guard = PTY_TEST_LOCK.lock().await;
@@ -271,7 +269,7 @@ async fn join_pane_last_source_window_to_other_session_removes_source_session(
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn join_pane_last_grouped_source_removes_entire_source_group() -> Result<(), Box<dyn Error>> {
     let _guard = PTY_TEST_LOCK.lock().await;
     let harness = TestHarness::new("join-pane-last-grouped-source-removes-group");
@@ -360,7 +358,7 @@ async fn join_pane_last_grouped_source_removes_entire_source_group() -> Result<(
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn pane_transfer_commands_move_live_ptys_between_windows() -> Result<(), Box<dyn Error>> {
     let _guard = PTY_TEST_LOCK.lock().await;
     let harness = TestHarness::new("pane-transfer-live-ptys");

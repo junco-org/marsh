@@ -5,13 +5,12 @@
 //! console prompt or into a full-screen pane, so they live here — beside the job table itself —
 //! rather than being reimplemented once per front-end.
 //!
-//! Jobs are closed through [`ShellMux::stop`], not from here: `kill` is `kill(1)`, and signals a
-//! process id as itself.
+//! Shells are closed through [`Shell::stop`](crate::shellmux::Shell::stop), not from here: `kill`
+//! is `kill(1)`, and signals a process id as itself.
 
 use std::io::Write;
 
-
-use crate::shellmux::{JobView, Sandbox, ShellMux};
+use crate::shellmux::{JobView, Sandbox, ShellId, ShellMux};
 
 /// Signals a frontend must not receive.
 ///
@@ -32,15 +31,14 @@ pub fn ignore_terminal_job_signals() {
     }
 }
 
-/// Writes `mux`'s job table to `out`, one row per sandbox.
-pub fn print_jobs(mux: &ShellMux, out: &mut dyn Write) {
-    let current = mux.current_job().map(|job| job.id);
+/// Writes `mux`'s shell table to `out`, one row per sandbox.
+///
+/// `current` is the caller's selection, marked with `*`. The collection has none of its own:
+/// which shell a display is looking at is the front-end's state, and a table rendered for one
+/// front-end must not mark another's choice.
+pub fn print_jobs(mux: &ShellMux, current: Option<&ShellId>, out: &mut dyn Write) {
     for job in mux.jobs() {
-        let marker = if current.as_ref() == Some(&job.id) {
-            "*"
-        } else {
-            ""
-        };
+        let marker = if current == Some(&job.id) { "*" } else { "" };
         let dir = dir_label(&job.sandbox);
         let (state, cmd) = job.running.as_ref().map_or_else(
             || (idle_state(&job), ""),

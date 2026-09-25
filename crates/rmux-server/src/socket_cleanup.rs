@@ -1,19 +1,15 @@
 use std::path::PathBuf;
 
-#[cfg(unix)]
 use std::path::Path;
 
-#[cfg(unix)]
 use crate::unix_socket::SocketFileIdentity;
 
-#[cfg(unix)]
 pub(crate) struct SocketCleanup {
     socket_path: PathBuf,
     socket_identity: Option<SocketFileIdentity>,
     armed: bool,
 }
 
-#[cfg(unix)]
 impl SocketCleanup {
     pub(crate) fn new(socket_path: PathBuf, socket_identity: Option<SocketFileIdentity>) -> Self {
         let socket_identity =
@@ -43,26 +39,12 @@ impl SocketCleanup {
     }
 }
 
-#[cfg(unix)]
 impl Drop for SocketCleanup {
     fn drop(&mut self) {
         self.cleanup_now();
     }
 }
 
-#[cfg(windows)]
-pub(crate) struct SocketCleanup;
-
-#[cfg(windows)]
-impl SocketCleanup {
-    pub(crate) fn new(_socket_path: PathBuf) -> Self {
-        Self
-    }
-
-    pub(crate) fn cleanup_now(&mut self) {}
-}
-
-#[cfg(unix)]
 fn cleanup_socket_artifacts(socket_path: &Path, socket_identity: Option<SocketFileIdentity>) {
     if !release_socket_generation(socket_path, socket_identity) {
         return;
@@ -73,7 +55,6 @@ fn cleanup_socket_artifacts(socket_path: &Path, socket_identity: Option<SocketFi
     crate::tmux_shim::cleanup_tmux_shim(socket_path);
 }
 
-#[cfg(unix)]
 fn release_socket_generation(
     socket_path: &Path,
     socket_identity: Option<SocketFileIdentity>,
@@ -89,7 +70,6 @@ fn release_socket_generation(
     }
 }
 
-#[cfg(unix)]
 fn socket_path_is_absent(socket_path: &Path) -> bool {
     matches!(
         std::fs::symlink_metadata(socket_path),
@@ -97,7 +77,6 @@ fn socket_path_is_absent(socket_path: &Path) -> bool {
     )
 }
 
-#[cfg(unix)]
 fn startup_lock_paths(socket_path: &Path) -> Vec<PathBuf> {
     let Some(parent) = socket_path.parent() else {
         return Vec::new();
@@ -117,7 +96,6 @@ fn startup_lock_paths(socket_path: &Path) -> Vec<PathBuf> {
     ]
 }
 
-#[cfg(unix)]
 fn remove_regular_file_if_present(path: &Path) -> std::io::Result<()> {
     match std::fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_file() => std::fs::remove_file(path),

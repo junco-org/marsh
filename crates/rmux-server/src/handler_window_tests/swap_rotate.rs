@@ -661,6 +661,95 @@ async fn swap_window_from_linked_slot_preserves_runtime_owners() {
 }
 
 #[tokio::test]
+async fn swap_window_resize_failure_preserves_link_occurrences() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+    let beta = session_name("beta");
+    let gamma = session_name("gamma");
+    create_session(&handler, "alpha").await;
+    create_session(&handler, "beta").await;
+    create_session(&handler, "gamma").await;
+
+    let link = handler
+        .handle(Request::LinkWindow(LinkWindowRequest {
+            source: WindowTarget::with_window(alpha.clone(), 0),
+            target: WindowTarget::with_window(beta.clone(), 1),
+            after: false,
+            before: false,
+            kill_destination: false,
+            detached: true,
+        }))
+        .await;
+    assert!(matches!(link, Response::LinkWindow(_)), "{link:?}");
+    handler.wait_for_initial_panes_for_test().await;
+
+    let (stable_alpha, stable_beta, stable_gamma) = {
+        let mut state = handler.state.lock().await;
+        let stable_alpha = crate::handler::StableTargetIdentity::capture(
+            &mut state,
+            Target::Pane(PaneTarget::with_window(alpha.clone(), 0, 0)),
+        )
+        .expect("capture alpha:0.0 identity");
+        let stable_beta = crate::handler::StableTargetIdentity::capture(
+            &mut state,
+            Target::Pane(PaneTarget::with_window(beta.clone(), 1, 0)),
+        )
+        .expect("capture beta:1.0 identity");
+        let stable_gamma = crate::handler::StableTargetIdentity::capture(
+            &mut state,
+            Target::Pane(PaneTarget::with_window(gamma.clone(), 0, 0)),
+        )
+        .expect("capture gamma:0.0 identity");
+        state.fail_next_resize_for_test();
+        (stable_alpha, stable_beta, stable_gamma)
+    };
+
+    let response = handler
+        .handle(Request::SwapWindow(SwapWindowRequest {
+            source: WindowTarget::with_window(beta.clone(), 1),
+            target: WindowTarget::with_window(gamma.clone(), 0),
+            detached: false,
+        }))
+        .await;
+    assert_eq!(
+        response,
+        Response::Error(rmux_proto::ErrorResponse {
+            error: rmux_proto::RmuxError::Server(
+                "injected pane terminal resize failure".to_owned()
+            ),
+        })
+    );
+
+    let state = handler.state.lock().await;
+    assert!(
+        stable_alpha.is_current(&state),
+        "the linked source alias must keep its occurrence through swap rollback"
+    );
+    assert!(
+        stable_beta.is_current(&state),
+        "the swapped-from alias must keep its occurrence through swap rollback"
+    );
+    assert!(
+        stable_gamma.is_current(&state),
+        "the swap destination must keep its occurrence through swap rollback"
+    );
+    assert_eq!(
+        (
+            state.window_link_count(&alpha, 0),
+            state.window_link_count(&beta, 1),
+            state.window_link_count(&gamma, 0),
+        ),
+        (2, 2, 1)
+    );
+    state
+        .pane_profile_in_window(&beta, 1, 0)
+        .expect("linked alias pane terminal should survive the rolled-back swap");
+    state
+        .pane_profile_in_window(&gamma, 0, 0)
+        .expect("destination pane terminal should survive the rolled-back swap");
+}
+
+#[tokio::test]
 async fn swap_window_from_group_peer_swaps_runtime_state() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");

@@ -327,35 +327,14 @@ pub(in crate::handler) fn normalize_target_client(target_client: &str) -> &str {
     target_client.strip_suffix(':').unwrap_or(target_client)
 }
 
-#[cfg(windows)]
-pub(in crate::handler) fn format_client_uid(_uid: u32) -> String {
-    String::new()
-}
-
-#[cfg(not(windows))]
 pub(in crate::handler) fn format_client_uid(uid: u32) -> String {
     uid.to_string()
 }
 
-#[cfg(windows)]
-pub(in crate::handler) fn format_requester_uid(_uid: u32) -> String {
-    String::new()
-}
-
-#[cfg(not(windows))]
 pub(in crate::handler) fn format_requester_uid(uid: u32) -> String {
     uid.to_string()
 }
 
-#[cfg(windows)]
-pub(in crate::handler) fn format_client_user(_uid: u32, user: &UserIdentity) -> String {
-    match user {
-        UserIdentity::Sid(sid) => sid.to_string(),
-        UserIdentity::Uid(uid) => uid.to_string(),
-    }
-}
-
-#[cfg(not(windows))]
 pub(in crate::handler) fn format_client_user(uid: u32, _user: &UserIdentity) -> String {
     crate::server_access::user_name_for_uid(uid)
 }
@@ -539,31 +518,7 @@ pub(in crate::handler) fn effective_client_terminal_context(
 ) -> rmux_proto::ClientTerminalContext {
     let mut client_terminal = client_terminal.clone();
     client_terminal.utf8 |= client_environment_infers_utf8(client_environment);
-    // Twin of src/client_terminal.rs: on Windows the daemon and its client are
-    // the same machine and rmux always drives the outer as VT, so advertise the
-    // base VT feature set for every attach — a VT outer reached without
-    // WT_SESSION otherwise never gets mouse reporting or bracketed paste
-    // enabled (issue #93). This is a server-side fallback for clients that do
-    // not self-advertise; a modern client already sends these.
-    #[cfg(windows)]
-    {
-        push_unique_terminal_feature(&mut client_terminal.terminal_features, "sync");
-        push_unique_terminal_feature(&mut client_terminal.terminal_features, "bpaste");
-        push_unique_terminal_feature(&mut client_terminal.terminal_features, "mouse");
-        // Clipboard (OSC 52): advertise it for every Windows attach so an Ms
-        // template exists and the daemon can emit pane writes under
-        // `set-clipboard on` (issue #91). System clipboard delivery remains
-        // host-dependent because older ConPTY paths may consume the sequence and
-        // an outer may ignore it. The on-only gate keeps the `external` default
-        // from letting untrusted output drive the clipboard.
-        push_unique_terminal_feature(&mut client_terminal.terminal_features, "clipboard");
-        // Title (TSL/FSL) on the same VT reasoning: Windows sets no TERM, so no
-        // terminal family supplies a title template and `set-titles on` would
-        // have nothing to write into (issue #182). Still emitted only when
-        // `set-titles` is on, which is off by default.
-        push_unique_terminal_feature(&mut client_terminal.terminal_features, "title");
-    }
-    if client_environment_is_windows_terminal(client_environment) {
+    if client_environment_advertises_wt_session(client_environment) {
         client_terminal.utf8 = true;
         push_unique_terminal_feature(&mut client_terminal.terminal_features, "sync");
         push_unique_terminal_feature(&mut client_terminal.terminal_features, "bpaste");
@@ -573,7 +528,7 @@ pub(in crate::handler) fn effective_client_terminal_context(
     client_terminal
 }
 
-fn client_environment_is_windows_terminal(
+fn client_environment_advertises_wt_session(
     client_environment: Option<&HashMap<String, String>>,
 ) -> bool {
     client_environment.is_some_and(|client_environment| {
@@ -782,28 +737,19 @@ mod tests {
         );
     }
 
-    /// The VT feature set a Windows Terminal attach ends up advertising. On
-    /// Windows the `cfg(windows)` fallback also supplies `title` (issue #182);
-    /// elsewhere only the WT_SESSION arm runs.
-    fn windows_terminal_feature_set() -> Vec<&'static str> {
-        let mut features = vec!["sync", "bpaste", "mouse", "clipboard"];
-        if cfg!(windows) {
-            features.push("title");
-        }
-        features
+    /// The VT feature set a client exporting `WT_SESSION` ends up advertising:
+    /// only that arm runs.
+    fn wt_session_feature_set() -> Vec<&'static str> {
+        vec!["sync", "bpaste", "mouse", "clipboard"]
     }
 
     /// Same set when the client already advertised sync/bpaste/mouse itself.
-    fn preadvertised_windows_terminal_feature_set() -> Vec<&'static str> {
-        let mut features = vec!["SYNC", "BPASTE", "MOUSE", "clipboard"];
-        if cfg!(windows) {
-            features.push("title");
-        }
-        features
+    fn preadvertised_wt_session_feature_set() -> Vec<&'static str> {
+        vec!["SYNC", "BPASTE", "MOUSE", "clipboard"]
     }
 
     #[test]
-    fn windows_terminal_environment_enables_synchronized_rendering() {
+    fn wt_session_environment_enables_synchronized_rendering() {
         let environment = HashMap::from([("WT_SESSION".to_owned(), "session-id".to_owned())]);
         let context = effective_client_terminal_context(
             Some(&environment),
@@ -811,11 +757,11 @@ mod tests {
         );
 
         assert!(context.utf8);
-        assert_eq!(context.terminal_features, windows_terminal_feature_set());
+        assert_eq!(context.terminal_features, wt_session_feature_set());
     }
 
     #[test]
-    fn windows_terminal_features_are_not_duplicated() {
+    fn wt_session_features_are_not_duplicated() {
         let environment = HashMap::from([("WT_SESSION".to_owned(), "session-id".to_owned())]);
         let context = effective_client_terminal_context(
             Some(&environment),
@@ -828,43 +774,10 @@ mod tests {
         assert!(context.utf8);
         assert_eq!(
             context.terminal_features,
-            preadvertised_windows_terminal_feature_set()
+            preadvertised_wt_session_feature_set()
         );
     }
 
-    #[cfg(windows)]
-    #[test]
-    fn windows_vt_outer_without_windows_terminal_still_advertises_mouse_and_bpaste() {
-        // Issue #93 server twin: a Windows client on a VT outer that is not
-        // Windows Terminal (no WT_SESSION) must still have mouse + bracketed
-        // paste advertised so the daemon enables them on the outer. Before the
-        // fix an empty (non-WT) client environment added no features.
-        let environment = HashMap::from([("SYSTEMROOT".to_owned(), "C:\\Windows".to_owned())]);
-        let context = effective_client_terminal_context(
-            Some(&environment),
-            &ClientTerminalContext::default(),
-        );
-
-        for feature in ["sync", "bpaste", "mouse", "clipboard", "title"] {
-            assert!(
-                context.terminal_features.iter().any(|f| f == feature),
-                "missing {feature} for non-WT Windows outer: {:?}",
-                context.terminal_features
-            );
-        }
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn windows_client_formats_do_not_expose_synthetic_uid_zero() {
-        let sid = UserIdentity::Sid("S-1-5-21-1000".into());
-
-        assert_eq!(format_client_uid(0), "");
-        assert_eq!(format_requester_uid(0), "");
-        assert_eq!(format_client_user(0, &sid), "S-1-5-21-1000");
-    }
-
-    #[cfg(unix)]
     #[test]
     fn unix_client_formats_preserve_uid_values() {
         let identity = UserIdentity::Uid(1234);

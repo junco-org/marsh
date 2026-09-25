@@ -21,7 +21,6 @@ use rmux_proto::{
     SplitWindowTarget, SwitchClientRequest, Target, TerminalSize, WindowTarget,
     CAPABILITY_ATTACH_RENDER,
 };
-#[cfg(unix)]
 use rmux_pty::{ChildCommand, TerminalSize as PtyTerminalSize};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -31,27 +30,12 @@ use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TryRecvError;
 use tokio::time::sleep;
 
-#[cfg(windows)]
-const ATTACH_LIFECYCLE_TIMEOUT: Duration = Duration::from_secs(20);
-#[cfg(not(windows))]
 const ATTACH_LIFECYCLE_TIMEOUT: Duration = Duration::from_secs(5);
 
-fn session_name(value: &str) -> SessionName {
-    SessionName::new(value).expect("valid session name")
-}
+use crate::test_names::session_name;
 
-#[cfg(unix)]
 fn default_shell_window_name() -> String {
     "bash".to_owned()
-}
-
-#[cfg(windows)]
-fn default_shell_window_name() -> String {
-    std::env::var_os("COMSPEC")
-        .and_then(|shell| Path::new(&shell).file_name().map(|name| name.to_owned()))
-        .map(|name| name.to_string_lossy().trim_start_matches('-').to_owned())
-        .filter(|name| !name.is_empty())
-        .unwrap_or_else(|| "cmd.exe".to_owned())
 }
 
 fn default_shell_pane_status() -> String {
@@ -174,11 +158,7 @@ async fn create_attached_session(
     requester_pid: u32,
     session: &SessionName,
 ) -> mpsc::UnboundedReceiver<AttachControl> {
-    #[cfg(windows)]
-    create_quiet_session(handler, session).await;
-    #[cfg(not(windows))]
     {
-        #[cfg(unix)]
         set_unix_test_shell(handler, session).await;
 
         assert!(matches!(
@@ -207,13 +187,11 @@ async fn create_attached_session(
 /// whatever `LC_CTYPE` the host account happens to export: a shell started in a
 /// single-byte locale discards those bytes in its own line editor, before rmux
 /// is ever observed handling them.
-#[cfg(not(windows))]
 async fn create_attached_session_in_utf8_locale(
     handler: &RequestHandler,
     requester_pid: u32,
     session: &SessionName,
 ) -> mpsc::UnboundedReceiver<AttachControl> {
-    #[cfg(unix)]
     set_unix_test_shell(handler, session).await;
 
     assert!(matches!(
@@ -342,7 +320,6 @@ async fn refresh_attached_session_removes_clients_over_backlog_limit() {
     );
 }
 
-#[cfg(any(unix, windows))]
 async fn create_line_exiting_attached_session(
     handler: &RequestHandler,
     requester_pid: u32,
@@ -355,7 +332,7 @@ async fn create_line_exiting_attached_session(
         handler,
         target.clone(),
         &marker,
-        "Windows attached-exit fixture should reach its input loop",
+        "the attached-exit fixture should reach its input loop",
     )
     .await;
     replace_transcript_contents(handler, &target, TerminalSize { cols: 80, rows: 24 }, b"").await;
@@ -367,32 +344,6 @@ async fn create_line_exiting_attached_session(
     control_rx
 }
 
-#[cfg(windows)]
-async fn create_line_echo_attached_session(
-    handler: &RequestHandler,
-    requester_pid: u32,
-    session: &SessionName,
-) -> mpsc::UnboundedReceiver<AttachControl> {
-    let marker = format!("RMUX_LINE_ECHO_READY_{}", std::process::id());
-    create_session_with_command(handler, session, line_echo_command(&marker)).await;
-    let target = PaneTarget::new(session.clone(), 0);
-    wait_for_capture_containing(
-        handler,
-        target.clone(),
-        &marker,
-        "Windows attached UTF-8 fixture should reach its input loop",
-    )
-    .await;
-    replace_transcript_contents(handler, &target, TerminalSize { cols: 80, rows: 24 }, b"").await;
-
-    let (control_tx, control_rx) = mpsc::unbounded_channel();
-    handler
-        .register_attach(requester_pid, session.clone(), control_tx)
-        .await;
-    control_rx
-}
-
-#[cfg(unix)]
 async fn set_unix_test_shell(handler: &RequestHandler, _session: &SessionName) {
     let mut state = handler.state.lock().await;
     state
@@ -419,24 +370,8 @@ async fn create_quiet_attached_session(
     control_rx
 }
 
-#[cfg(unix)]
 async fn create_quiet_session(handler: &RequestHandler, session: &SessionName) {
     create_session_with_command(handler, session, quiet_attached_command()).await;
-}
-
-#[cfg(windows)]
-async fn create_quiet_session(handler: &RequestHandler, session: &SessionName) {
-    let marker = format!("RMUX_QUIET_READY_{}", std::process::id());
-    create_session_with_command(handler, session, quiet_ready_command(&marker)).await;
-    let target = PaneTarget::new(session.clone(), 0);
-    wait_for_capture_containing(
-        handler,
-        target.clone(),
-        &marker,
-        "quiet Windows attach fixture should reach a stable shell frame",
-    )
-    .await;
-    replace_transcript_contents(handler, &target, TerminalSize { cols: 80, rows: 24 }, b"").await;
 }
 
 async fn create_session_with_command(
@@ -471,23 +406,6 @@ async fn create_session_with_command(
     );
 }
 
-#[cfg(windows)]
-fn quiet_ready_command(marker: &str) -> Vec<String> {
-    let system_root =
-        std::env::var_os("SystemRoot").unwrap_or_else(|| std::ffi::OsString::from(r"C:\Windows"));
-    let cmd = std::path::PathBuf::from(system_root)
-        .join("System32")
-        .join("cmd.exe");
-    vec![
-        cmd.to_string_lossy().into_owned(),
-        "/d".to_owned(),
-        "/q".to_owned(),
-        "/c".to_owned(),
-        format!("echo {marker} & ping -n 120 127.0.0.1 >NUL"),
-    ]
-}
-
-#[cfg(unix)]
 fn line_exiting_command(marker: &str) -> Vec<String> {
     vec![
         "/bin/sh".to_owned(),
@@ -504,38 +422,6 @@ fn line_exiting_command(marker: &str) -> Vec<String> {
     ]
 }
 
-#[cfg(windows)]
-fn line_exiting_command(marker: &str) -> Vec<String> {
-    windows_cmd_command(format!(
-        "echo {marker} & set \"line=\" & set /p \"line=\" & if /I \"!line!\"==\"RMUX_EXIT\" exit /b 0 & ping -n 120 127.0.0.1 >NUL"
-    ))
-}
-
-#[cfg(windows)]
-fn line_echo_command(marker: &str) -> Vec<String> {
-    windows_cmd_command(format!(
-        "chcp 65001 >NUL & echo {marker} & set \"line=\" & set /p \"line=\" & echo ECHO:!line! & ping -n 60 127.0.0.1 >NUL"
-    ))
-}
-
-#[cfg(windows)]
-fn windows_cmd_command(command: String) -> Vec<String> {
-    let system_root =
-        std::env::var_os("SystemRoot").unwrap_or_else(|| std::ffi::OsString::from(r"C:\Windows"));
-    let cmd = std::path::PathBuf::from(system_root)
-        .join("System32")
-        .join("cmd.exe");
-    vec![
-        cmd.to_string_lossy().into_owned(),
-        "/d".to_owned(),
-        "/q".to_owned(),
-        "/v:on".to_owned(),
-        "/c".to_owned(),
-        command,
-    ]
-}
-
-#[cfg(unix)]
 fn quiet_ready_command(marker: &str) -> Vec<String> {
     vec![
         "/bin/sh".to_owned(),
@@ -544,28 +430,11 @@ fn quiet_ready_command(marker: &str) -> Vec<String> {
     ]
 }
 
-#[cfg(unix)]
 fn quiet_attached_command() -> Vec<String> {
     ["/bin/sh", "-c", "sleep 60"]
         .into_iter()
         .map(str::to_owned)
         .collect()
-}
-
-#[cfg(windows)]
-fn quiet_attached_command() -> Vec<String> {
-    let system_root =
-        std::env::var_os("SystemRoot").unwrap_or_else(|| std::ffi::OsString::from(r"C:\Windows"));
-    let cmd = std::path::PathBuf::from(system_root)
-        .join("System32")
-        .join("cmd.exe");
-    vec![
-        cmd.to_string_lossy().into_owned(),
-        "/d".to_owned(),
-        "/q".to_owned(),
-        "/c".to_owned(),
-        "ping -n 120 127.0.0.1 >NUL".to_owned(),
-    ]
 }
 
 async fn active_panes(handler: &RequestHandler, session: &SessionName) -> String {
@@ -785,28 +654,12 @@ async fn prepare_attached_shell_prompt(handler: &RequestHandler, target: &PaneTa
     .await;
 }
 
-#[cfg(unix)]
 fn attached_shell_prompt_commands() -> [String; 2] {
     ["export PS1='PROMPT> '", "clear"].map(str::to_owned)
 }
 
-#[cfg(windows)]
-fn attached_shell_prompt_commands() -> [String; 2] {
-    [
-        "Remove-Module PSReadLine -ErrorAction SilentlyContinue; function global:prompt { 'PROMPT> ' }; Write-Output ('RMUX_PROMPT_' + 'READY')",
-        "$null = 0; Write-Output ('RMUX_PROMPT_' + 'CLEAR')",
-    ]
-    .map(str::to_owned)
-}
-
-#[cfg(unix)]
 fn attached_shell_prompt_ready_needle() -> &'static str {
     "PROMPT>"
-}
-
-#[cfg(windows)]
-fn attached_shell_prompt_ready_needle() -> &'static str {
-    "RMUX_PROMPT_CLEAR\nPROMPT>"
 }
 
 async fn wait_for_dead_pane(
@@ -879,7 +732,6 @@ async fn replace_transcript_contents(
         .set_screen_for_test(screen);
 }
 
-#[cfg(not(windows))]
 #[path = "handler_attach_tests/utf8_locale.rs"]
 mod utf8_locale;
 

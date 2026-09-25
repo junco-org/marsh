@@ -1,7 +1,7 @@
-//! The historical Windows probe's standard-input **byte** observer.
+//! The final-sink child's standard-input **byte** observer.
 //!
-//! The R1 diagnostic compares the candidate's console read boundary against the
-//! one the successful historical probe used:
+//! The capture every final-sink proof depends on is the plain standard-library
+//! read loop:
 //!
 //! ```text
 //! let mut stdin = std::io::stdin().lock();
@@ -9,39 +9,27 @@
 //! stdin.read(&mut buffer)
 //! ```
 //!
-//! Emulating that loop by hand is what made the previous attempt inconclusive:
-//! a hand-written `ReadConsoleW` loop has no demonstrated equivalent for the
-//! standard library's request sizing, incomplete-UTF-8 buffering, partial
-//! returns or unpaired-surrogate rejection, so a Windows 10 difference could
-//! have come from the emulation rather than from the boundary under test.
+//! This module is that loop, and the cases below drive it through a scripted
+//! [`Read`] so every boundary it can reach is pinned: partial returns, a
+//! multi-byte character split across two reads, end of input, a read error and
+//! an overrun. The `/bin/sh` child in [`super::unix_child`] owes the harness
+//! the same slot protocol, expressed with `dd`, so these cases are where that
+//! protocol's edges are stated executably.
 //!
-//! This module is therefore the loop itself, and it is compiled **twice from
-//! these exact bytes**:
+//! Nothing here interprets the bytes it reads. The observer's responsibility
+//! is narrow and complete: read into a 4,096-byte buffer until the expected
+//! count is reached, grow `out.part` as bytes arrive, refuse a short, failed
+//! or overrun capture, and publish `out` only after an exact one.
 //!
-//! * into this test binary, where the cases below drive it through a scripted
-//!   [`Read`] and pin every boundary it can reach;
-//! * into the Windows pane child, which
-//!   [`super::windows_byte_child`] writes out verbatim and compiles with the
-//!   workspace-pinned toolchain, feeding it `std::io::stdin().lock()`.
-//!
-//! Nothing here converts UTF-16, carries surrogates or touches a console: on
-//! Windows the standard library already drains the console as UTF-16, buffers an
-//! incomplete UTF-8 character across reads and rejects an unpaired surrogate
-//! with [`std::io::ErrorKind::InvalidData`]. Re-implementing any of that is
-//! exactly the manual emulation the finding rejects. The observer's own
-//! responsibility is narrow and complete: read into a 4,096-byte buffer until
-//! the expected count is reached, grow `out.part` as bytes arrive, refuse a
-//! short, failed or overrun capture, and publish `out` only after an exact one.
-//!
-//! It is deliberately free of every crate item: the generated child compiles it
-//! as a bare module of a `std`-only binary.
+//! It is deliberately free of every crate item, so it stays readable as the
+//! bare read loop it documents.
 
 use std::fs;
 use std::io::{Read, Write};
 use std::path::Path;
 
-/// The historical probe's output buffer. A single `read` can never yield more
-/// than this many bytes, which is what bounds one observation.
+/// The observer's input buffer. A single `read` can never yield more than this
+/// many bytes, which is what bounds one observation.
 pub(crate) const READ_BUFFER_BYTES: usize = 4096;
 
 /// Every way an observation can end other than an exact capture.
@@ -54,7 +42,7 @@ pub(crate) enum CaptureFailure {
     PartialUnavailable { path: String, error: String },
     /// Standard input ended before the expected byte count arrived.
     EndOfInput { received: usize, want: usize },
-    /// A read failed. On a Windows console an unpaired surrogate arrives here.
+    /// A read failed, so the bytes already captured are all the child saw.
     ReadFailed {
         received: usize,
         want: usize,
@@ -105,11 +93,12 @@ impl std::fmt::Display for CaptureFailure {
 
 /// Reads exactly `want` bytes, recording each read into `partial` as it arrives.
 ///
-/// The loop is the historical one: a fixed 4,096-byte buffer, one `read` per
+/// The loop is the plain one: a fixed 4,096-byte buffer, one `read` per
 /// iteration, and no interpretation of the bytes. A read of zero is end of
 /// input, an error is reported with the count already captured, and a read that
-/// carries the capture past `want` is an overrun rather than a success — the
-/// historical probe silently kept those extra bytes.
+/// carries the capture past `want` is an overrun rather than a success — a
+/// capture that kept those extra bytes would publish a byte count no proof
+/// asked for.
 pub(crate) fn observe_exact_bytes<R: Read, W: Write>(
     reader: &mut R,
     want: usize,
@@ -172,8 +161,8 @@ pub(crate) fn capture_to_slot<R: Read>(
             error: error.to_string(),
         })?;
     let received = observe_exact_bytes(reader, want, &mut partial)?;
-    // Closed before the rename: Windows refuses to move a file that still has
-    // a writable handle open in this process.
+    // Closed before the rename, so `out` is never published while a writable
+    // handle to it is still open.
     drop(partial);
     fs::rename(partial_path, out_path).map_err(|error| CaptureFailure::PublicationFailed {
         path: out_path.display().to_string(),
@@ -197,8 +186,8 @@ mod tests {
     enum ReaderStep {
         /// Bytes to hand out, split across as many reads as the buffer forces.
         Deliver(Vec<u8>),
-        /// A read error, which is how a Windows console reports an unpaired
-        /// surrogate.
+        /// A read error, which is how the child's standard input reports a
+        /// failure rather than an end of input.
         Fail(std::io::Error),
     }
 
@@ -301,10 +290,10 @@ mod tests {
         }
     }
 
-    /// The historical reader can never take more than 4,096 bytes from one
-    /// call, which is what bounds a single observation.
+    /// The reader can never take more than 4,096 bytes from one call, which is
+    /// what bounds a single observation.
     #[test]
-    fn one_read_never_takes_more_than_the_historical_four_kibibyte_buffer() {
+    fn one_read_never_takes_more_than_the_four_kibibyte_buffer() {
         let payload = vec![b'x'; READ_BUFFER_BYTES * 2 + 37];
         let slot = Slot::new("bounded-buffer");
         let mut reader = ScriptedReader::new(vec![ReaderStep::Deliver(payload.clone())]);
@@ -317,12 +306,12 @@ mod tests {
         assert_eq!(reader.largest_request, READ_BUFFER_BYTES);
         assert_eq!(
             reader.reads, 3,
-            "4096 + 4096 + 37 is three reads of the historical buffer"
+            "4096 + 4096 + 37 is three reads of the 4,096-byte buffer"
         );
         assert_eq!(fs::read(&slot.out).expect("published capture"), payload);
     }
 
-    /// A console read returns what is available, not what was asked for.
+    /// A terminal read returns what is available, not what was asked for.
     #[test]
     fn partial_returns_are_accumulated_until_the_exact_byte_count() {
         let payload = RICH_PAYLOAD.as_bytes();
@@ -371,24 +360,22 @@ mod tests {
         }
     }
 
-    /// An unpaired surrogate is how a Windows console rejects input it cannot
-    /// encode. It must arrive as an attributable read error with the bytes that
-    /// did reach the child preserved, not as a bare timeout.
+    /// A pseudoterminal whose other end is gone fails the read instead of
+    /// ending it. That must arrive as an attributable read error with the
+    /// bytes that did reach the child preserved, not as a bare timeout.
     #[test]
-    fn an_unpaired_surrogate_read_error_is_attributed_and_preserves_the_partial() {
-        let slot = Slot::new("unpaired-surrogate");
+    fn a_failing_read_is_attributed_and_preserves_the_partial() {
+        let slot = Slot::new("failing-read");
         let mut reader = ScriptedReader::new(vec![
             ReaderStep::Deliver(b"head".to_vec()),
-            ReaderStep::Fail(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "Windows stdin in console mode does not support non-UTF-16 input; \
-                 encountered unpaired surrogate",
+            ReaderStep::Fail(std::io::Error::other(
+                "input/output error on the pseudoterminal",
             )),
         ]);
 
         let failure = slot
             .capture(&mut reader, 32)
-            .expect_err("an unpaired surrogate must fail the capture");
+            .expect_err("a failing read must fail the capture");
 
         let rendered = failure.to_string();
         assert!(
@@ -403,8 +390,8 @@ mod tests {
             "unexpected failure: {rendered}"
         );
         assert!(
-            rendered.contains("unpaired surrogate"),
-            "the console's own reason must survive: {rendered}"
+            rendered.contains("input/output error on the pseudoterminal"),
+            "the reader's own reason must survive: {rendered}"
         );
         assert_eq!(slot.partial_bytes(), b"head", "the partial must be kept");
         assert!(
@@ -466,8 +453,8 @@ mod tests {
         );
     }
 
-    /// Extra input is a defect, not a success: the historical probe kept the
-    /// overrun bytes and published them as a complete capture.
+    /// Extra input is a defect, not a success: silently keeping the overrun
+    /// bytes would publish them as a complete capture.
     #[test]
     fn extra_input_beyond_the_expected_count_is_reported_as_an_overrun() {
         let slot = Slot::new("overrun");

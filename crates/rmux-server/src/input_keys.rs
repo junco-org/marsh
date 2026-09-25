@@ -11,7 +11,6 @@ mod mouse;
 
 #[cfg(test)]
 pub(crate) use self::mouse::MAX_SGR_MOUSE_FRAME_BYTES;
-#[cfg_attr(windows, allow(unused_imports))]
 pub(crate) use self::mouse::{decode_mouse, encode_mouse_event, MouseDecode, MouseForwardEvent};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

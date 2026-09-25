@@ -250,9 +250,6 @@ impl RequestHandler {
         if admission.is_some() {
             pause_before_access_registration(AccessRegistrationKind::Attach, requester_pid).await;
         }
-        #[cfg(windows)]
-        self.wait_for_windows_deferred_session_panes_ready(&session_name)
-            .await;
         let mut replaced_key_table = None;
         let mut replaced_overlay = None;
         let attached_session_name = session_name.clone();

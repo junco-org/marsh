@@ -339,10 +339,10 @@ impl RequestHandler {
             };
             if let Some(receipt) = receipt {
                 if receipt.wait().await.is_err() {
-                    // A synchronous ConPTY write can remain blocked when the
-                    // popup child stops reading. Retire only the popup whose
-                    // write failed so a concurrently installed replacement is
-                    // never cleared, and keep the attached client alive.
+                    // A pane write can stay blocked when the popup child stops
+                    // reading. Retire only the popup whose write failed so a
+                    // concurrently installed replacement is never cleared, and
+                    // keep the attached client alive.
                     self.clear_interactive_overlay_for_optional_identity_and_id(
                         attach_pid, identity, popup.id, true,
                     )

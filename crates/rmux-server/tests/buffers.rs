@@ -1,5 +1,3 @@
-#![cfg(unix)]
-
 use std::error::Error;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -30,7 +28,7 @@ async fn create_session(harness: &TestHarness, name: &str) -> Result<(), Box<dyn
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn client_disconnect_cancels_load_buffer_blocked_on_fifo_without_shutdown(
 ) -> Result<(), Box<dyn Error>> {
     let harness = TestHarness::new("buf-drop-load-fifo");
@@ -52,7 +50,7 @@ async fn client_disconnect_cancels_load_buffer_blocked_on_fifo_without_shutdown(
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn client_disconnect_cancels_save_buffer_blocked_on_fifo_without_shutdown(
 ) -> Result<(), Box<dyn Error>> {
     let harness = TestHarness::new("buf-drop-save-fifo");
@@ -185,7 +183,7 @@ fn fifo_path(harness: &TestHarness, name: &str) -> PathBuf {
         .join(name)
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn kill_server_cancels_load_buffer_blocked_opening_fifo() -> Result<(), Box<dyn Error>> {
     let harness = TestHarness::new("buf-kill-load-fifo");
     let handle = start_server(&harness).await?;
@@ -214,7 +212,7 @@ async fn kill_server_cancels_load_buffer_blocked_opening_fifo() -> Result<(), Bo
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn kill_server_cancels_save_buffer_blocked_opening_fifo() -> Result<(), Box<dyn Error>> {
     let harness = TestHarness::new("buf-kill-save-fifo");
     let handle = start_server(&harness).await?;
@@ -294,7 +292,7 @@ fn create_fifo(path: &std::path::Path) -> Result<(), Box<dyn Error>> {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn set_and_show_buffer_round_trips_through_real_socket() -> Result<(), Box<dyn Error>> {
     let harness = TestHarness::new("buf-set-show");
     let handle = start_server(&harness).await?;
@@ -332,7 +330,7 @@ async fn set_and_show_buffer_round_trips_through_real_socket() -> Result<(), Box
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn list_buffers_returns_formatted_output_through_real_socket() -> Result<(), Box<dyn Error>> {
     let harness = TestHarness::new("buf-list");
     let handle = start_server(&harness).await?;
@@ -380,7 +378,7 @@ async fn list_buffers_returns_formatted_output_through_real_socket() -> Result<(
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn delete_buffer_removes_stack_head_through_real_socket() -> Result<(), Box<dyn Error>> {
     let harness = TestHarness::new("buf-delete");
     let handle = start_server(&harness).await?;
@@ -435,7 +433,7 @@ async fn delete_buffer_removes_stack_head_through_real_socket() -> Result<(), Bo
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn paste_buffer_to_session_pane_through_real_socket() -> Result<(), Box<dyn Error>> {
     let harness = TestHarness::new("buf-paste");
     let handle = start_server(&harness).await?;
@@ -485,7 +483,7 @@ async fn paste_buffer_to_session_pane_through_real_socket() -> Result<(), Box<dy
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn paste_buffer_without_buffers_is_successful_noop_through_real_socket(
 ) -> Result<(), Box<dyn Error>> {
     let harness = TestHarness::new("buf-paste-empty");
@@ -515,7 +513,7 @@ async fn paste_buffer_without_buffers_is_successful_noop_through_real_socket(
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn paste_buffer_with_delete_removes_buffer_through_real_socket() -> Result<(), Box<dyn Error>>
 {
     let harness = TestHarness::new("buf-paste-del");
@@ -562,7 +560,7 @@ async fn paste_buffer_with_delete_removes_buffer_through_real_socket() -> Result
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn delete_nonexistent_buffer_returns_error_through_real_socket() -> Result<(), Box<dyn Error>>
 {
     let harness = TestHarness::new("buf-del-missing");
@@ -581,7 +579,7 @@ async fn delete_nonexistent_buffer_returns_error_through_real_socket() -> Result
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn show_buffer_empty_store_returns_error_through_real_socket() -> Result<(), Box<dyn Error>> {
     let harness = TestHarness::new("buf-show-empty");
     let handle = start_server(&harness).await?;
@@ -597,7 +595,7 @@ async fn show_buffer_empty_store_returns_error_through_real_socket() -> Result<(
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn list_buffers_empty_returns_empty_output_through_real_socket() -> Result<(), Box<dyn Error>>
 {
     let harness = TestHarness::new("buf-list-empty");

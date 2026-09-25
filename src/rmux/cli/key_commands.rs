@@ -1,10 +1,11 @@
 use std::path::Path;
 
-use rmux_client::{connect_or_absent, ConnectResult};
+use rmux_client::{ConnectResult, connect_or_absent};
 use rmux_core::{
-    formats::{render_template, FormatContext},
-    key_code_lookup_bits, key_string_lookup_string, KeyBindingDisplay, KeyBindingSortOrder,
-    KeyBindingStore, KEYC_NONE, KEYC_UNKNOWN, LIST_KEYS_TEMPLATE,
+    KEYC_NONE, KEYC_UNKNOWN, KeyBindingDisplay, KeyBindingSortOrder, KeyBindingStore,
+    LIST_KEYS_TEMPLATE,
+    formats::{FormatContext, render_template},
+    key_code_lookup_bits, key_string_lookup_string,
 };
 use rmux_proto::{
     BindKeyRequest, CommandOutput, ListKeysRequest, SendKeysExt2Request, SendKeysExtRequest,
@@ -12,8 +13,8 @@ use rmux_proto::{
 };
 
 use super::{
-    expect_command_output, resolve_pane_target_spec, run_command, run_command_resolved,
-    write_command_output, ExitFailure,
+    ExitFailure, expect_command_output, resolve_pane_target_spec, run_command,
+    run_command_resolved, write_command_output,
 };
 use crate::cli_args::{BindKeyArgs, ListKeysArgs, SendKeysArgs, SendPrefixArgs, UnbindKeyArgs};
 
@@ -134,9 +135,7 @@ pub(super) fn run_list_keys(args: ListKeysArgs, socket_path: &Path) -> Result<i3
 
     match connect_or_absent(socket_path).map_err(ExitFailure::from)? {
         ConnectResult::Connected(mut connection) => {
-            let response = connection
-                .list_keys(request)
-                .map_err(ExitFailure::from)?;
+            let response = connection.list_keys(request).map_err(ExitFailure::from)?;
             let output = expect_command_output(&response, "list-keys")?;
             write_command_output(output)?;
             Ok(0)
@@ -146,7 +145,10 @@ pub(super) fn run_list_keys(args: ListKeysArgs, socket_path: &Path) -> Result<i3
 }
 
 /// Renders `list-keys` from the default binding store when no server is reachable.
-fn run_default_list_keys(request: &ListKeysRequest, socket_path: &Path) -> Result<i32, ExitFailure> {
+fn run_default_list_keys(
+    request: &ListKeysRequest,
+    socket_path: &Path,
+) -> Result<i32, ExitFailure> {
     let sort_order = match request.sort_order.as_deref() {
         Some(value) => KeyBindingSortOrder::parse(value)
             .ok_or_else(|| ExitFailure::new(1, rmux_core::INVALID_SORT_ORDER))?,
@@ -364,11 +366,7 @@ fn command_output_from_lines(lines: &[String]) -> CommandOutput {
 
 /// Renders a flag as the `1` or `0` text the format templates expect.
 const fn bool_format(value: bool) -> &'static str {
-    if value {
-        "1"
-    } else {
-        "0"
-    }
+    if value { "1" } else { "0" }
 }
 
 /// Width reserved for the prefix column, defaulting to `C-b` plus a space.

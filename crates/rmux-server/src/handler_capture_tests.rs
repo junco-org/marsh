@@ -4,7 +4,6 @@ use std::time::{Duration, Instant};
 use super::RequestHandler;
 use rmux_core::{input::InputParser, GridRenderOptions, Screen, ScreenCaptureRange};
 use rmux_proto::types::OptionScopeSelector;
-#[cfg(unix)]
 use rmux_proto::ListBuffersRequest;
 use rmux_proto::{
     CapturePaneRequest, CapturePaneTargetActionRequest, LoadBufferRequest, NewSessionRequest,
@@ -15,9 +14,7 @@ use tokio::time::sleep;
 
 static UNIQUE_ID: AtomicUsize = AtomicUsize::new(0);
 
-fn session_name(value: &str) -> rmux_proto::SessionName {
-    rmux_proto::SessionName::new(value).expect("valid session name")
-}
+use crate::test_names::session_name;
 
 fn capture_pane_request(
     target: PaneTarget,
@@ -306,14 +303,8 @@ async fn send_marker(handler: &RequestHandler, target: PaneTarget, marker: &str)
     assert!(matches!(response, Response::SendKeys(_)));
 }
 
-#[cfg(unix)]
 fn marker_print_command(marker: &str) -> String {
     format!("printf '{marker}\\n'")
-}
-
-#[cfg(windows)]
-fn marker_print_command(marker: &str) -> String {
-    format!("echo {marker}")
 }
 
 async fn wait_for_capture(handler: &RequestHandler, target: PaneTarget, marker: &str) -> Vec<u8> {
@@ -494,7 +485,6 @@ async fn load_buffer_reads_server_file() {
     let _ = std::fs::remove_file(path);
 }
 
-#[cfg(unix)]
 #[tokio::test]
 async fn load_buffer_waiting_on_fifo_does_not_block_other_requests() {
     let handler = RequestHandler::new();
@@ -634,7 +624,6 @@ async fn save_buffer_writes_server_file() {
     let _ = std::fs::remove_file(path);
 }
 
-#[cfg(unix)]
 #[tokio::test]
 async fn save_buffer_waiting_on_fifo_does_not_block_other_requests() {
     for append in [false, true] {

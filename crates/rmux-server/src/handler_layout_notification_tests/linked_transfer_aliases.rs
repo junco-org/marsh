@@ -156,6 +156,4 @@ async fn set_resize_hook(handler: &RequestHandler, buffer: &str) {
     assert!(matches!(response, Response::SetHook(_)), "{response:?}");
 }
 
-fn session_name(value: &str) -> SessionName {
-    SessionName::new(value).expect("test session name")
-}
+use crate::test_names::session_name;

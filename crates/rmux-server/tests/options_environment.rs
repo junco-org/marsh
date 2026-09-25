@@ -1,5 +1,3 @@
-#![cfg(unix)]
-
 use std::error::Error;
 
 mod common;
@@ -10,7 +8,7 @@ use rmux_proto::{
     SetEnvironmentRequest, SetOptionMode, SetOptionRequest,
 };
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn set_option_round_trips_and_invalid_variants_fail_cleanly() -> Result<(), Box<dyn Error>> {
     let harness = TestHarness::new("set-option");
     let socket_path = harness.socket_path().to_path_buf();
@@ -125,7 +123,7 @@ async fn set_option_round_trips_and_invalid_variants_fail_cleanly() -> Result<()
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn set_environment_round_trips_and_requires_existing_sessions() -> Result<(), Box<dyn Error>>
 {
     let harness = TestHarness::new("set-environment");

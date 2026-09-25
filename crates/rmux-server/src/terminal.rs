@@ -9,16 +9,9 @@ use rmux_proto::{AttachShellCommand, OptionName, ProcessCommand, RmuxError, Sess
 mod shell_resolver;
 mod shell_spec;
 
-#[cfg(unix)]
 pub(crate) use shell_resolver::is_suitable_shell;
-#[cfg(windows)]
-use shell_resolver::CLIENT_SHELL_ENV;
 use shell_resolver::{configured_pane_shell, resolve_shell_path};
 use shell_spec::ShellSpec;
-
-#[cfg(windows)]
-const WINDOWS_BATCH_ARGV_UNSUPPORTED_MESSAGE: &str =
-    "process command argv cannot target Windows .cmd or .bat scripts; use shell command mode";
 
 /// How a pane's terminal runs what the user types or asks for.
 ///
@@ -55,15 +48,12 @@ impl PaneShell {
 /// Immutable pane-spawn metadata captured when a pane terminal is created.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TerminalProfile {
-    cwd: PathBuf,
-    /// Whether [`cwd`](Self::cwd) is a directory the caller *named*, or one that was inherited.
+    /// The directory a job for this profile starts in.
     ///
-    /// The distinction decides what happens when it turns out to lie outside the seed. A named
-    /// directory is a request this daemon cannot honour, and starting somewhere else would run the
-    /// caller's command against the wrong tree — so it is refused. An inherited one is not a
-    /// request at all: it is wherever the daemon happened to be started, and refusing it would
-    /// make a server launched from outside its own seed unable to open a single pane.
-    requested_cwd: bool,
+    /// A host path, authoritative whether it was named or inherited: the seed it lies in is
+    /// discovered from it when the job is opened, so there is nothing left for this type to
+    /// decide about it.
+    cwd: PathBuf,
     /// The shell helper commands run through, and the value exported as `SHELL`.
     ///
     /// Always a real path, and never on its own evidence of what the pane is running — see
@@ -286,7 +276,6 @@ impl TerminalProfile {
 
         Ok(Self {
             cwd,
-            requested_cwd: requested_cwd.is_some(),
             shell,
             pane_shell,
             raw_environment: raw_process_environment(
@@ -370,10 +359,6 @@ impl TerminalProfile {
 
         let cwd = resolve_working_directory(requested_cwd)?;
         let shell = resolve_shell_path(options, session_name, &resolved);
-        #[cfg(windows)]
-        {
-            remove_environment_value(&mut resolved, CLIENT_SHELL_ENV);
-        }
         set_environment_value(
             &mut resolved,
             "SHELL".to_owned(),
@@ -387,11 +372,8 @@ impl TerminalProfile {
 
         suppressed.insert("RMUX_PANE".to_owned());
         suppressed.insert("TMUX_PANE".to_owned());
-        #[cfg(windows)]
-        suppressed.insert(CLIENT_SHELL_ENV.to_owned());
         Ok(Self {
             cwd,
-            requested_cwd: requested_cwd.is_some(),
             shell,
             pane_shell: PaneShell::resolve(options, session_name),
             raw_environment: raw_process_environment(
@@ -419,47 +401,8 @@ impl TerminalProfile {
     /// # Errors
     ///
     /// Fails when a name or value is not UTF-8.
-    pub(crate) fn shell_environment(
-        &self,
-    ) -> Result<brush_core::env::ShellEnvironment, RmuxError> {
+    pub(crate) fn shell_environment(&self) -> Result<brush_core::env::ShellEnvironment, RmuxError> {
         shell_environment_from_pairs(self.raw_environment())
-    }
-
-    /// The seed-relative directory a job for this profile is opened over.
-    ///
-    /// An inherited directory outside the seed falls back to the seed root, which is the same
-    /// answer [`ShellMux::default_dir`](marsh_core::shellmux::ShellMux::default_dir) gives and for
-    /// the same reason: nobody asked for it, so there is nothing to refuse. A directory the caller
-    /// *named* is refused instead — see [`requested_cwd`](Self::requested_cwd).
-    ///
-    /// # Errors
-    ///
-    /// Fails when the caller named a directory outside the seed and outside every snapshot of it.
-    pub(crate) fn seed_relative_dir(
-        &self,
-        executor: &marsh_core::shellmux::ExecutorInfo,
-    ) -> Result<String, RmuxError> {
-        match seed_relative_path(executor, self.cwd()) {
-            Ok(directory) => Ok(directory),
-            Err(error) if self.requested_cwd => Err(error),
-            Err(_) => Ok(String::new()),
-        }
-    }
-
-    /// Marks this profile's directory as inherited rather than named by the caller.
-    ///
-    /// For one caller: a respawn. `plan_window_terminal` records the *resolved* directory in a
-    /// pane's provenance, which for an unnamed pane is whatever the daemon's own process cwd was.
-    /// Replaying that on respawn hands it back as `requested_cwd`, so a directory nobody ever
-    /// asked for arrives looking like a request — and [`seed_relative_dir`](Self::seed_relative_dir)
-    /// then refuses it. The visible symptom is a server started outside its own seed where
-    /// `new-window` works and `respawn-pane` fails.
-    ///
-    /// A respawn whose directory *was* named keeps its named-ness and keeps failing loudly, which
-    /// is what plan line 355's "a command-less respawn preserves its original mode" asks for.
-    pub(crate) const fn inherit_cwd(mut self) -> Self {
-        self.requested_cwd = false;
-        self
     }
 
     pub(crate) fn with_source_depth(mut self, depth: usize) -> Self {
@@ -537,11 +480,9 @@ impl TerminalProfile {
     ) -> Result<Option<String>, RmuxError> {
         match (&self.pane_shell, command) {
             (PaneShell::Embedded, None) => Ok(None),
-            (PaneShell::External(path), None) => {
-                ShellSpec::new(path).interactive_line(&self.cwd).map(Some)
-            }
+            (PaneShell::External(path), None) => ShellSpec::new(path).interactive_line().map(Some),
             (PaneShell::External(path), Some(ProcessCommand::Shell(text))) => {
-                ShellSpec::new(path).command_line(&self.cwd, text).map(Some)
+                ShellSpec::new(path).command_line(text).map(Some)
             }
             (_, Some(command)) => crate::io::protocol::workload_line(command)
                 .map(Some)
@@ -617,20 +558,8 @@ impl TerminalProfile {
             Some(ProcessCommand::Argv(_)) | Some(_) => shell_program_name(&self.shell),
         }
     }
-
 }
 
-#[cfg(windows)]
-fn suppress_client_shell_environment(
-    resolved: &mut HashMap<String, String>,
-    mut suppressed_raw_names: HashSet<String>,
-) -> HashSet<String> {
-    remove_environment_value(resolved, CLIENT_SHELL_ENV);
-    suppressed_raw_names.insert(CLIENT_SHELL_ENV.to_owned());
-    suppressed_raw_names
-}
-
-#[cfg(not(windows))]
 fn suppress_client_shell_environment(
     _resolved: &mut HashMap<String, String>,
     suppressed_raw_names: HashSet<String>,
@@ -702,7 +631,6 @@ where
         .collect()
 }
 
-#[cfg(unix)]
 fn display_os_environment_value(value: &OsStr) -> String {
     use std::os::unix::ffi::OsStrExt;
 
@@ -717,17 +645,6 @@ fn display_os_environment_value(value: &OsStr) -> String {
         .collect()
 }
 
-#[cfg(windows)]
-fn display_os_environment_value(value: &OsStr) -> String {
-    value.to_string_lossy().into_owned()
-}
-
-#[cfg(windows)]
-fn os_environment_name_eq(left: &OsStr, right: &str) -> bool {
-    left.to_string_lossy().eq_ignore_ascii_case(right)
-}
-
-#[cfg(not(windows))]
 fn os_environment_name_eq(left: &OsStr, right: &str) -> bool {
     left == OsStr::new(right)
 }
@@ -745,50 +662,7 @@ pub(crate) fn validate_process_command(command: Option<&ProcessCommand>) -> Resu
     if empty_argv {
         return Err(RmuxError::empty_process_command());
     }
-    #[cfg(windows)]
-    if let Some(ProcessCommand::Argv(argv)) = command {
-        if let Some(program) = argv.first() {
-            reject_windows_batch_argv(Path::new(program))?;
-        }
-    }
     Ok(())
-}
-
-/// Rejects a workload this profile's configured shell cannot express, before a pane is created.
-///
-/// Composing the line is the check. A Windows `default-shell` reached through a verbatim
-/// `cmd.exe` tail, a batch script named as an argv program, and a non-UTF-8 word all fail here
-/// rather than after the layout has already been mutated for a pane that can never start.
-///
-/// # Errors
-///
-/// Fails for the reasons [`TerminalProfile::pane_workload_line`] fails.
-#[cfg(windows)]
-pub(crate) fn validate_windows_process_command_for_profile(
-    profile: &TerminalProfile,
-    command: Option<&ProcessCommand>,
-) -> Result<(), RmuxError> {
-    validate_process_command(command)?;
-    let _ = profile.pane_workload_line(command)?;
-    Ok(())
-}
-
-#[cfg(windows)]
-fn reject_windows_batch_argv(program: &Path) -> Result<(), RmuxError> {
-    if is_windows_batch_script(program) {
-        return Err(RmuxError::spawn_failed(
-            WINDOWS_BATCH_ARGV_UNSUPPORTED_MESSAGE,
-        ));
-    }
-    Ok(())
-}
-
-#[cfg(windows)]
-fn is_windows_batch_script(path: &Path) -> bool {
-    path.extension()
-        .and_then(OsStr::to_str)
-        .map(|extension| matches!(extension.to_ascii_lowercase().as_str(), "bat" | "cmd"))
-        .unwrap_or(false)
 }
 
 pub(crate) fn parse_environment_assignments(
@@ -797,11 +671,6 @@ pub(crate) fn parse_environment_assignments(
     let mut environment = HashMap::new();
 
     for value in values {
-        #[cfg(windows)]
-        if value.starts_with('=') {
-            continue;
-        }
-
         let Some((name, value)) = value.split_once('=') else {
             return Err(RmuxError::Server(format!(
                 "environment assignment must be NAME=VALUE: {value}"
@@ -825,16 +694,6 @@ fn set_environment_value(environment: &mut HashMap<String, String>, name: String
 }
 
 fn remove_environment_value(environment: &mut HashMap<String, String>, name: &str) {
-    #[cfg(windows)]
-    if let Some(existing) = environment
-        .keys()
-        .find(|key| key.eq_ignore_ascii_case(name))
-        .cloned()
-    {
-        environment.remove(&existing);
-        return;
-    }
-
     environment.remove(name);
 }
 
@@ -848,11 +707,24 @@ fn set_raw_environment_value(
     environment.push((name, value));
 }
 
+/// The directory a profile starts its job in.
+///
+/// A caller who named one gets that one or an error: silently substituting `HOME` would run their
+/// command against a tree they never asked for. Only a caller who named *nothing* gets the search
+/// — the process directory, then the usual home candidates, then the OS root — because there is
+/// no request to honour and refusing would leave a host unable to build a profile at all.
 fn resolve_working_directory(requested_cwd: Option<&Path>) -> Result<PathBuf, RmuxError> {
-    let requested = requested_cwd
-        .map(PathBuf::from)
-        .or_else(|| std::env::current_dir().ok());
-    for candidate in requested
+    if let Some(requested) = requested_cwd {
+        if requested.as_os_str().is_empty() || !requested.is_dir() {
+            return Err(RmuxError::Server(format!(
+                "{}: no such directory",
+                requested.display()
+            )));
+        }
+        return Ok(requested.to_path_buf());
+    }
+    for candidate in std::env::current_dir()
+        .ok()
         .into_iter()
         .chain(std::env::var_os("USERPROFILE").map(PathBuf::from))
         .chain(std::env::var_os("HOME").map(PathBuf::from))
@@ -892,14 +764,7 @@ fn canonical_path_or_parent(path: PathBuf) -> PathBuf {
 }
 
 fn default_working_directory() -> PathBuf {
-    #[cfg(unix)]
-    {
-        PathBuf::from("/")
-    }
-    #[cfg(windows)]
-    {
-        PathBuf::from(r"C:\")
-    }
+    PathBuf::from("/")
 }
 
 fn shell_program_name(path: &Path) -> Option<String> {
@@ -940,76 +805,14 @@ where
         let mut variable = brush_core::variables::ShellVariable::new(value);
         variable.export();
         environment.set_global(name, variable).map_err(|error| {
-            RmuxError::spawn_failed(format!("pane environment variable {name} is unusable: {error}"))
+            RmuxError::spawn_failed(format!(
+                "pane environment variable {name} is unusable: {error}"
+            ))
         })?;
     }
     Ok(environment)
 }
 
-/// Rewrites a host path as the seed-relative directory a job is opened over.
-///
-/// Two prefixes are stripped, in this order, because both name the same logical place:
-///
-/// * the seed itself — the directory this daemon leased and every job publishes into;
-/// * `<snapshot root>/<one component>` — a path *inside* some job's snapshot. The first component
-///   under the snapshot root names that snapshot, and everything after it is the same relative
-///   position in the seed. A client whose shell has already moved into a pane's snapshot would
-///   otherwise hand over a path this daemon has no seed-relative name for.
-///
-/// # Errors
-///
-/// Fails when `path` is under neither. That is an ordinary spawn error and deliberately not a
-/// silent jump to the seed root: a caller that asked for a directory outside this singleton's
-/// seed asked for something this daemon cannot give it, and starting somewhere else instead would
-/// run their command against the wrong tree.
-pub(crate) fn seed_relative_path(
-    executor: &marsh_core::shellmux::ExecutorInfo,
-    path: &Path,
-) -> Result<String, RmuxError> {
-    if let Some(seed) = executor.seed.as_deref() {
-        if let Ok(relative) = path.strip_prefix(seed) {
-            return job_directory(path, relative);
-        }
-    }
-    if let Some(root) = executor.snapshot_parent.as_deref() {
-        if let Ok(relative) = path.strip_prefix(root) {
-            let mut components = relative.components();
-            if components.next().is_some() {
-                let inside = components.as_path().to_path_buf();
-                return job_directory(path, &inside);
-            }
-            return Ok(String::new());
-        }
-    }
-    Err(RmuxError::spawn_failed(format!(
-        "{} directory {} is outside this server's seed",
-        rmux_proto::SPAWN_FAILED_MESSAGE_PREFIX,
-        path.display()
-    )))
-}
-
-/// Joins `relative`'s components with `/`, the separator a job directory is spelled with.
-///
-/// `original` is only for the diagnostic: a caller needs the path it actually asked for, not the
-/// suffix that failed to convert.
-fn job_directory(original: &Path, relative: &Path) -> Result<String, RmuxError> {
-    let mut segments = Vec::new();
-    for component in relative.components() {
-        let Some(segment) = component.as_os_str().to_str() else {
-            return Err(RmuxError::spawn_failed(format!(
-                "{} directory {} is not UTF-8",
-                rmux_proto::SPAWN_FAILED_MESSAGE_PREFIX,
-                original.display()
-            )));
-        };
-        segments.push(segment);
-    }
-    Ok(segments.join("/"))
-}
-
-#[cfg(test)]
-#[path = "terminal/profile_env_tests.rs"]
-mod profile_env_tests;
 #[cfg(test)]
 #[path = "terminal/tests.rs"]
 mod tests;

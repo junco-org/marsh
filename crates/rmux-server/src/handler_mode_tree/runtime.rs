@@ -144,11 +144,6 @@ impl RequestHandler {
         }
 
         if let Some(identity) = attach_identity {
-            #[cfg(windows)]
-            if let Some(target) = mode.host_pane.as_ref() {
-                self.wait_for_windows_deferred_session_pane_pids(target.session_name())
-                    .await;
-            }
             #[cfg(test)]
             super::mode_tree_test_support::pause_mode_tree_identity(
                 super::mode_tree_test_support::ModeTreeIdentityPausePoint::Activation(
@@ -489,9 +484,6 @@ impl RequestHandler {
         identity: Option<&super::mode_tree_model::ModeTreePaneIdentity>,
         kind: ModeTreeKind,
     ) -> Result<bool, RmuxError> {
-        #[cfg(windows)]
-        self.wait_for_windows_deferred_session_pane_pids(target.session_name())
-            .await;
         let mut state = self.state.lock().await;
         if identity.is_none_or(|identity| !identity.matches(&state)) {
             return Err(RmuxError::Server(

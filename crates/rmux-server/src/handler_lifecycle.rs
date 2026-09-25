@@ -240,10 +240,7 @@ fn exact_pane_hook_target(
             identity.window_id,
         )?
     } else {
-        let (session_name, session) = state
-            .sessions
-            .iter()
-            .find(|(_, session)| session.id() == identity.session_id)?;
+        let session = state.sessions.session_by_id(identity.session_id)?;
         let (window_index, _) = session
             .windows()
             .iter()
@@ -254,7 +251,7 @@ fn exact_pane_hook_target(
                     **window_index,
                 )
             })?;
-        WindowTarget::with_window(session_name.clone(), *window_index)
+        WindowTarget::with_window(session.name().clone(), *window_index)
     };
     let session = state.sessions.session(target.session_name())?;
     let window = session.window_at(target.window_index())?;
@@ -302,11 +299,7 @@ fn stable_window_slot_was_replaced(
     session_id: SessionId,
     identity: StableWindowIdentity,
 ) -> bool {
-    let Some((session_name, session)) = state
-        .sessions
-        .iter()
-        .find(|(_, session)| session.id() == session_id)
-    else {
+    let Some(session) = state.sessions.session_by_id(session_id) else {
         return false;
     };
     session
@@ -314,7 +307,7 @@ fn stable_window_slot_was_replaced(
         .is_some_and(|window| {
             window.id() != identity.window_id
                 || identity.occurrence_id.is_some_and(|occurrence_id| {
-                    state.window_link_occurrence_id(session_name, identity.preferred_index)
+                    state.window_link_occurrence_id(session.name(), identity.preferred_index)
                         != Some(occurrence_id)
                 })
         })
@@ -326,9 +319,8 @@ fn resolve_stable_session_target(
 ) -> Option<Target> {
     state
         .sessions
-        .iter()
-        .find(|(_, session)| session.id() == session_id)
-        .map(|(session_name, _)| Target::Session(session_name.clone()))
+        .session_by_id(session_id)
+        .map(|session| Target::Session(session.name().clone()))
 }
 
 fn resolve_global_window_target(
@@ -401,14 +393,10 @@ fn resolve_stable_window_target(
     if let Some(occurrence_id) = identity.occurrence_id {
         return state.window_link_occurrence_target(occurrence_id, session_id, identity.window_id);
     }
-    let original_session = state
-        .sessions
-        .iter()
-        .find(|(_, session)| session.id() == session_id);
-    if let Some((session_name, session)) = original_session {
+    if let Some(session) = state.sessions.session_by_id(session_id) {
         if let Some((window_index, _)) = resolve_stable_window_identity(session, identity) {
             return Some(WindowTarget::with_window(
-                session_name.clone(),
+                session.name().clone(),
                 window_index,
             ));
         }
@@ -425,19 +413,11 @@ fn resolve_stable_pane_target(
 ) -> Option<PaneTarget> {
     if window_identity.occurrence_id.is_some() {
         let window_target = resolve_stable_window_target(state, session_id, window_identity)?;
-        let pane_index = state
-            .sessions
-            .session(window_target.session_name())?
-            .window_at(window_target.window_index())?
-            .panes()
-            .iter()
-            .find(|pane| pane.id() == pane_id)?
-            .index();
-        return Some(PaneTarget::with_window(
-            window_target.session_name().clone(),
+        return state.pane_target_for_id_in_window(
+            window_target.session_name(),
             window_target.window_index(),
-            pane_index,
-        ));
+            pane_id,
+        );
     }
 
     let pane_in_session = |session_name: &rmux_proto::SessionName,
@@ -458,9 +438,8 @@ fn resolve_stable_pane_target(
 
     if let Some(target) = state
         .sessions
-        .iter()
-        .find(|(_, session)| session.id() == session_id)
-        .and_then(|(session_name, session)| pane_in_session(session_name, session))
+        .session_by_id(session_id)
+        .and_then(|session| pane_in_session(session.name(), session))
     {
         return Some(target);
     }
@@ -740,10 +719,9 @@ impl RequestHandler {
     ) {
         self.emit_for_session_identity(
             LifecycleEvent::ClientAttached {
-                session_name: session_name.clone(),
+                session_name,
                 client_name: Some(client_name),
             },
-            &session_name,
             session_id,
         )
         .await;
@@ -767,10 +745,9 @@ impl RequestHandler {
     ) {
         self.emit_for_session_identity(
             LifecycleEvent::ClientSessionChanged {
-                session_name: session_name.clone(),
+                session_name,
                 client_name: Some(client_name),
             },
-            &session_name,
             session_id,
         )
         .await;
@@ -780,16 +757,14 @@ impl RequestHandler {
     pub(in crate::handler) async fn emit_for_session_identity(
         &self,
         event: LifecycleEvent,
-        _session_name: &rmux_proto::SessionName,
         session_id: SessionId,
     ) {
         let prepared = {
             let mut state = self.state.lock().await;
-            let Some(session_name) = state.sessions.iter().find_map(|(session_name, session)| {
-                (session.id() == session_id).then(|| session_name.clone())
-            }) else {
+            let Some(session) = state.sessions.session_by_id(session_id) else {
                 return;
             };
+            let session_name = session.name().clone();
             let Some(event) = canonicalize_exact_session_event(event, session_name) else {
                 debug_assert!(
                     false,
@@ -1971,9 +1946,7 @@ mod tests {
         TerminalSize,
     };
 
-    fn session_name(value: &str) -> rmux_proto::SessionName {
-        rmux_proto::SessionName::new(value).expect("valid session name")
-    }
+    use crate::test_names::session_name;
 
     #[tokio::test]
     async fn prepared_lifecycle_events_publish_in_commit_order_not_waiter_order() {

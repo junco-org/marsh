@@ -130,8 +130,12 @@ async fn switch_client_frames_the_target_with_the_joined_sessions_status() {
             );
 
             let framed = frame_geometry(
-                recv_switch_target_into_session(&mut control_rx, "linked-alias switch frame", &beta)
-                    .await,
+                recv_switch_target_into_session(
+                    &mut control_rx,
+                    "linked-alias switch frame",
+                    &beta,
+                )
+                .await,
             );
             if framed != expected {
                 regressions.push(format!(
@@ -186,8 +190,12 @@ async fn attach_session_frames_the_target_with_the_joined_sessions_status() {
             );
 
             let framed = frame_geometry(
-                recv_switch_target_into_session(&mut control_rx, "linked-alias attach frame", &beta)
-                    .await,
+                recv_switch_target_into_session(
+                    &mut control_rx,
+                    "linked-alias attach frame",
+                    &beta,
+                )
+                .await,
             );
             if framed != expected {
                 regressions.push(format!(

@@ -130,26 +130,6 @@ async fn parsed_queue_list_windows_all_uses_tmux_default_format() {
     );
 }
 
-#[cfg(windows)]
-#[tokio::test]
-async fn queued_list_windows_all_waits_for_deferred_windows_pane_pids() {
-    let handler = RequestHandler::new();
-    let parsed = CommandParser::new()
-        .parse(
-            "new-session -d -s deferred-pid-list ; \
-             list-windows -a -f '#{pane_pid}' -F '#{pane_pid}'",
-        )
-        .expect("deferred pane-pid queue parses");
-
-    let output = handler
-        .execute_parsed_commands_for_test(std::process::id(), parsed)
-        .await
-        .expect("deferred pane-pid queue executes");
-    let pane_pid = String::from_utf8(output.stdout().to_vec()).expect("pane pid is utf-8");
-    let pane_pid = pane_pid.trim().parse::<u32>().expect("pane pid is numeric");
-    assert_ne!(pane_pid, 0);
-}
-
 #[tokio::test]
 async fn source_file_and_control_queue_share_list_windows_all_execution() {
     let handler = RequestHandler::new();

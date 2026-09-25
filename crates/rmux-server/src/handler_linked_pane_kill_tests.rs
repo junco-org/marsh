@@ -2,13 +2,12 @@ use super::RequestHandler;
 use rmux_core::PaneId;
 use rmux_proto::{
     ErrorResponse, KillPaneRequest, LinkWindowRequest, NewSessionRequest, NewWindowRequest,
-    PaneTarget, Request, Response, RmuxError, SessionName, SplitDirection, SplitWindowRequest,
-    SplitWindowTarget, TerminalSize, WindowTarget,
+    OptionName, PaneTarget, Request, Response, RmuxError, ScopeSelector, SessionName,
+    SetOptionMode, SplitDirection, SplitWindowRequest, SplitWindowTarget, Target, TerminalSize,
+    WindowTarget,
 };
 
-fn session_name(value: &str) -> SessionName {
-    SessionName::new(value).expect("valid session name")
-}
+use crate::test_names::session_name;
 
 async fn create_session(handler: &RequestHandler, value: &str) -> SessionName {
     let session = session_name(value);
@@ -253,4 +252,133 @@ async fn linked_last_pane_kill_destroys_only_alias_with_no_surviving_window() {
     let owner_session = state.sessions.session(&owner).expect("owner survives");
     assert!(owner_session.window_at(0).is_none());
     assert!(owner_session.window_at(1).is_some());
+}
+
+/// The renumber that follows a linked last-pane kill can collide with a stale
+/// window override, which drives the real metadata-restore path in
+/// `reindex_windows_from_base` and then the linked-kill snapshot restore. No
+/// injection seam is involved: the collision is produced by ordinary options.
+#[tokio::test]
+async fn linked_last_pane_kill_metadata_collision_restores_aliases_and_runtime() {
+    let handler = RequestHandler::new();
+    let owner = create_session(&handler, "linked-metadata-owner").await;
+    create_window(&handler, &owner, 2).await;
+    create_window(&handler, &owner, 3).await;
+    let alias = create_session(&handler, "linked-metadata-alias").await;
+    create_window(&handler, &alias, 2).await;
+    link_window(&handler, &owner, &alias).await;
+    handler.wait_for_initial_panes_for_test().await;
+
+    let mut state = handler.state.lock().await;
+    for (option, value) in [
+        (OptionName::BaseIndex, "0"),
+        (OptionName::RenumberWindows, "on"),
+    ] {
+        state
+            .options
+            .set(
+                ScopeSelector::Session(owner.clone()),
+                option,
+                value.to_owned(),
+                SetOptionMode::Replace,
+            )
+            .expect("session option applies");
+    }
+    // Window index 1 deliberately has no live window: renumbering maps owner:3
+    // onto owner:1 and collides with this stale override.
+    for (window_index, value) in [(0, "off"), (1, "off"), (3, "on")] {
+        state
+            .options
+            .set(
+                ScopeSelector::Window(WindowTarget::with_window(owner.clone(), window_index)),
+                OptionName::AutomaticRename,
+                value.to_owned(),
+                SetOptionMode::Replace,
+            )
+            .expect("window override applies");
+    }
+    state.mark_auto_named_window(&owner, 0);
+
+    let pane_id = pane_ids(&state, &owner)[0];
+    let pane_instance = state
+        .pane_shell_if_alive(&owner, 0, 0)
+        .expect("linked pane has a live job")
+        .1
+        .sandbox()
+        .uid
+        .clone();
+    let stable_owner = crate::handler::StableTargetIdentity::capture(
+        &mut state,
+        Target::Pane(PaneTarget::with_window(owner.clone(), 0, 0)),
+    )
+    .expect("capture owner:0.0 identity");
+    let stable_alias = crate::handler::StableTargetIdentity::capture(
+        &mut state,
+        Target::Pane(PaneTarget::with_window(alias.clone(), 0, 0)),
+    )
+    .expect("capture alias:0.0 identity");
+
+    let error = state
+        .kill_pane(PaneTarget::with_window(alias.clone(), 0, 0))
+        .expect_err("stale window override collides with the renumber");
+    let RmuxError::Server(reason) = &error else {
+        panic!("expected a server-side collision error: {error:?}");
+    };
+    assert!(
+        reason.starts_with("window options already exist for"),
+        "{reason}"
+    );
+
+    assert_eq!(
+        state
+            .sessions
+            .session(&owner)
+            .expect("owner survives")
+            .windows()
+            .keys()
+            .copied()
+            .collect::<Vec<_>>(),
+        vec![0, 2, 3]
+    );
+    assert_eq!(
+        state
+            .sessions
+            .session(&alias)
+            .expect("alias survives")
+            .windows()
+            .keys()
+            .copied()
+            .collect::<Vec<_>>(),
+        vec![0, 2]
+    );
+    assert!(stable_owner.is_current(&state));
+    assert!(stable_alias.is_current(&state));
+    assert_eq!(state.window_link_count(&owner, 0), 2);
+    assert_eq!(state.window_link_count(&alias, 0), 2);
+    for (window_index, value) in [(0, "off"), (1, "off"), (3, "on")] {
+        assert_eq!(
+            state.options.window_value(
+                &WindowTarget::with_window(owner.clone(), window_index),
+                OptionName::AutomaticRename
+            ),
+            Some(value),
+            "rollback must restore the owner:{window_index} automatic-rename override"
+        );
+    }
+    assert!(state.tracks_auto_named_window(&owner, 0));
+    for session in [&owner, &alias] {
+        assert!(pane_ids(&state, session).contains(&pane_id));
+    }
+    state
+        .pane_output_for_target(&alias, 0, 0)
+        .expect("rollback restores pane output for the alias");
+    let restored = state
+        .pane_shell_if_alive(&alias, 0, 0)
+        .expect("restored pane job remains inspectable through the alias")
+        .1;
+    assert_eq!(
+        restored.sandbox().uid,
+        pane_instance,
+        "rollback must preserve the shared pane job"
+    );
 }

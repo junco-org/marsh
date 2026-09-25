@@ -87,13 +87,15 @@ impl<R> JsonLog<R> {
     /// Every complete record of the log at `path`; an absent log reads as empty.
     ///
     /// A torn final line — the only corruption an append-and-fsync log can produce — is truncated
-    /// away so the next append starts from a clean record boundary. A torn line anywhere else is a
-    /// corrupt log and is reported as one.
+    /// away so the next append starts from a clean record boundary. A newline-terminated record
+    /// that fails to parse or to typecheck as `R` is a different kind of corruption: the log
+    /// cannot be trusted to resume from, so the whole file is discarded and replaced with a fresh,
+    /// empty log rather than reporting a parsed prefix as recovered history.
     ///
     /// # Errors
     ///
-    /// Fails with [`Error::Wal`] when a newline-terminated line does not parse, and with
-    /// [`Error::Io`] when the log cannot be read or repaired.
+    /// Fails with [`Error::Io`] when the log cannot be read, or when discarding and recreating it
+    /// after a decoding failure fails.
     pub fn read(path: &Path) -> Result<Vec<R>, Error>
     where
         R: DeserializeOwned,
@@ -118,14 +120,15 @@ impl<R> JsonLog<R> {
                 durable_len += line.len();
                 continue;
             }
-            let parsed = serde_json::from_slice::<R>(record).map_err(|error| {
-                Error::Wal(format!(
-                    "corrupt record {:?}: {error}",
-                    String::from_utf8_lossy(record)
-                ))
-            })?;
-            records.push(parsed);
-            durable_len += line.len();
+            if let Ok(parsed) = serde_json::from_slice::<R>(record) {
+                records.push(parsed);
+                durable_len += line.len();
+            } else {
+                std::fs::remove_file(path)?;
+                let fresh = Self::open(path)?;
+                fresh.file.sync_all()?;
+                return Ok(Vec::new());
+            }
         }
         Ok(records)
     }
@@ -134,13 +137,24 @@ impl<R> JsonLog<R> {
 /// Copies `source` onto `target`, atomically at `target`.
 ///
 /// The copy carries the permission bits over, which the diff treats as part of the entry, and a
-/// symlink is recreated rather than dereferenced.
+/// symlink is recreated rather than dereferenced. A directory source is the directory itself,
+/// never its contents: [`apply_directory`] makes `target` one, and whatever the directory holds
+/// is written by operations of its own.
 ///
 /// # Errors
 ///
 /// Fails with [`Error::Wal`] when `target` names no file in a directory or `source` is gone, and
 /// with [`Error::Io`] when any of the copy, rename or fsync fails.
 pub fn apply_write(source: &Path, target: &Path) -> Result<(), Error> {
+    let metadata = source
+        .symlink_metadata()
+        .map_err(|error| Error::Wal(format!("missing source {}: {error}", source.display())))?;
+    if metadata.is_dir() {
+        return apply_directory(
+            target,
+            std::os::unix::fs::PermissionsExt::mode(&metadata.permissions()),
+        );
+    }
     let parent = target
         .parent()
         .ok_or_else(|| Error::Wal(format!("write target {} has no parent", target.display())))?;
@@ -153,9 +167,6 @@ pub fn apply_write(source: &Path, target: &Path) -> Result<(), Error> {
     temporary_name.push(TEMPORARY_SUFFIX);
     let temporary = parent.join(temporary_name);
 
-    let metadata = source
-        .symlink_metadata()
-        .map_err(|error| Error::Wal(format!("missing source {}: {error}", source.display())))?;
     let _ = std::fs::remove_file(&temporary);
     if metadata.file_type().is_symlink() {
         std::os::unix::fs::symlink(std::fs::read_link(source)?, &temporary)?;
@@ -168,6 +179,44 @@ pub fn apply_write(source: &Path, target: &Path) -> Result<(), Error> {
         std::fs::remove_dir_all(target)?;
     }
     std::fs::rename(&temporary, target)?;
+    File::open(parent)?.sync_all()?;
+    Ok(())
+}
+
+/// Makes `target` a directory with permission bits `mode & 0o7777`, durably.
+///
+/// A directory's whole durable intent is its path and its mode, so this needs no source: a replay
+/// whose snapshot is gone applies it exactly as the first attempt did. Whatever is at `target`
+/// and is not a directory — a file, a symlink, which is removed and never followed — is replaced.
+/// A directory already there keeps its contents: this writes the directory, not a tree.
+///
+/// # Errors
+///
+/// Fails with [`Error::Wal`] when `target` has no parent, and with [`Error::Io`] when the
+/// replacement, the creation, the mode change or an fsync fails.
+pub fn apply_directory(target: &Path, mode: u32) -> Result<(), Error> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let parent = target.parent().ok_or_else(|| {
+        Error::Wal(format!(
+            "directory target {} has no parent",
+            target.display()
+        ))
+    })?;
+    std::fs::create_dir_all(parent)?;
+    match target.symlink_metadata() {
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => {
+            std::fs::remove_file(target)?;
+            std::fs::create_dir(target)?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir(target)?;
+        }
+        Err(error) => return Err(Error::Io(error)),
+    }
+    std::fs::set_permissions(target, std::fs::Permissions::from_mode(mode & 0o7777))?;
+    File::open(target)?.sync_all()?;
     File::open(parent)?.sync_all()?;
     Ok(())
 }
@@ -329,20 +378,35 @@ mod tests {
         );
     }
 
-    /// Newline termination makes malformed JSON durable corruption, not a repairable suffix.
+    /// A newline-terminated record that fails to parse or typecheck resets the whole log: the
+    /// valid prefix and any valid suffix after it are both discarded, and a fresh empty file
+    /// takes the corrupt one's place so the next append starts clean.
     #[test]
-    fn malformed_newline_terminated_record_is_an_error() {
+    fn a_parse_error_resets_the_entire_log() {
         let scratch = tempfile::tempdir().expect("scratch directory");
         let root = scratch.path();
         let path = root.join("log.jsonl");
-        std::fs::write(&path, b"{not-json}\n").expect("write corrupt log");
-        let before = std::fs::read(&path).expect("read corrupt log");
+        std::fs::write(&path, b"{\"seq\":7}\n{not-json}\n{\"seq\":8}\n")
+            .expect("write corrupt log");
 
-        assert!(matches!(JsonLog::<Line>::read(&path), Err(Error::Wal(_))));
         assert_eq!(
-            std::fs::read(&path).expect("reread corrupt log"),
-            before,
-            "durable corruption must not be discarded"
+            JsonLog::<Line>::read(&path).expect("a parse error resets rather than errors"),
+            Vec::new(),
+            "no record is recovered from a log with a decoding failure in it"
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("reread reset log"),
+            Vec::<u8>::new(),
+            "the corrupt log is replaced with an empty file"
+        );
+
+        let mut log = JsonLog::open(&path).expect("open the reset log");
+        log.append(&[Line { seq: 1 }]).expect("append after reset");
+        drop(log);
+        assert_eq!(
+            JsonLog::<Line>::read(&path).expect("read after reset"),
+            vec![Line { seq: 1 }],
+            "the reset log accepts new appends"
         );
     }
 

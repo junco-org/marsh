@@ -290,34 +290,6 @@ async fn live_attach_chunked_sgr_mouse_sequence_still_dispatches() {
             .expect("mouse any and sgr transcript update");
     }
 
-    #[cfg(windows)]
-    let expected = encode_mouse_event(
-        mode::MODE_MOUSE_ALL | mode::MODE_MOUSE_SGR,
-        &MouseForwardEvent {
-            b: 64,
-            lb: 0,
-            x: 1,
-            y: 1,
-            lx: 0,
-            ly: 0,
-            sgr_b: 64,
-            sgr_type: 'M',
-            ignore: false,
-        },
-        1,
-        1,
-    )
-    .expect("sgr wheel encodes");
-
-    #[cfg(windows)]
-    let capture = RawPaneInputProbe::start(
-        &handler,
-        &alpha,
-        "live-attach-chunked-sgr-wheel",
-        expected.len(),
-    )
-    .await;
-
     let mut pending_input = Vec::new();
     handler
         .handle_attached_live_input(requester_pid, &mut pending_input, b"\x1b[<64;2")
@@ -340,12 +312,6 @@ async fn live_attach_chunked_sgr_mouse_sequence_still_dispatches() {
     assert_eq!(event.location, MouseLocation::Pane);
     assert_eq!(event.raw.b, 64);
     drop(active_attach);
-
-    #[cfg(windows)]
-    {
-        capture.finish(&handler, &alpha).await;
-        capture.assert_contents(&handler, &expected).await;
-    }
 }
 
 #[tokio::test]
@@ -375,14 +341,10 @@ async fn completed_pending_mouse_does_not_charge_large_plain_tail_to_retained_bo
         .expect("partial mouse opener is retained");
 
     tokio::time::timeout(
-        if cfg!(windows) {
-            Duration::from_secs(60)
-        } else {
-            // This is the maximum transport frame, not an interactive-latency
-            // assertion. Keep a bounded budget that survives full-suite CPU
-            // contention while still catching pathological decode work.
-            Duration::from_secs(8)
-        },
+        // This is the maximum transport frame, not an interactive-latency
+        // assertion. Keep a bounded budget that survives full-suite CPU
+        // contention while still catching pathological decode work.
+        Duration::from_secs(8),
         handler.handle_attached_live_input(
             requester_pid,
             &mut pending_input,

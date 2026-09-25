@@ -115,17 +115,17 @@ mod test_support;
 #[path = "handler_waits.rs"]
 mod wait_support;
 pub(crate) use wait_support::PreparedSdkWait;
-#[cfg(all(any(unix, windows), feature = "web"))]
+#[cfg(all(unix, feature = "web"))]
 #[path = "handler_web.rs"]
 mod web_support;
-#[cfg(not(all(any(unix, windows), feature = "web")))]
+#[cfg(not(all(unix, feature = "web")))]
 #[path = "handler_web_disabled.rs"]
 mod web_support;
-#[cfg(all(test, any(unix, windows), feature = "web"))]
+#[cfg(all(test, unix, feature = "web"))]
 pub(crate) use web_support::TestWebSessionView;
-#[cfg(all(test, any(unix, windows), feature = "web"))]
+#[cfg(all(test, unix, feature = "web"))]
 pub(crate) use web_support::WebSessionPaneView;
-#[cfg(all(any(unix, windows), feature = "web"))]
+#[cfg(all(unix, feature = "web"))]
 pub(crate) use web_support::{
     UndeliveredWebShareGuard, WebPaneSnapshot, WebPaneStream, WebSessionAttachEvent,
     WebSessionPaneFrame, WebSessionSnapshot, WebSessionStream, WebShareStream,
@@ -137,10 +137,9 @@ use crate::pane_terminals::HandlerState;
 #[cfg(test)]
 use crate::server_access::AccessMode;
 use crate::server_access::{current_owner_uid, ServerAccessAdmission, ServerAccessStore};
-#[cfg(unix)]
 use crate::unix_socket_access::UnixSocketAccessController;
 use crate::wait_for::WaitForStore;
-#[cfg(all(any(unix, windows), feature = "web"))]
+#[cfg(all(unix, feature = "web"))]
 use crate::web::WebShareRegistry;
 use attach_support::{ActiveAttachState, ClientFlags};
 pub(in crate::handler) use client_environment_support::{
@@ -222,17 +221,16 @@ pub(in crate::handler) use target_support::{
 use wait_support::SdkWaitState;
 // Only the web share handler dispatches against a bare window identity; the disabled build has no
 // caller for it, so re-exporting it unconditionally would be an unused name there.
-#[cfg(all(any(unix, windows), feature = "web"))]
+#[cfg(all(unix, feature = "web"))]
 pub(in crate::handler) use web_request_identity::dispatch_with_expected_window_identity;
 pub(in crate::handler) use web_request_identity::{
     current_expected_attach_identity, dispatch_with_expected_session_identity,
-    dispatch_with_expected_window_occurrence_identity,
-    expected_attach_follows_registration, rebase_expected_attach_session_after_switch,
-    require_expected_pane_identity, require_expected_session_identity,
-    require_expected_window_identity, resolve_expected_window_pane_target,
-    validate_expected_attach_identity, with_expected_attach_and_session_identity,
-    with_expected_attach_registration, with_expected_session_identity,
-    ExpectedWindowOccurrenceIdentity,
+    dispatch_with_expected_window_occurrence_identity, expected_attach_follows_registration,
+    rebase_expected_attach_session_after_switch, require_expected_pane_identity,
+    require_expected_session_identity, require_expected_window_identity,
+    resolve_expected_window_pane_target, validate_expected_attach_identity,
+    with_expected_attach_and_session_identity, with_expected_attach_registration,
+    with_expected_session_identity, ExpectedWindowOccurrenceIdentity,
 };
 
 /// Default detached session size used when `new-session` omits `-x` and `-y`.
@@ -394,7 +392,6 @@ pub(crate) struct RequestHandler {
     server_socket_path: Arc<StdMutex<PathBuf>>,
     server_access: Arc<StdMutex<ServerAccessStore>>,
     server_access_mutation: Arc<Mutex<()>>,
-    #[cfg(unix)]
     unix_socket_access: Arc<StdMutex<Option<UnixSocketAccessController>>>,
     shutdown_requested: Arc<AtomicBool>,
     shutdown_reason: Arc<StdMutex<Option<PendingShutdownReason>>>,
@@ -422,9 +419,9 @@ pub(crate) struct RequestHandler {
         Arc<StdMutex<HashMap<rmux_core::PaneId, (u64, rmux_proto::ForegroundStateDto)>>>,
     pane_mode_transaction: Arc<Mutex<()>>,
     pane_mode_post_commit: Arc<post_commit_sequencer::PostCommitSequencer>,
-    #[cfg(all(any(unix, windows), feature = "web"))]
+    #[cfg(all(unix, feature = "web"))]
     web_shares: Arc<WebShareRegistry>,
-    #[cfg(all(any(unix, windows), feature = "web"))]
+    #[cfg(all(unix, feature = "web"))]
     web_listener_start: Arc<Mutex<()>>,
     /// The daemon's in-process shell facade, installed once by [`crate::listener::serve`].
     ///
@@ -509,7 +506,6 @@ impl Clone for RequestHandler {
             server_socket_path: self.server_socket_path.clone(),
             server_access: self.server_access.clone(),
             server_access_mutation: self.server_access_mutation.clone(),
-            #[cfg(unix)]
             unix_socket_access: self.unix_socket_access.clone(),
             shutdown_requested: self.shutdown_requested.clone(),
             shutdown_reason: self.shutdown_reason.clone(),
@@ -536,9 +532,9 @@ impl Clone for RequestHandler {
             foreground_state_cache: self.foreground_state_cache.clone(),
             pane_mode_transaction: self.pane_mode_transaction.clone(),
             pane_mode_post_commit: self.pane_mode_post_commit.clone(),
-            #[cfg(all(any(unix, windows), feature = "web"))]
+            #[cfg(all(unix, feature = "web"))]
             web_shares: self.web_shares.clone(),
-            #[cfg(all(any(unix, windows), feature = "web"))]
+            #[cfg(all(unix, feature = "web"))]
             web_listener_start: self.web_listener_start.clone(),
             shell_io: self.shell_io.clone(),
             task_runtime: self.task_runtime.clone(),
@@ -603,7 +599,6 @@ pub(crate) struct WeakRequestHandler {
     server_socket_path: Weak<StdMutex<PathBuf>>,
     server_access: Weak<StdMutex<ServerAccessStore>>,
     server_access_mutation: Weak<Mutex<()>>,
-    #[cfg(unix)]
     unix_socket_access: Weak<StdMutex<Option<UnixSocketAccessController>>>,
     shutdown_requested: Weak<AtomicBool>,
     shutdown_reason: Weak<StdMutex<Option<PendingShutdownReason>>>,
@@ -631,9 +626,9 @@ pub(crate) struct WeakRequestHandler {
         Weak<StdMutex<HashMap<rmux_core::PaneId, (u64, rmux_proto::ForegroundStateDto)>>>,
     pane_mode_transaction: Weak<Mutex<()>>,
     pane_mode_post_commit: Weak<post_commit_sequencer::PostCommitSequencer>,
-    #[cfg(all(any(unix, windows), feature = "web"))]
+    #[cfg(all(unix, feature = "web"))]
     web_shares: Weak<WebShareRegistry>,
-    #[cfg(all(any(unix, windows), feature = "web"))]
+    #[cfg(all(unix, feature = "web"))]
     web_listener_start: Weak<Mutex<()>>,
     shell_io: Weak<StdMutex<Option<crate::io::ShellIo>>>,
     task_runtime: Option<tokio::runtime::Handle>,
@@ -675,7 +670,6 @@ impl WeakRequestHandler {
             server_socket_path: self.server_socket_path.upgrade()?,
             server_access: self.server_access.upgrade()?,
             server_access_mutation: self.server_access_mutation.upgrade()?,
-            #[cfg(unix)]
             unix_socket_access: self.unix_socket_access.upgrade()?,
             shutdown_requested: self.shutdown_requested.upgrade()?,
             shutdown_reason: self.shutdown_reason.upgrade()?,
@@ -702,9 +696,9 @@ impl WeakRequestHandler {
             foreground_state_cache: self.foreground_state_cache.upgrade()?,
             pane_mode_transaction: self.pane_mode_transaction.upgrade()?,
             pane_mode_post_commit: self.pane_mode_post_commit.upgrade()?,
-            #[cfg(all(any(unix, windows), feature = "web"))]
+            #[cfg(all(unix, feature = "web"))]
             web_shares: self.web_shares.upgrade()?,
-            #[cfg(all(any(unix, windows), feature = "web"))]
+            #[cfg(all(unix, feature = "web"))]
             web_listener_start: self.web_listener_start.upgrade()?,
             shell_io: self.shell_io.upgrade()?,
             task_runtime: self.task_runtime.clone(),
@@ -913,7 +907,7 @@ impl RequestHandler {
         )
     }
 
-    #[cfg_attr(all(any(unix, windows), feature = "web"), allow(dead_code))]
+    #[cfg_attr(all(unix, feature = "web"), allow(dead_code))]
     pub(crate) fn with_owner_uid_and_subscription_limits(
         owner_uid: u32,
         subscription_limits: SubscriptionLimits,
@@ -926,7 +920,7 @@ impl RequestHandler {
         )
     }
 
-    #[cfg(all(any(unix, windows), feature = "web"))]
+    #[cfg(all(unix, feature = "web"))]
     pub(crate) fn with_owner_uid_subscription_limits_and_web_settings(
         owner_uid: u32,
         subscription_limits: SubscriptionLimits,
@@ -999,7 +993,6 @@ impl RequestHandler {
             server_socket_path: Arc::new(StdMutex::new(PathBuf::from("/tmp/rmux-test.sock"))),
             server_access: Arc::new(StdMutex::new(ServerAccessStore::new(owner_uid))),
             server_access_mutation: Arc::new(Mutex::new(())),
-            #[cfg(unix)]
             unix_socket_access: Arc::new(StdMutex::new(None)),
             shutdown_requested: Arc::new(AtomicBool::new(false)),
             shutdown_reason: Arc::new(StdMutex::new(None)),
@@ -1039,9 +1032,9 @@ impl RequestHandler {
             pane_mode_post_commit: Arc::new(post_commit_sequencer::PostCommitSequencer::new(
                 PANE_MODE_POST_COMMIT_LIMIT,
             )),
-            #[cfg(all(any(unix, windows), feature = "web"))]
+            #[cfg(all(unix, feature = "web"))]
             web_shares: Arc::new(WebShareRegistry::default()),
-            #[cfg(all(any(unix, windows), feature = "web"))]
+            #[cfg(all(unix, feature = "web"))]
             web_listener_start: Arc::new(Mutex::new(())),
             shell_io,
             task_runtime,
@@ -1118,7 +1111,6 @@ impl RequestHandler {
             server_socket_path: Arc::downgrade(&self.server_socket_path),
             server_access: Arc::downgrade(&self.server_access),
             server_access_mutation: Arc::downgrade(&self.server_access_mutation),
-            #[cfg(unix)]
             unix_socket_access: Arc::downgrade(&self.unix_socket_access),
             shutdown_requested: Arc::downgrade(&self.shutdown_requested),
             shutdown_reason: Arc::downgrade(&self.shutdown_reason),
@@ -1147,9 +1139,9 @@ impl RequestHandler {
             foreground_state_cache: Arc::downgrade(&self.foreground_state_cache),
             pane_mode_transaction: Arc::downgrade(&self.pane_mode_transaction),
             pane_mode_post_commit: Arc::downgrade(&self.pane_mode_post_commit),
-            #[cfg(all(any(unix, windows), feature = "web"))]
+            #[cfg(all(unix, feature = "web"))]
             web_shares: Arc::downgrade(&self.web_shares),
-            #[cfg(all(any(unix, windows), feature = "web"))]
+            #[cfg(all(unix, feature = "web"))]
             web_listener_start: Arc::downgrade(&self.web_listener_start),
             shell_io: Arc::downgrade(&self.shell_io),
             task_runtime: self.task_runtime.clone(),
@@ -1212,10 +1204,7 @@ impl RequestHandler {
     }
 
     pub(crate) async fn continue_stopped_panes(&self) {
-        #[cfg(unix)]
-        {
-            self.state.lock().await.continue_stopped_panes();
-        }
+        self.state.lock().await.continue_stopped_panes();
     }
 
     pub(crate) fn install_shutdown_handle(&self, shutdown_handle: ShutdownHandle) {
@@ -1605,10 +1594,7 @@ impl RequestHandler {
     async fn pause_after_pane_exit_commit(&self) {}
 
     #[cfg(test)]
-    async fn wait_for_initial_panes_for_test(&self) {
-        #[cfg(windows)]
-        self.wait_for_windows_deferred_all_panes_ready().await;
-    }
+    async fn wait_for_initial_panes_for_test(&self) {}
 }
 
 #[cfg(test)]

@@ -9,9 +9,7 @@ use rmux_proto::{
 use super::{LeaseResolution, LifecycleTargetLease};
 use crate::handler::RequestHandler;
 
-fn session_name(value: &str) -> SessionName {
-    SessionName::new(value).expect("valid session name")
-}
+use crate::test_names::session_name;
 
 fn terminal_size() -> TerminalSize {
     TerminalSize { cols: 80, rows: 24 }
@@ -52,6 +50,25 @@ async fn set_global_activity_hook(handler: &RequestHandler, index: u32, command:
         }))
         .await;
     assert!(matches!(response, Response::SetHook(_)), "{response:?}");
+}
+
+async fn retained_alert_binding(
+    handler: &RequestHandler,
+    session_name: &SessionName,
+) -> (Option<Target>, std::sync::Arc<LifecycleTargetLease>) {
+    let mut state = handler.state.lock().await;
+    let event = super::super::prepare_lifecycle_event(
+        &mut state,
+        &rmux_core::LifecycleEvent::AlertActivity {
+            target: WindowTarget::with_window(session_name.clone(), 0),
+        },
+    );
+    (
+        event.current_target,
+        event
+            .retained_current_target
+            .expect("activity event captures a retained window"),
+    )
 }
 
 #[tokio::test]

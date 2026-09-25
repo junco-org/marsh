@@ -101,15 +101,27 @@ async fn retained_targets_follow_surviving_aliases_deterministically() {
 
     let source_window = WindowTarget::with_window(alpha.clone(), 0);
     let source_pane = PaneTarget::with_window(alpha.clone(), 0, 0);
-    let (window_lease, pane_lease) = {
-        let state = handler.state.lock().await;
+    let (window_lease, pane_lease, stable_window, stable_pane) = {
+        let mut state = handler.state.lock().await;
+        let stable_window = crate::handler::StableTargetIdentity::capture(
+            &mut state,
+            Target::Window(source_window.clone()),
+        )
+        .expect("capture stable window identity");
+        let stable_pane = crate::handler::StableTargetIdentity::capture(
+            &mut state,
+            Target::Pane(source_pane.clone()),
+        )
+        .expect("capture stable pane identity");
+        assert!(stable_window.is_current(&state));
+        assert!(stable_pane.is_current(&state));
         let window_lease = state
             .capture_retained_window_lifecycle_target(&source_window)
             .expect("capture retained window alias");
         let pane_lease = state
             .capture_retained_pane_lifecycle_target(&source_pane)
             .expect("capture retained pane alias");
-        (window_lease, pane_lease)
+        (window_lease, pane_lease, stable_window, stable_pane)
     };
 
     let response = handler
@@ -124,6 +136,12 @@ async fn retained_targets_follow_surviving_aliases_deterministically() {
     );
 
     let state = handler.state.lock().await;
+    assert!(
+        !stable_window.is_current(&state),
+        "the unlinked alpha:0 slot must not be reacquired by a surviving alias"
+    );
+    assert!(!stable_pane.is_current(&state));
+    assert_eq!(stable_pane.resolve_current_pane_target(&state), None);
     assert_eq!(
         window_lease.resolve(&state),
         LeaseResolution::Live(Target::Window(WindowTarget::with_window(gamma.clone(), 2,)))

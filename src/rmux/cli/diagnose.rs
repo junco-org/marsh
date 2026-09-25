@@ -9,11 +9,6 @@ use rmux_proto::Response;
 
 use super::ExitFailure;
 
-/// Windows-only shell detection backing the `shell` field of the report.
-#[cfg(windows)]
-#[path = "diagnose_windows.rs"]
-mod diagnose_windows;
-
 /// Selects whether `rmux diagnose` prints its human summary or a JSON object.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DiagnoseFormat {
@@ -48,7 +43,6 @@ struct DiagnoseReport {
     config_paths: Vec<String>,
     config_messages: Vec<String>,
     socket_path: String,
-    conpty: String,
     terminal_features: Vec<String>,
     osc52: String,
 }
@@ -176,12 +170,7 @@ fn split_top_level_prefix(arguments: &[OsString]) -> Option<(usize, TopLevelPref
 }
 
 /// Reports whether `value` is a bundled short-flag group such as `-2u` drawn only from `allowed`.
-fn is_short_flag_cluster(value: &str, allowed: &str) -> bool {
-    value.len() > 2
-        && value.starts_with('-')
-        && !value.starts_with("--")
-        && value.chars().skip(1).all(|flag| allowed.contains(flag))
-}
+use super::is_short_flag_cluster;
 
 /// Parses the `--human` / `--json` / `--help` arguments that follow the `diagnose` command word.
 fn parse_diagnose_format(arguments: &[OsString]) -> Result<DiagnoseFormat, ExitFailure> {
@@ -279,7 +268,6 @@ impl DiagnoseReport {
             config_paths,
             config_messages,
             socket_path: redact_path(&socket_path),
-            conpty: conpty_status().to_owned(),
             terminal_features,
             osc52: osc52.to_owned(),
         })
@@ -311,7 +299,6 @@ impl DiagnoseReport {
             }
         }
         output.push_str("capabilities:\n");
-        let _ = writeln!(output, "  conpty: {}", self.conpty);
         let _ = writeln!(output, "  osc52: {}", self.osc52);
         let _ = writeln!(
             output,
@@ -333,7 +320,7 @@ impl DiagnoseReport {
                 "  \"shell\": {},\n",
                 "  \"socket_path\": {},\n",
                 "  \"config\": {{\"mode\": {}, \"paths\": {}, \"messages\": {}}},\n",
-                "  \"capabilities\": {{\"conpty\": {}, \"osc52\": {}, \"terminal_features\": {}}},\n",
+                "  \"capabilities\": {{\"osc52\": {}, \"terminal_features\": {}}},\n",
                 "  \"privacy\": {{\"environment_values\": \"summarized-or-redacted\"}}\n",
                 "}}\n"
             ),
@@ -349,7 +336,6 @@ impl DiagnoseReport {
             json_string(&self.config_mode),
             json_array(&self.config_paths),
             json_array(&self.config_messages),
-            json_string(&self.conpty),
             json_string(&self.osc52),
             json_array(&self.terminal_features),
         )
@@ -379,10 +365,7 @@ fn config_message_from_show_messages_line(line: &str) -> Option<String> {
 }
 
 /// `config_message_from_show_messages_line` over explicit home prefixes, for testability.
-fn config_message_from_show_messages_line_against(
-    line: &str,
-    homes: &[PathBuf],
-) -> Option<String> {
+fn config_message_from_show_messages_line_against(line: &str, homes: &[PathBuf]) -> Option<String> {
     let message = line.split_once(": ").map_or(line, |(_, message)| message);
     if !is_config_diagnostic_message(message) {
         return None;
@@ -487,7 +470,7 @@ fn env_value(name: &str) -> String {
         .unwrap_or_else(|| "unset".to_owned())
 }
 
-/// Names the enclosing terminal emulator: Windows Terminal, then `TERM_PROGRAM`, then `TERM`.
+/// Names the enclosing terminal emulator: `WT_SESSION`, then `TERM_PROGRAM`, then `TERM`.
 fn detect_terminal_host(term: &str, term_program: &str) -> String {
     if std::env::var_os("WT_SESSION").is_some() {
         return "windows-terminal".to_owned();
@@ -501,28 +484,14 @@ fn detect_terminal_host(term: &str, term_program: &str) -> String {
     "unknown".to_owned()
 }
 
-/// The user's shell: a discovered Windows pane shell, or `SHELL` elsewhere.
+/// The user's shell, from `SHELL`.
 fn detected_shell() -> String {
-    #[cfg(windows)]
-    {
-        diagnose_windows::detected_pane_shell()
-    }
-    #[cfg(not(windows))]
-    {
-        env_value("SHELL")
-    }
+    env_value("SHELL")
 }
 
-/// The operating system version string, from `cmd /C ver` on Windows or `uname -sr` elsewhere.
+/// The operating system version string, from `uname -sr`.
 fn os_version() -> String {
-    #[cfg(windows)]
-    {
-        command_output("cmd", &["/C", "ver"])
-    }
-    #[cfg(not(windows))]
-    {
-        command_output("uname", &["-sr"])
-    }
+    command_output("uname", &["-sr"])
 }
 
 /// Runs a helper program and returns its trimmed stdout, or `unknown` on any failure.
@@ -539,18 +508,6 @@ fn command_output(program: &str, args: &[&str]) -> String {
         })
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| "unknown".to_owned())
-}
-
-/// Whether the platform offers a `ConPTY` backend.
-const fn conpty_status() -> &'static str {
-    #[cfg(windows)]
-    {
-        "available"
-    }
-    #[cfg(not(windows))]
-    {
-        "not-applicable"
-    }
 }
 
 /// Guesses whether the terminal would honour an `OSC 52` clipboard write.
@@ -573,18 +530,10 @@ fn terminal_looks_clipboard_capable(
 
 /// The config files `rmux` would load when no `-f` was given, in platform lookup order.
 fn default_config_paths() -> Vec<PathBuf> {
-    #[cfg(windows)]
-    {
-        windows_default_config_paths()
-    }
-    #[cfg(not(windows))]
-    {
-        unix_default_config_paths()
-    }
+    unix_default_config_paths()
 }
 
 /// The Unix config lookup order: `/etc/rmux.conf`, `~/.rmux.conf`, then the `XDG` locations.
-#[cfg(not(windows))]
 fn unix_default_config_paths() -> Vec<PathBuf> {
     let mut paths = Vec::new();
     push_unique_path(&mut paths, PathBuf::from("/etc/rmux.conf"));
@@ -606,34 +555,6 @@ fn unix_default_config_paths() -> Vec<PathBuf> {
             &mut paths,
             home.join(".config").join("rmux").join("rmux.conf"),
         );
-    }
-    paths
-}
-
-/// Windows config lookup order: `XDG_CONFIG_HOME`, `USERPROFILE`, `APPDATA`, `RMUX_CONFIG_FILE`.
-#[cfg(windows)]
-fn windows_default_config_paths() -> Vec<PathBuf> {
-    let mut paths = Vec::new();
-    if let Some(xdg_config_home) = nonempty_env_os("XDG_CONFIG_HOME") {
-        push_unique_path(
-            &mut paths,
-            PathBuf::from(xdg_config_home)
-                .join("rmux")
-                .join("rmux.conf"),
-        );
-    }
-    if let Some(userprofile) = nonempty_env_os("USERPROFILE") {
-        let userprofile = PathBuf::from(userprofile);
-        push_unique_path(&mut paths, userprofile.join(".rmux.conf"));
-    }
-    if let Some(appdata) = nonempty_env_os("APPDATA") {
-        push_unique_path(
-            &mut paths,
-            PathBuf::from(appdata).join("rmux").join("rmux.conf"),
-        );
-    }
-    if let Some(config_file) = nonempty_env_os("RMUX_CONFIG_FILE") {
-        push_unique_path(&mut paths, PathBuf::from(config_file));
     }
     paths
 }

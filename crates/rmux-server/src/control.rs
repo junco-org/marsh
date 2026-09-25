@@ -1,63 +1,42 @@
-#[cfg_attr(windows, allow(unused_imports))]
 pub(crate) use crate::control_mode::ControlModeUpgrade;
-#[cfg(any(unix, windows))]
 use crate::daemon::ShutdownHandle;
-#[cfg(any(unix, windows))]
 use crate::handler::{
     with_control_command_response_sink, with_control_queue_eof_cancellation,
     with_control_queue_identity, ControlClientIdentity, ControlCommandResponseSink,
     ControlQueueDrainLease, ControlQueueEofCancellation, RequestHandler,
 };
-#[cfg(any(unix, windows))]
 use rmux_core::command_parser::{CommandArgument, ParsedCommands};
-#[cfg(any(unix, windows))]
 use rmux_ipc::LocalStream;
-#[cfg(windows)]
-use rmux_proto::CONTROL_STDIN_EOF_MARKER;
-#[cfg(any(unix, windows))]
 use rmux_proto::{format_exit_line, format_guard_line, ControlGuardKind};
 use rmux_proto::{ControlMode, RmuxError, SessionName, MAX_INITIAL_CONTROL_COMMANDS};
-#[cfg(any(unix, windows))]
 use std::collections::{HashMap, HashSet, VecDeque};
-#[cfg(any(unix, windows))]
 use std::io;
-#[cfg(any(unix, windows))]
 use std::pin::Pin;
-#[cfg(any(unix, windows))]
 use std::sync::atomic::{AtomicBool, Ordering};
-#[cfg(any(unix, windows))]
 use std::sync::Arc;
 #[cfg(all(test, unix))]
 use std::sync::{Mutex as StdMutex, OnceLock};
-#[cfg(any(unix, windows))]
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-#[cfg(any(unix, windows))]
 use tokio::io::{AsyncReadExt, AsyncWriteExt, WriteHalf};
 #[cfg(all(test, unix))]
 use tokio::sync::Notify;
-#[cfg(any(unix, windows))]
 use tokio::sync::{mpsc, watch};
-#[cfg(any(unix, windows))]
 use tokio::task::JoinHandle;
 
 #[path = "control/output_queue.rs"]
 mod output_queue;
-#[cfg(any(unix, windows))]
 use output_queue::{ensure_control_newline, flush_output_queue, ControlOutputQueue};
 
 #[path = "control/command_numbering.rs"]
 mod command_numbering;
-#[cfg(any(unix, windows))]
 use command_numbering::{ControlCommandNumbering, ControlCommandOrigin};
 
 #[path = "control/command_validation.rs"]
 mod command_validation;
-#[cfg(any(unix, windows))]
 use command_validation::validate_control_command_arguments;
 
 #[path = "control/subscriptions.rs"]
 mod subscriptions;
-#[cfg(any(unix, windows))]
 use subscriptions::{
     drain_ready_pane_events, handle_pane_event, refresh_subscriptions, PaneEvent, PaneSubscription,
     PaneSubscriptionStart,
@@ -65,21 +44,15 @@ use subscriptions::{
 
 #[path = "control/session_attachment.rs"]
 mod session_attachment;
-#[cfg(any(unix, windows))]
 use session_attachment::ControlSessionAttachment;
 
 #[path = "control/eof_completion.rs"]
 mod eof_completion;
-#[cfg(any(unix, windows))]
 use eof_completion::ControlEofCompletion;
 
-#[cfg(any(unix, windows))]
 const MAX_DEFERRED_CONTROL_NOTIFICATIONS: usize = 1024;
-#[cfg(any(unix, windows))]
 const MAX_DEFERRED_CONTROL_NOTIFICATION_BYTES: usize = 4 * 1024 * 1024;
-#[cfg(any(unix, windows))]
 const CONTROL_PANE_EVENT_CAPACITY: usize = 256;
-#[cfg(any(unix, windows))]
 pub(crate) const CONTROL_SERVER_EVENT_CAPACITY: usize = 256;
 pub(crate) fn validate_initial_control_command_count(count: usize) -> Result<(), RmuxError> {
     if count <= MAX_INITIAL_CONTROL_COMMANDS {
@@ -90,7 +63,6 @@ pub(crate) fn validate_initial_control_command_count(count: usize) -> Result<(),
     )))
 }
 
-#[cfg(any(unix, windows))]
 fn control_commands_require_drain(commands: &ParsedCommands) -> bool {
     !commands.assignments().is_empty()
         || !commands
@@ -99,7 +71,6 @@ fn control_commands_require_drain(commands: &ParsedCommands) -> bool {
             .all(control_command_is_cancel_safe_wait)
 }
 
-#[cfg(any(unix, windows))]
 fn control_command_is_cancel_safe_wait(command: &rmux_core::command_parser::ParsedCommand) -> bool {
     if command.name() != "wait-for" {
         return false;
@@ -112,29 +83,22 @@ fn control_command_is_cancel_safe_wait(command: &rmux_core::command_parser::Pars
         _ => false,
     }
 }
-#[cfg(any(unix, windows))]
 const MAX_CONTROL_LINE_BYTES: usize = 1024 * 1024;
-#[cfg(any(unix, windows))]
 const MAX_QUEUED_CONTROL_LINES: usize = 1024;
-#[cfg(any(unix, windows))]
 const MAX_QUEUED_CONTROL_BYTES: usize = 4 * 1024 * 1024;
 
-#[cfg(any(unix, windows))]
 // Keep one bounded, global post-EOF window for already accepted frames to
 // publish fast replies before falling back to the detached finite drain.
 const CONTROL_EOF_GRACE: Duration = Duration::from_millis(250);
 
-#[cfg(any(unix, windows))]
 type ControlEofTransition = Pin<Box<tokio::time::Sleep>>;
 
-#[cfg(any(unix, windows))]
 fn arm_control_eof_transition(transition: &mut Option<ControlEofTransition>) {
     if transition.is_none() {
         *transition = Some(Box::pin(tokio::time::sleep(CONTROL_EOF_GRACE)));
     }
 }
 
-#[cfg(any(unix, windows))]
 async fn wait_for_control_eof_transition(transition: &mut Option<ControlEofTransition>) {
     match transition.as_mut() {
         Some(transition) => transition.as_mut().await,
@@ -199,21 +163,18 @@ pub(crate) struct ControlCommandResult {
 }
 
 #[derive(Debug)]
-#[cfg(any(unix, windows))]
 pub(crate) struct ControlLifecycle {
     pub(crate) closing: Arc<AtomicBool>,
     pub(crate) shutdown_handle: ShutdownHandle,
 }
 
 #[derive(Debug)]
-#[cfg(any(unix, windows))]
 pub(crate) struct ControlUpgradeInput {
     buffered_bytes: Vec<u8>,
     initial_command_count: usize,
     mode: ControlMode,
 }
 
-#[cfg(any(unix, windows))]
 impl ControlUpgradeInput {
     #[cfg(test)]
     pub(crate) fn new(buffered_bytes: Vec<u8>, initial_command_count: usize) -> Self {
@@ -233,7 +194,6 @@ impl ControlUpgradeInput {
     }
 }
 
-#[cfg(any(unix, windows))]
 pub(crate) async fn forward_control(
     stream: LocalStream,
     handler: Arc<RequestHandler>,
@@ -258,7 +218,6 @@ pub(crate) async fn forward_control(
     .await
 }
 
-#[cfg(any(unix, windows))]
 async fn forward_control_inner(
     stream: LocalStream,
     handler: Arc<RequestHandler>,
@@ -328,18 +287,6 @@ async fn forward_control_inner(
     let mut input_closed = shutdown_draining;
     let mut eof_queue_lease = None;
     let mut eof_transition = None;
-    #[cfg(windows)]
-    let initial_stdin_eof_marker = consume_control_eof_marker(
-        &mut input_buffer,
-        &mut queued_lines,
-        &mut queued_input_bytes,
-    );
-    #[cfg(windows)]
-    if initial_stdin_eof_marker {
-        input_closed = true;
-        acquire_control_eof_queue_lease(&mut eof_queue_lease, &handler, control_identity).await;
-        arm_control_eof_transition(&mut eof_transition);
-    }
     let mut attachment =
         ControlSessionAttachment::new(handler.control_session_name(requester_pid).await);
     let mut flags: ControlClientFlags = handler
@@ -352,10 +299,6 @@ async fn forward_control_inner(
         None;
     let mut initial_command_completion_pending = false;
     let mut eof_completion = ControlEofCompletion::default();
-    #[cfg(windows)]
-    if initial_stdin_eof_marker {
-        eof_completion.observe_stdin_eof_marker(attachment.is_attached(), !queued_lines.is_empty());
-    }
     let mut command_numbering = if initial_command_count == 0 {
         let initial_timestamp = unix_epoch_seconds();
         output_queue.enqueue_line(
@@ -514,21 +457,6 @@ async fn forward_control_inner(
             let Some(next_line) = queued_lines.front() else {
                 break;
             };
-            #[cfg(windows)]
-            if next_line == CONTROL_STDIN_EOF_MARKER {
-                queued_lines
-                    .pop_front()
-                    .expect("peeked control EOF marker remains queued");
-                input_closed = true;
-                acquire_control_eof_queue_lease(&mut eof_queue_lease, &handler, control_identity)
-                    .await;
-                arm_control_eof_transition(&mut eof_transition);
-                input_buffer.clear();
-                queued_lines.clear();
-                queued_input_bytes = 0;
-                eof_completion.observe_stdin_eof_marker(attachment.is_attached(), false);
-                break;
-            }
             if next_line.is_empty() {
                 queued_lines
                     .pop_front()
@@ -706,11 +634,6 @@ async fn forward_control_inner(
                     if let Some(command) = current_command.as_ref() {
                         command.eof_cancellation.cancel_for_eof();
                     }
-                    #[cfg(windows)]
-                    eof_completion.observe_transport_eof(
-                        attachment.is_attached(),
-                        current_command.is_some() || !queued_lines.is_empty(),
-                    );
                     arm_control_eof_transition(&mut eof_transition);
                 } else {
                     append_control_input(
@@ -719,28 +642,6 @@ async fn forward_control_inner(
                         &mut queued_input_bytes,
                         &read_buffer[..bytes_read],
                     )?;
-                    #[cfg(windows)]
-                    if consume_control_eof_marker(
-                        &mut input_buffer,
-                        &mut queued_lines,
-                        &mut queued_input_bytes,
-                    ) {
-                        input_closed = true;
-                        acquire_control_eof_queue_lease(
-                            &mut eof_queue_lease,
-                            &handler,
-                            control_identity,
-                        )
-                        .await;
-                        if let Some(command) = current_command.as_ref() {
-                            command.eof_cancellation.cancel_for_eof();
-                        }
-                        eof_completion.observe_stdin_eof_marker(
-                            attachment.is_attached(),
-                            current_command.is_some() || !queued_lines.is_empty(),
-                        );
-                        arm_control_eof_transition(&mut eof_transition);
-                    }
                 }
             }
             Some(event) = async {
@@ -923,16 +824,6 @@ async fn forward_control_inner(
                         .and_then(Option::as_deref),
                 )
                 .await;
-                #[cfg(windows)]
-                {
-                    // Tokio's named-pipe `AsyncWrite::shutdown` only flushes;
-                    // it does not half-close the duplex handle. Release both
-                    // split halves after the terminal `%exit` is flushed so
-                    // Windows clients can use transport EOF as the unambiguous
-                    // completion signal while the finite queue drains below.
-                    drop(read_half);
-                    drop(write_half);
-                }
                 let mut drain_context = EofDrainContext {
                     server_events: &mut server_events,
                     events_open: true,
@@ -984,7 +875,6 @@ async fn forward_control_inner(
     }
 }
 
-#[cfg(any(unix, windows))]
 fn control_control_waits_for_attached_session(
     mode: ControlMode,
     attachment: &ControlSessionAttachment,
@@ -992,7 +882,6 @@ fn control_control_waits_for_attached_session(
     mode.is_control_control() && attachment.is_attached()
 }
 
-#[cfg(any(unix, windows))]
 async fn acquire_control_eof_queue_lease(
     eof_queue_lease: &mut Option<ControlQueueDrainLease>,
     handler: &RequestHandler,
@@ -1105,13 +994,11 @@ async fn pause_after_control_eof_queue_lease(
     }
 }
 
-#[cfg(any(unix, windows))]
 struct ClosedControlCommand {
     task: Option<JoinHandle<ControlCommandResult>>,
     transport_result: io::Result<()>,
 }
 
-#[cfg(any(unix, windows))]
 async fn close_active_control_command_on_eof(
     current_command: &mut Option<ActiveControlCommand>,
     current_response_frame: &mut Option<ActiveControlResponseFrame>,
@@ -1158,7 +1045,6 @@ async fn close_active_control_command_on_eof(
     }
 }
 
-#[cfg(any(unix, windows))]
 struct EofDrainContext<'a> {
     server_events: &'a mut mpsc::Receiver<ControlServerEvent>,
     events_open: bool,
@@ -1168,7 +1054,6 @@ struct EofDrainContext<'a> {
     shutdown_handle: &'a ShutdownHandle,
 }
 
-#[cfg(any(unix, windows))]
 async fn drain_control_queue_after_eof(
     active_task: Option<JoinHandle<ControlCommandResult>>,
     queued_lines: &mut VecDeque<String>,
@@ -1190,10 +1075,6 @@ async fn drain_control_queue_after_eof(
             break;
         };
         *queued_input_bytes = queued_input_bytes.saturating_sub(line.len());
-        #[cfg(windows)]
-        if line == CONTROL_STDIN_EOF_MARKER {
-            break;
-        }
         if line.is_empty() {
             break;
         }
@@ -1241,7 +1122,6 @@ async fn drain_control_queue_after_eof(
     Ok(())
 }
 
-#[cfg(any(unix, windows))]
 async fn drain_control_command_after_eof(
     mut task: JoinHandle<ControlCommandResult>,
     context: &mut EofDrainContext<'_>,
@@ -1295,7 +1175,6 @@ async fn drain_control_command_after_eof(
     Ok(exit_received || shutdown_requested || registration_closed)
 }
 
-#[cfg(any(unix, windows))]
 async fn handle_server_event(
     event: ControlServerEvent,
     context: &mut ServerEventContext<'_>,
@@ -1386,7 +1265,6 @@ async fn handle_server_event(
     Ok(false)
 }
 
-#[cfg(any(unix, windows))]
 async fn write_control_notification(
     line: String,
     context: &mut ServerEventContext<'_>,
@@ -1419,7 +1297,6 @@ async fn write_control_notification(
     Ok(false)
 }
 
-#[cfg(any(unix, windows))]
 async fn handle_control_command_response_event(
     event: ControlCommandResponseEvent,
     numbering: &mut ControlCommandNumbering,
@@ -1509,7 +1386,6 @@ async fn handle_control_command_response_event(
     }
 }
 
-#[cfg(any(unix, windows))]
 fn enqueue_control_frame_terminal(
     output_queue: &mut ControlOutputQueue,
     command: &ActiveControlCommand,
@@ -1534,7 +1410,6 @@ fn enqueue_control_frame_terminal(
     );
 }
 
-#[cfg(any(unix, windows))]
 async fn flush_deferred_server_events(context: &mut ServerEventContext<'_>) -> io::Result<bool> {
     while let Some(line) = context.deferred.pop_notification() {
         if handle_server_event(ControlServerEvent::Notification(line), context, false).await? {
@@ -1567,7 +1442,6 @@ async fn flush_deferred_server_events(context: &mut ServerEventContext<'_>) -> i
     Ok(false)
 }
 
-#[cfg(any(unix, windows))]
 struct ServerEventContext<'a> {
     handler: &'a RequestHandler,
     control_identity: ControlClientIdentity,
@@ -1584,7 +1458,6 @@ struct ServerEventContext<'a> {
 }
 
 #[derive(Debug, Default)]
-#[cfg(any(unix, windows))]
 struct DeferredServerEvents {
     notifications: VecDeque<String>,
     notification_bytes: usize,
@@ -1593,13 +1466,11 @@ struct DeferredServerEvents {
 }
 
 #[derive(Debug)]
-#[cfg(any(unix, windows))]
 struct DeferredSessionChange {
     session_name: Option<SessionName>,
     pane_sequences: Option<Vec<(u32, u64)>>,
 }
 
-#[cfg(any(unix, windows))]
 impl DeferredServerEvents {
     fn defer_notification(&mut self, line: String) {
         if self.exit_reason.is_some() {
@@ -1640,13 +1511,11 @@ impl DeferredServerEvents {
 }
 
 #[derive(Debug)]
-#[cfg(any(unix, windows))]
 struct ActiveControlResponseFrame {
     open: bool,
     origin: Option<ControlQueueCommandOrigin>,
 }
 
-#[cfg(any(unix, windows))]
 impl ActiveControlResponseFrame {
     const fn owner() -> Self {
         Self {
@@ -1657,7 +1526,6 @@ impl ActiveControlResponseFrame {
 }
 
 #[derive(Debug)]
-#[cfg(any(unix, windows))]
 struct ActiveControlCommand {
     timestamp: i64,
     command_number: u64,
@@ -1667,7 +1535,6 @@ struct ActiveControlCommand {
     task: Option<JoinHandle<ControlCommandResult>>,
 }
 
-#[cfg(any(unix, windows))]
 impl Drop for ActiveControlCommand {
     fn drop(&mut self) {
         if let Some(task) = self.task.as_ref() {
@@ -1678,7 +1545,6 @@ impl Drop for ActiveControlCommand {
     }
 }
 
-#[cfg(any(unix, windows))]
 fn extract_complete_control_lines(buffer: &mut Vec<u8>) -> Vec<String> {
     let mut lines = Vec::new();
 
@@ -1696,7 +1562,6 @@ fn extract_complete_control_lines(buffer: &mut Vec<u8>) -> Vec<String> {
     lines
 }
 
-#[cfg(any(unix, windows))]
 fn append_control_input(
     input_buffer: &mut Vec<u8>,
     queued_lines: &mut VecDeque<String>,
@@ -1735,29 +1600,6 @@ fn append_control_input(
     Ok(())
 }
 
-#[cfg(windows)]
-fn consume_control_eof_marker(
-    input_buffer: &mut Vec<u8>,
-    queued_lines: &mut VecDeque<String>,
-    queued_input_bytes: &mut usize,
-) -> bool {
-    let Some(marker_index) = queued_lines.iter().position(|line| {
-        line == CONTROL_STDIN_EOF_MARKER || line.ends_with(CONTROL_STDIN_EOF_MARKER)
-    }) else {
-        return false;
-    };
-
-    // The Windows client writes this private terminal marker immediately
-    // before closing its named-pipe writer. Observe it even while a blocking
-    // command is active; waiting for the normal command-dequeue path would
-    // deadlock because wait-for cancellation itself depends on input_closed.
-    queued_lines.truncate(marker_index);
-    *queued_input_bytes = queued_lines.iter().map(String::len).sum();
-    input_buffer.clear();
-    true
-}
-
-#[cfg(any(unix, windows))]
 fn unix_epoch_seconds() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1765,7 +1607,7 @@ fn unix_epoch_seconds() -> i64 {
         .as_secs() as i64
 }
 
-#[cfg(all(test, any(unix, windows)))]
+#[cfg(all(test, unix))]
 mod deferred_tests {
     use super::{
         DeferredServerEvents, MAX_DEFERRED_CONTROL_NOTIFICATIONS,
@@ -1820,94 +1662,6 @@ mod deferred_tests {
         assert!(deferred.notifications.is_empty());
         assert_eq!(deferred.notification_bytes, 0);
         assert!(deferred.exit_reason.is_some());
-    }
-}
-
-#[cfg(all(test, windows))]
-mod windows_eof_marker_tests {
-    use std::collections::VecDeque;
-
-    use super::{
-        append_control_input, arm_control_eof_transition, consume_control_eof_marker,
-        wait_for_control_eof_transition, CONTROL_EOF_GRACE,
-    };
-    use rmux_proto::CONTROL_STDIN_EOF_MARKER;
-
-    #[test]
-    fn windows_eof_marker_discards_an_incomplete_command_prefix() {
-        let mut input_buffer = Vec::new();
-        let mut queued_lines = VecDeque::new();
-        let mut queued_bytes = 0;
-        let input = format!("display-message -p must-not-run{CONTROL_STDIN_EOF_MARKER}\n");
-        append_control_input(
-            &mut input_buffer,
-            &mut queued_lines,
-            &mut queued_bytes,
-            input.as_bytes(),
-        )
-        .expect("private EOF marker input parses");
-
-        assert!(consume_control_eof_marker(
-            &mut input_buffer,
-            &mut queued_lines,
-            &mut queued_bytes,
-        ));
-        assert!(queued_lines.is_empty());
-        assert_eq!(queued_bytes, 0);
-        assert!(input_buffer.is_empty());
-    }
-
-    #[tokio::test]
-    async fn windows_eof_marker_uses_the_global_persistent_deadline() {
-        let mut input_buffer = Vec::new();
-        let mut queued_lines = VecDeque::new();
-        let mut queued_bytes = 0;
-        append_control_input(
-            &mut input_buffer,
-            &mut queued_lines,
-            &mut queued_bytes,
-            format!("wait-for marker{CONTROL_STDIN_EOF_MARKER}\n").as_bytes(),
-        )
-        .expect("private EOF marker input parses");
-        assert!(consume_control_eof_marker(
-            &mut input_buffer,
-            &mut queued_lines,
-            &mut queued_bytes,
-        ));
-
-        let mut transition = None;
-        arm_control_eof_transition(&mut transition);
-        let initial_deadline = transition
-            .as_ref()
-            .expect("marker deadline is armed")
-            .deadline();
-        arm_control_eof_transition(&mut transition);
-        assert_eq!(
-            transition
-                .as_ref()
-                .expect("marker deadline stays armed")
-                .deadline(),
-            initial_deadline,
-            "another post-marker frame must not extend the global budget"
-        );
-        assert!(
-            tokio::time::timeout(
-                std::time::Duration::from_millis(50),
-                wait_for_control_eof_transition(&mut transition),
-            )
-            .await
-            .is_err(),
-            "the marker deadline leaves a bounded grace for fast output"
-        );
-        assert!(
-            tokio::time::timeout(
-                CONTROL_EOF_GRACE + std::time::Duration::from_millis(100),
-                wait_for_control_eof_transition(&mut transition),
-            )
-            .await
-            .is_ok(),
-            "the marker deadline still expires within its global budget"
-        );
     }
 }
 

@@ -1,7 +1,7 @@
 use clap::{ArgAction, Args};
 
-use super::automation::{parse_duration, SendKeysWaitMode, DURATION_HELP};
-use super::{parse_target_spec, TargetSpec};
+use super::automation::{DURATION_HELP, SendKeysWaitMode, parse_duration};
+use super::{TargetSpec, parse_target_spec};
 
 /// Parsed arguments of `send-keys`, including the rmux-specific `--wait` synchronization flags.
 #[derive(Debug, Clone, Args)]

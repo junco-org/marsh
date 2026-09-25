@@ -87,26 +87,6 @@ impl HandlerState {
         }
     }
 
-    fn pane_target_for_id_in_window(
-        &self,
-        session_name: &SessionName,
-        window_index: u32,
-        pane_id: PaneId,
-    ) -> Option<PaneTarget> {
-        let session = self.sessions.session(session_name)?;
-        let pane_index = session
-            .window_at(window_index)?
-            .panes()
-            .iter()
-            .find(|pane| pane.id() == pane_id)
-            .map(|pane| pane.index())?;
-        Some(PaneTarget::with_window(
-            session_name.clone(),
-            window_index,
-            pane_index,
-        ))
-    }
-
     fn pane_target_for_id(&self, pane_id: PaneId) -> Option<PaneTarget> {
         self.sessions.iter().find_map(|(session_name, session)| {
             let window_index = session.window_index_for_pane_id(pane_id)?;

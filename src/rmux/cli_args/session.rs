@@ -1,7 +1,7 @@
 use clap::{ArgAction, Args};
 use rmux_proto::SessionName;
 
-use super::{parse_session_name, parse_target_spec, TargetSpec};
+use super::{TargetSpec, parse_session_name, parse_target_spec};
 
 /// Parsed `new-session` flags: creation, attach-if-exists, geometry and the initial command.
 #[derive(Debug, Clone, Args)]

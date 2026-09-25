@@ -12,8 +12,10 @@
 //! poll them. Every descriptor is created `O_CLOEXEC` atomically with `pipe2`, so a concurrent
 //! `fork`/`exec` elsewhere in the process cannot leak one into an unrelated child.
 
-use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+use std::os::fd::OwnedFd;
 
+use nix::fcntl::{FcntlArg, OFlag};
+use tokio::io::Interest;
 use tokio::io::unix::AsyncFd;
 
 /// One job's six pipe ends, split by owner.
@@ -34,18 +36,7 @@ pub(crate) struct PipeSet {
 
 /// Creates one `O_CLOEXEC` pipe as `(read, write)`.
 fn pipe2_cloexec() -> std::io::Result<(OwnedFd, OwnedFd)> {
-    let mut fds = [0 as libc::c_int; 2];
-    // SAFETY: `pipe2` receives a pointer to a two-element array it is allowed to write, and a
-    // flag value it defines.
-    let created = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
-    if created < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    // SAFETY: both descriptors were just created by `pipe2` and are owned by nothing else.
-    let read = unsafe { OwnedFd::from_raw_fd(fds[0]) };
-    // SAFETY: as above, for the write end.
-    let write = unsafe { OwnedFd::from_raw_fd(fds[1]) };
-    Ok((read, write))
+    nix::unistd::pipe2(OFlag::O_CLOEXEC).map_err(std::io::Error::from)
 }
 
 /// Puts `fd` into non-blocking mode.
@@ -54,17 +45,10 @@ fn pipe2_cloexec() -> std::io::Result<(OwnedFd, OwnedFd)> {
 /// on purpose: a program that got `EAGAIN` writing to its own stdout would either lose the write
 /// or spin, and neither is something a workload can be asked to handle.
 fn set_nonblocking(fd: &OwnedFd) -> std::io::Result<()> {
-    // SAFETY: `fcntl` receives an open descriptor and a command that takes no further argument.
-    let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
-    if flags < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    // SAFETY: `fcntl` receives the same open descriptor and the flag word it just reported, plus
-    // one bit this call is setting.
-    let applied = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) };
-    if applied < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
+    // Retained rather than truncated: the descriptor's other status flags are the kernel's
+    // answer, and putting back only the bits this crate happens to name would clear them.
+    let flags = OFlag::from_bits_retain(nix::fcntl::fcntl(fd, FcntlArg::F_GETFL)?);
+    nix::fcntl::fcntl(fd, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK))?;
     Ok(())
 }
 
@@ -137,29 +121,17 @@ impl PipeInput {
         };
         let mut written = 0;
         while written < bytes.len() {
-            let mut ready = fd.writable().await?;
-            let attempt = ready.try_io(|inner| {
-                let slice = &bytes[written..];
-                // SAFETY: `write` receives an open descriptor, a valid pointer and the length of
-                // the slice behind it.
-                let count = unsafe {
-                    libc::write(
-                        inner.get_ref().as_raw_fd(),
-                        slice.as_ptr().cast(),
-                        slice.len(),
-                    )
-                };
-                if count < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(usize::try_from(count).unwrap_or(0))
-            });
+            // Tokio owns the readiness retry: a write the kernel refuses with `EAGAIN` clears the
+            // descriptor's readiness and waits again, inside `async_io`.
+            let attempt = fd
+                .async_io(Interest::WRITABLE, |inner| {
+                    nix::unistd::write(inner, &bytes[written..]).map_err(std::io::Error::from)
+                })
+                .await;
             match attempt {
-                Ok(Ok(count)) => written += count,
-                Ok(Err(error)) if error.kind() == std::io::ErrorKind::Interrupted => {}
-                Ok(Err(error)) => return Err(error),
-                // Not ready after all; the guard is cleared and the next await waits again.
-                Err(_would_block) => {}
+                Ok(count) => written += count,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(error),
             }
         }
         drop(guard);
@@ -189,27 +161,180 @@ impl PipeInput {
 /// Fails with whatever the read reported, other than `EINTR`, which is retried.
 pub(crate) async fn read_pipe(fd: &AsyncFd<OwnedFd>, buffer: &mut [u8]) -> std::io::Result<usize> {
     loop {
-        let mut ready = fd.readable().await?;
-        let attempt = ready.try_io(|inner| {
-            // SAFETY: `read` receives an open descriptor, a valid writable pointer and the length
-            // of the slice behind it.
-            let count = unsafe {
-                libc::read(
-                    inner.get_ref().as_raw_fd(),
-                    buffer.as_mut_ptr().cast(),
-                    buffer.len(),
-                )
-            };
-            if count < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(usize::try_from(count).unwrap_or(0))
-        });
+        let attempt = fd
+            .async_io(Interest::READABLE, |inner| {
+                nix::unistd::read(inner, &mut *buffer).map_err(std::io::Error::from)
+            })
+            .await;
         match attempt {
-            Ok(Ok(count)) => return Ok(count),
-            Ok(Err(error)) if error.kind() == std::io::ErrorKind::Interrupted => {}
-            Ok(Err(error)) => return Err(error),
-            Err(_would_block) => {}
+            Ok(count) => return Ok(count),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
         }
+    }
+}
+
+#[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
+#[cfg(test)]
+mod tests {
+    use std::pin::Pin;
+    use std::task::Poll;
+    use std::time::Duration;
+
+    use nix::fcntl::FdFlag;
+
+    use super::*;
+
+    /// How long a test may wait on the kernel before it is a failure rather than a hang.
+    const LIMIT: Duration = Duration::from_secs(5);
+
+    /// Polls `future` exactly once and leaves it alive, so a caller can establish that it is
+    /// waiting without consuming it.
+    async fn poll_once<F: Future>(mut future: Pin<&mut F>) -> Poll<F::Output> {
+        std::future::poll_fn(|cx| Poll::Ready(future.as_mut().poll(cx))).await
+    }
+
+    /// The pipe's real capacity, which is a kernel property and not a constant this may assume.
+    fn capacity_of(fd: &OwnedFd) -> usize {
+        let size = nix::fcntl::fcntl(fd, FcntlArg::F_GETPIPE_SZ).expect("the pipe's capacity");
+        usize::try_from(size).expect("a pipe capacity is not negative")
+    }
+
+    /// Fills the pipe behind `fd` until the kernel refuses, answering with what it accepted.
+    fn prefill(fd: &OwnedFd) -> Vec<u8> {
+        let chunk = vec![b'P'; 4096.min(capacity_of(fd))];
+        let mut accepted = Vec::new();
+        loop {
+            match nix::unistd::write(fd, &chunk) {
+                Ok(0) => break,
+                Ok(count) => accepted.extend_from_slice(&chunk[..count]),
+                Err(nix::errno::Errno::EAGAIN) => break,
+                Err(nix::errno::Errno::EINTR) => {}
+                Err(other) => panic!("the prefill write failed: {other}"),
+            }
+        }
+        accepted
+    }
+
+    /// Whether the descriptor itself is in non-blocking mode, as the kernel reports it.
+    fn is_nonblocking(fd: &OwnedFd) -> bool {
+        OFlag::from_bits_retain(nix::fcntl::fcntl(fd, FcntlArg::F_GETFL).expect("status flags"))
+            .contains(OFlag::O_NONBLOCK)
+    }
+
+    /// The six ends divide into two roles, and the kernel is asked which one each descriptor
+    /// actually got: a program that received `EAGAIN` from its own stdout would lose the write,
+    /// and an end leaked through an unrelated `exec` would outlive the job.
+    #[test]
+    fn pipe_endpoints_preserve_cloexec_and_blocking_roles() {
+        let pipes = open_pipes().expect("three pipes");
+        let polled = [&pipes.input, &pipes.stdout, &pipes.stderr];
+        let child = [&pipes.child_stdin, &pipes.child_stdout, &pipes.child_stderr];
+
+        for fd in polled.into_iter().chain(child) {
+            let flags = FdFlag::from_bits_retain(
+                nix::fcntl::fcntl(fd, FcntlArg::F_GETFD).expect("descriptor flags"),
+            );
+            assert!(
+                flags.contains(FdFlag::FD_CLOEXEC),
+                "every end is close-on-exec"
+            );
+        }
+        for fd in polled {
+            assert!(is_nonblocking(fd), "the mux polls the ends it owns");
+        }
+        for fd in child {
+            assert!(!is_nonblocking(fd), "the shell's own ends stay blocking");
+        }
+    }
+
+    /// Two writes and a close, all admitted while the pipe is full: the mutex decides their order
+    /// before a single byte moves, and the reader then sees each write whole, in that order, and
+    /// a real end of file behind them.
+    #[tokio::test]
+    async fn pipe_input_backpressure_preserves_whole_writes_and_eof() {
+        let pipes = open_pipes().expect("three pipes");
+        let capacity = capacity_of(&pipes.input);
+        let prefilled = prefill(&pipes.input);
+        assert!(!prefilled.is_empty(), "an empty pipe accepts something");
+
+        // Distinguishable, and each longer than the pipe holds, so neither can be delivered
+        // without the reader draining in the middle of it.
+        let first: Vec<u8> = (0..capacity * 2)
+            .map(|index| u8::try_from(index % 251).unwrap_or(0))
+            .collect();
+        let second: Vec<u8> = (0..capacity * 2)
+            .map(|index| u8::try_from(index % 241 + 1).unwrap_or(0))
+            .collect();
+        let expected: Vec<u8> = prefilled
+            .iter()
+            .chain(&first)
+            .chain(&second)
+            .copied()
+            .collect();
+
+        let input = PipeInput::new(pipes.input).expect("a registered write end");
+        let mut write_first = Box::pin(input.write_all(&first));
+        assert!(
+            poll_once(write_first.as_mut()).await.is_pending(),
+            "a full pipe accepts no more"
+        );
+        let mut write_second = Box::pin(input.write_all(&second));
+        assert!(
+            poll_once(write_second.as_mut()).await.is_pending(),
+            "the first write holds the input"
+        );
+        let mut closing = Box::pin(input.close());
+        assert!(
+            poll_once(closing.as_mut()).await.is_pending(),
+            "the close queues behind both writes"
+        );
+
+        // Only the test's reader is polled: the shell's own end of this pipe is blocking.
+        set_nonblocking(&pipes.child_stdin).expect("a pollable read end");
+        let reader = AsyncFd::new(pipes.child_stdin).expect("a registered read end");
+        let drained = tokio::time::timeout(LIMIT, async {
+            let writers = async {
+                write_first.as_mut().await.expect("the first write");
+                write_second.as_mut().await.expect("the second write");
+                closing.as_mut().await;
+            };
+            let drain = async {
+                let mut collected = Vec::new();
+                let mut buffer = vec![0_u8; 4096];
+                loop {
+                    let count = read_pipe(&reader, &mut buffer).await.expect("a read");
+                    if count == 0 {
+                        break collected;
+                    }
+                    collected.extend_from_slice(&buffer[..count]);
+                }
+            };
+            let ((), collected) = tokio::join!(writers, drain);
+            collected
+        })
+        .await
+        .expect("the writes and the drain finish");
+
+        assert_eq!(drained.len(), expected.len(), "every byte arrives once");
+        assert_eq!(drained, expected, "whole writes, in admission order");
+
+        input.close().await;
+        assert_eq!(
+            input
+                .write_all(b"x")
+                .await
+                .expect_err("a closed input takes nothing")
+                .kind(),
+            std::io::ErrorKind::BrokenPipe
+        );
+        assert_eq!(
+            input
+                .write_all(b"")
+                .await
+                .expect_err("not even an empty write")
+                .kind(),
+            std::io::ErrorKind::BrokenPipe
+        );
     }
 }

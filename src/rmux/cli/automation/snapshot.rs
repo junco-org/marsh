@@ -1,14 +1,14 @@
 use std::path::Path;
 
 use rmux_proto::{PaneSnapshotCell, PaneSnapshotResponse};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::cli_args::{PaneSnapshotArgs, SnapshotRegion};
 
 use super::super::ExitFailure;
 use super::common::{
-    check_disabled, connect_cli, pane_snapshot, resolve_pane_ref, visible_line_from_cells,
-    write_json, write_stdout_line, SCHEMA_VERSION,
+    SCHEMA_VERSION, check_disabled, connect_cli, pane_snapshot, resolve_pane_ref,
+    visible_line_from_cells, write_json, write_stdout_line,
 };
 
 /// Runs `pane-snapshot`, printing the requested region as text or as a JSON grid.

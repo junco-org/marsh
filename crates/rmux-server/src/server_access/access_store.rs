@@ -238,7 +238,6 @@ impl ServerAccessStore {
     }
 }
 
-#[cfg(unix)]
 fn insert_platform_superuser_access(
     entries: &mut BTreeMap<UserIdentity, ServerAccessEntry>,
     next_epoch: &mut u64,
@@ -249,13 +248,6 @@ fn insert_platform_superuser_access(
         UserIdentity::Uid(0),
         AccessMode::ReadWrite,
     );
-}
-
-#[cfg(windows)]
-fn insert_platform_superuser_access(
-    _entries: &mut BTreeMap<UserIdentity, ServerAccessEntry>,
-    _next_epoch: &mut u64,
-) {
 }
 
 fn insert_initial_access_entry(
@@ -279,14 +271,8 @@ fn insert_initial_access_entry(
     );
 }
 
-#[cfg(unix)]
 fn is_reserved_superuser_identity(identity: &UserIdentity) -> bool {
     *identity == UserIdentity::Uid(0)
-}
-
-#[cfg(windows)]
-fn is_reserved_superuser_identity(_identity: &UserIdentity) -> bool {
-    false
 }
 
 fn user_name_for_identity(identity: &UserIdentity) -> String {
