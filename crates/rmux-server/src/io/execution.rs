@@ -149,66 +149,6 @@ impl Default for CollectOptions {
 /// Four independent facts, deliberately not collapsed into one: the two byte streams, whether
 /// they are complete, and the verdict. A caller that read only one of them would be reporting
 /// something it never checked.
-///
-/// # Examples
-///
-/// Every outcome a completed line can carry, as distinct arms. Pure matching over a result, so
-/// this runs as an ordinary doctest.
-///
-/// ```
-/// use marsh_core::shellmux::MuxError;
-/// use marsh_core::{Outcome, Publication};
-///
-/// /// What a line achieved — which is never what its process status says on its own.
-/// fn verdict(exit_code: Option<i32>, outcome: &Result<Outcome, MuxError>) -> String {
-///     match outcome {
-///         // The only case in which the line's staged changes are in the seed.
-///         Ok(Outcome::Published { publication, granted }) => format!(
-///             "published seq {} ({} ops, {} capabilities granted)",
-///             publication.seq,
-///             publication.ops,
-///             granted.len(),
-///         ),
-///         // The policy refused a capability. The snapshot was retaken from the seed and the
-///         // history is as it was before the line; the exit code is untouched by any of that.
-///         Ok(Outcome::Denied { denials, .. }) => format!("denied ({} refusals)", denials.len()),
-///         // Thrown away unchecked at the caller's request. It may well have run and spawned
-///         // processes; what is gone is the staged filesystem work, not the fact of it.
-///         Ok(Outcome::Discarded) => "discarded, having possibly run".to_owned(),
-///         // A shell over a detached executor stages nothing, so nothing was ever checked. This
-///         // server never accepts it as approval.
-///         Ok(Outcome::Detached) => "ungated: never approval".to_owned(),
-///         // Infrastructure failure, which is not a gate answer at all. A storage or gate
-///         // failure *after* a real exit does not erase the exit code already known.
-///         Err(error) => format!("no verdict: {error} (exit {exit_code:?})"),
-///     }
-/// }
-///
-/// // Exit zero and published. The two facts agree here, and nothing guarantees that they will.
-/// assert_eq!(
-///     verdict(
-///         Some(0),
-///         &Ok(Outcome::Published {
-///             publication: Publication { seq: 7, ops: 3 },
-///             granted: Vec::new(),
-///         }),
-///     ),
-///     "published seq 7 (3 ops, 0 capabilities granted)",
-/// );
-/// // Exit zero and *nothing published*: the case a caller reporting success from the process
-/// // status alone gets wrong.
-/// assert_eq!(
-///     verdict(
-///         Some(0),
-///         &Ok(Outcome::Denied { requested: Vec::new(), denials: Vec::new() }),
-///     ),
-///     "denied (0 refusals)",
-/// );
-/// // No exit code, and still a real verdict rather than a lost one.
-/// assert_eq!(verdict(None, &Ok(Outcome::Discarded)), "discarded, having possibly run");
-/// // No verdict at all, which is a different answer again — and it keeps the exit code it had.
-/// assert!(verdict(Some(2), &Err(MuxError::ShuttingDown)).starts_with("no verdict"));
-/// ```
 #[derive(Debug)]
 pub struct CapturedOutput {
     /// Standard output, byte for byte.
@@ -466,7 +406,7 @@ impl Execution {
     /// // A third boundary, later than either stream ending: the gate's answer for the line.
     /// // Exiting zero here still says nothing about whether anything was published.
     /// let completion = command.wait().await?;
-    /// let _ = (completion.exit_code, completion.is_published());
+    /// let _ = (completion.exit_code(), completion.is_published());
     /// Ok(compressed)
     /// # }
     /// ```

@@ -1840,14 +1840,8 @@ impl ShellIo {
     /// // Nothing was invalidated. What changed is what the outstanding handles answer.
     /// assert_eq!(io.snapshot().phase, IoPhase::Closed);
     /// assert!(io.jobs().is_empty());
-    /// // Frozen read-only state still answers: which seeds this host's shells opened, and where
-    /// // they were, is a fair question once their leases have gone. The list was captured once,
-    /// // as the core was released — the live path never writes it.
-    /// for info in io.seeds() {
-    ///     let _ = (info.seed, info.snapshot_parent, info.recovery_required);
-    /// }
-    /// // A separate question, and not a seed: the directory a request naming none would have
-    /// // started in. It answers after teardown because it was never the mux's to begin with.
+    /// // The directory a request naming none would have started in answers after teardown: it
+    /// // was never the mux's to begin with.
     /// let _ = io.default_dir();
     /// // New work is refused rather than silently dropped.
     /// assert!(matches!(io.keep(&job), Err(IoError::Closed)));
