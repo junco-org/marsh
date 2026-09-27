@@ -1,15 +1,13 @@
 use super::*;
+use crate::test_fixtures::{Fixture, Sizeless};
 
 #[tokio::test]
 async fn new_session_uses_the_default_size_when_request_omits_geometry() {
     let handler = RequestHandler::new();
     let response = handler
         .handle(Request::NewSession(NewSessionRequest {
-            session_name: session_name("alpha"),
-            detached: true,
             size: None,
-
-            environment: None,
+            ..Fixture::fixture("alpha")
         }))
         .await;
 
@@ -46,13 +44,7 @@ async fn new_session_uses_the_default_size_when_request_omits_geometry() {
     );
 
     let recreated = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name: session_name("alpha"),
-            detached: true,
-            size: Some(DEFAULT_SESSION_SIZE),
-
-            environment: None,
-        }))
+        .handle(Request::NewSession(NewSessionRequest::fixture("alpha")))
         .await;
     assert_eq!(
         recreated,
@@ -72,26 +64,12 @@ async fn new_session_honors_global_base_index_and_default_size() {
         (OptionName::BaseIndex, "3"),
         (OptionName::DefaultSize, "120x32"),
     ] {
-        let response = handler
-            .handle(Request::SetOption(SetOptionRequest {
-                scope: ScopeSelector::Global,
-                option,
-                value: value.to_owned(),
-                mode: SetOptionMode::Replace,
-            }))
+        handler
+            .set_option(ScopeSelector::Global, option, value)
             .await;
-        assert!(matches!(response, Response::SetOption(_)));
     }
 
-    let created = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name: session_name("alpha"),
-            detached: true,
-            size: None,
-            environment: None,
-        }))
-        .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    handler.create_session(Sizeless("alpha")).await;
 
     let state = handler.state.lock().await;
     let session = state
@@ -118,25 +96,15 @@ async fn new_session_uses_default_command_when_request_omits_command() {
     // A short-lived `printf` may exit and remove the detached session first
     // when the full test suite runs under load.
     let default_command = "cat";
-    let response = handler
-        .handle(Request::SetOption(SetOptionRequest {
-            scope: ScopeSelector::Global,
-            option: OptionName::DefaultCommand,
-            value: default_command.to_owned(),
-            mode: SetOptionMode::Replace,
-        }))
+    handler
+        .set_option(
+            ScopeSelector::Global,
+            OptionName::DefaultCommand,
+            default_command,
+        )
         .await;
-    assert!(matches!(response, Response::SetOption(_)));
 
-    let created = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name: session_name("alpha"),
-            detached: true,
-            size: Some(DEFAULT_SESSION_SIZE),
-            environment: None,
-        }))
-        .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    handler.create_session("alpha").await;
 
     let state = handler.state.lock().await;
     let session = state
@@ -160,14 +128,9 @@ async fn new_session_uses_default_command_when_request_omits_command() {
 async fn duplicate_new_session_returns_the_duplicate_session_error() {
     let handler = RequestHandler::new();
     let request = Request::NewSession(NewSessionRequest {
-        session_name: session_name("alpha"),
         detached: false,
-        size: Some(TerminalSize {
-            cols: 100,
-            rows: 30,
-        }),
-
-        environment: None,
+        size: Some(TerminalSize::new(100, 30)),
+        ..Fixture::fixture("alpha")
     });
 
     let first = handler.handle(request.clone()).await;
@@ -199,25 +162,13 @@ async fn failed_new_session_spawn_does_not_leak_environment_into_reused_name() {
 
     let failed = handler
         .handle(Request::NewSessionExt(Box::new(NewSessionExtRequest {
-            session_name: Some(alpha.clone()),
             working_directory: Some(outside_seed.to_string_lossy().into_owned()),
-            detached: true,
-            size: Some(DEFAULT_SESSION_SIZE),
             environment: Some(vec![format!("{sentinel}=stale")]),
-            group_target: None,
-            attach_if_exists: false,
-            detach_other_clients: false,
-            kill_other_clients: false,
-            flags: None,
-            window_name: None,
             // Keep the spawn synchronous so this regression covers both
             // rollback branches instead of the deferred startup path.
             print_session_info: true,
-            print_format: None,
-            command: None,
-            process_command: None,
-            client_environment: None,
             skip_environment_update: true,
+            ..Fixture::fixture(&alpha)
         })))
         .await;
 
@@ -231,18 +182,7 @@ async fn failed_new_session_spawn_does_not_leak_environment_into_reused_name() {
         assert_eq!(state.environment.session_value(&alpha, sentinel), None);
     }
 
-    let recreated = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name: alpha.clone(),
-            detached: true,
-            size: Some(DEFAULT_SESSION_SIZE),
-            environment: None,
-        }))
-        .await;
-    assert!(
-        matches!(recreated, Response::NewSession(_)),
-        "reusing the failed session name must succeed, got {recreated:?}"
-    );
+    handler.create_session(&alpha).await;
 
     let state = handler.state.lock().await;
     assert_eq!(state.environment.session_value(&alpha, sentinel), None);
@@ -252,45 +192,21 @@ async fn failed_new_session_spawn_does_not_leak_environment_into_reused_name() {
 async fn attach_if_exists_reports_attach_semantics_without_new_session_hook() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    let created = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name: alpha.clone(),
-            detached: true,
-            size: None,
-            environment: None,
-        }))
-        .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    handler.create_session(Sizeless(&alpha)).await;
 
-    let hook = handler
-        .handle(Request::SetHook(SetHookRequest {
-            scope: ScopeSelector::Global,
-            hook: HookName::AfterNewSession,
-            command: "set-environment -g ATTACH_EXISTING_HOOK ran".to_owned(),
-            lifecycle: HookLifecycle::Persistent,
-        }))
+    handler
+        .handle_ok(SetHookRequest::fixture((
+            ScopeSelector::Global,
+            HookName::AfterNewSession,
+            "set-environment -g ATTACH_EXISTING_HOOK ran",
+        )))
         .await;
-    assert!(matches!(hook, Response::SetHook(_)), "{hook:?}");
 
     let reused = handler
         .handle(Request::NewSessionExt(Box::new(NewSessionExtRequest {
-            session_name: Some(alpha.clone()),
-            working_directory: None,
-            detached: true,
             size: None,
-            environment: None,
-            group_target: None,
             attach_if_exists: true,
-            detach_other_clients: false,
-            kill_other_clients: false,
-            flags: None,
-            window_name: None,
-            print_session_info: false,
-            print_format: None,
-            command: None,
-            process_command: None,
-            client_environment: None,
-            skip_environment_update: false,
+            ..Fixture::fixture(&alpha)
         })))
         .await;
 
@@ -310,15 +226,7 @@ async fn attach_if_exists_reports_attach_semantics_without_new_session_hook() {
     );
     drop(state);
 
-    let fresh = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name: session_name("fresh-after-hook"),
-            detached: true,
-            size: None,
-            environment: None,
-        }))
-        .await;
-    assert!(matches!(fresh, Response::NewSession(_)), "{fresh:?}");
+    handler.create_session(Sizeless("fresh-after-hook")).await;
     let state = handler.state.lock().await;
     assert_eq!(
         state.environment.global_value("ATTACH_EXISTING_HOOK"),
@@ -332,35 +240,16 @@ async fn grouped_new_session_without_explicit_name_uses_tmux_suffix_shape() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
 
-    let created = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name: alpha.clone(),
-            detached: true,
-            size: None,
-            environment: None,
-        }))
-        .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    handler.create_session(Sizeless(&alpha)).await;
 
     let grouped = handler
         .handle(Request::NewSessionExt(Box::new(NewSessionExtRequest {
             session_name: None,
-            working_directory: None,
-            detached: true,
             size: None,
-            environment: None,
             group_target: Some(alpha.clone()),
-            attach_if_exists: false,
-            detach_other_clients: false,
-            kill_other_clients: false,
-            flags: None,
-            window_name: None,
             print_session_info: true,
             print_format: Some("#{session_name}".to_owned()),
-            command: None,
-            process_command: None,
-            client_environment: None,
-            skip_environment_update: false,
+            ..Fixture::fixture(&alpha)
         })))
         .await;
 
@@ -401,23 +290,10 @@ async fn new_session_print_resolves_captured_identity_after_concurrent_rename() 
     let create = tokio::spawn(async move {
         create_handler
             .handle(Request::NewSessionExt(Box::new(NewSessionExtRequest {
-                session_name: Some(old_name),
-                working_directory: None,
-                detached: true,
                 size: None,
-                environment: None,
-                group_target: None,
-                attach_if_exists: false,
-                detach_other_clients: false,
-                kill_other_clients: false,
-                flags: None,
-                window_name: None,
                 print_session_info: true,
                 print_format: Some("#{session_name}:#{session_id}".to_owned()),
-                command: None,
-                process_command: None,
-                client_environment: None,
-                skip_environment_update: false,
+                ..Fixture::fixture(old_name)
             })))
             .await
     });
@@ -425,13 +301,12 @@ async fn new_session_print_resolves_captured_identity_after_concurrent_rename() 
     tokio::time::timeout(Duration::from_secs(2), pause.reached.notified())
         .await
         .expect("new-session reaches the pre-print pause");
-    let renamed = handler
-        .handle(Request::RenameSession(RenameSessionRequest {
+    handler
+        .handle_ok(RenameSessionRequest {
             target: session_name("print-before-rename"),
             new_name: new_name.clone(),
-        }))
+        })
         .await;
-    assert!(matches!(renamed, Response::RenameSession(_)), "{renamed:?}");
     pause.release.notify_one();
 
     assert_eq!(
@@ -450,36 +325,16 @@ async fn new_session_print_resolves_captured_identity_after_concurrent_rename() 
 async fn auto_named_session_uses_next_global_session_id_after_named_sessions() {
     let handler = RequestHandler::new();
     for name in ["0", "1", "bob"] {
-        let created = handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: session_name(name),
-                detached: true,
-                size: None,
-                environment: None,
-            }))
-            .await;
-        assert!(matches!(created, Response::NewSession(_)));
+        handler.create_session(Sizeless(name)).await;
     }
 
     let unnamed = handler
         .handle(Request::NewSessionExt(Box::new(NewSessionExtRequest {
             session_name: None,
-            working_directory: None,
-            detached: true,
             size: None,
-            environment: None,
-            group_target: None,
-            attach_if_exists: false,
-            detach_other_clients: false,
-            kill_other_clients: false,
-            flags: None,
-            window_name: None,
             print_session_info: true,
             print_format: Some("#{session_name}".to_owned()),
-            command: None,
-            process_command: None,
-            client_environment: None,
-            skip_environment_update: false,
+            ..Fixture::fixture("unnamed")
         })))
         .await;
 
@@ -498,35 +353,14 @@ async fn grouped_new_session_rejects_shell_command_like_tmux() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
 
-    let created = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name: alpha.clone(),
-            detached: true,
-            size: None,
-            environment: None,
-        }))
-        .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    handler.create_session(Sizeless(&alpha)).await;
 
     let grouped = handler
         .handle(Request::NewSessionExt(Box::new(NewSessionExtRequest {
-            session_name: Some(session_name("peer")),
-            working_directory: None,
-            detached: true,
             size: None,
-            environment: None,
             group_target: Some(alpha),
-            attach_if_exists: false,
-            detach_other_clients: false,
-            kill_other_clients: false,
-            flags: None,
-            window_name: None,
-            print_session_info: false,
-            print_format: None,
             command: Some(vec!["cat".to_owned()]),
-            process_command: None,
-            client_environment: None,
-            skip_environment_update: false,
+            ..Fixture::fixture("peer")
         })))
         .await;
 
@@ -540,36 +374,17 @@ async fn grouped_new_session_rejects_shell_command_like_tmux() {
 async fn grouped_new_session_uses_next_global_session_id_suffix_when_group_is_new() {
     let handler = RequestHandler::new();
     for name in ["0", "1", "bob"] {
-        let created = handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: session_name(name),
-                detached: true,
-                size: None,
-                environment: None,
-            }))
-            .await;
-        assert!(matches!(created, Response::NewSession(_)));
+        handler.create_session(Sizeless(name)).await;
     }
 
     let grouped = handler
         .handle(Request::NewSessionExt(Box::new(NewSessionExtRequest {
             session_name: None,
-            working_directory: None,
-            detached: true,
             size: None,
-            environment: None,
             group_target: Some(session_name("stacy")),
-            attach_if_exists: false,
-            detach_other_clients: false,
-            kill_other_clients: false,
-            flags: None,
-            window_name: None,
             print_session_info: true,
             print_format: Some("#{session_name}:#{session_group}".to_owned()),
-            command: None,
-            process_command: None,
-            client_environment: None,
-            skip_environment_update: false,
+            ..Fixture::fixture("stacy")
         })))
         .await;
 

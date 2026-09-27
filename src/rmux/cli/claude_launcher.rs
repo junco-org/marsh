@@ -23,17 +23,20 @@ use std::path::{Path, PathBuf};
 
 use rmux_proto::ProcessCommand;
 
+use super::aux_command::{AuxCommand, failure, user_home};
+use super::claude_skill::ClaudeSkillInvocation;
 use super::managed_io::{
     ManagedPaneCommand, ManagedPaneDisplay, ManagedPaneKind, run_managed_pane_command,
 };
-use super::{ExitFailure, StartupOptions};
+use super::tmux_dropin::{PUBLIC_BINARY_OVERRIDE_ENV, symlink_points_to};
+use super::top_level::{scan_claude_top_level_invocation, validate_claude_top_level_invocation};
+use super::{ExitFailure, StartupOptions, top_level_startup};
 use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 
 const TEAMMATE_MODE_FLAG: &str = "--teammate-mode";
 const TEAMMATE_MODE: &str = "tmux";
 const AGENT_TEAMS_ENV: &str = "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS";
 const DISABLE_TMUX_SHIM_ENV: &str = "RMUX_DISABLE_TMUX_SHIM";
-const PUBLIC_BINARY_OVERRIDE_ENV: &str = "RMUX_INTERNAL_PUBLIC_BINARY_PATH";
 const DIRECT_LAUNCH_ENV: &str = "RMUX_CLAUDE_DIRECT";
 
 /// The program name the managed pane resolves through its own `PATH`.
@@ -48,10 +51,30 @@ pub(super) struct ClaudeInvocation {
     args: Vec<OsString>,
 }
 
-impl ClaudeInvocation {
-    /// Wraps the pass-through arguments of one `rmux claude` invocation.
-    pub(super) const fn new(args: Vec<OsString>) -> Self {
-        Self { args }
+impl AuxCommand for ClaudeInvocation {
+    /// Recognizes `rmux claude`, rejecting top-level modes the managed launcher cannot honor.
+    fn parse(arguments: &[OsString]) -> Result<Option<Self>, ExitFailure> {
+        let Some(invocation) = scan_claude_top_level_invocation(arguments) else {
+            return Ok(None);
+        };
+        validate_claude_top_level_invocation(&invocation)?;
+        Ok(Some(Self {
+            args: invocation.into_arguments(),
+        }))
+    }
+
+    /// Installs the bundled skill for `rmux claude install-skill`, and otherwise launches Claude.
+    ///
+    /// Claude's arguments belong to Claude rather than to rmux, so the typed parse never runs
+    /// for them. The launch still needs the daemon this invocation would otherwise resolve, so
+    /// the top-level `-L`/`-S` selection is recovered from raw argv — the same recovery the
+    /// unknown-command path uses.
+    fn run(self, argv: &[OsString]) -> Result<i32, ExitFailure> {
+        if let Some(skill) = ClaudeSkillInvocation::parse(&self.args)? {
+            return skill.run(argv);
+        }
+        let (socket_path, startup) = top_level_startup(argv)?;
+        launch(self, &socket_path, startup).map_err(|error| error.with_socket_context(&socket_path))
     }
 }
 
@@ -66,7 +89,7 @@ impl ClaudeInvocation {
 ///
 /// Fails when the private tmux shim cannot be installed, when the daemon cannot be reached, and
 /// with Claude's own nonzero gated exit status.
-pub(super) fn run(
+fn launch(
     invocation: ClaudeInvocation,
     socket_path: &Path,
     startup: StartupOptions,
@@ -78,9 +101,9 @@ pub(super) fn run(
 
     let workload = build_claude_workload(invocation.args)?;
     let directory = env::current_dir().map_err(|error| {
-        ExitFailure::new(
-            1,
-            format!("rmux claude: failed to resolve the current directory: {error}"),
+        failure(
+            "claude",
+            format_args!("failed to resolve the current directory: {error}"),
         )
     })?;
 
@@ -124,12 +147,9 @@ fn build_claude_workload(args: Vec<OsString>) -> Result<ClaudeWorkload, ExitFail
     ];
     for argument in args {
         argv.push(argument.into_string().map_err(|value| {
-            ExitFailure::new(
-                1,
-                format!(
-                    "rmux claude: argument is not valid UTF-8: {}",
-                    value.to_string_lossy()
-                ),
+            failure(
+                "claude",
+                format_args!("argument is not valid UTF-8: {}", value.to_string_lossy()),
             )
         })?);
     }
@@ -141,12 +161,9 @@ fn build_claude_workload(args: Vec<OsString>) -> Result<ClaudeWorkload, ExitFail
         environment.push((
             "PATH".to_owned(),
             Some(path.into_string().map_err(|value| {
-                ExitFailure::new(
-                    1,
-                    format!(
-                        "rmux claude: PATH is not valid UTF-8: {}",
-                        value.to_string_lossy()
-                    ),
+                failure(
+                    "claude",
+                    format_args!("PATH is not valid UTF-8: {}", value.to_string_lossy()),
                 )
             })?),
         ));
@@ -241,39 +258,30 @@ fn report_unrequested_direct_launch() {
 /// Requires `path` to be a plain directory owned by this uid, tightening group/world bits.
 fn validate_secure_owner_directory(path: &Path, label: &str) -> Result<(), ExitFailure> {
     let metadata = fs::symlink_metadata(path).map_err(|error| {
-        ExitFailure::new(
-            1,
-            format!(
-                "rmux claude: failed to inspect {label} '{}': {error}",
-                path.display()
-            ),
+        failure(
+            "claude",
+            format_args!("failed to inspect {label} '{}': {error}", path.display()),
         )
     })?;
     if metadata.file_type().is_symlink() {
-        return Err(ExitFailure::new(
-            1,
-            format!(
-                "rmux claude: refusing symlinked {label} '{}'",
-                path.display()
-            ),
+        return Err(failure(
+            "claude",
+            format_args!("refusing symlinked {label} '{}'", path.display()),
         ));
     }
     if !metadata.is_dir() {
-        return Err(ExitFailure::new(
-            1,
-            format!(
-                "rmux claude: refusing non-directory {label} '{}'",
-                path.display()
-            ),
+        return Err(failure(
+            "claude",
+            format_args!("refusing non-directory {label} '{}'", path.display()),
         ));
     }
     // SAFETY: `geteuid` reads the effective uid of the current process and has no preconditions.
     let uid = unsafe { libc::geteuid() };
     if metadata.uid() != uid {
-        return Err(ExitFailure::new(
-            1,
-            format!(
-                "rmux claude: refusing {label} '{}' owned by uid {}",
+        return Err(failure(
+            "claude",
+            format_args!(
+                "refusing {label} '{}' owned by uid {}",
                 path.display(),
                 metadata.uid()
             ),
@@ -286,30 +294,27 @@ fn validate_secure_owner_directory(path: &Path, label: &str) -> Result<(), ExitF
     }
 
     fs::set_permissions(path, fs::Permissions::from_mode(mode & !0o077)).map_err(|error| {
-        ExitFailure::new(
-            1,
-            format!(
-                "rmux claude: failed to tighten permissions on {label} '{}': {error}",
+        failure(
+            "claude",
+            format_args!(
+                "failed to tighten permissions on {label} '{}': {error}",
                 path.display()
             ),
         )
     })?;
     let tightened = fs::symlink_metadata(path).map_err(|error| {
-        ExitFailure::new(
-            1,
-            format!(
-                "rmux claude: failed to re-inspect {label} '{}': {error}",
-                path.display()
-            ),
+        failure(
+            "claude",
+            format_args!("failed to re-inspect {label} '{}': {error}", path.display()),
         )
     })?;
     if tightened.mode().trailing_zeros() >= 6 {
         Ok(())
     } else {
-        Err(ExitFailure::new(
-            1,
-            format!(
-                "rmux claude: refusing group/world-accessible {label} '{}'",
+        Err(failure(
+            "claude",
+            format_args!(
+                "refusing group/world-accessible {label} '{}'",
                 path.display()
             ),
         ))
@@ -318,86 +323,66 @@ fn validate_secure_owner_directory(path: &Path, label: &str) -> Result<(), ExitF
 
 /// Creates or repairs the per-user `tmux` symlink that points back at this executable.
 fn ensure_private_tmux_shim() -> Result<PrivateTmuxShim, ExitFailure> {
-    let dir = private_shim_dir()?;
+    let dir = user_home("claude")?.join(".local/share/rmux/claude-tmux-shim");
     fs::create_dir_all(&dir).map_err(|error| {
-        ExitFailure::new(
-            1,
-            format!(
-                "rmux claude: failed to create private tmux shim directory '{}': {error}",
+        failure(
+            "claude",
+            format_args!(
+                "failed to create private tmux shim directory '{}': {error}",
                 dir.display()
             ),
         )
     })?;
     validate_secure_owner_directory(&dir, "private tmux shim directory")?;
     let target = private_tmux_shim_target_binary()?;
-    let shim = dir.join(tmux_file_name());
+    let shim = dir.join("tmux");
+    let create = || {
+        symlink(&target, &shim).map_err(|error| {
+            failure(
+                "claude",
+                format_args!(
+                    "failed to create private tmux shim '{}': {error}",
+                    shim.display()
+                ),
+            )
+        })
+    };
     match fs::symlink_metadata(&shim) {
         Ok(metadata) if metadata.file_type().is_symlink() => {
             if !symlink_points_to(&shim, &target) {
                 fs::remove_file(&shim).map_err(|error| {
-                    ExitFailure::new(
-                        1,
-                        format!(
-                            "rmux claude: failed to replace private tmux shim '{}': {error}",
+                    failure(
+                        "claude",
+                        format_args!(
+                            "failed to replace private tmux shim '{}': {error}",
                             shim.display()
                         ),
                     )
                 })?;
-                symlink(&target, &shim).map_err(|error| {
-                    ExitFailure::new(
-                        1,
-                        format!(
-                            "rmux claude: failed to create private tmux shim '{}': {error}",
-                            shim.display()
-                        ),
-                    )
-                })?;
+                create()?;
             }
         }
         Ok(_) => {
-            return Err(ExitFailure::new(
-                1,
-                format!(
-                    "rmux claude: '{}' exists and is not a symlink; refusing to overwrite it",
+            return Err(failure(
+                "claude",
+                format_args!(
+                    "'{}' exists and is not a symlink; refusing to overwrite it",
                     shim.display()
                 ),
             ));
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            symlink(&target, &shim).map_err(|error| {
-                ExitFailure::new(
-                    1,
-                    format!(
-                        "rmux claude: failed to create private tmux shim '{}': {error}",
-                        shim.display()
-                    ),
-                )
-            })?;
-        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => create()?,
         Err(error) => {
-            return Err(ExitFailure::new(
-                1,
-                format!(
-                    "rmux claude: failed to inspect private tmux shim '{}': {error}",
+            return Err(failure(
+                "claude",
+                format_args!(
+                    "failed to inspect private tmux shim '{}': {error}",
                     shim.display()
                 ),
             ));
         }
     }
     Ok(PrivateTmuxShim::persistent(dir))
-}
-
-/// Always fails: the private `tmux` shim is only supported on Unix.
-/// Per-user shim directory at `$HOME/.local/share/rmux/claude-tmux-shim`.
-fn private_shim_dir() -> Result<PathBuf, ExitFailure> {
-    let home = env::var_os("HOME")
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| ExitFailure::new(1, "rmux claude: HOME is not set"))?;
-    Ok(PathBuf::from(home)
-        .join(".local")
-        .join("share")
-        .join("rmux")
-        .join("claude-tmux-shim"))
 }
 
 /// Resolves the binary that the private `tmux` symlink should point to.
@@ -408,32 +393,19 @@ fn private_tmux_shim_target_binary() -> Result<PathBuf, ExitFailure> {
 
 /// Prefers a `libexec` full helper beside `public`, falling back to `public` itself.
 fn private_tmux_shim_target_for_public_binary(public: &Path) -> PathBuf {
-    unix_full_helper_candidates(public)
+    FULL_HELPER_PATHS
         .into_iter()
+        .filter_map(|helper| Some(public.parent()?.join(helper)))
         .find(|candidate| candidate.is_file() && candidate.as_path() != public)
         .unwrap_or_else(|| public.to_path_buf())
 }
 
-/// Lists the `libexec`/`lib` places a full `rmux` helper may sit relative to `public`.
-fn unix_full_helper_candidates(public: &Path) -> Vec<PathBuf> {
-    let Some(parent) = public.parent() else {
-        return Vec::new();
-    };
-    vec![
-        parent.join("libexec").join("rmux").join(rmux_file_name()),
-        parent
-            .join("..")
-            .join("libexec")
-            .join("rmux")
-            .join(rmux_file_name()),
-        parent
-            .join("..")
-            .join("lib")
-            .join("rmux")
-            .join("libexec")
-            .join(rmux_file_name()),
-    ]
-}
+/// Where a full `rmux` helper may sit relative to the public binary's directory, preferred first.
+const FULL_HELPER_PATHS: [&str; 3] = [
+    "libexec/rmux/rmux",
+    "../libexec/rmux/rmux",
+    "../lib/rmux/libexec/rmux",
+];
 
 /// Locates this rmux executable, honoring the internal public-binary override variable.
 fn public_rmux_binary() -> Result<PathBuf, ExitFailure> {
@@ -445,9 +417,9 @@ fn public_rmux_binary() -> Result<PathBuf, ExitFailure> {
     }
 
     env::current_exe().map_err(|error| {
-        ExitFailure::new(
-            1,
-            format!("rmux claude: failed to resolve current rmux binary: {error}"),
+        failure(
+            "claude",
+            format_args!("failed to resolve current rmux binary: {error}"),
         )
     })
 }
@@ -468,55 +440,11 @@ fn path_with_shim_first_from(
         paths.extend(env::split_paths(&original));
     }
     env::join_paths(paths).map_err(|error| {
-        ExitFailure::new(
-            1,
-            format!("rmux claude: failed to build PATH with private tmux shim: {error}"),
+        failure(
+            "claude",
+            format_args!("failed to build PATH with private tmux shim: {error}"),
         )
     })
-}
-
-/// Reports whether the symlink at `shim` ultimately resolves to `target`.
-fn symlink_points_to(shim: &Path, target: &Path) -> bool {
-    let Ok(link_target) = fs::read_link(shim) else {
-        return false;
-    };
-    let resolved = if link_target.is_absolute() {
-        link_target
-    } else {
-        shim.parent()
-            .unwrap_or_else(|| Path::new("."))
-            .join(link_target)
-    };
-    paths_resolve_to_same_file(&resolved, target)
-}
-
-/// Compares two paths by canonical identity, false when either cannot be canonicalized.
-fn paths_resolve_to_same_file(left: &Path, right: &Path) -> bool {
-    let Ok(left) = fs::canonicalize(left) else {
-        return false;
-    };
-    let Ok(right) = fs::canonicalize(right) else {
-        return false;
-    };
-    left == right
-}
-
-/// File name of the `tmux` shim, with the platform executable suffix applied.
-fn tmux_file_name() -> OsString {
-    let mut name = OsString::from("tmux");
-    if !env::consts::EXE_SUFFIX.is_empty() {
-        name.push(env::consts::EXE_SUFFIX);
-    }
-    name
-}
-
-/// File name of the `rmux` helper, with the platform executable suffix applied.
-fn rmux_file_name() -> OsString {
-    let mut name = OsString::from("rmux");
-    if !env::consts::EXE_SUFFIX.is_empty() {
-        name.push(env::consts::EXE_SUFFIX);
-    }
-    name
 }
 
 #[cfg(test)]
@@ -524,10 +452,10 @@ fn rmux_file_name() -> OsString {
 mod tests {
     use super::{
         ClaudeInvocation, launch_attached_decision, path_with_shim_first_from,
-        should_report_direct_launch,
+        private_tmux_shim_target_for_public_binary, should_report_direct_launch,
     };
+    use crate::cli::aux_command::{AuxCommand, args};
     use std::env;
-    use std::ffi::OsString;
     use std::fs;
     use std::path::{Path, PathBuf};
 
@@ -545,17 +473,16 @@ mod tests {
         assert!(!launch_attached_decision(false, false));
     }
 
-    fn args(values: &[&str]) -> Vec<OsString> {
-        values.iter().map(OsString::from).collect()
-    }
-
     #[test]
     fn invocation_preserves_claude_arguments() {
-        let invocation = ClaudeInvocation::new(args(&[
+        let invocation = ClaudeInvocation::parse(&args(&[
+            "claude",
             "--dangerously-skip-permissions",
             "--teammate-mode",
             "in-process",
-        ]));
+        ]))
+        .expect("parse succeeds")
+        .expect("claude invocation");
 
         assert_eq!(
             invocation.args,
@@ -580,92 +507,43 @@ mod tests {
     }
 
     #[test]
-    fn unix_private_tmux_shim_prefers_packaged_full_helper() {
-        let root = unique_test_dir("unix-full-helper");
-        let bin = root.join("bin");
-        let libexec = root.join("libexec").join("rmux");
-        fs::create_dir_all(&bin).expect("bin dir");
-        fs::create_dir_all(&libexec).expect("libexec dir");
-        let public = bin.join("rmux");
-        let helper = libexec.join("rmux");
-        fs::write(&public, b"tiny").expect("public rmux");
-        fs::write(&helper, b"full").expect("full helper");
+    fn private_tmux_shim_prefers_packaged_full_helpers_in_layout_order() {
+        const STANDARD: &str = "libexec/rmux/rmux";
+        const PREFIX_LIB: &str = "lib/rmux/libexec/rmux";
+        for (label, helpers, expected) in [
+            ("full-helper", &[STANDARD][..], Some(STANDARD)),
+            ("prefix-lib-helper", &[PREFIX_LIB][..], Some(PREFIX_LIB)),
+            (
+                "helper-precedence",
+                &[STANDARD, PREFIX_LIB][..],
+                Some(STANDARD),
+            ),
+            ("no-helper", &[][..], None),
+        ] {
+            let root = env::temp_dir().join(format!(
+                "rmux-claude-launcher-{label}-{}",
+                std::process::id()
+            ));
+            let public = root.join("bin").join("rmux");
+            fs::create_dir_all(root.join("bin")).expect("bin dir");
+            fs::write(&public, b"tiny").expect("public rmux");
+            for helper in helpers {
+                let helper = root.join(helper);
+                fs::create_dir_all(helper.parent().expect("helper parent")).expect("helper dir");
+                fs::write(&helper, b"full").expect("full helper");
+            }
 
-        assert_eq!(
-            fs::canonicalize(super::private_tmux_shim_target_for_public_binary(&public))
-                .expect("canonical target"),
-            fs::canonicalize(helper).expect("canonical helper")
-        );
+            let target = private_tmux_shim_target_for_public_binary(&public);
+            match expected {
+                Some(helper) => assert_eq!(
+                    fs::canonicalize(target).expect("canonical target"),
+                    fs::canonicalize(root.join(helper)).expect("canonical helper"),
+                    "{label}"
+                ),
+                None => assert_eq!(target, public, "{label}"),
+            }
 
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn unix_private_tmux_shim_supports_prefix_lib_full_helper() {
-        let root = unique_test_dir("unix-prefix-lib-helper");
-        let bin = root.join("bin");
-        let libexec = root.join("lib").join("rmux").join("libexec");
-        fs::create_dir_all(&bin).expect("bin dir");
-        fs::create_dir_all(&libexec).expect("prefix libexec dir");
-        let public = bin.join("rmux");
-        let helper = libexec.join("rmux");
-        fs::write(&public, b"tiny").expect("public rmux");
-        fs::write(&helper, b"full").expect("full helper");
-
-        assert_eq!(
-            fs::canonicalize(super::private_tmux_shim_target_for_public_binary(&public))
-                .expect("canonical target"),
-            fs::canonicalize(helper).expect("canonical helper")
-        );
-
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn unix_private_tmux_shim_prefers_standard_libexec_layout() {
-        let root = unique_test_dir("unix-helper-precedence");
-        let bin = root.join("bin");
-        let standard = root.join("libexec").join("rmux");
-        let alternate = root.join("lib").join("rmux").join("libexec");
-        fs::create_dir_all(&bin).expect("bin dir");
-        fs::create_dir_all(&standard).expect("standard libexec dir");
-        fs::create_dir_all(&alternate).expect("alternate libexec dir");
-        let public = bin.join("rmux");
-        let standard_helper = standard.join("rmux");
-        let alternate_helper = alternate.join("rmux");
-        fs::write(&public, b"tiny").expect("public rmux");
-        fs::write(&standard_helper, b"standard").expect("standard helper");
-        fs::write(&alternate_helper, b"alternate").expect("alternate helper");
-
-        assert_eq!(
-            fs::canonicalize(super::private_tmux_shim_target_for_public_binary(&public))
-                .expect("canonical target"),
-            fs::canonicalize(standard_helper).expect("canonical helper")
-        );
-
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn unix_private_tmux_shim_falls_back_to_public_binary_without_helper() {
-        let root = unique_test_dir("unix-no-helper");
-        let bin = root.join("bin");
-        fs::create_dir_all(&bin).expect("bin dir");
-        let public = bin.join("rmux");
-        fs::write(&public, b"full").expect("public rmux");
-
-        assert_eq!(
-            super::private_tmux_shim_target_for_public_binary(&public),
-            public
-        );
-
-        let _ = fs::remove_dir_all(root);
-    }
-
-    fn unique_test_dir(label: &str) -> PathBuf {
-        env::temp_dir().join(format!(
-            "rmux-claude-launcher-{label}-{}",
-            std::process::id()
-        ))
+            let _ = fs::remove_dir_all(root);
+        }
     }
 }

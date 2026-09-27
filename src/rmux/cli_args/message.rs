@@ -1,6 +1,6 @@
 use clap::{ArgAction, Args};
 
-use super::QueuedCommand;
+use super::validate::{Validate, too_many_arguments_error};
 
 /// Parsed arguments of `display-message`, covering the message, its target, and output mode.
 #[derive(Debug, Clone, Args)]
@@ -40,16 +40,9 @@ pub(crate) struct DisplayMessageArgs {
     pub(crate) queue_command: String,
 }
 
-impl QueuedCommand for DisplayMessageArgs {
-    /// Records the original command line so the message can be requeued for later evaluation.
-    fn set_queue_command(&mut self, queue_command: String) {
-        self.queue_command = queue_command;
-    }
-}
-
-impl DisplayMessageArgs {
+impl Validate for DisplayMessageArgs {
     /// Rejects an unparsable `-d` delay and more than one message argument.
-    pub(crate) fn validate(self) -> Result<Self, clap::Error> {
+    fn validate(self, command_name: &'static str) -> Result<Self, clap::Error> {
         if let Some(delay) = self.delay.as_deref() {
             delay
                 .parse::<rmux_proto::DisplayMessageDurationMillis>()
@@ -58,10 +51,7 @@ impl DisplayMessageArgs {
                 })?;
         }
         if self.message.len() > 1 {
-            return Err(clap::Error::raw(
-                clap::error::ErrorKind::TooManyValues,
-                "command display-message: too many arguments (need at most 1)",
-            ));
+            return Err(too_many_arguments_error(command_name, 1));
         }
         Ok(self)
     }

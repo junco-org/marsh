@@ -4,83 +4,21 @@ use std::time::Instant;
 
 use rmux_core::events::PaneOutputSubscriptionKey;
 use rmux_proto::{
-    PaneId, PaneOutputCursorRequest, PaneOutputSubscriptionStart, SessionId,
-    SubscribePaneOutputRequest,
+    PaneId, PaneOutputCursorRequest, PaneOutputSubscriptionStart, SubscribePaneOutputRequest,
 };
 
 use crate::handler::exited_output_support::RetainedExitedPaneIdentities;
 use crate::pane_io::pane_output_channel_with_limits;
-
-async fn create_session(handler: &RequestHandler, name: &SessionName) -> SessionId {
-    let response = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name: name.clone(),
-            detached: true,
-            size: Some(TerminalSize { cols: 80, rows: 24 }),
-            environment: None,
-        }))
-        .await;
-    assert!(matches!(response, Response::NewSession(_)), "{response:?}");
-    handler
-        .state
-        .lock()
-        .await
-        .sessions
-        .session(name)
-        .expect("created session exists")
-        .id()
-}
-
-async fn create_grouped_session(
-    handler: &RequestHandler,
-    name: &SessionName,
-    group_target: &SessionName,
-) -> SessionId {
-    let response = handler
-        .handle(Request::NewSessionExt(Box::new(NewSessionExtRequest {
-            session_name: Some(name.clone()),
-            working_directory: None,
-            detached: true,
-            size: Some(TerminalSize { cols: 80, rows: 24 }),
-            environment: None,
-            group_target: Some(group_target.clone()),
-            attach_if_exists: false,
-            detach_other_clients: false,
-            kill_other_clients: false,
-            flags: None,
-            window_name: None,
-            print_session_info: false,
-            print_format: None,
-            command: None,
-            process_command: None,
-            client_environment: None,
-            skip_environment_update: false,
-        })))
-        .await;
-    assert!(matches!(response, Response::NewSession(_)), "{response:?}");
-    handler
-        .state
-        .lock()
-        .await
-        .sessions
-        .session(name)
-        .expect("created grouped session exists")
-        .id()
-}
+use crate::test_fixtures::Grouped;
 
 async fn rename(handler: &RequestHandler, old_name: SessionName, new_name: SessionName) {
-    let response = handler
-        .handle(Request::RenameSession(RenameSessionRequest {
+    let renamed = handler
+        .handle_ok(RenameSessionRequest {
             target: old_name,
             new_name: new_name.clone(),
-        }))
-        .await;
-    assert_eq!(
-        response,
-        Response::RenameSession(rmux_proto::RenameSessionResponse {
-            session_name: new_name,
         })
-    );
+        .await;
+    assert_eq!(renamed.session_name, new_name);
 }
 
 async fn subscribe_retained(
@@ -126,7 +64,8 @@ async fn rename_session_rekeys_retained_output_for_late_replay() {
     let handler = RequestHandler::new();
     let alpha = session_name("retained-rename-alpha");
     let beta = session_name("retained-rename-beta");
-    let session_id = create_session(&handler, &alpha).await;
+    handler.create_session(&alpha).await;
+    let session_id = handler.session_id_for_test(&alpha).await;
     let pane_id = PaneId::new(90_001);
     let old_target = PaneTarget::with_window(alpha.clone(), 0, 91);
     let old_pane = PaneOutputSubscriptionKey::new(alpha.clone(), pane_id);
@@ -162,7 +101,8 @@ async fn retained_output_captured_before_rename_but_inserted_afterward_is_normal
     let handler = RequestHandler::new();
     let alpha = session_name("retained-late-alpha");
     let beta = session_name("retained-late-beta");
-    let session_id = create_session(&handler, &alpha).await;
+    handler.create_session(&alpha).await;
+    let session_id = handler.session_id_for_test(&alpha).await;
     rename(&handler, alpha.clone(), beta.clone()).await;
 
     let pane_id = PaneId::new(90_002);
@@ -202,8 +142,10 @@ async fn grouped_alias_and_runtime_owner_renames_rekey_distinct_retained_identit
     let peer = session_name("retained-group-peer");
     let renamed_owner = session_name("retained-group-owner-renamed");
     let renamed_peer = session_name("retained-group-peer-renamed");
-    let owner_id = create_session(&handler, &owner).await;
-    let peer_id = create_grouped_session(&handler, &peer, &owner).await;
+    handler.create_session(&owner).await;
+    handler.create_session(Grouped(&peer, &owner)).await;
+    let owner_id = handler.session_id_for_test(&owner).await;
+    let peer_id = handler.session_id_for_test(&peer).await;
     let pane_id = PaneId::new(90_003);
     let target = PaneTarget::with_window(peer.clone(), 0, 93);
     let pane = PaneOutputSubscriptionKey::new(owner.clone(), pane_id);

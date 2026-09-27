@@ -1,6 +1,4 @@
-use super::{
-    after_hook_format_values, AccessMode, RequestHandler, ServerAccessStore, DEFAULT_SESSION_SIZE,
-};
+use super::{after_hook_format_values, AccessMode, RequestHandler, ServerAccessStore};
 use crate::control::ControlModeUpgrade;
 use crate::daemon::ShutdownHandle;
 use crate::pane_io::AttachControl;
@@ -10,12 +8,11 @@ use rmux_core::{
 use rmux_ipc::PeerIdentity;
 use rmux_os::identity::UserIdentity;
 use rmux_proto::{
-    ControlMode, DisplayMessageRequest, ErrorResponse, HasSessionRequest, HookLifecycle, HookName,
-    KillPaneRequest, KillSessionRequest, LayoutName, ListPanesRequest, ListSessionsRequest,
-    NewSessionExtRequest, NewSessionRequest, OptionName, PaneTarget, RenameSessionRequest, Request,
-    ResizePaneAdjustment, ResizePaneTargetActionRequest, Response, RmuxError, ScopeSelector,
-    SelectPaneRequest, SessionName, SetHookRequest, SetOptionMode, SetOptionRequest,
-    SplitWindowIdentityRequest, SplitWindowRequest, SplitWindowTarget,
+    DisplayMessageRequest, ErrorResponse, HasSessionRequest, HookName, KillPaneRequest,
+    KillSessionRequest, LayoutName, ListPanesRequest, ListSessionsRequest, NewSessionExtRequest,
+    NewSessionRequest, OptionName, PaneTarget, RenameSessionRequest, Request, ResizePaneAdjustment,
+    ResizePaneTargetActionRequest, Response, RmuxError, ScopeSelector, SelectPaneRequest,
+    SessionName, SetHookRequest, SplitWindowIdentityRequest, SplitWindowRequest,
     SplitWindowTargetActionRequest, Target, TerminalSize,
 };
 use std::sync::atomic::AtomicBool;
@@ -63,6 +60,44 @@ mod copy_mode_tests;
 
 #[path = "handler_overlay_tests.rs"]
 mod overlay_tests;
+
+/// Registers a plain control client for `control_pid` in `session_name`, with its queued events
+/// drained, and answers with its id and event receiver.
+async fn register_control_test_client(
+    handler: &RequestHandler,
+    control_pid: u32,
+    session_name: &SessionName,
+) -> (u64, mpsc::Receiver<crate::control::ControlServerEvent>) {
+    let (control_id, mut event_rx) = handler
+        .register_control_for_test(control_pid, Some(session_name))
+        .await;
+    while event_rx.try_recv().is_ok() {}
+    (control_id, event_rx)
+}
+
+/// Polls `has-session` for up to three seconds until `session_name` exists (or not) as `expected`.
+async fn wait_for_session_state(
+    handler: &RequestHandler,
+    session_name: SessionName,
+    expected: bool,
+) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        let exists = handler
+            .handle(Request::HasSession(HasSessionRequest {
+                target: session_name.clone(),
+            }))
+            .await;
+        if exists == Response::HasSession(rmux_proto::HasSessionResponse { exists: expected }) {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "session {session_name} did not reach exists={expected}; last response: {exists:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
 
 #[test]
 fn access_mode_for_peer_uses_user_identity_not_pid() {

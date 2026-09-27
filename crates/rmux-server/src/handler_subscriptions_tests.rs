@@ -5,14 +5,15 @@ use rmux_core::events::{
     OutputCursor, OutputCursorItem, OutputRing, PaneOutputSubscriptionKey, SubscriptionLimits,
 };
 use rmux_proto::{
-    NewSessionRequest, PaneId, PaneOutputCursorRequest, PaneOutputSubscriptionStart, PaneTarget,
-    PaneTargetRef, RenameSessionRequest, Request, Response, RmuxError, SessionId, SessionName,
-    SubscribePaneOutputRefRequest, SubscribePaneOutputRequest,
+    PaneId, PaneOutputCursorRequest, PaneOutputSubscriptionId, PaneOutputSubscriptionStart,
+    PaneTarget, PaneTargetRef, RenameSessionRequest, Request, Response, RmuxError, SessionId,
+    SessionName, SubscribePaneOutputRefRequest, SubscribePaneOutputRequest,
 };
 
 use crate::daemon::ShutdownHandle;
 use crate::handler::exited_output_support::RetainedExitedPaneIdentities;
 use crate::pane_io::pane_output_channel_with_limits;
+use crate::test_fixtures::{Fixture, Sizeless};
 
 use super::{lag_dto, OutputSubscriptionState, RequestHandler, MAX_LAG_RECENT_BYTES};
 use crate::handler::PendingShutdownReason;
@@ -34,6 +35,46 @@ static LIVE_SUBSCRIPTION_COMMIT_PAUSE: std::sync::Mutex<
 
 fn retained_identities() -> RetainedExitedPaneIdentities {
     RetainedExitedPaneIdentities::new(SessionId::new(1), SessionId::new(1))
+}
+
+async fn pane_id_for_target(handler: &RequestHandler, target: &PaneTarget) -> PaneId {
+    let state = handler.state.lock().await;
+    state
+        .sessions
+        .session(target.session_name())
+        .and_then(|session| session.window_at(target.window_index()))
+        .and_then(|window| window.pane(target.pane_index()))
+        .map(rmux_core::Pane::id)
+        .expect("pane target exists")
+}
+
+async fn pane_target_for_id(
+    handler: &RequestHandler,
+    session_name: &SessionName,
+    pane_id: PaneId,
+) -> Option<PaneTarget> {
+    let state = handler.state.lock().await;
+    let session = state.sessions.session(session_name)?;
+    session.windows().iter().find_map(|(window_index, window)| {
+        window
+            .panes()
+            .iter()
+            .find(|pane| pane.id() == pane_id)
+            .map(|pane| PaneTarget::with_window(session_name.clone(), *window_index, pane.index()))
+    })
+}
+
+/// Subscribes `connection_id` to the pane in `target` by its stable id, starting now, and answers
+/// with the subscription and that id.
+async fn subscribe_by_id(
+    handler: &RequestHandler,
+    connection_id: u64,
+    target: &PaneTarget,
+) -> (PaneOutputSubscriptionId, PaneId) {
+    let pane_id = pane_id_for_target(handler, target).await;
+    let request = SubscribePaneOutputRefRequest::fixture((target.session_name(), pane_id));
+    let subscribed = handler.subscribe_ok(connection_id, request).await;
+    (subscribed.subscription_id, pane_id)
 }
 
 fn install_live_subscription_commit_pause(
@@ -177,16 +218,7 @@ async fn live_subscription_commit_serializes_with_session_rename_rekey() {
     let alpha = SessionName::new("subscription-rename-alpha").expect("valid session name");
     let beta = SessionName::new("subscription-rename-beta").expect("valid session name");
     let target = PaneTarget::with_window(alpha.clone(), 0, 0);
-    let created = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name: alpha.clone(),
-            detached: true,
-            size: None,
-            environment: None,
-        }))
-        .await;
-    assert!(matches!(created, Response::NewSession(_)), "{created:?}");
-    handler.wait_for_initial_panes_for_test().await;
+    handler.create_session(Sizeless(&alpha)).await;
 
     let previous_key = {
         let state = handler.state.lock().await;

@@ -22,92 +22,6 @@ use super::*;
 const PROBE: &str = "@probe-combined-input";
 const CREDIT_PID: u32 = 94_401;
 
-async fn attach(
-    handler: &RequestHandler,
-    requester_pid: u32,
-    session: &rmux_proto::SessionName,
-) -> mpsc::UnboundedReceiver<crate::pane_io::AttachControl> {
-    let (control_tx, control_rx) = mpsc::unbounded_channel();
-    handler
-        .register_attach(requester_pid, session.clone(), control_tx)
-        .await;
-    control_rx
-}
-
-async fn enter_copy_mode(handler: &RequestHandler, target: &PaneTarget) {
-    let response = handler
-        .handle(Request::CopyMode(CopyModeRequest {
-            target: Some(target.clone()),
-            page_down: false,
-            exit_on_scroll: false,
-            hide_position: false,
-            mouse_drag_start: false,
-            cancel_mode: false,
-            scrollbar_scroll: false,
-            source: None,
-            page_up: false,
-        }))
-        .await;
-    assert!(matches!(response, Response::CopyMode(_)), "{response:?}");
-}
-
-async fn set_mode_keys(handler: &RequestHandler, session: &rmux_proto::SessionName, value: &str) {
-    let response = handler
-        .handle(Request::SetOption(SetOptionRequest {
-            scope: ScopeSelector::Window(WindowTarget::with_window(session.clone(), 0)),
-            option: OptionName::ModeKeys,
-            value: value.to_owned(),
-            mode: SetOptionMode::Replace,
-        }))
-        .await;
-    assert!(matches!(response, Response::SetOption(_)), "{response:?}");
-}
-
-async fn unbind(handler: &RequestHandler, table: &str, key: &str) {
-    let response = handler
-        .handle(Request::UnbindKey(UnbindKeyRequest {
-            table_name: table.to_owned(),
-            key: Some(key.to_owned()),
-            all: false,
-            quiet: true,
-        }))
-        .await;
-    assert!(matches!(response, Response::UnbindKey(_)), "{response:?}");
-}
-
-async fn bind(handler: &RequestHandler, table: &str, key: &str, command: &[&str]) {
-    let response = handler
-        .handle(Request::BindKey(Box::new(BindKeyRequest {
-            table_name: table.to_owned(),
-            key: key.to_owned(),
-            note: None,
-            repeat: false,
-            command: Some(command.iter().map(|part| (*part).to_owned()).collect()),
-        })))
-        .await;
-    assert!(matches!(response, Response::BindKey(_)), "{response:?}");
-}
-
-async fn probe_value(handler: &RequestHandler, name: &str) -> String {
-    let response = handler
-        .handle(Request::ShowOptions(rmux_proto::ShowOptionsRequest {
-            scope: rmux_proto::OptionScopeSelector::SessionGlobal,
-            name: Some(name.to_owned()),
-            value_only: true,
-            include_inherited: false,
-            quiet: true,
-            include_hooks: false,
-        }))
-        .await;
-    let Response::ShowOptions(response) = response else {
-        panic!("expected show-options response, got {response:?}");
-    };
-    String::from_utf8(response.command_output().stdout().to_vec())
-        .expect("option value is utf-8")
-        .trim()
-        .to_owned()
-}
-
 /// The per-client activity order, allocated by the handler's own counter.
 async fn client_activity_sequence(handler: &RequestHandler, attach_pid: u32) -> u64 {
     handler
@@ -131,30 +45,6 @@ async fn session_activity_at(handler: &RequestHandler, session: &rmux_proto::Ses
         .activity_at()
 }
 
-/// The pane's mode as `#{pane_mode}` renders it. An out-of-mode pane renders an
-/// empty value, so an absent row and an empty row mean the same thing.
-async fn pane_mode(handler: &RequestHandler, target: &PaneTarget) -> String {
-    let listed = handler
-        .handle(Request::ListPanes(Box::new(ListPanesRequest {
-            target: target.session_name().clone(),
-            format: Some("#{pane_mode}".to_owned()),
-            filter: None,
-            sort_order: None,
-            reversed: false,
-            target_window_index: None,
-        })))
-        .await;
-    let output = listed
-        .command_output()
-        .expect("list-panes returns command output");
-    String::from_utf8_lossy(output.stdout())
-        .lines()
-        .next()
-        .unwrap_or_default()
-        .trim()
-        .to_owned()
-}
-
 /// A key the table leaves unbound is swallowed rather than forwarded, and still
 /// counts as use of the session.
 ///
@@ -170,12 +60,19 @@ async fn an_unbound_copy_mode_key_still_counts_as_session_use() {
     let target = PaneTarget::new(alpha.clone(), 0);
 
     create_quiet_input_session(&handler, &alpha).await;
-    let _control_rx = attach(&handler, CREDIT_PID, &alpha).await;
+    let _control_rx = handler.attach_client(CREDIT_PID, &alpha).await;
     set_mode_keys(&handler, &alpha, "emacs").await;
     // Leave the key with no binding at all: there is no hardcoded fallback
     // behind the table any more, so this key can only be swallowed.
-    unbind(&handler, "copy-mode", "Enter").await;
-    enter_copy_mode(&handler, &target).await;
+    handler
+        .handle_ok(UnbindKeyRequest {
+            table_name: "copy-mode".to_owned(),
+            key: Some("Enter".to_owned()),
+            all: false,
+            quiet: true,
+        })
+        .await;
+    handler.handle_ok(CopyModeRequest::fixture(&target)).await;
 
     let sequence_before = client_activity_sequence(&handler, CREDIT_PID).await;
     let activity_before = session_activity_at(&handler, &alpha).await;
@@ -222,7 +119,7 @@ async fn a_synthesized_copy_mode_escape_credits_activity_exactly_once() {
         let target = PaneTarget::new(alpha.clone(), 0);
 
         create_quiet_input_session(&handler, &alpha).await;
-        let _control_rx = attach(&handler, CREDIT_PID, &alpha).await;
+        let _control_rx = handler.attach_client(CREDIT_PID, &alpha).await;
         set_mode_keys(&handler, &alpha, mode_keys).await;
         bind(
             &handler,
@@ -231,7 +128,7 @@ async fn a_synthesized_copy_mode_escape_credits_activity_exactly_once() {
             &["set-option", "-g", PROBE, "HIT-Escape"],
         )
         .await;
-        enter_copy_mode(&handler, &target).await;
+        handler.handle_ok(CopyModeRequest::fixture(&target)).await;
 
         let sequence_before = client_activity_sequence(&handler, CREDIT_PID).await;
 

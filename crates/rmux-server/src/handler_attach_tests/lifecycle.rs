@@ -11,21 +11,17 @@ async fn attached_remain_on_exit_strips_the_submitted_exit_line_from_dead_pane_c
     let handler = RequestHandler::new();
     let requester_pid = std::process::id();
     let alpha = session_name("alpha");
-    let mut control_rx = create_exit_attached_session(&handler, requester_pid, &alpha).await;
+    let mut control_rx =
+        create_line_exiting_attached_session(&handler, requester_pid, &alpha).await;
     let target = PaneTarget::new(alpha.clone(), 0);
 
-    assert!(matches!(
-        handler
-            .handle(Request::SetOption(SetOptionRequest {
-                scope: ScopeSelector::Pane(target.clone()),
-                option: OptionName::RemainOnExit,
-                value: "on".to_owned(),
-                mode: SetOptionMode::Replace,
-            }))
-            .await,
-        Response::SetOption(_)
-    ));
-    prepare_exit_prompt(&handler, &target).await;
+    handler
+        .set_option(
+            ScopeSelector::Pane(target.clone()),
+            OptionName::RemainOnExit,
+            "on",
+        )
+        .await;
     handler
         .active_attach
         .lock()
@@ -55,7 +51,9 @@ async fn attached_remain_on_exit_strips_the_submitted_exit_line_from_dead_pane_c
         .handle_attached_live_input_for_test(requester_pid, ATTACHED_EXIT_INPUT)
         .await
         .expect("attached exit input");
-    wait_for_dead_pane(&handler, &alpha, 0, 0).await;
+    handler
+        .wait_for_pane_exit_for_test(&PaneTarget::with_window(alpha.clone(), 0, 0))
+        .await;
 
     let mouse_tracking_enables = [
         b"\x1b[?1000h".as_slice(),
@@ -138,32 +136,17 @@ async fn attached_display_message_print_reports_client_size_and_cursor_position(
         .expect("attached terminal geometry is applied");
     let target = PaneTarget::new(alpha.clone(), 0);
 
-    replace_transcript_contents(
-        &handler,
-        &target,
-        TerminalSize { cols: 80, rows: 23 },
-        b"PROMPT> ",
-    )
-    .await;
-
-    let response = handler
-        .handle(Request::DisplayMessage(rmux_proto::DisplayMessageRequest {
-            target: None,
-            print: true,
-            message: Some(
-                "#{client_width}x#{client_height}|#{cursor_x}|#{cursor_y}|#{session_width}x#{session_height}|#{pane_width}x#{pane_height}"
-                    .to_owned(),
-            ),
-            empty_target_context: false,
-            }))
+    handler
+        .replace_transcript_for_test(&target, TerminalSize { cols: 80, rows: 23 }, b"PROMPT> ")
         .await;
-    let Response::DisplayMessage(response) = response else {
-        panic!("expected display-message response");
-    };
-    let output = response
-        .command_output()
-        .expect("display-message -p returns output");
-    assert_eq!(output.stdout(), b"80x24|8|0|80x23|80x23\n");
+
+    let output = handler
+        .display_print(
+            None,
+            "#{client_width}x#{client_height}|#{cursor_x}|#{cursor_y}|#{session_width}x#{session_height}|#{pane_width}x#{pane_height}",
+        )
+        .await;
+    assert_eq!(output, b"80x24|8|0|80x23|80x23\n");
 }
 
 #[tokio::test]
@@ -171,10 +154,8 @@ async fn attached_exit_on_last_pane_closes_the_session_and_client() {
     let handler = RequestHandler::new();
     let requester_pid = std::process::id();
     let alpha = session_name("alpha");
-    let mut control_rx = create_exit_attached_session(&handler, requester_pid, &alpha).await;
-    let target = PaneTarget::new(alpha.clone(), 0);
-
-    prepare_exit_prompt(&handler, &target).await;
+    let mut control_rx =
+        create_line_exiting_attached_session(&handler, requester_pid, &alpha).await;
     drain_attach_controls(&mut control_rx);
 
     handler
@@ -202,19 +183,16 @@ async fn attached_last_pane_exit_honors_detach_on_destroy_off() {
     let requester_pid = std::process::id();
     let beta = session_name("pane-exit-destroy-beta");
     let alpha = session_name("pane-exit-destroy-alpha");
-    create_quiet_session(&handler, &beta).await;
-    let mut control_rx = create_exit_attached_session(&handler, requester_pid, &alpha).await;
-    let target = PaneTarget::new(alpha.clone(), 0);
-    let response = handler
-        .handle(Request::SetOption(SetOptionRequest {
-            scope: ScopeSelector::Session(alpha.clone()),
-            option: OptionName::DetachOnDestroy,
-            value: "off".to_owned(),
-            mode: SetOptionMode::Replace,
-        }))
+    handler.create_session(Quiet(&beta)).await;
+    let mut control_rx =
+        create_line_exiting_attached_session(&handler, requester_pid, &alpha).await;
+    handler
+        .set_option(
+            ScopeSelector::Session(alpha.clone()),
+            OptionName::DetachOnDestroy,
+            "off",
+        )
         .await;
-    assert!(matches!(response, Response::SetOption(_)), "{response:?}");
-    prepare_exit_prompt(&handler, &target).await;
     drain_attach_controls(&mut control_rx);
 
     handler
@@ -245,16 +223,6 @@ async fn attached_last_pane_exit_honors_detach_on_destroy_off() {
     assert_eq!(active.session_name, beta);
     assert!(!active.closing.load(Ordering::SeqCst));
 }
-
-async fn create_exit_attached_session(
-    handler: &RequestHandler,
-    requester_pid: u32,
-    session: &SessionName,
-) -> mpsc::UnboundedReceiver<AttachControl> {
-    create_line_exiting_attached_session(handler, requester_pid, session).await
-}
-
-async fn prepare_exit_prompt(_handler: &RequestHandler, _target: &PaneTarget) {}
 
 #[tokio::test]
 async fn attached_keystroke_stub_returns_key_dispatched_ack() {
@@ -319,17 +287,13 @@ async fn attached_control_space_prefix_activates_prefix_table() {
     let requester_pid = std::process::id();
     let alpha = session_name("alpha");
     let _control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
-    assert!(matches!(
-        handler
-            .handle(Request::SetOption(SetOptionRequest {
-                scope: ScopeSelector::Session(alpha.clone()),
-                option: OptionName::Prefix,
-                value: "C-Space".to_owned(),
-                mode: SetOptionMode::Replace,
-            }))
-            .await,
-        Response::SetOption(_)
-    ));
+    handler
+        .set_option(
+            ScopeSelector::Session(alpha.clone()),
+            OptionName::Prefix,
+            "C-Space",
+        )
+        .await;
 
     handler
         .handle_attached_live_input_for_test(requester_pid, b"\x00")
@@ -352,17 +316,13 @@ async fn attached_control_space_prefix_c_creates_window() {
     let requester_pid = std::process::id();
     let alpha = session_name("alpha");
     let _control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
-    assert!(matches!(
-        handler
-            .handle(Request::SetOption(SetOptionRequest {
-                scope: ScopeSelector::Session(alpha.clone()),
-                option: OptionName::Prefix,
-                value: "C-Space".to_owned(),
-                mode: SetOptionMode::Replace,
-            }))
-            .await,
-        Response::SetOption(_)
-    ));
+    handler
+        .set_option(
+            ScopeSelector::Session(alpha.clone()),
+            OptionName::Prefix,
+            "C-Space",
+        )
+        .await;
 
     handler
         .handle_attached_live_input_for_test(requester_pid, b"\x00c")
@@ -382,17 +342,13 @@ async fn attached_printable_space_prefix_c_creates_window() {
     let requester_pid = std::process::id();
     let alpha = session_name("alpha");
     let _control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
-    assert!(matches!(
-        handler
-            .handle(Request::SetOption(SetOptionRequest {
-                scope: ScopeSelector::Session(alpha.clone()),
-                option: OptionName::Prefix,
-                value: "Space".to_owned(),
-                mode: SetOptionMode::Replace,
-            }))
-            .await,
-        Response::SetOption(_)
-    ));
+    handler
+        .set_option(
+            ScopeSelector::Session(alpha.clone()),
+            OptionName::Prefix,
+            "Space",
+        )
+        .await;
 
     handler
         .handle_attached_live_input_for_test(requester_pid, b" c")
@@ -437,17 +393,13 @@ async fn attached_send_prefix_emits_the_configured_prefix_byte() {
     let requester_pid = std::process::id();
     let alpha = session_name("alpha");
     let _control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
-    assert!(matches!(
-        handler
-            .handle(Request::SetOption(SetOptionRequest {
-                scope: ScopeSelector::Session(alpha.clone()),
-                option: OptionName::Prefix,
-                value: "C-a".to_owned(),
-                mode: SetOptionMode::Replace,
-            }))
-            .await,
-        Response::SetOption(_)
-    ));
+    handler
+        .set_option(
+            ScopeSelector::Session(alpha.clone()),
+            OptionName::Prefix,
+            "C-a",
+        )
+        .await;
     let capture = RawPaneInputProbe::start(&handler, &alpha, "attached-prefix-configured", 1).await;
 
     handler

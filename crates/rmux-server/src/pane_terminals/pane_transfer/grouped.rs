@@ -1,11 +1,13 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
+use marsh_lib::{extend_occurrence_map, group_keys_by_value};
 use rmux_core::{BreakPaneOptions, PaneId, PaneJoinOptions, PaneSwapOptions, SessionPaneTarget};
 use rmux_proto::{
     BreakPaneRequest, BreakPaneResponse, JoinPaneRequest, JoinPaneResponse, PaneTarget, RmuxError,
     SessionName, SwapPaneResponse, WindowTarget,
 };
 
+use super::super::window_indices::window_ids_by_index;
 use super::super::{session_not_found, HandlerState};
 use super::window_metadata::PaneTransferWindowMetadata;
 use super::{join_pane_internal_direction, pane_id_for_target, pane_index_for_id};
@@ -385,14 +387,6 @@ impl HandlerState {
     }
 }
 
-fn window_ids_by_index(session: &rmux_core::Session) -> BTreeMap<u32, u32> {
-    session
-        .windows()
-        .iter()
-        .map(|(window_index, window)| (*window_index, window.id().as_u32()))
-        .collect()
-}
-
 fn break_window_index_map(
     state: &HandlerState,
     session_name: &SessionName,
@@ -406,8 +400,8 @@ fn break_window_index_map(
         .session(session_name)
         .ok_or_else(|| session_not_found(session_name))?;
     let after = window_ids_by_index(session);
-    let mut old_by_id = window_indexes_by_id(before);
-    let mut new_by_id = window_indexes_by_id(&after);
+    let mut old_by_id = group_keys_by_value(before.iter().map(|(&index, &id)| (index, id)));
+    let mut new_by_id = group_keys_by_value(after.iter().map(|(&index, &id)| (index, id)));
     let mut index_map = BTreeMap::new();
 
     if source_window_is_single_pane {
@@ -435,24 +429,12 @@ fn break_window_index_map(
         )?;
     }
 
-    for (window_id, old_indexes) in old_by_id {
-        let new_indexes = new_by_id.remove(&window_id).unwrap_or_default();
-        if old_indexes.len() != new_indexes.len() {
-            return Err(RmuxError::Server(format!(
-                "window @{window_id} occurrence count changed during break-pane remap"
-            )));
-        }
-        index_map.extend(old_indexes.into_iter().zip(new_indexes));
-    }
+    extend_occurrence_map(&mut index_map, old_by_id, new_by_id, |window_id| {
+        RmuxError::Server(format!(
+            "window @{window_id} occurrence count changed during break-pane remap"
+        ))
+    })?;
     Ok(index_map)
-}
-
-fn window_indexes_by_id(indexes: &BTreeMap<u32, u32>) -> BTreeMap<u32, Vec<u32>> {
-    let mut by_id = BTreeMap::<u32, Vec<u32>>::new();
-    for (window_index, window_id) in indexes {
-        by_id.entry(*window_id).or_default().push(*window_index);
-    }
-    by_id
 }
 
 fn remove_window_index_occurrence(

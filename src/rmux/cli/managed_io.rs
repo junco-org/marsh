@@ -990,7 +990,13 @@ fn consume_chunk(
             if bytes.is_empty() {
                 progress.saw_end = true;
             } else {
-                write_stdout(&bytes)?;
+                let mut stdout = io::stdout().lock();
+                stdout
+                    .write_all(&bytes)
+                    .and_then(|()| stdout.flush())
+                    .map_err(|error| {
+                        ExitFailure::new(1, format!("rmux: failed to write output: {error}"))
+                    })?;
             }
         }
         rmux_sdk::PaneOutputChunk::Lag(notice) => {
@@ -1089,15 +1095,6 @@ async fn pump_output(
 fn stable_pane_id(pane: &PaneTargetRef) -> Result<rmux_proto::PaneId, ExitFailure> {
     pane.pane_id()
         .ok_or_else(|| ExitFailure::new(1, "rmux: managed pane has no stable identity"))
-}
-
-/// Writes raw pane bytes to stdout without decoding them.
-fn write_stdout(bytes: &[u8]) -> Result<(), ExitFailure> {
-    let mut stdout = io::stdout().lock();
-    stdout
-        .write_all(bytes)
-        .and_then(|()| stdout.flush())
-        .map_err(|error| ExitFailure::new(1, format!("rmux: failed to write output: {error}")))
 }
 
 /// Forwards stdin to the workload pane on its own thread and connection.

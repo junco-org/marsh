@@ -1,32 +1,17 @@
 use super::*;
+use crate::test_fixtures::{Fixture, Sizeless};
 
 #[tokio::test]
 async fn split_window_routes_session_and_pane_targets_to_the_expected_panes() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
 
-    let created = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name: alpha.clone(),
-            detached: true,
-            size: Some(TerminalSize {
-                cols: 120,
-                rows: 40,
-            }),
-
-            environment: None,
-        }))
+    handler
+        .create_session((&alpha, TerminalSize::new(120, 40)))
         .await;
-    assert!(matches!(created, Response::NewSession(_)));
 
     let first_split = handler
-        .handle(Request::SplitWindow(SplitWindowRequest {
-            target: SplitWindowTarget::Session(alpha.clone()),
-            direction: rmux_proto::SplitDirection::Vertical,
-            before: false,
-
-            environment: None,
-        }))
+        .handle(Request::SplitWindow(SplitWindowRequest::fixture(&alpha)))
         .await;
     assert_eq!(
         first_split,
@@ -36,13 +21,9 @@ async fn split_window_routes_session_and_pane_targets_to_the_expected_panes() {
     );
 
     let selected = handler
-        .handle(Request::SelectPane(Box::new(SelectPaneRequest {
-            target: PaneTarget::new(alpha.clone(), 1),
-            title: None,
-            style: None,
-            input_disabled: None,
-            preserve_zoom: false,
-        })))
+        .handle(Request::SelectPane(Box::new(SelectPaneRequest::fixture(
+            PaneTarget::new(alpha.clone(), 1),
+        ))))
         .await;
     assert_eq!(
         selected,
@@ -52,13 +33,7 @@ async fn split_window_routes_session_and_pane_targets_to_the_expected_panes() {
     );
 
     let active_split = handler
-        .handle(Request::SplitWindow(SplitWindowRequest {
-            target: SplitWindowTarget::Session(alpha.clone()),
-            direction: rmux_proto::SplitDirection::Vertical,
-            before: false,
-
-            environment: None,
-        }))
+        .handle(Request::SplitWindow(SplitWindowRequest::fixture(&alpha)))
         .await;
     assert_eq!(
         active_split,
@@ -68,13 +43,9 @@ async fn split_window_routes_session_and_pane_targets_to_the_expected_panes() {
     );
 
     let explicit_split = handler
-        .handle(Request::SplitWindow(SplitWindowRequest {
-            target: SplitWindowTarget::Pane(PaneTarget::new(alpha.clone(), 0)),
-            direction: rmux_proto::SplitDirection::Vertical,
-            before: false,
-
-            environment: None,
-        }))
+        .handle(Request::SplitWindow(SplitWindowRequest::fixture(
+            PaneTarget::new(alpha.clone(), 0),
+        )))
         .await;
     assert_eq!(
         explicit_split,
@@ -103,15 +74,7 @@ async fn target_action_split_and_resize_resolve_raw_targets_server_side() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
 
-    let created = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name: alpha.clone(),
-            detached: true,
-            size: Some(TerminalSize { cols: 80, rows: 24 }),
-            environment: None,
-        }))
-        .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    handler.create_session(&alpha).await;
 
     let split = handler
         .handle(Request::SplitWindowTargetAction(Box::new(
@@ -161,28 +124,10 @@ async fn sdk_split_identity_returns_visible_base_index_and_stable_id_atomically(
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
 
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: alpha.clone(),
-                detached: true,
-                size: Some(TerminalSize { cols: 80, rows: 24 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
-    assert!(matches!(
-        handler
-            .handle(Request::SetOption(SetOptionRequest {
-                scope: ScopeSelector::Global,
-                option: OptionName::PaneBaseIndex,
-                value: "5".to_owned(),
-                mode: SetOptionMode::Replace,
-            }))
-            .await,
-        Response::SetOption(_)
-    ));
+    handler.create_session(&alpha).await;
+    handler
+        .set_option(ScopeSelector::Global, OptionName::PaneBaseIndex, "5")
+        .await;
 
     let response = handler
         .handle(Request::SplitWindowIdentity(Box::new(
@@ -228,17 +173,7 @@ async fn sdk_split_identity_accepts_a_stable_pane_target() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha-stable-split");
 
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: alpha.clone(),
-                detached: true,
-                size: Some(TerminalSize { cols: 80, rows: 24 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
+    handler.create_session(&alpha).await;
     let original_pane_id = {
         let state = handler.state.lock().await;
         state
@@ -285,28 +220,8 @@ async fn sdk_split_identity_rejects_a_reindexed_replacement_after_resolution() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha-stale-split");
 
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: alpha.clone(),
-                detached: true,
-                size: Some(TerminalSize { cols: 80, rows: 24 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
-    assert!(matches!(
-        handler
-            .handle(Request::SplitWindow(SplitWindowRequest {
-                target: SplitWindowTarget::Session(alpha.clone()),
-                direction: rmux_proto::SplitDirection::Vertical,
-                before: false,
-                environment: None,
-            }))
-            .await,
-        Response::SplitWindow(_)
-    ));
+    handler.create_session(&alpha).await;
+    handler.handle_ok(SplitWindowRequest::fixture(&alpha)).await;
     let (removed_pane_id, surviving_pane_id) = {
         let state = handler.state.lock().await;
         let window = state
@@ -352,15 +267,12 @@ async fn sdk_split_identity_rejects_a_reindexed_replacement_after_resolution() {
         .await
         .expect("stable split reaches the post-resolution pause");
 
-    assert!(matches!(
-        handler
-            .handle(Request::KillPane(KillPaneRequest {
-                target: PaneTarget::new(alpha.clone(), 0),
-                kill_all_except: false,
-            }))
-            .await,
-        Response::KillPane(_)
-    ));
+    handler
+        .handle_ok(KillPaneRequest {
+            target: PaneTarget::new(alpha.clone(), 0),
+            kill_all_except: false,
+        })
+        .await;
     pause.release.notify_one();
 
     assert_eq!(
@@ -388,36 +300,15 @@ async fn select_pane_style_sets_pane_style_and_format_colours() {
     let alpha = session_name("alpha");
     let target = PaneTarget::new(alpha.clone(), 1);
 
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: alpha.clone(),
-                detached: true,
-                size: Some(TerminalSize { cols: 80, rows: 10 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
-    assert!(matches!(
-        handler
-            .handle(Request::SplitWindow(SplitWindowRequest {
-                target: SplitWindowTarget::Session(alpha.clone()),
-                direction: rmux_proto::SplitDirection::Vertical,
-                before: false,
-                environment: None,
-            }))
-            .await,
-        Response::SplitWindow(_)
-    ));
+    handler
+        .create_session((&alpha, TerminalSize::new(80, 10)))
+        .await;
+    handler.handle_ok(SplitWindowRequest::fixture(&alpha)).await;
 
     let response = handler
         .handle(Request::SelectPane(Box::new(SelectPaneRequest {
-            target: target.clone(),
-            title: None,
             style: Some("fg=blue,bg=red".to_owned()),
-            input_disabled: None,
-            preserve_zoom: false,
+            ..Fixture::fixture(&target)
         })))
         .await;
 
@@ -437,21 +328,10 @@ async fn select_pane_style_sets_pane_style_and_format_colours() {
         );
     }
 
-    let response = handler
-        .handle(Request::DisplayMessage(DisplayMessageRequest {
-            target: Some(Target::Pane(target)),
-            print: true,
-            message: Some("#{pane_active}:#{pane_fg}:#{pane_bg}".to_owned()),
-            empty_target_context: false,
-        }))
+    let output = handler
+        .display_print(target, "#{pane_active}:#{pane_fg}:#{pane_bg}")
         .await;
-    let Response::DisplayMessage(response) = response else {
-        panic!("expected display-message response");
-    };
-    let output = response
-        .command_output()
-        .expect("display-message -p returns output");
-    assert_eq!(output.stdout(), b"1:blue:red\n");
+    assert_eq!(output, b"1:blue:red\n");
 }
 
 #[tokio::test]
@@ -459,19 +339,9 @@ async fn split_window_rolls_back_the_session_when_terminal_resize_fails() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
 
-    let created = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name: alpha.clone(),
-            detached: true,
-            size: Some(TerminalSize {
-                cols: 120,
-                rows: 40,
-            }),
-
-            environment: None,
-        }))
+    handler
+        .create_session((&alpha, TerminalSize::new(120, 40)))
         .await;
-    assert!(matches!(created, Response::NewSession(_)));
 
     {
         let mut state = handler.state.lock().await;
@@ -479,13 +349,7 @@ async fn split_window_rolls_back_the_session_when_terminal_resize_fails() {
     }
 
     let failed_split = handler
-        .handle(Request::SplitWindow(SplitWindowRequest {
-            target: SplitWindowTarget::Session(alpha.clone()),
-            direction: rmux_proto::SplitDirection::Vertical,
-            before: false,
-
-            environment: None,
-        }))
+        .handle(Request::SplitWindow(SplitWindowRequest::fixture(&alpha)))
         .await;
     assert_eq!(
         failed_split,
@@ -505,13 +369,7 @@ async fn split_window_rolls_back_the_session_when_terminal_resize_fails() {
     }
 
     let retried_split = handler
-        .handle(Request::SplitWindow(SplitWindowRequest {
-            target: SplitWindowTarget::Session(alpha.clone()),
-            direction: rmux_proto::SplitDirection::Vertical,
-            before: false,
-
-            environment: None,
-        }))
+        .handle(Request::SplitWindow(SplitWindowRequest::fixture(&alpha)))
         .await;
     assert_eq!(
         retried_split,
@@ -526,27 +384,14 @@ async fn horizontal_split_updates_layout_and_geometry() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
 
-    let created = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name: alpha.clone(),
-            detached: true,
-            size: Some(TerminalSize {
-                cols: 100,
-                rows: 50,
-            }),
-
-            environment: None,
-        }))
+    handler
+        .create_session((&alpha, TerminalSize::new(100, 50)))
         .await;
-    assert!(matches!(created, Response::NewSession(_)));
 
     let split = handler
         .handle(Request::SplitWindow(SplitWindowRequest {
-            target: SplitWindowTarget::Session(alpha.clone()),
             direction: rmux_proto::SplitDirection::Horizontal,
-            before: false,
-
-            environment: None,
+            ..Fixture::fixture(&alpha)
         }))
         .await;
     assert_eq!(
@@ -574,56 +419,23 @@ async fn kill_pane_removes_the_terminal_and_uses_last_pane_fallback() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
 
-    let created = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name: alpha.clone(),
-            detached: true,
-            size: Some(TerminalSize {
-                cols: 120,
-                rows: 40,
-            }),
-
-            environment: None,
-        }))
+    handler
+        .create_session((&alpha, TerminalSize::new(120, 40)))
         .await;
-    assert!(matches!(created, Response::NewSession(_)));
 
-    assert!(matches!(
-        handler
-            .handle(Request::SplitWindow(SplitWindowRequest {
-                target: SplitWindowTarget::Session(alpha.clone()),
-                direction: rmux_proto::SplitDirection::Vertical,
-                before: false,
-
-                environment: None,
-            }))
-            .await,
-        Response::SplitWindow(_)
-    ));
-    assert!(matches!(
-        handler
-            .handle(Request::SelectPane(Box::new(SelectPaneRequest {
-                target: PaneTarget::new(alpha.clone(), 1),
-                title: None,
-                style: None,
-                input_disabled: None,
-                preserve_zoom: false,
-            })))
-            .await,
-        Response::SelectPane(_)
-    ));
-    assert!(matches!(
-        handler
-            .handle(Request::SelectPane(Box::new(SelectPaneRequest {
-                target: PaneTarget::new(alpha.clone(), 0),
-                title: None,
-                style: None,
-                input_disabled: None,
-                preserve_zoom: false,
-            })))
-            .await,
-        Response::SelectPane(_)
-    ));
+    handler.handle_ok(SplitWindowRequest::fixture(&alpha)).await;
+    handler
+        .handle_ok(SelectPaneRequest::fixture(PaneTarget::new(
+            alpha.clone(),
+            1,
+        )))
+        .await;
+    handler
+        .handle_ok(SelectPaneRequest::fixture(PaneTarget::new(
+            alpha.clone(),
+            0,
+        )))
+        .await;
 
     let (removed_pane_id, surviving_pane_id) = {
         let state = handler.state.lock().await;
@@ -692,32 +504,11 @@ async fn kill_pane_rolls_back_when_terminal_resize_fails() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
 
-    let created = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name: alpha.clone(),
-            detached: true,
-            size: Some(TerminalSize {
-                cols: 120,
-                rows: 40,
-            }),
-
-            environment: None,
-        }))
+    handler
+        .create_session((&alpha, TerminalSize::new(120, 40)))
         .await;
-    assert!(matches!(created, Response::NewSession(_)));
 
-    assert!(matches!(
-        handler
-            .handle(Request::SplitWindow(SplitWindowRequest {
-                target: SplitWindowTarget::Session(alpha.clone()),
-                direction: rmux_proto::SplitDirection::Vertical,
-                before: false,
-
-                environment: None,
-            }))
-            .await,
-        Response::SplitWindow(_)
-    ));
+    handler.handle_ok(SplitWindowRequest::fixture(&alpha)).await;
 
     let removed_pane_id = {
         let state = handler.state.lock().await;
@@ -762,20 +553,9 @@ async fn kill_last_pane_in_only_window_removes_the_session() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
 
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: alpha.clone(),
-                detached: true,
-                size: Some(TerminalSize {
-                    cols: 120,
-                    rows: 40
-                }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
+    handler
+        .create_session((&alpha, TerminalSize::new(120, 40)))
+        .await;
 
     let killed = handler
         .handle(Request::KillPane(KillPaneRequest {
@@ -803,27 +583,14 @@ async fn resize_pane_rolls_back_geometry_when_terminal_resize_fails() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
 
-    let created = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name: alpha.clone(),
-            detached: true,
-            size: Some(TerminalSize {
-                cols: 200,
-                rows: 50,
-            }),
-
-            environment: None,
-        }))
+    handler
+        .create_session((&alpha, TerminalSize::new(200, 50)))
         .await;
-    assert!(matches!(created, Response::NewSession(_)));
 
     let split = handler
         .handle(Request::SplitWindow(SplitWindowRequest {
-            target: SplitWindowTarget::Session(alpha.clone()),
             direction: rmux_proto::SplitDirection::Horizontal,
-            before: false,
-
-            environment: None,
+            ..Fixture::fixture(&alpha)
         }))
         .await;
     assert_eq!(
@@ -895,15 +662,7 @@ async fn resize_pane_noop_validates_target_slot() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
 
-    let created = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name: alpha.clone(),
-            detached: true,
-            size: None,
-            environment: None,
-        }))
-        .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    handler.create_session(Sizeless(&alpha)).await;
 
     let missing_pane_resize = handler
         .handle(Request::ResizePane(rmux_proto::ResizePaneRequest {

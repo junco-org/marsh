@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use rmux_proto::{OptionName, RmuxError, SessionName};
 
-use super::session_mutation::WindowMutationMetadataSnapshot;
+use super::session_mutation::SessionCheckpoint;
 use super::{session_not_found, HandlerState};
 
 impl HandlerState {
@@ -68,7 +68,7 @@ impl HandlerState {
             .session(session_name)
             .cloned()
             .ok_or_else(|| session_not_found(session_name))?;
-        let previous_metadata = WindowMutationMetadataSnapshot::capture(self);
+        let checkpoint = SessionCheckpoint::capture(self, [(session_name, previous_session)]);
 
         let session = self
             .sessions
@@ -76,8 +76,7 @@ impl HandlerState {
             .ok_or_else(|| session_not_found(session_name))?;
         let index_map = session.reindex_windows_from(base_index)?;
         if let Err(error) = self.remap_reindexed_window_metadata(session_name, &index_map) {
-            self.replace_session(session_name, previous_session)?;
-            previous_metadata.restore(self);
+            checkpoint.restore(self)?;
             return Err(error);
         }
         Ok(index_map)
@@ -95,4 +94,16 @@ impl HandlerState {
         self.remap_window_indexed_state(session_name, index_map);
         Ok(())
     }
+}
+
+/// Each window slot of `session` paired with the id of the window it holds, in slot order; a
+/// linked window's id appears once per slot it occupies.
+pub(in crate::pane_terminals) fn window_ids_by_index(
+    session: &rmux_core::Session,
+) -> BTreeMap<u32, u32> {
+    session
+        .windows()
+        .iter()
+        .map(|(index, window)| (*index, window.id().as_u32()))
+        .collect()
 }

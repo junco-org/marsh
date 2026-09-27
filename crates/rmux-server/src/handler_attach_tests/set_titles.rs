@@ -11,7 +11,8 @@
 //! `set-titles-string`, once per distinct value.
 
 use super::set_titles_support::{
-    client_title_of, new_detached_session, set_global, title_capable_context, titles_in, TITLE_OPEN,
+    active_pane_id, attach_title_capable_client, client_title_of, enable_osc7, set_global,
+    title_capable_context, titles_in, TITLE_OPEN,
 };
 use super::*;
 
@@ -22,17 +23,8 @@ use super::*;
 async fn set_titles_on_carries_the_expanded_custom_string() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    new_detached_session(&handler, &alpha).await;
-
-    let (control_tx, mut control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach_with_terminal_context(
-            std::process::id(),
-            alpha.clone(),
-            control_tx,
-            title_capable_context(),
-        )
-        .await;
+    handler.create_session(&alpha).await;
+    let mut control_rx = attach_title_capable_client(&handler, &alpha, std::process::id()).await;
 
     set_global(&handler, OptionName::SetTitlesString, "RMUXTEST #S:#I").await;
     let _ = recv_switch_target(&mut control_rx, "set-titles-string refresh").await;
@@ -57,17 +49,8 @@ async fn set_titles_on_carries_the_expanded_custom_string() {
 async fn set_titles_on_expands_the_default_string() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    new_detached_session(&handler, &alpha).await;
-
-    let (control_tx, mut control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach_with_terminal_context(
-            std::process::id(),
-            alpha.clone(),
-            control_tx,
-            title_capable_context(),
-        )
-        .await;
+    handler.create_session(&alpha).await;
+    let mut control_rx = attach_title_capable_client(&handler, &alpha, std::process::id()).await;
 
     set_global(&handler, OptionName::SetTitles, "on").await;
 
@@ -90,29 +73,12 @@ async fn set_titles_on_expands_the_default_string() {
 async fn set_titles_off_writes_no_title_and_no_path() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    new_detached_session(&handler, &alpha).await;
-
-    let (control_tx, mut control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach_with_terminal_context(
-            std::process::id(),
-            alpha.clone(),
-            control_tx,
-            title_capable_context(),
-        )
-        .await;
+    handler.create_session(&alpha).await;
+    let mut control_rx = attach_title_capable_client(&handler, &alpha, std::process::id()).await;
 
     // Turn the osc7 capability on so the path would be emitted if it were not
     // gated, then drive a refresh with set-titles left at its "off" default.
-    let set = handler
-        .handle(Request::SetOption(SetOptionRequest {
-            scope: ScopeSelector::Global,
-            option: OptionName::TerminalFeatures,
-            value: "xterm*:osc7".to_owned(),
-            mode: SetOptionMode::Append,
-        }))
-        .await;
-    assert!(matches!(set, Response::SetOption(_)));
+    enable_osc7(&handler).await;
 
     let target = recv_switch_target(&mut control_rx, "terminal-features refresh").await;
     assert!(
@@ -141,17 +107,8 @@ async fn set_titles_off_writes_no_title_and_no_path() {
 async fn an_unchanged_title_is_not_re_emitted_on_the_next_refresh() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    new_detached_session(&handler, &alpha).await;
-
-    let (control_tx, mut control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach_with_terminal_context(
-            std::process::id(),
-            alpha.clone(),
-            control_tx,
-            title_capable_context(),
-        )
-        .await;
+    handler.create_session(&alpha).await;
+    let mut control_rx = attach_title_capable_client(&handler, &alpha, std::process::id()).await;
 
     set_global(&handler, OptionName::SetTitlesString, "STATIC-TITLE").await;
     let _ = recv_switch_target(&mut control_rx, "set-titles-string refresh").await;
@@ -187,7 +144,7 @@ async fn an_unchanged_title_is_not_re_emitted_on_the_next_refresh() {
 async fn a_client_without_the_title_capability_receives_no_title() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    new_detached_session(&handler, &alpha).await;
+    handler.create_session(&alpha).await;
 
     let (control_tx, mut control_rx) = mpsc::unbounded_channel();
     let _attach_id = handler
@@ -223,17 +180,8 @@ async fn a_client_without_the_title_capability_receives_no_title() {
 async fn control_characters_in_the_title_cannot_inject_a_second_sequence() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    new_detached_session(&handler, &alpha).await;
-
-    let (control_tx, mut control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach_with_terminal_context(
-            std::process::id(),
-            alpha.clone(),
-            control_tx,
-            title_capable_context(),
-        )
-        .await;
+    handler.create_session(&alpha).await;
+    let mut control_rx = attach_title_capable_client(&handler, &alpha, std::process::id()).await;
 
     set_global(
         &handler,
@@ -267,27 +215,10 @@ async fn control_characters_in_the_title_cannot_inject_a_second_sequence() {
 async fn an_active_pane_title_change_carries_the_new_title_to_the_client() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    create_quiet_session(&handler, &alpha).await;
+    handler.create_session(Quiet(&alpha)).await;
     let target = PaneTarget::with_window(alpha.clone(), 0, 0);
-    let pane_id = {
-        let state = handler.state.lock().await;
-        state
-            .sessions
-            .session(&alpha)
-            .and_then(|session| session.window_at(0))
-            .and_then(|window| window.pane(0).map(|pane| pane.id()))
-            .expect("window pane exists")
-    };
-
-    let (control_tx, mut control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach_with_terminal_context(
-            std::process::id(),
-            alpha.clone(),
-            control_tx,
-            title_capable_context(),
-        )
-        .await;
+    let pane_id = active_pane_id(&handler, &alpha).await;
+    let mut control_rx = attach_title_capable_client(&handler, &alpha, std::process::id()).await;
 
     set_global(&handler, OptionName::SetTitlesString, "T:#{pane_title}").await;
     let _ = recv_switch_target(&mut control_rx, "set-titles-string refresh").await;
@@ -295,27 +226,13 @@ async fn an_active_pane_title_change_carries_the_new_title_to_the_client() {
     let _ = recv_switch_target(&mut control_rx, "set-titles on refresh").await;
 
     // The application in the active pane emits OSC 2.
-    replace_transcript_contents(
-        &handler,
-        &target,
-        TerminalSize { cols: 80, rows: 24 },
-        b"\x1b]2;APP-DRIVEN\x07",
-    )
-    .await;
+    let size = TerminalSize { cols: 80, rows: 24 };
+    handler
+        .replace_transcript_for_test(&target, size, b"\x1b]2;APP-DRIVEN\x07")
+        .await;
     handler.pane_alert_callback()(crate::pane_io::PaneAlertEvent {
-        session_name: alpha,
-        pane_id,
-        bell_count: 0,
         title_changed: true,
-        title_change: None,
-        path_changed: false,
-        clipboard_set: false,
-        clipboard_writes: Vec::new(),
-        clipboard_queries: Vec::new(),
-        mouse_mode_changed: false,
-        alternate_mode_changed: false,
-        queue_activity_alert: false,
-        generation: None,
+        ..Fixture::fixture((alpha, pane_id))
     });
 
     let refreshed = recv_switch_target(&mut control_rx, "pane title change refresh").await;
@@ -332,49 +249,18 @@ async fn an_active_pane_title_change_carries_the_new_title_to_the_client() {
 async fn an_active_pane_title_change_does_not_refresh_when_set_titles_is_off() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    create_quiet_session(&handler, &alpha).await;
+    handler.create_session(Quiet(&alpha)).await;
     let target = PaneTarget::with_window(alpha.clone(), 0, 0);
-    let pane_id = {
-        let state = handler.state.lock().await;
-        state
-            .sessions
-            .session(&alpha)
-            .and_then(|session| session.window_at(0))
-            .and_then(|window| window.pane(0).map(|pane| pane.id()))
-            .expect("window pane exists")
-    };
+    let pane_id = active_pane_id(&handler, &alpha).await;
+    let mut control_rx = attach_title_capable_client(&handler, &alpha, std::process::id()).await;
 
-    let (control_tx, mut control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach_with_terminal_context(
-            std::process::id(),
-            alpha.clone(),
-            control_tx,
-            title_capable_context(),
-        )
+    let size = TerminalSize { cols: 80, rows: 24 };
+    handler
+        .replace_transcript_for_test(&target, size, b"\x1b]2;APP-DRIVEN\x07")
         .await;
-
-    replace_transcript_contents(
-        &handler,
-        &target,
-        TerminalSize { cols: 80, rows: 24 },
-        b"\x1b]2;APP-DRIVEN\x07",
-    )
-    .await;
     handler.pane_alert_callback()(crate::pane_io::PaneAlertEvent {
-        session_name: alpha,
-        pane_id,
-        bell_count: 0,
         title_changed: true,
-        title_change: None,
-        path_changed: false,
-        clipboard_set: false,
-        clipboard_writes: Vec::new(),
-        clipboard_queries: Vec::new(),
-        mouse_mode_changed: false,
-        alternate_mode_changed: false,
-        queue_activity_alert: false,
-        generation: None,
+        ..Fixture::fixture((alpha, pane_id))
     });
 
     assert!(
@@ -391,17 +277,8 @@ async fn an_active_pane_title_change_does_not_refresh_when_set_titles_is_off() {
 async fn toggling_set_titles_off_and_on_does_not_rewrite_an_unchanged_title() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    new_detached_session(&handler, &alpha).await;
-
-    let (control_tx, mut control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach_with_terminal_context(
-            std::process::id(),
-            alpha.clone(),
-            control_tx,
-            title_capable_context(),
-        )
-        .await;
+    handler.create_session(&alpha).await;
+    let mut control_rx = attach_title_capable_client(&handler, &alpha, std::process::id()).await;
 
     set_global(&handler, OptionName::SetTitlesString, "STABLE").await;
     let _ = recv_switch_target(&mut control_rx, "set-titles-string refresh").await;
@@ -431,17 +308,8 @@ async fn toggling_set_titles_off_and_on_does_not_rewrite_an_unchanged_title() {
 async fn a_title_change_survives_a_coalesced_follow_up_refresh() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    new_detached_session(&handler, &alpha).await;
-
-    let (control_tx, mut control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach_with_terminal_context(
-            std::process::id(),
-            alpha.clone(),
-            control_tx,
-            title_capable_context(),
-        )
-        .await;
+    handler.create_session(&alpha).await;
+    let mut control_rx = attach_title_capable_client(&handler, &alpha, std::process::id()).await;
 
     set_global(&handler, OptionName::SetTitlesString, "FIRST").await;
     let _ = recv_switch_target(&mut control_rx, "set-titles-string refresh").await;
@@ -481,7 +349,7 @@ fn drain_queued_titles(control_rx: &mut mpsc::UnboundedReceiver<AttachControl>) 
 async fn the_attach_frame_title_is_not_repeated_by_the_first_refresh() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    new_detached_session(&handler, &alpha).await;
+    handler.create_session(&alpha).await;
     set_global(&handler, OptionName::SetTitlesString, "SEEDED-TITLE").await;
     set_global(&handler, OptionName::SetTitles, "on").await;
 
@@ -542,28 +410,14 @@ async fn attach_with_initial_title(
     client_title: Option<crate::outer_terminal::ClientTitleState>,
 ) -> mpsc::UnboundedReceiver<AttachControl> {
     let (control_tx, control_rx) = mpsc::unbounded_channel();
-    let uid = current_owner_uid();
     let attach_pid = if client_title.is_some() { 4182 } else { 4183 };
+    let registration = AttachRegistration {
+        terminal_context: title_capable_context(),
+        client_title,
+        ..Fixture::fixture((control_tx, current_owner_uid()))
+    };
     handler
-        .register_attach_with_access(
-            attach_pid,
-            session.clone(),
-            None,
-            AttachRegistration {
-                control_tx,
-                control_backlog: Arc::new(AtomicUsize::new(0)),
-                closing: Arc::new(AtomicBool::new(false)),
-                persistent_overlay_epoch: Arc::new(AtomicU64::new(0)),
-                terminal_context: title_capable_context(),
-                client_title,
-                flags: crate::handler::attach_support::ClientFlags::default(),
-                render_stream: false,
-                uid,
-                user: rmux_os::identity::UserIdentity::Uid(uid),
-                can_write: true,
-                client_size: Some(TerminalSize { cols: 80, rows: 24 }),
-            },
-        )
+        .register_attach_with_access(attach_pid, session.clone(), None, registration)
         .await
         .expect("attach registration succeeds");
     control_rx
@@ -579,7 +433,7 @@ async fn attach_with_initial_title(
 async fn the_web_and_snapshot_renders_carry_no_title() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    new_detached_session(&handler, &alpha).await;
+    handler.create_session(&alpha).await;
     set_global(&handler, OptionName::SetTitlesString, "WEB-MUST-NOT-APPEAR").await;
     set_global(&handler, OptionName::SetTitles, "on").await;
 
@@ -627,17 +481,8 @@ async fn the_web_and_snapshot_renders_carry_no_title() {
 async fn a_shell_command_in_the_title_expands_through_the_status_job_runtime() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    new_detached_session(&handler, &alpha).await;
-
-    let (control_tx, mut control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach_with_terminal_context(
-            std::process::id(),
-            alpha.clone(),
-            control_tx,
-            title_capable_context(),
-        )
-        .await;
+    handler.create_session(&alpha).await;
+    let mut control_rx = attach_title_capable_client(&handler, &alpha, std::process::id()).await;
 
     let marker = format!("TITLEJOB{}", std::process::id());
     set_global(
@@ -683,7 +528,7 @@ async fn a_shell_command_in_the_title_expands_through_the_status_job_runtime() {
 async fn the_status_tick_carries_a_changed_title_and_repeats_nothing() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    new_detached_session(&handler, &alpha).await;
+    handler.create_session(&alpha).await;
 
     let (control_tx, mut control_rx) = mpsc::unbounded_channel();
     let attach_pid = std::process::id();
@@ -714,18 +559,13 @@ async fn the_status_tick_carries_a_changed_title_and_repeats_nothing() {
     );
 
     // Change the expansion without touching any client, then tick again.
-    {
-        let mut state = handler.state.lock().await;
-        state
-            .options
-            .set(
-                ScopeSelector::Global,
-                OptionName::SetTitlesString,
-                "TICK-TWO".to_owned(),
-                SetOptionMode::Replace,
-            )
-            .expect("set-titles-string set succeeds");
-    }
+    handler
+        .store_option_for_test(
+            ScopeSelector::Global,
+            OptionName::SetTitlesString,
+            "TICK-TWO",
+        )
+        .await;
     handler
         .refresh_attached_client_status_for_identity(attach_pid, attach_id, &alpha)
         .await

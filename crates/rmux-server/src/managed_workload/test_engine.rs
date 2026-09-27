@@ -58,9 +58,9 @@ pub(crate) fn install(handler: &RequestHandler) -> Option<ShellIo> {
             rows: ROWS,
             cols: COLS,
         },
-        filesystem,
         runtime,
         handler.socket_path(),
+        |profile, frontend| marsh_core::test_support::mux(profile, frontend, filesystem),
     )
     .ok()?;
 

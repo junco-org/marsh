@@ -119,10 +119,6 @@ impl PaneStateJournal {
 
     pub(crate) fn mark_pane_closed(&mut self, pane_id: PaneId) -> bool {
         let newly_closed = self.closed_panes.insert(pane_id);
-        if newly_closed {
-            self.closed_pane_order.push_back(pane_id);
-            self.prune_closed_panes();
-        }
         let has_open_subscription = self
             .subscriptions
             .values()
@@ -160,9 +156,7 @@ impl PaneStateJournal {
     }
 
     pub(crate) fn reopen_pane(&mut self, pane_id: PaneId) {
-        if self.closed_panes.remove(&pane_id) {
-            self.closed_pane_order.retain(|closed| *closed != pane_id);
-        }
+        self.closed_panes.remove(&pane_id);
     }
 
     pub(crate) fn foreground_subscription_count(&self) -> usize {

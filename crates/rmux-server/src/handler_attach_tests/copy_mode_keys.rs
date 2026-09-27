@@ -1,4 +1,5 @@
 use super::*;
+use crate::test_fixtures::wait_until;
 
 pub(super) async fn send_attached_copy_mode_command(
     handler: &RequestHandler,
@@ -7,16 +8,9 @@ pub(super) async fn send_attached_copy_mode_command(
 ) -> Response {
     handler
         .handle(Request::SendKeysExt(rmux_proto::SendKeysExtRequest {
-            target: Some(target.clone()),
-            keys: tokens.iter().map(|token| (*token).to_owned()).collect(),
-            expand_formats: false,
-            hex: false,
-            literal: false,
             dispatch_key_table: false,
             copy_mode_command: true,
-            forward_mouse_event: false,
-            reset_terminal: false,
-            repeat_count: None,
+            ..Fixture::fixture((target, tokens.iter().copied()))
         }))
         .await
 }
@@ -26,18 +20,22 @@ async fn wait_for_pane_mode_status(
     session: &SessionName,
     expected: &str,
 ) {
-    let deadline = tokio::time::Instant::now() + ATTACH_LIFECYCLE_TIMEOUT;
-    loop {
-        let actual = pane_mode_status(handler, session).await;
-        if actual == expected {
-            return;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "timed out waiting for pane mode status {expected:?}, got {actual:?}"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-    }
+    wait_until(
+        ATTACH_LIFECYCLE_TIMEOUT,
+        Duration::from_millis(25),
+        async || {
+            let actual = pane_mode_status(handler, session).await;
+            if actual == expected {
+                Ok(())
+            } else {
+                Err(actual)
+            }
+        },
+    )
+    .await
+    .unwrap_or_else(|actual| {
+        panic!("timed out waiting for pane mode status {expected:?}, got {actual:?}")
+    });
 }
 
 #[tokio::test]
@@ -47,29 +45,14 @@ async fn attached_copy_mode_emacs_slash_is_unbound_and_not_forwarded() {
     let alpha = session_name("alpha");
     let _control_rx = create_quiet_attached_session(&handler, requester_pid, &alpha).await;
     let target = PaneTarget::new(alpha.clone(), 0);
-    replace_transcript_contents(
-        &handler,
-        &target,
-        TerminalSize { cols: 80, rows: 24 },
-        b"P0-LINE-12\r\n",
-    )
-    .await;
-    assert!(matches!(
-        handler
-            .handle(Request::CopyMode(CopyModeRequest {
-                target: Some(target.clone()),
-                page_down: false,
-                exit_on_scroll: false,
-                hide_position: false,
-                mouse_drag_start: false,
-                cancel_mode: false,
-                scrollbar_scroll: false,
-                source: None,
-                page_up: false,
-            }))
-            .await,
-        Response::CopyMode(_)
-    ));
+    handler
+        .replace_transcript_for_test(
+            &target,
+            TerminalSize { cols: 80, rows: 24 },
+            b"P0-LINE-12\r\n",
+        )
+        .await;
+    handler.handle_ok(CopyModeRequest::fixture(&target)).await;
     assert_eq!(
         pane_mode_status(&handler, &alpha).await,
         "1:copy-mode:0:0\n"
@@ -102,29 +85,14 @@ async fn attached_copy_mode_emacs_ctrl_s_opens_search_prompt() {
     let alpha = session_name("alpha");
     let _control_rx = create_quiet_attached_session(&handler, requester_pid, &alpha).await;
     let target = PaneTarget::new(alpha.clone(), 0);
-    replace_transcript_contents(
-        &handler,
-        &target,
-        TerminalSize { cols: 80, rows: 24 },
-        b"P0-LINE-12\r\n",
-    )
-    .await;
-    assert!(matches!(
-        handler
-            .handle(Request::CopyMode(CopyModeRequest {
-                target: Some(target),
-                page_down: false,
-                exit_on_scroll: false,
-                hide_position: false,
-                mouse_drag_start: false,
-                cancel_mode: false,
-                scrollbar_scroll: false,
-                source: None,
-                page_up: false,
-            }))
-            .await,
-        Response::CopyMode(_)
-    ));
+    handler
+        .replace_transcript_for_test(
+            &target,
+            TerminalSize { cols: 80, rows: 24 },
+            b"P0-LINE-12\r\n",
+        )
+        .await;
+    handler.handle_ok(CopyModeRequest::fixture(target)).await;
 
     handler
         .handle_attached_live_input_for_test(requester_pid, b"\x13P0-LINE-12\r")
@@ -140,41 +108,16 @@ async fn attached_copy_mode_vi_search_and_selection_keys_resolve_from_the_table(
     let alpha = session_name("alpha");
     let _control_rx = create_quiet_attached_session(&handler, requester_pid, &alpha).await;
     let target = PaneTarget::new(alpha.clone(), 0);
-    replace_transcript_contents(
-        &handler,
-        &target,
-        TerminalSize { cols: 80, rows: 24 },
-        b"P0-LINE-12\r\n",
-    )
-    .await;
+    handler
+        .replace_transcript_for_test(
+            &target,
+            TerminalSize { cols: 80, rows: 24 },
+            b"P0-LINE-12\r\n",
+        )
+        .await;
 
-    assert!(matches!(
-        handler
-            .handle(Request::SetOption(SetOptionRequest {
-                scope: ScopeSelector::Window(WindowTarget::with_window(alpha.clone(), 0)),
-                option: OptionName::ModeKeys,
-                value: "vi".to_owned(),
-                mode: SetOptionMode::Replace,
-            }))
-            .await,
-        Response::SetOption(_)
-    ));
-    assert!(matches!(
-        handler
-            .handle(Request::CopyMode(CopyModeRequest {
-                target: Some(target.clone()),
-                page_down: false,
-                exit_on_scroll: false,
-                hide_position: false,
-                mouse_drag_start: false,
-                cancel_mode: false,
-                scrollbar_scroll: false,
-                source: None,
-                page_up: false,
-            }))
-            .await,
-        Response::CopyMode(_)
-    ));
+    set_vi_mode_keys(&handler, &alpha).await;
+    handler.handle_ok(CopyModeRequest::fixture(&target)).await;
     assert!(handler
         .target_is_in_copy_mode(&target)
         .await
@@ -194,40 +137,15 @@ async fn attached_copy_mode_q_exits_and_refreshes_normal_surface() {
     let alpha = session_name("alpha");
     let mut control_rx = create_quiet_attached_session(&handler, requester_pid, &alpha).await;
     let target = PaneTarget::new(alpha.clone(), 0);
-    replace_transcript_contents(
-        &handler,
-        &target,
-        TerminalSize { cols: 80, rows: 24 },
-        b"P0-LINE-12\r\n",
-    )
-    .await;
-    assert!(matches!(
-        handler
-            .handle(Request::SetOption(SetOptionRequest {
-                scope: ScopeSelector::Window(WindowTarget::with_window(alpha.clone(), 0)),
-                option: OptionName::ModeKeys,
-                value: "vi".to_owned(),
-                mode: SetOptionMode::Replace,
-            }))
-            .await,
-        Response::SetOption(_)
-    ));
-    assert!(matches!(
-        handler
-            .handle(Request::CopyMode(CopyModeRequest {
-                target: Some(target.clone()),
-                page_down: false,
-                exit_on_scroll: false,
-                hide_position: false,
-                mouse_drag_start: false,
-                cancel_mode: false,
-                scrollbar_scroll: false,
-                source: None,
-                page_up: false,
-            }))
-            .await,
-        Response::CopyMode(_)
-    ));
+    handler
+        .replace_transcript_for_test(
+            &target,
+            TerminalSize { cols: 80, rows: 24 },
+            b"P0-LINE-12\r\n",
+        )
+        .await;
+    set_vi_mode_keys(&handler, &alpha).await;
+    handler.handle_ok(CopyModeRequest::fixture(&target)).await;
     assert_eq!(
         pane_mode_status(&handler, &alpha).await,
         "1:copy-mode:0:0\n"
@@ -262,39 +180,11 @@ async fn attached_copy_mode_exit_refreshes_every_client_on_shared_pane() {
     let second_pid = u32::MAX - 502;
     let alpha = session_name("alpha");
     let mut first_rx = create_quiet_attached_session(&handler, first_pid, &alpha).await;
-    let (second_tx, mut second_rx) = mpsc::unbounded_channel();
-    handler
-        .register_attach(second_pid, alpha.clone(), second_tx)
-        .await;
+    let mut second_rx = handler.attach_client(second_pid, &alpha).await;
     let target = PaneTarget::new(alpha.clone(), 0);
 
-    assert!(matches!(
-        handler
-            .handle(Request::SetOption(SetOptionRequest {
-                scope: ScopeSelector::Window(WindowTarget::with_window(alpha.clone(), 0)),
-                option: OptionName::ModeKeys,
-                value: "vi".to_owned(),
-                mode: SetOptionMode::Replace,
-            }))
-            .await,
-        Response::SetOption(_)
-    ));
-    assert!(matches!(
-        handler
-            .handle(Request::CopyMode(CopyModeRequest {
-                target: Some(target),
-                page_down: false,
-                exit_on_scroll: false,
-                hide_position: false,
-                mouse_drag_start: false,
-                cancel_mode: false,
-                scrollbar_scroll: false,
-                source: None,
-                page_up: false,
-            }))
-            .await,
-        Response::CopyMode(_)
-    ));
+    set_vi_mode_keys(&handler, &alpha).await;
+    handler.handle_ok(CopyModeRequest::fixture(target)).await;
     drain_attach_controls(&mut first_rx);
     drain_attach_controls(&mut second_rx);
 
@@ -326,75 +216,24 @@ async fn assert_grouped_copy_mode_refresh_fanout(label: &str, automatic_rename: 
     let alpha = session_name(&format!("copy-group-{label}-alpha"));
     let beta = session_name(&format!("copy-group-{label}-beta"));
     let mut first_rx = create_quiet_attached_session(&handler, first_pid, &alpha).await;
-    let grouped = handler
-        .handle(Request::NewSessionExt(Box::new(NewSessionExtRequest {
-            session_name: Some(beta.clone()),
-            working_directory: None,
-            detached: true,
-            size: Some(TerminalSize { cols: 80, rows: 24 }),
-            environment: None,
-            group_target: Some(alpha.clone()),
-            attach_if_exists: false,
-            detach_other_clients: false,
-            kill_other_clients: false,
-            flags: None,
-            window_name: None,
-            print_session_info: false,
-            print_format: None,
-            command: None,
-            process_command: None,
-            client_environment: None,
-            skip_environment_update: false,
-        })))
-        .await;
-    assert!(matches!(grouped, Response::NewSession(_)), "{grouped:?}");
-    let (second_tx, mut second_rx) = mpsc::unbounded_channel();
-    handler
-        .register_attach(second_pid, beta.clone(), second_tx)
-        .await;
+    handler.create_session(Grouped(&beta, &alpha)).await;
+    let mut second_rx = handler.attach_client(second_pid, &beta).await;
 
     if !automatic_rename {
-        let response = handler
-            .handle(Request::SetOption(SetOptionRequest {
-                scope: ScopeSelector::Window(WindowTarget::with_window(alpha.clone(), 0)),
-                option: OptionName::AutomaticRename,
-                value: "off".to_owned(),
-                mode: SetOptionMode::Replace,
-            }))
-            .await;
-        assert!(matches!(response, Response::SetOption(_)), "{response:?}");
-    }
-    assert!(matches!(
         handler
-            .handle(Request::SetOption(SetOptionRequest {
-                scope: ScopeSelector::Window(WindowTarget::with_window(alpha.clone(), 0)),
-                option: OptionName::ModeKeys,
-                value: "vi".to_owned(),
-                mode: SetOptionMode::Replace,
-            }))
-            .await,
-        Response::SetOption(_)
-    ));
+            .set_option(
+                ScopeSelector::Window(WindowTarget::with_window(alpha.clone(), 0)),
+                OptionName::AutomaticRename,
+                "off",
+            )
+            .await;
+    }
+    set_vi_mode_keys(&handler, &alpha).await;
     drain_attach_controls(&mut first_rx);
     drain_attach_controls(&mut second_rx);
 
     let target = PaneTarget::new(alpha.clone(), 0);
-    assert!(matches!(
-        handler
-            .handle(Request::CopyMode(CopyModeRequest {
-                target: Some(target),
-                page_down: false,
-                exit_on_scroll: false,
-                hide_position: false,
-                mouse_drag_start: false,
-                cancel_mode: false,
-                scrollbar_scroll: false,
-                source: None,
-                page_up: false,
-            }))
-            .await,
-        Response::CopyMode(_)
-    ));
+    handler.handle_ok(CopyModeRequest::fixture(target)).await;
     assert_eq!(
         pane_mode_status(&handler, &alpha).await,
         "1:copy-mode:0:0\n"
@@ -457,58 +296,30 @@ async fn attached_copy_mode_refreshes_clients_on_linked_window_aliases() {
     let linked = session_name("copy-linked-peer");
     let mut owner_rx = create_quiet_attached_session(&handler, owner_pid, &owner).await;
     let mut linked_rx = create_quiet_attached_session(&handler, linked_pid, &linked).await;
-    let response = handler
-        .handle(Request::LinkWindow(LinkWindowRequest {
-            source: WindowTarget::with_window(owner.clone(), 0),
-            target: WindowTarget::with_window(linked.clone(), 0),
-            after: false,
-            before: false,
+    handler
+        .handle_ok(LinkWindowRequest {
             kill_destination: true,
             detached: false,
-        }))
+            ..Fixture::fixture((
+                WindowTarget::with_window(owner.clone(), 0),
+                WindowTarget::with_window(linked.clone(), 0),
+            ))
+        })
         .await;
-    assert!(matches!(response, Response::LinkWindow(_)), "{response:?}");
-    assert!(matches!(
-        handler
-            .handle(Request::SetOption(SetOptionRequest {
-                scope: ScopeSelector::Window(WindowTarget::with_window(owner.clone(), 0)),
-                option: OptionName::AutomaticRename,
-                value: "off".to_owned(),
-                mode: SetOptionMode::Replace,
-            }))
-            .await,
-        Response::SetOption(_)
-    ));
-    assert!(matches!(
-        handler
-            .handle(Request::SetOption(SetOptionRequest {
-                scope: ScopeSelector::Window(WindowTarget::with_window(owner.clone(), 0)),
-                option: OptionName::ModeKeys,
-                value: "vi".to_owned(),
-                mode: SetOptionMode::Replace,
-            }))
-            .await,
-        Response::SetOption(_)
-    ));
+    handler
+        .set_option(
+            ScopeSelector::Window(WindowTarget::with_window(owner.clone(), 0)),
+            OptionName::AutomaticRename,
+            "off",
+        )
+        .await;
+    set_vi_mode_keys(&handler, &owner).await;
     drain_attach_controls(&mut owner_rx);
     drain_attach_controls(&mut linked_rx);
 
-    assert!(matches!(
-        handler
-            .handle(Request::CopyMode(CopyModeRequest {
-                target: Some(PaneTarget::new(owner.clone(), 0)),
-                page_down: false,
-                exit_on_scroll: false,
-                hide_position: false,
-                mouse_drag_start: false,
-                cancel_mode: false,
-                scrollbar_scroll: false,
-                source: None,
-                page_up: false,
-            }))
-            .await,
-        Response::CopyMode(_)
-    ));
+    handler
+        .handle_ok(CopyModeRequest::fixture(PaneTarget::new(owner.clone(), 0)))
+        .await;
     recv_matching_attach_control(&mut owner_rx, "linked copy-mode entry owner", |control| {
         matches!(control, AttachControl::Switch(_))
     })
@@ -543,29 +354,14 @@ async fn attached_copy_mode_copies_selection_to_buffer_and_exits_cleanly() {
     let alpha = session_name("alpha");
     let mut control_rx = create_quiet_attached_session(&handler, requester_pid, &alpha).await;
     let target = PaneTarget::new(alpha.clone(), 0);
-    replace_transcript_contents(
-        &handler,
-        &target,
-        TerminalSize { cols: 80, rows: 24 },
-        b"alpha\r\nneedle value\r\nomega\r\n",
-    )
-    .await;
-    assert!(matches!(
-        handler
-            .handle(Request::CopyMode(CopyModeRequest {
-                target: Some(target.clone()),
-                page_down: false,
-                exit_on_scroll: false,
-                hide_position: false,
-                mouse_drag_start: false,
-                cancel_mode: false,
-                scrollbar_scroll: false,
-                source: None,
-                page_up: false,
-            }))
-            .await,
-        Response::CopyMode(_)
-    ));
+    handler
+        .replace_transcript_for_test(
+            &target,
+            TerminalSize { cols: 80, rows: 24 },
+            b"alpha\r\nneedle value\r\nomega\r\n",
+        )
+        .await;
+    handler.handle_ok(CopyModeRequest::fixture(&target)).await;
     assert_eq!(
         pane_mode_status(&handler, &alpha).await,
         "1:copy-mode:0:0\n"
@@ -628,22 +424,7 @@ async fn attached_copy_mode_updates_automatic_window_name_on_entry_and_exit() {
         normal_status.ends_with("|0|\n"),
         "normal pane status should report no active mode, got {normal_status:?}"
     );
-    assert!(matches!(
-        handler
-            .handle(Request::CopyMode(CopyModeRequest {
-                target: Some(target.clone()),
-                page_down: false,
-                exit_on_scroll: false,
-                hide_position: false,
-                mouse_drag_start: false,
-                cancel_mode: false,
-                scrollbar_scroll: false,
-                source: None,
-                page_up: false,
-            }))
-            .await,
-        Response::CopyMode(_)
-    ));
+    handler.handle_ok(CopyModeRequest::fixture(&target)).await;
     assert_eq!(
         display_target_format(
             &handler,
@@ -709,22 +490,7 @@ async fn attached_copy_mode_escape_exits_and_clears_mode_state() {
     let alpha = session_name("alpha");
     let mut control_rx = create_quiet_attached_session(&handler, requester_pid, &alpha).await;
     let target = PaneTarget::new(alpha.clone(), 0);
-    assert!(matches!(
-        handler
-            .handle(Request::CopyMode(CopyModeRequest {
-                target: Some(target.clone()),
-                page_down: false,
-                exit_on_scroll: false,
-                hide_position: false,
-                mouse_drag_start: false,
-                cancel_mode: false,
-                scrollbar_scroll: false,
-                source: None,
-                page_up: false,
-            }))
-            .await,
-        Response::CopyMode(_)
-    ));
+    handler.handle_ok(CopyModeRequest::fixture(&target)).await;
     assert_eq!(
         pane_mode_status(&handler, &alpha).await,
         "1:copy-mode:0:0\n"
@@ -758,31 +524,21 @@ async fn attached_copy_mode_u_refresh_renders_history_backing() {
     let alpha = session_name("alpha");
     let mut control_rx = create_quiet_attached_session(&handler, requester_pid, &alpha).await;
     let target = PaneTarget::new(alpha.clone(), 0);
-    replace_transcript_contents(
-        &handler,
-        &target,
-        TerminalSize { cols: 80, rows: 24 },
-        b"copy-u-line-01\r\ncopy-u-line-02\r\ncopy-u-line-03\r\ncopy-u-line-04\r\ncopy-u-line-05\r\ncopy-u-line-06\r\ncopy-u-line-07\r\ncopy-u-line-08\r\ncopy-u-line-09\r\ncopy-u-line-10\r\ncopy-u-line-11\r\ncopy-u-line-12\r\ncopy-u-line-13\r\ncopy-u-line-14\r\ncopy-u-line-15\r\ncopy-u-line-16\r\ncopy-u-line-17\r\ncopy-u-line-18\r\ncopy-u-line-19\r\ncopy-u-line-20\r\ncopy-u-line-21\r\ncopy-u-line-22\r\ncopy-u-line-23\r\ncopy-u-line-24\r\ncopy-u-line-25\r\ncopy-u-line-26\r\ncopy-u-line-27\r\ncopy-u-line-28\r\ncopy-u-line-29\r\ncopy-u-line-30\r\n",
-    )
-    .await;
+    handler
+        .replace_transcript_for_test(
+            &target,
+            TerminalSize { cols: 80, rows: 24 },
+            b"copy-u-line-01\r\ncopy-u-line-02\r\ncopy-u-line-03\r\ncopy-u-line-04\r\ncopy-u-line-05\r\ncopy-u-line-06\r\ncopy-u-line-07\r\ncopy-u-line-08\r\ncopy-u-line-09\r\ncopy-u-line-10\r\ncopy-u-line-11\r\ncopy-u-line-12\r\ncopy-u-line-13\r\ncopy-u-line-14\r\ncopy-u-line-15\r\ncopy-u-line-16\r\ncopy-u-line-17\r\ncopy-u-line-18\r\ncopy-u-line-19\r\ncopy-u-line-20\r\ncopy-u-line-21\r\ncopy-u-line-22\r\ncopy-u-line-23\r\ncopy-u-line-24\r\ncopy-u-line-25\r\ncopy-u-line-26\r\ncopy-u-line-27\r\ncopy-u-line-28\r\ncopy-u-line-29\r\ncopy-u-line-30\r\n",
+        )
+        .await;
     drain_attach_controls(&mut control_rx);
 
-    assert!(matches!(
-        handler
-            .handle(Request::CopyMode(CopyModeRequest {
-                target: Some(target.clone()),
-                page_down: false,
-                exit_on_scroll: false,
-                hide_position: false,
-                mouse_drag_start: false,
-                cancel_mode: false,
-                scrollbar_scroll: false,
-                source: None,
-                page_up: true,
-            }))
-            .await,
-        Response::CopyMode(_)
-    ));
+    handler
+        .handle_ok(CopyModeRequest {
+            page_up: true,
+            ..Fixture::fixture(&target)
+        })
+        .await;
 
     let frame = recv_render_frame(&mut control_rx, "copy-mode -u refresh").await;
     assert!(
@@ -802,31 +558,16 @@ async fn attached_copy_mode_refresh_renders_tmux_position_indicator() {
     let alpha = session_name("alpha");
     let mut control_rx = create_quiet_attached_session(&handler, requester_pid, &alpha).await;
     let target = PaneTarget::new(alpha.clone(), 0);
-    replace_transcript_contents(
-        &handler,
-        &target,
-        TerminalSize { cols: 80, rows: 24 },
-        b"copy-position-line\r\n",
-    )
-    .await;
+    handler
+        .replace_transcript_for_test(
+            &target,
+            TerminalSize { cols: 80, rows: 24 },
+            b"copy-position-line\r\n",
+        )
+        .await;
     drain_attach_controls(&mut control_rx);
 
-    assert!(matches!(
-        handler
-            .handle(Request::CopyMode(CopyModeRequest {
-                target: Some(target),
-                page_down: false,
-                exit_on_scroll: false,
-                hide_position: false,
-                mouse_drag_start: false,
-                cancel_mode: false,
-                scrollbar_scroll: false,
-                source: None,
-                page_up: false,
-            }))
-            .await,
-        Response::CopyMode(_)
-    ));
+    handler.handle_ok(CopyModeRequest::fixture(target)).await;
 
     let frame = recv_render_frame(&mut control_rx, "copy-mode refresh").await;
     assert!(

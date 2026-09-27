@@ -1,6 +1,7 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex as StdMutex};
 
+use marsh_lib::FifoSet;
 use rmux_core::events::{OutputCursorItem, OutputGap, SdkWaitKey, SdkWaitRegistry};
 use rmux_proto::{
     CancelSdkWaitRequest, CancelSdkWaitResponse, ErrorResponse, PaneId,
@@ -24,57 +25,8 @@ pub(in crate::handler) struct SdkWaitState {
     registry: SdkWaitRegistry,
     cancel_senders: HashMap<SdkWaitKey, oneshot::Sender<()>>,
     quota: SdkWaitQuota,
-    finished_waits: BoundedSdkWaitKeys,
-    cancelled_before_register: BoundedSdkWaitKeys,
-}
-
-#[derive(Debug)]
-struct BoundedSdkWaitKeys {
-    keys: HashSet<SdkWaitKey>,
-    order: VecDeque<SdkWaitKey>,
-    limit: usize,
-}
-
-impl BoundedSdkWaitKeys {
-    fn new(limit: usize) -> Self {
-        Self {
-            keys: HashSet::new(),
-            order: VecDeque::new(),
-            limit,
-        }
-    }
-
-    fn insert(&mut self, key: SdkWaitKey) {
-        if !self.keys.insert(key) {
-            return;
-        }
-
-        self.order.push_back(key);
-        while self.keys.len() > self.limit {
-            let Some(expired) = self.order.pop_front() else {
-                break;
-            };
-            self.keys.remove(&expired);
-        }
-    }
-
-    fn remove(&mut self, key: &SdkWaitKey) -> bool {
-        if !self.keys.remove(key) {
-            return false;
-        }
-
-        self.order.retain(|candidate| candidate != key);
-        true
-    }
-
-    fn contains(&self, key: &SdkWaitKey) -> bool {
-        self.keys.contains(key)
-    }
-
-    #[cfg(test)]
-    fn len(&self) -> usize {
-        self.keys.len()
-    }
+    finished_waits: FifoSet<SdkWaitKey>,
+    cancelled_before_register: FifoSet<SdkWaitKey>,
 }
 
 impl Default for SdkWaitState {
@@ -89,8 +41,8 @@ impl SdkWaitState {
             registry: SdkWaitRegistry::default(),
             cancel_senders: HashMap::new(),
             quota: SdkWaitQuota::new(quota_limits),
-            finished_waits: BoundedSdkWaitKeys::new(SDK_WAIT_FINISHED_KEY_LIMIT),
-            cancelled_before_register: BoundedSdkWaitKeys::new(SDK_WAIT_PENDING_CANCEL_LIMIT),
+            finished_waits: FifoSet::new(SDK_WAIT_FINISHED_KEY_LIMIT),
+            cancelled_before_register: FifoSet::new(SDK_WAIT_PENDING_CANCEL_LIMIT),
         }
     }
 }

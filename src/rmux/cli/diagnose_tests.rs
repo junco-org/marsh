@@ -2,7 +2,7 @@ use super::*;
 
 #[test]
 fn parser_detects_diagnose_after_socket_flags() {
-    let invocation = parse_invocation(&[
+    let invocation = DiagnoseInvocation::parse(&[
         OsString::from("-Ldiag"),
         OsString::from("-Tclipboard,RGB"),
         OsString::from("diagnose"),
@@ -11,7 +11,7 @@ fn parser_detects_diagnose_after_socket_flags() {
     .expect("parse diagnose")
     .expect("diagnose invocation");
 
-    assert_eq!(invocation.format, DiagnoseFormat::Json);
+    assert_eq!(invocation.format, OutputFormat::Json);
     assert_eq!(invocation.socket_name, Some(OsString::from("diag")));
     assert_eq!(
         invocation.terminal_features,
@@ -22,7 +22,7 @@ fn parser_detects_diagnose_after_socket_flags() {
 #[test]
 fn parser_ignores_non_diagnose_commands() {
     assert_eq!(
-        parse_invocation(&[OsString::from("new-session")]).expect("parse"),
+        DiagnoseInvocation::parse(&[OsString::from("new-session")]).expect("parse"),
         None
     );
 }
@@ -79,7 +79,7 @@ fn config_message_filter_includes_source_file_location_diagnostics() {
 fn config_message_filter_redacts_home_paths() {
     let home = PathBuf::from("/tmp/rmux-diagnose-home");
     let raw = format!(
-        "123: config error: {}:2: unknown command: nope",
+        r"123: config error: {}:2: unknown command: ~\notes",
         home.join(".tmux.conf").display()
     );
 
@@ -87,9 +87,8 @@ fn config_message_filter_redacts_home_paths() {
         config_message_from_show_messages_line_against(&raw, std::slice::from_ref(&home))
             .expect("config message");
 
-    assert!(redacted.contains("~/.tmux.conf"), "{redacted}");
-    assert!(
-        !redacted.contains(&home.display().to_string()),
-        "{redacted}"
+    assert_eq!(
+        redacted,
+        r"123: config error: ~/.tmux.conf:2: unknown command: ~\notes"
     );
 }

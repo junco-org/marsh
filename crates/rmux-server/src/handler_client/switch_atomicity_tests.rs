@@ -1,22 +1,20 @@
 use super::*;
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
-use rmux_core::command_parser::CommandParser;
 use rmux_core::LifecycleEvent;
 use rmux_proto::request::SwitchClientExt3Request;
 use rmux_proto::{
-    ControlMode, NewSessionRequest, NewWindowRequest, OptionName, Request, Response, ScopeSelector,
-    SetOptionMode, SetOptionRequest, SplitDirection, SplitWindowRequest, SplitWindowTarget,
+    NewWindowRequest, OptionName, PaneTarget, Response, ScopeSelector, SplitWindowRequest,
     TerminalPixels, TerminalSize,
 };
 use tokio::sync::mpsc;
 
-use crate::control::{ControlModeUpgrade, ControlServerEvent, CONTROL_SERVER_EVENT_CAPACITY};
+use crate::control::ControlServerEvent;
+use crate::handler::test_support::open_mode_tree;
+use crate::test_fixtures::{wait_until, Fixture};
 
 const ENVIRONMENT_HELPER: &str = "RMUX_TEST_SWITCH_ATOMICITY_ENVIRONMENT_HELPER";
-const INITIAL_SIZE: TerminalSize = TerminalSize { cols: 80, rows: 24 };
 const SWITCH_SIZE: TerminalSize = TerminalSize {
     cols: 117,
     rows: 39,
@@ -63,18 +61,21 @@ async fn spawn_environment_child(display: &str) -> EnvironmentChild {
         .stderr(std::process::Stdio::null());
     let child = EnvironmentChild(command.spawn().expect("spawn environment helper"));
     let pid = child.0.id();
-    tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        loop {
+    wait_until(
+        std::time::Duration::from_secs(2),
+        std::time::Duration::from_millis(1),
+        async || {
             if rmux_os::process::environment(pid)
                 .as_ref()
                 .and_then(|environment| environment.get("DISPLAY"))
                 .is_some_and(|value| value == display)
             {
-                break;
+                Ok(())
+            } else {
+                Err(())
             }
-            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-        }
-    })
+        },
+    )
     .await
     .expect("environment helper publishes DISPLAY");
     child
@@ -121,77 +122,26 @@ fn session_with_reference_pane_activity(
 /// nothing to do with the switch. Declaring the option off makes that a stated precondition
 /// rather than a race the comparison would lose intermittently.
 async fn silence_automatic_rename(handler: &RequestHandler, session: &rmux_proto::SessionName) {
-    let response = handler
-        .handle(Request::SetOption(SetOptionRequest {
-            scope: ScopeSelector::Session(session.clone()),
-            option: OptionName::AutomaticRename,
-            value: "off".to_owned(),
-            mode: SetOptionMode::Replace,
-        }))
+    handler
+        .set_option(
+            ScopeSelector::Session(session.clone()),
+            OptionName::AutomaticRename,
+            "off",
+        )
         .await;
-    assert!(matches!(response, Response::SetOption(_)), "{response:?}");
-}
-
-async fn create_session(handler: &RequestHandler, name: rmux_proto::SessionName) {
-    let response = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name: name,
-            detached: true,
-            size: Some(INITIAL_SIZE),
-            environment: None,
-        }))
-        .await;
-    assert!(matches!(response, Response::NewSession(_)), "{response:?}");
 }
 
 async fn create_runtime_window(
     handler: &RequestHandler,
     session_name: &rmux_proto::SessionName,
 ) -> u32 {
-    let response = handler
-        .handle(Request::NewWindow(Box::new(NewWindowRequest {
-            target: session_name.clone(),
-            name: Some("atomic-target".to_owned()),
-            detached: true,
-            environment: None,
-            command: None,
-            start_directory: None,
-            target_window_index: None,
-            insert_at_target: false,
-            process_command: None,
-        })))
-        .await;
-    let Response::NewWindow(response) = response else {
-        panic!("runtime window creation failed: {response:?}");
-    };
-    handler.wait_for_initial_panes_for_test().await;
-    response.target.window_index()
-}
-
-async fn create_second_pane(handler: &RequestHandler, session_name: &rmux_proto::SessionName) {
-    let response = handler
-        .handle(Request::SplitWindow(SplitWindowRequest {
-            target: SplitWindowTarget::Session(session_name.clone()),
-            direction: SplitDirection::Vertical,
-            before: false,
-            environment: None,
-        }))
-        .await;
-    assert!(matches!(response, Response::SplitWindow(_)), "{response:?}");
-    handler.wait_for_initial_panes_for_test().await;
-}
-
-async fn pane_terminal_size(
-    handler: &RequestHandler,
-    session_name: &rmux_proto::SessionName,
-    window_index: u32,
-) -> TerminalSize {
     handler
-        .state
-        .lock()
+        .create_window(NewWindowRequest {
+            name: Some("atomic-target".to_owned()),
+            ..Fixture::fixture(session_name)
+        })
         .await
-        .pane_terminal_size(session_name, window_index, 0)
-        .expect("test pane terminal exposes its size")
+        .window_index()
 }
 
 async fn set_attached_geometry(handler: &RequestHandler, attach_pid: u32) {
@@ -206,23 +156,6 @@ async fn set_attached_geometry(handler: &RequestHandler, attach_pid: u32) {
     active.size_sequence = size_sequence;
     drop(active_attach);
     handler.bump_active_attach_epoch();
-}
-
-async fn open_zoomed_choose_tree(handler: &RequestHandler, attach_pid: u32) {
-    let parsed = CommandParser::new()
-        .parse_arguments(["choose-tree", "-Zw"])
-        .expect("zoomed choose-tree parses");
-    let command = RequestHandler::parse_mode_tree_queue_command(parsed.commands()[0].clone())
-        .expect("zoomed choose-tree command is valid")
-        .expect("choose-tree is recognized");
-    handler
-        .execute_queued_mode_tree(
-            attach_pid,
-            command,
-            &super::super::scripting_support::QueueExecutionContext::without_caller_cwd(),
-        )
-        .await
-        .expect("zoomed choose-tree opens");
 }
 
 async fn capture_mode_tree_preservation_snapshot(
@@ -376,26 +309,12 @@ async fn control_switch_accepts_the_canonical_list_clients_name() {
     let handler = RequestHandler::new();
     let alpha = session_name("switch-canonical-control-alpha");
     let beta = session_name("switch-canonical-control-beta");
-    create_session(&handler, alpha.clone()).await;
-    create_session(&handler, beta.clone()).await;
+    handler.create_session(&alpha).await;
+    handler.create_session(&beta).await;
     let control_pid = 94_450;
-    let (event_tx, mut event_rx) = mpsc::channel(CONTROL_SERVER_EVENT_CAPACITY);
-    let _control_id = handler
-        .register_control_with_closing(
-            control_pid,
-            ControlModeUpgrade {
-                mode: ControlMode::Plain,
-                terminal_context: crate::outer_terminal::OuterTerminalContext::default(),
-                initial_command_count: 0,
-            },
-            event_tx,
-            Arc::new(AtomicBool::new(false)),
-        )
+    let (_control_id, mut event_rx) = handler
+        .register_control_for_test(control_pid, Some(&alpha))
         .await;
-    handler
-        .set_control_session(control_pid, Some(alpha))
-        .await
-        .expect("initial control session set succeeds");
     assert!(matches!(
         event_rx.try_recv(),
         Ok(ControlServerEvent::SessionChanged(Some(_))
@@ -426,17 +345,14 @@ async fn closed_attach_switch_rolls_back_environment_geometry_selection_touch_an
     let handler = RequestHandler::new();
     let alpha = session_name("switch-atomic-attach-alpha");
     let beta = session_name("switch-atomic-attach-beta");
-    create_session(&handler, alpha.clone()).await;
-    create_session(&handler, beta.clone()).await;
+    handler.create_session(&alpha).await;
+    handler.create_session(&beta).await;
     silence_automatic_rename(&handler, &beta).await;
-    create_second_pane(&handler, &alpha).await;
+    handler.handle_ok(SplitWindowRequest::fixture(&alpha)).await;
     let target_window = create_runtime_window(&handler, &beta).await;
     let requester = spawn_environment_child("switch-atomic-attach-after").await;
     let attach_pid = requester.0.id();
-    let (control_tx, mut control_rx) = mpsc::unbounded_channel();
-    handler
-        .register_attach(attach_pid, alpha.clone(), control_tx)
-        .await;
+    let mut control_rx = handler.attach_client(attach_pid, &alpha).await;
     // `refresh_attached_session` deliberately prunes dead OS pids. Use the
     // live test-process pid for the observer so this regression fixture does
     // not accidentally exercise stale-client cleanup while opening the tree.
@@ -446,7 +362,7 @@ async fn closed_attach_switch_rolls_back_environment_geometry_selection_touch_an
         .register_attach(observer_pid, alpha.clone(), observer_tx)
         .await;
     set_attached_geometry(&handler, attach_pid).await;
-    open_zoomed_choose_tree(&handler, attach_pid).await;
+    open_mode_tree(&handler, attach_pid, &["choose-tree", "-Zw"]).await;
     while control_rx.try_recv().is_ok() {}
     while observer_rx.try_recv().is_ok() {}
     let mode_tree_before =
@@ -472,7 +388,8 @@ async fn closed_attach_switch_rolls_back_environment_geometry_selection_touch_an
             state.window_runtime_resize_count_for_test(),
         )
     };
-    let before_target_pty = pane_terminal_size(&handler, &beta, target_window).await;
+    let target_pane = PaneTarget::with_window(beta.clone(), target_window, 0);
+    let before_target_pty = handler.pane_terminal_size_for_test(&target_pane).await;
 
     let response = handler
         .handle_switch_client_ext3(
@@ -508,7 +425,7 @@ async fn closed_attach_switch_rolls_back_environment_geometry_selection_touch_an
     );
     drop(state);
     assert_eq!(
-        pane_terminal_size(&handler, &beta, target_window).await,
+        handler.pane_terminal_size_for_test(&target_pane).await,
         before_target_pty
     );
     assert_mode_tree_preserved(&handler, &mode_tree_before, &mut observer_rx).await;
@@ -525,14 +442,13 @@ async fn receiver_close_after_precheck_uses_runtime_rollback_for_the_residual_ra
     let handler = RequestHandler::new();
     let alpha = session_name("switch-atomic-race-alpha");
     let beta = session_name("switch-atomic-race-beta");
-    create_session(&handler, alpha.clone()).await;
-    create_session(&handler, beta.clone()).await;
+    handler.create_session(&alpha).await;
+    handler.create_session(&beta).await;
     silence_automatic_rename(&handler, &beta).await;
     let target_window = create_runtime_window(&handler, &beta).await;
     let requester = spawn_environment_child("switch-atomic-race-after").await;
     let attach_pid = requester.0.id();
-    let (control_tx, control_rx) = mpsc::unbounded_channel();
-    handler.register_attach(attach_pid, alpha, control_tx).await;
+    let control_rx = handler.attach_client(attach_pid, alpha).await;
     set_attached_geometry(&handler, attach_pid).await;
     let closing = handler
         .active_attach
@@ -562,7 +478,8 @@ async fn receiver_close_after_precheck_uses_runtime_rollback_for_the_residual_ra
             state.window_runtime_resize_count_for_test(),
         )
     };
-    let before_target_pty = pane_terminal_size(&handler, &beta, target_window).await;
+    let target_pane = PaneTarget::with_window(beta.clone(), target_window, 0);
+    let before_target_pty = handler.pane_terminal_size_for_test(&target_pane).await;
     let pause = handler.install_attached_switch_post_closed_check_pause(attach_pid);
     let switch_handler = handler.clone();
     let switch_target = format!("{beta}:{target_window}");
@@ -602,7 +519,7 @@ async fn receiver_close_after_precheck_uses_runtime_rollback_for_the_residual_ra
     );
     drop(state);
     assert_eq!(
-        pane_terminal_size(&handler, &beta, target_window).await,
+        handler.pane_terminal_size_for_test(&target_pane).await,
         before_target_pty
     );
     assert!(
@@ -622,13 +539,12 @@ async fn full_switch_backlog_closes_and_removes_attach_before_runtime_mutation()
     let handler = RequestHandler::new();
     let alpha = session_name("switch-atomic-backlog-alpha");
     let beta = session_name("switch-atomic-backlog-beta");
-    create_session(&handler, alpha.clone()).await;
-    create_session(&handler, beta.clone()).await;
+    handler.create_session(&alpha).await;
+    handler.create_session(&beta).await;
     let target_window = create_runtime_window(&handler, &beta).await;
     let requester = spawn_environment_child("switch-atomic-backlog-host").await;
     let attach_pid = requester.0.id();
-    let (control_tx, mut control_rx) = mpsc::unbounded_channel();
-    handler.register_attach(attach_pid, alpha, control_tx).await;
+    let mut control_rx = handler.attach_client(attach_pid, alpha).await;
     set_attached_geometry(&handler, attach_pid).await;
     let (backlog, closing) = {
         let active_attach = handler.active_attach.lock().await;
@@ -689,22 +605,19 @@ async fn successful_attach_switch_applies_mode_tree_dismissal_after_delivery() {
     let handler = RequestHandler::new();
     let alpha = session_name("switch-atomic-mode-tree-alpha");
     let beta = session_name("switch-atomic-mode-tree-beta");
-    create_session(&handler, alpha.clone()).await;
-    create_session(&handler, beta.clone()).await;
-    create_second_pane(&handler, &alpha).await;
+    handler.create_session(&alpha).await;
+    handler.create_session(&beta).await;
+    handler.handle_ok(SplitWindowRequest::fixture(&alpha)).await;
 
     let requester = spawn_environment_child("switch-atomic-mode-tree-host").await;
     let attach_pid = requester.0.id();
-    let (control_tx, mut control_rx) = mpsc::unbounded_channel();
-    handler
-        .register_attach(attach_pid, alpha.clone(), control_tx)
-        .await;
+    let mut control_rx = handler.attach_client(attach_pid, &alpha).await;
     let observer_pid = std::process::id();
     let (observer_tx, mut observer_rx) = mpsc::unbounded_channel();
     let observer_attach_id = handler
         .register_attach(observer_pid, alpha.clone(), observer_tx)
         .await;
-    open_zoomed_choose_tree(&handler, attach_pid).await;
+    open_mode_tree(&handler, attach_pid, &["choose-tree", "-Zw"]).await;
     while control_rx.try_recv().is_ok() {}
     while observer_rx.try_recv().is_ok() {}
     let mode_tree_before =
@@ -775,15 +688,12 @@ async fn concurrent_switch_recomputes_mode_tree_source_under_commit_locks() {
     let handler = RequestHandler::new();
     let alpha = session_name("switch-atomic-concurrent-alpha");
     let beta = session_name("switch-atomic-concurrent-beta");
-    create_session(&handler, alpha.clone()).await;
-    create_session(&handler, beta.clone()).await;
-    create_second_pane(&handler, &beta).await;
+    handler.create_session(&alpha).await;
+    handler.create_session(&beta).await;
+    handler.handle_ok(SplitWindowRequest::fixture(&beta)).await;
     let requester = spawn_environment_child("switch-atomic-concurrent-host").await;
     let attach_pid = requester.0.id();
-    let (control_tx, mut control_rx) = mpsc::unbounded_channel();
-    handler
-        .register_attach(attach_pid, alpha.clone(), control_tx)
-        .await;
+    let mut control_rx = handler.attach_client(attach_pid, &alpha).await;
 
     // The first switch resolves while alpha is current, so an early cached
     // `switch_changes_session` value would be false. Hold it after size
@@ -810,7 +720,7 @@ async fn concurrent_switch_recomputes_mode_tree_source_under_commit_locks() {
     let observer_attach_id = handler
         .register_attach(observer_pid, beta.clone(), observer_tx)
         .await;
-    open_zoomed_choose_tree(&handler, attach_pid).await;
+    open_mode_tree(&handler, attach_pid, &["choose-tree", "-Zw"]).await;
     while control_rx.try_recv().is_ok() {}
     while observer_rx.try_recv().is_ok() {}
     let mode_tree_before =
@@ -875,8 +785,8 @@ async fn closed_control_switch_preserves_environment_selection_and_touch() {
     let handler = RequestHandler::new();
     let alpha = session_name("switch-atomic-control-alpha");
     let beta = session_name("switch-atomic-control-beta");
-    create_session(&handler, alpha.clone()).await;
-    create_session(&handler, beta.clone()).await;
+    handler.create_session(&alpha).await;
+    handler.create_session(&beta).await;
     silence_automatic_rename(&handler, &beta).await;
     let target_window = create_runtime_window(&handler, &beta).await;
     let alpha_id = handler
@@ -889,23 +799,9 @@ async fn closed_control_switch_preserves_environment_selection_and_touch() {
         .id();
     let requester = spawn_environment_child("switch-atomic-control-after").await;
     let control_pid = requester.0.id();
-    let (event_tx, mut event_rx) = mpsc::channel(CONTROL_SERVER_EVENT_CAPACITY);
-    let control_id = handler
-        .register_control_with_closing(
-            control_pid,
-            ControlModeUpgrade {
-                mode: ControlMode::Plain,
-                terminal_context: crate::outer_terminal::OuterTerminalContext::default(),
-                initial_command_count: 0,
-            },
-            event_tx,
-            Arc::new(AtomicBool::new(false)),
-        )
+    let (control_id, mut event_rx) = handler
+        .register_control_for_test(control_pid, Some(&alpha))
         .await;
-    handler
-        .set_control_session(control_pid, Some(alpha.clone()))
-        .await
-        .expect("initial control session set succeeds");
     assert!(matches!(
         event_rx.try_recv(),
         Ok(ControlServerEvent::SessionChanged(Some(_))
@@ -995,8 +891,8 @@ async fn control_switch_resize_failure_preserves_session_identity_and_event_stre
     let handler = RequestHandler::new();
     let alpha = session_name("switch-atomic-resize-alpha");
     let beta = session_name("switch-atomic-resize-beta");
-    create_session(&handler, alpha.clone()).await;
-    create_session(&handler, beta.clone()).await;
+    handler.create_session(&alpha).await;
+    handler.create_session(&beta).await;
     silence_automatic_rename(&handler, &beta).await;
     let target_window = create_runtime_window(&handler, &beta).await;
     let (alpha_id, before_session) = {
@@ -1006,25 +902,12 @@ async fn control_switch_resize_failure_preserves_session_identity_and_event_stre
             state.sessions.session(&beta).expect("beta exists").clone(),
         )
     };
-    let before_terminal_size = pane_terminal_size(&handler, &beta, target_window).await;
+    let target_pane = PaneTarget::with_window(beta.clone(), target_window, 0);
+    let before_terminal_size = handler.pane_terminal_size_for_test(&target_pane).await;
     let control_pid = 94_500;
-    let (event_tx, mut event_rx) = mpsc::channel(CONTROL_SERVER_EVENT_CAPACITY);
-    let control_id = handler
-        .register_control_with_closing(
-            control_pid,
-            ControlModeUpgrade {
-                mode: ControlMode::Plain,
-                terminal_context: crate::outer_terminal::OuterTerminalContext::default(),
-                initial_command_count: 0,
-            },
-            event_tx,
-            Arc::new(AtomicBool::new(false)),
-        )
+    let (control_id, mut event_rx) = handler
+        .register_control_for_test(control_pid, Some(&alpha))
         .await;
-    handler
-        .set_control_session(control_pid, Some(alpha.clone()))
-        .await
-        .expect("initial control session set succeeds");
     assert!(matches!(
         event_rx.try_recv(),
         Ok(ControlServerEvent::SessionChanged(Some(_))
@@ -1061,7 +944,7 @@ async fn control_switch_resize_failure_preserves_session_identity_and_event_stre
         );
     }
     assert_eq!(
-        pane_terminal_size(&handler, &beta, target_window).await,
+        handler.pane_terminal_size_for_test(&target_pane).await,
         before_terminal_size
     );
     {
@@ -1087,28 +970,14 @@ async fn control_switch_success_commits_environment_touch_selection_and_event() 
     let handler = RequestHandler::new();
     let alpha = session_name("switch-success-control-alpha");
     let beta = session_name("switch-success-control-beta");
-    create_session(&handler, alpha.clone()).await;
-    create_session(&handler, beta.clone()).await;
+    handler.create_session(&alpha).await;
+    handler.create_session(&beta).await;
     let target_window = create_runtime_window(&handler, &beta).await;
     let requester = spawn_environment_child("switch-success-control-after").await;
     let control_pid = requester.0.id();
-    let (event_tx, mut event_rx) = mpsc::channel(CONTROL_SERVER_EVENT_CAPACITY);
-    let control_id = handler
-        .register_control_with_closing(
-            control_pid,
-            ControlModeUpgrade {
-                mode: ControlMode::Plain,
-                terminal_context: crate::outer_terminal::OuterTerminalContext::default(),
-                initial_command_count: 0,
-            },
-            event_tx,
-            Arc::new(AtomicBool::new(false)),
-        )
+    let (control_id, mut event_rx) = handler
+        .register_control_for_test(control_pid, Some(&alpha))
         .await;
-    handler
-        .set_control_session(control_pid, Some(alpha.clone()))
-        .await
-        .expect("initial control session set succeeds");
     assert!(event_rx.try_recv().is_ok());
     {
         let mut state = handler.state.lock().await;
@@ -1185,10 +1054,10 @@ async fn attach_identity_replacement_after_size_selection_commits_no_target_muta
     let handler = RequestHandler::new();
     let alpha = session_name("switch-atomic-replace-alpha");
     let beta = session_name("switch-atomic-replace-beta");
-    create_session(&handler, alpha.clone()).await;
-    create_session(&handler, beta.clone()).await;
+    handler.create_session(&alpha).await;
+    handler.create_session(&beta).await;
     silence_automatic_rename(&handler, &beta).await;
-    create_second_pane(&handler, &alpha).await;
+    handler.handle_ok(SplitWindowRequest::fixture(&alpha)).await;
     let target_window = create_runtime_window(&handler, &beta).await;
     let requester = spawn_environment_child("switch-atomic-replace-after").await;
     let attach_pid = requester.0.id();
@@ -1202,7 +1071,7 @@ async fn attach_identity_replacement_after_size_selection_commits_no_target_muta
         .register_attach(observer_pid, alpha.clone(), observer_tx)
         .await;
     set_attached_geometry(&handler, attach_pid).await;
-    open_zoomed_choose_tree(&handler, attach_pid).await;
+    open_mode_tree(&handler, attach_pid, &["choose-tree", "-Zw"]).await;
     while old_rx.try_recv().is_ok() {}
     while observer_rx.try_recv().is_ok() {}
     let mode_tree_before =

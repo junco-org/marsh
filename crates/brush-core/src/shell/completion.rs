@@ -1,6 +1,6 @@
 //! Command completion support for shell instances.
 
-use crate::{completion, error, extensions};
+use crate::{completion, error, extensions, extensions::ExecutionObserver as _};
 
 impl<SE: extensions::ShellExtensions> crate::Shell<SE> {
     /// Generates command completions for the shell.
@@ -14,9 +14,12 @@ impl<SE: extensions::ShellExtensions> crate::Shell<SE> {
         input: &str,
         position: usize,
     ) -> Result<completion::Completions, error::Error> {
+        // Completion runs as a future scoped by the observer: completion functions and
+        // commands are shell code.
         let completion_config = self.completion_config.clone();
-        completion_config
-            .get_completions(self, input, position)
+        let observer = self.execution_observer.clone();
+        observer
+            .scope_future(completion_config.get_completions(self, input, position))?
             .await
     }
 }

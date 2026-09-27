@@ -1,14 +1,14 @@
 use std::path::Path;
 
 use rmux_client::Connection;
-use rmux_proto::{
-    HookLifecycle, HookName, ResolveTargetType, ScopeSelector, SessionName, Target, WindowTarget,
-};
+use rmux_proto::{HookLifecycle, HookName, ResolveTargetType, ScopeSelector, SessionName, Target};
 
+use crate::cli::target_resolution::{
+    resolve_active_pane_index, resolve_active_window_index, target_session, target_window,
+};
 use crate::cli::{
-    ExitFailure, expect_command_output, resolve_current_pane_target,
-    resolve_current_session_target, resolve_target_spec, run_command_resolved,
-    run_payload_command_resolved,
+    ExitFailure, resolve_current_pane_target, resolve_current_session_target, resolve_target_spec,
+    resolve_window_target_or_current, run_command_resolved, run_payload_command_resolved,
 };
 use crate::cli_args::{SetHookArgs, ShowHooksArgs, TargetSpec};
 
@@ -33,7 +33,6 @@ pub(crate) fn run_set_hook(args: SetHookArgs, socket_path: &Path) -> Result<i32,
         target,
         hook: Some(hook.hook),
         run_immediately,
-        allow_global_target: true,
     })?;
 
     run_command_resolved(socket_path, "set-hook", move |connection| {
@@ -57,9 +56,20 @@ pub(crate) fn run_set_hook(args: SetHookArgs, socket_path: &Path) -> Result<i32,
 /// Runs the `show-hooks` CLI command, printing the hooks registered in the requested scope.
 pub(crate) fn run_show_hooks(args: ShowHooksArgs, socket_path: &Path) -> Result<i32, ExitFailure> {
     let hook = args.hook;
-    let scope = resolve_show_hooks_scope(args.global, args.window, args.pane, args.target, hook)?;
-    let window = args.window;
-    let pane = args.pane;
+    let scope = if args.global {
+        reject_target("show-hooks", args.target.as_ref(), "-g")?;
+        HookScope::Resolved(ScopeSelector::Global)
+    } else {
+        resolve_hook_scope(ResolveHookScopeInput {
+            command: "show-hooks",
+            global: false,
+            window: args.window,
+            pane: args.pane,
+            target: args.target,
+            hook,
+            run_immediately: false,
+        })?
+    };
 
     run_payload_command_resolved(socket_path, "show-hooks", move |connection| {
         let scope = scope.resolve(connection, "show-hooks")?;
@@ -68,7 +78,7 @@ pub(crate) fn run_show_hooks(args: ShowHooksArgs, socket_path: &Path) -> Result<
                 .map_err(|error| ExitFailure::new(1, error.to_string()))?;
         }
         connection
-            .show_hooks(scope, window, pane, hook)
+            .show_hooks(scope, args.window, args.pane, hook)
             .map_err(ExitFailure::from)
     })
 }
@@ -82,7 +92,6 @@ struct ResolveHookScopeInput<'a> {
     target: Option<TargetSpec>,
     hook: Option<HookName>,
     run_immediately: bool,
-    allow_global_target: bool,
 }
 
 /// Maps hook command flags and target onto the scope the hook will be registered in.
@@ -95,15 +104,13 @@ fn resolve_hook_scope(input: ResolveHookScopeInput<'_>) -> Result<HookScope, Exi
         target,
         hook,
         run_immediately,
-        allow_global_target,
     } = input;
     if run_immediately {
-        return Ok(
-            target.map_or(HookScope::CurrentPane, |target| HookScope::Unresolved {
-                target,
-                kind: HookTargetKind::Pane,
-            }),
-        );
+        return Ok(scope_or_current(
+            target,
+            HookTargetKind::Pane,
+            HookScope::CurrentPane,
+        ));
     }
     if window && pane {
         return Err(ExitFailure::new(
@@ -111,68 +118,36 @@ fn resolve_hook_scope(input: ResolveHookScopeInput<'_>) -> Result<HookScope, Exi
             format!("{command} does not support combining -w and -p"),
         ));
     }
-
     if global {
-        if !allow_global_target {
-            reject_target(command, target.as_ref(), "-g")?;
-        }
         return Ok(target.map_or(
             HookScope::Resolved(ScopeSelector::Global),
             HookScope::TargetCheckedGlobal,
         ));
     }
 
-    match (window, pane, target) {
-        (true, false, Some(target)) => Ok(HookScope::Unresolved {
-            target,
-            kind: HookTargetKind::Window,
-        }),
-        (true, false, None) => Ok(HookScope::CurrentWindow),
-        (false, true, Some(target)) => Ok(HookScope::Unresolved {
-            target,
-            kind: HookTargetKind::Pane,
-        }),
-        (false, true, None) => Ok(HookScope::CurrentPane),
-        (false, false, Some(target)) => Ok(HookScope::Unresolved {
+    Ok(match (window, pane, target) {
+        (true, _, target) => {
+            scope_or_current(target, HookTargetKind::Window, HookScope::CurrentWindow)
+        }
+        (false, true, target) => {
+            scope_or_current(target, HookTargetKind::Pane, HookScope::CurrentPane)
+        }
+        (false, false, Some(target)) => HookScope::Unresolved {
             target,
             kind: HookTargetKind::Natural(hook),
-        }),
-        (false, false, None) => {
-            Ok(hook.map_or(HookScope::CurrentSession, HookScope::CurrentNatural))
-        }
-        (true, true, _) => unreachable!("validated conflicting hook scope flags"),
-    }
-}
-
-/// Resolves the `show-hooks` scope, where `-g` is global and rejects an accompanying target.
-fn resolve_show_hooks_scope(
-    global: bool,
-    window: bool,
-    pane: bool,
-    target: Option<TargetSpec>,
-    hook: Option<HookName>,
-) -> Result<ShowHooksScope, ExitFailure> {
-    if global {
-        reject_target("show-hooks", target.as_ref(), "-g")?;
-        return Ok(ShowHooksScope(HookScope::Resolved(ScopeSelector::Global)));
-    }
-
-    resolve_hook_scope(ResolveHookScopeInput {
-        command: "show-hooks",
-        global: false,
-        window,
-        pane,
-        target,
-        hook,
-        run_immediately: false,
-        allow_global_target: false,
+        },
+        (false, false, None) => hook.map_or(HookScope::CurrentSession, HookScope::CurrentNatural),
     })
-    .map(ShowHooksScope)
 }
 
-/// Scope a `show-hooks` request will be listed from, resolved against a live connection.
-#[derive(Debug, Clone)]
-struct ShowHooksScope(HookScope);
+/// Narrows to `target` as `kind` when one was given, else falls back to the `current` scope.
+fn scope_or_current(
+    target: Option<TargetSpec>,
+    kind: HookTargetKind,
+    current: HookScope,
+) -> HookScope {
+    target.map_or(current, |target| HookScope::Unresolved { target, kind })
+}
 
 /// Hook scope selected by the command line, possibly still needing server-side resolution.
 #[derive(Debug, Clone)]
@@ -195,17 +170,6 @@ enum HookTargetKind {
     Window,
     Pane,
     Natural(Option<HookName>),
-}
-
-impl ShowHooksScope {
-    /// Resolves the wrapped scope against the server.
-    fn resolve(
-        self,
-        connection: &mut Connection,
-        command: &str,
-    ) -> Result<ScopeSelector, ExitFailure> {
-        self.0.resolve(connection, command)
-    }
 }
 
 impl HookScope {
@@ -239,13 +203,8 @@ impl HookScope {
                     session_name,
                 )
             }
-            Self::CurrentWindow => {
-                let pane = resolve_current_pane_target(connection, command)?;
-                Ok(ScopeSelector::Window(WindowTarget::with_window(
-                    pane.session_name().clone(),
-                    pane.window_index(),
-                )))
-            }
+            Self::CurrentWindow => resolve_window_target_or_current(connection, None, command)
+                .map(ScopeSelector::Window),
             Self::CurrentPane => {
                 resolve_current_pane_target(connection, command).map(ScopeSelector::Pane)
             }
@@ -270,27 +229,15 @@ fn resolve_unresolved_hook_scope(
             1,
             format!("{command} -p requires a pane target"),
         )),
-        (HookTargetKind::Window, Target::Session(session_name)) => {
-            Ok(ScopeSelector::Window(WindowTarget::new(session_name)))
-        }
-        (HookTargetKind::Window, Target::Window(target)) => Ok(ScopeSelector::Window(target)),
-        (HookTargetKind::Window, Target::Pane(target)) => Ok(ScopeSelector::Window(
-            WindowTarget::with_window(target.session_name().clone(), target.window_index()),
-        )),
+        (HookTargetKind::Window, target) => Ok(ScopeSelector::Window(target_window(target))),
         (HookTargetKind::Natural(Some(hook)), Target::Session(session_name)) => {
             resolve_natural_hook_scope_for_session_target(connection, command, hook, session_name)
         }
         (HookTargetKind::Natural(Some(hook)), target) => {
             Ok(rmux_core::hook_natural_scope_for_target(hook, target))
         }
-        (HookTargetKind::Natural(None), Target::Session(session_name)) => {
-            Ok(ScopeSelector::Session(session_name))
-        }
-        (HookTargetKind::Natural(None), Target::Window(target)) => {
-            Ok(ScopeSelector::Session(target.session_name().clone()))
-        }
-        (HookTargetKind::Natural(None), Target::Pane(target)) => {
-            Ok(ScopeSelector::Session(target.session_name().clone()))
+        (HookTargetKind::Natural(None), target) => {
+            Ok(ScopeSelector::Session(target_session(target)))
         }
     }
 }
@@ -315,68 +262,6 @@ fn resolve_natural_hook_scope_for_session_target(
         session_name,
         window_index,
         pane_index,
-    ))
-}
-
-/// Asks the server for the index of the active window in `session_name`.
-fn resolve_active_window_index(
-    connection: &mut Connection,
-    session_name: &SessionName,
-    command: &str,
-) -> Result<u32, ExitFailure> {
-    let response = connection
-        .list_windows(
-            session_name.clone(),
-            Some("#{window_index}:#{window_active}".to_owned()),
-        )
-        .map_err(ExitFailure::from)?;
-    let output = expect_command_output(&response, "list-windows")?;
-    let stdout = String::from_utf8_lossy(output.stdout());
-    for line in stdout.lines() {
-        let Some((index, active)) = line.split_once(':') else {
-            continue;
-        };
-        if active == "1" {
-            return index.parse::<u32>().map_err(|error| {
-                ExitFailure::new(1, format!("{command}: invalid active window: {error}"))
-            });
-        }
-    }
-    Err(ExitFailure::new(
-        1,
-        format!("{command}: no active window in session {session_name}"),
-    ))
-}
-
-/// Asks the server for the index of the active pane in the given session and window.
-fn resolve_active_pane_index(
-    connection: &mut Connection,
-    session_name: &SessionName,
-    window_index: u32,
-    command: &str,
-) -> Result<u32, ExitFailure> {
-    let response = connection
-        .list_panes_in_window(
-            session_name.clone(),
-            Some(window_index),
-            Some("#{pane_index}:#{pane_active}".to_owned()),
-        )
-        .map_err(ExitFailure::from)?;
-    let output = expect_command_output(&response, "list-panes")?;
-    let stdout = String::from_utf8_lossy(output.stdout());
-    for line in stdout.lines() {
-        let Some((index, active)) = line.split_once(':') else {
-            continue;
-        };
-        if active == "1" {
-            return index.parse::<u32>().map_err(|error| {
-                ExitFailure::new(1, format!("{command}: invalid active pane: {error}"))
-            });
-        }
-    }
-    Err(ExitFailure::new(
-        1,
-        format!("{command}: no active pane in session {session_name}:{window_index}"),
     ))
 }
 

@@ -4,6 +4,7 @@
 //! 600-line ceiling.
 
 use super::*;
+use crate::test_fixtures::Fixture;
 
 #[tokio::test]
 async fn split_window_before_inserts_new_pane_on_the_leading_edge() {
@@ -12,28 +13,17 @@ async fn split_window_before_inserts_new_pane_on_the_leading_edge() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
 
-    let created = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name: alpha.clone(),
-            detached: true,
-            size: Some(TerminalSize {
-                cols: 100,
-                rows: 50,
-            }),
-            environment: None,
-        }))
+    handler
+        .create_session((&alpha, TerminalSize::new(100, 50)))
         .await;
-    assert!(matches!(created, Response::NewSession(_)));
 
-    let split = handler
-        .handle(Request::SplitWindow(SplitWindowRequest {
-            target: SplitWindowTarget::Session(alpha.clone()),
+    handler
+        .handle_ok(SplitWindowRequest {
             direction: rmux_proto::SplitDirection::Horizontal,
             before: true,
-            environment: None,
-        }))
+            ..Fixture::fixture(&alpha)
+        })
         .await;
-    assert!(matches!(split, Response::SplitWindow(_)));
 
     let state = handler.state.lock().await;
     let session = state.sessions.session(&alpha).expect("session exists");

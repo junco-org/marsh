@@ -1,18 +1,14 @@
-use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
-
 use rmux_proto::{
-    ControlMode, NewSessionRequest, NewWindowRequest, OptionName, PaneTarget, ProcessCommand,
-    Request, RespawnPaneRequest, Response, ScopeSelector, SessionName, SetOptionMode,
-    SetOptionRequest, SplitDirection, SplitWindowExtRequest, SplitWindowTarget, TerminalSize,
-    WindowTarget,
+    NewWindowRequest, OptionName, PaneTarget, ProcessCommand, RespawnPaneRequest, ScopeSelector,
+    SessionName, SplitWindowExtRequest, TerminalSize,
 };
 use tokio::sync::mpsc;
 use tokio::time::{sleep, timeout, Duration, Instant};
 
 use super::RequestHandler;
-use crate::control::{ControlModeUpgrade, ControlServerEvent, CONTROL_SERVER_EVENT_CAPACITY};
+use crate::control::ControlServerEvent;
 use crate::pane_io::AttachControl;
+use crate::test_fixtures::{wait_until, Fixture};
 
 const EXIT_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -57,8 +53,6 @@ struct SelectionFixture {
     _target_client: TargetClientGuard,
 }
 
-use crate::test_names::session_name;
-
 fn sleeping_process() -> ProcessCommand {
     ProcessCommand::Argv(vec![
         "/bin/sh".to_owned(),
@@ -75,116 +69,6 @@ fn exiting_process() -> ProcessCommand {
     ])
 }
 
-async fn new_session(handler: &RequestHandler, name: &SessionName) {
-    let response = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name: name.clone(),
-            detached: true,
-            size: Some(TerminalSize {
-                cols: 100,
-                rows: 40,
-            }),
-            environment: None,
-        }))
-        .await;
-    assert!(matches!(response, Response::NewSession(_)), "{response:?}");
-}
-
-async fn add_panes(handler: &RequestHandler, session: &SessionName, pane_count: usize) {
-    for _ in 1..pane_count {
-        let response = handler
-            .handle(Request::SplitWindowExt(Box::new(SplitWindowExtRequest {
-                target: SplitWindowTarget::Session(session.clone()),
-                direction: SplitDirection::Vertical,
-                before: false,
-                environment: None,
-                command: None,
-                process_command: Some(sleeping_process()),
-                start_directory: None,
-                keep_alive_on_exit: None,
-                detached: true,
-                size: None,
-                preserve_zoom: false,
-                full_size: false,
-                stdin_payload: None,
-            })))
-            .await;
-        assert!(matches!(response, Response::SplitWindow(_)), "{response:?}");
-    }
-}
-
-async fn add_windows(handler: &RequestHandler, session: &SessionName, window_count: usize) {
-    for _ in 1..window_count {
-        let response = handler
-            .handle(Request::NewWindow(Box::new(NewWindowRequest {
-                target: session.clone(),
-                name: None,
-                detached: true,
-                environment: None,
-                command: None,
-                start_directory: None,
-                target_window_index: None,
-                insert_at_target: false,
-                process_command: Some(sleeping_process()),
-            })))
-            .await;
-        assert!(matches!(response, Response::NewWindow(_)), "{response:?}");
-    }
-}
-
-async fn set_window_size_mode(handler: &RequestHandler, session_name: &SessionName, mode: &str) {
-    let window_indexes = {
-        let state = handler.state.lock().await;
-        state
-            .sessions
-            .session(session_name)
-            .expect("target session exists")
-            .windows()
-            .keys()
-            .copied()
-            .collect::<Vec<_>>()
-    };
-    for window_index in window_indexes {
-        let response = handler
-            .handle(Request::SetOption(SetOptionRequest {
-                scope: ScopeSelector::Window(WindowTarget::with_window(
-                    session_name.clone(),
-                    window_index,
-                )),
-                option: OptionName::WindowSize,
-                value: mode.to_owned(),
-                mode: SetOptionMode::Replace,
-            }))
-            .await;
-        assert!(matches!(response, Response::SetOption(_)), "{response:?}");
-    }
-}
-
-async fn register_control(
-    handler: &RequestHandler,
-    pid: u32,
-    session: &SessionName,
-) -> mpsc::Receiver<ControlServerEvent> {
-    let (event_tx, event_rx) = mpsc::channel(CONTROL_SERVER_EVENT_CAPACITY);
-    handler
-        .register_control_with_closing(
-            pid,
-            ControlModeUpgrade {
-                initial_command_count: 0,
-                mode: ControlMode::Plain,
-                terminal_context: crate::outer_terminal::OuterTerminalContext::default(),
-            },
-            event_tx,
-            Arc::new(AtomicBool::new(false)),
-        )
-        .await;
-    handler
-        .set_control_session(pid, Some(session.clone()))
-        .await
-        .expect("control client attaches to test session");
-    event_rx
-}
-
 async fn register_target_client(
     handler: &RequestHandler,
     pid: u32,
@@ -193,32 +77,63 @@ async fn register_target_client(
 ) -> TargetClientGuard {
     match kind {
         TargetClientKind::None => TargetClientGuard::None,
-        TargetClientKind::Pty => {
-            let (control_tx, control_rx) = mpsc::unbounded_channel();
-            handler
-                .register_attach(pid, session.clone(), control_tx)
-                .await;
-            TargetClientGuard::Pty {
-                _receiver: control_rx,
+        TargetClientKind::Pty => TargetClientGuard::Pty {
+            _receiver: handler.attach_client(pid, session).await,
+        },
+        TargetClientKind::Control => {
+            let (_, receiver) = handler.register_control_for_test(pid, Some(session)).await;
+            TargetClientGuard::Control {
+                _receiver: receiver,
             }
         }
-        TargetClientKind::Control => TargetClientGuard::Control {
-            _receiver: register_control(handler, pid, session).await,
-        },
     }
 }
 
 async fn fixture(scenario: SelectionScenario) -> SelectionFixture {
     let handler = RequestHandler::new();
-    let observer = session_name("observer");
-    let target = session_name("target");
-    new_session(&handler, &observer).await;
-    new_session(&handler, &target).await;
-    add_panes(&handler, &target, scenario.panes).await;
-    add_windows(&handler, &target, scenario.windows).await;
-    set_window_size_mode(&handler, &target, scenario.mode).await;
+    let observer = handler
+        .create_session(("observer", TerminalSize::new(100, 40)))
+        .await;
+    let target = handler
+        .create_session(("target", TerminalSize::new(100, 40)))
+        .await;
+    for _ in 1..scenario.panes {
+        handler
+            .handle_ok(SplitWindowExtRequest {
+                process_command: Some(sleeping_process()),
+                detached: true,
+                ..Fixture::fixture(&target)
+            })
+            .await;
+    }
+    for _ in 1..scenario.windows {
+        handler
+            .create_window(NewWindowRequest {
+                process_command: Some(sleeping_process()),
+                ..Fixture::fixture(&target)
+            })
+            .await;
+    }
+    let window_indexes = {
+        let state = handler.state.lock().await;
+        state
+            .sessions
+            .session(&target)
+            .expect("target session exists")
+            .windows()
+            .keys()
+            .copied()
+            .collect::<Vec<_>>()
+    };
+    for window_index in window_indexes {
+        handler
+            .set_window_size_policy(&target, window_index, scenario.mode)
+            .await;
+    }
 
-    let observer_rx = register_control(&handler, scenario.pid_seed, &observer).await;
+    let (_, observer_rx) = handler
+        .register_control_for_test(scenario.pid_seed, Some(&observer))
+        .await;
     let target_client =
         register_target_client(&handler, scenario.pid_seed + 1, &target, scenario.client).await;
     let mut fixture = SelectionFixture {
@@ -298,15 +213,10 @@ async fn inactive_window_pane_target(
 }
 
 async fn set_remain_on_exit(handler: &RequestHandler, target: PaneTarget, enabled: bool) {
-    let response = handler
-        .handle(Request::SetOption(SetOptionRequest {
-            scope: ScopeSelector::Pane(target),
-            option: OptionName::RemainOnExit,
-            value: if enabled { "on" } else { "off" }.to_owned(),
-            mode: SetOptionMode::Replace,
-        }))
+    let value = if enabled { "on" } else { "off" };
+    handler
+        .set_option(ScopeSelector::Pane(target), OptionName::RemainOnExit, value)
         .await;
-    assert!(matches!(response, Response::SetOption(_)), "{response:?}");
 }
 
 async fn exit_and_wait_removed(handler: &RequestHandler, target: PaneTarget) {
@@ -318,39 +228,29 @@ async fn exit_and_wait_removed(handler: &RequestHandler, target: PaneTarget) {
             .expect("exit target exists")
             .id()
     };
-    let response = handler
-        .handle(Request::RespawnPane(Box::new(RespawnPaneRequest {
-            target,
-            kill: true,
-            start_directory: None,
-            environment: None,
-            command: None,
+    handler
+        .handle_ok(RespawnPaneRequest {
             process_command: Some(exiting_process()),
-        })))
+            ..Fixture::fixture(target)
+        })
         .await;
-    assert!(matches!(response, Response::RespawnPane(_)), "{response:?}");
 
-    let deadline = Instant::now() + EXIT_TIMEOUT;
-    loop {
-        let present = {
-            let state = handler.state.lock().await;
-            let present = state.sessions.iter().any(|(_, session)| {
-                session
-                    .windows()
-                    .values()
-                    .any(|window| window.panes().iter().any(|pane| pane.id() == pane_id))
-            });
-            present
-        };
-        if !present {
-            return;
+    wait_until(EXIT_TIMEOUT, Duration::from_millis(20), async || {
+        let state = handler.state.lock().await;
+        let present = state.sessions.iter().any(|(_, session)| {
+            session
+                .windows()
+                .values()
+                .any(|window| window.panes().iter().any(|pane| pane.id() == pane_id))
+        });
+        if present {
+            Err(())
+        } else {
+            Ok(())
         }
-        assert!(
-            Instant::now() < deadline,
-            "real exited process did not remove pane {pane_id}"
-        );
-        sleep(Duration::from_millis(20)).await;
-    }
+    })
+    .await
+    .unwrap_or_else(|()| panic!("real exited process did not remove pane {pane_id}"));
 }
 
 async fn exit_and_wait_dead(
@@ -366,33 +266,23 @@ async fn exit_and_wait_dead(
             .expect("exit target exists")
             .id()
     };
-    let response = handler
-        .handle(Request::RespawnPane(Box::new(RespawnPaneRequest {
-            target,
-            kill: true,
-            start_directory: None,
-            environment: None,
-            command: None,
+    handler
+        .handle_ok(RespawnPaneRequest {
             process_command: Some(exiting_process()),
-        })))
+            ..Fixture::fixture(target)
+        })
         .await;
-    assert!(matches!(response, Response::RespawnPane(_)), "{response:?}");
 
-    let deadline = Instant::now() + EXIT_TIMEOUT;
-    loop {
-        let dead = {
-            let state = handler.state.lock().await;
-            state.pane_is_dead(session_name, pane_id)
-        };
-        if dead {
-            return;
+    wait_until(EXIT_TIMEOUT, Duration::from_millis(20), async || {
+        let state = handler.state.lock().await;
+        if state.pane_is_dead(session_name, pane_id) {
+            Ok(())
+        } else {
+            Err(())
         }
-        assert!(
-            Instant::now() < deadline,
-            "real exited process did not become kept-dead pane {pane_id}"
-        );
-        sleep(Duration::from_millis(20)).await;
-    }
+    })
+    .await
+    .unwrap_or_else(|()| panic!("real exited process did not become kept-dead pane {pane_id}"));
 }
 
 fn relevant_notification(event: ControlServerEvent) -> Option<String> {

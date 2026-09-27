@@ -1,10 +1,15 @@
 use std::error::Error;
 mod common;
 
-use common::{send_request, session_name, start_server, TestHarness};
+use common::{create_session, send, send_ok, session_name, start_server, Fixture, TestHarness};
 use rmux_proto::{
-    DisplayMessageRequest, ListWindowsRequest, NewSessionRequest, NewWindowRequest, Request,
-    Response, Target, TerminalSize,
+    DisplayMessageRequest, ListWindowsRequest, NewSessionRequest, NewWindowRequest, Target,
+    TerminalSize,
+};
+
+const SESSION_SIZE: TerminalSize = TerminalSize {
+    cols: 120,
+    rows: 40,
 };
 
 const FORMAT_FIELD_SEPARATOR: char = '\x1f';
@@ -53,53 +58,26 @@ async fn list_windows_uses_shared_formatter_through_real_socket() -> Result<(), 
     let handle = start_server(&harness).await?;
     let alpha = session_name("alpha");
 
-    let created = send_request(
+    create_session(
         harness.socket_path(),
-        &Request::NewSession(NewSessionRequest {
-            session_name: alpha.clone(),
-            detached: true,
-            size: Some(TerminalSize {
-                cols: 120,
-                rows: 40,
-            }),
+        NewSessionRequest {
+            size: Some(SESSION_SIZE),
             environment: Some(vec![
                 "SHELL=/bin/bash".to_owned(),
                 "TERM_PROGRAM=tmux".to_owned(),
             ]),
-        }),
+            ..Fixture::fixture(&alpha)
+        },
     )
     .await?;
-    assert!(matches!(created, Response::NewSession(_)));
+    send_ok(harness.socket_path(), attached_logs_window(&alpha)).await?;
 
-    let new_window = send_request(
+    let listed = send(
         harness.socket_path(),
-        &Request::NewWindow(Box::new(NewWindowRequest {
-            target: alpha.clone(),
-            name: Some("logs".to_owned()),
-            detached: false,
-            start_directory: None,
-            environment: None,
-            command: None,
-            process_command: None,
-            target_window_index: None,
-            insert_at_target: false,
-        })),
-    )
-    .await?;
-    assert!(matches!(new_window, Response::NewWindow(_)));
-
-    let listed = send_request(
-        harness.socket_path(),
-        &Request::ListWindows(Box::new(ListWindowsRequest {
-            target: alpha,
-            format: Some(
-                "#{session_name}\x1f#{session_windows}\x1f#{session_attached}\x1f#{session_width}x#{session_height}\x1f#{window_index}\x1f#{window_name}\x1f#{window_raw_flags}\x1f#{window_active}\x1f#{window_last_flag}\x1f#{window_id}\x1f#{missing}\x1f#I#W#S\x1f#{=21:pane_title}\x1f#{?window_active,yes,no}"
-                    .to_owned(),
-            ),
-            filter: None,
-            sort_order: None,
-            reversed: false,
-        })),
+        ListWindowsRequest::fixture((
+            alpha,
+            "#{session_name}\x1f#{session_windows}\x1f#{session_attached}\x1f#{session_width}x#{session_height}\x1f#{window_index}\x1f#{window_name}\x1f#{window_raw_flags}\x1f#{window_active}\x1f#{window_last_flag}\x1f#{window_id}\x1f#{missing}\x1f#I#W#S\x1f#{=21:pane_title}\x1f#{?window_active,yes,no}",
+        )),
     )
     .await?;
 
@@ -131,50 +109,15 @@ async fn nested_conditionals_expand_inner_templates_through_real_socket(
     let handle = start_server(&harness).await?;
     let alpha = session_name("alpha");
 
-    let created = send_request(
-        harness.socket_path(),
-        &Request::NewSession(NewSessionRequest {
-            session_name: alpha.clone(),
-            detached: true,
-            size: Some(TerminalSize {
-                cols: 120,
-                rows: 40,
-            }),
-            environment: None,
-        }),
-    )
-    .await?;
-    assert!(matches!(created, Response::NewSession(_)));
+    create_session(harness.socket_path(), (&alpha, SESSION_SIZE)).await?;
+    send_ok(harness.socket_path(), attached_logs_window(&alpha)).await?;
 
-    let new_window = send_request(
+    let listed = send(
         harness.socket_path(),
-        &Request::NewWindow(Box::new(NewWindowRequest {
-            target: alpha.clone(),
-            name: Some("logs".to_owned()),
-            detached: false,
-            start_directory: None,
-            environment: None,
-            command: None,
-            process_command: None,
-            target_window_index: None,
-            insert_at_target: false,
-        })),
-    )
-    .await?;
-    assert!(matches!(new_window, Response::NewWindow(_)));
-
-    let listed = send_request(
-        harness.socket_path(),
-        &Request::ListWindows(Box::new(ListWindowsRequest {
-            target: alpha,
-            format: Some(
-                "#{?window_active,#{window_name},#{?window_last_flag,last,#{session_name}}}"
-                    .to_owned(),
-            ),
-            filter: None,
-            sort_order: None,
-            reversed: false,
-        })),
+        ListWindowsRequest::fixture((
+            alpha,
+            "#{?window_active,#{window_name},#{?window_last_flag,last,#{session_name}}}",
+        )),
     )
     .await?;
 
@@ -197,29 +140,16 @@ async fn display_message_session_target_includes_active_pane_runtime_context(
     let handle = start_server(&harness).await?;
     let alpha = session_name("alpha");
 
-    let created = send_request(
-        harness.socket_path(),
-        &Request::NewSession(NewSessionRequest {
-            session_name: alpha.clone(),
-            detached: true,
-            size: Some(TerminalSize { cols: 80, rows: 24 }),
-            environment: None,
-        }),
-    )
-    .await?;
-    assert!(matches!(created, Response::NewSession(_)));
+    create_session(harness.socket_path(), &alpha).await?;
 
-    let displayed = send_request(
+    let displayed = send(
         harness.socket_path(),
-        &Request::DisplayMessage(DisplayMessageRequest {
+        DisplayMessageRequest {
             target: Some(Target::Session(alpha)),
-            print: true,
-            message: Some(
-                "#{session_name}|#{window_index}|#{pane_index}|#{pane_current_path}|#{pane_pid}|#{pane_tty}|#{socket_path}"
-                    .to_owned(),
-            ),
-            empty_target_context: false,
-            }),
+            ..Fixture::fixture(
+                "#{session_name}|#{window_index}|#{pane_index}|#{pane_current_path}|#{pane_pid}|#{pane_tty}|#{socket_path}",
+            )
+        },
     )
     .await?;
 
@@ -246,4 +176,13 @@ async fn display_message_session_target_includes_active_pane_runtime_context(
 
     handle.shutdown().await?;
     Ok(())
+}
+
+/// A `new-window -n logs` in `session` that becomes its current window.
+fn attached_logs_window(session: &rmux_proto::SessionName) -> NewWindowRequest {
+    NewWindowRequest {
+        name: Some("logs".to_owned()),
+        detached: false,
+        ..Fixture::fixture(session)
+    }
 }

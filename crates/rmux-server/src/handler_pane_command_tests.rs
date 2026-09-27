@@ -1,45 +1,23 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use super::RequestHandler;
 use crate::pane_io::AttachControl;
 use crate::pane_terminals::{seed_scratch_dir, PaneLifecycleProcessState, SeedScratch};
+use crate::test_fixtures::{unique_temp_path, wait_for_file_contents, Fixture, Grouped};
+use crate::test_names::session_name;
+use crate::test_shell::{sh_quote_path, stdin_discard_command};
 use rmux_proto::{
-    BreakPaneRequest, DisplayPanesRequest, KillPaneRequest, ListPanesRequest, ListWindowsRequest,
-    MovePaneRequest, NewSessionExtRequest, NewSessionRequest, OptionName, PaneKillRequest,
+    BreakPaneRequest, DisplayPanesRequest, HookName, KillPaneRequest, ListPanesRequest,
+    ListWindowsRequest, MovePaneRequest, NewSessionExtRequest, OptionName, PaneKillRequest,
     PaneRespawnRequest, PaneSnapshotRequest, PaneTarget, PaneTargetRef, PipePaneRequest,
     ProcessCommand, RenameWindowRequest, Request, ResizePaneAdjustment, ResizePaneRequest,
-    RespawnPaneRequest, Response, ScopeSelector, SelectPaneRequest, SessionName,
-    SetHookMutationRequest, SetOptionMode, SetOptionRequest, SplitDirection, SplitWindowExtRequest,
-    SplitWindowRequest, SplitWindowTarget, TerminalSize, WindowTarget,
+    RespawnPaneRequest, Response, ScopeSelector, SelectPaneRequest, SessionName, SetOptionMode,
+    SplitDirection, SplitWindowExtRequest, SplitWindowRequest, TerminalSize, WindowTarget,
 };
-use rmux_proto::{HookLifecycle, HookName};
 use tokio::sync::mpsc;
 use tokio::time::{sleep, timeout};
-
-const PROCESS_OUTPUT_FILE_TIMEOUT: Duration = Duration::from_secs(5);
-
-use crate::test_names::session_name;
-
-fn unique_temp_path(label: &str) -> PathBuf {
-    let unique = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time after epoch")
-        .as_nanos();
-    std::env::temp_dir().join(format!(
-        "rmux-pane-command-{label}-{}-{unique}",
-        std::process::id()
-    ))
-}
-
-fn shell_quote(path: &Path) -> String {
-    crate::test_shell::sh_quote_path(path)
-}
-
-fn pipe_discard_command() -> String {
-    crate::test_shell::stdin_discard_command()
-}
 
 /// The shell that reports a job's own directory, as the probes below spell it.
 ///
@@ -59,14 +37,14 @@ const JOB_DIRECTORY_NAME: &str = "dir=$(pwd); name=${dir##*/};";
 fn respawn_probe_command(output: &Path) -> String {
     format!(
         "{JOB_DIRECTORY_NAME} printf '%s:%s' \"$name\" \"$RMUX_RESPAWN\" > {}",
-        shell_quote(output)
+        sh_quote_path(output)
     )
 }
 
 fn cwd_probe_command(output: &Path) -> String {
     format!(
         "{JOB_DIRECTORY_NAME} printf '%s' \"$name\" > {}",
-        shell_quote(output)
+        sh_quote_path(output)
     )
 }
 
@@ -81,7 +59,7 @@ fn expected_spawn_cwd(scratch: &SeedScratch) -> &str {
 fn respawn_replay_script(output: &Path, tag: &str) -> String {
     format!(
         "{JOB_DIRECTORY_NAME} printf '%s:%s:{tag}\\n' \"$name\" \"$RMUX_RESPAWN\" >> {}; sleep 60",
-        shell_quote(output)
+        sh_quote_path(output)
     )
 }
 
@@ -93,86 +71,23 @@ fn respawn_argv_probe_command(output: &Path, tag: &str) -> Vec<String> {
     ]
 }
 
-fn respawn_shell_probe_command(output: &Path, tag: &str) -> String {
-    respawn_replay_script(output, tag)
-}
-
 fn respawn_shell_identity_command(output: &Path, tag: &str) -> String {
     format!(
         "printf '%s:%s:{tag}\\n' \"${{0##*/}}\" \"$SHELL\" >> {}; sleep 60",
-        shell_quote(output)
+        sh_quote_path(output)
     )
-}
-
-async fn set_global_default_shell(handler: &RequestHandler, shell: &str) {
-    let response = handler
-        .handle(Request::SetOption(SetOptionRequest {
-            scope: ScopeSelector::Global,
-            option: OptionName::DefaultShell,
-            value: shell.to_owned(),
-            mode: SetOptionMode::Replace,
-        }))
-        .await;
-    assert!(matches!(response, Response::SetOption(_)), "{response:?}");
 }
 
 fn respawn_probe_line(cwd: &str, environment: &str, tag: &str) -> String {
     format!("{cwd}:{environment}:{tag}\n")
 }
 
-async fn create_session(handler: &RequestHandler, session_name: &SessionName) {
-    let created = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name: session_name.clone(),
-            detached: true,
-            size: Some(TerminalSize { cols: 80, rows: 24 }),
-            environment: None,
-        }))
-        .await;
-    assert!(matches!(created, rmux_proto::Response::NewSession(_)));
-}
-
-async fn create_grouped_session(
-    handler: &RequestHandler,
-    session_name: &SessionName,
-    group_target: &SessionName,
-) {
-    let created = handler
-        .handle(Request::NewSessionExt(Box::new(NewSessionExtRequest {
-            session_name: Some(session_name.clone()),
-            working_directory: None,
-            detached: true,
-            size: Some(TerminalSize { cols: 80, rows: 24 }),
-            environment: None,
-            group_target: Some(group_target.clone()),
-            attach_if_exists: false,
-            detach_other_clients: false,
-            kill_other_clients: false,
-            flags: None,
-            window_name: None,
-            print_session_info: false,
-            print_format: None,
-            command: None,
-            process_command: None,
-            client_environment: None,
-            skip_environment_update: false,
-        })))
-        .await;
-    assert!(matches!(created, Response::NewSession(_)), "{created:?}");
-}
-
 async fn create_three_pane_window(handler: &RequestHandler, session_name: &SessionName) {
-    create_session(handler, session_name).await;
+    handler.create_session(session_name).await;
     for _ in 0..2 {
-        let split = handler
-            .handle(Request::SplitWindow(SplitWindowRequest {
-                target: SplitWindowTarget::Session(session_name.clone()),
-                direction: SplitDirection::Vertical,
-                before: false,
-                environment: None,
-            }))
+        handler
+            .handle_ok(SplitWindowRequest::fixture(session_name))
             .await;
-        assert!(matches!(split, Response::SplitWindow(_)), "{split:?}");
     }
 }
 
@@ -231,29 +146,6 @@ async fn wait_for_attached_session_exit(control_rx: &mut mpsc::UnboundedReceiver
     .expect("timed out waiting for source session attach exit");
 }
 
-async fn wait_for_file_contents(path: &Path, expected: &str) {
-    let deadline = tokio::time::Instant::now() + PROCESS_OUTPUT_FILE_TIMEOUT;
-    loop {
-        match fs::read_to_string(path) {
-            Ok(contents) if contents == expected => return,
-            Ok(_) | Err(_) if tokio::time::Instant::now() < deadline => {
-                sleep(Duration::from_millis(25)).await;
-            }
-            Ok(contents) => panic!(
-                "timed out waiting for {} to contain {:?}, got {:?}",
-                path.display(),
-                expected,
-                contents
-            ),
-            Err(error) => panic!(
-                "timed out waiting for {} to exist with {:?}: {error}",
-                path.display(),
-                expected
-            ),
-        }
-    }
-}
-
 #[tokio::test]
 async fn list_panes_activity_sort_follows_selection_counter_like_tmux() {
     // Oracle probes 2026-07-09 (pinned tmux 3.7b): pane "activity" ordering
@@ -263,17 +155,14 @@ async fn list_panes_activity_sort_follows_selection_counter_like_tmux() {
     // "0 1 2". Output/alert activity does not reorder anything.
     let handler = RequestHandler::new();
     let session = session_name("list-panes-activity-sort");
-    create_session(&handler, &session).await;
+    handler.create_session(&session).await;
     for _ in 0..2 {
-        let split = handler
-            .handle(Request::SplitWindow(SplitWindowRequest {
-                target: SplitWindowTarget::Session(session.clone()),
+        handler
+            .handle_ok(SplitWindowRequest {
                 direction: SplitDirection::Horizontal,
-                before: false,
-                environment: None,
-            }))
+                ..Fixture::fixture(&session)
+            })
             .await;
-        assert!(matches!(split, Response::SplitWindow(_)), "{split:?}");
     }
 
     let list = |reversed: bool| {
@@ -299,16 +188,8 @@ async fn list_panes_activity_sort_follows_selection_counter_like_tmux() {
         let handler = handler.clone();
         let session = session.clone();
         async move {
-            let response = handler
-                .handle(Request::SelectPane(Box::new(SelectPaneRequest {
-                    target: PaneTarget::with_window(session, 0, pane_index),
-                    title: None,
-                    input_disabled: None,
-                    preserve_zoom: false,
-                    style: None,
-                })))
-                .await;
-            assert!(matches!(response, Response::SelectPane(_)), "{response:?}");
+            let target = PaneTarget::with_window(session, 0, pane_index);
+            handler.handle_ok(SelectPaneRequest::fixture(target)).await;
         }
     };
 
@@ -326,48 +207,33 @@ async fn list_panes_activity_sort_follows_selection_counter_like_tmux() {
 async fn list_panes_size_sort_uses_area_in_both_directions() {
     let handler = RequestHandler::new();
     let session = session_name("list-panes-area-sort");
-    create_session(&handler, &session).await;
+    handler.create_session(&session).await;
 
-    assert!(matches!(
-        handler
-            .handle(Request::SplitWindow(SplitWindowRequest {
-                target: SplitWindowTarget::Pane(PaneTarget::with_window(session.clone(), 0, 0)),
-                direction: SplitDirection::Horizontal,
-                before: false,
-                environment: None,
-            }))
-            .await,
-        Response::SplitWindow(_)
-    ));
-    assert!(matches!(
-        handler
-            .handle(Request::ResizePane(ResizePaneRequest {
-                target: PaneTarget::with_window(session.clone(), 0, 0),
-                adjustment: ResizePaneAdjustment::AbsoluteWidth { columns: 59 },
-            }))
-            .await,
-        Response::ResizePane(_)
-    ));
-    assert!(matches!(
-        handler
-            .handle(Request::SplitWindow(SplitWindowRequest {
-                target: SplitWindowTarget::Pane(PaneTarget::with_window(session.clone(), 0, 0)),
-                direction: SplitDirection::Vertical,
-                before: false,
-                environment: None,
-            }))
-            .await,
-        Response::SplitWindow(_)
-    ));
-    assert!(matches!(
-        handler
-            .handle(Request::ResizePane(ResizePaneRequest {
-                target: PaneTarget::with_window(session.clone(), 0, 0),
-                adjustment: ResizePaneAdjustment::AbsoluteHeight { rows: 5 },
-            }))
-            .await,
-        Response::ResizePane(_)
-    ));
+    handler
+        .handle_ok(SplitWindowRequest {
+            direction: SplitDirection::Horizontal,
+            ..Fixture::fixture(PaneTarget::with_window(session.clone(), 0, 0))
+        })
+        .await;
+    handler
+        .handle_ok(ResizePaneRequest {
+            target: PaneTarget::with_window(session.clone(), 0, 0),
+            adjustment: ResizePaneAdjustment::AbsoluteWidth { columns: 59 },
+        })
+        .await;
+    handler
+        .handle_ok(SplitWindowRequest::fixture(PaneTarget::with_window(
+            session.clone(),
+            0,
+            0,
+        )))
+        .await;
+    handler
+        .handle_ok(ResizePaneRequest {
+            target: PaneTarget::with_window(session.clone(), 0, 0),
+            adjustment: ResizePaneAdjustment::AbsoluteHeight { rows: 5 },
+        })
+        .await;
 
     let list = |reversed| {
         Request::ListPanes(Box::new(ListPanesRequest {
@@ -388,31 +254,6 @@ async fn list_panes_size_sort_uses_area_in_both_directions() {
         list_stdout(handler.handle(list(true)).await),
         "1:59x18\n2:20x24\n0:59x5\n"
     );
-}
-
-async fn wait_for_dead_pane(
-    handler: &RequestHandler,
-    session_name: &SessionName,
-    window_index: u32,
-    pane_index: u32,
-) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        let exited = {
-            let state = handler.state.lock().await;
-            state
-                .pane_shell_if_alive(session_name, window_index, pane_index)
-                .is_err()
-        };
-        if exited {
-            return;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "timed out waiting for pane {session_name}:{window_index}.{pane_index} to exit"
-        );
-        sleep(Duration::from_millis(25)).await;
-    }
 }
 
 async fn wait_for_lifecycle_exit(
@@ -452,35 +293,21 @@ async fn sticky_lifecycle_state_is_id_keyed_and_redacts_spawn_env() {
     // server's seed is refused rather than silently relocated, so they are allocated inside it.
     let initial_cwd = seed_scratch_dir(&handler, "sticky-initial-cwd");
     let respawn_cwd = seed_scratch_dir(&handler, "sticky-respawn-cwd");
-    let initial_command = pipe_discard_command();
-    let split_command = pipe_discard_command();
-    let respawn_command = pipe_discard_command();
+    let initial_command = stdin_discard_command();
+    let split_command = stdin_discard_command();
+    let respawn_command = stdin_discard_command();
     let initial_secret = "RMUX_PRIVATE_INITIAL=alpha-secret".to_owned();
     let split_secret = "RMUX_PRIVATE_SPLIT=beta-secret".to_owned();
     let respawn_secret = "RMUX_PRIVATE_RESPAWN=gamma-secret".to_owned();
 
-    let created = handler
-        .handle(Request::NewSessionExt(Box::new(NewSessionExtRequest {
-            session_name: Some(alpha.clone()),
+    handler
+        .create_session(NewSessionExtRequest {
             working_directory: Some(initial_cwd.path().to_string_lossy().into_owned()),
-            detached: true,
-            size: Some(TerminalSize { cols: 80, rows: 24 }),
             environment: Some(vec![initial_secret.clone()]),
-            group_target: None,
-            attach_if_exists: false,
-            detach_other_clients: false,
-            kill_other_clients: false,
-            flags: None,
-            window_name: None,
-            print_session_info: false,
-            print_format: None,
             command: Some(vec![initial_command.clone()]),
-            process_command: None,
-            client_environment: None,
-            skip_environment_update: false,
-        })))
+            ..Fixture::fixture(&alpha)
+        })
         .await;
-    assert!(matches!(created, rmux_proto::Response::NewSession(_)));
     handler
         .wait_for_pane_terminal_for_test(&PaneTarget::new(alpha.clone(), 0))
         .await;
@@ -523,27 +350,14 @@ async fn sticky_lifecycle_state_is_id_keyed_and_redacts_spawn_env() {
         )
     };
 
-    let split = handler
-        .handle(Request::SplitWindowExt(Box::new(SplitWindowExtRequest {
-            target: SplitWindowTarget::Session(alpha.clone()),
-            direction: SplitDirection::Vertical,
-            before: false,
+    let split_target = handler
+        .handle_ok(SplitWindowExtRequest {
             environment: Some(vec![split_secret.clone()]),
             command: Some(vec![split_command.clone()]),
-            process_command: None,
-            start_directory: None,
-            keep_alive_on_exit: None,
-            detached: false,
-            size: None,
-            preserve_zoom: false,
-            full_size: false,
-            stdin_payload: None,
-        })))
-        .await;
-    let split_target = match split {
-        rmux_proto::Response::SplitWindow(response) => response.pane,
-        response => panic!("expected split-window success, got {response:?}"),
-    };
+            ..Fixture::fixture(&alpha)
+        })
+        .await
+        .pane;
     let split_pane_id = {
         let state = handler.state.lock().await;
         let session = state.sessions.session(&alpha).expect("session exists");
@@ -617,13 +431,12 @@ async fn sticky_lifecycle_state_is_id_keyed_and_redacts_spawn_env() {
     assert!(!windows_stdout.contains(&initial_secret));
     assert!(!windows_stdout.contains(&split_secret));
 
-    let killed = handler
-        .handle(Request::KillPane(KillPaneRequest {
+    handler
+        .handle_ok(KillPaneRequest {
             target: split_target,
             kill_all_except: false,
-        }))
+        })
         .await;
-    assert!(matches!(killed, rmux_proto::Response::KillPane(_)));
     {
         let state = handler.state.lock().await;
         assert!(
@@ -632,43 +445,33 @@ async fn sticky_lifecycle_state_is_id_keyed_and_redacts_spawn_env() {
         );
     }
 
-    assert!(matches!(
-        handler
-            .handle(Request::SetOption(SetOptionRequest {
-                scope: ScopeSelector::Pane(PaneTarget::with_window(alpha.clone(), 0, 0)),
-                option: OptionName::RemainOnExit,
-                value: "on".to_owned(),
-                mode: SetOptionMode::Replace,
-            }))
-            .await,
-        rmux_proto::Response::SetOption(_)
-    ));
-    let dead_respawn = handler
-        .handle(Request::RespawnPane(Box::new(RespawnPaneRequest {
-            target: PaneTarget::with_window(alpha.clone(), 0, 0),
-            kill: true,
-            start_directory: None,
-            environment: None,
-            command: Some(vec!["exit 7".to_owned()]),
-            process_command: None,
-        })))
+    handler
+        .set_option(
+            ScopeSelector::Pane(PaneTarget::with_window(alpha.clone(), 0, 0)),
+            OptionName::RemainOnExit,
+            "on",
+        )
         .await;
-    assert!(matches!(dead_respawn, rmux_proto::Response::RespawnPane(_)));
-    wait_for_dead_pane(&handler, &alpha, 0, 0).await;
+    handler
+        .handle_ok(RespawnPaneRequest {
+            command: Some(vec!["exit 7".to_owned()]),
+            ..Fixture::fixture(PaneTarget::with_window(alpha.clone(), 0, 0))
+        })
+        .await;
+    handler
+        .wait_for_pane_exit_for_test(&PaneTarget::new(alpha.clone(), 0))
+        .await;
     let (dead_generation, dead_output_sequence) =
         wait_for_lifecycle_exit(&handler, initial_pane_id, 7).await;
 
-    let respawned = handler
-        .handle(Request::RespawnPane(Box::new(RespawnPaneRequest {
-            target: PaneTarget::with_window(alpha.clone(), 0, 0),
-            kill: true,
+    handler
+        .handle_ok(RespawnPaneRequest {
             start_directory: Some(respawn_cwd.path().to_path_buf()),
             environment: Some(vec![respawn_secret.clone()]),
             command: Some(vec![respawn_command.clone()]),
-            process_command: None,
-        })))
+            ..Fixture::fixture(PaneTarget::with_window(alpha.clone(), 0, 0))
+        })
         .await;
-    assert!(matches!(respawned, rmux_proto::Response::RespawnPane(_)));
     {
         let state = handler.state.lock().await;
         let session = state.sessions.session(&alpha).expect("session exists");
@@ -739,29 +542,16 @@ async fn split_window_ext_applies_start_directory_to_spawned_process() {
     // output stays on the host: a job writing an absolute path writes straight through.
     let cwd = seed_scratch_dir(&handler, "split-cwd");
     let output = unique_temp_path("split-cwd-output");
-    create_session(&handler, &alpha).await;
+    handler.create_session(&alpha).await;
 
-    let response = handler
-        .handle(Request::SplitWindowExt(Box::new(SplitWindowExtRequest {
-            target: SplitWindowTarget::Session(alpha.clone()),
-            direction: SplitDirection::Vertical,
-            before: false,
-            environment: None,
+    let _split_target = handler
+        .handle_ok(SplitWindowExtRequest {
             command: Some(vec![cwd_probe_command(&output)]),
-            process_command: None,
             start_directory: Some(cwd.path().to_path_buf()),
-            keep_alive_on_exit: None,
-            detached: false,
-            size: None,
-            preserve_zoom: false,
-            full_size: false,
-            stdin_payload: None,
-        })))
-        .await;
-    let _split_target = match response {
-        rmux_proto::Response::SplitWindow(response) => response.pane,
-        response => panic!("expected split-window success, got {response:?}"),
-    };
+            ..Fixture::fixture(&alpha)
+        })
+        .await
+        .pane;
 
     wait_for_file_contents(&output, expected_spawn_cwd(&cwd)).await;
 
@@ -772,39 +562,16 @@ async fn split_window_ext_applies_start_directory_to_spawned_process() {
 async fn detached_split_with_zoom_keeps_original_pane_zoomed() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha-detached-split-zoom");
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: alpha.clone(),
-                detached: true,
-                size: Some(TerminalSize { cols: 80, rows: 24 }),
-                environment: None,
-            }))
-            .await,
-        rmux_proto::Response::NewSession(_)
-    ));
+    handler.create_session(&alpha).await;
 
-    let response = handler
-        .handle(Request::SplitWindowExt(Box::new(SplitWindowExtRequest {
-            target: SplitWindowTarget::Pane(PaneTarget::with_window(alpha.clone(), 0, 0)),
-            direction: SplitDirection::Vertical,
-            before: false,
-            environment: None,
-            command: None,
-            process_command: None,
-            start_directory: None,
-            keep_alive_on_exit: None,
+    let new_pane = handler
+        .handle_ok(SplitWindowExtRequest {
             detached: true,
-            size: None,
             preserve_zoom: true,
-            full_size: false,
-            stdin_payload: None,
-        })))
-        .await;
-    let new_pane = match response {
-        rmux_proto::Response::SplitWindow(response) => response.pane,
-        other => panic!("expected split-window success, got {other:?}"),
-    };
+            ..Fixture::fixture(PaneTarget::with_window(alpha.clone(), 0, 0))
+        })
+        .await
+        .pane;
 
     let state = handler.state.lock().await;
     let session = state.sessions.session(&alpha).expect("session exists");
@@ -818,51 +585,22 @@ async fn detached_split_with_zoom_keeps_original_pane_zoomed() {
 async fn detached_split_targeting_inactive_pane_preserves_active_pane() {
     let handler = RequestHandler::new();
     let alpha = session_name("detached-split-preserves-active-pane");
-    create_session(&handler, &alpha).await;
+    handler.create_session(&alpha).await;
 
-    assert!(matches!(
-        handler
-            .handle(Request::SplitWindow(SplitWindowRequest {
-                target: SplitWindowTarget::Session(alpha.clone()),
-                direction: SplitDirection::Vertical,
-                before: false,
-                environment: None,
-            }))
-            .await,
-        rmux_proto::Response::SplitWindow(_)
-    ));
-    assert!(matches!(
-        handler
-            .handle(Request::SelectPane(Box::new(SelectPaneRequest {
-                target: PaneTarget::with_window(alpha.clone(), 0, 0),
-                title: None,
-                style: None,
-                input_disabled: None,
-                preserve_zoom: false,
-            })))
-            .await,
-        rmux_proto::Response::SelectPane(_)
-    ));
-    assert!(matches!(
-        handler
-            .handle(Request::SplitWindowExt(Box::new(SplitWindowExtRequest {
-                target: SplitWindowTarget::Pane(PaneTarget::with_window(alpha.clone(), 0, 1)),
-                direction: SplitDirection::Vertical,
-                before: false,
-                environment: None,
-                command: None,
-                process_command: None,
-                start_directory: None,
-                keep_alive_on_exit: None,
-                detached: true,
-                size: None,
-                preserve_zoom: false,
-                full_size: false,
-                stdin_payload: None,
-            })))
-            .await,
-        rmux_proto::Response::SplitWindow(_)
-    ));
+    handler.handle_ok(SplitWindowRequest::fixture(&alpha)).await;
+    handler
+        .handle_ok(SelectPaneRequest::fixture(PaneTarget::with_window(
+            alpha.clone(),
+            0,
+            0,
+        )))
+        .await;
+    handler
+        .handle_ok(SplitWindowExtRequest {
+            detached: true,
+            ..Fixture::fixture(PaneTarget::with_window(alpha.clone(), 0, 1))
+        })
+        .await;
 
     let state = handler.state.lock().await;
     let session = state.sessions.session(&alpha).expect("session exists");
@@ -873,7 +611,7 @@ async fn detached_split_targeting_inactive_pane_preserves_active_pane() {
 async fn split_window_rolls_back_session_when_spawn_fails() {
     let handler = RequestHandler::new();
     let alpha = session_name("split-spawn-fails");
-    create_session(&handler, &alpha).await;
+    handler.create_session(&alpha).await;
     // A directory that exists but is not one this server can open a job over.
     //
     // The failure this test used to arrange — an argv whose program does not exist — no longer
@@ -887,19 +625,8 @@ async fn split_window_rolls_back_session_when_spawn_fails() {
 
     let response = handler
         .handle(Request::SplitWindowExt(Box::new(SplitWindowExtRequest {
-            target: SplitWindowTarget::Session(alpha.clone()),
-            direction: SplitDirection::Vertical,
-            before: false,
-            environment: None,
-            command: None,
-            process_command: None,
             start_directory: Some(outside_the_seed.clone()),
-            keep_alive_on_exit: None,
-            detached: false,
-            size: None,
-            preserve_zoom: false,
-            full_size: false,
-            stdin_payload: None,
+            ..Fixture::fixture(&alpha)
         })))
         .await;
 
@@ -918,28 +645,12 @@ async fn split_window_rolls_back_session_when_spawn_fails() {
 async fn pane_output_sequence_advances_when_transcript_changes() {
     let handler = RequestHandler::new();
     let alpha = session_name("sequence");
-    let created = handler
-        .handle(Request::NewSessionExt(Box::new(NewSessionExtRequest {
-            session_name: Some(alpha.clone()),
-            working_directory: None,
-            detached: true,
-            size: Some(TerminalSize { cols: 80, rows: 24 }),
-            environment: None,
-            group_target: None,
-            attach_if_exists: false,
-            detach_other_clients: false,
-            kill_other_clients: false,
-            flags: None,
-            window_name: None,
-            print_session_info: false,
-            print_format: None,
-            command: Some(vec![pipe_discard_command()]),
-            process_command: None,
-            client_environment: None,
-            skip_environment_update: false,
-        })))
+    handler
+        .create_session(NewSessionExtRequest {
+            command: Some(vec![stdin_discard_command()]),
+            ..Fixture::fixture(&alpha)
+        })
         .await;
-    assert!(matches!(created, rmux_proto::Response::NewSession(_)));
 
     let pane_id = {
         let state = handler.state.lock().await;
@@ -998,8 +709,8 @@ async fn move_pane_same_window_keeps_last_when_moving_the_active_pane_like_tmux(
     create_three_pane_window(&handler, &alpha).await;
     let selection_before = active_and_last_pane_ids(&handler, &alpha).await;
 
-    let response = handler
-        .handle(Request::MovePane(MovePaneRequest {
+    handler
+        .handle_ok(MovePaneRequest {
             source: PaneTarget::with_window(alpha.clone(), 0, 2),
             target: PaneTarget::with_window(alpha.clone(), 0, 0),
             direction: SplitDirection::Vertical,
@@ -1007,10 +718,8 @@ async fn move_pane_same_window_keeps_last_when_moving_the_active_pane_like_tmux(
             before: false,
             full_size: false,
             size: None,
-        }))
+        })
         .await;
-
-    assert!(matches!(response, Response::MovePane(_)), "{response:?}");
     assert_eq!(
         active_and_last_pane_ids(&handler, &alpha).await,
         selection_before
@@ -1025,8 +734,8 @@ async fn join_pane_same_window_keeps_last_when_moving_the_active_pane_like_tmux(
     create_three_pane_window(&handler, &alpha).await;
     let selection_before = active_and_last_pane_ids(&handler, &alpha).await;
 
-    let response = handler
-        .handle(Request::JoinPane(rmux_proto::JoinPaneRequest {
+    handler
+        .handle_ok(rmux_proto::JoinPaneRequest {
             source: PaneTarget::with_window(alpha.clone(), 0, 2),
             target: PaneTarget::with_window(alpha.clone(), 0, 0),
             direction: SplitDirection::Vertical,
@@ -1034,10 +743,8 @@ async fn join_pane_same_window_keeps_last_when_moving_the_active_pane_like_tmux(
             before: false,
             full_size: false,
             size: None,
-        }))
+        })
         .await;
-
-    assert!(matches!(response, Response::JoinPane(_)), "{response:?}");
     assert_eq!(
         active_and_last_pane_ids(&handler, &alpha).await,
         selection_before
@@ -1048,19 +755,9 @@ async fn join_pane_same_window_keeps_last_when_moving_the_active_pane_like_tmux(
 async fn move_pane_routes_through_join_semantics() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    create_session(&handler, &alpha).await;
+    handler.create_session(&alpha).await;
 
-    assert!(matches!(
-        handler
-            .handle(Request::SplitWindow(SplitWindowRequest {
-                target: SplitWindowTarget::Session(alpha.clone()),
-                direction: SplitDirection::Vertical,
-                before: false,
-                environment: None,
-            }))
-            .await,
-        rmux_proto::Response::SplitWindow(_)
-    ));
+    handler.handle_ok(SplitWindowRequest::fixture(&alpha)).await;
     {
         let mut state = handler.state.lock().await;
         let pane_id = state.sessions.allocate_pane_id();
@@ -1132,12 +829,12 @@ async fn join_pane_exits_attached_source_session_when_source_is_removed() {
     let handler = RequestHandler::new();
     let alpha = session_name("join-remove-alpha");
     let beta = session_name("join-remove-beta");
-    create_session(&handler, &alpha).await;
-    create_session(&handler, &beta).await;
+    handler.create_session(&alpha).await;
+    handler.create_session(&beta).await;
     let mut control_rx = attach_to_existing_session(&handler, 70_001, &alpha).await;
 
-    let response = handler
-        .handle(Request::JoinPane(rmux_proto::JoinPaneRequest {
+    handler
+        .handle_ok(rmux_proto::JoinPaneRequest {
             source: PaneTarget::with_window(alpha.clone(), 0, 0),
             target: PaneTarget::with_window(beta.clone(), 0, 0),
             direction: SplitDirection::Vertical,
@@ -1145,13 +842,8 @@ async fn join_pane_exits_attached_source_session_when_source_is_removed() {
             before: false,
             full_size: false,
             size: None,
-        }))
+        })
         .await;
-
-    assert!(
-        matches!(response, Response::JoinPane(_)),
-        "expected successful join-pane, got {response:?}"
-    );
     wait_for_attached_session_exit(&mut control_rx).await;
 }
 
@@ -1160,12 +852,12 @@ async fn break_pane_exits_attached_source_session_when_source_is_removed() {
     let handler = RequestHandler::new();
     let alpha = session_name("break-remove-alpha");
     let beta = session_name("break-remove-beta");
-    create_session(&handler, &alpha).await;
-    create_session(&handler, &beta).await;
+    handler.create_session(&alpha).await;
+    handler.create_session(&beta).await;
     let mut control_rx = attach_to_existing_session(&handler, 70_002, &alpha).await;
 
-    let response = handler
-        .handle(Request::BreakPane(Box::new(BreakPaneRequest {
+    handler
+        .handle_ok(BreakPaneRequest {
             source: PaneTarget::with_window(alpha.clone(), 0, 0),
             target: Some(WindowTarget::with_window(beta.clone(), 1)),
             name: None,
@@ -1174,13 +866,8 @@ async fn break_pane_exits_attached_source_session_when_source_is_removed() {
             before: false,
             print_target: false,
             format: None,
-        })))
+        })
         .await;
-
-    assert!(
-        matches!(response, Response::BreakPane(_)),
-        "expected successful break-pane, got {response:?}"
-    );
     wait_for_attached_session_exit(&mut control_rx).await;
 }
 
@@ -1188,22 +875,12 @@ async fn break_pane_exits_attached_source_session_when_source_is_removed() {
 async fn break_pane_print_target_uses_custom_format() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    create_session(&handler, &alpha).await;
+    handler.create_session(&alpha).await;
 
-    assert!(matches!(
-        handler
-            .handle(Request::SplitWindow(SplitWindowRequest {
-                target: SplitWindowTarget::Session(alpha.clone()),
-                direction: SplitDirection::Vertical,
-                before: false,
-                environment: None,
-            }))
-            .await,
-        rmux_proto::Response::SplitWindow(_)
-    ));
+    handler.handle_ok(SplitWindowRequest::fixture(&alpha)).await;
 
-    let response = handler
-        .handle(Request::BreakPane(Box::new(BreakPaneRequest {
+    let success = handler
+        .handle_ok(BreakPaneRequest {
             source: PaneTarget::with_window(alpha.clone(), 0, 1),
             target: Some(WindowTarget::with_window(alpha.clone(), 1)),
             name: None,
@@ -1212,12 +889,8 @@ async fn break_pane_print_target_uses_custom_format() {
             before: false,
             print_target: true,
             format: Some("#{window_index}.#{pane_index}".to_owned()),
-        })))
+        })
         .await;
-
-    let rmux_proto::Response::BreakPane(success) = response else {
-        panic!("expected break-pane response");
-    };
     let output = success.command_output().expect("break-pane -P output");
     assert_eq!(output.stdout(), b"1.0\n");
 }
@@ -1227,30 +900,14 @@ async fn break_pane_implicit_destination_starts_at_base_index() {
     let handler = RequestHandler::new();
     let alpha = session_name("break-base-index");
 
-    let set_base_index = handler
-        .handle(Request::SetOption(SetOptionRequest {
-            scope: ScopeSelector::Global,
-            option: OptionName::BaseIndex,
-            value: "1".to_owned(),
-            mode: SetOptionMode::Replace,
-        }))
+    handler
+        .set_option(ScopeSelector::Global, OptionName::BaseIndex, "1")
         .await;
-    assert!(matches!(set_base_index, Response::SetOption(_)));
-    create_session(&handler, &alpha).await;
-    assert!(matches!(
-        handler
-            .handle(Request::SplitWindow(SplitWindowRequest {
-                target: SplitWindowTarget::Session(alpha.clone()),
-                direction: SplitDirection::Vertical,
-                before: false,
-                environment: None,
-            }))
-            .await,
-        Response::SplitWindow(_)
-    ));
+    handler.create_session(&alpha).await;
+    handler.handle_ok(SplitWindowRequest::fixture(&alpha)).await;
 
-    let response = handler
-        .handle(Request::BreakPane(Box::new(BreakPaneRequest {
+    let success = handler
+        .handle_ok(BreakPaneRequest {
             source: PaneTarget::with_window(alpha.clone(), 1, 1),
             target: None,
             name: None,
@@ -1259,12 +916,8 @@ async fn break_pane_implicit_destination_starts_at_base_index() {
             before: false,
             print_target: true,
             format: Some("#{window_index}.#{pane_index}".to_owned()),
-        })))
+        })
         .await;
-
-    let Response::BreakPane(success) = response else {
-        panic!("expected break-pane response, got {response:?}");
-    };
     assert_eq!(
         success
             .command_output()
@@ -1284,22 +937,12 @@ async fn break_pane_implicit_destination_starts_at_base_index() {
 async fn break_pane_print_target_refreshes_automatic_window_name() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha-break-name");
-    create_session(&handler, &alpha).await;
+    handler.create_session(&alpha).await;
 
-    assert!(matches!(
-        handler
-            .handle(Request::SplitWindow(SplitWindowRequest {
-                target: SplitWindowTarget::Session(alpha.clone()),
-                direction: SplitDirection::Vertical,
-                before: false,
-                environment: None,
-            }))
-            .await,
-        rmux_proto::Response::SplitWindow(_)
-    ));
+    handler.handle_ok(SplitWindowRequest::fixture(&alpha)).await;
 
-    let response = handler
-        .handle(Request::BreakPane(Box::new(BreakPaneRequest {
+    let success = handler
+        .handle_ok(BreakPaneRequest {
             source: PaneTarget::with_window(alpha.clone(), 0, 1),
             target: Some(WindowTarget::with_window(alpha.clone(), 1)),
             name: None,
@@ -1308,12 +951,8 @@ async fn break_pane_print_target_refreshes_automatic_window_name() {
             before: false,
             print_target: true,
             format: Some("#{window_name}:#{pane_current_command}".to_owned()),
-        })))
+        })
         .await;
-
-    let rmux_proto::Response::BreakPane(success) = response else {
-        panic!("expected break-pane response");
-    };
     let output = success.command_output().expect("break-pane -P output");
     let output = String::from_utf8(output.stdout().to_vec()).expect("utf-8 output");
     let (window_name, current_command) = output
@@ -1334,31 +973,24 @@ async fn break_pane_print_target_refreshes_automatic_window_name() {
 async fn attached_input_to_dead_kept_pane_does_not_fail_liveness_probe() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    create_session(&handler, &alpha).await;
-    assert!(matches!(
-        handler
-            .handle(Request::SetOption(SetOptionRequest {
-                scope: ScopeSelector::Pane(PaneTarget::with_window(alpha.clone(), 0, 0)),
-                option: OptionName::RemainOnExit,
-                value: "on".to_owned(),
-                mode: SetOptionMode::Replace,
-            }))
-            .await,
-        Response::SetOption(_)
-    ));
-
-    let respawned = handler
-        .handle(Request::RespawnPane(Box::new(RespawnPaneRequest {
-            target: PaneTarget::with_window(alpha.clone(), 0, 0),
-            kill: true,
-            start_directory: None,
-            environment: None,
-            command: Some(vec!["exit 0".to_owned()]),
-            process_command: None,
-        })))
+    handler.create_session(&alpha).await;
+    handler
+        .set_option(
+            ScopeSelector::Pane(PaneTarget::with_window(alpha.clone(), 0, 0)),
+            OptionName::RemainOnExit,
+            "on",
+        )
         .await;
-    assert!(matches!(respawned, Response::RespawnPane(_)));
-    wait_for_dead_pane(&handler, &alpha, 0, 0).await;
+
+    handler
+        .handle_ok(RespawnPaneRequest {
+            command: Some(vec!["exit 0".to_owned()]),
+            ..Fixture::fixture(PaneTarget::with_window(alpha.clone(), 0, 0))
+        })
+        .await;
+    handler
+        .wait_for_pane_exit_for_test(&PaneTarget::new(alpha.clone(), 0))
+        .await;
 
     let requester_pid = 44_200_u32;
     let (control_tx, _control_rx) = mpsc::unbounded_channel();
@@ -1379,32 +1011,25 @@ async fn attached_input_to_dead_kept_pane_does_not_fail_liveness_probe() {
 async fn respawn_pane_without_command_restarts_dead_remain_on_exit_workload() {
     let handler = RequestHandler::new();
     let alpha = session_name("respawn-dead-provenance");
-    create_session(&handler, &alpha).await;
+    handler.create_session(&alpha).await;
     let target = PaneTarget::with_window(alpha.clone(), 0, 0);
-    assert!(matches!(
-        handler
-            .handle(Request::SetOption(SetOptionRequest {
-                scope: ScopeSelector::Pane(target.clone()),
-                option: OptionName::RemainOnExit,
-                value: "on".to_owned(),
-                mode: SetOptionMode::Replace,
-            }))
-            .await,
-        Response::SetOption(_)
-    ));
-
-    let explicit = handler
-        .handle(Request::RespawnPane(Box::new(RespawnPaneRequest {
-            target: target.clone(),
-            kill: true,
-            start_directory: None,
-            environment: None,
-            command: None,
-            process_command: Some(ProcessCommand::Shell("exit 7".to_owned())),
-        })))
+    handler
+        .set_option(
+            ScopeSelector::Pane(target.clone()),
+            OptionName::RemainOnExit,
+            "on",
+        )
         .await;
-    assert!(matches!(explicit, Response::RespawnPane(_)), "{explicit:?}");
-    wait_for_dead_pane(&handler, &alpha, 0, 0).await;
+
+    handler
+        .handle_ok(RespawnPaneRequest {
+            process_command: Some(ProcessCommand::Shell("exit 7".to_owned())),
+            ..Fixture::fixture(&target)
+        })
+        .await;
+    handler
+        .wait_for_pane_exit_for_test(&PaneTarget::new(alpha.clone(), 0))
+        .await;
     let pane_id = {
         let state = handler.state.lock().await;
         state
@@ -1415,21 +1040,15 @@ async fn respawn_pane_without_command_restarts_dead_remain_on_exit_workload() {
     };
     let (first_generation, _) = wait_for_lifecycle_exit(&handler, pane_id, 7).await;
 
-    let inherited = handler
-        .handle(Request::RespawnPane(Box::new(RespawnPaneRequest {
-            target,
+    handler
+        .handle_ok(RespawnPaneRequest {
             kill: false,
-            start_directory: None,
-            environment: None,
-            command: None,
-            process_command: None,
-        })))
+            ..Fixture::fixture(target)
+        })
         .await;
-    assert!(
-        matches!(inherited, Response::RespawnPane(_)),
-        "{inherited:?}"
-    );
-    wait_for_dead_pane(&handler, &alpha, 0, 0).await;
+    handler
+        .wait_for_pane_exit_for_test(&PaneTarget::new(alpha.clone(), 0))
+        .await;
     let (second_generation, _) = wait_for_lifecycle_exit(&handler, pane_id, 7).await;
     assert!(
         second_generation > first_generation,
@@ -1441,31 +1060,24 @@ async fn respawn_pane_without_command_restarts_dead_remain_on_exit_workload() {
 async fn pipe_pane_rejects_dead_panes() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    create_session(&handler, &alpha).await;
-    assert!(matches!(
-        handler
-            .handle(Request::SetOption(SetOptionRequest {
-                scope: ScopeSelector::Pane(PaneTarget::with_window(alpha.clone(), 0, 0)),
-                option: OptionName::RemainOnExit,
-                value: "on".to_owned(),
-                mode: SetOptionMode::Replace,
-            }))
-            .await,
-        rmux_proto::Response::SetOption(_)
-    ));
-
-    let respawned = handler
-        .handle(Request::RespawnPane(Box::new(RespawnPaneRequest {
-            target: PaneTarget::with_window(alpha.clone(), 0, 0),
-            kill: true,
-            start_directory: None,
-            environment: None,
-            command: Some(vec!["exit 0".to_owned()]),
-            process_command: None,
-        })))
+    handler.create_session(&alpha).await;
+    handler
+        .set_option(
+            ScopeSelector::Pane(PaneTarget::with_window(alpha.clone(), 0, 0)),
+            OptionName::RemainOnExit,
+            "on",
+        )
         .await;
-    assert!(matches!(respawned, rmux_proto::Response::RespawnPane(_)));
-    wait_for_dead_pane(&handler, &alpha, 0, 0).await;
+
+    handler
+        .handle_ok(RespawnPaneRequest {
+            command: Some(vec!["exit 0".to_owned()]),
+            ..Fixture::fixture(PaneTarget::with_window(alpha.clone(), 0, 0))
+        })
+        .await;
+    handler
+        .wait_for_pane_exit_for_test(&PaneTarget::new(alpha.clone(), 0))
+        .await;
 
     let response = handler
         .handle(Request::PipePane(PipePaneRequest {
@@ -1473,7 +1085,7 @@ async fn pipe_pane_rejects_dead_panes() {
             stdin: false,
             stdout: true,
             once: false,
-            command: Some(pipe_discard_command()),
+            command: Some(stdin_discard_command()),
         }))
         .await;
 
@@ -1487,16 +1099,12 @@ async fn pipe_pane_rejects_dead_panes() {
 async fn respawn_pane_rejects_active_pane_without_kill_flag() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    create_session(&handler, &alpha).await;
+    handler.create_session(&alpha).await;
 
     let response = handler
         .handle(Request::RespawnPane(Box::new(RespawnPaneRequest {
-            target: PaneTarget::with_window(alpha, 0, 0),
             kill: false,
-            start_directory: None,
-            environment: None,
-            command: None,
-            process_command: None,
+            ..Fixture::fixture(PaneTarget::with_window(alpha, 0, 0))
         })))
         .await;
 
@@ -1514,16 +1122,14 @@ async fn respawn_pane_with_kill_flag_applies_directory_environment_and_command()
     // on the host, which a job reaches by naming an absolute path.
     let cwd = seed_scratch_dir(&handler, "respawn-pane-cwd");
     let output = unique_temp_path("respawn-pane-output");
-    create_session(&handler, &alpha).await;
+    handler.create_session(&alpha).await;
 
     let response = handler
         .handle(Request::RespawnPane(Box::new(RespawnPaneRequest {
-            target: PaneTarget::with_window(alpha.clone(), 0, 0),
-            kill: true,
             start_directory: Some(cwd.path().to_path_buf()),
             environment: Some(vec!["RMUX_RESPAWN=ready".to_owned()]),
             command: Some(vec![respawn_probe_command(&output)]),
-            process_command: None,
+            ..Fixture::fixture(PaneTarget::with_window(alpha.clone(), 0, 0))
         })))
         .await;
 
@@ -1550,28 +1156,14 @@ async fn respawn_pane_reuses_structured_command_cwd_and_private_environment() {
     let initial_process_command = ProcessCommand::Argv(initial_argv.clone());
     let initial_environment = "RMUX_RESPAWN=initial".to_owned();
 
-    let created = handler
-        .handle(Request::NewSessionExt(Box::new(NewSessionExtRequest {
-            session_name: Some(alpha.clone()),
+    handler
+        .create_session(NewSessionExtRequest {
             working_directory: Some(initial_cwd.path().to_string_lossy().into_owned()),
-            detached: true,
-            size: Some(TerminalSize { cols: 80, rows: 24 }),
             environment: Some(vec![initial_environment.clone()]),
-            group_target: None,
-            attach_if_exists: false,
-            detach_other_clients: false,
-            kill_other_clients: false,
-            flags: None,
-            window_name: None,
-            print_session_info: false,
-            print_format: None,
-            command: None,
             process_command: Some(initial_process_command.clone()),
-            client_environment: None,
-            skip_environment_update: false,
-        })))
+            ..Fixture::fixture(&alpha)
+        })
         .await;
-    assert!(matches!(created, Response::NewSession(_)), "{created:?}");
 
     let initial_cwd_text = expected_spawn_cwd(&initial_cwd);
     let initial_line = respawn_probe_line(initial_cwd_text, "initial", "argv");
@@ -1593,36 +1185,22 @@ async fn respawn_pane_reuses_structured_command_cwd_and_private_environment() {
         pane_id
     };
 
-    let inherited = handler
-        .handle(Request::RespawnPane(Box::new(RespawnPaneRequest {
-            target: target.clone(),
-            kill: true,
-            start_directory: None,
-            environment: None,
-            command: None,
-            process_command: None,
-        })))
+    handler
+        .handle_ok(RespawnPaneRequest::fixture(&target))
         .await;
-    assert!(
-        matches!(inherited, Response::RespawnPane(_)),
-        "{inherited:?}"
-    );
     wait_for_file_contents(&output, &format!("{initial_line}{initial_line}")).await;
 
     let override_environment = "RMUX_RESPAWN=override".to_owned();
-    let explicit_shell = respawn_shell_probe_command(&output, "shell");
+    let explicit_shell = respawn_replay_script(&output, "shell");
     let explicit_process_command = ProcessCommand::Shell(explicit_shell);
-    let explicit = handler
-        .handle(Request::RespawnPane(Box::new(RespawnPaneRequest {
-            target: target.clone(),
-            kill: true,
+    handler
+        .handle_ok(RespawnPaneRequest {
             start_directory: Some(override_cwd.path().to_path_buf()),
             environment: Some(vec![override_environment.clone()]),
-            command: None,
             process_command: Some(explicit_process_command.clone()),
-        })))
+            ..Fixture::fixture(&target)
+        })
         .await;
-    assert!(matches!(explicit, Response::RespawnPane(_)), "{explicit:?}");
     let override_cwd_text = expected_spawn_cwd(&override_cwd);
     let override_line = respawn_probe_line(override_cwd_text, "override", "shell");
     wait_for_file_contents(
@@ -1644,20 +1222,7 @@ async fn respawn_pane_reuses_structured_command_cwd_and_private_environment() {
         );
     }
 
-    let inherited_after_override = handler
-        .handle(Request::RespawnPane(Box::new(RespawnPaneRequest {
-            target,
-            kill: true,
-            start_directory: None,
-            environment: None,
-            command: None,
-            process_command: None,
-        })))
-        .await;
-    assert!(
-        matches!(inherited_after_override, Response::RespawnPane(_)),
-        "{inherited_after_override:?}"
-    );
+    handler.handle_ok(RespawnPaneRequest::fixture(target)).await;
     let inherited_override_line = respawn_probe_line(override_cwd_text, "initial", "shell");
     wait_for_file_contents(
         &output,
@@ -1674,41 +1239,27 @@ async fn respawn_pane_keeps_the_original_resolved_shell_after_option_changes() {
     let handler = RequestHandler::new();
     let alpha = session_name("respawn-pane-shell-provenance");
     let output = unique_temp_path("respawn-pane-shell-provenance-output");
-    set_global_default_shell(&handler, "/bin/sh").await;
-    create_session(&handler, &alpha).await;
+    handler
+        .set_option(ScopeSelector::Global, OptionName::DefaultShell, "/bin/sh")
+        .await;
+    handler.create_session(&alpha).await;
     handler.wait_for_initial_panes_for_test().await;
-    set_global_default_shell(&handler, "/bin/bash").await;
+    handler
+        .set_option(ScopeSelector::Global, OptionName::DefaultShell, "/bin/bash")
+        .await;
 
     let target = PaneTarget::with_window(alpha.clone(), 0, 0);
     let shell_command = respawn_shell_identity_command(&output, "shell");
-    let explicit = handler
-        .handle(Request::RespawnPane(Box::new(RespawnPaneRequest {
-            target: target.clone(),
-            kill: true,
-            start_directory: None,
-            environment: None,
-            command: None,
+    handler
+        .handle_ok(RespawnPaneRequest {
             process_command: Some(ProcessCommand::Shell(shell_command)),
-        })))
+            ..Fixture::fixture(&target)
+        })
         .await;
-    assert!(matches!(explicit, Response::RespawnPane(_)), "{explicit:?}");
     let expected_line = "sh:/bin/sh:shell\n";
     wait_for_file_contents(&output, expected_line).await;
 
-    let inherited = handler
-        .handle(Request::RespawnPane(Box::new(RespawnPaneRequest {
-            target,
-            kill: true,
-            start_directory: None,
-            environment: None,
-            command: None,
-            process_command: None,
-        })))
-        .await;
-    assert!(
-        matches!(inherited, Response::RespawnPane(_)),
-        "{inherited:?}"
-    );
+    handler.handle_ok(RespawnPaneRequest::fixture(target)).await;
     wait_for_file_contents(&output, &format!("{expected_line}{expected_line}")).await;
 
     let state = handler.state.lock().await;
@@ -1733,7 +1284,7 @@ async fn respawn_pane_keeps_the_original_resolved_shell_after_option_changes() {
 async fn respawn_pane_with_kill_flag_does_not_emit_pane_exited_like_tmux() {
     let handler = RequestHandler::new();
     let alpha = session_name("respawn-exit");
-    create_session(&handler, &alpha).await;
+    handler.create_session(&alpha).await;
     let target = PaneTarget::with_window(alpha.clone(), 0, 0);
     let (pane_id, previous_generation) = {
         let state = handler.state.lock().await;
@@ -1750,17 +1301,12 @@ async fn respawn_pane_with_kill_flag_does_not_emit_pane_exited_like_tmux() {
     };
     let mut lifecycle_events = handler.subscribe_lifecycle_events();
 
-    let response = handler
-        .handle(Request::RespawnPane(Box::new(RespawnPaneRequest {
-            target: target.clone(),
-            kill: true,
-            start_directory: None,
-            environment: None,
-            command: Some(vec![pipe_discard_command()]),
-            process_command: None,
-        })))
+    handler
+        .handle_ok(RespawnPaneRequest {
+            command: Some(vec![stdin_discard_command()]),
+            ..Fixture::fixture(&target)
+        })
         .await;
-    assert!(matches!(response, rmux_proto::Response::RespawnPane(_)));
 
     assert_no_pane_exited_event(&mut lifecycle_events, "forced respawn").await;
 
@@ -1787,16 +1333,8 @@ async fn respawn_pane_with_kill_flag_does_not_emit_pane_exited_like_tmux() {
 async fn pane_id_kill_does_not_emit_pane_exited_like_tmux() {
     let handler = RequestHandler::new();
     let alpha = session_name("pane-id-kill-exit");
-    create_session(&handler, &alpha).await;
-    let split = handler
-        .handle(Request::SplitWindow(SplitWindowRequest {
-            target: SplitWindowTarget::Session(alpha.clone()),
-            direction: SplitDirection::Vertical,
-            before: false,
-            environment: None,
-        }))
-        .await;
-    assert!(matches!(split, Response::SplitWindow(_)));
+    handler.create_session(&alpha).await;
+    handler.handle_ok(SplitWindowRequest::fixture(&alpha)).await;
     let pane_id = {
         let state = handler.state.lock().await;
         state
@@ -1824,7 +1362,7 @@ async fn pane_id_kill_does_not_emit_pane_exited_like_tmux() {
 async fn pane_id_respawn_with_kill_flag_does_not_emit_pane_exited_like_tmux() {
     let handler = RequestHandler::new();
     let alpha = session_name("pane-id-respawn-exit");
-    create_session(&handler, &alpha).await;
+    handler.create_session(&alpha).await;
     let (pane_id, previous_generation) = {
         let state = handler.state.lock().await;
         let pane = state
@@ -1846,7 +1384,7 @@ async fn pane_id_respawn_with_kill_flag_does_not_emit_pane_exited_like_tmux() {
             kill: true,
             start_directory: None,
             environment: None,
-            command: Some(vec![pipe_discard_command()]),
+            command: Some(vec![stdin_discard_command()]),
             process_command: None,
             keep_alive_on_exit: None,
         })))
@@ -1900,7 +1438,7 @@ async fn assert_no_pane_exited_event(
 async fn respawn_pane_preserves_id_and_clears_parser_state_before_new_output() {
     let handler = RequestHandler::new();
     let alpha = session_name("respawn-reset");
-    create_session(&handler, &alpha).await;
+    handler.create_session(&alpha).await;
     let target = PaneTarget::with_window(alpha.clone(), 0, 0);
     let pane_id = {
         let state = handler.state.lock().await;
@@ -1933,17 +1471,12 @@ async fn respawn_pane_preserves_id_and_clears_parser_state_before_new_output() {
         )
     };
 
-    let response = handler
-        .handle(Request::RespawnPane(Box::new(RespawnPaneRequest {
-            target: target.clone(),
-            kill: true,
-            start_directory: None,
-            environment: None,
-            command: Some(vec![pipe_discard_command()]),
-            process_command: None,
-        })))
+    handler
+        .handle_ok(RespawnPaneRequest {
+            command: Some(vec![stdin_discard_command()]),
+            ..Fixture::fixture(&target)
+        })
         .await;
-    assert!(matches!(response, rmux_proto::Response::RespawnPane(_)));
 
     let after = snapshot_response(&handler, target).await;
     assert!(
@@ -1971,31 +1504,16 @@ async fn display_panes_uses_the_default_select_pane_template() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
     let requester_pid = 42_u32;
-    create_session(&handler, &alpha).await;
+    handler.create_session(&alpha).await;
 
-    assert!(matches!(
-        handler
-            .handle(Request::SplitWindow(SplitWindowRequest {
-                target: SplitWindowTarget::Session(alpha.clone()),
-                direction: SplitDirection::Vertical,
-                before: false,
-                environment: None,
-            }))
-            .await,
-        rmux_proto::Response::SplitWindow(_)
-    ));
-    assert!(matches!(
-        handler
-            .handle(Request::SelectPane(Box::new(SelectPaneRequest {
-                target: PaneTarget::with_window(alpha.clone(), 0, 0),
-                title: None,
-                style: None,
-                input_disabled: None,
-                preserve_zoom: false,
-            })))
-            .await,
-        rmux_proto::Response::SelectPane(_)
-    ));
+    handler.handle_ok(SplitWindowRequest::fixture(&alpha)).await;
+    handler
+        .handle_ok(SelectPaneRequest::fixture(PaneTarget::with_window(
+            alpha.clone(),
+            0,
+            0,
+        )))
+        .await;
 
     let (control_tx, mut control_rx) = mpsc::unbounded_channel();
     handler
@@ -2034,46 +1552,22 @@ async fn display_panes_default_template_runs_select_pane_hooks() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
     let requester_pid = 4242_u32;
-    create_session(&handler, &alpha).await;
+    handler.create_session(&alpha).await;
 
-    assert!(matches!(
-        handler
-            .handle(Request::SplitWindow(SplitWindowRequest {
-                target: SplitWindowTarget::Session(alpha.clone()),
-                direction: SplitDirection::Vertical,
-                before: false,
-                environment: None,
-            }))
-            .await,
-        rmux_proto::Response::SplitWindow(_)
-    ));
-    assert!(matches!(
-        handler
-            .handle(Request::SelectPane(Box::new(SelectPaneRequest {
-                target: PaneTarget::with_window(alpha.clone(), 0, 0),
-                title: None,
-                style: None,
-                input_disabled: None,
-                preserve_zoom: false,
-            })))
-            .await,
-        rmux_proto::Response::SelectPane(_)
-    ));
-    assert!(matches!(
-        handler
-            .handle(Request::SetHookMutation(SetHookMutationRequest {
-                scope: ScopeSelector::Global,
-                hook: HookName::AfterSelectPane,
-                command: Some("set-buffer -b display-panes-probe fired".to_owned()),
-                lifecycle: HookLifecycle::Persistent,
-                append: false,
-                unset: false,
-                run_immediately: false,
-                index: None,
-            }))
-            .await,
-        rmux_proto::Response::SetHook(_)
-    ));
+    handler.handle_ok(SplitWindowRequest::fixture(&alpha)).await;
+    handler
+        .handle_ok(SelectPaneRequest::fixture(PaneTarget::with_window(
+            alpha.clone(),
+            0,
+            0,
+        )))
+        .await;
+    handler
+        .set_global_hook(
+            HookName::AfterSelectPane,
+            "set-buffer -b display-panes-probe fired",
+        )
+        .await;
 
     let (control_tx, mut control_rx) = mpsc::unbounded_channel();
     handler
@@ -2117,31 +1611,16 @@ async fn display_panes_without_a_command_keeps_the_active_pane() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
     let requester_pid = 43_u32;
-    create_session(&handler, &alpha).await;
+    handler.create_session(&alpha).await;
 
-    assert!(matches!(
-        handler
-            .handle(Request::SplitWindow(SplitWindowRequest {
-                target: SplitWindowTarget::Session(alpha.clone()),
-                direction: SplitDirection::Vertical,
-                before: false,
-                environment: None,
-            }))
-            .await,
-        rmux_proto::Response::SplitWindow(_)
-    ));
-    assert!(matches!(
-        handler
-            .handle(Request::SelectPane(Box::new(SelectPaneRequest {
-                target: PaneTarget::with_window(alpha.clone(), 0, 0),
-                title: None,
-                style: None,
-                input_disabled: None,
-                preserve_zoom: false,
-            })))
-            .await,
-        rmux_proto::Response::SelectPane(_)
-    ));
+    handler.handle_ok(SplitWindowRequest::fixture(&alpha)).await;
+    handler
+        .handle_ok(SelectPaneRequest::fixture(PaneTarget::with_window(
+            alpha.clone(),
+            0,
+            0,
+        )))
+        .await;
 
     let (control_tx, mut control_rx) = mpsc::unbounded_channel();
     handler
@@ -2180,7 +1659,7 @@ async fn display_panes_uses_the_session_option_duration_by_default() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
     let requester_pid = 44_u32;
-    create_session(&handler, &alpha).await;
+    handler.create_session(&alpha).await;
 
     {
         let mut state = handler.state.lock().await;
@@ -2238,7 +1717,7 @@ async fn display_panes_timeout_emits_a_clear_overlay_to_the_attached_client() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
     let requester_pid = 45_u32;
-    create_session(&handler, &alpha).await;
+    handler.create_session(&alpha).await;
 
     let (control_tx, mut control_rx) = mpsc::unbounded_channel();
     handler
@@ -2285,7 +1764,7 @@ async fn display_panes_timeout_emits_a_clear_overlay_to_the_attached_client() {
 async fn join_pane_rejects_same_source_and_target() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    create_session(&handler, &alpha).await;
+    handler.create_session(&alpha).await;
 
     let response = handler
         .handle(Request::JoinPane(rmux_proto::JoinPaneRequest {
@@ -2309,7 +1788,7 @@ async fn join_pane_rejects_same_source_and_target() {
 async fn move_pane_rejects_same_source_and_target() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    create_session(&handler, &alpha).await;
+    handler.create_session(&alpha).await;
 
     let response = handler
         .handle(Request::MovePane(MovePaneRequest {
@@ -2335,9 +1814,9 @@ async fn cross_session_swap_from_group_owner_preserves_owner_and_session_pair() 
     let owner = session_name("swap-owner-success");
     let peer = session_name("swap-peer-success");
     let target = session_name("swap-target-success");
-    create_session(&handler, &owner).await;
-    create_grouped_session(&handler, &peer, &owner).await;
-    create_session(&handler, &target).await;
+    handler.create_session(&owner).await;
+    handler.create_session(Grouped(&peer, &owner)).await;
+    handler.create_session(&target).await;
     let (source_pane_id, target_pane_id) = {
         let state = handler.state.lock().await;
         (
@@ -2354,17 +1833,15 @@ async fn cross_session_swap_from_group_owner_preserves_owner_and_session_pair() 
         )
     };
 
-    let response = handler
-        .handle(Request::SwapPane(rmux_proto::SwapPaneRequest {
+    handler
+        .handle_ok(rmux_proto::SwapPaneRequest {
             source: PaneTarget::with_window(owner.clone(), 0, 0),
             target: PaneTarget::with_window(target.clone(), 0, 0),
             direction: None,
             detached: false,
             preserve_zoom: false,
-        }))
+        })
         .await;
-
-    assert!(matches!(response, Response::SwapPane(_)), "{response:?}");
     let state = handler.state.lock().await;
     assert_eq!(state.sessions.runtime_owner(&owner), Some(owner.clone()));
     assert_eq!(state.sessions.runtime_owner(&peer), Some(owner.clone()));
@@ -2397,9 +1874,9 @@ async fn cross_session_swap_rollback_restores_owner_and_session_pair() {
     let owner = session_name("swap-owner-rollback");
     let peer = session_name("swap-peer-rollback");
     let target = session_name("swap-target-rollback");
-    create_session(&handler, &owner).await;
-    create_grouped_session(&handler, &peer, &owner).await;
-    create_session(&handler, &target).await;
+    handler.create_session(&owner).await;
+    handler.create_session(Grouped(&peer, &owner)).await;
+    handler.create_session(&target).await;
     handler.wait_for_initial_panes_for_test().await;
     let (owner_before, peer_before, target_before) = {
         let mut state = handler.state.lock().await;
@@ -2446,34 +1923,19 @@ async fn cross_session_swap_rollback_restores_owner_and_session_pair() {
 async fn swap_pane_self_swap_is_a_no_op() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    create_session(&handler, &alpha).await;
+    handler.create_session(&alpha).await;
 
-    assert!(matches!(
-        handler
-            .handle(Request::SplitWindow(SplitWindowRequest {
-                target: SplitWindowTarget::Session(alpha.clone()),
-                direction: SplitDirection::Vertical,
-                before: false,
-                environment: None,
-            }))
-            .await,
-        rmux_proto::Response::SplitWindow(_)
-    ));
+    handler.handle_ok(SplitWindowRequest::fixture(&alpha)).await;
 
-    let response = handler
-        .handle(Request::SwapPane(rmux_proto::SwapPaneRequest {
+    handler
+        .handle_ok(rmux_proto::SwapPaneRequest {
             source: PaneTarget::with_window(alpha.clone(), 0, 0),
             target: PaneTarget::with_window(alpha.clone(), 0, 0),
             direction: None,
             detached: false,
             preserve_zoom: false,
-        }))
+        })
         .await;
-
-    assert!(
-        matches!(response, rmux_proto::Response::SwapPane(_)),
-        "self-swap should succeed as a no-op, got {response:?}"
-    );
 }
 
 #[tokio::test]
@@ -2481,48 +1943,32 @@ async fn respawn_pane_dead_pane_succeeds_without_kill_flag() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
     let target = PaneTarget::with_window(alpha.clone(), 0, 0);
-    create_session(&handler, &alpha).await;
+    handler.create_session(&alpha).await;
 
-    assert!(matches!(
-        handler
-            .handle(Request::SetOption(SetOptionRequest {
-                scope: ScopeSelector::Pane(target.clone()),
-                option: OptionName::RemainOnExit,
-                value: "on".to_owned(),
-                mode: SetOptionMode::Replace,
-            }))
-            .await,
-        rmux_proto::Response::SetOption(_)
-    ));
+    handler
+        .set_option(
+            ScopeSelector::Pane(target.clone()),
+            OptionName::RemainOnExit,
+            "on",
+        )
+        .await;
 
-    let respawned = handler
-        .handle(Request::RespawnPane(Box::new(RespawnPaneRequest {
-            target: target.clone(),
-            kill: true,
-            start_directory: None,
-            environment: None,
+    handler
+        .handle_ok(RespawnPaneRequest {
             command: Some(vec!["exit 0".to_owned()]),
-            process_command: None,
-        })))
+            ..Fixture::fixture(&target)
+        })
         .await;
-    assert!(matches!(respawned, rmux_proto::Response::RespawnPane(_)));
-    wait_for_dead_pane(&handler, &alpha, 0, 0).await;
+    handler
+        .wait_for_pane_exit_for_test(&PaneTarget::new(alpha.clone(), 0))
+        .await;
 
-    let response = handler
-        .handle(Request::RespawnPane(Box::new(RespawnPaneRequest {
-            target,
+    handler
+        .handle_ok(RespawnPaneRequest {
             kill: false,
-            start_directory: None,
-            environment: None,
-            command: None,
-            process_command: None,
-        })))
+            ..Fixture::fixture(target)
+        })
         .await;
-
-    assert!(
-        matches!(response, rmux_proto::Response::RespawnPane(_)),
-        "respawning a dead pane without -k should succeed, got {response:?}"
-    );
 }
 
 #[tokio::test]
@@ -2530,29 +1976,22 @@ async fn remain_on_exit_keeps_the_existing_window_name() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
     let target = PaneTarget::with_window(alpha.clone(), 0, 0);
-    create_session(&handler, &alpha).await;
+    handler.create_session(&alpha).await;
 
-    assert!(matches!(
-        handler
-            .handle(Request::RenameWindow(RenameWindowRequest {
-                target: WindowTarget::with_window(alpha.clone(), 0),
-                name: "custom".to_owned(),
-            }))
-            .await,
-        rmux_proto::Response::RenameWindow(_)
-    ));
+    handler
+        .handle_ok(RenameWindowRequest {
+            target: WindowTarget::with_window(alpha.clone(), 0),
+            name: "custom".to_owned(),
+        })
+        .await;
 
-    assert!(matches!(
-        handler
-            .handle(Request::SetOption(SetOptionRequest {
-                scope: ScopeSelector::Pane(target.clone()),
-                option: OptionName::RemainOnExit,
-                value: "on".to_owned(),
-                mode: SetOptionMode::Replace,
-            }))
-            .await,
-        rmux_proto::Response::SetOption(_)
-    ));
+    handler
+        .set_option(
+            ScopeSelector::Pane(target.clone()),
+            OptionName::RemainOnExit,
+            "on",
+        )
+        .await;
 
     let expected_window_name = {
         let state = handler.state.lock().await;
@@ -2565,18 +2004,15 @@ async fn remain_on_exit_keeps_the_existing_window_name() {
             .to_owned()
     };
 
-    let response = handler
-        .handle(Request::RespawnPane(Box::new(RespawnPaneRequest {
-            target: target.clone(),
-            kill: true,
-            start_directory: None,
-            environment: None,
+    handler
+        .handle_ok(RespawnPaneRequest {
             command: Some(vec!["exit 0".to_owned()]),
-            process_command: None,
-        })))
+            ..Fixture::fixture(&target)
+        })
         .await;
-    assert!(matches!(response, rmux_proto::Response::RespawnPane(_)));
-    wait_for_dead_pane(&handler, &alpha, 0, 0).await;
+    handler
+        .wait_for_pane_exit_for_test(&PaneTarget::new(alpha.clone(), 0))
+        .await;
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
@@ -2624,34 +2060,27 @@ async fn remain_on_exit_auto_named_window_gets_tmux_dead_suffix_when_unattached(
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
     let target = PaneTarget::with_window(alpha.clone(), 0, 0);
-    create_session(&handler, &alpha).await;
+    handler.create_session(&alpha).await;
 
-    assert!(matches!(
-        handler
-            .handle(Request::SetOption(SetOptionRequest {
-                scope: ScopeSelector::Pane(target.clone()),
-                option: OptionName::RemainOnExit,
-                value: "on".to_owned(),
-                mode: SetOptionMode::Replace,
-            }))
-            .await,
-        rmux_proto::Response::SetOption(_)
-    ));
+    handler
+        .set_option(
+            ScopeSelector::Pane(target.clone()),
+            OptionName::RemainOnExit,
+            "on",
+        )
+        .await;
 
     let expected_window_name = "exit[dead]".to_owned();
 
-    let response = handler
-        .handle(Request::RespawnPane(Box::new(RespawnPaneRequest {
-            target: target.clone(),
-            kill: true,
-            start_directory: None,
-            environment: None,
+    handler
+        .handle_ok(RespawnPaneRequest {
             command: Some(vec!["exit 0".to_owned()]),
-            process_command: None,
-        })))
+            ..Fixture::fixture(&target)
+        })
         .await;
-    assert!(matches!(response, rmux_proto::Response::RespawnPane(_)));
-    wait_for_dead_pane(&handler, &alpha, 0, 0).await;
+    handler
+        .wait_for_pane_exit_for_test(&PaneTarget::new(alpha.clone(), 0))
+        .await;
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
@@ -2698,87 +2127,66 @@ async fn remain_on_exit_auto_named_window_gets_tmux_dead_suffix_when_unattached(
 async fn pipe_pane_close_on_nonexistent_pipe_is_a_no_op() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    create_session(&handler, &alpha).await;
+    handler.create_session(&alpha).await;
 
-    let response = handler
-        .handle(Request::PipePane(PipePaneRequest {
+    handler
+        .handle_ok(PipePaneRequest {
             target: PaneTarget::with_window(alpha, 0, 0),
             stdin: false,
             stdout: true,
             once: false,
             command: None,
-        }))
+        })
         .await;
-
-    assert!(
-        matches!(response, rmux_proto::Response::PipePane(_)),
-        "closing a non-existent pipe should succeed, got {response:?}"
-    );
 }
 
 #[tokio::test]
 async fn pipe_pane_empty_command_closes_existing_pipe() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    create_session(&handler, &alpha).await;
+    handler.create_session(&alpha).await;
     let target = PaneTarget::with_window(alpha.clone(), 0, 0);
 
-    let open = handler
-        .handle(Request::PipePane(PipePaneRequest {
+    handler
+        .handle_ok(PipePaneRequest {
             target: target.clone(),
             stdin: false,
             stdout: true,
             once: false,
-            command: Some(pipe_discard_command()),
-        }))
+            command: Some(stdin_discard_command()),
+        })
         .await;
-    assert!(
-        matches!(open, rmux_proto::Response::PipePane(_)),
-        "opening the pipe should succeed, got {open:?}"
-    );
 
-    let close = handler
-        .handle(Request::PipePane(PipePaneRequest {
+    handler
+        .handle_ok(PipePaneRequest {
             target: target.clone(),
             stdin: false,
             stdout: true,
             once: false,
             command: Some(String::new()),
-        }))
+        })
         .await;
-    assert!(
-        matches!(close, rmux_proto::Response::PipePane(_)),
-        "empty command should close existing pipe, got {close:?}"
-    );
 
     // Opening a new pipe after an empty-command close should succeed, confirming the previous
     // pipe was cleaned up.
-    let reopen = handler
-        .handle(Request::PipePane(PipePaneRequest {
+    handler
+        .handle_ok(PipePaneRequest {
             target: target.clone(),
             stdin: false,
             stdout: true,
             once: true,
-            command: Some(pipe_discard_command()),
-        }))
+            command: Some(stdin_discard_command()),
+        })
         .await;
-    assert!(
-        matches!(reopen, rmux_proto::Response::PipePane(_)),
-        "reopening after close should succeed"
-    );
-    let close = handler
-        .handle(Request::PipePane(PipePaneRequest {
+    handler
+        .handle_ok(PipePaneRequest {
             target,
             stdin: false,
             stdout: true,
             once: false,
             command: None,
-        }))
+        })
         .await;
-    assert!(
-        matches!(close, rmux_proto::Response::PipePane(_)),
-        "closing the reopened pipe should succeed, got {close:?}"
-    );
 }
 
 async fn snapshot_response(
@@ -2823,28 +2231,13 @@ async fn pane_snapshot_returns_live_screen_built_via_terminal_parser() {
     // observing the structured cells exercises that exact path end-to-end.
     let handler = RequestHandler::new();
     let alpha = session_name("snapshot-live");
-    let created = handler
-        .handle(Request::NewSessionExt(Box::new(NewSessionExtRequest {
-            session_name: Some(alpha.clone()),
-            working_directory: None,
-            detached: true,
+    handler
+        .create_session(NewSessionExtRequest {
             size: Some(TerminalSize { cols: 12, rows: 4 }),
-            environment: None,
-            group_target: None,
-            attach_if_exists: false,
-            detach_other_clients: false,
-            kill_other_clients: false,
-            flags: None,
-            window_name: None,
-            print_session_info: false,
-            print_format: None,
-            command: Some(vec![pipe_discard_command()]),
-            process_command: None,
-            client_environment: None,
-            skip_environment_update: false,
-        })))
+            command: Some(vec![stdin_discard_command()]),
+            ..Fixture::fixture(&alpha)
+        })
         .await;
-    assert!(matches!(created, rmux_proto::Response::NewSession(_)));
 
     let pane_id = {
         let state = handler.state.lock().await;
@@ -2954,28 +2347,13 @@ async fn pane_snapshot_folds_invalid_utf8_through_parser_not_raw_bytes() {
     // to clean them up later.
     let handler = RequestHandler::new();
     let alpha = session_name("snapshot-bad-utf8");
-    let created = handler
-        .handle(Request::NewSessionExt(Box::new(NewSessionExtRequest {
-            session_name: Some(alpha.clone()),
-            working_directory: None,
-            detached: true,
+    handler
+        .create_session(NewSessionExtRequest {
             size: Some(TerminalSize { cols: 8, rows: 2 }),
-            environment: None,
-            group_target: None,
-            attach_if_exists: false,
-            detach_other_clients: false,
-            kill_other_clients: false,
-            flags: None,
-            window_name: None,
-            print_session_info: false,
-            print_format: None,
-            command: Some(vec![pipe_discard_command()]),
-            process_command: None,
-            client_environment: None,
-            skip_environment_update: false,
-        })))
+            command: Some(vec![stdin_discard_command()]),
+            ..Fixture::fixture(&alpha)
+        })
         .await;
-    assert!(matches!(created, rmux_proto::Response::NewSession(_)));
 
     let pane_id = {
         let state = handler.state.lock().await;
@@ -3041,28 +2419,13 @@ async fn pane_snapshot_revision_changes_after_clear_history() {
     // post-clear screen as identical to the pre-clear one.
     let handler = RequestHandler::new();
     let alpha = session_name("snapshot-clear");
-    let created = handler
-        .handle(Request::NewSessionExt(Box::new(NewSessionExtRequest {
-            session_name: Some(alpha.clone()),
-            working_directory: None,
-            detached: true,
+    handler
+        .create_session(NewSessionExtRequest {
             size: Some(TerminalSize { cols: 4, rows: 2 }),
-            environment: None,
-            group_target: None,
-            attach_if_exists: false,
-            detach_other_clients: false,
-            kill_other_clients: false,
-            flags: None,
-            window_name: None,
-            print_session_info: false,
-            print_format: None,
-            command: Some(vec![pipe_discard_command()]),
-            process_command: None,
-            client_environment: None,
-            skip_environment_update: false,
-        })))
+            command: Some(vec![stdin_discard_command()]),
+            ..Fixture::fixture(&alpha)
+        })
         .await;
-    assert!(matches!(created, rmux_proto::Response::NewSession(_)));
 
     let pane_id = {
         let state = handler.state.lock().await;

@@ -1,33 +1,4 @@
 use super::*;
-use rmux_core::{input::InputParser, Screen};
-
-async fn replace_transcript_contents(
-    handler: &RequestHandler,
-    target: &PaneTarget,
-    size: TerminalSize,
-    content: &[u8],
-) {
-    handler
-        .wait_for_pane_startup_to_finish_for_test(target)
-        .await;
-    let transcript = {
-        let state = handler.state.lock().await;
-        state
-            .transcript_handle(target)
-            .expect("session transcript must exist")
-    };
-    let history_limit = transcript
-        .lock()
-        .expect("pane transcript mutex must not be poisoned")
-        .history_limit();
-    let mut screen = Screen::new(size, history_limit);
-    let mut parser = InputParser::new();
-    parser.parse(content, &mut screen);
-    transcript
-        .lock()
-        .expect("pane transcript mutex must not be poisoned")
-        .set_screen_for_test(screen);
-}
 
 #[tokio::test]
 async fn copy_mode_mouse_drag_start_anchors_on_press_cell() {
@@ -36,20 +7,11 @@ async fn copy_mode_mouse_drag_start_anchors_on_press_cell() {
     let requester_pid = std::process::id();
     let target = PaneTarget::new(alpha.clone(), 0);
 
-    let created = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name: alpha.clone(),
-            detached: true,
-            size: Some(TerminalSize { cols: 20, rows: 5 }),
-            environment: None,
-        }))
+    handler
+        .create_session((&alpha, TerminalSize::new(20, 5)))
         .await;
-    assert!(matches!(created, Response::NewSession(_)));
 
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
 
     let (window_id, pane_id) = {
         let state = handler.state.lock().await;
@@ -88,20 +50,12 @@ async fn copy_mode_mouse_drag_start_anchors_on_press_cell() {
         });
     }
 
-    let response = handler
-        .handle(Request::CopyMode(CopyModeRequest {
-            target: Some(target),
-            page_down: false,
-            exit_on_scroll: false,
-            hide_position: false,
+    handler
+        .handle_ok(CopyModeRequest {
             mouse_drag_start: true,
-            cancel_mode: false,
-            scrollbar_scroll: false,
-            source: None,
-            page_up: false,
-        }))
+            ..Fixture::fixture(target)
+        })
         .await;
-    assert!(matches!(response, Response::CopyMode(_)));
 
     let summary = {
         let state = handler.state.lock().await;
@@ -118,10 +72,6 @@ async fn copy_mode_mouse_drag_start_anchors_on_press_cell() {
     );
 }
 
-fn quiet_copy_mode_fixture_command() -> Vec<String> {
-    vec!["/bin/sh".to_owned(), "-c".to_owned(), "sleep 60".to_owned()]
-}
-
 #[tokio::test]
 async fn copy_mode_single_motion_drag_copies_from_press_to_motion_cell() {
     let handler = RequestHandler::new();
@@ -130,34 +80,18 @@ async fn copy_mode_single_motion_drag_copies_from_press_to_motion_cell() {
     let target = PaneTarget::new(alpha.clone(), 0);
     let size = TerminalSize { cols: 20, rows: 5 };
 
-    let created = handler
-        .handle(Request::NewSessionExt(Box::new(NewSessionExtRequest {
-            session_name: Some(alpha.clone()),
-            working_directory: None,
-            detached: true,
+    handler
+        .create_started_session(NewSessionExtRequest {
             size: Some(size),
-            environment: None,
-            group_target: None,
-            attach_if_exists: false,
-            detach_other_clients: false,
-            kill_other_clients: false,
-            flags: None,
-            window_name: None,
-            print_session_info: false,
-            print_format: None,
-            command: Some(quiet_copy_mode_fixture_command()),
-            process_command: None,
-            client_environment: None,
-            skip_environment_update: false,
-        })))
+            command: Some(quiet_command()),
+            ..Fixture::fixture(&alpha)
+        })
         .await;
-    assert!(matches!(created, Response::NewSession(_)));
-    replace_transcript_contents(&handler, &target, size, b"ABCDEF\r\n").await;
+    handler
+        .replace_transcript_for_test(&target, size, b"ABCDEF\r\n")
+        .await;
 
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
 
     let (window_id, pane_id) = {
         let state = handler.state.lock().await;
@@ -196,33 +130,18 @@ async fn copy_mode_single_motion_drag_copies_from_press_to_motion_cell() {
         });
     }
 
-    let response = handler
-        .handle(Request::CopyMode(CopyModeRequest {
-            target: Some(target.clone()),
-            page_down: false,
-            exit_on_scroll: false,
-            hide_position: false,
+    handler
+        .handle_ok(CopyModeRequest {
             mouse_drag_start: true,
-            cancel_mode: false,
-            scrollbar_scroll: false,
-            source: None,
-            page_up: false,
-        }))
+            ..Fixture::fixture(&target)
+        })
         .await;
-    assert!(matches!(response, Response::CopyMode(_)));
 
     let copied = handler
         .handle(Request::SendKeysExt(SendKeysExtRequest {
-            target: Some(target),
-            keys: vec!["copy-selection".to_owned()],
-            expand_formats: false,
-            hex: false,
-            literal: false,
             dispatch_key_table: false,
             copy_mode_command: true,
-            forward_mouse_event: false,
-            reset_terminal: false,
-            repeat_count: None,
+            ..Fixture::fixture((target, ["copy-selection"]))
         }))
         .await;
     assert!(matches!(
@@ -249,57 +168,34 @@ async fn copy_mode_mouse_entry_uses_left_scrollbar_content_origin() {
     let alpha = session_name("copy-mode-left-scrollbar");
     let requester_pid = std::process::id();
     let target = PaneTarget::new(alpha.clone(), 0);
-    let created = handler
-        .handle(Request::NewSessionExt(Box::new(NewSessionExtRequest {
-            session_name: Some(alpha.clone()),
-            working_directory: None,
-            detached: true,
+    handler
+        .create_session(NewSessionExtRequest {
             size: Some(TerminalSize { cols: 20, rows: 5 }),
-            environment: None,
-            group_target: None,
-            attach_if_exists: false,
-            detach_other_clients: false,
-            kill_other_clients: false,
-            flags: None,
-            window_name: None,
-            print_session_info: false,
-            print_format: None,
-            command: Some(quiet_copy_mode_fixture_command()),
-            process_command: None,
-            client_environment: None,
-            skip_environment_update: false,
-        })))
+            command: Some(quiet_command()),
+            ..Fixture::fixture(&alpha)
+        })
         .await;
-    assert!(matches!(created, Response::NewSession(_)));
     for (option, value) in [
         (OptionName::PaneScrollbars, "on"),
         (OptionName::PaneScrollbarsPosition, "left"),
         (OptionName::PaneScrollbarsStyle, "width=2,pad=1"),
     ] {
-        assert!(matches!(
-            handler
-                .handle(Request::SetOption(SetOptionRequest {
-                    scope: ScopeSelector::Window(WindowTarget::with_window(alpha.clone(), 0)),
-                    option,
-                    value: value.to_owned(),
-                    mode: SetOptionMode::Replace,
-                }))
-                .await,
-            Response::SetOption(_)
-        ));
+        handler
+            .set_option(
+                ScopeSelector::Window(WindowTarget::with_window(alpha.clone(), 0)),
+                option,
+                value,
+            )
+            .await;
     }
-    replace_transcript_contents(
-        &handler,
-        &target,
-        TerminalSize { cols: 17, rows: 4 },
-        b"ABCDEF\r\n",
-    )
-    .await;
-
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
     handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
+        .wait_for_pane_startup_to_finish_for_test(&target)
         .await;
+    handler
+        .replace_transcript_for_test(&target, TerminalSize { cols: 17, rows: 4 }, b"ABCDEF\r\n")
+        .await;
+
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
     let (window_id, pane_id) = {
         let state = handler.state.lock().await;
         let window = state
@@ -340,35 +236,19 @@ async fn copy_mode_mouse_entry_uses_left_scrollbar_content_origin() {
         });
     }
 
-    let entered = handler
-        .handle(Request::CopyMode(CopyModeRequest {
-            target: Some(target.clone()),
-            page_down: false,
-            exit_on_scroll: false,
-            hide_position: false,
+    handler
+        .handle_ok(CopyModeRequest {
             mouse_drag_start: true,
-            cancel_mode: false,
-            scrollbar_scroll: false,
-            source: None,
-            page_up: false,
-        }))
+            ..Fixture::fixture(&target)
+        })
         .await;
-    assert!(matches!(entered, Response::CopyMode(_)));
-    let copied = handler
-        .handle(Request::SendKeysExt(SendKeysExtRequest {
-            target: Some(target),
-            keys: vec!["copy-selection".to_owned()],
-            expand_formats: false,
-            hex: false,
-            literal: false,
+    handler
+        .handle_ok(SendKeysExtRequest {
             dispatch_key_table: false,
             copy_mode_command: true,
-            forward_mouse_event: false,
-            reset_terminal: false,
-            repeat_count: None,
-        }))
+            ..Fixture::fixture((target, ["copy-selection"]))
+        })
         .await;
-    assert!(matches!(copied, Response::SendKeys(_)));
     let shown = handler
         .handle(Request::ShowBuffer(ShowBufferRequest { name: None }))
         .await;

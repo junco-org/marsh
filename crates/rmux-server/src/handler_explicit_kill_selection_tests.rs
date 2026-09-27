@@ -1,20 +1,17 @@
 use std::collections::BTreeSet;
-use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
 
 use rmux_core::PaneId;
 use rmux_proto::{
-    ControlMode, KillPaneRequest, LinkWindowRequest, NewSessionRequest, NewWindowRequest,
-    OptionName, PaneKillRequest, PaneTarget, PaneTargetRef, Request, Response, ScopeSelector,
-    SelectWindowRequest, SessionName, SetOptionMode, SetOptionRequest, SplitDirection,
-    SplitWindowRequest, SplitWindowTarget, TerminalSize, WindowTarget,
+    KillPaneRequest, LinkWindowRequest, NewWindowRequest, OptionName, PaneKillRequest, PaneTarget,
+    PaneTargetRef, Request, Response, ScopeSelector, SelectWindowRequest, SessionName,
+    SplitWindowRequest, WindowTarget,
 };
 use tokio::sync::mpsc;
 
-use super::pane_group_transfer_tests::create_grouped_session;
 use super::RequestHandler;
-use crate::control::{ControlModeUpgrade, ControlServerEvent, CONTROL_SERVER_EVENT_CAPACITY};
+use crate::control::ControlServerEvent;
 use crate::pane_io::AttachControl;
+use crate::test_fixtures::{Fixture, Grouped};
 
 #[path = "handler_explicit_kill_selection_tests/entry_paths.rs"]
 mod entry_paths;
@@ -72,41 +69,9 @@ struct OracleRemoval {
 
 use crate::test_names::session_name;
 
+/// Creates `name`; the `entry_paths` scenarios share it.
 async fn new_session(handler: &RequestHandler, name: &SessionName) {
-    let response = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name: name.clone(),
-            detached: true,
-            size: Some(TerminalSize { cols: 80, rows: 24 }),
-            environment: None,
-        }))
-        .await;
-    assert!(matches!(response, Response::NewSession(_)), "{response:?}");
-}
-
-async fn new_window(handler: &RequestHandler, session: &SessionName) {
-    new_window_at(handler, session, None).await;
-}
-
-async fn new_window_at(
-    handler: &RequestHandler,
-    session: &SessionName,
-    target_window_index: Option<u32>,
-) {
-    let response = handler
-        .handle(Request::NewWindow(Box::new(NewWindowRequest {
-            target: session.clone(),
-            name: None,
-            detached: true,
-            start_directory: None,
-            environment: None,
-            command: None,
-            process_command: None,
-            target_window_index,
-            insert_at_target: false,
-        })))
-        .await;
-    assert!(matches!(response, Response::NewWindow(_)), "{response:?}");
+    handler.create_session(name).await;
 }
 
 async fn set_window_size_mode(handler: &RequestHandler, session_name: &SessionName, mode: &str) {
@@ -122,56 +87,10 @@ async fn set_window_size_mode(handler: &RequestHandler, session_name: &SessionNa
             .collect::<Vec<_>>()
     };
     for index in indexes {
-        let response = handler
-            .handle(Request::SetOption(SetOptionRequest {
-                scope: ScopeSelector::Window(WindowTarget::with_window(
-                    session_name.clone(),
-                    index,
-                )),
-                option: OptionName::WindowSize,
-                value: mode.to_owned(),
-                mode: SetOptionMode::Replace,
-            }))
+        handler
+            .set_window_size_policy(session_name, index, mode)
             .await;
-        assert!(matches!(response, Response::SetOption(_)), "{response:?}");
     }
-}
-
-async fn set_renumber_windows(handler: &RequestHandler, session_name: &SessionName, enabled: bool) {
-    let response = handler
-        .handle(Request::SetOption(SetOptionRequest {
-            scope: ScopeSelector::Session(session_name.clone()),
-            option: OptionName::RenumberWindows,
-            value: if enabled { "on" } else { "off" }.to_owned(),
-            mode: SetOptionMode::Replace,
-        }))
-        .await;
-    assert!(matches!(response, Response::SetOption(_)), "{response:?}");
-}
-
-async fn register_control(
-    handler: &RequestHandler,
-    requester_pid: u32,
-    session: &SessionName,
-) -> (u64, mpsc::Receiver<ControlServerEvent>) {
-    let (event_tx, event_rx) = mpsc::channel(CONTROL_SERVER_EVENT_CAPACITY);
-    let control_id = handler
-        .register_control_with_closing(
-            requester_pid,
-            ControlModeUpgrade {
-                initial_command_count: 0,
-                mode: ControlMode::Plain,
-                terminal_context: crate::outer_terminal::OuterTerminalContext::default(),
-            },
-            event_tx,
-            Arc::new(AtomicBool::new(false)),
-        )
-        .await;
-    handler
-        .set_control_session(requester_pid, Some(session.clone()))
-        .await
-        .expect("control client attaches to test session");
-    (control_id, event_rx)
 }
 
 async fn register_target_client(
@@ -182,17 +101,11 @@ async fn register_target_client(
 ) -> TargetClientGuard {
     match client_kind {
         TargetClientKind::None => TargetClientGuard::None,
-        TargetClientKind::Pty => {
-            let (control_tx, control_rx) = mpsc::unbounded_channel();
-            handler
-                .register_attach(pid, target.clone(), control_tx)
-                .await;
-            TargetClientGuard::Pty {
-                _events: control_rx,
-            }
-        }
+        TargetClientKind::Pty => TargetClientGuard::Pty {
+            _events: handler.attach_client(pid, target).await,
+        },
         TargetClientKind::Control => {
-            let (_, events) = register_control(handler, pid, target).await;
+            let (_, events) = handler.register_control_for_test(pid, Some(target)).await;
             TargetClientGuard::Control { _events: events }
         }
     }
@@ -207,17 +120,18 @@ async fn build_scenario(
     let handler = RequestHandler::new();
     let observer = session_name(&format!("observer-{pid_offset}"));
     let target = session_name(&format!("target-{pid_offset}"));
-    new_session(&handler, &observer).await;
-    new_session(&handler, &target).await;
+    handler.create_session(&observer).await;
+    handler.create_session(&target).await;
     for _ in 1..window_count {
-        new_window(&handler, &target).await;
+        handler.create_window(&target).await;
     }
     set_window_size_mode(&handler, &target, window_size_mode).await;
     let target_client =
         register_target_client(&handler, &target, client_kind, TARGET_PID - pid_offset).await;
     let observer_pid = OBSERVER_PID - pid_offset;
-    let (observer_control_id, mut observer_events) =
-        register_control(&handler, observer_pid, &observer).await;
+    let (observer_control_id, mut observer_events) = handler
+        .register_control_for_test(observer_pid, Some(&observer))
+        .await;
     let _ = relevant_notifications(&mut observer_events);
     Scenario {
         handler,
@@ -547,23 +461,21 @@ async fn explicit_kill_selection_neighbours_remain_silent_when_identity_cannot_c
 async fn create_linked_family(handler: &RequestHandler) -> (SessionName, SessionName) {
     let alpha = session_name("linked-alpha");
     let beta = session_name("linked-beta");
-    new_session(handler, &alpha).await;
-    new_window(handler, &alpha).await;
-    new_window(handler, &alpha).await;
-    new_session(handler, &beta).await;
-    new_window(handler, &beta).await;
-    new_window(handler, &beta).await;
-    let response = handler
-        .handle(Request::LinkWindow(LinkWindowRequest {
-            source: WindowTarget::with_window(alpha.clone(), 0),
-            target: WindowTarget::with_window(beta.clone(), 0),
-            after: false,
-            before: false,
+    for session in [&alpha, &beta] {
+        handler.create_session(session).await;
+        handler.create_window(session).await;
+        handler.create_window(session).await;
+    }
+    handler
+        .handle_ok(LinkWindowRequest {
             kill_destination: true,
             detached: false,
-        }))
+            ..Fixture::fixture((
+                WindowTarget::with_window(alpha.clone(), 0),
+                WindowTarget::with_window(beta.clone(), 0),
+            ))
+        })
         .await;
-    assert!(matches!(response, Response::LinkWindow(_)), "{response:?}");
     (alpha, beta)
 }
 
@@ -590,10 +502,18 @@ async fn linked_and_grouped_last_pane_kill_interleave_each_selection_before_its_
     for renumber in [false, true] {
         let handler = RequestHandler::new();
         let observer = session_name(&format!("linked-observer-{renumber}"));
-        new_session(&handler, &observer).await;
+        handler.create_session(&observer).await;
         let (alpha, beta) = create_linked_family(&handler).await;
-        set_renumber_windows(&handler, &alpha, renumber).await;
-        set_renumber_windows(&handler, &beta, renumber).await;
+        let renumber_windows = if renumber { "on" } else { "off" };
+        for session in [&alpha, &beta] {
+            handler
+                .set_option(
+                    ScopeSelector::Session(session.clone()),
+                    OptionName::RenumberWindows,
+                    renumber_windows,
+                )
+                .await;
+        }
         // tmux 3.7b selects index 2 for both active aliases in this
         // no-history, three-window setup.
         let (alpha_session_id, alpha_expected_id) = expected_selection(&handler, &alpha, 2).await;
@@ -610,15 +530,16 @@ async fn linked_and_grouped_last_pane_kill_interleave_each_selection_before_its_
                 window.active_pane().expect("shared pane exists").index(),
             )
         };
-        let (_, mut events) = register_control(&handler, 83_000 + renumber as u32, &observer).await;
+        let (_, mut events) = handler
+            .register_control_for_test(83_000 + renumber as u32, Some(&observer))
+            .await;
         let _ = relevant_notifications(&mut events);
-        let response = handler
-            .handle(Request::KillPane(KillPaneRequest {
+        handler
+            .handle_ok(KillPaneRequest {
                 target: PaneTarget::with_window(alpha, 0, pane_index),
                 kill_all_except: false,
-            }))
+            })
             .await;
-        assert!(matches!(response, Response::KillPane(_)), "{response:?}");
         assert_eq!(
             relevant_notifications(&mut events),
             vec![
@@ -634,32 +555,27 @@ async fn linked_and_grouped_last_pane_kill_interleave_each_selection_before_its_
     let handler = RequestHandler::new();
     let observer = session_name("grouped-observer");
     let owner = session_name("grouped-owner");
-    new_session(&handler, &observer).await;
-    let base_index = handler
-        .handle(Request::SetOption(SetOptionRequest {
-            scope: ScopeSelector::Global,
-            option: OptionName::BaseIndex,
-            value: "2".to_owned(),
-            mode: SetOptionMode::Replace,
-        }))
+    handler.create_session(&observer).await;
+    handler
+        .set_option(ScopeSelector::Global, OptionName::BaseIndex, "2")
         .await;
-    assert!(
-        matches!(base_index, Response::SetOption(_)),
-        "{base_index:?}"
-    );
-    new_session(&handler, &owner).await;
-    new_window_at(&handler, &owner, Some(0)).await;
-    new_window_at(&handler, &owner, Some(1)).await;
-    let peer = create_grouped_session(&handler, "grouped-peer", &owner).await;
-    let peer_selection = handler
-        .handle(Request::SelectWindow(SelectWindowRequest {
+    handler.create_session(&owner).await;
+    for index in [0, 1] {
+        handler
+            .create_window(NewWindowRequest {
+                target_window_index: Some(index),
+                ..Fixture::fixture(&owner)
+            })
+            .await;
+    }
+    let peer = handler
+        .create_session(Grouped("grouped-peer", &owner))
+        .await;
+    handler
+        .handle_ok(SelectWindowRequest {
             target: WindowTarget::with_window(peer.clone(), 2),
-        }))
+        })
         .await;
-    assert!(
-        matches!(peer_selection, Response::SelectWindow(_)),
-        "{peer_selection:?}"
-    );
     // Fresh tmux 3.7b causal matrix: a group peer created while the
     // no-history owner is on index 2 starts on its own index 0. Its single
     // selection of index 2 therefore records 0 as the local last window.
@@ -678,15 +594,16 @@ async fn linked_and_grouped_last_pane_kill_interleave_each_selection_before_its_
             window.active_pane().expect("grouped pane exists").index(),
         )
     };
-    let (_, mut events) = register_control(&handler, 83_100, &observer).await;
+    let (_, mut events) = handler
+        .register_control_for_test(83_100, Some(&observer))
+        .await;
     let _ = relevant_notifications(&mut events);
-    let response = handler
-        .handle(Request::KillPane(KillPaneRequest {
+    handler
+        .handle_ok(KillPaneRequest {
             target: PaneTarget::with_window(owner, 2, pane_index),
             kill_all_except: false,
-        }))
+        })
         .await;
-    assert!(matches!(response, Response::KillPane(_)), "{response:?}");
     assert_eq!(
         relevant_notifications(&mut events),
         vec![
@@ -701,16 +618,10 @@ async fn linked_and_grouped_last_pane_kill_interleave_each_selection_before_its_
 #[tokio::test]
 async fn surviving_window_kill_keeps_pane_selection_without_session_duplicate() {
     let mut scenario = build_scenario(TargetClientKind::None, 1, "manual", 800).await;
-    let split = scenario
+    scenario
         .handler
-        .handle(Request::SplitWindow(SplitWindowRequest {
-            target: SplitWindowTarget::Session(scenario.target.clone()),
-            direction: SplitDirection::Vertical,
-            before: false,
-            environment: None,
-        }))
+        .handle_ok(SplitWindowRequest::fixture(&scenario.target))
         .await;
-    assert!(matches!(split, Response::SplitWindow(_)), "{split:?}");
     let _ = relevant_notifications(&mut scenario.observer_events);
     let (window_id, target, expected_pane_id) = {
         let state = scenario.handler.state.lock().await;
@@ -733,14 +644,11 @@ async fn surviving_window_kill_keeps_pane_selection_without_session_duplicate() 
     };
     let response = scenario
         .handler
-        .handle(Request::KillPane(KillPaneRequest {
+        .handle_ok(KillPaneRequest {
             target,
             kill_all_except: false,
-        }))
+        })
         .await;
-    let Response::KillPane(response) = response else {
-        panic!("kill-pane failed: {response:?}");
-    };
     assert!(!response.window_destroyed, "{response:?}");
     assert_eq!(
         relevant_notifications(&mut scenario.observer_events),

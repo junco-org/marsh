@@ -10,11 +10,7 @@ async fn move_window_without_s_moves_current_window_to_first_free_index() {
         .parse("move-window")
         .expect("commands parse");
     handler
-        .execute_parsed_commands(
-            std::process::id(),
-            parsed,
-            current_window_context(&session, 2),
-        )
+        .execute_parsed_commands(std::process::id(), parsed, pane_context(&session, 2))
         .await
         .expect("move-window should use current window source and first free index");
 
@@ -36,11 +32,7 @@ async fn move_window_after_uses_current_window_as_source() {
         .parse("move-window -a -t move-current-after:0")
         .expect("commands parse");
     handler
-        .execute_parsed_commands(
-            std::process::id(),
-            parsed,
-            current_window_context(&session, 2),
-        )
+        .execute_parsed_commands(std::process::id(), parsed, pane_context(&session, 2))
         .await
         .expect("move-window -a should use current window source");
 
@@ -58,11 +50,7 @@ async fn move_window_before_uses_current_window_as_source() {
         .parse("move-window -b -t move-current-before:0")
         .expect("commands parse");
     handler
-        .execute_parsed_commands(
-            std::process::id(),
-            parsed,
-            current_window_context(&session, 2),
-        )
+        .execute_parsed_commands(std::process::id(), parsed, pane_context(&session, 2))
         .await
         .expect("move-window -b should use current window source");
 
@@ -79,18 +67,11 @@ async fn move_window_relative_collision_uses_tmux_error_shape() {
         .parse("move-window -t move-current-collision:1")
         .expect("commands parse");
     let error = handler
-        .execute_parsed_commands(
-            std::process::id(),
-            parsed,
-            current_window_context(&session, 2),
-        )
+        .execute_parsed_commands(std::process::id(), parsed, pane_context(&session, 2))
         .await
         .expect_err("occupied relative target should fail");
 
-    assert_eq!(
-        error,
-        rmux_proto::RmuxError::Server("index in use: 1".to_owned())
-    );
+    assert_eq!(error, RmuxError::Server("index in use: 1".to_owned()));
 }
 
 #[tokio::test]
@@ -99,17 +80,7 @@ async fn move_window_trailing_colon_target_uses_first_free_index() {
     let alpha = session_name("move-colon-alpha");
     let beta = session_name("move-colon-beta");
     for session in [&alpha, &beta] {
-        assert!(matches!(
-            handler
-                .handle(Request::NewSession(NewSessionRequest {
-                    session_name: session.clone(),
-                    detached: true,
-                    size: Some(TerminalSize { cols: 80, rows: 24 }),
-                    environment: None,
-                }))
-                .await,
-            Response::NewSession(_)
-        ));
+        handler.create_session(session).await;
     }
 
     let parsed = CommandParser::new()
@@ -121,7 +92,7 @@ async fn move_window_trailing_colon_target_uses_first_free_index() {
     );
     {
         let state = handler.state.lock().await;
-        let request = crate::handler::scripting_support::parse_request_from_parts(
+        let request = parse_request_from_parts(
             "move-window".to_owned(),
             vec![
                 "-s".to_owned(),
@@ -149,7 +120,7 @@ async fn move_window_trailing_colon_target_uses_first_free_index() {
         );
     }
     handler
-        .execute_parsed_commands(std::process::id(), parsed, current_window_context(&beta, 0))
+        .execute_parsed_commands(std::process::id(), parsed, pane_context(&beta, 0))
         .await
         .expect("trailing colon target should use first free window index");
 
@@ -161,43 +132,16 @@ async fn move_window_trailing_colon_target_uses_first_free_index() {
     );
 }
 
-fn current_window_context(session: &SessionName, window_index: u32) -> QueueExecutionContext {
-    QueueExecutionContext::without_caller_cwd().with_current_target(Some(Target::Pane(
-        PaneTarget::with_window(session.clone(), window_index, 0),
-    )))
-}
-
 async fn handler_with_three_windows(name: &str) -> (RequestHandler, SessionName) {
     let handler = RequestHandler::new();
-    let session = session_name(name);
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: session.clone(),
-                detached: true,
-                size: Some(TerminalSize { cols: 80, rows: 24 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
+    let session = handler.create_session(name).await;
     for window_name in ["b", "c"] {
-        assert!(matches!(
-            handler
-                .handle(Request::NewWindow(Box::new(NewWindowRequest {
-                    target: session.clone(),
-                    name: Some(window_name.to_owned()),
-                    detached: true,
-                    start_directory: None,
-                    environment: None,
-                    command: None,
-                    process_command: None,
-                    target_window_index: None,
-                    insert_at_target: false,
-                })))
-                .await,
-            Response::NewWindow(_)
-        ));
+        handler
+            .create_window(NewWindowRequest {
+                name: Some(window_name.to_owned()),
+                ..Fixture::fixture(&session)
+            })
+            .await;
     }
     (handler, session)
 }
@@ -206,7 +150,7 @@ async fn pane_id_at(
     handler: &RequestHandler,
     session_name: &SessionName,
     window_index: u32,
-) -> Option<rmux_core::PaneId> {
+) -> Option<PaneId> {
     let state = handler.state.lock().await;
     state
         .sessions
@@ -214,7 +158,7 @@ async fn pane_id_at(
         .and_then(|session| pane_id_in(session, window_index))
 }
 
-fn pane_id_in(session: &rmux_core::Session, window_index: u32) -> Option<rmux_core::PaneId> {
+fn pane_id_in(session: &rmux_core::Session, window_index: u32) -> Option<PaneId> {
     session
         .window_at(window_index)
         .and_then(|window| window.pane(0))

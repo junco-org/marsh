@@ -3,14 +3,11 @@ use std::path::Path;
 use std::time::Duration;
 
 use super::RequestHandler;
-use rmux_proto::{
-    DisplayMessageRequest, KillPaneRequest, NewSessionRequest, PaneTarget, PipePaneRequest,
-    Request, Response, SendKeysRequest, Target, TerminalSize,
-};
-use tokio::time::sleep;
+use rmux_proto::{KillPaneRequest, PaneTarget, PipePaneRequest, SendKeysRequest};
 
 const PANE_PIPE_TEST_TIMEOUT: Duration = Duration::from_secs(15);
 
+use crate::test_fixtures::wait_until;
 use crate::test_names::session_name;
 
 /// A pipe command that logs the first line it is given and then exits.
@@ -28,17 +25,6 @@ fn first_line_to_file_command(name: &str) -> String {
     format!("head -n 1 > {}", crate::test_shell::sh_quote(name))
 }
 
-/// A pipe command that logs everything it is given and never ends on its own.
-///
-/// Never ending is the point. A logger that finishes by itself reaches its own approved boundary
-/// and publishes, which says nothing about teardown; this one is still running when its pane is
-/// killed, so the only thing deciding the log's fate is how that teardown ends the job.
-///
-/// `name` is relative for the reason given on [`first_line_to_file_command`].
-fn all_input_to_file_command(name: &str) -> String {
-    format!("cat > {}", crate::test_shell::sh_quote(name))
-}
-
 fn pipe_discard_command() -> String {
     crate::test_shell::stdin_discard_command()
 }
@@ -47,58 +33,32 @@ fn pane_print_command(text: &str) -> String {
     format!("printf '{}\\n'", text.replace('\'', r"'\''"))
 }
 
-async fn create_session(handler: &RequestHandler, name: &str) {
-    let response = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name: session_name(name),
-            detached: true,
-            size: Some(TerminalSize { cols: 80, rows: 24 }),
-            environment: None,
-        }))
-        .await;
-    assert!(matches!(response, Response::NewSession(_)));
-    handler
-        .wait_for_pane_startup_to_finish_for_test(&PaneTarget::new(session_name(name), 0))
-        .await;
-}
-
 async fn display_pane_format(
     handler: &RequestHandler,
     target: PaneTarget,
     message: &str,
 ) -> String {
-    let response = handler
-        .handle(Request::DisplayMessage(DisplayMessageRequest {
-            target: Some(Target::Pane(target)),
-            print: true,
-            message: Some(message.to_owned()),
-            empty_target_context: false,
-        }))
-        .await;
-    let Response::DisplayMessage(response) = response else {
-        panic!("expected display-message response");
-    };
-    let output = response
-        .command_output()
-        .expect("display-message -p returns output");
-    String::from_utf8_lossy(output.stdout())
+    String::from_utf8_lossy(&handler.display_print(target, message).await)
         .trim_end()
         .to_owned()
 }
 
 async fn wait_for_pane_process(handler: &RequestHandler, target: PaneTarget) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        let last = display_pane_format(handler, target.clone(), "#{pane_current_command}").await;
-        if !last.is_empty() {
-            return;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "timed out waiting for pane process; last command={last:?}"
-        );
-        sleep(Duration::from_millis(25)).await;
-    }
+    wait_until(
+        Duration::from_secs(5),
+        Duration::from_millis(25),
+        async || {
+            let last =
+                display_pane_format(handler, target.clone(), "#{pane_current_command}").await;
+            if last.is_empty() {
+                Err(last)
+            } else {
+                Ok(())
+            }
+        },
+    )
+    .await
+    .unwrap_or_else(|last| panic!("timed out waiting for pane process; last command={last:?}"));
 }
 
 async fn pipe_pane(
@@ -107,79 +67,42 @@ async fn pipe_pane(
     once: bool,
     command: Option<String>,
 ) {
-    let response = handler
-        .handle(Request::PipePane(PipePaneRequest {
+    handler
+        .handle_ok(PipePaneRequest {
             target,
             stdin: false,
             stdout: true,
             once,
             command,
-        }))
+        })
         .await;
-    assert!(
-        matches!(response, Response::PipePane(_)),
-        "pipe-pane should succeed, got {response:?}"
-    );
 }
 
 async fn send_pane_line(handler: &RequestHandler, target: PaneTarget, text: &str) {
-    let response = handler
-        .handle(Request::SendKeys(SendKeysRequest {
+    handler
+        .handle_ok(SendKeysRequest {
             target,
             keys: vec![pane_print_command(text), "Enter".to_owned()],
-        }))
+        })
         .await;
-    assert!(matches!(response, Response::SendKeys(_)));
 }
 
 async fn wait_for_file_contains(path: &Path, expected: &str) {
-    let deadline = tokio::time::Instant::now() + PANE_PIPE_TEST_TIMEOUT;
-    loop {
-        match fs::read_to_string(path) {
-            Ok(contents) if contents.contains(expected) => return,
-            Ok(_) | Err(_) if tokio::time::Instant::now() < deadline => {
-                sleep(Duration::from_millis(25)).await;
-            }
-            Ok(contents) => panic!(
-                "timed out waiting for {} to contain {:?}, got {:?}",
-                path.display(),
-                expected,
-                contents
-            ),
-            Err(error) => panic!(
-                "timed out waiting for {} to exist containing {:?}: {error}",
-                path.display(),
-                expected
-            ),
-        }
-    }
-}
-
-/// Waits until some job has *staged* `name` with `expected` written into it.
-///
-/// The immediate children of `snapshot_parent` are this session's per-job snapshots, so a pipe
-/// command's log is at `<snapshot_parent>/<uid>/<name>` for as long as the job is running and
-/// nowhere else. Waiting for it is what stops a later absence in the seed from being vacuous:
-/// without this, a log that was never written yet and a log that was written and then discarded
-/// look identical from the seed.
-async fn wait_for_staged_file_contains(snapshot_parent: &Path, name: &str, expected: &str) {
-    let deadline = tokio::time::Instant::now() + PANE_PIPE_TEST_TIMEOUT;
-    loop {
-        if let Ok(entries) = fs::read_dir(snapshot_parent) {
-            for entry in entries.flatten() {
-                let staged = entry.path().join(name);
-                if fs::read_to_string(&staged).is_ok_and(|contents| contents.contains(expected)) {
-                    return;
-                }
-            }
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "timed out waiting for a staged {name} containing {expected:?} under {}",
-            snapshot_parent.display()
-        );
-        sleep(Duration::from_millis(25)).await;
-    }
+    wait_until(
+        PANE_PIPE_TEST_TIMEOUT,
+        Duration::from_millis(25),
+        async || match fs::read_to_string(path) {
+            Ok(contents) if contents.contains(expected) => Ok(()),
+            last => Err(last),
+        },
+    )
+    .await
+    .unwrap_or_else(|last| {
+        panic!(
+            "timed out waiting for {} to contain {expected:?}, got {last:?}",
+            path.display()
+        )
+    });
 }
 
 /// `pipe-pane -o` closes the running pipe and does not open the replacement it was given.
@@ -200,7 +123,7 @@ async fn pipe_pane_once_closes_existing_pipe_without_reopening() {
     let target = PaneTarget::with_window(alpha.clone(), 0, 0);
     let first_output = seed.join("once-first");
     let second_output = seed.join("once-second");
-    create_session(&handler, "alpha").await;
+    handler.create_started_session(&alpha).await;
     wait_for_pane_process(&handler, target.clone()).await;
 
     pipe_pane(
@@ -241,7 +164,7 @@ async fn pane_pipe_format_reports_active_pipe_state() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
     let target = PaneTarget::with_window(alpha.clone(), 0, 0);
-    create_session(&handler, "alpha").await;
+    handler.create_started_session(&alpha).await;
 
     assert_eq!(
         display_pane_format(&handler, target.clone(), "#{pane_pipe}").await,
@@ -274,10 +197,8 @@ async fn pane_pipe_format_reports_active_pipe_state() {
 /// exits zero, and a zero exit through the normal boundary is publishable. That is how a partial
 /// log reached the seed with nobody waiting for it.
 ///
-/// The log is waited for in the pipe job's snapshot first, and only then is the pane killed. A
-/// pipe command's writes are staged there and reach the seed only on an approved boundary, so
-/// without that wait the seed would be empty afterwards whether the log had been discarded or
-/// simply never written — which is no assertion at all.
+/// The logger acknowledges a real write outside the source, then its public command receipt
+/// proves termination. No snapshot paths or quiet-period inference are needed.
 #[tokio::test]
 async fn killing_a_pane_discards_its_pipe_log_instead_of_publishing_it() {
     let handler = RequestHandler::new();
@@ -288,60 +209,45 @@ async fn killing_a_pane_discards_its_pipe_log_instead_of_publishing_it() {
     let alpha = session_name("alpha");
     let target = PaneTarget::with_window(alpha.clone(), 0, 0);
     let output = seed.join("killed-pipe-log");
-    create_session(&handler, "alpha").await;
+    let ready = tempfile::NamedTempFile::new().expect("logger acknowledgement");
+    let script = format!("while IFS= read -r line; do printf '%s\\n' \"$line\" >> killed-pipe-log; case \"$line\" in *pipe-killed*) printf ready > {};; esac; done", crate::test_shell::sh_quote(&ready.path().to_string_lossy()));
+    let logger = format!("/bin/sh -c {}", crate::test_shell::sh_quote(&script));
+    handler.create_started_session(&alpha).await;
     wait_for_pane_process(&handler, target.clone()).await;
 
-    pipe_pane(
-        &handler,
-        target.clone(),
-        false,
-        Some(all_input_to_file_command("killed-pipe-log")),
-    )
-    .await;
+    pipe_pane(&handler, target.clone(), false, Some(logger)).await;
     assert_eq!(
         display_pane_format(&handler, target.clone(), "#{pane_pipe}").await,
         "1",
         "the pipe must be carrying the pane's output before its pane is killed"
     );
     send_pane_line(&handler, target.clone(), "pipe-killed").await;
-    // The seed is only opened once the pane's own job exists, so its snapshot parent is asked for
-    // here rather than before the session was created.
-    let snapshot_parent = io
-        .seeds()
+    wait_for_file_contains(ready.path(), "ready").await;
+    let receipt = io
+        .snapshot()
+        .state
+        .commands
         .into_iter()
-        .find(|info| info.seed == seed)
-        .expect("the pane's seed is open")
-        .snapshot_parent;
-    wait_for_staged_file_contains(&snapshot_parent, "killed-pipe-log", "pipe-killed").await;
+        .find(|command| command.text().contains("killed-pipe-log"))
+        .expect("the logger still owns an admitted command");
     assert!(
         !output.exists(),
         "a running pipe's log is staged, not published, so it must not be in the seed yet"
     );
 
-    let killed = handler
-        .handle(Request::KillPane(KillPaneRequest {
+    handler
+        .handle_ok(KillPaneRequest {
             target: target.clone(),
             kill_all_except: false,
-        }))
+        })
         .await;
-    assert!(
-        matches!(killed, Response::KillPane(_)),
-        "kill-pane should succeed, got {killed:?}"
-    );
 
-    // Bounded, and calibrated against the publishing path rather than guessed: a close that
-    // reaches the gate publishes within the pipe's own termination grace, so a log still absent
-    // well past that was discarded rather than merely slow. Checked throughout, not only at the
-    // end, because a log that appears and is then removed still reached the seed.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-    while tokio::time::Instant::now() < deadline {
-        assert!(
-            !output.exists(),
-            "a killed pane's pipe log must never reach the seed, found {}",
-            output.display()
-        );
-        sleep(Duration::from_millis(25)).await;
-    }
+    let completion = tokio::time::timeout(PANE_PIPE_TEST_TIMEOUT, receipt.wait())
+        .await
+        .expect("logger termination is bounded")
+        .expect("logger produces a verdict");
+    assert!(!completion.is_published(), "forced logger must not publish");
+    assert!(!output.exists(), "the staged pipe log was discarded");
 
     let _ = fs::remove_file(output);
 }

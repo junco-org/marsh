@@ -1,23 +1,24 @@
 use std::ffi::{OsStr, OsString};
 
-use clap::{ArgAction, Args, FromArgMatches};
 use rmux_core::command_parser::{
     CommandArgument, CommandParseError, CommandParser as TmuxCommandParser, ParsedCommand,
     ParsedCommands,
 };
 
+use super::pane::{parse_resize_pane_args, parse_split_window_args};
+use super::script::parse_source_file_args;
+use super::validate::{
+    Validate, invalid_utf8_error, too_many_arguments_error, unknown_flag_error, value_error,
+};
+use super::web::parse_web_share_args;
+use super::window::parse_rename_window_args;
 use super::{
-    BroadcastKeysArgs, CapturePaneArgs, ChooseBufferArgs, ChooseClientArgs, ChooseTreeArgs,
-    CollectPaneOutputArgs, Command, ConfirmBeforeArgs, CopyModeArgs, CustomizeModeArgs,
-    DisplayMenuArgs, DisplayMessageArgs, DisplayPopupArgs, ExpectPaneArgs, FindWindowArgs,
-    IfShellArgs, ListKeysArgs, ListSessionsArgs, LocatorArgs, PositionalOptionPolicy, PromptArgs,
-    PromptHistoryArgs, QueuedCommand, RunShellArgs, RuntimeCommandGroup, SendKeysArgs,
-    ServerAccessArgs, SetBufferArgs, SetOptionArgs, SetOptionCommandKind, SetWindowOptionArgs,
-    ShowOptionsArgs, ShowWindowOptionsArgs, StreamPaneArgs, UnsupportedCommandArgs, WaitPaneArgs,
-    WithSessionArgs, parse_command_args, parse_command_args_with_policy, parse_join_pane_args,
-    parse_rename_window_args, parse_resize_pane_args, parse_select_layout_args,
-    parse_select_pane_args, parse_select_window_args, parse_source_file_args,
-    parse_split_window_args, parse_swap_window_args,
+    ChooseBufferArgs, ChooseClientArgs, ChooseTreeArgs, Command, ConfirmBeforeArgs,
+    CustomizeModeArgs, DisplayMenuArgs, DisplayMessageArgs, DisplayPopupArgs, FindWindowArgs,
+    IfShellArgs, NewWindowArgs, PositionalOptionPolicy, PromptArgs, PromptHistoryArgs,
+    RuntimeCommandGroup, SendKeysArgs, ServerAccessArgs, SetOptionArgs, SetOptionCommandKind,
+    SetWindowOptionArgs, ShowWindowOptionsArgs, UnsupportedCommandArgs, documented_cli_aliases,
+    help_argument, parse_command_args, parse_command_args_with_policy,
 };
 
 /// Splits raw command-line words into the queue of `tmux`-style commands they encode.
@@ -60,41 +61,25 @@ pub(super) fn parse_runtime_command_groups(
     Ok(parsed)
 }
 
-/// Rewrites `choose-window` and `choose-session` into the `choose-tree` forms that actually exist.
+/// Rewrites the documented built-in aliases, such as `choose-window`, into their expansions.
 fn expand_cli_argument_aliases(arguments: Vec<String>) -> Vec<String> {
     let mut expanded = Vec::with_capacity(arguments.len() + 2);
     let mut command_start = true;
 
     for argument in arguments {
         let (base, ends_command) = split_cli_command_terminator(&argument);
-        if command_start {
-            match base {
-                "choose-window" => {
-                    expanded.push("choose-tree".to_owned());
-                    expanded.push(if ends_command {
-                        "-w;".to_owned()
-                    } else {
-                        "-w".to_owned()
-                    });
-                    command_start = ends_command;
-                    continue;
-                }
-                "choose-session" => {
-                    expanded.push("choose-tree".to_owned());
-                    expanded.push(if ends_command {
-                        "-s;".to_owned()
-                    } else {
-                        "-s".to_owned()
-                    });
-                    command_start = ends_command;
-                    continue;
-                }
-                _ => {}
-            }
-        }
-
-        expanded.push(argument);
+        let alias = documented_cli_aliases()
+            .iter()
+            .find(|alias| command_start && alias.alias == base);
         command_start = ends_command;
+        let Some(alias) = alias else {
+            expanded.push(argument);
+            continue;
+        };
+        expanded.extend(alias.expansion.split(' ').map(str::to_owned));
+        if let Some(last) = expanded.last_mut().filter(|_| ends_command) {
+            last.push(';');
+        }
     }
 
     expanded
@@ -115,12 +100,10 @@ fn split_cli_command_terminator(argument: &str) -> (&str, bool) {
 
 /// Converts one raw OS argument to UTF-8, failing with a `clap` invalid-UTF-8 error.
 fn command_argument_to_string(argument: &OsStr) -> Result<String, clap::Error> {
-    argument.to_str().map(str::to_owned).ok_or_else(|| {
-        clap::Error::raw(
-            clap::error::ErrorKind::InvalidUtf8,
-            "invalid UTF-8 in command argument",
-        )
-    })
+    argument
+        .to_str()
+        .map(str::to_owned)
+        .ok_or_else(invalid_utf8_error)
 }
 
 /// Converts a command-parser failure into a `clap` error with the matching error kind.
@@ -152,6 +135,76 @@ fn cli_command_error_message(message: &str) -> &str {
     }
 }
 
+/// Argument structs that record the raw command text queued for them.
+trait QueuedCommand {
+    /// Records the original command-queue text this invocation came from.
+    fn set_queue_command(&mut self, queue_command: String);
+}
+
+/// Implements [`QueuedCommand`] for argument structs that carry a `queue_command` field.
+macro_rules! queued_commands {
+    ($($args:ty),+ $(,)?) => {$(
+        impl QueuedCommand for $args {
+            fn set_queue_command(&mut self, queue_command: String) {
+                self.queue_command = queue_command;
+            }
+        }
+    )+};
+}
+
+queued_commands! {
+    NewWindowArgs, FindWindowArgs, DisplayMessageArgs, IfShellArgs, PromptArgs, ConfirmBeforeArgs,
+    PromptHistoryArgs, ChooseTreeArgs, ChooseBufferArgs, ChooseClientArgs, CustomizeModeArgs,
+    DisplayMenuArgs, DisplayPopupArgs,
+}
+
+/// Attaches the original command text to parsed arguments so the server can re-parse it later.
+fn with_queue_command<T: QueuedCommand>(mut args: T, queue_command: String) -> T {
+    args.set_queue_command(queue_command);
+    args
+}
+
+/// Parses one row of `dispatch_table!`: `plain` rows parse with clap alone, `checked` rows then
+/// run [`Validate::validate`], `queued` rows record the command's reparse text for the server,
+/// and `queued_checked` rows do both.
+macro_rules! dispatch_row {
+    (plain $command:literal, $variant:ident, $arguments:ident, $queue_command:ident) => {
+        parse_command_args($command, $arguments).map(Command::$variant)
+    };
+    (checked $command:literal, $variant:ident, $arguments:ident, $queue_command:ident) => {
+        parse_command_args($command, $arguments)
+            .and_then(|args| Validate::validate(args, $command))
+            .map(Command::$variant)
+    };
+    (queued $command:literal, $variant:ident, $arguments:ident, $queue_command:ident) => {
+        parse_command_args($command, $arguments)
+            .map(|args| Command::$variant(with_queue_command(args, $queue_command)))
+    };
+    (queued_checked $command:literal, $variant:ident, $arguments:ident, $queue_command:ident) => {
+        parse_command_args($command, $arguments)
+            .and_then(|args| Validate::validate(args, $command))
+            .map(|args| Command::$variant(with_queue_command(args, $queue_command)))
+    };
+}
+
+/// Expands the command dispatch table into one `match` on the command name. Each row names the
+/// command and its aliases, how `dispatch_row!` parses it, and its [`Command`] variant; the arms
+/// after the `;` handle commands with bespoke parsers and pass through unchanged.
+macro_rules! dispatch_table {
+    (
+        $name:expr, $arguments:ident, $queue_command:ident;
+        $($command:literal $(| $alias:literal)* => $kind:ident $variant:ident,)*
+        ; $($arm:tt)*
+    ) => {
+        match $name {
+            $($command $(| $alias)* => {
+                dispatch_row!($kind $command, $variant, $arguments, $queue_command)
+            })*
+            $($arm)*
+        }
+    };
+}
+
 /// Dispatches one parsed command name to its argument parser and builds the typed `Command`.
 #[allow(
     clippy::too_many_lines,
@@ -162,230 +215,124 @@ pub(super) fn command_from_parsed(command: &ParsedCommand) -> Result<Command, cl
     let error_command_name = name.clone();
     let queue_command = command.to_tmux_reparse_string();
     let arguments = command_arguments_for_clap(command.arguments());
-    let parsed = match name.as_str() {
-        "new-session" => parse_command_args("new-session", arguments).map(Command::NewSession),
-        "start-server" => parse_command_args("start-server", arguments).map(Command::StartServer),
+    let parsed = dispatch_table! { name.as_str(), arguments, queue_command;
+        "new-session" => plain NewSession,
+        "start-server" => plain StartServer,
+        "has-session" => plain HasSession,
+        "kill-session" => plain KillSession,
+        "rename-session" => plain RenameSession,
+        "lock-session" => plain LockSession,
+        "lock-client" => plain LockClient,
+        "new-window" => queued NewWindow,
+        "kill-window" => plain KillWindow,
+        "select-window" => checked SelectWindow,
+        "next-window" => plain NextWindow,
+        "previous-window" => plain PreviousWindow,
+        "last-window" => plain LastWindow,
+        "list-sessions" => plain ListSessions,
+        "list-windows" => plain ListWindows,
+        "move-window" => plain MoveWindow,
+        "swap-window" => checked SwapWindow,
+        "rotate-window" => plain RotateWindow,
+        "resize-window" => plain ResizeWindow,
+        "respawn-window" => plain RespawnWindow,
+        "swap-pane" => plain SwapPane,
+        "last-pane" => plain LastPane,
+        "join-pane" => plain JoinPane,
+        "move-pane" => plain MovePane,
+        "break-pane" => plain BreakPane,
+        "pipe-pane" => plain PipePane,
+        "respawn-pane" => plain RespawnPane,
+        "kill-pane" => plain KillPane,
+        "select-layout" => plain SelectLayout,
+        "next-layout" => plain NextLayout,
+        "previous-layout" => plain PreviousLayout,
+        "display-panes" => plain DisplayPanes,
+        "list-panes" => plain ListPanes,
+        "select-pane" => checked SelectPane,
+        "copy-mode" => plain CopyMode,
+        "clock-mode" => plain ClockMode,
+        "wait-pane" => checked WaitPane,
+        "pane-snapshot" => plain PaneSnapshot,
+        "stream-pane" => checked StreamPane,
+        "collect-pane-output" => checked CollectPaneOutput,
+        "locator" => checked Locator,
+        "expect-pane" => checked ExpectPane,
+        "find-panes" => plain FindPanes,
+        "find-sessions" => plain FindSessions,
+        "broadcast-keys" => checked BroadcastKeys,
+        "bind-key" => plain BindKey,
+        "unbind-key" => plain UnbindKey,
+        "list-commands" => plain ListCommands,
+        "list-keys" => plain ListKeys,
+        "send-prefix" => plain SendPrefix,
+        "attach-session" => plain AttachSession,
+        "refresh-client" => plain RefreshClient,
+        "list-clients" => plain ListClients,
+        "switch-client" => plain SwitchClient,
+        "detach-client" => plain DetachClient,
+        "suspend-client" => plain SuspendClient,
+        "set-environment" => plain SetEnvironment,
+        "show-options" => plain ShowOptions,
+        "show-environment" => plain ShowEnvironment,
+        "set-hook" => plain SetHook,
+        "show-hooks" => plain ShowHooks,
+        "set-buffer" => checked SetBuffer,
+        "show-buffer" => plain ShowBuffer,
+        "paste-buffer" => plain PasteBuffer,
+        "list-buffers" => plain ListBuffers,
+        "delete-buffer" => plain DeleteBuffer,
+        "load-buffer" => plain LoadBuffer,
+        "save-buffer" => plain SaveBuffer,
+        "capture-pane" => plain CapturePane,
+        "clear-history" => plain ClearHistory,
+        "display-message" => queued_checked DisplayMessage,
+        "show-messages" => plain ShowMessages,
+        "run-shell" => plain RunShell,
+        "if-shell" => queued IfShell,
+        "wait-for" => plain WaitFor,
+        "command-prompt" => queued Prompt,
+        "confirm-before" => queued ConfirmBefore,
+        "find-window" => queued FindWindow,
+        "link-window" => plain LinkWindow,
+        "unlink-window" => plain UnlinkWindow,
+        "choose-tree" => queued_checked ChooseTree,
+        "choose-buffer" => queued_checked ChooseBuffer,
+        "choose-client" => queued_checked ChooseClient,
+        "customize-mode" => queued CustomizeMode,
+        "display-menu" | "menu" => queued DisplayMenu,
+        "display-popup" | "popup" => queued DisplayPopup,
+        "clear-prompt-history" | "clearphist" => queued ClearPromptHistory,
+        "show-prompt-history" | "showphist" => queued ShowPromptHistory,
+        ;
         "kill-server" => parse_no_args("kill-server", arguments).map(|()| Command::KillServer),
-        "has-session" => parse_command_args("has-session", arguments).map(Command::HasSession),
-        "kill-session" => parse_command_args("kill-session", arguments).map(Command::KillSession),
-        "rename-session" => {
-            parse_command_args("rename-session", arguments).map(Command::RenameSession)
-        }
-        "server-access" => parse_server_access_args(arguments).map(Command::ServerAccess),
         "lock-server" => parse_no_args("lock-server", arguments).map(|()| Command::LockServer),
-        "lock-session" => parse_command_args("lock-session", arguments).map(Command::LockSession),
-        "lock-client" => parse_command_args("lock-client", arguments).map(Command::LockClient),
-        "new-window" => parse_command_args("new-window", arguments)
-            .map(|args| Command::NewWindow(with_queue_command(args, queue_command))),
-        "kill-window" => parse_command_args("kill-window", arguments).map(Command::KillWindow),
-        "select-window" => parse_select_window_args(arguments).map(Command::SelectWindow),
+        "server-access" => parse_server_access_args(arguments).map(Command::ServerAccess),
         "rename-window" => parse_rename_window_args(arguments).map(Command::RenameWindow),
-        "next-window" => parse_command_args("next-window", arguments).map(Command::NextWindow),
-        "previous-window" => {
-            parse_command_args("previous-window", arguments).map(Command::PreviousWindow)
-        }
-        "last-window" => parse_command_args("last-window", arguments).map(Command::LastWindow),
-        "list-sessions" => parse_command_args::<ListSessionsArgs>("list-sessions", arguments)
-            .map(Command::ListSessions),
-        "list-windows" => parse_command_args("list-windows", arguments).map(Command::ListWindows),
-        "move-window" => parse_command_args("move-window", arguments).map(Command::MoveWindow),
-        "swap-window" => parse_swap_window_args(arguments).map(Command::SwapWindow),
-        "rotate-window" => {
-            parse_command_args("rotate-window", arguments).map(Command::RotateWindow)
-        }
-        "resize-window" => {
-            parse_command_args("resize-window", arguments).map(Command::ResizeWindow)
-        }
-        "respawn-window" => {
-            parse_command_args("respawn-window", arguments).map(Command::RespawnWindow)
-        }
         "split-window" => parse_split_window_args(arguments).map(Command::SplitWindow),
-        "swap-pane" => parse_command_args("swap-pane", arguments).map(Command::SwapPane),
-        "last-pane" => parse_command_args("last-pane", arguments).map(Command::LastPane),
-        "join-pane" => parse_join_pane_args("join-pane", arguments).map(Command::JoinPane),
-        "move-pane" => parse_join_pane_args("move-pane", arguments).map(Command::MovePane),
-        "break-pane" => parse_command_args("break-pane", arguments).map(Command::BreakPane),
-        "pipe-pane" => parse_command_args("pipe-pane", arguments).map(Command::PipePane),
-        "respawn-pane" => parse_command_args("respawn-pane", arguments).map(Command::RespawnPane),
-        "kill-pane" => parse_command_args("kill-pane", arguments).map(Command::KillPane),
-        "select-layout" => parse_select_layout_args(arguments).map(Command::SelectLayout),
-        "next-layout" => parse_command_args("next-layout", arguments).map(Command::NextLayout),
-        "previous-layout" => {
-            parse_command_args("previous-layout", arguments).map(Command::PreviousLayout)
-        }
         "resize-pane" => parse_resize_pane_args(arguments).map(Command::ResizePane),
-        "display-panes" => {
-            parse_command_args("display-panes", arguments).map(Command::DisplayPanes)
-        }
-        "list-panes" => parse_command_args("list-panes", arguments).map(Command::ListPanes),
-        "select-pane" => parse_select_pane_args(arguments).map(Command::SelectPane),
-        "copy-mode" => {
-            parse_command_args::<CopyModeArgs>("copy-mode", arguments).map(Command::CopyMode)
-        }
-        "clock-mode" => parse_command_args("clock-mode", arguments).map(Command::ClockMode),
-        "wait-pane" => parse_command_args::<WaitPaneArgs>("wait-pane", arguments)
-            .and_then(WaitPaneArgs::validate)
-            .map(Command::WaitPane),
-        "pane-snapshot" => {
-            parse_command_args("pane-snapshot", arguments).map(Command::PaneSnapshot)
-        }
-        "stream-pane" => parse_command_args::<StreamPaneArgs>("stream-pane", arguments)
-            .and_then(StreamPaneArgs::validate)
-            .map(Command::StreamPane),
-        "collect-pane-output" => {
-            parse_command_args::<CollectPaneOutputArgs>("collect-pane-output", arguments)
-                .and_then(CollectPaneOutputArgs::validate)
-                .map(Command::CollectPaneOutput)
-        }
-        "locator" => parse_command_args::<LocatorArgs>("locator", arguments)
-            .and_then(LocatorArgs::validate)
-            .map(Command::Locator),
-        "expect-pane" => parse_command_args::<ExpectPaneArgs>("expect-pane", arguments)
-            .and_then(ExpectPaneArgs::validate)
-            .map(Command::ExpectPane),
-        "find-panes" => parse_command_args("find-panes", arguments).map(Command::FindPanes),
-        "find-sessions" => {
-            parse_command_args("find-sessions", arguments).map(Command::FindSessions)
-        }
-        "broadcast-keys" => parse_command_args::<BroadcastKeysArgs>("broadcast-keys", arguments)
-            .and_then(BroadcastKeysArgs::validate)
-            .map(Command::BroadcastKeys),
-        "with-session" => parse_command_args_with_policy::<WithSessionArgs>(
+        "with-session" => parse_command_args_with_policy(
             "with-session",
             arguments,
             PositionalOptionPolicy::InterspersedBeforeSeparator,
         )
-        .and_then(WithSessionArgs::validate)
+        .and_then(|args| Validate::validate(args, "with-session"))
         .map(Command::WithSession),
         "send-keys" => parse_send_keys_args(arguments).map(Command::SendKeys),
-        "bind-key" => parse_command_args("bind-key", arguments).map(Command::BindKey),
-        "unbind-key" => parse_command_args("unbind-key", arguments).map(Command::UnbindKey),
-        "list-commands" => {
-            parse_command_args("list-commands", arguments).map(Command::ListCommands)
-        }
-        "list-keys" => parse_command_args::<ListKeysArgs>("list-keys", arguments)
-            .map(ListKeysArgs::validate)
-            .map(Command::ListKeys),
-        "send-prefix" => parse_command_args("send-prefix", arguments).map(Command::SendPrefix),
-        "attach-session" => {
-            parse_command_args("attach-session", arguments).map(Command::AttachSession)
-        }
-        "refresh-client" => {
-            parse_command_args("refresh-client", arguments).map(Command::RefreshClient)
-        }
-        "list-clients" => parse_command_args("list-clients", arguments).map(Command::ListClients),
-        "switch-client" => {
-            parse_command_args("switch-client", arguments).map(Command::SwitchClient)
-        }
-        "detach-client" => {
-            parse_command_args("detach-client", arguments).map(Command::DetachClient)
-        }
-        "suspend-client" => {
-            parse_command_args("suspend-client", arguments).map(Command::SuspendClient)
-        }
-        "set-option" => parse_set_option_args("set-option", arguments).map(Command::SetOption),
+        "set-option" => parse_set_option_args(SetOptionCommandKind::SetOption, arguments)
+            .map(Command::SetOption),
         "set-window-option" => {
-            parse_set_option_args("set-window-option", arguments).map(Command::SetWindowOption)
+            parse_set_option_args(SetOptionCommandKind::SetWindowOption, arguments)
+                .map(Command::SetWindowOption)
         }
-        "set-environment" => {
-            parse_command_args("set-environment", arguments).map(Command::SetEnvironment)
-        }
-        "show-options" => {
-            parse_show_options_args("show-options", arguments).map(Command::ShowOptions)
-        }
-        "show-window-options" => parse_show_options_args("show-window-options", arguments)
-            .map(Command::ShowWindowOptions),
-        "show-environment" => {
-            parse_command_args("show-environment", arguments).map(Command::ShowEnvironment)
-        }
-        "set-hook" => parse_command_args("set-hook", arguments).map(Command::SetHook),
-        "show-hooks" => parse_command_args("show-hooks", arguments).map(Command::ShowHooks),
-        "set-buffer" => parse_set_buffer_args(arguments).map(Command::SetBuffer),
-        "show-buffer" => parse_command_args("show-buffer", arguments).map(Command::ShowBuffer),
-        "paste-buffer" => parse_command_args("paste-buffer", arguments).map(Command::PasteBuffer),
-        "list-buffers" => parse_command_args("list-buffers", arguments).map(Command::ListBuffers),
-        "delete-buffer" => {
-            parse_command_args("delete-buffer", arguments).map(Command::DeleteBuffer)
-        }
-        "load-buffer" => parse_command_args("load-buffer", arguments).map(Command::LoadBuffer),
-        "save-buffer" => parse_command_args("save-buffer", arguments).map(Command::SaveBuffer),
-        "capture-pane" => parse_command_args::<CapturePaneArgs>("capture-pane", arguments)
-            .and_then(CapturePaneArgs::validate)
-            .map(Command::CapturePane),
-        "clear-history" => {
-            parse_command_args("clear-history", arguments).map(Command::ClearHistory)
-        }
-        "display-message" => {
-            parse_queue_command_args::<DisplayMessageArgs>("display-message", arguments)
-                .and_then(DisplayMessageArgs::validate)
-                .map(|args| Command::DisplayMessage(with_queue_command(args, queue_command)))
-        }
-        "show-messages" => {
-            parse_command_args("show-messages", arguments).map(Command::ShowMessages)
-        }
-        "run-shell" => {
-            parse_command_args::<RunShellArgs>("run-shell", arguments).map(Command::RunShell)
-        }
+        "show-window-options" => parse_command_args("show-window-options", arguments)
+            .map(|args: ShowWindowOptionsArgs| Command::ShowWindowOptions(args.into())),
         "source-file" => parse_source_file_args(arguments).map(Command::SourceFile),
-        "if-shell" => parse_queue_command_args::<IfShellArgs>("if-shell", arguments)
-            .map(|args| Command::IfShell(with_queue_command(args, queue_command))),
-        "wait-for" => parse_command_args("wait-for", arguments).map(Command::WaitFor),
-        "web-share" => super::web::parse_web_share_args(arguments).map(Command::WebShare),
-        "command-prompt" => parse_queue_command_args::<PromptArgs>("command-prompt", arguments)
-            .map(|args| Command::Prompt(with_queue_command(args, queue_command))),
-        "confirm-before" => {
-            parse_queue_command_args::<ConfirmBeforeArgs>("confirm-before", arguments)
-                .map(|args| Command::ConfirmBefore(with_queue_command(args, queue_command)))
-        }
-        "find-window" => parse_queue_command_args::<FindWindowArgs>("find-window", arguments)
-            .map(|args| Command::FindWindow(with_queue_command(args, queue_command))),
-        "link-window" => parse_command_args("link-window", arguments).map(Command::LinkWindow),
-        "unlink-window" => {
-            parse_command_args("unlink-window", arguments).map(Command::UnlinkWindow)
-        }
-        "choose-tree" => parse_queue_command_args::<ChooseTreeArgs>("choose-tree", arguments)
-            .and_then(ChooseTreeArgs::validate)
-            .map(|args| Command::ChooseTree(with_queue_command(args, queue_command))),
-        "choose-buffer" => parse_queue_command_args::<ChooseBufferArgs>("choose-buffer", arguments)
-            .and_then(ChooseBufferArgs::validate)
-            .map(|args| Command::ChooseBuffer(with_queue_command(args, queue_command))),
-        "choose-client" => parse_queue_command_args::<ChooseClientArgs>("choose-client", arguments)
-            .and_then(ChooseClientArgs::validate)
-            .map(|args| Command::ChooseClient(with_queue_command(args, queue_command))),
-        "customize-mode" => {
-            parse_queue_command_args::<CustomizeModeArgs>("customize-mode", arguments)
-                .map(|args| Command::CustomizeMode(with_queue_command(args, queue_command)))
-        }
-        "display-menu" | "menu" => {
-            parse_queue_command_args::<DisplayMenuArgs>("display-menu", arguments)
-                .map(|args| Command::DisplayMenu(with_queue_command(args, queue_command)))
-        }
-        "display-popup" | "popup" => {
-            parse_queue_command_args::<DisplayPopupArgs>("display-popup", arguments)
-                .map(|args| Command::DisplayPopup(with_queue_command(args, queue_command)))
-        }
-        "clear-prompt-history" | "clearphist" => {
-            parse_queue_command_args::<PromptHistoryArgs>("clear-prompt-history", arguments)
-                .map(|args| Command::ClearPromptHistory(with_queue_command(args, queue_command)))
-        }
-        "show-prompt-history" | "showphist" => {
-            parse_queue_command_args::<PromptHistoryArgs>("show-prompt-history", arguments)
-                .map(|args| Command::ShowPromptHistory(with_queue_command(args, queue_command)))
-        }
-        "capabilities" => {
-            let is_help = arguments.iter().any(|arg| arg == "--help");
-            if is_help {
-                Err(clap::Error::raw(
-                    clap::error::ErrorKind::DisplayHelp,
-                    "usage: rmux capabilities [--human|--json]\n",
-                ))
-            } else {
-                Ok(Command::Unsupported(UnsupportedCommandArgs {
-                    name,
-                    arguments,
-                }))
-            }
-        }
+        "web-share" => parse_web_share_args(arguments).map(Command::WebShare),
+        "capabilities" if arguments.iter().any(|arg| arg == "--help") => Err(clap::Error::raw(
+            clap::error::ErrorKind::DisplayHelp,
+            "usage: rmux capabilities [--human|--json]\n",
+        )),
         _ => Ok(Command::Unsupported(UnsupportedCommandArgs {
             name,
             arguments,
@@ -417,38 +364,34 @@ fn parse_no_args(command_name: &'static str, arguments: Vec<String>) -> Result<(
     clap::Command::new(command_name)
         .no_binary_name(true)
         .disable_help_flag(true)
-        .arg(
-            clap::Arg::new("help")
-                .long("help")
-                .action(ArgAction::Help)
-                .help("Print help"),
-        )
+        .arg(help_argument())
         .try_get_matches_from(arguments)
         .map(|_| ())
 }
 
 /// Parses `send-keys`, requiring `--` before the payload when any `--wait` flag is used.
 fn parse_send_keys_args(arguments: Vec<String>) -> Result<SendKeysArgs, clap::Error> {
+    const WAIT_VALUE_FLAGS: [&str; 4] = [
+        "--wait",
+        "--wait-text",
+        "--wait-visible-text",
+        "--wait-next-text",
+    ];
     let has_wait = arguments.iter().any(|argument| {
-        matches!(
-            argument.as_str(),
-            "--wait"
-                | "--wait-text"
-                | "--wait-visible-text"
-                | "--wait-next-text"
-                | "--wait-pane-exit"
-        ) || argument.starts_with("--wait=")
-            || argument.starts_with("--wait-text=")
-            || argument.starts_with("--wait-visible-text=")
-            || argument.starts_with("--wait-next-text=")
+        argument == "--wait-pane-exit"
+            || WAIT_VALUE_FLAGS.iter().any(|flag| {
+                argument
+                    .strip_prefix(flag)
+                    .is_some_and(|rest| rest.is_empty() || rest.starts_with('='))
+            })
     });
     if has_wait && !arguments.iter().any(|argument| argument == "--") {
-        return Err(clap::Error::raw(
-            clap::error::ErrorKind::ValueValidation,
-            "command send-keys: -- is required before payload when using --wait options",
+        return Err(value_error(
+            "send-keys",
+            "-- is required before payload when using --wait options",
         ));
     }
-    parse_command_args::<SendKeysArgs>("send-keys", arguments).and_then(SendKeysArgs::validate)
+    parse_command_args::<SendKeysArgs>("send-keys", arguments)?.validate("send-keys")
 }
 
 /// Parses `server-access`, rejecting long flags and unknown short flags such as `-t`.
@@ -460,58 +403,37 @@ fn parse_server_access_args(arguments: Vec<String>) -> Result<ServerAccessArgs, 
         if argument == "--help" {
             continue;
         }
-        if argument.starts_with("--") {
+        if argument == "-" || argument.starts_with("--") {
+            let flag = if argument == "-" { "-" } else { "--" };
             return Err(clap::Error::raw(
                 clap::error::ErrorKind::UnknownArgument,
-                "command server-access: invalid flag --",
-            ));
-        }
-        if argument == "-" {
-            return Err(clap::Error::raw(
-                clap::error::ErrorKind::UnknownArgument,
-                "command server-access: invalid flag -",
+                format!("command server-access: invalid flag {flag}"),
             ));
         }
         let Some(flags) = argument.strip_prefix('-') else {
             continue;
         };
-        if flags.is_empty() {
-            continue;
-        }
-        for flag in flags.chars() {
-            if flag == 't' {
-                return Err(clap::Error::raw(
-                    clap::error::ErrorKind::UnknownArgument,
-                    "command server-access: unknown flag -t",
-                ));
-            }
-            if !matches!(flag, 'a' | 'd' | 'l' | 'r' | 'w') {
-                return Err(clap::Error::raw(
-                    clap::error::ErrorKind::UnknownArgument,
-                    format!("command server-access: unknown flag -{flag}"),
-                ));
-            }
+        if let Some(flag) = flags
+            .chars()
+            .find(|flag| !matches!(flag, 'a' | 'd' | 'l' | 'r' | 'w'))
+        {
+            return Err(unknown_flag_error("server-access", &format!("-{flag}")));
         }
     }
 
-    let args = parse_command_args::<ServerAccessArgs>("server-access", arguments)?;
-    args.validate()
+    parse_command_args::<ServerAccessArgs>("server-access", arguments)?.validate("server-access")
 }
 
 /// Parses `set-option` / `set-window-option`, resolving scope flags and a literal `--` value.
 fn parse_set_option_args(
-    command_name: &'static str,
+    kind: SetOptionCommandKind,
     mut arguments: Vec<String>,
 ) -> Result<SetOptionArgs, clap::Error> {
+    let command_name = kind.command_name();
     let trailing_literal_separator = normalize_set_option_separator(command_name, &mut arguments)?;
-    let explicit_scope = set_option_scope(command_name, &arguments);
-    let kind = match command_name {
-        "set-option" => SetOptionCommandKind::SetOption,
-        "set-window-option" => SetOptionCommandKind::SetWindowOption,
-        _ => unreachable!("unexpected set-option command name"),
-    };
     let mut args = match kind {
         SetOptionCommandKind::SetOption => {
+            let explicit_scope = set_option_scope(&arguments);
             let mut args = parse_command_args::<SetOptionArgs>(command_name, arguments)?;
             apply_set_option_scope(&mut args, explicit_scope);
             args
@@ -522,7 +444,7 @@ fn parse_set_option_args(
     };
     if trailing_literal_separator {
         if args.value.is_some() {
-            return Err(set_option_too_many_arguments(command_name));
+            return Err(too_many_arguments_error(command_name, 2));
         }
         args.value = Some("--".to_owned());
     }
@@ -561,14 +483,7 @@ impl SetOptionScopeFlags {
 }
 
 /// Scans `set-option` flag clusters for an explicit scope, skipping `-t` and its target value.
-fn set_option_scope(
-    command_name: &'static str,
-    arguments: &[String],
-) -> Option<SetOptionScopeFlag> {
-    if command_name != "set-option" {
-        return None;
-    }
-
+fn set_option_scope(arguments: &[String]) -> Option<SetOptionScopeFlag> {
     let mut scopes = SetOptionScopeFlags::default();
     let mut index = 0;
     while let Some(argument) = arguments.get(index) {
@@ -635,7 +550,7 @@ fn normalize_set_option_separator(
         return Ok(true);
     }
     if set_option_positionals_before_separator(&arguments[..index]) > 0 {
-        return Err(set_option_too_many_arguments(command_name));
+        return Err(too_many_arguments_error(command_name, 2));
     }
     let _ = arguments.remove(index);
     Ok(false)
@@ -671,49 +586,4 @@ fn set_option_positionals_before_separator(arguments: &[String]) -> usize {
         index += 1;
     }
     positionals
-}
-
-/// Builds the shared too-many-arguments error for the `set-option` family.
-fn set_option_too_many_arguments(command_name: &'static str) -> clap::Error {
-    clap::Error::raw(
-        clap::error::ErrorKind::TooManyValues,
-        format!("command {command_name}: too many arguments (need at most 2)"),
-    )
-}
-
-/// Parses `show-options` / `show-window-options` into the shared `ShowOptionsArgs` shape.
-fn parse_show_options_args(
-    command_name: &'static str,
-    arguments: Vec<String>,
-) -> Result<ShowOptionsArgs, clap::Error> {
-    match command_name {
-        "show-options" => parse_command_args::<ShowOptionsArgs>(command_name, arguments),
-        "show-window-options" => {
-            parse_command_args::<ShowWindowOptionsArgs>(command_name, arguments).map(Into::into)
-        }
-        _ => unreachable!("unexpected show-options command name"),
-    }
-}
-
-/// Parses `set-buffer` and applies its cross-flag validation.
-fn parse_set_buffer_args(arguments: Vec<String>) -> Result<SetBufferArgs, clap::Error> {
-    let args = parse_command_args::<SetBufferArgs>("set-buffer", arguments)?;
-    args.validate()
-}
-
-/// Parses a command whose arguments are later re-queued, deferring to the shared `clap` parser.
-fn parse_queue_command_args<T>(
-    command_name: &'static str,
-    arguments: Vec<String>,
-) -> Result<T, clap::Error>
-where
-    T: Args + FromArgMatches,
-{
-    parse_command_args(command_name, arguments)
-}
-
-/// Attaches the original command text to parsed arguments so the server can re-parse it later.
-fn with_queue_command<T: QueuedCommand>(mut args: T, queue_command: String) -> T {
-    args.set_queue_command(queue_command);
-    args
 }

@@ -3,15 +3,6 @@ use std::time::Instant;
 use super::*;
 use crate::handler::attach_support::ActiveAttachIdentity;
 
-async fn current_identity(handler: &RequestHandler, attach_pid: u32) -> ActiveAttachIdentity {
-    let active_attach = handler.active_attach.lock().await;
-    active_attach
-        .by_pid
-        .get(&attach_pid)
-        .expect("attached client remains registered")
-        .identity(attach_pid)
-}
-
 async fn arm_prefix_timer(
     handler: &RequestHandler,
     identity: ActiveAttachIdentity,
@@ -82,16 +73,6 @@ async fn prefix_references(handler: &RequestHandler) -> usize {
         .expect("default prefix table exists")
 }
 
-async fn table_references(handler: &RequestHandler, table_name: &str) -> Option<usize> {
-    handler
-        .state
-        .lock()
-        .await
-        .key_bindings
-        .table(table_name)
-        .map(|table| table.references())
-}
-
 #[tokio::test]
 async fn normal_shutdown_cancels_pending_prefix_and_repeat_timers_without_mutation() {
     let handler = RequestHandler::new();
@@ -99,12 +80,9 @@ async fn normal_shutdown_cancels_pending_prefix_and_repeat_timers_without_mutati
     let prefix_pid = u32::MAX - 801;
     let repeat_pid = u32::MAX - 802;
     let _prefix_rx = create_attached_session(&handler, prefix_pid, &session).await;
-    let (repeat_tx, _repeat_rx) = mpsc::unbounded_channel();
-    handler
-        .register_attach(repeat_pid, session.clone(), repeat_tx)
-        .await;
-    let prefix_identity = current_identity(&handler, prefix_pid).await;
-    let repeat_identity = current_identity(&handler, repeat_pid).await;
+    let _repeat_rx = handler.attach_client(repeat_pid, &session).await;
+    let prefix_identity = handler.active_attach_identity_for_test(prefix_pid).await;
+    let repeat_identity = handler.active_attach_identity_for_test(repeat_pid).await;
     let prefix_set_at = Instant::now();
     let repeat_deadline = prefix_set_at + Duration::from_secs(60 * 60);
     let prefix_generation =
@@ -163,7 +141,7 @@ async fn shutdown_waits_for_local_timer_mutation_but_not_blocked_refresh() {
     let session = session_name("key-timer-mutation-boundary");
     let attach_pid = u32::MAX - 803;
     let _control_rx = create_attached_session(&handler, attach_pid, &session).await;
-    let identity = current_identity(&handler, attach_pid).await;
+    let identity = handler.active_attach_identity_for_test(attach_pid).await;
     let key_table_set_at = Instant::now();
     let key_table_generation =
         arm_prefix_timer(&handler, identity, &session, key_table_set_at).await;
@@ -224,7 +202,7 @@ async fn stale_repeat_timer_cannot_touch_same_pid_replacement_generation() {
     let session = session_name("key-timer-replaced-generation");
     let attach_pid = u32::MAX - 804;
     let _original_rx = create_attached_session(&handler, attach_pid, &session).await;
-    let stale_identity = current_identity(&handler, attach_pid).await;
+    let stale_identity = handler.active_attach_identity_for_test(attach_pid).await;
     let repeat_deadline = Instant::now() + Duration::from_secs(30);
     let stale_generation =
         arm_repeat_timer(&handler, stale_identity, &session, repeat_deadline).await;
@@ -241,11 +219,8 @@ async fn stale_repeat_timer_cannot_touch_same_pid_replacement_generation() {
         .await
         .expect("old generation timer reaches its expiry boundary");
 
-    let (replacement_tx, _replacement_rx) = mpsc::unbounded_channel();
-    handler
-        .register_attach(attach_pid, session.clone(), replacement_tx)
-        .await;
-    let replacement_identity = current_identity(&handler, attach_pid).await;
+    let _replacement_rx = handler.attach_client(attach_pid, &session).await;
+    let replacement_identity = handler.active_attach_identity_for_test(attach_pid).await;
     assert_ne!(stale_identity, replacement_identity);
     let _replacement_generation =
         arm_repeat_timer(&handler, replacement_identity, &session, repeat_deadline).await;
@@ -277,7 +252,7 @@ async fn concurrent_key_table_transitions_commit_refs_in_state_lock_order() {
     let session = session_name("key-table-transition-order");
     let attach_pid = u32::MAX - 805;
     let _control_rx = create_attached_session(&handler, attach_pid, &session).await;
-    let identity = current_identity(&handler, attach_pid).await;
+    let identity = handler.active_attach_identity_for_test(attach_pid).await;
     let initial_generation =
         set_key_table_for_timer(&handler, identity, &session, "old-table", Instant::now()).await;
 
@@ -367,22 +342,18 @@ async fn stale_dispatch_cannot_rearm_repeat_after_table_switch() {
     let session = session_name("dispatch-repeat-generation-cas");
     let attach_pid = std::process::id();
     let _control_rx = create_attached_session(&handler, attach_pid, &session).await;
-    let identity = current_identity(&handler, attach_pid).await;
-    let response = handler
-        .handle(Request::BindKey(Box::new(rmux_proto::BindKeyRequest {
-            table_name: "old-repeat".to_owned(),
-            key: "r".to_owned(),
+    let identity = handler.active_attach_identity_for_test(attach_pid).await;
+    handler
+        .handle_ok(rmux_proto::BindKeyRequest {
             note: Some("dispatch generation CAS regression".to_owned()),
             repeat: true,
-            command: Some(vec![
-                "set-buffer".to_owned(),
-                "-b".to_owned(),
-                "dispatch-generation-cas".to_owned(),
-                "hit".to_owned(),
-            ]),
-        })))
+            ..Fixture::fixture((
+                "old-repeat",
+                "r",
+                ["set-buffer", "-b", "dispatch-generation-cas", "hit"],
+            ))
+        })
         .await;
-    assert!(matches!(response, Response::BindKey(_)), "{response:?}");
     let lookup_generation =
         set_key_table_for_timer(&handler, identity, &session, "old-repeat", Instant::now()).await;
 
@@ -460,7 +431,7 @@ async fn concurrent_key_table_transition_stress_keeps_refs_balanced() {
     let session = session_name("key-table-transition-stress");
     let attach_pid = u32::MAX - 806;
     let _control_rx = create_attached_session(&handler, attach_pid, &session).await;
-    let identity = current_identity(&handler, attach_pid).await;
+    let identity = handler.active_attach_identity_for_test(attach_pid).await;
     let initial_generation = {
         let active_attach = handler.active_attach.lock().await;
         active_attach

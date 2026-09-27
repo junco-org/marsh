@@ -5,14 +5,16 @@ use std::time::Duration;
 
 use rmux_core::LifecycleEvent;
 use rmux_proto::{
-    ControlMode, KillSessionRequest, NewSessionRequest, OptionName, RenameSessionRequest, Request,
-    Response, ScopeSelector, SessionId, SessionName, SetOptionMode, TerminalSize,
+    ControlMode, KillSessionRequest, OptionName, RenameSessionRequest, ScopeSelector, SessionId,
+    SessionName,
 };
 use tokio::sync::mpsc;
 
 use super::{ControlClientIdentity, RequestHandler};
 use crate::control::{ControlModeUpgrade, ControlServerEvent};
 use crate::outer_terminal::OuterTerminalContext;
+use crate::test_fixtures::Fixture;
+use crate::test_names::session_name;
 
 struct AttachedControl {
     pid: u32,
@@ -22,41 +24,12 @@ struct AttachedControl {
     events: mpsc::Receiver<ControlServerEvent>,
 }
 
-use crate::test_names::session_name;
-
-async fn new_session(handler: &RequestHandler, name: &SessionName) -> SessionId {
-    let response = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name: name.clone(),
-            detached: true,
-            size: Some(TerminalSize { cols: 80, rows: 24 }),
-            environment: None,
-        }))
-        .await;
-    assert!(matches!(response, Response::NewSession(_)), "{response:?}");
-    handler
-        .state
-        .lock()
-        .await
-        .sessions
-        .session(name)
-        .expect("session exists")
-        .id()
-}
-
 async fn register_attached_control(
     handler: &RequestHandler,
     pid: u32,
     name: SessionName,
 ) -> AttachedControl {
-    let session_id = handler
-        .state
-        .lock()
-        .await
-        .sessions
-        .session(&name)
-        .expect("session exists")
-        .id();
+    let session_id = handler.session_id_for_test(&name).await;
     let (event_tx, mut events) = mpsc::channel(1);
     let closing = Arc::new(AtomicBool::new(false));
     let control_id = handler
@@ -95,9 +68,9 @@ async fn refresh_delivery_failures_keep_exact_control_identities_until_finish() 
     let by_name = session_name("refresh-failure-by-name");
     let by_session_id = session_name("refresh-failure-by-session-id");
     let by_client_id = session_name("refresh-failure-by-client-id");
-    new_session(&handler, &by_name).await;
-    new_session(&handler, &by_session_id).await;
-    new_session(&handler, &by_client_id).await;
+    handler.create_session(&by_name).await;
+    handler.create_session(&by_session_id).await;
+    handler.create_session(&by_client_id).await;
 
     let mut controls = vec![
         register_attached_control(&handler, 43_001, by_name.clone()).await,
@@ -139,20 +112,17 @@ async fn failed_rename_delivery_tracks_the_committed_stable_session_until_finish
     let handler = RequestHandler::new();
     let original = session_name("rename-failure-original");
     let renamed = session_name("rename-failure-renamed");
-    let session_id = new_session(&handler, &original).await;
+    handler.create_session(&original).await;
+    let session_id = handler.session_id_for_test(&original).await;
     let mut control = register_attached_control(&handler, 43_010, original.clone()).await;
     control.events.close();
 
-    let response = handler
-        .handle(Request::RenameSession(RenameSessionRequest {
+    handler
+        .handle_ok(RenameSessionRequest {
             target: original,
             new_name: renamed.clone(),
-        }))
+        })
         .await;
-    assert!(
-        matches!(response, Response::RenameSession(_)),
-        "{response:?}"
-    );
     assert!(control.closing.load(Ordering::SeqCst));
     {
         let active_control = handler.active_control.lock().await;
@@ -187,7 +157,8 @@ async fn failed_rename_delivery_tracks_the_committed_stable_session_until_finish
 async fn queue_attach_without_exact_identity_commits_event_identity_and_touch() {
     let handler = RequestHandler::new();
     let target = session_name("queue-attach-success-target");
-    let target_id = new_session(&handler, &target).await;
+    handler.create_session(&target).await;
+    let target_id = handler.session_id_for_test(&target).await;
     let requester_pid = 43_019;
     let (event_tx, mut events) = mpsc::channel(1);
     let control_id = handler
@@ -243,8 +214,10 @@ async fn failed_queue_attach_and_destroy_switch_restore_their_source_identities(
     let handler = RequestHandler::new();
     let source = session_name("delivery-failure-destroy-source");
     let target = session_name("delivery-failure-target");
-    let source_id = new_session(&handler, &source).await;
-    let target_id = new_session(&handler, &target).await;
+    handler.create_session(&source).await;
+    handler.create_session(&target).await;
+    let source_id = handler.session_id_for_test(&source).await;
+    let target_id = handler.session_id_for_test(&target).await;
 
     let unattached_pid = 43_020;
     let (unattached_tx, mut unattached_rx) = mpsc::channel(1);
@@ -334,35 +307,26 @@ async fn failed_queue_attach_and_destroy_switch_restore_their_source_identities(
 async fn stale_closing_control_does_not_keep_recreated_destroy_unattached_session_alive() {
     let handler = RequestHandler::new();
     let session = session_name("delivery-failure-recreated-destroy-unattached");
-    let old_session_id = new_session(&handler, &session).await;
+    handler.create_session(&session).await;
+    let old_session_id = handler.session_id_for_test(&session).await;
     let mut stale = register_attached_control(&handler, 43_030, session.clone()).await;
     stale.events.close();
 
-    let killed = handler
-        .handle(Request::KillSession(KillSessionRequest {
-            target: session.clone(),
-            kill_all_except_target: false,
-            clear_alerts: false,
-            kill_group: false,
-        }))
+    handler
+        .handle_ok(KillSessionRequest::fixture(&session))
         .await;
-    assert!(matches!(killed, Response::KillSession(_)), "{killed:?}");
     assert!(stale.closing.load(Ordering::SeqCst));
 
-    let replacement_session_id = new_session(&handler, &session).await;
+    handler.create_session(&session).await;
+    let replacement_session_id = handler.session_id_for_test(&session).await;
     assert_ne!(replacement_session_id, old_session_id);
-    {
-        let mut state = handler.state.lock().await;
-        state
-            .options
-            .set(
-                ScopeSelector::Session(session.clone()),
-                OptionName::DestroyUnattached,
-                "on".to_owned(),
-                SetOptionMode::Replace,
-            )
-            .expect("destroy-unattached option is valid");
-    }
+    handler
+        .store_option_for_test(
+            ScopeSelector::Session(session.clone()),
+            OptionName::DestroyUnattached,
+            "on",
+        )
+        .await;
     let replacement = register_attached_control(&handler, 43_031, session.clone()).await;
 
     handler

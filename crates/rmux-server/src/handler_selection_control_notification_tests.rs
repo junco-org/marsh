@@ -1,101 +1,13 @@
-use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
-
 use rmux_proto::{
-    ControlMode, LinkWindowRequest, NewSessionRequest, NewWindowRequest, PaneKillRequest,
-    PaneTargetRef, Request, Response, SessionName, TerminalSize, WindowTarget,
+    LinkWindowRequest, NewWindowRequest, PaneKillRequest, PaneTargetRef, Request, Response,
+    SessionName, WindowTarget,
 };
 use tokio::sync::mpsc;
 
 use super::RequestHandler;
-use crate::control::{ControlModeUpgrade, ControlServerEvent, CONTROL_SERVER_EVENT_CAPACITY};
-
+use crate::control::ControlServerEvent;
+use crate::test_fixtures::Fixture;
 use crate::test_names::session_name;
-
-async fn new_session(handler: &RequestHandler, name: &SessionName) {
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: name.clone(),
-                detached: true,
-                size: Some(TerminalSize { cols: 80, rows: 24 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
-}
-
-async fn new_window(
-    handler: &RequestHandler,
-    session: &SessionName,
-    detached: bool,
-) -> WindowTarget {
-    let response = handler
-        .handle(Request::NewWindow(Box::new(NewWindowRequest {
-            target: session.clone(),
-            name: None,
-            detached,
-            start_directory: None,
-            environment: None,
-            command: None,
-            process_command: None,
-            target_window_index: None,
-            insert_at_target: false,
-        })))
-        .await;
-    let Response::NewWindow(response) = response else {
-        panic!("new-window failed: {response:?}");
-    };
-    response.target
-}
-
-async fn link_window(
-    handler: &RequestHandler,
-    source: WindowTarget,
-    target: WindowTarget,
-    detached: bool,
-) -> WindowTarget {
-    let response = handler
-        .handle(Request::LinkWindow(LinkWindowRequest {
-            source,
-            target,
-            after: false,
-            before: false,
-            kill_destination: false,
-            detached,
-        }))
-        .await;
-    let Response::LinkWindow(response) = response else {
-        panic!("link-window failed: {response:?}");
-    };
-    response.target
-}
-
-async fn register_control(
-    handler: &RequestHandler,
-    requester_pid: u32,
-    session: &SessionName,
-) -> (u64, mpsc::Receiver<ControlServerEvent>) {
-    let (event_tx, event_rx) = mpsc::channel(CONTROL_SERVER_EVENT_CAPACITY);
-    let control_id = handler
-        .register_control_with_closing(
-            requester_pid,
-            ControlModeUpgrade {
-                initial_command_count: 0,
-                mode: ControlMode::Plain,
-                terminal_context: crate::outer_terminal::OuterTerminalContext::default(),
-            },
-            event_tx,
-            Arc::new(AtomicBool::new(false)),
-        )
-        .await;
-    handler
-        .set_control_session(requester_pid, Some(session.clone()))
-        .await
-        .expect("control attaches to test session");
-    (control_id, event_rx)
-}
 
 async fn run_control(handler: &RequestHandler, requester_pid: u32, control_id: u64, command: &str) {
     let commands = handler
@@ -157,17 +69,6 @@ async fn active_id_strings(
     )
 }
 
-async fn window_id(handler: &RequestHandler, target: &WindowTarget) -> String {
-    let state = handler.state.lock().await;
-    state
-        .sessions
-        .session(target.session_name())
-        .and_then(|session| session.window_at(target.window_index()))
-        .expect("window exists")
-        .id()
-        .to_string()
-}
-
 #[tokio::test]
 async fn new_window_and_explicit_select_publish_only_stable_id_changes() {
     // Frozen tmux 3.7b, measured 2026-07-26: non-detached new-window
@@ -175,8 +76,10 @@ async fn new_window_and_explicit_select_publish_only_stable_id_changes() {
     // window-add. Selecting the current stable window is silent.
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    new_session(&handler, &alpha).await;
-    let (control_id, mut rx) = register_control(&handler, 31_001, &alpha).await;
+    handler.create_session(&alpha).await;
+    let (control_id, mut rx) = handler
+        .register_control_for_test(31_001, Some(&alpha))
+        .await;
     let _ = relevant_notifications(&mut rx);
 
     run_control(&handler, 31_001, control_id, "new-window -t alpha").await;
@@ -190,8 +93,9 @@ async fn new_window_and_explicit_select_publish_only_stable_id_changes() {
     );
 
     run_control(&handler, 31_001, control_id, "new-window -d -t alpha").await;
-    let detached_window_id =
-        window_id(&handler, &WindowTarget::with_window(alpha.clone(), 2)).await;
+    let detached_window_id = handler
+        .window_id_for_test(&WindowTarget::with_window(alpha.clone(), 2))
+        .await;
     assert_eq!(
         relevant_notifications(&mut rx),
         vec![format!("%window-add {detached_window_id}")]
@@ -237,11 +141,13 @@ async fn link_and_unlink_window_follow_detached_and_no_switch_semantics() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
     let beta = session_name("beta");
-    new_session(&handler, &alpha).await;
-    new_session(&handler, &beta).await;
-    let beta_source = new_window(&handler, &beta, true).await;
-    let beta_detached = new_window(&handler, &beta, true).await;
-    let (control_id, mut rx) = register_control(&handler, 31_002, &alpha).await;
+    handler.create_session(&alpha).await;
+    handler.create_session(&beta).await;
+    let beta_source = handler.create_window(&beta).await;
+    let beta_detached = handler.create_window(&beta).await;
+    let (control_id, mut rx) = handler
+        .register_control_for_test(31_002, Some(&alpha))
+        .await;
     let _ = relevant_notifications(&mut rx);
 
     run_control(
@@ -267,7 +173,7 @@ async fn link_and_unlink_window_follow_detached_and_no_switch_semantics() {
         "link-window -d -s beta:2 -t alpha:2",
     )
     .await;
-    let detached_window_id = window_id(&handler, &beta_detached).await;
+    let detached_window_id = handler.window_id_for_test(&beta_detached).await;
     assert_eq!(
         relevant_notifications(&mut rx),
         vec![format!("%window-add {detached_window_id}")]
@@ -299,11 +205,18 @@ async fn move_window_orders_destination_and_source_stable_transitions() {
         let handler = RequestHandler::new();
         let alpha = session_name("alpha");
         let beta = session_name("beta");
-        new_session(&handler, &alpha).await;
-        let moving = new_window(&handler, &alpha, false).await;
-        new_session(&handler, &beta).await;
-        let moving_window_id = window_id(&handler, &moving).await;
-        let (control_id, mut rx) = register_control(&handler, 31_003, &alpha).await;
+        handler.create_session(&alpha).await;
+        let moving = handler
+            .create_window(NewWindowRequest {
+                detached: false,
+                ..Fixture::fixture(&alpha)
+            })
+            .await;
+        handler.create_session(&beta).await;
+        let moving_window_id = handler.window_id_for_test(&moving).await;
+        let (control_id, mut rx) = handler
+            .register_control_for_test(31_003, Some(&alpha))
+            .await;
         let _ = relevant_notifications(&mut rx);
 
         let flag = if detached { "-d " } else { "" };
@@ -337,18 +250,24 @@ async fn linked_kill_window_interleaves_each_real_session_transition_and_close()
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
     let beta = session_name("beta");
-    new_session(&handler, &alpha).await;
-    let shared = new_window(&handler, &alpha, false).await;
-    new_session(&handler, &beta).await;
-    link_window(
-        &handler,
-        shared.clone(),
-        WindowTarget::with_window(beta.clone(), 1),
-        false,
-    )
-    .await;
-    let shared_id = window_id(&handler, &shared).await;
-    let (control_id, mut rx) = register_control(&handler, 31_004, &alpha).await;
+    handler.create_session(&alpha).await;
+    let shared = handler
+        .create_window(NewWindowRequest {
+            detached: false,
+            ..Fixture::fixture(&alpha)
+        })
+        .await;
+    handler.create_session(&beta).await;
+    handler
+        .handle_ok(LinkWindowRequest {
+            detached: false,
+            ..Fixture::fixture((&shared, WindowTarget::with_window(beta.clone(), 1)))
+        })
+        .await;
+    let shared_id = handler.window_id_for_test(&shared).await;
+    let (control_id, mut rx) = handler
+        .register_control_for_test(31_004, Some(&alpha))
+        .await;
     let _ = relevant_notifications(&mut rx);
 
     run_control(&handler, 31_004, control_id, "kill-window -t alpha:1").await;
@@ -373,16 +292,17 @@ async fn split_and_kill_pane_preserve_tmux_transition_order_and_detached_silence
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
     let beta = session_name("beta");
-    new_session(&handler, &alpha).await;
-    new_session(&handler, &beta).await;
-    link_window(
-        &handler,
-        WindowTarget::with_window(alpha.clone(), 0),
-        WindowTarget::with_window(beta, 1),
-        true,
-    )
-    .await;
-    let (control_id, mut rx) = register_control(&handler, 31_005, &alpha).await;
+    handler.create_session(&alpha).await;
+    handler.create_session(&beta).await;
+    handler
+        .handle_ok(LinkWindowRequest::fixture((
+            WindowTarget::with_window(alpha.clone(), 0),
+            WindowTarget::with_window(beta, 1),
+        )))
+        .await;
+    let (control_id, mut rx) = handler
+        .register_control_for_test(31_005, Some(&alpha))
+        .await;
     let _ = relevant_notifications(&mut rx);
 
     run_control(&handler, 31_005, control_id, "split-window -t alpha:0.0").await;
@@ -456,16 +376,17 @@ async fn break_pane_orders_source_selection_layout_add_and_destination_selection
         let handler = RequestHandler::new();
         let alpha = session_name("alpha");
         let beta = session_name("beta");
-        new_session(&handler, &alpha).await;
-        new_session(&handler, &beta).await;
-        link_window(
-            &handler,
-            WindowTarget::with_window(alpha.clone(), 0),
-            WindowTarget::with_window(beta, 1),
-            true,
-        )
-        .await;
-        let (control_id, mut rx) = register_control(&handler, 31_006, &alpha).await;
+        handler.create_session(&alpha).await;
+        handler.create_session(&beta).await;
+        handler
+            .handle_ok(LinkWindowRequest::fixture((
+                WindowTarget::with_window(alpha.clone(), 0),
+                WindowTarget::with_window(beta, 1),
+            )))
+            .await;
+        let (control_id, mut rx) = handler
+            .register_control_for_test(31_006, Some(&alpha))
+            .await;
         let _ = relevant_notifications(&mut rx);
         run_control(&handler, 31_006, control_id, "split-window -t alpha:0.0").await;
         let _ = relevant_notifications(&mut rx);
@@ -517,8 +438,10 @@ async fn initial_window_is_published_before_sessions_changed() {
     // window-add in the same order.
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    new_session(&handler, &alpha).await;
-    let (control_id, mut rx) = register_control(&handler, 31_007, &alpha).await;
+    handler.create_session(&alpha).await;
+    let (control_id, mut rx) = handler
+        .register_control_for_test(31_007, Some(&alpha))
+        .await;
     let _ = relevant_notifications(&mut rx);
 
     run_control(&handler, 31_007, control_id, "new-session -d -s beta").await;

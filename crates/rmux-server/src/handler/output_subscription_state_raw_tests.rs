@@ -44,21 +44,20 @@ fn cached_raw_rebase() -> Arc<CachedRawRebase> {
 async fn one_raw_initializer_wakes_waiters_before_re_election() {
     let mut state = OutputSubscriptionState::new(SubscriptionLimits::default());
     let pane = pane();
-    let RawInitializationRoute::Initialize { token } = state.raw_initialization_route(&pane, false)
+    let InitializationRoute::Initialize { token } = state.raw_initialization_route(&pane, false)
     else {
         panic!("first caller must initialize");
     };
-    let RawInitializationRoute::Wait(mut waiter) = state.raw_initialization_route(&pane, false)
-    else {
+    let InitializationRoute::Wait(mut waiter) = state.raw_initialization_route(&pane, false) else {
         panic!("second caller must wait");
     };
 
-    state.finish_raw_initialization(token);
+    state.raw_initializations.finish(token);
     waiter.changed().await.expect("initializer completion");
     assert!(*waiter.borrow());
     assert!(matches!(
         state.raw_initialization_route(&pane, false),
-        RawInitializationRoute::Initialize { .. }
+        InitializationRoute::Initialize { .. }
     ));
 }
 
@@ -69,13 +68,13 @@ fn raw_initialization_reuses_only_a_sufficient_cached_projection() {
     let cached = cached_raw_rebase();
     state.raw_rebases.insert(pane.clone(), Arc::clone(&cached));
 
-    let RawInitializationRoute::Ready(found) = state.raw_initialization_route(&pane, false) else {
+    let InitializationRoute::Ready(found) = state.raw_initialization_route(&pane, false) else {
         panic!("keyframe-only caller should reuse the cached projection");
     };
     assert!(Arc::ptr_eq(&found, &cached));
     assert!(matches!(
         state.raw_initialization_route(&pane, true),
-        RawInitializationRoute::Initialize { .. }
+        InitializationRoute::Initialize { .. }
     ));
 }
 
@@ -85,10 +84,9 @@ async fn pane_removal_wakes_raw_initialization_waiters() {
     let pane = pane();
     assert!(matches!(
         state.raw_initialization_route(&pane, false),
-        RawInitializationRoute::Initialize { .. }
+        InitializationRoute::Initialize { .. }
     ));
-    let RawInitializationRoute::Wait(mut waiter) = state.raw_initialization_route(&pane, false)
-    else {
+    let InitializationRoute::Wait(mut waiter) = state.raw_initialization_route(&pane, false) else {
         panic!("second caller must wait");
     };
 
@@ -105,24 +103,34 @@ async fn raw_initialization_token_survives_a_pane_rekey() {
         SessionName::new("raw-moved").expect("valid session name"),
         previous.pane_id(),
     );
-    let RawInitializationRoute::Initialize { token } =
+    let InitializationRoute::Initialize { token } =
         state.raw_initialization_route(&previous, false)
     else {
         panic!("first caller must initialize");
     };
-    let RawInitializationRoute::Wait(mut waiter) = state.raw_initialization_route(&previous, false)
+    let InitializationRoute::Wait(mut waiter) = state.raw_initialization_route(&previous, false)
     else {
         panic!("second caller must wait");
     };
 
     state.rekey_pane(&previous, current.clone());
-    state.finish_raw_initialization(token);
+    assert!(matches!(
+        state.raw_initialization_route(&current, false),
+        InitializationRoute::Wait(_)
+    ));
+    state.raw_initializations.finish(token);
 
     waiter
         .changed()
         .await
         .expect("rekeyed initializer completion");
     assert!(*waiter.borrow());
-    assert!(!state.raw_initializations.contains_key(&previous));
-    assert!(!state.raw_initializations.contains_key(&current));
+    assert!(matches!(
+        state.raw_initialization_route(&current, false),
+        InitializationRoute::Initialize { .. }
+    ));
+    assert!(matches!(
+        state.raw_initialization_route(&previous, false),
+        InitializationRoute::Initialize { .. }
+    ));
 }

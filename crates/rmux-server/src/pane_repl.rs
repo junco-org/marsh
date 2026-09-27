@@ -728,7 +728,7 @@ impl Prompt {
         // Every outcome that is not an ordinary publication is reported: a denial and a discard
         // are both things the user must see, because the command may have exited zero and still
         // changed nothing.
-        let report = repl::report_lines(self.job.id(), &completion.outcome);
+        let report = repl::report_lines(self.job.id(), &completion.result);
         self.deliver(report, Some(completion.id)).await
     }
 
@@ -826,7 +826,7 @@ impl Prompt {
                 return vec![format!("sd: {name}: not a usable job name")];
             }
         }
-        let base = match self.snapshot_relative_cwd() {
+        let base = match self.source_relative_cwd() {
             Ok(base) => base,
             Err(message) => return vec![message],
         };
@@ -846,26 +846,18 @@ impl Prompt {
         }
     }
 
-    /// Where this job's shell currently stands, relative to its own snapshot.
-    ///
-    /// A cwd that is not inside the snapshot is an error rather than a silent fall back to the
-    /// seed root: `sd api docs` names the `docs` beside the files the prompt is showing, and
-    /// answering with a directory at the top of the seed would open the job somewhere the user
-    /// never named.
-    fn snapshot_relative_cwd(&self) -> Result<String, String> {
+    /// Logical cwd relative to the source. A cwd outside that source is never silently rebased.
+    fn source_relative_cwd(&self) -> Result<String, String> {
         let Some(view) = self.io.job(self.job.id()) else {
             return Err(format!("sd: {}: no such job", self.job.id().reference()));
         };
-        let Some(root) = view.snapshot_root.as_ref() else {
-            return Err(format!(
-                "sd: {}: has no snapshot to resolve a directory against",
-                view.id.reference()
-            ));
-        };
-        match view.working_directory.strip_prefix(root) {
-            Ok(relative) => Ok(relative.to_string_lossy().into_owned()),
+        match view.working_directory.strip_prefix(&view.sandbox.seed) {
+            Ok(relative) => relative
+                .to_str()
+                .map(str::to_owned)
+                .ok_or_else(|| "sd: current directory is not UTF-8".to_owned()),
             Err(_) => Err(format!(
-                "sd: {}: current directory is outside this job's snapshot",
+                "sd: {}: current directory is outside this job's source",
                 view.working_directory.display()
             )),
         }

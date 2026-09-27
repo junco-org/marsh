@@ -41,17 +41,6 @@ pub(crate) struct CapturePaneArgs {
     pub(crate) buffer_name: Option<String>,
 }
 
-impl CapturePaneArgs {
-    /// Accepts the parsed arguments unchanged; `capture-pane` has no cross-flag constraints.
-    #[allow(
-        clippy::unnecessary_wraps,
-        reason = "queue dispatch uses `and_then(CapturePaneArgs::validate)` alongside fallible validators"
-    )]
-    pub(crate) const fn validate(self) -> Result<Self, clap::Error> {
-        Ok(self)
-    }
-}
-
 /// Parsed arguments of `clear-history`, emptying one pane's scrollback.
 #[derive(Debug, Clone, Args)]
 pub(crate) struct ClearHistoryArgs {

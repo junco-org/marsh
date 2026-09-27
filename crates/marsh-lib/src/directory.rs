@@ -98,6 +98,13 @@ mod tests {
         path.to_path_buf()
     }
 
+    /// An empty `root` inside a fresh scratch directory, which lives as long as the returned guard.
+    fn scratch_root() -> (tempfile::TempDir, PathBuf) {
+        let scratch = tempfile::tempdir().expect("scratch directory");
+        let root = directory(&scratch.path().join("root"));
+        (scratch, root)
+    }
+
     /// Walks `root`, descending into every directory and recording what was seen where.
     fn trace(root: &Path) -> Result<Vec<Visit>, TestError> {
         let mut seen = Vec::new();
@@ -113,14 +120,10 @@ mod tests {
                     name: entry.file_name().to_string_lossy().into_owned(),
                     depth: state.depth,
                 });
-                if entry.file_type()?.is_dir() {
-                    Ok(Some(Descent {
-                        directory: entry.path(),
-                        depth: state.depth + 1,
-                    }))
-                } else {
-                    Ok(None)
-                }
+                Ok(entry.file_type()?.is_dir().then(|| Descent {
+                    directory: entry.path(),
+                    depth: state.depth + 1,
+                }))
             },
         )?;
         Ok(seen)
@@ -129,13 +132,9 @@ mod tests {
     /// The directories a trace enumerated, in the order it enumerated them, with no directory
     /// appearing twice in a row.
     fn batches(seen: &[Visit]) -> Vec<PathBuf> {
-        let mut order: Vec<PathBuf> = Vec::new();
-        for visit in seen {
-            if order.last() != Some(&visit.directory) {
-                order.push(visit.directory.clone());
-            }
-        }
-        order
+        seen.chunk_by(|left, right| left.directory == right.directory)
+            .map(|batch| batch[0].directory.clone())
+            .collect()
     }
 
     /// A directory's entries are one contiguous batch, and the directories it descends into are
@@ -146,8 +145,7 @@ mod tests {
     /// filesystem.
     #[test]
     fn a_parent_is_enumerated_before_its_children_are_walked_last_first() {
-        let scratch = tempfile::tempdir().expect("scratch directory");
-        let root = directory(&scratch.path().join("root"));
+        let (_scratch, root) = scratch_root();
         let a = directory(&root.join("a"));
         let b = directory(&root.join("b"));
         let c = directory(&b.join("c"));
@@ -164,20 +162,13 @@ mod tests {
         assert_eq!(root_batch.len(), 3, "every root entry is visited once");
         assert!(root_batch.iter().all(|visit| visit.depth == 0));
 
-        let mut descended: Vec<PathBuf> = root_batch
-            .iter()
-            .filter(|visit| visit.name != "f.txt")
-            .map(|visit| root.join(&visit.name))
-            .collect();
-        descended.reverse();
         let mut expected = vec![root.clone()];
-        for child in descended {
-            let subtree = if child == b {
-                vec![b.clone(), c.clone()]
-            } else {
-                vec![a.clone()]
-            };
-            expected.extend(subtree);
+        for visit in root_batch.iter().rev() {
+            match visit.name.as_str() {
+                "a" => expected.push(a.clone()),
+                "b" => expected.extend([b.clone(), c.clone()]),
+                _ => {}
+            }
         }
 
         assert_eq!(batches(&seen), expected);
@@ -193,8 +184,7 @@ mod tests {
     /// Answering `None` for a directory prunes it, however many entries it holds.
     #[test]
     fn a_pruned_directory_is_never_enumerated() {
-        let scratch = tempfile::tempdir().expect("scratch directory");
-        let root = directory(&scratch.path().join("root"));
+        let (_scratch, root) = scratch_root();
         let skipped = directory(&root.join("skipped"));
         file(&skipped.join("hidden.txt"));
         directory(&skipped.join("deeper"));
@@ -217,8 +207,7 @@ mod tests {
     /// An empty directory is a successful walk that visits nothing.
     #[test]
     fn an_empty_tree_visits_nothing() {
-        let scratch = tempfile::tempdir().expect("scratch directory");
-        let root = directory(&scratch.path().join("root"));
+        let (_scratch, root) = scratch_root();
         directory(&root.join("empty"));
 
         let seen = trace(&root).expect("walk");
@@ -241,8 +230,7 @@ mod tests {
     /// any directory still pending is enumerated.
     #[test]
     fn a_visitor_error_stops_the_walk() {
-        let scratch = tempfile::tempdir().expect("scratch directory");
-        let root = directory(&scratch.path().join("root"));
+        let (_scratch, root) = scratch_root();
         let child = directory(&root.join("child"));
         file(&child.join("never.txt"));
         for index in 0..8 {
@@ -265,9 +253,6 @@ mod tests {
             !seen.iter().any(|name| name == "never.txt"),
             "a pending directory is not walked after a refusal"
         );
-        match error {
-            TestError::Refused(_) => {}
-            TestError::Io(io) => panic!("unexpected io error: {io}"),
-        }
+        assert!(matches!(error, TestError::Refused(_)), "{error:?}");
     }
 }

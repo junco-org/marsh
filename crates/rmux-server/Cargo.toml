@@ -20,6 +20,9 @@ bincode = "1.3.3"
 chrono = { version = "0.4.42", default-features = false, features = ["clock", "std"] }
 getrandom = { version = "0.3", optional = true }
 glob = "0.3"
+either = "1"
+clap = { version = "4.6.0", features = ["derive"] }
+pin-project-lite = "0.2"
 hkdf = { version = "0.12", optional = true }
 httparse = { version = "1.9", optional = true }
 regex = "1.12.2"
@@ -44,16 +47,17 @@ toml = { version = "0.8", optional = true }
 tracing = "0.1"
 # The shell engine every pane, popup and workload helper in this daemon runs on.
 marsh-core = { path = "../marsh-core" }
-# The snapshot backend `RmuxFrontend::open` opens its seed through. The trait is part of the
-# public constructor's signature (`open_with` takes an explicit `Arc<dyn Subvolumes>`), so this is
-# a normal dependency; the `fake` feature stays in dev-dependencies, where the fixtures need it.
-marsh-btrfs = { path = "../marsh-btrfs" }
+# Domain-free keyed initialization, bounded retention, and occurrence remapping primitives.
+marsh-lib = { path = "../marsh-lib", features = ["watch"] }
+# Only the explicit test-support factory accepts storage backends.
+marsh-btrfs = { path = "../marsh-btrfs", optional = true }
 # Exported shell variables and the quoting the `exec` workload plan is composed with.
 brush-core.workspace = true
 
 [features]
 default = ["web"]
 perf-instrument = []
+testing = ["marsh-core/testing", "dep:marsh-btrfs"]
 web = [
     "dep:base64",
     "dep:getrandom",
@@ -84,6 +88,7 @@ rustix = { version = "=1.1.4", features = ["event", "fs", "net", "process"] }
 # The daemon's tests build their mux over a plain directory tree rather than a real btrfs seed,
 # so they run on any filesystem.
 marsh-btrfs = { path = "../marsh-btrfs", features = ["fake"] }
+marsh-core = { path = "../marsh-core", features = ["testing"] }
 rmux-core = { workspace = true, features = ["test-seams"] }
 rustix = { version = "1.1.4", features = ["event", "fs", "termios"] }
 serde_json = "1"

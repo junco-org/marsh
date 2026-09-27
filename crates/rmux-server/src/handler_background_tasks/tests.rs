@@ -5,7 +5,8 @@ use super::*;
 
 use rmux_os::process_tree::ProcessTreeChild;
 
-/// The runtime these tests build their handler inside, and drive their closes on.
+/// The runtime these tests build their handler inside, and drive their closes on, together with
+/// that handler.
 ///
 /// A background task is an OS thread that drives its future with `Handle::block_on`, and the
 /// handle it blocks on is the one `RequestHandler::new` captured from the *ambient* runtime —
@@ -19,12 +20,19 @@ use rmux_os::process_tree::ProcessTreeChild;
 /// the same time, and one of them stays blocked on purpose while the test asserts that another
 /// makes progress. A current-thread runtime has a single core to hand out, so the thread that
 /// did not get it could only be driven by the thread that did.
-fn lifecycle_test_runtime() -> tokio::runtime::Runtime {
-    tokio::runtime::Builder::new_multi_thread()
+fn lifecycle_test_handler() -> (tokio::runtime::Runtime, RequestHandler) {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
         .build()
-        .expect("lifecycle background task runtime")
+        .expect("lifecycle background task runtime");
+    // Scoped: `Runtime::block_on` in the tests refuses to start a runtime from inside one, and
+    // the guard is only needed for the constructor that captures the handle.
+    let handler = {
+        let _runtime_guard = runtime.enter();
+        RequestHandler::new()
+    };
+    (runtime, handler)
 }
 
 #[test]
@@ -92,13 +100,7 @@ fn shutdown_cancels_and_joins_a_started_background_task() {
 
 #[test]
 fn lifecycle_worker_pending_is_cancelled_and_releases_its_registration() {
-    let runtime = lifecycle_test_runtime();
-    // Scoped: `Runtime::block_on` below refuses to start a runtime from inside one, and the
-    // guard is only needed for the constructor that captures the handle.
-    let handler = {
-        let _runtime_guard = runtime.enter();
-        RequestHandler::new()
-    };
+    let (runtime, handler) = lifecycle_test_handler();
     let (started_tx, started_rx) = mpsc::channel();
     let (dropped_tx, dropped_rx) = mpsc::channel();
     handler
@@ -138,11 +140,7 @@ fn lifecycle_worker_pending_is_cancelled_and_releases_its_registration() {
 
 #[test]
 fn lifecycle_worker_close_drains_an_active_mutation() {
-    let runtime = lifecycle_test_runtime();
-    let handler = {
-        let _runtime_guard = runtime.enter();
-        RequestHandler::new()
-    };
+    let (runtime, handler) = lifecycle_test_handler();
     let registration = handler
         .reserve_lifecycle_producer_task("rmux-lifecycle-worker-mutation-test")
         .expect("reserve lifecycle worker");
@@ -196,11 +194,7 @@ fn lifecycle_worker_close_drains_an_active_mutation() {
 
 #[test]
 fn lifecycle_worker_preserves_hook_lane_until_final_close() {
-    let runtime = lifecycle_test_runtime();
-    let handler = {
-        let _runtime_guard = runtime.enter();
-        RequestHandler::new()
-    };
+    let (runtime, handler) = lifecycle_test_handler();
     let registration = handler
         .try_begin_lifecycle_hook_producer()
         .expect("hook producer registered");
@@ -252,11 +246,7 @@ fn lifecycle_worker_preserves_hook_lane_until_final_close() {
 
 #[test]
 fn background_shutdown_cancels_a_pending_opt_in_lifecycle_worker() {
-    let runtime = lifecycle_test_runtime();
-    let handler = {
-        let _runtime_guard = runtime.enter();
-        RequestHandler::new()
-    };
+    let (runtime, handler) = lifecycle_test_handler();
     let registration = handler
         .try_begin_lifecycle_hook_producer()
         .expect("hook producer registered");
@@ -291,11 +281,7 @@ fn background_shutdown_cancels_a_pending_opt_in_lifecycle_worker() {
 
 #[test]
 fn background_shutdown_drains_an_active_hook_lane_mutation() {
-    let runtime = lifecycle_test_runtime();
-    let handler = {
-        let _runtime_guard = runtime.enter();
-        RequestHandler::new()
-    };
+    let (runtime, handler) = lifecycle_test_handler();
     let registration = handler
         .try_begin_lifecycle_hook_producer()
         .expect("hook producer registered");

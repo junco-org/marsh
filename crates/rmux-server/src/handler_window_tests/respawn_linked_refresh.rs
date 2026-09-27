@@ -30,25 +30,14 @@ async fn receive_latest_respawn_refresh(
 #[tokio::test]
 async fn respawn_window_refreshes_attached_link_aliases_after_active_pane_is_removed() {
     let handler = RequestHandler::new();
-    let owner = session_name("respawn-refresh-owner");
-    let alias = session_name("respawn-refresh-alias");
-    let alias_peer = session_name("respawn-refresh-alias-peer");
-    create_session(&handler, owner.as_str()).await;
-    create_session(&handler, alias.as_str()).await;
-    create_grouped_session(&handler, alias_peer.as_str(), &alias).await;
+    let owner = create_session(&handler, "respawn-refresh-owner").await;
+    let alias = create_session(&handler, "respawn-refresh-alias").await;
+    let alias_peer = create_grouped_session(&handler, "respawn-refresh-alias-peer", &alias).await;
 
-    let split = handler
-        .handle(Request::SplitWindow(SplitWindowRequest {
-            target: SplitWindowTarget::Session(owner.clone()),
-            direction: SplitDirection::Vertical,
-            before: false,
-            environment: None,
-        }))
-        .await;
-    let split_target = match split {
-        Response::SplitWindow(response) => response.pane,
-        response => panic!("expected owner split success, got {response:?}"),
-    };
+    let split_target = handler
+        .handle_ok(SplitWindowRequest::fixture(&owner))
+        .await
+        .pane;
     let (retained_pane_id, removed_active_pane_id) = {
         let mut state = handler.state.lock().await;
         let owner_session = state.sessions.session_mut(&owner).expect("owner exists");
@@ -63,17 +52,15 @@ async fn respawn_window_refreshes_attached_link_aliases_after_active_pane_is_rem
     };
     assert_ne!(retained_pane_id, removed_active_pane_id);
 
-    let linked = handler
-        .handle(Request::LinkWindow(LinkWindowRequest {
-            source: WindowTarget::with_window(owner.clone(), 0),
-            target: WindowTarget::with_window(alias.clone(), 0),
-            after: false,
-            before: false,
+    handler
+        .handle_ok(LinkWindowRequest {
             kill_destination: true,
-            detached: true,
-        }))
+            ..Fixture::fixture((
+                WindowTarget::with_window(owner.clone(), 0),
+                WindowTarget::with_window(alias.clone(), 0),
+            ))
+        })
         .await;
-    assert!(matches!(linked, Response::LinkWindow(_)), "{linked:?}");
     {
         let state = handler.state.lock().await;
         for session_name in [&owner, &alias, &alias_peer] {
@@ -94,30 +81,22 @@ async fn respawn_window_refreshes_attached_link_aliases_after_active_pane_is_rem
         }
     }
 
-    let (alias_tx, mut alias_rx) = mpsc::unbounded_channel();
-    let (peer_tx, mut peer_rx) = mpsc::unbounded_channel();
-    handler.register_attach(51, alias.clone(), alias_tx).await;
-    handler
-        .register_attach(52, alias_peer.clone(), peer_tx)
-        .await;
+    let mut alias_rx = handler.attach_client(51, &alias).await;
+    let mut peer_rx = handler.attach_client(52, &alias_peer).await;
     tokio::join!(
         drain_attach_controls(&mut alias_rx),
         drain_attach_controls(&mut peer_rx),
     );
 
-    let response = handler
-        .handle(Request::RespawnWindow(Box::new(RespawnWindowRequest {
+    handler
+        .handle_ok(RespawnWindowRequest {
             target: WindowTarget::with_window(owner.clone(), 0),
             kill: true,
             start_directory: None,
             environment: None,
-            command: Some(quiet_window_test_command()),
-        })))
+            command: Some(quiet_command()),
+        })
         .await;
-    assert!(
-        matches!(response, Response::RespawnWindow(_)),
-        "{response:?}"
-    );
 
     let mut alias_target = receive_latest_respawn_refresh(&mut alias_rx, &alias).await;
     let mut peer_target = receive_latest_respawn_refresh(&mut peer_rx, &alias_peer).await;

@@ -149,6 +149,9 @@ pub struct CreateOptions<SE: extensions::ShellExtensions = extensions::DefaultSh
     /// Spawner for external commands.
     #[builder(default)]
     pub external_command_spawner: SE::ExternalCommandSpawner,
+    /// Observer of the work the shell runs and schedules.
+    #[builder(default)]
+    pub execution_observer: SE::ExecutionObserver,
     /// Disallow overwriting regular files via output redirection.
     #[builder(default)]
     pub disallow_overwriting_regular_files_via_output_redirection: bool,
@@ -237,6 +240,7 @@ impl<SE: extensions::ShellExtensions> Default for Shell<SE> {
         Self {
             error_formatter: SE::ErrorFormatter::default(),
             external_command_spawner: SE::ExternalCommandSpawner::default(),
+            execution_observer: SE::ExecutionObserver::default(),
             traps: traps::TrapHandlerConfig::default(),
             open_files: openfiles::OpenFiles::default(),
             working_dir: PathBuf::default(),

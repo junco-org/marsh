@@ -3,12 +3,8 @@ use super::*;
 #[tokio::test]
 async fn moved_pane_stays_live_while_its_destroyed_source_window_retires() {
     let handler = RequestHandler::new();
-    let session_name = session_name("retained-pane-move");
     let mut state = handler.state.lock().await;
-    state
-        .sessions
-        .create_session(session_name.clone(), terminal_size())
-        .expect("create session");
+    let session_name = create_session_in_state(&mut state, "retained-pane-move");
     state
         .sessions
         .session_mut(&session_name)
@@ -67,36 +63,22 @@ async fn moved_pane_stays_live_while_its_destroyed_source_window_retires() {
 #[tokio::test]
 async fn retained_targets_follow_surviving_aliases_deterministically() {
     let handler = RequestHandler::new();
-    let alpha = create_handler_session(&handler, "retained-alias-alpha").await;
-    let beta = create_handler_session(&handler, "retained-alias-beta").await;
-    let gamma = create_handler_session(&handler, "retained-alias-gamma").await;
-    let response = handler
-        .handle(Request::NewWindow(Box::new(NewWindowRequest {
-            target: alpha.clone(),
-            name: None,
-            detached: true,
-            start_directory: None,
-            environment: None,
-            command: None,
-            process_command: None,
+    let alpha = handler.create_session("retained-alias-alpha").await;
+    let beta = handler.create_session("retained-alias-beta").await;
+    let gamma = handler.create_session("retained-alias-gamma").await;
+    handler
+        .create_window(NewWindowRequest {
             target_window_index: Some(1),
-            insert_at_target: false,
-        })))
+            ..Fixture::fixture(&alpha)
+        })
         .await;
-    assert!(matches!(response, Response::NewWindow(_)), "{response:?}");
-    handler.wait_for_initial_panes_for_test().await;
     for (session_name, window_index) in [(&gamma, 3), (&gamma, 2), (&beta, 1)] {
-        let response = handler
-            .handle(Request::LinkWindow(LinkWindowRequest {
-                source: WindowTarget::with_window(alpha.clone(), 0),
-                target: WindowTarget::with_window(session_name.clone(), window_index),
-                after: false,
-                before: false,
-                kill_destination: false,
-                detached: true,
-            }))
+        handler
+            .handle_ok(LinkWindowRequest::fixture((
+                WindowTarget::with_window(alpha.clone(), 0),
+                WindowTarget::with_window(session_name.clone(), window_index),
+            )))
             .await;
-        assert!(matches!(response, Response::LinkWindow(_)), "{response:?}");
     }
 
     let source_window = WindowTarget::with_window(alpha.clone(), 0);
@@ -124,16 +106,12 @@ async fn retained_targets_follow_surviving_aliases_deterministically() {
         (window_lease, pane_lease, stable_window, stable_pane)
     };
 
-    let response = handler
-        .handle(Request::UnlinkWindow(UnlinkWindowRequest {
+    handler
+        .handle_ok(UnlinkWindowRequest {
             target: source_window,
             kill_if_last: false,
-        }))
+        })
         .await;
-    assert!(
-        matches!(response, Response::UnlinkWindow(_)),
-        "{response:?}"
-    );
 
     let state = handler.state.lock().await;
     assert!(
@@ -155,35 +133,21 @@ async fn retained_targets_follow_surviving_aliases_deterministically() {
 #[tokio::test]
 async fn surviving_alias_becomes_the_retirement_slot_after_original_slot_reuse() {
     let handler = RequestHandler::new();
-    let alpha = create_handler_session(&handler, "retained-cursor-alpha").await;
-    let beta = create_handler_session(&handler, "retained-cursor-beta").await;
-    let response = handler
-        .handle(Request::NewWindow(Box::new(NewWindowRequest {
-            target: alpha.clone(),
-            name: None,
-            detached: true,
-            start_directory: None,
-            environment: None,
-            command: None,
-            process_command: None,
+    let alpha = handler.create_session("retained-cursor-alpha").await;
+    let beta = handler.create_session("retained-cursor-beta").await;
+    handler
+        .create_window(NewWindowRequest {
             target_window_index: Some(1),
-            insert_at_target: false,
-        })))
+            ..Fixture::fixture(&alpha)
+        })
         .await;
-    assert!(matches!(response, Response::NewWindow(_)), "{response:?}");
-    handler.wait_for_initial_panes_for_test().await;
     let source = WindowTarget::with_window(alpha.clone(), 0);
-    let response = handler
-        .handle(Request::LinkWindow(LinkWindowRequest {
-            source: source.clone(),
-            target: WindowTarget::with_window(beta.clone(), 1),
-            after: false,
-            before: false,
-            kill_destination: false,
-            detached: true,
-        }))
+    handler
+        .handle_ok(LinkWindowRequest::fixture((
+            &source,
+            WindowTarget::with_window(beta.clone(), 1),
+        )))
         .await;
-    assert!(matches!(response, Response::LinkWindow(_)), "{response:?}");
     let lease = {
         let state = handler.state.lock().await;
         state
@@ -191,16 +155,12 @@ async fn surviving_alias_becomes_the_retirement_slot_after_original_slot_reuse()
             .expect("capture retained aliased window")
     };
 
-    let response = handler
-        .handle(Request::UnlinkWindow(UnlinkWindowRequest {
+    handler
+        .handle_ok(UnlinkWindowRequest {
             target: source,
             kill_if_last: false,
-        }))
+        })
         .await;
-    assert!(
-        matches!(response, Response::UnlinkWindow(_)),
-        "{response:?}"
-    );
     {
         let state = handler.state.lock().await;
         assert_eq!(
@@ -209,32 +169,19 @@ async fn surviving_alias_becomes_the_retirement_slot_after_original_slot_reuse()
         );
     }
 
-    let response = handler
-        .handle(Request::NewWindow(Box::new(NewWindowRequest {
-            target: alpha,
-            name: None,
-            detached: true,
-            start_directory: None,
-            environment: None,
-            command: None,
-            process_command: None,
+    handler
+        .create_window(NewWindowRequest {
             target_window_index: Some(0),
-            insert_at_target: false,
-        })))
+            ..Fixture::fixture(alpha)
+        })
         .await;
-    assert!(matches!(response, Response::NewWindow(_)), "{response:?}");
-    handler.wait_for_initial_panes_for_test().await;
 
-    let response = handler
-        .handle(Request::UnlinkWindow(UnlinkWindowRequest {
+    handler
+        .handle_ok(UnlinkWindowRequest {
             target: WindowTarget::with_window(beta, 1),
             kill_if_last: true,
-        }))
+        })
         .await;
-    assert!(
-        matches!(response, Response::UnlinkWindow(_)),
-        "{response:?}"
-    );
     let state = handler.state.lock().await;
     assert_retired(&lease, &state);
 }
@@ -242,12 +189,8 @@ async fn surviving_alias_becomes_the_retirement_slot_after_original_slot_reuse()
 #[tokio::test]
 async fn respawn_boundary_retires_the_old_pane_lifetime_even_when_id_survives() {
     let handler = RequestHandler::new();
-    let session_name = session_name("retained-pane-respawn");
     let mut state = handler.state.lock().await;
-    state
-        .sessions
-        .create_session(session_name.clone(), terminal_size())
-        .expect("create session");
+    let session_name = create_session_in_state(&mut state, "retained-pane-respawn");
     let target = PaneTarget::with_window(session_name.clone(), 0, 0);
     let lease = state
         .capture_retained_pane_lifecycle_target(&target)
@@ -277,12 +220,8 @@ async fn respawn_boundary_retires_the_old_pane_lifetime_even_when_id_survives() 
 #[tokio::test]
 async fn same_transaction_slot_replacement_invalidates_instead_of_retargeting() {
     let handler = RequestHandler::new();
-    let session_name = session_name("retained-window-replacement");
     let mut state = handler.state.lock().await;
-    state
-        .sessions
-        .create_session(session_name.clone(), terminal_size())
-        .expect("create session");
+    let session_name = create_session_in_state(&mut state, "retained-window-replacement");
     let target = WindowTarget::with_window(session_name.clone(), 0);
     let lease = state
         .capture_retained_window_lifecycle_target(&target)
@@ -306,12 +245,8 @@ async fn same_transaction_slot_replacement_invalidates_instead_of_retargeting() 
 #[tokio::test]
 async fn retired_window_never_reacquires_a_later_numeric_slot_reuse() {
     let handler = RequestHandler::new();
-    let session_name = session_name("retained-window-reuse");
     let mut state = handler.state.lock().await;
-    state
-        .sessions
-        .create_session(session_name.clone(), terminal_size())
-        .expect("create session");
+    let session_name = create_session_in_state(&mut state, "retained-window-reuse");
     let target = WindowTarget::with_window(session_name.clone(), 0);
     let lease = state
         .capture_retained_window_lifecycle_target(&target)

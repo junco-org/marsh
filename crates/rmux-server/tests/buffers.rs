@@ -1,32 +1,21 @@
 use std::error::Error;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 mod common;
 
-use common::{send_request, session_name, start_server, TestHarness};
+use common::{
+    create_session, send, send_ok, send_request, session_name, start_server, Fixture, TestHarness,
+    TestRequest,
+};
 use rmux_proto::{
     DaemonStatusRequest, DeleteBufferRequest, KillServerRequest, ListBuffersRequest,
-    LoadBufferRequest, NewSessionRequest, PaneTarget, PasteBufferRequest, Request, Response,
-    SaveBufferRequest, SetBufferRequest, ShowBufferRequest, SourceFileRequest, TerminalSize,
+    LoadBufferRequest, PaneTarget, PasteBufferRequest, Request, Response, SaveBufferRequest,
+    SetBufferRequest, ShowBufferRequest, SourceFileRequest,
 };
 
 const FIFO_REQUEST_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
-
-async fn create_session(harness: &TestHarness, name: &str) -> Result<(), Box<dyn Error>> {
-    let response = send_request(
-        harness.socket_path(),
-        &Request::NewSession(NewSessionRequest {
-            session_name: session_name(name),
-            detached: true,
-            size: Some(TerminalSize { cols: 80, rows: 24 }),
-            environment: None,
-        }),
-    )
-    .await?;
-    assert!(matches!(response, Response::NewSession(_)));
-    Ok(())
-}
 
 #[tokio::test(flavor = "multi_thread")]
 async fn client_disconnect_cancels_load_buffer_blocked_on_fifo_without_shutdown(
@@ -36,14 +25,8 @@ async fn client_disconnect_cancels_load_buffer_blocked_on_fifo_without_shutdown(
     let fifo_path = fifo_path(&harness, "load.fifo");
     create_fifo(&fifo_path)?;
 
-    let request = Request::LoadBuffer(Box::new(LoadBufferRequest {
-        path: fifo_path.display().to_string(),
-        cwd: None,
-        name: Some("blocked".to_owned()),
-        set_clipboard: false,
-        target_client: None,
-    }));
-    assert_peer_disconnect_cleans_blocked_request(&harness, request).await?;
+    let request = LoadBufferRequest::fixture((fifo_path.display().to_string(), "blocked"));
+    assert_peer_disconnect_cleans_blocked_request(&harness, request.into_request()).await?;
 
     request_kill_server(harness.socket_path()).await?;
     handle.wait().await?;
@@ -58,25 +41,9 @@ async fn client_disconnect_cancels_save_buffer_blocked_on_fifo_without_shutdown(
     let fifo_path = fifo_path(&harness, "save.fifo");
     create_fifo(&fifo_path)?;
 
-    send_request(
-        harness.socket_path(),
-        &Request::SetBuffer(Box::new(SetBufferRequest {
-            name: Some("blocked".to_owned()),
-            content: b"blocked write".to_vec(),
-            append: false,
-            new_name: None,
-            set_clipboard: false,
-            target_client: None,
-        })),
-    )
-    .await?;
-    let request = Request::SaveBuffer(SaveBufferRequest {
-        path: fifo_path.display().to_string(),
-        cwd: None,
-        name: Some("blocked".to_owned()),
-        append: false,
-    });
-    assert_peer_disconnect_cleans_blocked_request(&harness, request).await?;
+    send(harness.socket_path(), blocked_buffer()).await?;
+    let request = SaveBufferRequest::fixture((fifo_path.display().to_string(), "blocked"));
+    assert_peer_disconnect_cleans_blocked_request(&harness, request.into_request()).await?;
 
     request_kill_server(harness.socket_path()).await?;
     handle.wait().await?;
@@ -183,24 +150,23 @@ fn fifo_path(harness: &TestHarness, name: &str) -> PathBuf {
         .join(name)
 }
 
+/// The buffer the FIFO save tests try to write out.
+fn blocked_buffer() -> SetBufferRequest {
+    SetBufferRequest {
+        name: Some("blocked".to_owned()),
+        ..Fixture::fixture(b"blocked write")
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn kill_server_cancels_load_buffer_blocked_opening_fifo() -> Result<(), Box<dyn Error>> {
     let harness = TestHarness::new("buf-kill-load-fifo");
     let handle = start_server(&harness).await?;
-    let fifo_path = harness
-        .socket_path()
-        .parent()
-        .expect("test socket has parent")
-        .join("load.fifo");
+    let fifo_path = fifo_path(&harness, "load.fifo");
     create_fifo(&fifo_path)?;
 
-    let request = Request::LoadBuffer(Box::new(LoadBufferRequest {
-        path: fifo_path.display().to_string(),
-        cwd: None,
-        name: Some("blocked".to_owned()),
-        set_clipboard: false,
-        target_client: None,
-    }));
+    let request =
+        LoadBufferRequest::fixture((fifo_path.display().to_string(), "blocked")).into_request();
     let mut blocked_request = Box::pin(send_request(harness.socket_path(), &request));
     assert_request_stays_blocked(blocked_request.as_mut()).await;
 
@@ -216,32 +182,13 @@ async fn kill_server_cancels_load_buffer_blocked_opening_fifo() -> Result<(), Bo
 async fn kill_server_cancels_save_buffer_blocked_opening_fifo() -> Result<(), Box<dyn Error>> {
     let harness = TestHarness::new("buf-kill-save-fifo");
     let handle = start_server(&harness).await?;
-    let fifo_path = harness
-        .socket_path()
-        .parent()
-        .expect("test socket has parent")
-        .join("save.fifo");
+    let fifo_path = fifo_path(&harness, "save.fifo");
     create_fifo(&fifo_path)?;
 
-    send_request(
-        harness.socket_path(),
-        &Request::SetBuffer(Box::new(SetBufferRequest {
-            name: Some("blocked".to_owned()),
-            content: b"blocked write".to_vec(),
-            append: false,
-            new_name: None,
-            set_clipboard: false,
-            target_client: None,
-        })),
-    )
-    .await?;
+    send(harness.socket_path(), blocked_buffer()).await?;
 
-    let request = Request::SaveBuffer(SaveBufferRequest {
-        path: fifo_path.display().to_string(),
-        cwd: None,
-        name: Some("blocked".to_owned()),
-        append: false,
-    });
+    let request =
+        SaveBufferRequest::fixture((fifo_path.display().to_string(), "blocked")).into_request();
     let mut blocked_request = Box::pin(send_request(harness.socket_path(), &request));
     assert_request_stays_blocked(blocked_request.as_mut()).await;
 
@@ -255,7 +202,7 @@ async fn kill_server_cancels_save_buffer_blocked_opening_fifo() -> Result<(), Bo
 
 async fn assert_request_stays_blocked<F>(mut request: std::pin::Pin<&mut F>)
 where
-    F: std::future::Future<Output = Result<Response, Box<dyn Error>>> + ?Sized,
+    F: Future<Output = Result<Response, Box<dyn Error>>> + ?Sized,
 {
     tokio::select! {
         response = request.as_mut() => panic!("FIFO request unexpectedly completed: {response:?}"),
@@ -265,7 +212,7 @@ where
 
 async fn assert_blocked_request_was_disconnected<F>(request: std::pin::Pin<&mut F>)
 where
-    F: std::future::Future<Output = Result<Response, Box<dyn Error>>> + ?Sized,
+    F: Future<Output = Result<Response, Box<dyn Error>>> + ?Sized,
 {
     let response = tokio::time::timeout(std::time::Duration::from_secs(2), request)
         .await
@@ -297,16 +244,9 @@ async fn set_and_show_buffer_round_trips_through_real_socket() -> Result<(), Box
     let harness = TestHarness::new("buf-set-show");
     let handle = start_server(&harness).await?;
 
-    let set_response = send_request(
+    let set_response = send(
         harness.socket_path(),
-        &Request::SetBuffer(Box::new(SetBufferRequest {
-            name: None,
-            content: b"hello world".to_vec(),
-            append: false,
-            new_name: None,
-            set_clipboard: false,
-            target_client: None,
-        })),
+        SetBufferRequest::fixture(b"hello world"),
     )
     .await?;
 
@@ -335,31 +275,15 @@ async fn list_buffers_returns_formatted_output_through_real_socket() -> Result<(
     let harness = TestHarness::new("buf-list");
     let handle = start_server(&harness).await?;
 
-    send_request(
+    send(
         harness.socket_path(),
-        &Request::SetBuffer(Box::new(SetBufferRequest {
+        SetBufferRequest {
             name: Some("alpha".to_owned()),
-            content: b"first".to_vec(),
-            append: false,
-            new_name: None,
-            set_clipboard: false,
-            target_client: None,
-        })),
+            ..Fixture::fixture(b"first")
+        },
     )
     .await?;
-
-    send_request(
-        harness.socket_path(),
-        &Request::SetBuffer(Box::new(SetBufferRequest {
-            name: None,
-            content: b"second".to_vec(),
-            append: false,
-            new_name: None,
-            set_clipboard: false,
-            target_client: None,
-        })),
-    )
-    .await?;
+    send(harness.socket_path(), SetBufferRequest::fixture(b"second")).await?;
 
     let list_response = send_request(
         harness.socket_path(),
@@ -383,31 +307,8 @@ async fn delete_buffer_removes_stack_head_through_real_socket() -> Result<(), Bo
     let harness = TestHarness::new("buf-delete");
     let handle = start_server(&harness).await?;
 
-    send_request(
-        harness.socket_path(),
-        &Request::SetBuffer(Box::new(SetBufferRequest {
-            name: None,
-            content: b"a".to_vec(),
-            append: false,
-            new_name: None,
-            set_clipboard: false,
-            target_client: None,
-        })),
-    )
-    .await?;
-
-    send_request(
-        harness.socket_path(),
-        &Request::SetBuffer(Box::new(SetBufferRequest {
-            name: None,
-            content: b"b".to_vec(),
-            append: false,
-            new_name: None,
-            set_clipboard: false,
-            target_client: None,
-        })),
-    )
-    .await?;
+    send(harness.socket_path(), SetBufferRequest::fixture(b"a")).await?;
+    send(harness.socket_path(), SetBufferRequest::fixture(b"b")).await?;
 
     let delete_response = send_request(
         harness.socket_path(),
@@ -437,32 +338,17 @@ async fn delete_buffer_removes_stack_head_through_real_socket() -> Result<(), Bo
 async fn paste_buffer_to_session_pane_through_real_socket() -> Result<(), Box<dyn Error>> {
     let harness = TestHarness::new("buf-paste");
     let handle = start_server(&harness).await?;
-    create_session(&harness, "alpha").await?;
+    create_session(harness.socket_path(), "alpha").await?;
 
-    send_request(
+    send(
         harness.socket_path(),
-        &Request::SetBuffer(Box::new(SetBufferRequest {
-            name: None,
-            content: b"paste-me".to_vec(),
-            append: false,
-            new_name: None,
-            set_clipboard: false,
-            target_client: None,
-        })),
+        SetBufferRequest::fixture(b"paste-me"),
     )
     .await?;
 
-    let paste_response = send_request(
+    let paste_response = send(
         harness.socket_path(),
-        &Request::PasteBuffer(Box::new(PasteBufferRequest {
-            name: None,
-            target: PaneTarget::new(session_name("alpha"), 0),
-            delete_after: false,
-            separator: None,
-            linefeed: false,
-            raw: false,
-            bracketed: false,
-        })),
+        PasteBufferRequest::fixture(PaneTarget::new(session_name("alpha"), 0)),
     )
     .await?;
 
@@ -488,19 +374,11 @@ async fn paste_buffer_without_buffers_is_successful_noop_through_real_socket(
 ) -> Result<(), Box<dyn Error>> {
     let harness = TestHarness::new("buf-paste-empty");
     let handle = start_server(&harness).await?;
-    create_session(&harness, "alpha").await?;
+    create_session(harness.socket_path(), "alpha").await?;
 
-    let paste_response = send_request(
+    let paste_response = send(
         harness.socket_path(),
-        &Request::PasteBuffer(Box::new(PasteBufferRequest {
-            name: None,
-            target: PaneTarget::new(session_name("alpha"), 0),
-            delete_after: false,
-            separator: None,
-            linefeed: false,
-            raw: false,
-            bracketed: false,
-        })),
+        PasteBufferRequest::fixture(PaneTarget::new(session_name("alpha"), 0)),
     )
     .await?;
 
@@ -518,35 +396,18 @@ async fn paste_buffer_with_delete_removes_buffer_through_real_socket() -> Result
 {
     let harness = TestHarness::new("buf-paste-del");
     let handle = start_server(&harness).await?;
-    create_session(&harness, "alpha").await?;
+    create_session(harness.socket_path(), "alpha").await?;
 
-    send_request(
-        harness.socket_path(),
-        &Request::SetBuffer(Box::new(SetBufferRequest {
-            name: None,
-            content: b"temp".to_vec(),
-            append: false,
-            new_name: None,
-            set_clipboard: false,
-            target_client: None,
-        })),
-    )
-    .await?;
+    send(harness.socket_path(), SetBufferRequest::fixture(b"temp")).await?;
 
-    let paste_response = send_request(
+    send_ok(
         harness.socket_path(),
-        &Request::PasteBuffer(Box::new(PasteBufferRequest {
-            name: None,
-            target: PaneTarget::new(session_name("alpha"), 0),
+        PasteBufferRequest {
             delete_after: true,
-            separator: None,
-            linefeed: false,
-            raw: false,
-            bracketed: false,
-        })),
+            ..Fixture::fixture(PaneTarget::new(session_name("alpha"), 0))
+        },
     )
     .await?;
-    assert!(matches!(paste_response, Response::PasteBuffer(_)));
 
     // Buffer should be gone
     let show = send_request(

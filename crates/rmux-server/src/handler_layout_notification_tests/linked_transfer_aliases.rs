@@ -1,15 +1,14 @@
 use rmux_core::LifecycleEvent;
 use rmux_proto::{
-    HookLifecycle, HookName, LinkWindowRequest, Request, Response, ScopeSelector, SessionName,
-    SetHookRequest, WindowTarget,
+    HookName, LinkWindowRequest, ScopeSelector, SessionName, SetHookRequest, WindowTarget,
 };
 use tokio::sync::oneshot;
 
 use super::{
-    create_session, register_control_client, run_control_command, run_detached_command,
-    settle_control_notifications, wait_for_buffer_text, RequestHandler,
+    create_session, run_control_command, run_detached_command, settle_control_notifications,
+    wait_for_buffer_text, RequestHandler,
 };
-use crate::handler::pane_group_transfer_tests::create_grouped_session;
+use crate::test_fixtures::{Fixture, Grouped};
 
 #[tokio::test]
 async fn linked_and_grouped_join_move_keep_requested_resize_alias() {
@@ -40,20 +39,18 @@ async fn assert_transfer_alias(operation: &str, family: &str) {
 
     create_session(&handler, &alpha).await;
     if family == "grouped" {
-        create_grouped_session(&handler, beta.as_str(), &alpha).await;
+        handler.create_session(Grouped(&beta, &alpha)).await;
     } else {
         create_session(&handler, &beta).await;
-        let linked = handler
-            .handle(Request::LinkWindow(LinkWindowRequest {
-                source: WindowTarget::with_window(alpha.clone(), 0),
-                target: WindowTarget::with_window(beta.clone(), 0),
-                after: false,
-                before: false,
+        handler
+            .handle_ok(LinkWindowRequest {
                 kill_destination: true,
-                detached: true,
-            }))
+                ..Fixture::fixture((
+                    WindowTarget::with_window(alpha.clone(), 0),
+                    WindowTarget::with_window(beta.clone(), 0),
+                ))
+            })
             .await;
-        assert!(matches!(linked, Response::LinkWindow(_)), "{linked:?}");
     }
     let requested = alias_opposite_hashmap_first(&handler, &alpha, &beta).await;
     create_session(&handler, &source).await;
@@ -68,9 +65,19 @@ async fn assert_transfer_alias(operation: &str, family: &str) {
     )
     .await;
     run_detached_command(&handler, &format!("set-buffer -b {buffer} ''")).await;
-    set_resize_hook(&handler, &buffer).await;
+    let resize_hook = format!("run-shell -C 'set-buffer -b {buffer} #{{session_name}}'");
+    handler
+        .handle_ok(SetHookRequest::fixture((
+            ScopeSelector::Global,
+            HookName::WindowResized,
+            resize_hook.as_str(),
+        )))
+        .await;
 
-    let (control_pid, mut notifications) = register_control_client(&handler, &requested).await;
+    let control_pid = std::process::id();
+    let (_, mut notifications) = handler
+        .register_control_for_test(control_pid, Some(&requested))
+        .await;
     let _ = settle_control_notifications(&mut notifications).await;
     let mut lifecycle_events = handler.subscribe_lifecycle_events();
     let command = format!("{operation} -h -d -s {source}:0.0 -t {requested}:0.0");
@@ -142,18 +149,6 @@ async fn alias_opposite_hashmap_first(
     } else {
         alpha.clone()
     }
-}
-
-async fn set_resize_hook(handler: &RequestHandler, buffer: &str) {
-    let response = handler
-        .handle(Request::SetHook(SetHookRequest {
-            scope: ScopeSelector::Global,
-            hook: HookName::WindowResized,
-            command: format!("run-shell -C 'set-buffer -b {buffer} #{{session_name}}'"),
-            lifecycle: HookLifecycle::Persistent,
-        }))
-        .await;
-    assert!(matches!(response, Response::SetHook(_)), "{response:?}");
 }
 
 use crate::test_names::session_name;

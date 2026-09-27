@@ -46,34 +46,15 @@ async fn create_status_off_attach(
     mpsc::UnboundedReceiver<AttachControl>,
 ) {
     let handler = RequestHandler::new();
-    let session = session_name(name);
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: session.clone(),
-                detached: true,
-                size: Some(size),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
-    {
-        let mut state = handler.state.lock().await;
-        state
-            .options
-            .set(
-                ScopeSelector::Session(session.clone()),
-                OptionName::Status,
-                "off".to_owned(),
-                SetOptionMode::Replace,
-            )
-            .expect("status off");
-    }
-    let (control_tx, control_rx) = mpsc::unbounded_channel();
+    let session = handler.create_session((name, size)).await;
     handler
-        .register_attach(attach_pid, session.clone(), control_tx)
+        .store_option_for_test(
+            ScopeSelector::Session(session.clone()),
+            OptionName::Status,
+            "off",
+        )
         .await;
+    let control_rx = handler.attach_client(attach_pid, &session).await;
     (handler, session, control_rx)
 }
 
@@ -85,22 +66,15 @@ async fn display_status_off_message(
     duration_ms: u32,
     ignore_input: bool,
 ) {
-    assert!(matches!(
-        handler
-            .handle(Request::DisplayMessageExt(Box::new(
-                DisplayMessageExtRequest {
-                    target: Some(Target::Session(session.clone())),
-                    print: false,
-                    message: Some(message.to_owned()),
-                    target_client: Some(attach_pid.to_string()),
-                    empty_target_context: false,
-                    duration_ms: Some(rmux_proto::DisplayMessageDurationMillis::new(duration_ms,)),
-                    ignore_input,
-                },
-            )))
-            .await,
-        Response::DisplayMessage(_)
-    ));
+    handler
+        .handle_ok(DisplayMessageExtRequest {
+            target: Some(Target::Session(session.clone())),
+            target_client: Some(attach_pid.to_string()),
+            duration_ms: Some(rmux_proto::DisplayMessageDurationMillis::new(duration_ms)),
+            ignore_input,
+            ..Fixture::fixture(message)
+        })
+        .await;
 }
 
 async fn expire_current_message(handler: &RequestHandler, attach_pid: u32) {

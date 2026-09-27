@@ -1,15 +1,16 @@
 use std::path::Path;
 
-use rmux_client::connect;
+use rmux_client::Connection;
 use rmux_proto::{
-    ErrorResponse, ProcessCommand, Request, Response, SplitWindowExtRequest, SplitWindowRequest,
-    SplitWindowTargetActionRequest,
+    ErrorResponse, PaneTarget, ProcessCommand, Request, Response, SplitWindowExtRequest,
+    SplitWindowRequest, SplitWindowTarget, SplitWindowTargetActionRequest, Target,
 };
 
 use super::super::format_print::print_target_format;
+use super::super::target_resolution::{connect_cli, response_failure};
 use super::super::{
-    ExitFailure, cli_target_actions_enabled, resolve_current_pane_target,
-    resolve_split_window_target_spec, target_action_needs_legacy_retry, unexpected_response,
+    ExitFailure, cli_target_actions_enabled, resolve_pane_target_or_current,
+    target_action_needs_legacy_retry, unexpected_response,
 };
 use crate::cli_args::SplitWindowArgs;
 use crate::cli_response::tmux_cli_error_message;
@@ -26,40 +27,25 @@ pub(in crate::cli) fn run_split_window(
         args.start_directory = std::env::current_dir().ok();
     }
     if !cli_target_actions_enabled() {
-        return run_split_window_legacy(args, socket_path);
+        return run_split_window_legacy(args, socket_path, None);
     }
 
     let legacy_args = args.clone();
     let direction = args.direction();
-    let print_target = args.print_target;
-    let print_format = args
-        .format
-        .clone()
-        .unwrap_or_else(|| DEFAULT_SPLIT_WINDOW_PRINT_FORMAT.to_owned());
-    let mut connection = connect(socket_path)
-        .map_err(|error| ExitFailure::from_client_connect(socket_path, error))?;
+    let mut connection = connect_cli(socket_path)?;
     let target = args.target.as_ref().map(|target| target.raw().to_owned());
     let size = args.size_spec();
     let environment = (!args.environment.is_empty()).then_some(args.environment);
     let command = (!args.command.is_empty()).then_some(args.command);
     let stdin_to_empty_pane = args.stdin && command.is_none();
-    let legacy_stdin_payload = if stdin_to_empty_pane {
-        Some(read_stdin_payload()?)
-    } else {
-        None
-    };
-    let process_command = if stdin_to_empty_pane {
-        Some(ProcessCommand::Shell(String::new()))
-    } else {
-        None
-    };
+    let legacy_stdin_payload = stdin_to_empty_pane.then(read_stdin_payload).transpose()?;
     let response = connection.split_window_target_action(SplitWindowTargetActionRequest {
         target,
         direction,
         before: args.before,
         environment,
         command,
-        process_command,
+        process_command: stdin_to_empty_pane.then_some(ProcessCommand::Shell(String::new())),
         start_directory: args.start_directory,
         keep_alive_on_exit: (args.keep_alive_on_exit || stdin_to_empty_pane).then_some(true),
         detached: args.detached,
@@ -69,10 +55,9 @@ pub(in crate::cli) fn run_split_window(
         stdin_payload: legacy_stdin_payload.clone(),
     });
     if target_action_needs_legacy_retry(&response) {
-        return run_split_window_legacy_with_stdin(legacy_args, socket_path, legacy_stdin_payload);
+        return run_split_window_legacy(legacy_args, socket_path, legacy_stdin_payload);
     }
-    let response = response.map_err(ExitFailure::from)?;
-    let pane = match response {
+    let pane = match response.map_err(ExitFailure::from)? {
         Response::SplitWindow(response) => response.pane,
         Response::Error(ErrorResponse { error }) => {
             return Err(ExitFailure::new(
@@ -82,62 +67,37 @@ pub(in crate::cli) fn run_split_window(
         }
         other => return Err(unexpected_response("split-window", &other)),
     };
-
-    if print_target {
-        print_target_format(
-            &mut connection,
-            "split-window",
-            rmux_proto::Target::Pane(pane),
-            &print_format,
-        )?;
-    }
-    Ok(0)
+    print_new_pane(
+        &mut connection,
+        args.print_target,
+        args.format.as_deref(),
+        pane,
+    )
 }
 
-/// Splits a window after resolving the target locally, as older servers require.
-fn run_split_window_legacy(args: SplitWindowArgs, socket_path: &Path) -> Result<i32, ExitFailure> {
-    run_split_window_legacy_with_stdin(args, socket_path, None)
-}
-
-/// Legacy `split-window` path that reuses stdin already read for the target-action attempt.
-fn run_split_window_legacy_with_stdin(
+/// Splits a window after resolving the target locally, as older servers require, reusing stdin
+/// already read for a target-action attempt.
+fn run_split_window_legacy(
     args: SplitWindowArgs,
     socket_path: &Path,
     preloaded_stdin_payload: Option<Vec<u8>>,
 ) -> Result<i32, ExitFailure> {
     let direction = args.direction();
-    let print_target = args.print_target;
-    let print_format = args
-        .format
-        .clone()
-        .unwrap_or_else(|| DEFAULT_SPLIT_WINDOW_PRINT_FORMAT.to_owned());
-    let mut connection = connect(socket_path)
-        .map_err(|error| ExitFailure::from_client_connect(socket_path, error))?;
-    let target = match args.target.as_ref() {
-        Some(target) => resolve_split_window_target_spec(&mut connection, target)?,
-        None => rmux_proto::SplitWindowTarget::Pane(resolve_current_pane_target(
-            &mut connection,
-            "split-window",
-        )?),
-    };
+    let mut connection = connect_cli(socket_path)?;
+    let target = SplitWindowTarget::Pane(resolve_pane_target_or_current(
+        &mut connection,
+        args.target.as_ref(),
+        "split-window",
+    )?);
     let size = args.size_spec();
     let environment = (!args.environment.is_empty()).then_some(args.environment);
     let command = (!args.command.is_empty()).then_some(args.command);
     let stdin_to_empty_pane = args.stdin && command.is_none();
-    let stdin_payload = if stdin_to_empty_pane {
-        match preloaded_stdin_payload {
-            Some(payload) => Some(payload),
-            None => Some(read_stdin_payload()?),
-        }
-    } else {
-        None
-    };
-    let process_command = if stdin_to_empty_pane {
-        Some(ProcessCommand::Shell(String::new()))
-    } else {
-        None
-    };
-    let response = if command.is_some()
+    let stdin_payload = stdin_to_empty_pane
+        .then(|| preloaded_stdin_payload.map_or_else(read_stdin_payload, Ok))
+        .transpose()?;
+    let process_command = stdin_to_empty_pane.then_some(ProcessCommand::Shell(String::new()));
+    let request = if command.is_some()
         || process_command.is_some()
         || args.start_directory.is_some()
         || args.detached
@@ -147,49 +107,51 @@ fn run_split_window_legacy_with_stdin(
         || args.keep_alive_on_exit
         || stdin_payload.is_some()
     {
-        connection
-            .roundtrip(&Request::SplitWindowExt(Box::new(SplitWindowExtRequest {
-                target,
-                direction,
-                before: args.before,
-                environment,
-                command,
-                process_command,
-                start_directory: args.start_directory,
-                keep_alive_on_exit: (args.keep_alive_on_exit || stdin_to_empty_pane)
-                    .then_some(true),
-                detached: args.detached,
-                size,
-                preserve_zoom: args.preserve_zoom,
-                full_size: args.full_size,
-                stdin_payload,
-            })))
-            .map_err(ExitFailure::from)?
+        Request::SplitWindowExt(Box::new(SplitWindowExtRequest {
+            target,
+            direction,
+            before: args.before,
+            environment,
+            command,
+            process_command,
+            start_directory: args.start_directory,
+            keep_alive_on_exit: (args.keep_alive_on_exit || stdin_to_empty_pane).then_some(true),
+            detached: args.detached,
+            size,
+            preserve_zoom: args.preserve_zoom,
+            full_size: args.full_size,
+            stdin_payload,
+        }))
     } else {
-        connection
-            .roundtrip(&Request::SplitWindow(SplitWindowRequest {
-                target,
-                direction,
-                before: args.before,
-                environment,
-            }))
-            .map_err(ExitFailure::from)?
+        Request::SplitWindow(SplitWindowRequest {
+            target,
+            direction,
+            before: args.before,
+            environment,
+        })
     };
-    let pane = match response {
+    let pane = match connection.roundtrip(&request).map_err(ExitFailure::from)? {
         Response::SplitWindow(response) => response.pane,
-        Response::Error(ErrorResponse { error }) => {
-            return Err(ExitFailure::new(1, error.to_string()));
-        }
-        other => return Err(unexpected_response("split-window", &other)),
+        other => return Err(response_failure("split-window", &other)),
     };
+    print_new_pane(
+        &mut connection,
+        args.print_target,
+        args.format.as_deref(),
+        pane,
+    )
+}
 
+/// Prints the new pane through `-F`, or the default target format, when `-P` was given.
+fn print_new_pane(
+    connection: &mut Connection,
+    print_target: bool,
+    format: Option<&str>,
+    pane: PaneTarget,
+) -> Result<i32, ExitFailure> {
     if print_target {
-        print_target_format(
-            &mut connection,
-            "split-window",
-            rmux_proto::Target::Pane(pane),
-            &print_format,
-        )?;
+        let format = format.unwrap_or(DEFAULT_SPLIT_WINDOW_PRINT_FORMAT);
+        print_target_format(connection, "split-window", Target::Pane(pane), format)?;
     }
     Ok(0)
 }

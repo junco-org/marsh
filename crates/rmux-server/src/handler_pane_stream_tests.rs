@@ -1,20 +1,24 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use marsh_lib::InitializationRoute;
 use rmux_core::events::SubscriptionLimits;
 use rmux_proto::{
     NewSessionExtRequest, PaneRawRebase, PaneRawRebaseReason, PaneRecoveryCoverage,
     PaneSnapshotRequest, PaneStreamCursorRequest, PaneStreamEndReason, PaneStreamEvent,
     PaneStreamLifecycleEvent, PaneStreamMode, PaneSurfaceFrame, PaneTarget, PaneTargetRef,
-    RenameSessionRequest, Request, Response, SessionName, SplitDirection, SplitWindowRequest,
-    SplitWindowTarget, SubscribePaneStreamRequest, SubscribePaneStreamResponse, TerminalSize,
-    UnsubscribePaneStreamRequest, DEFAULT_MAX_DETACHED_FRAME_LENGTH,
+    RenameSessionRequest, Request, Response, SplitWindowRequest, SubscribePaneStreamRequest,
+    SubscribePaneStreamResponse, TerminalSize, UnsubscribePaneStreamRequest,
+    DEFAULT_MAX_DETACHED_FRAME_LENGTH,
 };
 
 use crate::pane_io::{PaneExitEvent, PaneInvalidationReason, PaneOutputSender};
 use crate::pane_transcript::SharedPaneTranscript;
+use crate::test_fixtures::{quiet_command, Fixture};
+use crate::test_names::session_name;
 
 use super::{validate_raw_rebase_size, RequestHandler};
+use surface_test_support::subscribe_mode_response;
 
 #[path = "handler_pane_stream_tests/subscription_kind.rs"]
 mod subscription_kind;
@@ -27,40 +31,17 @@ mod surface_test_support;
 
 const CONNECTION_ID: u64 = 41;
 
-fn quiet_command() -> Vec<String> {
-    vec!["/bin/sh".to_owned(), "-c".to_owned(), "sleep 60".to_owned()]
-}
-
 async fn test_pane(
     handler: &RequestHandler,
 ) -> (PaneTarget, PaneOutputSender, SharedPaneTranscript) {
-    let session = SessionName::new("pane-stream").expect("valid session name");
-    let response = handler
-        .handle(Request::NewSessionExt(Box::new(NewSessionExtRequest {
-            session_name: Some(session.clone()),
-            working_directory: None,
-            detached: true,
+    let session = handler
+        .create_started_session(NewSessionExtRequest {
             size: Some(TerminalSize { cols: 12, rows: 4 }),
-            environment: None,
-            group_target: None,
-            attach_if_exists: false,
-            detach_other_clients: false,
-            kill_other_clients: false,
-            flags: None,
-            window_name: None,
-            print_session_info: false,
-            print_format: None,
             command: Some(quiet_command()),
-            process_command: None,
-            client_environment: None,
-            skip_environment_update: false,
-        })))
+            ..Fixture::fixture("pane-stream")
+        })
         .await;
-    assert!(matches!(response, Response::NewSession(_)), "{response:?}");
     let target = PaneTarget::with_window(session, 0, 0);
-    handler
-        .wait_for_pane_startup_to_finish_for_test(&target)
-        .await;
     let (output, transcript) = {
         let state = handler.state.lock().await;
         (
@@ -158,20 +139,15 @@ async fn subscribe_with_snapshot(
     mode: PaneStreamMode,
     include_snapshot: bool,
 ) -> SubscribePaneStreamResponse {
-    let response = handler
-        .handle_subscribe_pane_stream(
+    handler
+        .subscribe_ok(
             CONNECTION_ID,
             SubscribePaneStreamRequest {
-                target: PaneTargetRef::slot(target.clone()),
-                mode,
                 include_snapshot,
+                ..Fixture::fixture((target, mode))
             },
         )
-        .await;
-    let Response::SubscribePaneStream(response) = response else {
-        panic!("unexpected subscribe response: {response:?}");
-    };
-    *response
+        .await
 }
 
 async fn cursor(
@@ -1297,7 +1273,7 @@ async fn cancelled_surface_refresh_is_retried_after_a_pane_rekey() {
     let guard =
         super::SurfaceRefreshGuard::new(&handler.subscriptions, previous.pane_id(), token, pending);
     let current = rmux_core::events::PaneOutputSubscriptionKey::new(
-        SessionName::new("pane-stream-moved").expect("valid session"),
+        session_name("pane-stream-moved"),
         previous.pane_id(),
     );
     handler
@@ -1448,15 +1424,9 @@ async fn kill_pane_drains_buffered_stream_events_before_typed_end() {
 async fn kill_pane_all_except_drains_the_removed_pane_stream() {
     let handler = RequestHandler::new();
     let (target, output, transcript) = test_pane(&handler).await;
-    let response = handler
-        .handle(Request::SplitWindow(SplitWindowRequest {
-            target: SplitWindowTarget::Pane(target.clone()),
-            direction: SplitDirection::Vertical,
-            before: false,
-            environment: None,
-        }))
+    handler
+        .handle_ok(SplitWindowRequest::fixture(&target))
         .await;
-    assert!(matches!(response, Response::SplitWindow(_)), "{response:?}");
 
     // Killing every pane except the split sibling leaves the window and the
     // session alive, so only the removed pane's staged source can project its
@@ -1623,15 +1593,9 @@ async fn assert_exit_commit_keeps_stream_source_available(
     let handler = Arc::new(RequestHandler::new());
     let (target, output, transcript) = test_pane(handler.as_ref()).await;
     if keep_session {
-        let response = handler
-            .handle(Request::SplitWindow(SplitWindowRequest {
-                target: SplitWindowTarget::Pane(target.clone()),
-                direction: SplitDirection::Vertical,
-                before: false,
-                environment: None,
-            }))
+        handler
+            .handle_ok(SplitWindowRequest::fixture(&target))
             .await;
-        assert!(matches!(response, Response::SplitWindow(_)), "{response:?}");
     }
     let subscribed =
         subscribe_with_snapshot(handler.as_ref(), &target, mode, mode == PaneStreamMode::Raw).await;
@@ -1940,8 +1904,7 @@ async fn reserved_raw_subscription_keeps_exit_reason_when_initialization_finishe
 async fn raw_subscription_response_uses_rekeyed_session_after_concurrent_rename() {
     let handler = RequestHandler::new();
     let (target, _, _) = test_pane(&handler).await;
-    let renamed_session =
-        SessionName::new("pane-stream-renamed").expect("valid renamed session name");
+    let renamed_session = session_name("pane-stream-renamed");
     let source = {
         let state = handler.state.lock().await;
         super::stream_source_for_target(&state, target).expect("stream source")
@@ -1973,13 +1936,12 @@ async fn raw_subscription_response_uses_rekeyed_session_after_concurrent_rename(
         id
     };
 
-    let rename = handler
-        .handle(Request::RenameSession(RenameSessionRequest {
+    handler
+        .handle_ok(RenameSessionRequest {
             target: source.target.session_name().clone(),
             new_name: renamed_session.clone(),
-        }))
+        })
         .await;
-    assert!(matches!(rename, Response::RenameSession(_)), "{rename:?}");
 
     let response = handler.finish_raw_subscription(
         CONNECTION_ID,
@@ -2005,8 +1967,7 @@ async fn existing_surface_response_uses_rekeyed_session_after_concurrent_rename(
     let handler = RequestHandler::new();
     let (target, _, _) = test_pane(&handler).await;
     let _active = subscribe(&handler, &target, PaneStreamMode::Surface).await;
-    let renamed_session =
-        SessionName::new("surface-stream-renamed").expect("valid renamed session name");
+    let renamed_session = session_name("surface-stream-renamed");
     let source = {
         let state = handler.state.lock().await;
         super::stream_source_for_target(&state, target).expect("stream source")
@@ -2025,13 +1986,12 @@ async fn existing_surface_response_uses_rekeyed_session_after_concurrent_rename(
         id
     };
 
-    let rename = handler
-        .handle(Request::RenameSession(RenameSessionRequest {
+    handler
+        .handle_ok(RenameSessionRequest {
             target: source.target.session_name().clone(),
             new_name: renamed_session.clone(),
-        }))
+        })
         .await;
-    assert!(matches!(rename, Response::RenameSession(_)), "{rename:?}");
 
     let response = handler.finish_existing_surface_subscription(CONNECTION_ID, reserved_id, source);
     let Response::SubscribePaneStream(response) = response else {
@@ -2051,8 +2011,7 @@ async fn existing_surface_response_uses_rekeyed_session_after_concurrent_rename(
 async fn waiting_surface_response_uses_rekeyed_session_after_concurrent_rename() {
     let handler = Arc::new(RequestHandler::new());
     let (target, _, _) = test_pane(handler.as_ref()).await;
-    let renamed_session =
-        SessionName::new("surface-wait-renamed").expect("valid renamed session name");
+    let renamed_session = session_name("surface-wait-renamed");
     let key = {
         let state = handler.state.lock().await;
         state
@@ -2061,8 +2020,7 @@ async fn waiting_surface_response_uses_rekeyed_session_after_concurrent_rename()
     };
     let initialization_token = {
         let mut subscriptions = handler.subscriptions.lock().expect("subscription lock");
-        let super::SurfaceDriverRoute::Initialize { token } =
-            subscriptions.surface_driver_route(&key)
+        let InitializationRoute::Initialize { token } = subscriptions.surface_driver_route(&key)
         else {
             panic!("test must reserve the surface initializer");
         };
@@ -2075,11 +2033,7 @@ async fn waiting_surface_response_uses_rekeyed_session_after_concurrent_rename()
         task_handler
             .handle_subscribe_pane_stream(
                 CONNECTION_ID,
-                SubscribePaneStreamRequest {
-                    target: PaneTargetRef::slot(request_target),
-                    mode: PaneStreamMode::Surface,
-                    include_snapshot: false,
-                },
+                SubscribePaneStreamRequest::fixture((request_target, PaneStreamMode::Surface)),
             )
             .await
     });
@@ -2103,18 +2057,18 @@ async fn waiting_surface_response_uses_rekeyed_session_after_concurrent_rename()
         "surface waiter must reserve its stream before the rename"
     );
 
-    let rename = handler
-        .handle(Request::RenameSession(RenameSessionRequest {
+    handler
+        .handle_ok(RenameSessionRequest {
             target: target.session_name().clone(),
             new_name: renamed_session.clone(),
-        }))
+        })
         .await;
-    assert!(matches!(rename, Response::RenameSession(_)), "{rename:?}");
     handler
         .subscriptions
         .lock()
         .expect("subscription lock")
-        .finish_surface_initialization(initialization_token);
+        .surface_initializations
+        .finish(initialization_token);
 
     let response = tokio::time::timeout(Duration::from_secs(5), task)
         .await
@@ -2130,8 +2084,7 @@ async fn waiting_surface_response_uses_rekeyed_session_after_concurrent_rename()
 async fn draining_surface_source_uses_rekeyed_session_after_concurrent_rename() {
     let handler = RequestHandler::new();
     let (target, _, _) = test_pane(&handler).await;
-    let renamed_session =
-        SessionName::new("surface-drain-renamed").expect("valid renamed session name");
+    let renamed_session = session_name("surface-drain-renamed");
     let source = {
         let state = handler.state.lock().await;
         super::stream_source_for_target(&state, target).expect("stream source")
@@ -2146,13 +2099,12 @@ async fn draining_surface_source_uses_rekeyed_session_after_concurrent_rename() 
     };
     handler.stage_exited_pane_stream_source(source.key.clone(), source.clone());
 
-    let rename = handler
-        .handle(Request::RenameSession(RenameSessionRequest {
+    handler
+        .handle_ok(RenameSessionRequest {
             target: source.target.session_name().clone(),
             new_name: renamed_session.clone(),
-        }))
+        })
         .await;
-    assert!(matches!(rename, Response::RenameSession(_)), "{rename:?}");
     let current_key = handler
         .pane_output_subscription_key_for_test(reserved_id)
         .expect("subscription survives rename");
@@ -2190,16 +2142,7 @@ async fn late_stream_subscriptions_are_rejected_while_an_exited_pane_drains() {
         .await;
 
     for mode in [PaneStreamMode::Raw, PaneStreamMode::Surface] {
-        let response = handler
-            .handle_subscribe_pane_stream(
-                CONNECTION_ID + 1,
-                SubscribePaneStreamRequest {
-                    target: PaneTargetRef::slot(target.clone()),
-                    mode,
-                    include_snapshot: false,
-                },
-            )
-            .await;
+        let response = subscribe_mode_response(&handler, CONNECTION_ID + 1, &target, mode).await;
         assert!(
             matches!(response, Response::Error(_)),
             "{mode:?} late subscription unexpectedly succeeded: {response:?}"
@@ -2317,16 +2260,8 @@ async fn quota_is_reserved_before_a_second_snapshot_capture() {
     let _first = subscribe(&handler, &target, PaneStreamMode::Raw).await;
     let receiver_count = output.receiver_count_for_test();
 
-    let response = handler
-        .handle_subscribe_pane_stream(
-            CONNECTION_ID,
-            SubscribePaneStreamRequest {
-                target: PaneTargetRef::slot(target),
-                mode: PaneStreamMode::Raw,
-                include_snapshot: false,
-            },
-        )
-        .await;
+    let response =
+        subscribe_mode_response(&handler, CONNECTION_ID, &target, PaneStreamMode::Raw).await;
     assert!(matches!(response, Response::Error(_)), "{response:?}");
     assert_eq!(
         output.receiver_count_for_test(),
@@ -2347,8 +2282,7 @@ async fn cancelled_surface_waiter_releases_its_reserved_quota() {
     };
     let initialization_token = {
         let mut subscriptions = handler.subscriptions.lock().expect("subscription lock");
-        let super::SurfaceDriverRoute::Initialize { token } =
-            subscriptions.surface_driver_route(&key)
+        let InitializationRoute::Initialize { token } = subscriptions.surface_driver_route(&key)
         else {
             panic!("test must reserve the surface initializer");
         };
@@ -2357,16 +2291,13 @@ async fn cancelled_surface_waiter_releases_its_reserved_quota() {
 
     let task_handler = Arc::clone(&handler);
     let task = tokio::spawn(async move {
-        task_handler
-            .handle_subscribe_pane_stream(
-                CONNECTION_ID,
-                SubscribePaneStreamRequest {
-                    target: PaneTargetRef::slot(target),
-                    mode: PaneStreamMode::Surface,
-                    include_snapshot: false,
-                },
-            )
-            .await
+        subscribe_mode_response(
+            &task_handler,
+            CONNECTION_ID,
+            &target,
+            PaneStreamMode::Surface,
+        )
+        .await
     });
     for _ in 0..100 {
         if !handler
@@ -2402,7 +2333,8 @@ async fn cancelled_surface_waiter_releases_its_reserved_quota() {
         .subscriptions
         .lock()
         .expect("subscription lock")
-        .finish_surface_initialization(initialization_token);
+        .surface_initializations
+        .finish(initialization_token);
 }
 
 #[tokio::test]
@@ -2417,7 +2349,7 @@ async fn raw_waiter_re_elects_after_initializer_wakeup() {
     };
     let initialization_token = {
         let mut subscriptions = handler.subscriptions.lock().expect("subscription lock");
-        let super::super::subscription_support::RawInitializationRoute::Initialize { token } =
+        let InitializationRoute::Initialize { token } =
             subscriptions.raw_initialization_route(&key, false)
         else {
             panic!("test must reserve the raw initializer");
@@ -2427,16 +2359,7 @@ async fn raw_waiter_re_elects_after_initializer_wakeup() {
 
     let task_handler = Arc::clone(&handler);
     let task = tokio::spawn(async move {
-        task_handler
-            .handle_subscribe_pane_stream(
-                CONNECTION_ID,
-                SubscribePaneStreamRequest {
-                    target: PaneTargetRef::slot(target),
-                    mode: PaneStreamMode::Raw,
-                    include_snapshot: false,
-                },
-            )
-            .await
+        subscribe_mode_response(&task_handler, CONNECTION_ID, &target, PaneStreamMode::Raw).await
     });
     for _ in 0..100 {
         if !handler
@@ -2453,7 +2376,8 @@ async fn raw_waiter_re_elects_after_initializer_wakeup() {
         .subscriptions
         .lock()
         .expect("subscription lock")
-        .finish_raw_initialization(initialization_token);
+        .raw_initializations
+        .finish(initialization_token);
 
     let response = tokio::time::timeout(Duration::from_secs(2), task)
         .await

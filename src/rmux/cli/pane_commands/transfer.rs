@@ -2,11 +2,12 @@ use std::path::Path;
 
 use rmux_proto::{BreakPaneRequest, JoinPaneRequest, MovePaneRequest, PaneSplitSize};
 
+use super::super::target_resolution::{parse_spec, run_targeted};
 use super::super::{
     ExitFailure, resolve_pane_target_or_current, resolve_pane_target_spec,
     resolve_window_target_spec, run_command_resolved,
 };
-use crate::cli_args::{BreakPaneArgs, JoinPaneArgs, SwapPaneArgs, TargetSpec, parse_target_spec};
+use crate::cli_args::{BreakPaneArgs, JoinPaneArgs, SwapPaneArgs, TargetSpec};
 
 /// Runs `swap-pane`, exchanging two panes or the next/previous pane with `-D`/`-U`.
 pub(in crate::cli) fn run_swap_pane(
@@ -18,23 +19,18 @@ pub(in crate::cli) fn run_swap_pane(
             return Err(ExitFailure::new(1, "swap-pane -D/-U does not accept -s"));
         }
 
-        if args.down {
-            return run_command_resolved(socket_path, "swap-pane", move |connection| {
-                let target =
-                    resolve_pane_target_or_current(connection, args.target.as_ref(), "swap-pane")?;
-                connection
-                    .swap_pane_with_next(target, args.detached, args.preserve_zoom)
-                    .map_err(ExitFailure::from)
-            });
-        }
-
-        return run_command_resolved(socket_path, "swap-pane", move |connection| {
-            let target =
-                resolve_pane_target_or_current(connection, args.target.as_ref(), "swap-pane")?;
-            connection
-                .swap_pane_with_previous(target, args.detached, args.preserve_zoom)
-                .map_err(ExitFailure::from)
-        });
+        return run_targeted(
+            socket_path,
+            "swap-pane",
+            args.target.as_ref(),
+            |connection, target| {
+                if args.down {
+                    connection.swap_pane_with_next(target, args.detached, args.preserve_zoom)
+                } else {
+                    connection.swap_pane_with_previous(target, args.detached, args.preserve_zoom)
+                }
+            },
+        );
     }
 
     run_command_resolved(socket_path, "swap-pane", move |connection| {
@@ -135,7 +131,7 @@ fn resolve_pane_source_or_marked(
         clippy::literal_string_with_formatting_args,
         reason = "`{marked}` is tmux's literal target spec, not a format placeholder"
     )]
-    let marked = parse_target_spec("{marked}").map_err(|error| ExitFailure::new(1, error))?;
+    let marked = parse_spec("{marked}")?;
     resolve_pane_target_spec(connection, &marked)
         .or_else(|_| resolve_pane_target_or_current(connection, None, "pane source"))
 }

@@ -1,10 +1,16 @@
 use super::*;
 
-fn sanitize(chunks: &[&[u8]]) -> Vec<u8> {
+/// Both connect roles, in the order the per-role checks run.
+pub(super) const ROLES: [WebShareConnectRole; 2] = [
+    WebShareConnectRole::Operator,
+    WebShareConnectRole::Spectator,
+];
+
+pub(super) fn sanitize(chunks: &[&[u8]]) -> Vec<u8> {
     sanitize_for_role(WebShareConnectRole::Operator, chunks)
 }
 
-fn sanitize_for_role(role: WebShareConnectRole, chunks: &[&[u8]]) -> Vec<u8> {
+pub(super) fn sanitize_for_role(role: WebShareConnectRole, chunks: &[&[u8]]) -> Vec<u8> {
     let mut sanitizer = WebTerminalSanitizer::for_role(role);
     let mut output = Vec::new();
     for chunk in chunks {
@@ -14,30 +20,71 @@ fn sanitize_for_role(role: WebShareConnectRole, chunks: &[&[u8]]) -> Vec<u8> {
 }
 
 fn sanitize_bytewise(role: WebShareConnectRole, input: &[u8]) -> Vec<u8> {
-    let mut sanitizer = WebTerminalSanitizer::for_role(role);
-    let mut output = Vec::new();
-    for byte in input {
-        sanitizer.push(std::slice::from_ref(byte), &mut output);
-    }
-    output
+    sanitize_for_role(role, &input.chunks(1).collect::<Vec<_>>())
 }
 
-fn assert_sanitized_for_roles_at_every_boundary(name: &str, input: &[u8], expected: &[u8]) {
-    for role in [
+/// Asserts `role` sanitizes `input` to `expected` wherever `splits` cut it in two; each failure
+/// message is `context` followed by the split.
+#[track_caller]
+fn assert_splits(
+    role: WebShareConnectRole,
+    input: &[u8],
+    splits: impl IntoIterator<Item = usize>,
+    expected: &[u8],
+    context: &str,
+) {
+    for split in splits {
+        assert_eq!(
+            sanitize_for_role(role, &[&input[..split], &input[split..]]),
+            expected,
+            "{context}split {split}"
+        );
+    }
+}
+
+/// [`assert_splits`] for the operator role at every offset of `input`.
+#[track_caller]
+fn assert_every_split(input: &[u8], expected: &[u8], context: &str) {
+    assert_splits(
         WebShareConnectRole::Operator,
-        WebShareConnectRole::Spectator,
-    ] {
-        for split in 0..=input.len() {
+        input,
+        0..=input.len(),
+        expected,
+        context,
+    );
+}
+
+/// Asserts the operator role sanitizes `input` to `expected` wherever two boundaries cut it in
+/// three.
+#[track_caller]
+fn assert_every_double_split(input: &[u8], expected: &[u8]) {
+    for first in 0..=input.len() {
+        for second in first..=input.len() {
             assert_eq!(
-                sanitize_for_role(role, &[&input[..split], &input[split..]]),
+                sanitize(&[&input[..first], &input[first..second], &input[second..]]),
                 expected,
-                "{name}, role {role:?}, split {split}"
+                "splits {first}/{second}"
             );
         }
+    }
+}
+
+/// Asserts both roles sanitize `input` to `expected` wherever `splits` cut it in two and when it
+/// arrives byte by byte; each failure message starts with `context`.
+#[track_caller]
+fn assert_sanitized_for_roles(
+    context: &str,
+    input: &[u8],
+    splits: impl IntoIterator<Item = usize> + Clone,
+    expected: &[u8],
+) {
+    for role in ROLES {
+        let role_context = format!("{context}role {role:?}, ");
+        assert_splits(role, input, splits.clone(), expected, &role_context);
         assert_eq!(
             sanitize_bytewise(role, input),
             expected,
-            "{name}, role {role:?}, bytewise"
+            "{role_context}bytewise"
         );
     }
 }
@@ -68,16 +115,13 @@ fn spectator_role_removes_private_metadata_and_keeps_visual_osc() {
     )
     .as_bytes();
 
-    for split in 0..=input.len() {
-        assert_eq!(
-            sanitize_for_role(
-                WebShareConnectRole::Spectator,
-                &[&input[..split], &input[split..]],
-            ),
-            expected,
-            "split {split}"
-        );
-    }
+    assert_splits(
+        WebShareConnectRole::Spectator,
+        input,
+        0..=input.len(),
+        expected,
+        "",
+    );
 }
 
 #[test]
@@ -91,28 +135,19 @@ fn operator_role_preserves_authorized_private_metadata() {
     )
     .as_bytes();
 
-    for split in 0..=input.len() {
-        assert_eq!(
-            sanitize_for_role(
-                WebShareConnectRole::Operator,
-                &[&input[..split], &input[split..]],
-            ),
-            input,
-            "split {split}"
-        );
-    }
+    assert_splits(
+        WebShareConnectRole::Operator,
+        input,
+        0..=input.len(),
+        input,
+        "",
+    );
 }
 
 #[test]
 fn osc_52_is_removed_at_every_fragmentation_boundary() {
     let input = b"before\x1b]52;c;Zm9v\x1b\\after";
-    for split in 0..=input.len() {
-        assert_eq!(
-            sanitize(&[&input[..split], &input[split..]]),
-            b"beforeafter",
-            "split {split}"
-        );
-    }
+    assert_every_split(input, b"beforeafter", "");
 }
 
 #[test]
@@ -147,13 +182,11 @@ fn escape_c0_families_do_not_bypass_blocked_string_introducers() {
             expected.push(control);
             expected.extend_from_slice(b"after");
 
-            for split in 0..=input.len() {
-                assert_eq!(
-                    sanitize(&[&input[..split], &input[split..]]),
-                    expected,
-                    "{name}, control {control:#04x}, split {split}"
-                );
-            }
+            assert_every_split(
+                &input,
+                &expected,
+                &format!("{name}, control {control:#04x}, "),
+            );
         }
     }
 }
@@ -175,19 +208,20 @@ fn escape_c0_preserves_private_metadata_policy_by_role() {
         operator_expected.extend_from_slice(private_osc);
         operator_expected.extend_from_slice(b"after");
 
-        for split in 0..=input.len() {
-            let chunks = [&input[..split], &input[split..]];
-            assert_eq!(
-                sanitize_for_role(WebShareConnectRole::Spectator, &chunks),
-                spectator_expected,
-                "spectator {name}, split {split}"
-            );
-            assert_eq!(
-                sanitize_for_role(WebShareConnectRole::Operator, &chunks),
-                operator_expected,
-                "operator {name}, split {split}"
-            );
-        }
+        assert_splits(
+            WebShareConnectRole::Spectator,
+            &input,
+            0..=input.len(),
+            spectator_expected,
+            &format!("spectator {name}, "),
+        );
+        assert_splits(
+            WebShareConnectRole::Operator,
+            &input,
+            0..=input.len(),
+            &operator_expected,
+            &format!("operator {name}, "),
+        );
     }
 }
 
@@ -199,13 +233,7 @@ fn can_and_sub_still_cancel_escape_before_following_text() {
         input.extend_from_slice(b"]52;c;Zm9vYmFy\x07after");
         let expected = b"before]52;c;Zm9vYmFy\x07after";
 
-        for split in 0..=input.len() {
-            assert_eq!(
-                sanitize(&[&input[..split], &input[split..]]),
-                expected,
-                "cancel {cancel:#04x}, split {split}"
-            );
-        }
+        assert_every_split(&input, expected, &format!("cancel {cancel:#04x}, "));
     }
 }
 
@@ -216,26 +244,14 @@ fn escape_c0_remains_pending_when_reentered_from_control_strings() {
         b"before\x1b_abandoned\x1b\r]52;c;Zm9vYmFy\x07after".as_slice(),
         b"before\x1bP1\x1b\r]52;c;Zm9vYmFy\x07after".as_slice(),
     ] {
-        for split in 0..=input.len() {
-            assert_eq!(
-                sanitize(&[&input[..split], &input[split..]]),
-                b"before\rafter",
-                "input {input:02x?}, split {split}"
-            );
-        }
+        assert_every_split(input, b"before\rafter", &format!("input {input:02x?}, "));
     }
 }
 
 #[test]
 fn allowed_visual_osc_survives_all_fragmentation_boundaries() {
     let input = b"A\x1b]8;;https://example.test\x1b\\link\x1b]8;;\x07B";
-    for split in 0..=input.len() {
-        assert_eq!(
-            sanitize(&[&input[..split], &input[split..]]),
-            input,
-            "split {split}"
-        );
-    }
+    assert_every_split(input, input, "");
 }
 
 #[test]
@@ -246,13 +262,7 @@ fn osc_8_allows_web_links_and_closures_but_drops_active_content_schemes() {
         b"A\x1b]8;;file:///etc/passwd\x1b\\B".as_slice(),
         b"A\x1b]8;;relative/path\x1b\\B".as_slice(),
     ] {
-        for split in 0..=input.len() {
-            assert_eq!(
-                sanitize(&[&input[..split], &input[split..]]),
-                b"A\x1b]8;;\x1b\\B",
-                "split {split}"
-            );
-        }
+        assert_every_split(input, b"A\x1b]8;;\x1b\\B", "");
     }
     for input in [
         b"A\x1b]8;;https://example.test\x1b\\B".as_slice(),
@@ -337,7 +347,7 @@ fn rejected_osc_8_closes_a_prior_hyperlink_at_every_fragmentation_boundary() {
             b"\x1b]8;;http://old.example\x07OLD\x1b]8;;\x1b\\C1NEXT\x1b]8;;\x1b\\END",
         ),
     ] {
-        assert_sanitized_for_roles_at_every_boundary(name, input, expected);
+        assert_sanitized_for_roles(&format!("{name}, "), input, 0..=input.len(), expected);
     }
 }
 
@@ -370,7 +380,7 @@ fn repeated_rejected_osc_8_sequences_each_close_without_changing_text() {
     )
     .as_bytes();
 
-    assert_sanitized_for_roles_at_every_boundary("repeated rejects", input, expected);
+    assert_sanitized_for_roles("repeated rejects, ", input, 0..=input.len(), expected);
 }
 
 #[test]
@@ -396,7 +406,7 @@ fn allowed_hyperlink_after_a_rejection_opens_normally() {
     )
     .as_bytes();
 
-    assert_sanitized_for_roles_at_every_boundary("rejected then allowed", input, expected);
+    assert_sanitized_for_roles("rejected then allowed, ", input, 0..=input.len(), expected);
 }
 
 #[test]
@@ -405,7 +415,7 @@ fn cancelled_rejected_osc_8_keeps_the_prior_hyperlink_active() {
         b"\x1b]8;;https://old.example\x1b\\OLD\x1b]8;;file:///cancelled\x18NEXT\x1b]8;;\x1b\\END";
     let expected = b"\x1b]8;;https://old.example\x1b\\OLDNEXT\x1b]8;;\x1b\\END";
 
-    assert_sanitized_for_roles_at_every_boundary("cancelled hyperlink", input, expected);
+    assert_sanitized_for_roles("cancelled hyperlink, ", input, 0..=input.len(), expected);
 }
 
 #[test]
@@ -440,7 +450,7 @@ fn escape_terminated_rejected_osc_8_closes_before_escape_recovery() {
                 .as_slice(),
         ),
     ] {
-        assert_sanitized_for_roles_at_every_boundary(name, input, expected);
+        assert_sanitized_for_roles(&format!("{name}, "), input, 0..=input.len(), expected);
     }
 }
 
@@ -448,7 +458,12 @@ fn escape_terminated_rejected_osc_8_closes_before_escape_recovery() {
 fn rejected_non_hyperlink_osc_does_not_close_a_prior_hyperlink() {
     let clipboard = b"\x1b]8;;https://old.example\x1b\\OLD\x1b]52;c;WA==\x07NEXT\x1b]8;;\x1b\\END";
     let clipboard_expected = b"\x1b]8;;https://old.example\x1b\\OLDNEXT\x1b]8;;\x1b\\END";
-    assert_sanitized_for_roles_at_every_boundary("blocked OSC 52", clipboard, clipboard_expected);
+    assert_sanitized_for_roles(
+        "blocked OSC 52, ",
+        clipboard,
+        0..=clipboard.len(),
+        clipboard_expected,
+    );
 
     let title = b"\x1b]8;;https://old.example\x1b\\OLD\x1b]2;private\x07NEXT\x1b]8;;\x1b\\END";
     assert_eq!(
@@ -466,15 +481,7 @@ fn rejected_non_hyperlink_osc_does_not_close_a_prior_hyperlink() {
 #[test]
 fn apc_dcs_pm_and_sos_are_explicitly_dropped() {
     let input = b"a\x1b_Gi=1;kitty\x1b\\b\x1bPqSIXEL\x1b\\c\x1b^pm\x1b\\d\x1bXsos\x1b\\e";
-    for first in 0..=input.len() {
-        for second in first..=input.len() {
-            assert_eq!(
-                sanitize(&[&input[..first], &input[first..second], &input[second..]]),
-                b"abcde",
-                "splits {first}/{second}"
-            );
-        }
-    }
+    assert_every_double_split(input, b"abcde");
 }
 
 #[test]
@@ -484,13 +491,7 @@ fn bare_c1_bytes_become_viewer_safe_replacements() {
     let input = b"a\x9d52;c;Zm9v\x9cb\x9fGkitty\x9cc\x90qsixel\x9cd";
     let expected =
         "a\u{fffd}52;c;Zm9v\u{fffd}b\u{fffd}Gkitty\u{fffd}c\u{fffd}qsixel\u{fffd}d".as_bytes();
-    for split in 0..=input.len() {
-        assert_eq!(
-            sanitize(&[&input[..split], &input[split..]]),
-            expected,
-            "split {split}"
-        );
-    }
+    assert_every_split(input, expected, "");
 }
 
 #[test]
@@ -510,13 +511,11 @@ fn a_bare_c1_byte_never_swallows_the_rest_of_a_pane_stream() {
 fn every_bare_c1_byte_matches_the_owners_replacement_character() {
     for byte in 0x80..=0x9f_u8 {
         let input = [b'A', byte, b'B', b'C', b'\r', b'\n'];
-        for split in 0..=input.len() {
-            assert_eq!(
-                sanitize(&[&input[..split], &input[split..]]),
-                "A\u{fffd}BC\r\n".as_bytes(),
-                "byte {byte:#04x}, split {split}"
-            );
-        }
+        assert_every_split(
+            &input,
+            "A\u{fffd}BC\r\n".as_bytes(),
+            &format!("byte {byte:#04x}, "),
+        );
     }
 }
 
@@ -525,25 +524,13 @@ fn a_bare_c1_terminator_cannot_end_a_string_the_viewer_keeps_open() {
     // The viewer decodes 0x9c as U+FFFD and keeps buffering the OSC, so
     // treating it as ST would forward the clipboard tail as visible text.
     let input = b"a\x1b]52;c;Zm9vYmFy\x9cdGFpbA==\x07b";
-    for split in 0..=input.len() {
-        assert_eq!(
-            sanitize(&[&input[..split], &input[split..]]),
-            b"ab",
-            "split {split}"
-        );
-    }
+    assert_every_split(input, b"ab", "");
 }
 
 #[test]
 fn a_bare_c1_byte_inside_an_allowed_osc_stays_part_of_its_payload() {
     let input = b"a\x1b]2;ti\x9ctle\x07b";
-    for split in 0..=input.len() {
-        assert_eq!(
-            sanitize(&[&input[..split], &input[split..]]),
-            input.as_slice(),
-            "split {split}"
-        );
-    }
+    assert_every_split(input, input, "");
 }
 
 #[test]
@@ -551,13 +538,7 @@ fn a_bare_c1_byte_inside_an_osc_identifier_fails_closed() {
     // The viewer's OSC identifier would be `2<U+FFFD>` — not a number, so
     // its parser aborts the string. Forwarding it would be a divergence.
     let input = b"a\x1b]2\x9c;title\x07b";
-    for split in 0..=input.len() {
-        assert_eq!(
-            sanitize(&[&input[..split], &input[split..]]),
-            b"ab",
-            "split {split}"
-        );
-    }
+    assert_every_split(input, b"ab", "");
 }
 
 #[test]
@@ -590,58 +571,28 @@ fn an_orphaned_c2_lead_byte_cannot_be_recombined_into_a_forged_c1_control() {
 #[test]
 fn a_complete_two_byte_character_keeps_both_halves() {
     let input = "A\u{a0}\u{ff}B".as_bytes();
-    for split in 0..=input.len() {
-        assert_eq!(
-            sanitize(&[&input[..split], &input[split..]]),
-            input,
-            "split {split}"
-        );
-    }
+    assert_every_split(input, input, "");
 }
 
 #[test]
 fn utf8_encoded_c1_codepoints_do_not_become_terminal_strings() {
     let blocked = b"a\xc2\x9d52;c;Zm9v\xc2\x9cb\xc2\x9fGkitty\xc2\x9cc";
-    for split in 0..=blocked.len() {
-        assert_eq!(
-            sanitize(&[&blocked[..split], &blocked[split..]]),
-            b"a52;c;Zm9vbGkittyc",
-            "blocked split {split}"
-        );
-    }
+    assert_every_split(blocked, b"a52;c;Zm9vbGkittyc", "blocked ");
 
     let allowed = b"a\xc2\x9d2;title\xc2\x9cb";
-    for split in 0..=allowed.len() {
-        assert_eq!(
-            sanitize(&[&allowed[..split], &allowed[split..]]),
-            b"a2;titleb",
-            "allowed split {split}"
-        );
-    }
+    assert_every_split(allowed, b"a2;titleb", "allowed ");
 }
 
 #[test]
 fn utf8_continuations_that_overlap_c1_controls_are_never_reinterpreted() {
     let input = "a\u{a0}НÜ\u{259c}b".as_bytes();
-    for split in 0..=input.len() {
-        assert_eq!(
-            sanitize(&[&input[..split], &input[split..]]),
-            input,
-            "split {split}"
-        );
-    }
+    assert_every_split(input, input, "");
 }
 
 #[test]
 fn utf8_inside_an_allowed_osc_cannot_terminate_it_as_a_c1_string() {
     let input = "\u{1b}]2;Н\u{259c} title\u{1b}\\safe".as_bytes();
-    for split in 0..=input.len() {
-        assert_eq!(
-            sanitize(&[&input[..split], &input[split..]]),
-            input,
-            "split {split}"
-        );
-    }
+    assert_every_split(input, input, "");
 }
 
 #[test]
@@ -651,15 +602,7 @@ fn escape_reentry_never_emits_a_forbidden_string_prefix() {
         b"a\x1b]2;safe\x1b]52;c;WA==\x07b".as_slice(),
         b"a\x1bPignored\x1b]52;c;WA==\x07\x1b\\b".as_slice(),
     ] {
-        for first in 0..=input.len() {
-            for second in first..=input.len() {
-                assert_eq!(
-                    sanitize(&[&input[..first], &input[first..second], &input[second..]]),
-                    b"ab",
-                    "splits {first}/{second}"
-                );
-            }
-        }
+        assert_every_double_split(input, b"ab");
     }
 }
 
@@ -677,13 +620,11 @@ fn can_and_sub_cancel_every_non_dcs_control_string() {
             input.extend_from_slice(introducer);
             input.push(cancel);
             input.extend_from_slice(b"VISIBLEb");
-            for split in 0..=input.len() {
-                assert_eq!(
-                    sanitize(&[&input[..split], &input[split..]]),
-                    b"aVISIBLEb",
-                    "introducer {introducer:02x?}, cancel {cancel:#04x}, split {split}"
-                );
-            }
+            assert_every_split(
+                &input,
+                b"aVISIBLEb",
+                &format!("introducer {introducer:02x?}, cancel {cancel:#04x}, "),
+            );
         }
     }
 }
@@ -701,36 +642,22 @@ fn dcs_preamble_controls_follow_the_rmux_entry_states() {
             input.extend_from_slice(preamble);
             input.push(cancel);
             input.extend_from_slice(b"VISIBLEb");
-            for split in 0..=input.len() {
-                assert_eq!(
-                    sanitize(&[&input[..split], &input[split..]]),
-                    b"aVISIBLEb",
-                    "preamble {preamble:02x?}, cancel {cancel:#04x}, split {split}"
-                );
-            }
+            assert_every_split(
+                &input,
+                b"aVISIBLEb",
+                &format!("preamble {preamble:02x?}, cancel {cancel:#04x}, "),
+            );
         }
     }
 
     let input = b"a\x1bP1\x1b[31mVISIBLE\x1b[0mb";
-    for split in 0..=input.len() {
-        assert_eq!(
-            sanitize(&[&input[..split], &input[split..]]),
-            b"a\x1b[31mVISIBLE\x1b[0mb",
-            "split {split}"
-        );
-    }
+    assert_every_split(input, b"a\x1b[31mVISIBLE\x1b[0mb", "");
 }
 
 #[test]
 fn bel_only_terminates_osc_strings() {
     let osc = b"a\x1b]52;c;WA==\x07VISIBLEb";
-    for split in 0..=osc.len() {
-        assert_eq!(
-            sanitize(&[&osc[..split], &osc[split..]]),
-            b"aVISIBLEb",
-            "OSC split {split}"
-        );
-    }
+    assert_every_split(osc, b"aVISIBLEb", "OSC ");
 
     for input in [
         b"a\x1bPqpayload\x07HIDDEN\x1b\\b".as_slice(),
@@ -739,26 +666,14 @@ fn bel_only_terminates_osc_strings() {
         b"a\x1bXpayload\x07HIDDEN\x1b\\b".as_slice(),
         b"a\x1bkpayload\x07HIDDEN\x1b\\b".as_slice(),
     ] {
-        for split in 0..=input.len() {
-            assert_eq!(
-                sanitize(&[&input[..split], &input[split..]]),
-                b"ab",
-                "input {input:02x?}, split {split}"
-            );
-        }
+        assert_every_split(input, b"ab", &format!("input {input:02x?}, "));
     }
 }
 
 #[test]
 fn utf8_c1_inside_an_allowed_osc_fails_closed() {
     let input = b"a\x1b]2;ti\xc2\x9dtle\x07b";
-    for split in 0..=input.len() {
-        assert_eq!(
-            sanitize(&[&input[..split], &input[split..]]),
-            b"ab",
-            "split {split}"
-        );
-    }
+    assert_every_split(input, b"ab", "");
 }
 
 #[test]
@@ -767,13 +682,7 @@ fn can_and_sub_cancel_strings_before_following_input_is_reparsed() {
         let mut input = b"a\x1b]2;safe".to_vec();
         input.push(cancel);
         input.extend_from_slice(b"\x1b]52;c;WA==\x07b");
-        for split in 0..=input.len() {
-            assert_eq!(
-                sanitize(&[&input[..split], &input[split..]]),
-                b"ab",
-                "cancel {cancel:#x}, split {split}"
-            );
-        }
+        assert_every_split(&input, b"ab", &format!("cancel {cancel:#x}, "));
     }
 }
 
@@ -785,26 +694,14 @@ fn dcs_passthrough_never_reparses_payload_controls() {
         b"a\x1bPq\x1b[31mVISIBLE\x1b\\b".as_slice(),
         b"a\x1bPq\x1bAVISIBLE\x1b\\b".as_slice(),
     ] {
-        for split in 0..=input.len() {
-            assert_eq!(
-                sanitize(&[&input[..split], &input[split..]]),
-                b"ab",
-                "input {input:02x?}, split {split}"
-            );
-        }
+        assert_every_split(input, b"ab", &format!("input {input:02x?}, "));
     }
 }
 
 #[test]
 fn screen_rename_string_is_not_printed_for_the_viewer() {
     let input = b"a\x1bkWINDOWNAME\x1b\\b";
-    for split in 0..=input.len() {
-        assert_eq!(
-            sanitize(&[&input[..split], &input[split..]]),
-            b"ab",
-            "split {split}"
-        );
-    }
+    assert_every_split(input, b"ab", "");
 }
 
 #[test]
@@ -813,13 +710,7 @@ fn utf8_c1_codepoints_are_nonprinting_text_not_control_introducers() {
         let input = [
             b'a', 0xc2, codepoint, b'V', b'I', b'S', b'I', b'B', b'L', b'E', b'b',
         ];
-        for split in 0..=input.len() {
-            assert_eq!(
-                sanitize(&[&input[..split], &input[split..]]),
-                b"aVISIBLEb",
-                "C1 {codepoint:#04x}, split {split}"
-            );
-        }
+        assert_every_split(&input, b"aVISIBLEb", &format!("C1 {codepoint:#04x}, "));
     }
 }
 
@@ -857,23 +748,12 @@ fn oversized_osc_8_closes_a_prior_hyperlink_for_bel_st_and_both_roles() {
         boundaries.sort_unstable();
         boundaries.dedup();
 
-        for role in [
-            WebShareConnectRole::Operator,
-            WebShareConnectRole::Spectator,
-        ] {
-            for split in boundaries.iter().copied() {
-                assert_eq!(
-                    sanitize_for_role(role, &[&input[..split], &input[split..]]),
-                    expected,
-                    "{name}, role {role:?}, split {split}"
-                );
-            }
-            assert_eq!(
-                sanitize_bytewise(role, &input),
-                expected,
-                "{name}, role {role:?}, bytewise"
-            );
-        }
+        assert_sanitized_for_roles(
+            &format!("{name}, "),
+            &input,
+            boundaries.iter().copied(),
+            expected,
+        );
     }
 }
 
@@ -902,23 +782,7 @@ fn oversized_osc_8_closes_before_escape_recovery() {
     boundaries.sort_unstable();
     boundaries.dedup();
 
-    for role in [
-        WebShareConnectRole::Operator,
-        WebShareConnectRole::Spectator,
-    ] {
-        for split in boundaries.iter().copied() {
-            assert_eq!(
-                sanitize_for_role(role, &[&input[..split], &input[split..]]),
-                expected,
-                "role {role:?}, split {split}"
-            );
-        }
-        assert_eq!(
-            sanitize_bytewise(role, &input),
-            expected,
-            "role {role:?}, bytewise"
-        );
-    }
+    assert_sanitized_for_roles("", &input, boundaries.iter().copied(), expected);
 }
 
 #[test]
@@ -930,10 +794,7 @@ fn cancelled_oversized_osc_8_does_not_inject_a_close() {
     input.extend_from_slice(b"\x18NEXT\x1b]8;;\x1b\\END");
     let expected = b"\x1b]8;;https://old.example\x1b\\OLDNEXT\x1b]8;;\x1b\\END";
 
-    for role in [
-        WebShareConnectRole::Operator,
-        WebShareConnectRole::Spectator,
-    ] {
+    for role in ROLES {
         assert_eq!(
             sanitize_for_role(role, &[&input]),
             expected,
@@ -950,13 +811,7 @@ fn cancelled_oversized_osc_8_does_not_inject_a_close() {
 #[test]
 fn unknown_osc_is_removed_at_every_fragmentation_boundary() {
     let input = b"before\x1b]999;not-a-web-contract\x07after";
-    for split in 0..=input.len() {
-        assert_eq!(
-            sanitize(&[&input[..split], &input[split..]]),
-            b"beforeafter",
-            "split {split}"
-        );
-    }
+    assert_every_split(input, b"beforeafter", "");
 }
 
 #[test]

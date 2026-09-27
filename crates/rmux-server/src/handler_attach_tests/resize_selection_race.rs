@@ -1,11 +1,9 @@
-use super::{pane_terminal_size, session_name, RequestHandler};
-use crate::pane_io::AttachControl;
+use super::{session_name, RequestHandler};
+use crate::test_fixtures::Fixture;
 use rmux_proto::{
-    KillSessionRequest, KillWindowRequest, NewSessionRequest, NewWindowRequest, OptionName,
-    Request, Response, ScopeSelector, SetOptionMode, SetOptionRequest, TerminalGeometry,
+    KillSessionRequest, KillWindowRequest, NewWindowRequest, PaneTarget, TerminalGeometry,
     TerminalPixels, TerminalSize, WindowTarget,
 };
-use tokio::sync::mpsc;
 
 const LARGE_SIZE: TerminalSize = TerminalSize {
     cols: 132,
@@ -26,28 +24,14 @@ async fn live_resize_aborts_if_the_attach_switches_after_geometry_capture() {
     let alpha = session_name("attached-resize-switch-alpha");
     let beta = session_name("attached-resize-switch-beta");
     for name in [&alpha, &beta] {
-        let created = handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: name.clone(),
-                detached: true,
-                size: Some(SMALL_SIZE),
-                environment: None,
-            }))
-            .await;
-        assert!(matches!(created, Response::NewSession(_)), "{created:?}");
+        handler.create_session((name, SMALL_SIZE)).await;
     }
     handler.wait_for_initial_panes_for_test().await;
 
-    let (control_tx, _control_rx) = mpsc::unbounded_channel::<AttachControl>();
     let attach_pid = 7_509;
-    handler
-        .register_attach(attach_pid, alpha.clone(), control_tx)
-        .await;
+    let _control_rx = handler.attach_client(attach_pid, &alpha).await;
     let identity = handler.active_attach_identity_for_test(attach_pid).await;
-    let beta_id = {
-        let state = handler.state.lock().await;
-        state.sessions.session(&beta).expect("beta session").id()
-    };
+    let beta_id = handler.session_id_for_test(&beta).await;
     let pixels = TerminalPixels::new(1_320, 860);
     let geometry = TerminalGeometry {
         size: LARGE_SIZE,
@@ -98,57 +82,22 @@ async fn live_resize_aborts_if_the_attach_switches_after_geometry_capture() {
 async fn live_resize_never_mutates_a_recreated_same_name_session() {
     let handler = RequestHandler::new();
     let session_name = session_name("attached-resize-session-identity");
-    let created = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name: session_name.clone(),
-            detached: true,
-            size: Some(SMALL_SIZE),
-            environment: None,
-        }))
-        .await;
-    assert!(matches!(created, Response::NewSession(_)), "{created:?}");
+    handler.create_session((&session_name, SMALL_SIZE)).await;
     handler.wait_for_initial_panes_for_test().await;
 
-    let (control_tx, _control_rx) = mpsc::unbounded_channel::<AttachControl>();
     let attach_pid = 7_510;
-    handler
-        .register_attach(attach_pid, session_name.clone(), control_tx)
-        .await;
+    let _control_rx = handler.attach_client(attach_pid, &session_name).await;
     let identity = handler.active_attach_identity_for_test(attach_pid).await;
-    let original_session_id = {
-        let state = handler.state.lock().await;
-        state
-            .sessions
-            .session(&session_name)
-            .expect("original session")
-            .id()
-    };
+    let original_session_id = handler.session_id_for_test(&session_name).await;
 
     let pause = handler.install_attached_size_selection_pause();
     let resize = handler.handle_attached_resize_for_identity(identity, LARGE_SIZE);
     let replace = async {
         pause.reached.notified().await;
-        let killed = handler
-            .handle(Request::KillSession(KillSessionRequest {
-                target: session_name.clone(),
-                kill_all_except_target: false,
-                clear_alerts: false,
-                kill_group: false,
-            }))
+        handler
+            .handle_ok(KillSessionRequest::fixture(&session_name))
             .await;
-        assert!(matches!(killed, Response::KillSession(_)), "{killed:?}");
-        let recreated = handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: session_name.clone(),
-                detached: true,
-                size: Some(SMALL_SIZE),
-                environment: None,
-            }))
-            .await;
-        assert!(
-            matches!(recreated, Response::NewSession(_)),
-            "{recreated:?}"
-        );
+        handler.create_session((&session_name, SMALL_SIZE)).await;
         pause.release.notify_one();
     };
     let (resized, ()) = tokio::join!(resize, replace);
@@ -167,36 +116,19 @@ async fn live_resize_never_mutates_a_recreated_same_name_session() {
 async fn attached_size_selection_retries_after_the_captured_window_is_killed() {
     let handler = RequestHandler::new();
     let session_name = session_name("attached-size-window-race");
-    let created = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name: session_name.clone(),
-            detached: true,
-            size: Some(SMALL_SIZE),
-            environment: None,
-        }))
-        .await;
-    assert!(matches!(created, Response::NewSession(_)), "{created:?}");
-    let created = handler
-        .handle(Request::NewWindow(Box::new(NewWindowRequest {
-            target: session_name.clone(),
+    handler.create_session((&session_name, SMALL_SIZE)).await;
+    handler
+        .create_window(NewWindowRequest {
             name: Some("captured-window".to_owned()),
             detached: false,
-            start_directory: None,
-            environment: None,
-            command: None,
-            process_command: None,
             target_window_index: Some(1),
-            insert_at_target: false,
-        })))
+            ..Fixture::fixture(&session_name)
+        })
         .await;
-    assert!(matches!(created, Response::NewWindow(_)), "{created:?}");
     handler.wait_for_initial_panes_for_test().await;
 
-    let (control_tx, _control_rx) = mpsc::unbounded_channel::<AttachControl>();
     let attach_pid = 7511;
-    handler
-        .register_attach(attach_pid, session_name.clone(), control_tx)
-        .await;
+    let _control_rx = handler.attach_client(attach_pid, &session_name).await;
     handler
         .handle_attached_resize(attach_pid, SMALL_SIZE)
         .await
@@ -215,19 +147,15 @@ async fn attached_size_selection_retries_after_the_captured_window_is_killed() {
 
     let pause = handler.install_attached_size_selection_pause();
     let reconcile = handler.reconcile_attached_session_size(&session_name);
+    let captured_window = WindowTarget::with_window(session_name.clone(), 1);
     let kill_captured_window = async {
         pause.reached.notified().await;
-        let response = handler
-            .handle(Request::KillWindow(KillWindowRequest {
-                target: WindowTarget::with_window(session_name.clone(), 1),
-                kill_all_others: false,
-            }))
+        handler
+            .handle_ok(KillWindowRequest::fixture(&captured_window))
             .await;
         pause.release.notify_one();
-        response
     };
-    let (reconciled, killed) = tokio::join!(reconcile, kill_captured_window);
-    assert!(matches!(killed, Response::KillWindow(_)), "{killed:?}");
+    let (reconciled, ()) = tokio::join!(reconcile, kill_captured_window);
     let reconciled = reconciled.expect("reconciliation succeeds");
     let surviving_target = WindowTarget::with_window(session_name.clone(), 0);
     assert!(
@@ -245,7 +173,9 @@ async fn attached_size_selection_retries_after_the_captured_window_is_killed() {
         assert!(session.window_at(1).is_none());
         assert_eq!(session.window().size(), attached_content_size(LARGE_SIZE));
     }
-    let pty_size = pane_terminal_size(&handler, &session_name, 0, 0).await;
+    let pty_size = handler
+        .pane_terminal_size_for_test(&PaneTarget::with_window(session_name.clone(), 0, 0))
+        .await;
     assert_eq!(pty_size, attached_content_size(LARGE_SIZE));
 }
 
@@ -253,22 +183,11 @@ async fn attached_size_selection_retries_after_the_captured_window_is_killed() {
 async fn attached_size_selection_retries_after_the_candidate_epoch_changes() {
     let handler = RequestHandler::new();
     let session_name = session_name("attached-size-candidate-race");
-    let created = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name: session_name.clone(),
-            detached: true,
-            size: Some(LARGE_SIZE),
-            environment: None,
-        }))
-        .await;
-    assert!(matches!(created, Response::NewSession(_)), "{created:?}");
+    handler.create_session((&session_name, LARGE_SIZE)).await;
     handler.wait_for_initial_panes_for_test().await;
 
-    let (control_tx, _control_rx) = mpsc::unbounded_channel::<AttachControl>();
     let attach_pid = 7512;
-    handler
-        .register_attach(attach_pid, session_name.clone(), control_tx)
-        .await;
+    let _control_rx = handler.attach_client(attach_pid, &session_name).await;
     set_attached_candidate_size(&handler, attach_pid, SMALL_SIZE).await;
 
     let pause = handler.install_attached_size_selection_pause();
@@ -301,44 +220,23 @@ async fn attached_size_selection_retries_after_the_candidate_epoch_changes() {
 async fn attached_size_selection_retries_after_the_policy_changes() {
     let handler = RequestHandler::new();
     let session_name = session_name("attached-size-policy-race");
-    let created = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name: session_name.clone(),
-            detached: true,
-            size: Some(LARGE_SIZE),
-            environment: None,
-        }))
-        .await;
-    assert!(matches!(created, Response::NewSession(_)), "{created:?}");
+    handler.create_session((&session_name, LARGE_SIZE)).await;
     handler.wait_for_initial_panes_for_test().await;
 
-    let (control_tx, _control_rx) = mpsc::unbounded_channel::<AttachControl>();
     let attach_pid = 7513;
-    handler
-        .register_attach(attach_pid, session_name.clone(), control_tx)
-        .await;
+    let _control_rx = handler.attach_client(attach_pid, &session_name).await;
     set_attached_candidate_size(&handler, attach_pid, SMALL_SIZE).await;
 
     let pause = handler.install_attached_size_selection_pause();
     let reconcile = handler.reconcile_attached_session_size(&session_name);
     let change_policy = async {
         pause.reached.notified().await;
-        let response = handler
-            .handle(Request::SetOption(SetOptionRequest {
-                scope: ScopeSelector::Window(WindowTarget::with_window(session_name.clone(), 0)),
-                option: OptionName::WindowSize,
-                value: "manual".to_owned(),
-                mode: SetOptionMode::Replace,
-            }))
+        handler
+            .set_window_size_policy(&session_name, 0, "manual")
             .await;
         pause.release.notify_one();
-        response
     };
-    let (reconciled, policy_response) = tokio::join!(reconcile, change_policy);
-    assert!(
-        matches!(policy_response, Response::SetOption(_)),
-        "{policy_response:?}"
-    );
+    let (reconciled, ()) = tokio::join!(reconcile, change_policy);
     assert_eq!(reconciled.expect("reconciliation succeeds"), None);
 
     let state = handler.state.lock().await;
@@ -358,22 +256,11 @@ async fn attached_size_selection_retries_after_the_policy_changes() {
 async fn attached_candidate_cannot_change_between_final_validation_and_apply() {
     let handler = RequestHandler::new();
     let session_name = session_name("attached-size-final-apply-race");
-    let created = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name: session_name.clone(),
-            detached: true,
-            size: Some(LARGE_SIZE),
-            environment: None,
-        }))
-        .await;
-    assert!(matches!(created, Response::NewSession(_)), "{created:?}");
+    handler.create_session((&session_name, LARGE_SIZE)).await;
     handler.wait_for_initial_panes_for_test().await;
 
-    let (control_tx, _control_rx) = mpsc::unbounded_channel::<AttachControl>();
     let attach_pid = 7514;
-    handler
-        .register_attach(attach_pid, session_name.clone(), control_tx)
-        .await;
+    let _control_rx = handler.attach_client(attach_pid, &session_name).await;
     set_attached_candidate_size(&handler, attach_pid, SMALL_SIZE).await;
 
     let pause = handler.install_attached_size_apply_pause();

@@ -76,6 +76,51 @@ async fn await_start(started: tokio::sync::oneshot::Receiver<()>) {
         .expect("popup I/O start sender should remain connected");
 }
 
+/// A cancellable queue whose executor signals the first start and then parks every operation on
+/// a watchdog-armed gate, counting the operations it runs and the cancellations it receives.
+struct GatedQueue {
+    queue: PopupIoQueue,
+    gate: Arc<IoGate>,
+    started_rx: tokio::sync::oneshot::Receiver<()>,
+    executions: Arc<AtomicUsize>,
+    cancellations: Arc<AtomicUsize>,
+}
+
+impl GatedQueue {
+    fn spawn() -> Self {
+        let gate = IoGate::new();
+        arm_gate_watchdog(&gate);
+        let (start, started_rx) = StartSignal::new();
+        let callback_gate = Arc::clone(&gate);
+        let executions = Arc::new(AtomicUsize::new(0));
+        let execution_count = Arc::clone(&executions);
+        let cancellations = Arc::new(AtomicUsize::new(0));
+        let cancellation_count = Arc::clone(&cancellations);
+        let queue = PopupIoQueue::spawn_with_cancel(
+            move |_| {
+                execution_count.fetch_add(1, Ordering::AcqRel);
+                let gate = Arc::clone(&callback_gate);
+                let start = start.clone();
+                async move {
+                    start.fire();
+                    gate.wait().await;
+                    Ok(())
+                }
+            },
+            move || {
+                cancellation_count.fetch_add(1, Ordering::AcqRel);
+            },
+        );
+        Self {
+            queue,
+            gate,
+            started_rx,
+            executions,
+            cancellations,
+        }
+    }
+}
+
 #[tokio::test]
 async fn popup_io_queue_preserves_write_resize_write_enqueue_order() {
     let observed = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
@@ -137,26 +182,13 @@ async fn popup_io_queue_preserves_write_resize_write_enqueue_order() {
 
 #[tokio::test]
 async fn popup_io_receipt_times_out_when_blocking_write_never_acknowledges() {
-    let gate = IoGate::new();
-    arm_gate_watchdog(&gate);
-    let (start, started_rx) = StartSignal::new();
-    let callback_gate = Arc::clone(&gate);
-    let cancellations = Arc::new(AtomicUsize::new(0));
-    let cancellation_count = Arc::clone(&cancellations);
-    let queue = PopupIoQueue::spawn_with_cancel(
-        move |_| {
-            let gate = Arc::clone(&callback_gate);
-            let start = start.clone();
-            async move {
-                start.fire();
-                gate.wait().await;
-                Ok(())
-            }
-        },
-        move || {
-            cancellation_count.fetch_add(1, Ordering::AcqRel);
-        },
-    );
+    let GatedQueue {
+        queue,
+        gate,
+        started_rx,
+        cancellations,
+        ..
+    } = GatedQueue::spawn();
     let active = queue
         .enqueue(PopupIoOperation::Write(b"blocked".to_vec()))
         .expect("enqueue blocked write");
@@ -183,29 +215,13 @@ async fn popup_io_receipt_times_out_when_blocking_write_never_acknowledges() {
 
 #[tokio::test]
 async fn popup_io_queue_saturation_cancels_active_and_pending_work() {
-    let gate = IoGate::new();
-    arm_gate_watchdog(&gate);
-    let (start, started_rx) = StartSignal::new();
-    let callback_gate = Arc::clone(&gate);
-    let executions = Arc::new(AtomicUsize::new(0));
-    let execution_count = Arc::clone(&executions);
-    let cancellations = Arc::new(AtomicUsize::new(0));
-    let cancellation_count = Arc::clone(&cancellations);
-    let queue = PopupIoQueue::spawn_with_cancel(
-        move |_| {
-            execution_count.fetch_add(1, Ordering::AcqRel);
-            let gate = Arc::clone(&callback_gate);
-            let start = start.clone();
-            async move {
-                start.fire();
-                gate.wait().await;
-                Ok(())
-            }
-        },
-        move || {
-            cancellation_count.fetch_add(1, Ordering::AcqRel);
-        },
-    );
+    let GatedQueue {
+        queue,
+        gate,
+        started_rx,
+        executions,
+        cancellations,
+    } = GatedQueue::spawn();
 
     let active = queue
         .enqueue(PopupIoOperation::Write(b"active".to_vec()))
@@ -254,26 +270,13 @@ async fn popup_io_queue_saturation_cancels_active_and_pending_work() {
 
 #[tokio::test]
 async fn dropping_last_popup_io_queue_cancels_worker_and_releases_receipts() {
-    let gate = IoGate::new();
-    arm_gate_watchdog(&gate);
-    let (start, started_rx) = StartSignal::new();
-    let callback_gate = Arc::clone(&gate);
-    let cancellations = Arc::new(AtomicUsize::new(0));
-    let cancellation_count = Arc::clone(&cancellations);
-    let queue = PopupIoQueue::spawn_with_cancel(
-        move |_| {
-            let gate = Arc::clone(&callback_gate);
-            let start = start.clone();
-            async move {
-                start.fire();
-                gate.wait().await;
-                Ok(())
-            }
-        },
-        move || {
-            cancellation_count.fetch_add(1, Ordering::AcqRel);
-        },
-    );
+    let GatedQueue {
+        queue,
+        gate,
+        started_rx,
+        cancellations,
+        ..
+    } = GatedQueue::spawn();
     let active = queue
         .enqueue(PopupIoOperation::Write(b"active".to_vec()))
         .expect("enqueue active write");
@@ -306,26 +309,13 @@ async fn dropping_last_popup_io_queue_cancels_worker_and_releases_receipts() {
 
 #[tokio::test]
 async fn dropping_unacknowledged_popup_io_receipt_cancels_worker() {
-    let gate = IoGate::new();
-    arm_gate_watchdog(&gate);
-    let (start, started_rx) = StartSignal::new();
-    let callback_gate = Arc::clone(&gate);
-    let cancellations = Arc::new(AtomicUsize::new(0));
-    let cancellation_count = Arc::clone(&cancellations);
-    let queue = PopupIoQueue::spawn_with_cancel(
-        move |_| {
-            let gate = Arc::clone(&callback_gate);
-            let start = start.clone();
-            async move {
-                start.fire();
-                gate.wait().await;
-                Ok(())
-            }
-        },
-        move || {
-            cancellation_count.fetch_add(1, Ordering::AcqRel);
-        },
-    );
+    let GatedQueue {
+        queue,
+        gate,
+        started_rx,
+        cancellations,
+        ..
+    } = GatedQueue::spawn();
     let receipt = queue
         .enqueue(PopupIoOperation::Write(b"active".to_vec()))
         .expect("enqueue active write");

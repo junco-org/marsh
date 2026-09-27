@@ -1,3 +1,4 @@
+use super::linked_pane_selection::LinkedPaneFixture;
 use super::*;
 
 use crate::handler::prompt_support::PromptInputEvent;
@@ -6,94 +7,21 @@ use rmux_proto::{
     PaneResizeRequest, ResizePaneAdjustment, ResizePaneRequest, SplitWindowExtRequest,
 };
 
-struct LinkedMutationFixture {
-    owner: SessionName,
-    grouped_peer: SessionName,
-    linked_peer: SessionName,
-    pane_one_id: rmux_proto::PaneId,
-}
-
-impl LinkedMutationFixture {
-    fn targets(&self) -> [WindowTarget; 3] {
-        [
-            WindowTarget::with_window(self.owner.clone(), 0),
-            WindowTarget::with_window(self.grouped_peer.clone(), 0),
-            WindowTarget::with_window(self.linked_peer.clone(), 1),
-        ]
-    }
-}
-
-async fn linked_mutation_fixture(handler: &RequestHandler, label: &str) -> LinkedMutationFixture {
-    let status = handler
-        .handle(Request::SetOption(SetOptionRequest {
-            scope: ScopeSelector::Global,
-            option: OptionName::Status,
-            value: "off".to_owned(),
-            mode: SetOptionMode::Replace,
-        }))
+async fn linked_mutation_fixture(handler: &RequestHandler, label: &str) -> LinkedPaneFixture {
+    handler
+        .set_option(ScopeSelector::Global, OptionName::Status, "off")
         .await;
-    assert!(matches!(status, Response::SetOption(_)), "{status:?}");
 
-    let owner = session_name(&format!("{label}-owner"));
-    let grouped_peer = session_name(&format!("{label}-grouped"));
-    let linked_peer = session_name(&format!("{label}-linked"));
-    create_session(handler, owner.as_str()).await;
-    create_grouped_session(handler, grouped_peer.as_str(), &owner).await;
-    let split = handler
-        .handle(Request::SplitWindow(SplitWindowRequest {
-            target: SplitWindowTarget::Session(owner.clone()),
-            direction: SplitDirection::Vertical,
-            before: false,
-            environment: None,
-        }))
-        .await;
-    assert!(matches!(split, Response::SplitWindow(_)), "{split:?}");
+    let owner = create_session(handler, format!("{label}-owner")).await;
+    let grouped_peer = create_grouped_session(handler, format!("{label}-grouped"), &owner).await;
+    handler.handle_ok(SplitWindowRequest::fixture(&owner)).await;
 
-    create_session(handler, linked_peer.as_str()).await;
-    let linked = handler
-        .handle(Request::LinkWindow(LinkWindowRequest {
-            source: WindowTarget::with_window(owner.clone(), 0),
-            target: WindowTarget::with_window(linked_peer.clone(), 1),
-            after: false,
-            before: false,
-            kill_destination: false,
-            detached: true,
-        }))
-        .await;
-    assert!(matches!(linked, Response::LinkWindow(_)), "{linked:?}");
-    handler.wait_for_initial_panes_for_test().await;
-
-    let fixture = {
-        let mut state = handler.state.lock().await;
-        for target in [
-            WindowTarget::with_window(owner.clone(), 0),
-            WindowTarget::with_window(grouped_peer.clone(), 0),
-            WindowTarget::with_window(linked_peer.clone(), 1),
-        ] {
-            state
-                .sessions
-                .session_mut(target.session_name())
-                .expect("fixture session exists")
-                .select_pane_in_window(target.window_index(), 0)
-                .expect("fixture pane zero selection succeeds");
-        }
-        let window = state
-            .sessions
-            .session(&owner)
-            .and_then(|session| session.window_at(0))
-            .expect("fixture owner window exists");
-        LinkedMutationFixture {
-            owner,
-            grouped_peer,
-            linked_peer,
-            pane_one_id: window.pane(1).expect("pane one exists").id(),
-        }
-    };
+    let fixture = LinkedPaneFixture::link(handler, owner, grouped_peer, label).await;
     assert_alias_windows_identical(handler, &fixture).await;
     fixture
 }
 
-async fn assert_alias_windows_identical(handler: &RequestHandler, fixture: &LinkedMutationFixture) {
+async fn assert_alias_windows_identical(handler: &RequestHandler, fixture: &LinkedPaneFixture) {
     let state = handler.state.lock().await;
     let expected = state
         .sessions
@@ -116,7 +44,7 @@ async fn assert_alias_windows_identical(handler: &RequestHandler, fixture: &Link
 
 async fn assert_alias_zoom(
     handler: &RequestHandler,
-    fixture: &LinkedMutationFixture,
+    fixture: &LinkedPaneFixture,
     zoomed: bool,
     active_pane: u32,
 ) {
@@ -137,23 +65,9 @@ async fn assert_alias_zoom(
     }
 }
 
-async fn pane_terminal_size(
-    handler: &RequestHandler,
-    session_name: &SessionName,
-    window_index: u32,
-    pane_index: u32,
-) -> TerminalSize {
-    handler
-        .state
-        .lock()
-        .await
-        .pane_terminal_size(session_name, window_index, pane_index)
-        .expect("pane terminal exposes its size")
-}
-
 async fn assert_active_runtime_and_lifecycle_match(
     handler: &RequestHandler,
-    fixture: &LinkedMutationFixture,
+    fixture: &LinkedPaneFixture,
 ) {
     let (active_pane, expected_size, lifecycle_size) = {
         let state = handler.state.lock().await;
@@ -166,10 +80,7 @@ async fn assert_active_runtime_and_lifecycle_match(
         let pane = window.pane(active_pane).expect("active pane exists");
         (
             active_pane,
-            TerminalSize {
-                cols: pane.geometry().cols(),
-                rows: pane.geometry().rows(),
-            },
+            TerminalSize::new(pane.geometry().cols(), pane.geometry().rows()),
             state
                 .pane_lifecycle(pane.id())
                 .expect("active pane lifecycle exists")
@@ -177,8 +88,9 @@ async fn assert_active_runtime_and_lifecycle_match(
         )
     };
     assert_eq!(lifecycle_size, expected_size);
+    let active = PaneTarget::with_window(fixture.owner.clone(), 0, active_pane);
     assert_eq!(
-        pane_terminal_size(handler, &fixture.owner, 0, active_pane).await,
+        handler.pane_terminal_size_for_test(&active).await,
         expected_size,
         "shared PTY size must commit with the linked window model"
     );
@@ -194,13 +106,12 @@ async fn cli_and_sdk_zoom_commit_linked_model_runtime_and_lifecycle_together() {
         .await
         .window_runtime_resize_count_for_test();
 
-    let zoomed = handler
-        .handle(Request::ResizePane(ResizePaneRequest {
+    handler
+        .handle_ok(ResizePaneRequest {
             target: PaneTarget::with_window(fixture.linked_peer.clone(), 1, 1),
             adjustment: ResizePaneAdjustment::Zoom,
-        }))
+        })
         .await;
-    assert!(matches!(zoomed, Response::ResizePane(_)), "{zoomed:?}");
     assert_alias_zoom(&handler, &fixture, true, 1).await;
     assert_active_runtime_and_lifecycle_match(&handler, &fixture).await;
 
@@ -229,7 +140,8 @@ async fn cli_and_sdk_zoom_commit_linked_model_runtime_and_lifecycle_together() {
 async fn pane_selection_resize_failure_rolls_back_every_alias_and_the_shared_runtime() {
     let handler = RequestHandler::new();
     let fixture = linked_mutation_fixture(&handler, "linked-select-rollback").await;
-    let terminal_size_before = pane_terminal_size(&handler, &fixture.owner, 0, 0).await;
+    let pane_zero = PaneTarget::with_window(fixture.owner.clone(), 0, 0);
+    let terminal_size_before = handler.pane_terminal_size_for_test(&pane_zero).await;
     let resize_count_before = {
         let mut state = handler.state.lock().await;
         let count = state.window_runtime_resize_count_for_test();
@@ -237,14 +149,11 @@ async fn pane_selection_resize_failure_rolls_back_every_alias_and_the_shared_run
         count
     };
 
+    let pane_one = PaneTarget::with_window(fixture.owner.clone(), 0, 1);
     let response = handler
-        .handle(Request::SelectPane(Box::new(SelectPaneRequest {
-            target: PaneTarget::with_window(fixture.owner.clone(), 0, 1),
-            title: None,
-            style: None,
-            input_disabled: None,
-            preserve_zoom: false,
-        })))
+        .handle(Request::SelectPane(Box::new(SelectPaneRequest::fixture(
+            pane_one,
+        ))))
         .await;
     assert_eq!(
         response,
@@ -256,7 +165,7 @@ async fn pane_selection_resize_failure_rolls_back_every_alias_and_the_shared_run
     );
     assert_alias_zoom(&handler, &fixture, false, 0).await;
     assert_eq!(
-        pane_terminal_size(&handler, &fixture.owner, 0, 0).await,
+        handler.pane_terminal_size_for_test(&pane_zero).await,
         terminal_size_before
     );
     assert_eq!(
@@ -275,31 +184,13 @@ async fn split_window_zoom_commits_the_new_zoomed_window_to_every_alias() {
     let handler = RequestHandler::new();
     let fixture = linked_mutation_fixture(&handler, "linked-split-zoom").await;
 
-    let response = handler
-        .handle(Request::SplitWindowExt(Box::new(SplitWindowExtRequest {
-            target: SplitWindowTarget::Pane(PaneTarget::with_window(
-                fixture.linked_peer.clone(),
-                1,
-                1,
-            )),
-            direction: SplitDirection::Vertical,
-            before: false,
-            environment: None,
-            command: Some(quiet_window_test_command()),
-            process_command: None,
-            start_directory: None,
-            keep_alive_on_exit: None,
-            detached: false,
-            size: None,
+    let split = handler
+        .handle_ok(SplitWindowExtRequest {
+            command: Some(quiet_command()),
             preserve_zoom: true,
-            full_size: false,
-            stdin_payload: None,
-        })))
+            ..Fixture::fixture(PaneTarget::with_window(fixture.linked_peer.clone(), 1, 1))
+        })
         .await;
-    let Response::SplitWindow(response) = response else {
-        panic!("linked split-window -Z failed: {response:?}");
-    };
-    handler.wait_for_initial_panes_for_test().await;
     assert_alias_windows_identical(&handler, &fixture).await;
     let state = handler.state.lock().await;
     for target in fixture.targets() {
@@ -309,21 +200,13 @@ async fn split_window_zoom_commits_the_new_zoomed_window_to_every_alias() {
             .and_then(|session| session.window_at(target.window_index()))
             .expect("window alias exists");
         assert!(window.is_zoomed(), "split zoom diverged for {target}");
-        assert_eq!(window.active_pane_index(), response.pane.pane_index());
+        assert_eq!(window.active_pane_index(), split.pane.pane_index());
     }
     drop(state);
-    let size = handler
-        .state
-        .lock()
-        .await
-        .pane_terminal_size(&fixture.owner, 0, response.pane.pane_index())
-        .expect("new split pane exposes its size");
+    let new_pane = PaneTarget::with_window(fixture.owner.clone(), 0, split.pane.pane_index());
     assert_eq!(
-        size,
-        TerminalSize {
-            cols: 120,
-            rows: 40
-        }
+        handler.pane_terminal_size_for_test(&new_pane).await,
+        TerminalSize::new(120, 40)
     );
 }
 
@@ -332,10 +215,7 @@ async fn mode_tree_zoom_and_dismissal_commit_every_linked_alias() {
     let handler = RequestHandler::new();
     let fixture = linked_mutation_fixture(&handler, "linked-mode-tree-zoom").await;
     let attach_pid = std::process::id().saturating_add(9_141);
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    handler
-        .register_attach(attach_pid, fixture.owner.clone(), control_tx)
-        .await;
+    let _control_rx = handler.attach_client(attach_pid, &fixture.owner).await;
 
     let parsed = CommandParser::new()
         .parse_arguments(["choose-tree", "-Zw"])
@@ -367,13 +247,12 @@ async fn non_zoom_window_geometry_mutations_remain_transactional_across_aliases(
     let handler = RequestHandler::new();
     let fixture = linked_mutation_fixture(&handler, "linked-layout").await;
 
-    let resized = handler
-        .handle(Request::ResizePane(ResizePaneRequest {
+    handler
+        .handle_ok(ResizePaneRequest {
             target: PaneTarget::with_window(fixture.linked_peer.clone(), 1, 0),
             adjustment: ResizePaneAdjustment::AbsoluteHeight { rows: 12 },
-        }))
+        })
         .await;
-    assert!(matches!(resized, Response::ResizePane(_)), "{resized:?}");
     assert_alias_windows_identical(&handler, &fixture).await;
 
     let layout = handler
@@ -384,14 +263,13 @@ async fn non_zoom_window_geometry_mutations_remain_transactional_across_aliases(
     assert!(matches!(layout, Response::NextLayout(_)), "{layout:?}");
     assert_alias_windows_identical(&handler, &fixture).await;
 
-    let rotated = handler
-        .handle(Request::RotateWindow(rmux_proto::RotateWindowRequest {
+    handler
+        .handle_ok(RotateWindowRequest {
             target: WindowTarget::with_window(fixture.owner.clone(), 0),
             direction: RotateWindowDirection::Down,
             restore_zoom: false,
-        }))
+        })
         .await;
-    assert!(matches!(rotated, Response::RotateWindow(_)), "{rotated:?}");
     assert_alias_windows_identical(&handler, &fixture).await;
     assert_active_runtime_and_lifecycle_match(&handler, &fixture).await;
 }

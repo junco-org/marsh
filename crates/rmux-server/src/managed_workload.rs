@@ -227,7 +227,7 @@ pub(crate) fn unapproved_error(captured: &CapturedOutput) -> RmuxError {
 /// decision would be one more thing to keep in step.
 pub(crate) fn completion_report(completion: &marsh_core::shellmux::CommandCompletion) -> String {
     let mut lines =
-        marsh_core::shellmux::repl::report_lines(&completion.shell.id, completion.outcome.as_ref());
+        marsh_core::shellmux::repl::report_lines(&completion.shell.id, completion.result.as_ref());
     if lines.is_empty() {
         lines.push(format!(
             "{}: the shell engine refused to publish this command",
@@ -461,7 +461,7 @@ fn builtin_spec(io: &ShellIo, cwd: &Path, line: String) -> Result<ExecutionSpec,
 /// The builtin writes one diagnostic line and exits nonzero; reporting "exit status 1" instead of
 /// that line would throw away the only part a user can act on.
 fn finish_builtin(captured: &CapturedOutput, what: &str) -> Result<(), RmuxError> {
-    if captured.completion.exit_code == Some(0) {
+    if captured.completion.exit_code() == Some(0) {
         return Ok(());
     }
     let detail = String::from_utf8_lossy(&captured.stderr);
@@ -471,7 +471,7 @@ fn finish_builtin(captured: &CapturedOutput, what: &str) -> Result<(), RmuxError
             "managed file {what} failed with status {}",
             captured
                 .completion
-                .exit_code
+                .exit_code()
                 .map_or_else(|| "unknown".to_owned(), |code| code.to_string())
         )));
     }

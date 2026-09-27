@@ -5,21 +5,10 @@ async fn attached_prefix_q_repaints_status_line_after_status_message() {
     let handler = RequestHandler::new();
     let requester_pid = std::process::id();
     let alpha = session_name("alpha");
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: alpha.clone(),
-                detached: true,
-                size: Some(TerminalSize { cols: 30, rows: 6 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
-    let (control_tx, mut control_rx) = mpsc::unbounded_channel();
     handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
+        .create_session((&alpha, TerminalSize { cols: 30, rows: 6 }))
         .await;
+    let mut control_rx = handler.attach_client(requester_pid, &alpha).await;
     drain_attach_controls(&mut control_rx);
 
     let mut status_frame = String::new();
@@ -68,41 +57,20 @@ async fn attached_prefix_x_during_display_panes_opens_kill_pane_prompt() {
     let requester_pid = std::process::id();
     let alpha = session_name("alpha");
     let mut control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
-    {
-        let mut state = handler.state.lock().await;
-        state
-            .options
-            .set(
-                ScopeSelector::Session(alpha.clone()),
-                OptionName::DisplayPanesTime,
-                "60000".to_owned(),
-                SetOptionMode::Replace,
-            )
-            .expect("extend display-panes timeout for prompt dispatch test");
-    }
-    assert!(matches!(
-        handler
-            .handle(Request::SplitWindow(SplitWindowRequest {
-                target: SplitWindowTarget::Session(alpha.clone()),
-                direction: rmux_proto::SplitDirection::Vertical,
-                before: false,
-                environment: None,
-            }))
-            .await,
-        Response::SplitWindow(_)
-    ));
-    assert!(matches!(
-        handler
-            .handle(Request::SelectPane(Box::new(SelectPaneRequest {
-                target: PaneTarget::new(alpha.clone(), 1),
-                title: None,
-                style: None,
-                input_disabled: None,
-                preserve_zoom: false,
-            })))
-            .await,
-        Response::SelectPane(_)
-    ));
+    handler
+        .store_option_for_test(
+            ScopeSelector::Session(alpha.clone()),
+            OptionName::DisplayPanesTime,
+            "60000",
+        )
+        .await;
+    handler.handle_ok(SplitWindowRequest::fixture(&alpha)).await;
+    handler
+        .handle_ok(SelectPaneRequest::fixture(PaneTarget::new(
+            alpha.clone(),
+            1,
+        )))
+        .await;
     drain_attach_controls(&mut control_rx);
 
     handler
@@ -141,17 +109,7 @@ async fn attached_prefix_q_emits_a_display_panes_overlay_when_prefix_and_q_arriv
     let requester_pid = std::process::id();
     let alpha = session_name("alpha");
     let mut control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
-    assert!(matches!(
-        handler
-            .handle(Request::SplitWindow(SplitWindowRequest {
-                target: SplitWindowTarget::Session(alpha.clone()),
-                direction: rmux_proto::SplitDirection::Vertical,
-                before: false,
-                environment: None,
-            }))
-            .await,
-        Response::SplitWindow(_)
-    ));
+    handler.handle_ok(SplitWindowRequest::fixture(&alpha)).await;
     drain_attach_controls(&mut control_rx);
 
     handler
@@ -187,8 +145,7 @@ async fn display_panes_target_client_does_not_fan_out_within_the_session() {
     let handler = RequestHandler::new();
     let alpha = session_name("display-panes-target-client");
     let mut first_rx = create_attached_session(&handler, 101, &alpha).await;
-    let (second_tx, mut second_rx) = mpsc::unbounded_channel();
-    handler.register_attach(202, alpha.clone(), second_tx).await;
+    let mut second_rx = handler.attach_client(202, &alpha).await;
     drain_attach_controls(&mut first_rx);
     drain_attach_controls(&mut second_rx);
 
@@ -250,16 +207,12 @@ async fn rename_session_rekeys_display_panes_typed_and_template_targets() {
     );
     let _ = recv_overlay_frame(&mut control_rx, "display-panes before rename").await;
 
-    let response = handler
-        .handle(Request::RenameSession(rmux_proto::RenameSessionRequest {
+    handler
+        .handle_ok(RenameSessionRequest {
             target: alpha,
             new_name: beta.clone(),
-        }))
+        })
         .await;
-    assert!(
-        matches!(response, Response::RenameSession(_)),
-        "{response:?}"
-    );
 
     let label = {
         let active_attach = handler.active_attach.lock().await;
@@ -320,31 +273,9 @@ async fn refresh_client_replays_active_display_panes_after_base_switch() {
     let _ = recv_overlay_frame(&mut control_rx, "display-panes before refresh-client").await;
     drain_attach_controls(&mut control_rx);
 
-    let response = handler
-        .handle(Request::RefreshClient(Box::new(
-            rmux_proto::request::RefreshClientRequest {
-                target_client: None,
-                adjustment: None,
-                clear_pan: false,
-                pan_left: false,
-                pan_right: false,
-                pan_up: false,
-                pan_down: false,
-                status_only: false,
-                clipboard_query: false,
-                flags: None,
-                flags_alias: None,
-                subscriptions: Vec::new(),
-                subscriptions_format: Vec::new(),
-                control_size: None,
-                colour_report: None,
-            },
-        )))
+    handler
+        .handle_ok(rmux_proto::RefreshClientRequest::fixture(None))
         .await;
-    assert!(
-        matches!(response, Response::RefreshClient(_)),
-        "{response:?}"
-    );
 
     let mut saw_switch = false;
     let mut replayed_display_panes = None;
@@ -430,22 +361,12 @@ async fn refresh_client_replay_order_matches_overlay_input_priority() {
     let requester_pid = std::process::id();
     let session = session_name("refresh-client-overlay-priority");
     let mut control_rx = create_attached_session(&handler, requester_pid, &session).await;
-    assert!(matches!(
-        handler
-            .handle(Request::NewWindow(Box::new(NewWindowRequest {
-                target: session.clone(),
-                name: Some("w1".to_owned()),
-                detached: true,
-                start_directory: None,
-                environment: None,
-                command: None,
-                process_command: None,
-                target_window_index: None,
-                insert_at_target: false,
-            })))
-            .await,
-        Response::NewWindow(_)
-    ));
+    handler
+        .create_window(NewWindowRequest {
+            name: Some("w1".to_owned()),
+            ..Fixture::fixture(&session)
+        })
+        .await;
     let commands = handler
         .parse_control_commands("choose-tree -Zw")
         .await
@@ -478,31 +399,9 @@ async fn refresh_client_replay_order_matches_overlay_input_priority() {
     }
     drain_attach_controls(&mut control_rx);
 
-    let response = handler
-        .handle(Request::RefreshClient(Box::new(
-            rmux_proto::request::RefreshClientRequest {
-                target_client: None,
-                adjustment: None,
-                clear_pan: false,
-                pan_left: false,
-                pan_right: false,
-                pan_up: false,
-                pan_down: false,
-                status_only: false,
-                clipboard_query: false,
-                flags: None,
-                flags_alias: None,
-                subscriptions: Vec::new(),
-                subscriptions_format: Vec::new(),
-                control_size: None,
-                colour_report: None,
-            },
-        )))
+    handler
+        .handle_ok(rmux_proto::RefreshClientRequest::fixture(None))
         .await;
-    assert!(
-        matches!(response, Response::RefreshClient(_)),
-        "{response:?}"
-    );
 
     let mut saw_switch = false;
     let mut replay_order = Vec::new();
@@ -532,52 +431,28 @@ async fn display_panes_input_uses_visible_pane_base_index_labels() {
     let requester_pid = std::process::id();
     let alpha = session_name("alpha");
     let mut control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
-    assert!(matches!(
-        handler
-            .handle(Request::SplitWindow(SplitWindowRequest {
-                target: SplitWindowTarget::Session(alpha.clone()),
-                direction: rmux_proto::SplitDirection::Vertical,
-                before: false,
-                environment: None,
-            }))
-            .await,
-        Response::SplitWindow(_)
-    ));
-    assert!(matches!(
-        handler
-            .handle(Request::SelectPane(Box::new(SelectPaneRequest {
-                target: PaneTarget::with_window(alpha.clone(), 0, 0),
-                title: None,
-                style: None,
-                input_disabled: None,
-                preserve_zoom: false,
-            })))
-            .await,
-        Response::SelectPane(_)
-    ));
-    assert!(matches!(
-        handler
-            .handle(Request::SetOption(SetOptionRequest {
-                scope: ScopeSelector::Window(WindowTarget::with_window(alpha.clone(), 0)),
-                option: OptionName::PaneBaseIndex,
-                value: "10".to_owned(),
-                mode: SetOptionMode::Replace,
-            }))
-            .await,
-        Response::SetOption(_)
-    ));
-    {
-        let mut state = handler.state.lock().await;
-        state
-            .options
-            .set(
-                ScopeSelector::Session(alpha.clone()),
-                OptionName::DisplayPanesTime,
-                "60000".to_owned(),
-                SetOptionMode::Replace,
-            )
-            .expect("extend display-panes timeout for multi-digit input test");
-    }
+    handler.handle_ok(SplitWindowRequest::fixture(&alpha)).await;
+    handler
+        .handle_ok(SelectPaneRequest::fixture(PaneTarget::with_window(
+            alpha.clone(),
+            0,
+            0,
+        )))
+        .await;
+    handler
+        .set_option(
+            ScopeSelector::Window(WindowTarget::with_window(alpha.clone(), 0)),
+            OptionName::PaneBaseIndex,
+            "10",
+        )
+        .await;
+    handler
+        .store_option_for_test(
+            ScopeSelector::Session(alpha.clone()),
+            OptionName::DisplayPanesTime,
+            "60000",
+        )
+        .await;
     drain_attach_controls(&mut control_rx);
 
     handler
@@ -665,29 +540,14 @@ async fn attached_prefix_q_emits_a_display_panes_clear_after_the_timeout() {
     let requester_pid = std::process::id();
     let alpha = session_name("alpha");
     let mut control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
-    {
-        let mut state = handler.state.lock().await;
-        state
-            .options
-            .set(
-                ScopeSelector::Session(alpha.clone()),
-                OptionName::DisplayPanesTime,
-                "25".to_owned(),
-                SetOptionMode::Replace,
-            )
-            .expect("set display-panes-time");
-    }
-    assert!(matches!(
-        handler
-            .handle(Request::SplitWindow(SplitWindowRequest {
-                target: SplitWindowTarget::Session(alpha.clone()),
-                direction: rmux_proto::SplitDirection::Vertical,
-                before: false,
-                environment: None,
-            }))
-            .await,
-        Response::SplitWindow(_)
-    ));
+    handler
+        .store_option_for_test(
+            ScopeSelector::Session(alpha.clone()),
+            OptionName::DisplayPanesTime,
+            "25",
+        )
+        .await;
+    handler.handle_ok(SplitWindowRequest::fixture(&alpha)).await;
     drain_attach_controls(&mut control_rx);
 
     handler
@@ -737,34 +597,19 @@ async fn attached_prefix_q_inside_choose_tree_restores_the_tree_overlay_without_
     let requester_pid = std::process::id();
     let alpha = session_name("alpha");
     let mut control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
-    {
-        let mut state = handler.state.lock().await;
-        state
-            .options
-            .set(
-                ScopeSelector::Session(alpha.clone()),
-                OptionName::DisplayPanesTime,
-                "25".to_owned(),
-                SetOptionMode::Replace,
-            )
-            .expect("set display-panes-time");
-    }
-    assert!(matches!(
-        handler
-            .handle(Request::NewWindow(Box::new(NewWindowRequest {
-                target: alpha.clone(),
-                name: Some("w1".to_owned()),
-                detached: true,
-                start_directory: None,
-                environment: None,
-                command: None,
-                process_command: None,
-                target_window_index: None,
-                insert_at_target: false,
-            })))
-            .await,
-        Response::NewWindow(_)
-    ));
+    handler
+        .store_option_for_test(
+            ScopeSelector::Session(alpha.clone()),
+            OptionName::DisplayPanesTime,
+            "25",
+        )
+        .await;
+    handler
+        .create_window(NewWindowRequest {
+            name: Some("w1".to_owned()),
+            ..Fixture::fixture(&alpha)
+        })
+        .await;
     let commands = handler
         .parse_control_commands("choose-tree -Zw")
         .await
@@ -868,10 +713,7 @@ async fn old_display_panes_timer_cannot_clear_same_pid_replacement_state() {
         )
     };
 
-    let (replacement_tx, mut replacement_rx) = mpsc::unbounded_channel();
-    handler
-        .register_attach(requester_pid, alpha.clone(), replacement_tx)
-        .await;
+    let mut replacement_rx = handler.attach_client(requester_pid, &alpha).await;
     let replacement = handler
         .handle(Request::DisplayPanes(Box::new(
             rmux_proto::DisplayPanesRequest {

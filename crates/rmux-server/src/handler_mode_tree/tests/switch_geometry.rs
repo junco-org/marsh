@@ -5,15 +5,7 @@
 use super::super::mode_tree_order::{pane_item_id, session_item_id};
 use super::*;
 
-use crate::control::{ControlModeUpgrade, ControlServerEvent, CONTROL_SERVER_EVENT_CAPACITY};
-use rmux_proto::NewWindowRequest;
-use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
-use std::time::Duration;
-
-const NOTIFICATION_TIMEOUT: Duration = Duration::from_secs(5);
-const NOTIFICATION_POLL: Duration = Duration::from_millis(25);
-const NOTIFICATION_SETTLE: Duration = Duration::from_millis(250);
+use crate::test_fixtures::{collect_control_notifications_through, settle_control_notifications};
 
 /// Frozen tmux 3.7b oracle, measured 2026-07-25
 /// (`.rmux-audit/oracle/scenario_switch_destination.py`): a 101x41 client
@@ -29,10 +21,17 @@ async fn choose_tree_switch_notifies_the_destination_session_layout_change_like_
     let handler = RequestHandler::new();
     let source = SessionName::new("choose-tree-switch-source").expect("valid session");
     let target = SessionName::new("choose-tree-switch-target").expect("valid session");
-    create_test_session(&handler, &source).await;
-    create_test_session(&handler, &target).await;
-    set_window_size_largest(&handler, &source).await;
-    set_window_size_largest(&handler, &target).await;
+    handler.create_session(&source).await;
+    handler.create_session(&target).await;
+    for session in [&source, &target] {
+        handler
+            .set_option(
+                ScopeSelector::Session(session.clone()),
+                OptionName::WindowSize,
+                "largest",
+            )
+            .await;
+    }
 
     let attach_pid = std::process::id().saturating_add(211);
     let control_pid = attach_pid.saturating_add(1);
@@ -42,84 +41,38 @@ async fn choose_tree_switch_notifies_the_destination_session_layout_change_like_
     };
     let destination_size = TerminalSize { cols: 60, rows: 20 };
 
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
+    let _control_rx = handler.attach_client(attach_pid, &source).await;
     handler
-        .register_attach(attach_pid, source.clone(), control_tx)
+        .declare_client_size_for_test(attach_pid, switching_size)
         .await;
-    set_attached_client_size(&handler, attach_pid, switching_size).await;
 
-    let (event_tx, mut control_events) = tokio::sync::mpsc::channel(CONTROL_SERVER_EVENT_CAPACITY);
-    handler
-        .register_control_with_closing(
-            control_pid,
-            ControlModeUpgrade {
-                initial_command_count: 0,
-                mode: rmux_proto::ControlMode::Plain,
-                terminal_context: crate::outer_terminal::OuterTerminalContext::default(),
-            },
-            event_tx,
-            Arc::new(AtomicBool::new(false)),
-        )
+    let (_, mut control_events) = handler
+        .register_control_for_test(control_pid, Some(&target))
         .await;
     handler
-        .set_control_session(control_pid, Some(target.clone()))
-        .await
-        .expect("set control session");
-    assert!(matches!(
-        handler
-            .handle(Request::RefreshClient(Box::new(control_size_request(
-                control_pid,
-                destination_size
-            ))))
-            .await,
-        Response::RefreshClient(_)
-    ));
-    assert_eq!(window_size(&handler, &target).await, destination_size);
+        .handle_ok(rmux_proto::RefreshClientRequest {
+            control_size: Some(format!(
+                "{}x{}",
+                destination_size.cols, destination_size.rows
+            )),
+            ..Fixture::fixture(Some(control_pid.to_string()))
+        })
+        .await;
+    assert_eq!(
+        handler.active_window_size_for_test(&target).await,
+        destination_size
+    );
 
-    let target_session_id = handler
-        .state
-        .lock()
-        .await
-        .sessions
-        .session(&target)
-        .expect("target session exists")
-        .id();
-    let target_window_id = handler
-        .state
-        .lock()
-        .await
-        .sessions
-        .session(&target)
-        .expect("target session exists")
-        .window()
-        .id()
-        .as_u32();
+    let target_session_id = handler.session_id_for_test(&target).await;
+    let target_window_id = handler.active_window_id_for_test(&target).await;
     let layout_prefix = format!("%layout-change @{target_window_id} ");
 
-    let parsed = CommandParser::new()
-        .parse_arguments(["choose-tree"])
-        .expect("choose-tree parses");
-    let command = RequestHandler::parse_mode_tree_queue_command(parsed.commands()[0].clone())
-        .expect("mode-tree command parses")
-        .expect("mode-tree command recognized");
-    handler
-        .execute_queued_mode_tree(
-            attach_pid,
-            command,
-            &QueueExecutionContext::without_caller_cwd(),
-        )
-        .await
-        .expect("choose-tree opens");
-    handler
-        .active_attach
-        .lock()
-        .await
-        .by_pid
-        .get_mut(&attach_pid)
-        .and_then(|active| active.mode_tree.as_mut())
-        .expect("choose-tree remains active")
-        .selected_id = Some(session_item_id(target_session_id));
-    settle_notifications(&mut control_events).await;
+    open_mode_tree(&handler, attach_pid, &["choose-tree"]).await;
+    with_mode_tree(&handler, attach_pid, |mode| {
+        mode.selected_id = Some(session_item_id(target_session_id));
+    })
+    .await;
+    settle_control_notifications(&mut control_events).await;
 
     handler
         .accept_mode_tree_selection(attach_pid)
@@ -127,14 +80,14 @@ async fn choose_tree_switch_notifies_the_destination_session_layout_change_like_
         .expect("choose-tree switch-client -Zt succeeds");
 
     assert_eq!(
-        window_size(&handler, &target).await,
+        handler.active_window_size_for_test(&target).await,
         TerminalSize {
             cols: switching_size.cols,
             rows: switching_size.rows - 1,
         },
         "choose-tree's switch must grow the destination window"
     );
-    let lines = notifications_through(&mut control_events, &layout_prefix).await;
+    let lines = collect_control_notifications_through(&mut control_events, &layout_prefix).await;
     let layout_index = lines
         .iter()
         .position(|line| line.starts_with(&layout_prefix))
@@ -167,73 +120,38 @@ async fn choose_tree_switch_carries_a_sizeless_client_outer_terminal_anchor() {
     let handler = RequestHandler::new();
     let source = SessionName::new("choose-tree-sizeless-source").expect("valid session");
     let target = SessionName::new("choose-tree-sizeless-target").expect("valid session");
-    create_test_session(&handler, &source).await;
-    create_test_session(&handler, &target).await;
+    handler.create_session(&source).await;
+    handler.create_session(&target).await;
     for session in [&source, &target] {
-        assert!(matches!(
-            handler
-                .handle(Request::SetOption(SetOptionRequest {
-                    scope: ScopeSelector::Session((*session).clone()),
-                    option: OptionName::Status,
-                    value: "2".to_owned(),
-                    mode: SetOptionMode::Replace,
-                }))
-                .await,
-            Response::SetOption(_)
-        ));
+        handler
+            .set_option(
+                ScopeSelector::Session(session.clone()),
+                OptionName::Status,
+                "2",
+            )
+            .await;
     }
 
     let declared_pid = std::process::id().saturating_add(311);
     let sizeless_pid = declared_pid.saturating_add(1);
-    let (declared_tx, _declared_rx) = mpsc::unbounded_channel();
-    handler
-        .register_attach(declared_pid, source.clone(), declared_tx)
-        .await;
+    let _declared_rx = handler.attach_client(declared_pid, &source).await;
     handler
         .handle_attached_resize(declared_pid, TerminalSize { cols: 80, rows: 24 })
         .await
         .expect("declared terminal geometry seeds status-aware content size");
     assert_eq!(
-        window_size(&handler, &source).await,
+        handler.active_window_size_for_test(&source).await,
         TerminalSize { cols: 80, rows: 22 }
     );
 
-    let (sizeless_tx, _sizeless_rx) = mpsc::unbounded_channel();
-    handler
-        .register_attach(sizeless_pid, source.clone(), sizeless_tx)
-        .await;
+    let _sizeless_rx = handler.attach_client(sizeless_pid, &source).await;
 
-    let target_session_id = handler
-        .state
-        .lock()
-        .await
-        .sessions
-        .session(&target)
-        .expect("target session exists")
-        .id();
-    let parsed = CommandParser::new()
-        .parse_arguments(["choose-tree"])
-        .expect("choose-tree parses");
-    let command = RequestHandler::parse_mode_tree_queue_command(parsed.commands()[0].clone())
-        .expect("mode-tree command parses")
-        .expect("mode-tree command recognized");
-    handler
-        .execute_queued_mode_tree(
-            sizeless_pid,
-            command,
-            &QueueExecutionContext::without_caller_cwd(),
-        )
-        .await
-        .expect("choose-tree opens");
-    handler
-        .active_attach
-        .lock()
-        .await
-        .by_pid
-        .get_mut(&sizeless_pid)
-        .and_then(|active| active.mode_tree.as_mut())
-        .expect("choose-tree remains active")
-        .selected_id = Some(session_item_id(target_session_id));
+    let target_session_id = handler.session_id_for_test(&target).await;
+    open_mode_tree(&handler, sizeless_pid, &["choose-tree"]).await;
+    with_mode_tree(&handler, sizeless_pid, |mode| {
+        mode.selected_id = Some(session_item_id(target_session_id));
+    })
+    .await;
 
     handler
         .accept_mode_tree_selection(sizeless_pid)
@@ -246,7 +164,7 @@ async fn choose_tree_switch_carries_a_sizeless_client_outer_terminal_anchor() {
         "choose-tree must carry the outer terminal anchor to the destination"
     );
     assert_eq!(
-        window_size(&handler, &target).await,
+        handler.active_window_size_for_test(&target).await,
         TerminalSize { cols: 80, rows: 22 },
         "the destination subtracts its own status rows exactly once"
     );
@@ -257,37 +175,16 @@ async fn choose_tree_pane_switch_keeps_the_control_selection_model_current() {
     let handler = RequestHandler::new();
     let source = SessionName::new("choose-tree-selection-source").expect("valid session");
     let target = SessionName::new("choose-tree-selection-target").expect("valid session");
-    create_test_session(&handler, &source).await;
-    create_test_session(&handler, &target).await;
-    let response = handler
-        .handle(Request::NewWindow(Box::new(NewWindowRequest {
-            target: target.clone(),
-            name: None,
-            detached: true,
-            start_directory: None,
-            environment: None,
-            command: None,
-            process_command: None,
-            target_window_index: None,
-            insert_at_target: false,
-        })))
+    handler.create_session(&source).await;
+    handler.create_session(&target).await;
+    let window = handler.create_window(&target).await;
+    assert_eq!(window.window_index(), 1);
+    handler
+        .handle_ok(SplitWindowRequest {
+            direction: SplitDirection::Horizontal,
+            ..Fixture::fixture(PaneTarget::with_window(target.clone(), 1, 0))
+        })
         .await;
-    let Response::NewWindow(window) = response else {
-        panic!("target window creation failed: {response:?}");
-    };
-    assert_eq!(window.target.window_index(), 1);
-    assert!(matches!(
-        handler
-            .handle(Request::SplitWindow(SplitWindowRequest {
-                target: SplitWindowTarget::Pane(PaneTarget::with_window(target.clone(), 1, 0,)),
-                direction: SplitDirection::Horizontal,
-                before: false,
-                environment: None,
-            }))
-            .await,
-        Response::SplitWindow(_)
-    ));
-    handler.wait_for_initial_panes_for_test().await;
 
     let (
         pane_item,
@@ -342,56 +239,25 @@ async fn choose_tree_pane_switch_keeps_the_control_selection_model_current() {
 
     let attach_pid = std::process::id().saturating_add(212);
     let control_pid = attach_pid.saturating_add(1);
-    let (attach_tx, _attach_rx) = mpsc::unbounded_channel();
-    handler.register_attach(attach_pid, source, attach_tx).await;
-    let (event_tx, mut control_events) = tokio::sync::mpsc::channel(CONTROL_SERVER_EVENT_CAPACITY);
-    handler
-        .register_control_with_closing(
-            control_pid,
-            ControlModeUpgrade {
-                initial_command_count: 0,
-                mode: rmux_proto::ControlMode::Plain,
-                terminal_context: crate::outer_terminal::OuterTerminalContext::default(),
-            },
-            event_tx,
-            Arc::new(AtomicBool::new(false)),
-        )
+    let _attach_rx = handler.attach_client(attach_pid, source).await;
+    let (_, mut control_events) = handler
+        .register_control_for_test(control_pid, Some(&target))
         .await;
-    handler
-        .set_control_session(control_pid, Some(target.clone()))
-        .await
-        .expect("set control session");
 
-    let parsed = CommandParser::new()
-        .parse_arguments(["choose-tree"])
-        .expect("choose-tree parses");
-    let command = RequestHandler::parse_mode_tree_queue_command(parsed.commands()[0].clone())
-        .expect("mode-tree command parses")
-        .expect("mode-tree command recognized");
-    handler
-        .execute_queued_mode_tree(
-            attach_pid,
-            command,
-            &QueueExecutionContext::without_caller_cwd(),
-        )
-        .await
-        .expect("choose-tree opens");
-    handler
-        .active_attach
-        .lock()
-        .await
-        .by_pid
-        .get_mut(&attach_pid)
-        .and_then(|active| active.mode_tree.as_mut())
-        .expect("choose-tree remains active")
-        .selected_id = Some(pane_item);
-    settle_notifications(&mut control_events).await;
+    open_mode_tree(&handler, attach_pid, &["choose-tree"]).await;
+    with_mode_tree(&handler, attach_pid, |mode| {
+        mode.selected_id = Some(pane_item);
+    })
+    .await;
+    settle_control_notifications(&mut control_events).await;
 
     handler
         .accept_mode_tree_selection(attach_pid)
         .await
         .expect("choose-tree pane switch succeeds");
-    let lines = notifications_through(&mut control_events, "%client-session-changed ").await;
+    let lines =
+        collect_control_notifications_through(&mut control_events, "%client-session-changed ")
+            .await;
     let transitions = lines
         .iter()
         .filter_map(|line| {
@@ -437,70 +303,6 @@ async fn choose_tree_pane_switch_keeps_the_control_selection_model_current() {
     assert_eq!(predicted_pane_id, target_pane_id);
 }
 
-async fn create_test_session(handler: &RequestHandler, session_name: &SessionName) {
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: session_name.clone(),
-                detached: true,
-                size: Some(TerminalSize { cols: 80, rows: 24 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
-}
-
-fn control_size_request(
-    control_pid: u32,
-    size: TerminalSize,
-) -> rmux_proto::request::RefreshClientRequest {
-    rmux_proto::request::RefreshClientRequest {
-        target_client: Some(control_pid.to_string()),
-        adjustment: None,
-        clear_pan: false,
-        pan_left: false,
-        pan_right: false,
-        pan_up: false,
-        pan_down: false,
-        status_only: false,
-        clipboard_query: false,
-        flags: None,
-        flags_alias: None,
-        subscriptions: Vec::new(),
-        subscriptions_format: Vec::new(),
-        control_size: Some(format!("{}x{}", size.cols, size.rows)),
-        colour_report: None,
-    }
-}
-
-async fn set_window_size_largest(handler: &RequestHandler, session_name: &SessionName) {
-    assert!(matches!(
-        handler
-            .handle(Request::SetOption(SetOptionRequest {
-                scope: ScopeSelector::Session(session_name.clone()),
-                option: OptionName::WindowSize,
-                value: "largest".to_owned(),
-                mode: SetOptionMode::Replace,
-            }))
-            .await,
-        Response::SetOption(_)
-    ));
-}
-
-async fn set_attached_client_size(handler: &RequestHandler, attach_pid: u32, size: TerminalSize) {
-    let size_sequence = handler.next_client_size_sequence();
-    let mut active_attach = handler.active_attach.lock().await;
-    let active = active_attach
-        .by_pid
-        .get_mut(&attach_pid)
-        .expect("attached client remains registered");
-    active.set_declared_client_size(size);
-    active.size_sequence = size_sequence;
-    drop(active_attach);
-    handler.bump_active_attach_epoch();
-}
-
 async fn session_terminal_size(
     handler: &RequestHandler,
     session_name: &SessionName,
@@ -513,49 +315,4 @@ async fn session_terminal_size(
         .session(session_name)
         .expect("session remains present")
         .terminal_size()
-}
-
-async fn window_size(handler: &RequestHandler, session_name: &SessionName) -> TerminalSize {
-    handler
-        .state
-        .lock()
-        .await
-        .sessions
-        .session(session_name)
-        .expect("session remains present")
-        .window()
-        .size()
-}
-
-async fn notifications_through(
-    events: &mut tokio::sync::mpsc::Receiver<ControlServerEvent>,
-    prefix: &str,
-) -> Vec<String> {
-    let deadline = tokio::time::Instant::now() + NOTIFICATION_TIMEOUT;
-    let mut lines = Vec::new();
-    while tokio::time::Instant::now() < deadline {
-        match tokio::time::timeout(NOTIFICATION_POLL, events.recv()).await {
-            Ok(Some(ControlServerEvent::Notification(line))) => {
-                let matched = line.starts_with(prefix);
-                lines.push(line);
-                if matched {
-                    return lines;
-                }
-            }
-            Ok(Some(_)) | Err(_) => continue,
-            Ok(None) => break,
-        }
-    }
-    lines
-}
-
-async fn settle_notifications(events: &mut tokio::sync::mpsc::Receiver<ControlServerEvent>) {
-    let mut deadline = tokio::time::Instant::now() + NOTIFICATION_SETTLE;
-    while tokio::time::Instant::now() < deadline {
-        match tokio::time::timeout(NOTIFICATION_POLL, events.recv()).await {
-            Ok(Some(_)) => deadline = tokio::time::Instant::now() + NOTIFICATION_SETTLE,
-            Ok(None) => break,
-            Err(_) => continue,
-        }
-    }
 }

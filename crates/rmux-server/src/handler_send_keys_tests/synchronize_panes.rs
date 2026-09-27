@@ -7,49 +7,31 @@ async fn live_attach_synchronize_panes_writes_to_each_live_pane() {
     let requester_pid = std::process::id();
 
     create_send_keys_test_session(&handler, &alpha).await;
-    let split = handler
-        .handle(Request::SplitWindow(SplitWindowRequest {
-            target: SplitWindowTarget::Pane(PaneTarget::new(alpha.clone(), 0)),
+    handler
+        .handle_ok(SplitWindowRequest {
             direction: SplitDirection::Horizontal,
-            before: false,
-            environment: None,
-        }))
+            ..Fixture::fixture(PaneTarget::new(alpha.clone(), 0))
+        })
         .await;
-    assert!(matches!(split, Response::SplitWindow(_)));
-
-    let select_first = handler
-        .handle(Request::SelectPane(Box::new(SelectPaneRequest {
-            target: PaneTarget::with_window(alpha.clone(), 0, 0),
-            title: None,
-            style: None,
-            input_disabled: None,
-            preserve_zoom: false,
-        })))
-        .await;
-    assert!(matches!(select_first, Response::SelectPane(_)));
-
-    let set_sync = handler
-        .handle(Request::SetOption(SetOptionRequest {
-            scope: ScopeSelector::Window(WindowTarget::with_window(alpha.clone(), 0)),
-            option: OptionName::SynchronizePanes,
-            value: "on".to_owned(),
-            mode: SetOptionMode::Replace,
-        }))
-        .await;
-    assert!(matches!(set_sync, Response::SetOption(_)));
 
     let pane_zero = PaneTarget::with_window(alpha.clone(), 0, 0);
     let pane_one = PaneTarget::with_window(alpha.clone(), 0, 1);
+    handler
+        .handle_ok(SelectPaneRequest::fixture(&pane_zero))
+        .await;
+
+    let scope = ScopeSelector::Window(WindowTarget::with_window(alpha.clone(), 0));
+    handler
+        .set_option(scope, OptionName::SynchronizePanes, "on")
+        .await;
+
     {
         let state = handler.state.lock().await;
         state.start_pane_input_capture_for_test(&pane_zero);
         state.start_pane_input_capture_for_test(&pane_one);
     }
 
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
 
     handler
         .handle_attached_live_input_for_test(requester_pid, b"sync")
@@ -302,51 +284,23 @@ async fn create_synchronized_two_pane_session(
     // double-click content race fixed in live_attach.rs).
     create_quiet_input_session(handler, alpha).await;
     let split = handler
-        .handle(Request::SplitWindowExt(Box::new(
-            rmux_proto::SplitWindowExtRequest {
-                target: SplitWindowTarget::Pane(PaneTarget::new(alpha.clone(), 0)),
-                direction: SplitDirection::Horizontal,
-                before: false,
-                environment: None,
-                command: Some(quiet_pane_command()),
-                process_command: None,
-                start_directory: None,
-                keep_alive_on_exit: None,
-                detached: false,
-                size: None,
-                preserve_zoom: false,
-                full_size: false,
-                stdin_payload: None,
-            },
-        )))
+        .handle_ok(rmux_proto::SplitWindowExtRequest {
+            direction: SplitDirection::Horizontal,
+            command: Some(quiet_command()),
+            ..Fixture::fixture(PaneTarget::new(alpha.clone(), 0))
+        })
         .await;
-    let Response::SplitWindow(split) = split else {
-        panic!("expected split-window response: {split:?}");
-    };
     handler
         .wait_for_pane_startup_to_finish_for_test(&split.pane)
         .await;
 
-    let select_first = handler
-        .handle(Request::SelectPane(Box::new(SelectPaneRequest {
-            target: PaneTarget::with_window(alpha.clone(), 0, 0),
-            title: None,
-            style: None,
-            input_disabled: None,
-            preserve_zoom: false,
-        })))
-        .await;
-    assert!(matches!(select_first, Response::SelectPane(_)));
+    let first = PaneTarget::with_window(alpha.clone(), 0, 0);
+    handler.handle_ok(SelectPaneRequest::fixture(first)).await;
 
-    let set_sync = handler
-        .handle(Request::SetOption(SetOptionRequest {
-            scope: ScopeSelector::Window(WindowTarget::with_window(alpha.clone(), 0)),
-            option: OptionName::SynchronizePanes,
-            value: "on".to_owned(),
-            mode: SetOptionMode::Replace,
-        }))
+    let scope = ScopeSelector::Window(WindowTarget::with_window(alpha.clone(), 0));
+    handler
+        .set_option(scope, OptionName::SynchronizePanes, "on")
         .await;
-    assert!(matches!(set_sync, Response::SetOption(_)));
 }
 
 async fn setup_synchronized_attached_mode_captures(
@@ -357,7 +311,7 @@ async fn setup_synchronized_attached_mode_captures(
     pane_one_mode: &[u8],
 ) -> (
     u32,
-    mpsc::UnboundedReceiver<crate::pane_io::AttachControl>,
+    mpsc::UnboundedReceiver<AttachControl>,
     PaneTarget,
     PaneTarget,
 ) {
@@ -376,26 +330,15 @@ async fn setup_synchronized_attached_mode_captures(
         state.start_pane_input_capture_for_test(&pane_one);
     }
 
-    let selected = handler
-        .handle(Request::SelectPane(Box::new(SelectPaneRequest {
-            target: PaneTarget::with_window(session_name.clone(), 0, active_pane),
-            title: None,
-            style: None,
-            input_disabled: None,
-            preserve_zoom: false,
-        })))
-        .await;
-    assert!(matches!(selected, Response::SelectPane(_)));
+    let active = PaneTarget::with_window(session_name.clone(), 0, active_pane);
+    handler.handle_ok(SelectPaneRequest::fixture(active)).await;
 
     let requester_pid = std::process::id();
     // The receiver has to outlive the caller, not this helper. A live pane keeps refreshing its
     // attached clients, and a refresh prunes any client whose control channel has been closed —
     // so dropping the receiver here would deregister the very attach these tests then drive
     // input through, and every call would fail with "attached client disappeared".
-    let (control_tx, control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, session_name.clone(), control_tx)
-        .await;
+    let control_rx = handler.attach_client(requester_pid, session_name).await;
     (requester_pid, control_rx, pane_zero, pane_one)
 }
 

@@ -27,11 +27,9 @@
 use super::*;
 
 use super::switch_frame_geometry::{
-    frame_geometry, linked_alias_sessions, pane_pty_size, register_declared_attach,
-    set_window_size_policy, window_content_size, CLIENT_SIZE, SOURCE_WINDOW_INDEX, STATUS_OFF,
-    TARGET_WINDOW_INDEX,
+    frame_geometry, linked_aliases_with_policy, window_content_size, CLIENT_SIZE,
+    SOURCE_WINDOW_INDEX, STATUS_OFF, TARGET_WINDOW_INDEX,
 };
-use rmux_core::SessionRecency;
 
 /// The moving client's geometry. It registers first, so under `latest` it is
 /// the older vote right up to the moment it switches.
@@ -50,41 +48,6 @@ const REQUESTED_SIZE: TerminalSize = TerminalSize { cols: 80, rows: 24 };
 // process-wide static, so these must not collide with any sibling module's.
 const MOVER_PID: u32 = 94_201;
 const RESIDENT_PID: u32 = 94_202;
-
-/// Reads one session's current position in the recency order.
-async fn session_recency(handler: &RequestHandler, session: &SessionName) -> SessionRecency {
-    handler
-        .state
-        .lock()
-        .await
-        .sessions
-        .session(session)
-        .expect("session exists")
-        .recency()
-}
-
-/// A bystander session, created and therefore used after the fixture's own
-/// sessions, so it starts out ranked ahead of them.
-async fn create_witness_session(handler: &RequestHandler, session: &SessionName) {
-    let created = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name: session.clone(),
-            detached: true,
-            size: Some(CLIENT_SIZE),
-            environment: None,
-        }))
-        .await;
-    assert!(matches!(created, Response::NewSession(_)), "{created:?}");
-}
-
-/// `alpha:0` linked into `beta:1`, `status off` on both, one `window-size`
-/// across both aliases of the single shared window.
-async fn linked_family(handler: &RequestHandler, policy: &str) -> (SessionName, SessionName) {
-    let (alpha, beta) = linked_alias_sessions(handler, STATUS_OFF, STATUS_OFF).await;
-    set_window_size_policy(handler, &alpha, SOURCE_WINDOW_INDEX, policy).await;
-    set_window_size_policy(handler, &beta, TARGET_WINDOW_INDEX, policy).await;
-    (alpha, beta)
-}
 
 /// A successful attached switch credits its destination, and credits nothing
 /// else.
@@ -110,12 +73,14 @@ async fn linked_family(handler: &RequestHandler, policy: &str) -> (SessionName, 
 #[tokio::test]
 async fn attached_switch_credits_the_destination_recency_exactly_once() {
     let handler = RequestHandler::new();
-    let (alpha, beta) = linked_family(&handler, "latest").await;
+    let (alpha, beta) =
+        linked_aliases_with_policy(&handler, STATUS_OFF, STATUS_OFF, "latest").await;
 
-    let mut mover_rx = register_declared_attach(&handler, MOVER_PID, &alpha, MOVER_SIZE).await;
+    let (_, mut mover_rx) = register_sized_attach(&handler, MOVER_PID, &alpha, MOVER_SIZE).await;
     // Registered second, so the resident owns the shared window until the
     // switch makes the mover the newest sizing authority.
-    let _resident_rx = register_declared_attach(&handler, RESIDENT_PID, &beta, RESIDENT_SIZE).await;
+    let (_, _resident_rx) =
+        register_sized_attach(&handler, RESIDENT_PID, &beta, RESIDENT_SIZE).await;
     drain_attach_controls(&mut mover_rx);
 
     assert_eq!(
@@ -127,7 +92,7 @@ async fn attached_switch_credits_the_destination_recency_exactly_once() {
     // up ahead of it, which is what makes the credit demonstrably this command's
     // rather than something it already carried.
     let witness = session_name("combined-switch-witness");
-    create_witness_session(&handler, &witness).await;
+    handler.create_session((&witness, CLIENT_SIZE)).await;
     let alpha_before = session_recency(&handler, &alpha).await;
     let beta_before = session_recency(&handler, &beta).await;
     let witness_before = session_recency(&handler, &witness).await;
@@ -175,13 +140,14 @@ async fn attached_switch_credits_the_destination_recency_exactly_once() {
         frame_geometry(recv_moved_switch_target(&mut mover_rx, "combined switch frame").await);
     assert_eq!(framed, MOVER_SIZE, "the switch frame carries the mover");
     for (alias, window_index) in [(&beta, TARGET_WINDOW_INDEX), (&alpha, SOURCE_WINDOW_INDEX)] {
+        let pane = PaneTarget::with_window(alias.clone(), window_index, 0);
         assert_eq!(
             window_content_size(&handler, alias, window_index).await,
             MOVER_SIZE,
             "alias {alias}:{window_index} must settle on the mover's geometry"
         );
         assert_eq!(
-            pane_pty_size(&handler, alias, window_index).await,
+            handler.pane_terminal_size_for_test(&pane).await,
             MOVER_SIZE,
             "the PTY behind {alias}:{window_index} must agree with the model"
         );
@@ -222,9 +188,10 @@ async fn a_failed_attached_switch_leaves_the_destination_recency_unchanged() {
 
 async fn assert_failed_switch_credits_nothing(lost: LostDelivery) {
     let handler = RequestHandler::new();
-    let (alpha, beta) = linked_family(&handler, "largest").await;
+    let (alpha, beta) =
+        linked_aliases_with_policy(&handler, STATUS_OFF, STATUS_OFF, "largest").await;
 
-    let mut mover_rx = register_declared_attach(&handler, MOVER_PID, &alpha, MOVER_SIZE).await;
+    let (_, mut mover_rx) = register_sized_attach(&handler, MOVER_PID, &alpha, MOVER_SIZE).await;
     drain_attach_controls(&mut mover_rx);
     let identity = handler.active_attach_identity_for_test(MOVER_PID).await;
 
@@ -239,21 +206,7 @@ async fn assert_failed_switch_credits_nothing(lost: LostDelivery) {
         identity,
         alpha.clone(),
         identity.session_id(),
-        handler.dispatch(
-            MOVER_PID,
-            Request::AttachSessionExt2(Box::new(AttachSessionExt2Request {
-                target: Some(beta.clone()),
-                target_spec: Some(beta.to_string()),
-                detach_other_clients: false,
-                kill_other_clients: false,
-                read_only: false,
-                skip_environment_update: false,
-                flags: None,
-                working_directory: None,
-                client_terminal: rmux_proto::ClientTerminalContext::default(),
-                client_size: Some(REQUESTED_SIZE),
-            })),
-        ),
+        handler.dispatch(MOVER_PID, attach_session_request(&beta, REQUESTED_SIZE)),
     );
     let lose_the_delivery = async {
         tokio::time::timeout(ATTACH_LIFECYCLE_TIMEOUT, pause.reached.notified())
@@ -346,11 +299,13 @@ async fn lose_delivery(
 #[tokio::test]
 async fn rename_between_switch_selection_and_commit_preserves_both_orders() {
     let handler = RequestHandler::new();
-    let (alpha, beta) = linked_family(&handler, "latest").await;
+    let (alpha, beta) =
+        linked_aliases_with_policy(&handler, STATUS_OFF, STATUS_OFF, "latest").await;
     let renamed = session_name("combined-renamed-source");
 
-    let mut mover_rx = register_declared_attach(&handler, MOVER_PID, &alpha, MOVER_SIZE).await;
-    let _resident_rx = register_declared_attach(&handler, RESIDENT_PID, &beta, RESIDENT_SIZE).await;
+    let (_, mut mover_rx) = register_sized_attach(&handler, MOVER_PID, &alpha, MOVER_SIZE).await;
+    let (_, _resident_rx) =
+        register_sized_attach(&handler, RESIDENT_PID, &beta, RESIDENT_SIZE).await;
     drain_attach_controls(&mut mover_rx);
 
     let alpha_before = session_recency(&handler, &alpha).await;
@@ -367,16 +322,12 @@ async fn rename_between_switch_selection_and_commit_preserves_both_orders() {
         tokio::time::timeout(ATTACH_LIFECYCLE_TIMEOUT, pause.reached.notified())
             .await
             .expect("the switch reaches its selection pause");
-        let response = handler
-            .handle(Request::RenameSession(RenameSessionRequest {
+        handler
+            .handle_ok(RenameSessionRequest {
                 target: alpha.clone(),
                 new_name: renamed.clone(),
-            }))
+            })
             .await;
-        assert!(
-            matches!(response, Response::RenameSession(_)),
-            "renaming the source must succeed, got {response:?}"
-        );
         // The rename refreshes the family it renamed and enqueues a frame of
         // its own, at the geometry the shared window still has. Drain it here,
         // while the command is still parked, so the frame examined below is the
@@ -430,10 +381,12 @@ async fn rename_between_switch_selection_and_commit_preserves_both_orders() {
 #[tokio::test]
 async fn switch_latest_recency_holds_with_a_popup_open() {
     let handler = RequestHandler::new();
-    let (alpha, beta) = linked_family(&handler, "latest").await;
+    let (alpha, beta) =
+        linked_aliases_with_policy(&handler, STATUS_OFF, STATUS_OFF, "latest").await;
 
-    let mut mover_rx = register_declared_attach(&handler, MOVER_PID, &alpha, MOVER_SIZE).await;
-    let _resident_rx = register_declared_attach(&handler, RESIDENT_PID, &beta, RESIDENT_SIZE).await;
+    let (_, mut mover_rx) = register_sized_attach(&handler, MOVER_PID, &alpha, MOVER_SIZE).await;
+    let (_, _resident_rx) =
+        register_sized_attach(&handler, RESIDENT_PID, &beta, RESIDENT_SIZE).await;
     drain_attach_controls(&mut mover_rx);
 
     open_popup(&handler, MOVER_PID).await;
@@ -464,13 +417,14 @@ async fn switch_latest_recency_holds_with_a_popup_open() {
         "an open popup must not change which client the switch frame is sized for"
     );
     for (alias, window_index) in [(&beta, TARGET_WINDOW_INDEX), (&alpha, SOURCE_WINDOW_INDEX)] {
+        let pane = PaneTarget::with_window(alias.clone(), window_index, 0);
         assert_eq!(
             window_content_size(&handler, alias, window_index).await,
             MOVER_SIZE,
             "alias {alias}:{window_index} must settle on the mover's geometry"
         );
         assert_eq!(
-            pane_pty_size(&handler, alias, window_index).await,
+            handler.pane_terminal_size_for_test(&pane).await,
             MOVER_SIZE,
             "the PTY behind {alias}:{window_index} must agree with the model"
         );

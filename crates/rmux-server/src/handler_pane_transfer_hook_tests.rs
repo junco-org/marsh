@@ -1,61 +1,28 @@
-use super::pane_group_transfer_tests::{create_grouped_session, create_session, split_session};
 use super::{QueuedLifecycleEvent, RequestHandler};
+use crate::test_fixtures::{Fixture, Grouped};
 use rmux_proto::{
     BreakPaneRequest, HookLifecycle, HookName, JoinPaneRequest, LinkWindowRequest, MovePaneRequest,
-    NewWindowRequest, PaneTarget, Request, Response, ScopeSelector, SetHookRequest, SplitDirection,
-    SplitWindowRequest, SplitWindowTarget, SwapPaneRequest, WindowTarget,
+    NewWindowRequest, PaneTarget, Request, Response, ScopeSelector, SetHookRequest,
+    SplitWindowRequest, SwapPaneRequest, WindowTarget,
 };
-
-async fn set_one_shot_hook(
-    handler: &RequestHandler,
-    scope: ScopeSelector,
-    hook: HookName,
-    command: &str,
-) {
-    let response = handler
-        .handle(Request::SetHook(SetHookRequest {
-            scope,
-            hook,
-            command: command.to_owned(),
-            lifecycle: HookLifecycle::OneShot,
-        }))
-        .await;
-    assert!(matches!(response, Response::SetHook(_)), "{response:?}");
-}
-
-fn join_request(source: PaneTarget, target: PaneTarget) -> JoinPaneRequest {
-    JoinPaneRequest {
-        source,
-        target,
-        direction: SplitDirection::Vertical,
-        detached: true,
-        before: false,
-        full_size: false,
-        size: None,
-    }
-}
 
 async fn create_session_with_duplicate_window_alias(
     handler: &RequestHandler,
     label: &str,
     split_source: bool,
 ) -> rmux_proto::SessionName {
-    let session_name = create_session(handler, label).await;
+    let session_name = handler.create_session(label).await;
     if split_source {
-        split_session(handler, &session_name).await;
+        handler
+            .handle_ok(SplitWindowRequest::fixture(&session_name))
+            .await;
     }
-    let linked = handler
-        .handle(Request::LinkWindow(LinkWindowRequest {
-            source: WindowTarget::with_window(session_name.clone(), 0),
-            target: WindowTarget::with_window(session_name.clone(), 1),
-            after: false,
-            before: false,
-            kill_destination: false,
-            detached: true,
-        }))
+    handler
+        .handle_ok(LinkWindowRequest::fixture((
+            WindowTarget::with_window(session_name.clone(), 0),
+            WindowTarget::with_window(session_name.clone(), 1),
+        )))
         .await;
-    assert!(matches!(linked, Response::LinkWindow(_)), "{linked:?}");
-    handler.wait_for_initial_panes_for_test().await;
     session_name
 }
 
@@ -87,26 +54,33 @@ fn drain_layout_events(
 #[tokio::test]
 async fn session_closed_one_shot_survives_success_without_session_destruction() {
     let handler = RequestHandler::new();
-    let source = create_session(&handler, "one-shot-survives-non-emission-source").await;
-    split_session(&handler, &source).await;
-    let target = create_session(&handler, "one-shot-survives-non-emission-target").await;
-    handler.wait_for_initial_panes_for_test().await;
-    set_one_shot_hook(
-        &handler,
-        ScopeSelector::Session(source.clone()),
-        HookName::SessionClosed,
-        "display-message -p non-emitted-one-shot",
-    )
-    .await;
+    let source = handler
+        .create_session("one-shot-survives-non-emission-source")
+        .await;
+    handler
+        .handle_ok(SplitWindowRequest::fixture(&source))
+        .await;
+    let target = handler
+        .create_session("one-shot-survives-non-emission-target")
+        .await;
+    handler
+        .handle_ok(SetHookRequest {
+            lifecycle: HookLifecycle::OneShot,
+            ..Fixture::fixture((
+                ScopeSelector::Session(source.clone()),
+                HookName::SessionClosed,
+                "display-message -p non-emitted-one-shot",
+            ))
+        })
+        .await;
     let mut events = handler.subscribe_lifecycle_events();
 
-    let response = handler
-        .handle(Request::JoinPane(join_request(
+    handler
+        .handle_ok(JoinPaneRequest::fixture((
             PaneTarget::with_window(source.clone(), 0, 1),
             PaneTarget::with_window(target, 0, 0),
         )))
         .await;
-    assert!(matches!(response, Response::JoinPane(_)), "{response:?}");
 
     let state = handler.state.lock().await;
     assert!(state.sessions.session(&source).is_some());
@@ -132,23 +106,29 @@ async fn session_closed_one_shot_survives_success_without_session_destruction() 
 #[tokio::test]
 async fn session_closed_one_shot_survives_failed_transfer() {
     let handler = RequestHandler::new();
-    let source = create_session(&handler, "one-shot-survives-error-source").await;
-    let target = create_session(&handler, "one-shot-survives-error-target").await;
-    handler.wait_for_initial_panes_for_test().await;
-    set_one_shot_hook(
-        &handler,
-        ScopeSelector::Session(source.clone()),
-        HookName::SessionClosed,
-        "display-message -p failed-one-shot",
-    )
-    .await;
+    let source = handler
+        .create_session("one-shot-survives-error-source")
+        .await;
+    let target = handler
+        .create_session("one-shot-survives-error-target")
+        .await;
+    handler
+        .handle_ok(SetHookRequest {
+            lifecycle: HookLifecycle::OneShot,
+            ..Fixture::fixture((
+                ScopeSelector::Session(source.clone()),
+                HookName::SessionClosed,
+                "display-message -p failed-one-shot",
+            ))
+        })
+        .await;
     let mut events = handler.subscribe_lifecycle_events();
 
     let response = handler
-        .handle(Request::JoinPane(join_request(
+        .handle(Request::JoinPane(JoinPaneRequest::fixture((
             PaneTarget::with_window(source.clone(), 0, 0),
             PaneTarget::with_window(target, 0, 99),
-        )))
+        ))))
         .await;
     assert!(matches!(response, Response::Error(_)), "{response:?}");
 
@@ -176,26 +156,31 @@ async fn session_closed_one_shot_survives_failed_transfer() {
 #[tokio::test]
 async fn session_closed_one_shot_is_emitted_once_for_real_destruction() {
     let handler = RequestHandler::new();
-    let source = create_session(&handler, "one-shot-real-destruction-source").await;
-    let target = create_session(&handler, "one-shot-real-destruction-target").await;
-    handler.wait_for_initial_panes_for_test().await;
+    let source = handler
+        .create_session("one-shot-real-destruction-source")
+        .await;
+    let target = handler
+        .create_session("one-shot-real-destruction-target")
+        .await;
     let command = "display-message -p destroyed-one-shot";
-    set_one_shot_hook(
-        &handler,
-        ScopeSelector::Session(source.clone()),
-        HookName::SessionClosed,
-        command,
-    )
-    .await;
+    handler
+        .handle_ok(SetHookRequest {
+            lifecycle: HookLifecycle::OneShot,
+            ..Fixture::fixture((
+                ScopeSelector::Session(source.clone()),
+                HookName::SessionClosed,
+                command,
+            ))
+        })
+        .await;
     let mut events = handler.subscribe_lifecycle_events();
 
-    let response = handler
-        .handle(Request::JoinPane(join_request(
+    handler
+        .handle_ok(JoinPaneRequest::fixture((
             PaneTarget::with_window(source.clone(), 0, 0),
             PaneTarget::with_window(target, 0, 0),
         )))
         .await;
-    assert!(matches!(response, Response::JoinPane(_)), "{response:?}");
 
     assert!(handler
         .state
@@ -227,27 +212,26 @@ async fn session_closed_one_shot_is_emitted_once_for_real_destruction() {
 #[tokio::test]
 async fn global_session_closed_one_shot_is_not_duplicated_across_destroyed_group() {
     let handler = RequestHandler::new();
-    let owner = create_session(&handler, "global-one-shot-group-owner").await;
-    let peer = create_grouped_session(&handler, "global-one-shot-group-peer", &owner).await;
-    let target = create_session(&handler, "global-one-shot-group-target").await;
-    handler.wait_for_initial_panes_for_test().await;
+    let owner = handler.create_session("global-one-shot-group-owner").await;
+    let peer = handler
+        .create_session(Grouped("global-one-shot-group-peer", &owner))
+        .await;
+    let target = handler.create_session("global-one-shot-group-target").await;
     let command = "display-message -p global-destroyed-one-shot";
-    set_one_shot_hook(
-        &handler,
-        ScopeSelector::Global,
-        HookName::SessionClosed,
-        command,
-    )
-    .await;
+    handler
+        .handle_ok(SetHookRequest {
+            lifecycle: HookLifecycle::OneShot,
+            ..Fixture::fixture((ScopeSelector::Global, HookName::SessionClosed, command))
+        })
+        .await;
     let mut events = handler.subscribe_lifecycle_events();
 
-    let response = handler
-        .handle(Request::JoinPane(join_request(
+    handler
+        .handle_ok(JoinPaneRequest::fixture((
             PaneTarget::with_window(owner.clone(), 0, 0),
             PaneTarget::with_window(target, 0, 0),
         )))
         .await;
-    assert!(matches!(response, Response::JoinPane(_)), "{response:?}");
 
     let state = handler.state.lock().await;
     assert!(state.sessions.session(&owner).is_none());
@@ -277,27 +261,28 @@ async fn global_session_closed_one_shot_is_not_duplicated_across_destroyed_group
 #[tokio::test]
 async fn join_last_pane_emits_only_destination_layout_contexts_like_tmux() {
     let handler = RequestHandler::new();
-    let source = create_session(&handler, "join-last-layout-source").await;
-    let target = create_session(&handler, "join-last-layout-target").await;
-    handler.wait_for_initial_panes_for_test().await;
+    let source = handler.create_session("join-last-layout-source").await;
+    let target = handler.create_session("join-last-layout-target").await;
     let target_window = WindowTarget::with_window(target.clone(), 0);
     let command = "display-message -p join-last-layout-once";
-    set_one_shot_hook(
-        &handler,
-        ScopeSelector::Window(target_window.clone()),
-        HookName::WindowLayoutChanged,
-        command,
-    )
-    .await;
+    handler
+        .handle_ok(SetHookRequest {
+            lifecycle: HookLifecycle::OneShot,
+            ..Fixture::fixture((
+                ScopeSelector::Window(target_window.clone()),
+                HookName::WindowLayoutChanged,
+                command,
+            ))
+        })
+        .await;
     let mut events = handler.subscribe_lifecycle_events();
 
-    let response = handler
-        .handle(Request::JoinPane(join_request(
+    handler
+        .handle_ok(JoinPaneRequest::fixture((
             PaneTarget::with_window(source.clone(), 0, 0),
             PaneTarget::with_window(target, 0, 0),
         )))
         .await;
-    assert!(matches!(response, Response::JoinPane(_)), "{response:?}");
 
     assert!(handler
         .state
@@ -333,32 +318,28 @@ async fn join_last_pane_emits_only_destination_layout_contexts_like_tmux() {
 #[tokio::test]
 async fn move_last_pane_emits_only_destination_layout_contexts() {
     let handler = RequestHandler::new();
-    let source = create_session(&handler, "move-last-layout-source").await;
-    let target = create_session(&handler, "move-last-layout-target").await;
-    handler.wait_for_initial_panes_for_test().await;
+    let source = handler.create_session("move-last-layout-source").await;
+    let target = handler.create_session("move-last-layout-target").await;
     let target_window = WindowTarget::with_window(target.clone(), 0);
     let command = "display-message -p move-last-layout-once";
-    set_one_shot_hook(
-        &handler,
-        ScopeSelector::Window(target_window.clone()),
-        HookName::WindowLayoutChanged,
-        command,
-    )
-    .await;
+    handler
+        .handle_ok(SetHookRequest {
+            lifecycle: HookLifecycle::OneShot,
+            ..Fixture::fixture((
+                ScopeSelector::Window(target_window.clone()),
+                HookName::WindowLayoutChanged,
+                command,
+            ))
+        })
+        .await;
     let mut events = handler.subscribe_lifecycle_events();
 
-    let response = handler
-        .handle(Request::MovePane(MovePaneRequest {
-            source: PaneTarget::with_window(source.clone(), 0, 0),
-            target: PaneTarget::with_window(target, 0, 0),
-            direction: SplitDirection::Vertical,
-            detached: true,
-            before: false,
-            full_size: false,
-            size: None,
-        }))
+    handler
+        .handle_ok(MovePaneRequest::fixture((
+            PaneTarget::with_window(source.clone(), 0, 0),
+            PaneTarget::with_window(target, 0, 0),
+        )))
         .await;
-    assert!(matches!(response, Response::MovePane(_)), "{response:?}");
 
     assert!(handler
         .state
@@ -394,31 +375,31 @@ async fn move_last_pane_emits_only_destination_layout_contexts() {
 #[tokio::test]
 async fn swap_group_aliases_emits_one_target_layout_and_consumes_one_shot_once() {
     let handler = RequestHandler::new();
-    let owner = create_session(&handler, "swap-alias-layout-owner").await;
-    split_session(&handler, &owner).await;
-    let peer = create_grouped_session(&handler, "swap-alias-layout-peer", &owner).await;
-    handler.wait_for_initial_panes_for_test().await;
+    let owner = handler.create_session("swap-alias-layout-owner").await;
+    handler.handle_ok(SplitWindowRequest::fixture(&owner)).await;
+    let peer = handler
+        .create_session(Grouped("swap-alias-layout-peer", &owner))
+        .await;
     let target_window = WindowTarget::with_window(peer.clone(), 0);
     let command = "display-message -p swap-alias-layout-once";
-    set_one_shot_hook(
-        &handler,
-        ScopeSelector::Window(target_window.clone()),
-        HookName::WindowLayoutChanged,
-        command,
-    )
-    .await;
+    handler
+        .handle_ok(SetHookRequest {
+            lifecycle: HookLifecycle::OneShot,
+            ..Fixture::fixture((
+                ScopeSelector::Window(target_window.clone()),
+                HookName::WindowLayoutChanged,
+                command,
+            ))
+        })
+        .await;
     let mut events = handler.subscribe_lifecycle_events();
 
-    let response = handler
-        .handle(Request::SwapPane(SwapPaneRequest {
-            source: PaneTarget::with_window(owner, 0, 0),
-            target: PaneTarget::with_window(peer, 0, 1),
-            direction: None,
-            detached: true,
-            preserve_zoom: false,
-        }))
+    handler
+        .handle_ok(SwapPaneRequest::fixture((
+            PaneTarget::with_window(owner, 0, 0),
+            PaneTarget::with_window(peer, 0, 1),
+        )))
         .await;
-    assert!(matches!(response, Response::SwapPane(_)), "{response:?}");
 
     let layouts = drain_layout_events(&mut events);
     assert_eq!(layouts.len(), 1);
@@ -440,30 +421,21 @@ async fn swap_group_aliases_emits_one_target_layout_and_consumes_one_shot_once()
 #[tokio::test]
 async fn break_before_emits_layout_only_for_reindexed_source_window_identity() {
     let handler = RequestHandler::new();
-    let session_name = create_session(&handler, "break-before-layout-source").await;
-    let created = handler
-        .handle(Request::NewWindow(Box::new(NewWindowRequest {
-            target: session_name.clone(),
+    let session_name = handler.create_session("break-before-layout-source").await;
+    handler
+        .create_window(NewWindowRequest {
             name: Some("source".to_owned()),
-            detached: true,
-            start_directory: None,
-            environment: None,
-            command: None,
-            process_command: None,
             target_window_index: Some(1),
-            insert_at_target: false,
-        })))
+            ..Fixture::fixture(&session_name)
+        })
         .await;
-    assert!(matches!(created, Response::NewWindow(_)), "{created:?}");
-    let split = handler
-        .handle(Request::SplitWindow(SplitWindowRequest {
-            target: SplitWindowTarget::Pane(PaneTarget::with_window(session_name.clone(), 1, 0)),
-            direction: SplitDirection::Vertical,
-            before: false,
-            environment: None,
-        }))
+    handler
+        .handle_ok(SplitWindowRequest::fixture(PaneTarget::with_window(
+            session_name.clone(),
+            1,
+            0,
+        )))
         .await;
-    assert!(matches!(split, Response::SplitWindow(_)), "{split:?}");
     let source_window_id = {
         let state = handler.state.lock().await;
         state
@@ -475,19 +447,15 @@ async fn break_before_emits_layout_only_for_reindexed_source_window_identity() {
     };
     let mut events = handler.subscribe_lifecycle_events();
 
-    let response = handler
-        .handle(Request::BreakPane(Box::new(BreakPaneRequest {
-            source: PaneTarget::with_window(session_name.clone(), 1, 1),
-            target: Some(WindowTarget::with_window(session_name.clone(), 0)),
-            name: None,
-            detached: true,
-            after: false,
+    handler
+        .handle_ok(BreakPaneRequest {
             before: true,
-            print_target: false,
-            format: None,
-        })))
+            ..Fixture::fixture((
+                PaneTarget::with_window(session_name.clone(), 1, 1),
+                WindowTarget::with_window(session_name.clone(), 0),
+            ))
+        })
         .await;
-    assert!(matches!(response, Response::BreakPane(_)), "{response:?}");
 
     let layout_targets = std::iter::from_fn(|| events.try_recv().ok())
         .filter_map(|event| match event.event {
@@ -533,20 +501,14 @@ async fn break_before_from_second_alias_updates_aliases_and_emits_first_survivin
     let mut events = handler.subscribe_lifecycle_events();
 
     let response = handler
-        .handle(Request::BreakPane(Box::new(BreakPaneRequest {
-            source: PaneTarget::with_window(session_name.clone(), 1, 1),
-            target: Some(WindowTarget::with_window(session_name.clone(), 0)),
-            name: None,
-            detached: true,
-            after: false,
+        .handle_ok(BreakPaneRequest {
             before: true,
-            print_target: false,
-            format: None,
-        })))
+            ..Fixture::fixture((
+                PaneTarget::with_window(session_name.clone(), 1, 1),
+                WindowTarget::with_window(session_name.clone(), 0),
+            ))
+        })
         .await;
-    let Response::BreakPane(response) = response else {
-        panic!("expected break-pane success, got {response:?}");
-    };
     assert_eq!(
         response.target,
         PaneTarget::with_window(session_name.clone(), 0, 0)
@@ -600,20 +562,14 @@ async fn break_after_from_second_alias_emits_first_surviving_layout() {
     let mut events = handler.subscribe_lifecycle_events();
 
     let response = handler
-        .handle(Request::BreakPane(Box::new(BreakPaneRequest {
-            source: PaneTarget::with_window(session_name.clone(), 1, 1),
-            target: Some(WindowTarget::with_window(session_name.clone(), 0)),
-            name: None,
-            detached: true,
+        .handle_ok(BreakPaneRequest {
             after: true,
-            before: false,
-            print_target: false,
-            format: None,
-        })))
+            ..Fixture::fixture((
+                PaneTarget::with_window(session_name.clone(), 1, 1),
+                WindowTarget::with_window(session_name.clone(), 0),
+            ))
+        })
         .await;
-    let Response::BreakPane(response) = response else {
-        panic!("expected break-pane success, got {response:?}");
-    };
     assert_eq!(
         response.target,
         PaneTarget::with_window(session_name.clone(), 1, 0)
@@ -647,37 +603,25 @@ async fn break_after_from_second_alias_emits_first_surviving_layout() {
 #[tokio::test]
 async fn break_before_from_distinct_single_pane_window_emits_no_layout() {
     let handler = RequestHandler::new();
-    let session_name = create_session(&handler, "break-single-distinct").await;
-    let created = handler
-        .handle(Request::NewWindow(Box::new(NewWindowRequest {
-            target: session_name.clone(),
+    let session_name = handler.create_session("break-single-distinct").await;
+    handler
+        .create_window(NewWindowRequest {
             name: Some("single-source".to_owned()),
-            detached: true,
-            start_directory: None,
-            environment: None,
-            command: None,
-            process_command: None,
             target_window_index: Some(1),
-            insert_at_target: false,
-        })))
+            ..Fixture::fixture(&session_name)
+        })
         .await;
-    assert!(matches!(created, Response::NewWindow(_)), "{created:?}");
-    handler.wait_for_initial_panes_for_test().await;
     let mut events = handler.subscribe_lifecycle_events();
 
-    let response = handler
-        .handle(Request::BreakPane(Box::new(BreakPaneRequest {
-            source: PaneTarget::with_window(session_name.clone(), 1, 0),
-            target: Some(WindowTarget::with_window(session_name.clone(), 0)),
-            name: None,
-            detached: true,
-            after: false,
+    handler
+        .handle_ok(BreakPaneRequest {
             before: true,
-            print_target: false,
-            format: None,
-        })))
+            ..Fixture::fixture((
+                PaneTarget::with_window(session_name.clone(), 1, 0),
+                WindowTarget::with_window(session_name.clone(), 0),
+            ))
+        })
         .await;
-    assert!(matches!(response, Response::BreakPane(_)), "{response:?}");
     assert!(drain_layout_targets(&mut events).is_empty());
 }
 
@@ -688,18 +632,14 @@ async fn break_before_from_duplicate_single_pane_alias_emits_no_layout() {
         create_session_with_duplicate_window_alias(&handler, "break-single-duplicate", false).await;
     let mut events = handler.subscribe_lifecycle_events();
 
-    let response = handler
-        .handle(Request::BreakPane(Box::new(BreakPaneRequest {
-            source: PaneTarget::with_window(session_name.clone(), 1, 0),
-            target: Some(WindowTarget::with_window(session_name.clone(), 0)),
-            name: None,
-            detached: true,
-            after: false,
+    handler
+        .handle_ok(BreakPaneRequest {
             before: true,
-            print_target: false,
-            format: None,
-        })))
+            ..Fixture::fixture((
+                PaneTarget::with_window(session_name.clone(), 1, 0),
+                WindowTarget::with_window(session_name.clone(), 0),
+            ))
+        })
         .await;
-    assert!(matches!(response, Response::BreakPane(_)), "{response:?}");
     assert!(drain_layout_targets(&mut events).is_empty());
 }

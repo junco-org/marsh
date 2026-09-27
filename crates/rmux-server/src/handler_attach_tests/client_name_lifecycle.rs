@@ -40,7 +40,7 @@ fn detached_names(
 async fn abrupt_attach_finish_keeps_the_captured_client_name() {
     let handler = RequestHandler::new();
     let session = session_name("captured-client-abrupt-finish");
-    create_quiet_session(&handler, &session).await;
+    handler.create_session(Quiet(&session)).await;
     let attach_pid = u32::MAX - 901;
     let (attach_id, _control_rx) = register_named_attach(&handler, attach_pid, &session).await;
     let mut events = handler.subscribe_lifecycle_events();
@@ -57,7 +57,7 @@ async fn abrupt_attach_finish_keeps_the_captured_client_name() {
 async fn normal_detach_emits_the_captured_client_name_once() {
     let handler = RequestHandler::new();
     let session = session_name("captured-client-normal-detach");
-    create_quiet_session(&handler, &session).await;
+    handler.create_session(Quiet(&session)).await;
     let attach_pid = u32::MAX - 902;
     let (attach_id, mut control_rx) = register_named_attach(&handler, attach_pid, &session).await;
     let identity = handler
@@ -72,15 +72,9 @@ async fn normal_detach_emits_the_captured_client_name_once() {
         "{response:?}"
     );
     assert!(matches!(control_rx.try_recv(), Ok(AttachControl::Detach)));
-    let response = handler
-        .handle(Request::KillSession(KillSessionRequest {
-            target: session.clone(),
-            kill_all_except_target: false,
-            clear_alerts: false,
-            kill_group: false,
-        }))
+    handler
+        .handle_ok(KillSessionRequest::fixture(&session))
         .await;
-    assert!(matches!(response, Response::KillSession(_)), "{response:?}");
     handler.finish_attach(attach_pid, attach_id).await;
 
     assert_eq!(
@@ -94,7 +88,7 @@ async fn normal_detach_emits_the_captured_client_name_once() {
 async fn failed_detach_delivery_emits_the_captured_client_name() {
     let handler = RequestHandler::new();
     let session = session_name("captured-client-failed-detach");
-    create_quiet_session(&handler, &session).await;
+    handler.create_session(Quiet(&session)).await;
     let attach_pid = u32::MAX - 907;
     let (_attach_id, control_rx) = register_named_attach(&handler, attach_pid, &session).await;
     let identity = handler
@@ -117,7 +111,7 @@ async fn failed_detach_delivery_emits_the_captured_client_name() {
 async fn stale_client_cleanup_keeps_the_captured_client_name() {
     let handler = RequestHandler::new();
     let session = session_name("captured-client-stale-cleanup");
-    create_quiet_session(&handler, &session).await;
+    handler.create_session(Quiet(&session)).await;
     let attach_pid = u32::MAX - 903;
     let (_attach_id, control_rx) = register_named_attach(&handler, attach_pid, &session).await;
     let mut events = handler.subscribe_lifecycle_events();
@@ -138,21 +132,15 @@ async fn stale_client_cleanup_keeps_the_captured_client_name() {
 async fn session_destroy_keeps_the_captured_client_name() {
     let handler = RequestHandler::new();
     let session = session_name("captured-client-session-destroy");
-    create_quiet_session(&handler, &session).await;
+    handler.create_session(Quiet(&session)).await;
     let attach_pid = u32::MAX - 904;
     let (_attach_id, mut control_rx) = register_named_attach(&handler, attach_pid, &session).await;
     let mut events = handler.subscribe_lifecycle_events();
 
-    let response = handler
-        .handle(Request::KillSession(KillSessionRequest {
-            target: session.clone(),
-            kill_all_except_target: false,
-            clear_alerts: false,
-            kill_group: false,
-        }))
+    handler
+        .handle_ok(KillSessionRequest::fixture(&session))
         .await;
 
-    assert!(matches!(response, Response::KillSession(_)), "{response:?}");
     assert!(matches!(control_rx.try_recv(), Ok(AttachControl::Exited)));
     assert_eq!(
         detached_names(&mut events),
@@ -165,21 +153,17 @@ async fn switch_then_abrupt_finish_keeps_one_client_name_across_sessions() {
     let handler = RequestHandler::new();
     let source = session_name("captured-client-switch-source");
     let target = session_name("captured-client-switch-target");
-    create_quiet_session(&handler, &source).await;
-    create_quiet_session(&handler, &target).await;
+    handler.create_session(Quiet(&source)).await;
+    handler.create_session(Quiet(&target)).await;
     let attach_pid = u32::MAX - 905;
     let (attach_id, _control_rx) = register_named_attach(&handler, attach_pid, &source).await;
     let mut events = handler.subscribe_lifecycle_events();
 
-    let response = handler
-        .handle(Request::SwitchClient(SwitchClientRequest {
+    handler
+        .handle_ok(SwitchClientRequest {
             target: target.clone(),
-        }))
+        })
         .await;
-    assert!(
-        matches!(response, Response::SwitchClient(_)),
-        "{response:?}"
-    );
     handler.finish_attach(attach_pid, attach_id).await;
 
     let client_events = std::iter::from_fn(|| events.try_recv().ok())
@@ -209,8 +193,8 @@ async fn failed_switch_delivery_emits_the_captured_client_name() {
     let handler = RequestHandler::new();
     let source = session_name("captured-client-failed-switch-source");
     let target = session_name("captured-client-failed-switch-target");
-    create_quiet_session(&handler, &source).await;
-    create_quiet_session(&handler, &target).await;
+    handler.create_session(Quiet(&source)).await;
+    handler.create_session(Quiet(&target)).await;
     let attach_pid = u32::MAX - 906;
     let (_attach_id, control_rx) = register_named_attach(&handler, attach_pid, &source).await;
     let mut events = handler.subscribe_lifecycle_events();

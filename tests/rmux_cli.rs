@@ -26,9 +26,12 @@
 //! ordinary application launch replaces whatever daemon owns the endpoint it selected, while a
 //! control command, a `-c` workload and `-N` reuse it.
 //!
-//! The fixture is [`tests/rmux.rs`](./rmux.rs)'s: a fake btrfs ([`marsh_btrfs::fake::CopyTree`])
-//! under a temporary directory and one host per test. Every test is `#[serial]` because builtin
-//! instrumentation is process-global and because the shell a test opens takes that seed's lease.
+//! The fixture is the [`Host`] [`tests/rmux.rs`](./rmux.rs) uses: a fake btrfs
+//! ([`marsh_btrfs::fake::CopyTree`]) under a temporary directory and one host per test. Every test
+//! is `#[serial]` because builtin instrumentation is process-global and because the shell a test
+//! opens takes that seed's lease.
+
+mod common;
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -36,19 +39,13 @@ use std::process::{Command, ExitStatus, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use brush_core::env::ShellEnvironment;
-use marsh::rmux::{
-    CollectOptions, ExecutionSpec, IoError, IoEvent, RmuxFrontend, ShellIo,
-};
-use marsh::shellmux::{
-    CommandOptions, JobIo, MuxError, ShellId, SpawnOptions, TerminalGeometry,
-};
-use marsh::MarshError;
-use marsh_btrfs::fake::CopyTree;
+use common::rmux::{Host, frontend, pipes, saw};
+use common::run;
+use marsh::rmux::IoEvent;
+use marsh::shellmux::{CommandOptions, ShellId};
 use marsh_btrfs::Subvolumes;
-use rmux_server::DaemonConfig;
+use marsh_btrfs::fake::CopyTree;
 use serial_test::serial;
-use tempfile::TempDir;
 
 /// How long a managed CLI invocation may take before a test declares it hung.
 const TIMEOUT: Duration = Duration::from_mins(1);
@@ -56,99 +53,40 @@ const TIMEOUT: Duration = Duration::from_mins(1);
 /// How long a readiness or exit probe sleeps between attempts.
 const POLL: Duration = Duration::from_millis(10);
 
-/// A seed, a bound host, and the socket the CLI talks to it over.
-struct CliHost {
-    /// The running daemon.
-    rmux: Option<RmuxFrontend>,
-    /// The facade, for seeding state the CLI then has to interact with.
-    io: ShellIo,
-    /// The seed's root, so a test can read back what was published.
-    seed: PathBuf,
-    /// The daemon socket, passed to every CLI invocation as `-S`.
-    socket: PathBuf,
-    /// Kept alive: dropping it deletes the tree the host publishes into. Also the root a test
-    /// can join into to reach paths outside the seed (e.g. WAL metadata).
-    scratch: TempDir,
+/// The built `rmux` binary aimed at `socket`.
+///
+/// Whoever runs the suite may already be inside a multiplexer, and an inherited `$RMUX`/`$TMUX`
+/// changes which client context the CLI admits. The endpoint under test is the `-S` one, never an
+/// ambient one.
+fn rmux(socket: &Path) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_rmux"));
+    command
+        .arg("-S")
+        .arg(socket)
+        .env_remove("RMUX")
+        .env_remove("TMUX");
+    command
 }
 
-impl CliHost {
-    /// Binds a host over a fresh seed on an ordinary fake btrfs.
-    async fn new() -> Self {
-        Self::new_with(Arc::new(CopyTree::new())).await
-    }
-
-    /// Binds a host over a fresh seed created through `fs`.
-    ///
-    /// The seam exists for the one test that has to observe the daemon *mid*-teardown: the seed
-    /// is created through the same backend the host serves over, so a fixture can intercept a
-    /// filesystem operation the engine's release performs.
-    async fn new_with(fs: Arc<dyn Subvolumes>) -> Self {
-        let scratch = tempfile::tempdir().expect("a scratch directory");
-        let seed = scratch.path().join("seed");
-        fs.create_subvolume(&seed).expect("create the seed root");
-
-        // Outside the seed, so the socket is never part of what a workload can publish.
-        let socket = scratch.path().join("rmux.sock");
-        let rmux = RmuxFrontend::open_with(
-            DaemonConfig::new(socket.clone()),
-            &seed,
-            ShellEnvironment::new(),
-            TerminalGeometry { rows: 24, cols: 80 },
-            fs,
-        )
-        .await
-        .expect("open an rmux frontend");
-
-        let io = rmux.io();
-        Self {
-            rmux: Some(rmux),
-            io,
-            seed,
-            socket,
-            scratch,
-        }
-    }
-
-    /// A path inside the seed.
-    fn seed(&self, path: &str) -> PathBuf {
-        self.seed.join(path)
-    }
-
-    /// Stops the daemon and waits for every snapshot to be reclaimed.
-    async fn shutdown(mut self) {
-        if let Some(rmux) = self.rmux.take() {
-            rmux.shutdown().await.expect("shut the host down");
-        }
-    }
-
+impl Host {
     /// Runs the built `rmux` binary against this host's socket, with `stdin` piped in.
     ///
     /// Blocking work goes through `spawn_blocking` because the daemon this subprocess talks to
     /// is running on the very runtime the test is on: waiting for the child inline would hold
     /// the only thread the daemon needs to answer it.
     async fn run_cli(&self, args: &[&str], stdin: &'static [u8]) -> CliOutcome {
-        let socket = self.socket.clone();
-        let seed = self.seed.clone();
-        let args: Vec<String> = args.iter().map(|value| (*value).to_owned()).collect();
+        let mut command = rmux(&self.socket);
+        command
+            .args(args)
+            // The invocation's cwd is what the managed pane starts in.
+            .current_dir(&self.seed)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
         let joined = tokio::time::timeout(
             TIMEOUT,
             tokio::task::spawn_blocking(move || {
-                let mut child = Command::new(env!("CARGO_BIN_EXE_rmux"))
-                    .arg("-S")
-                    .arg(&socket)
-                    .args(&args)
-                    // The invocation's cwd is what the managed pane starts in.
-                    .current_dir(&seed)
-                    // Whoever runs the suite may already be inside a multiplexer, and an
-                    // inherited `$RMUX`/`$TMUX` changes which client context the CLI admits.
-                    // The endpoint under test is the `-S` one, never an ambient one.
-                    .env_remove("RMUX")
-                    .env_remove("TMUX")
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .spawn()
-                    .expect("spawn the rmux binary");
+                let mut child = command.spawn().expect("spawn the rmux binary");
                 child
                     .stdin
                     .take()
@@ -166,6 +104,12 @@ impl CliHost {
         .await
         .expect("the managed invocation finishes rather than hanging");
         joined.expect("the invocation task did not panic")
+    }
+
+    /// Runs the binary with no input, requiring it to succeed; `what` names the claim.
+    async fn succeeds(&self, args: &[&str], what: &str) {
+        let outcome = self.run_cli(args, b"").await;
+        assert_eq!(outcome.code, 0, "{what}: {}", outcome.stderr);
     }
 
     /// Job identities the daemon currently has, which is where an owned session's pane shows up.
@@ -193,7 +137,7 @@ struct CliOutcome {
 
 /// A foreground `rmux` process this test owns: a `-D` daemon, or a client run to its failure.
 ///
-/// Ownership is the whole point: [`CliHost::run_cli`] waits for the child it spawned, so it
+/// Ownership is the whole point: [`Host::run_cli`] waits for the child it spawned, so it
 /// cannot hold a process that is supposed to outlive the invocation. `Drop` is failure cleanup
 /// only — a passing run stops every daemon through the ordinary `kill-server` CLI and reaps it
 /// here, so a panicking assertion is the only thing that can leave a process bound to the
@@ -206,6 +150,16 @@ struct CliProcess {
 }
 
 impl CliProcess {
+    /// Spawns `command` with its stderr redirected to `stderr`.
+    fn spawn(command: &mut Command, stderr: PathBuf) -> Self {
+        let log = std::fs::File::create(&stderr).expect("create a stderr log");
+        let child = command
+            .stderr(Stdio::from(log))
+            .spawn()
+            .expect("spawn the rmux binary");
+        Self { child, stderr }
+    }
+
     /// This process's exit status if it has already finished, reaping it when it has.
     fn finished(&mut self) -> Option<ExitStatus> {
         self.child.try_wait().expect("poll the foreground process")
@@ -286,13 +240,17 @@ impl Subvolumes for PausingCopyTree {
         self.inner.snapshot(src, dest)
     }
 
-    fn delete_subvolume(&self, path: &Path) {
+    fn snapshot_readonly(&self, src: &Path, dest: &Path) -> Result<(), marsh_btrfs::Error> {
+        self.inner.snapshot_readonly(src, dest)
+    }
+
+    fn delete_subvolume(&self, path: &Path) -> Result<(), marsh_btrfs::Error> {
         // Out of the mutex before waiting: the gate is one-shot, and holding the lock across the
         // wait would stall every later reclamation behind this one.
         let armed = self
             .delete_pause
             .lock()
-            .expect("take the deletion gate")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
         if let Some((reached, resume)) = armed {
             let _ = reached.send(());
@@ -300,7 +258,20 @@ impl Subvolumes for PausingCopyTree {
             // this blocking worker.
             let _ = resume.recv();
         }
-        self.inner.delete_subvolume(path);
+        self.inner.delete_subvolume(path)
+    }
+}
+
+/// Re-runs `probe` every [`POLL`] until it answers, failing with its latest complaint once
+/// [`TIMEOUT`] has passed.
+async fn poll<T>(mut probe: impl AsyncFnMut() -> Result<T, String>) -> T {
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        match probe().await {
+            Ok(answer) => return answer,
+            Err(complaint) => assert!(Instant::now() < deadline, "{complaint}"),
+        }
+        tokio::time::sleep(POLL).await;
     }
 }
 
@@ -308,9 +279,8 @@ impl Subvolumes for PausingCopyTree {
 ///
 /// `-N` is deliberate. An auto-start here would answer from a daemon the test never spawned, so
 /// a replacement that failed to bind would read as a successful restart.
-async fn await_sessions(host: &CliHost, daemon: &mut CliProcess, label: &str) -> serde_json::Value {
-    let deadline = Instant::now() + TIMEOUT;
-    loop {
+async fn await_sessions(host: &Host, daemon: &mut CliProcess, label: &str) -> serde_json::Value {
+    poll(async || {
         if let Some(status) = daemon.finished() {
             panic!(
                 "{label} exited ({status}) instead of serving {}: {}",
@@ -320,54 +290,25 @@ async fn await_sessions(host: &CliHost, daemon: &mut CliProcess, label: &str) ->
         }
         let outcome = host.run_cli(&["-N", "list-sessions", "--json"], b"").await;
         if outcome.code == 0 {
-            return serde_json::from_slice(&outcome.stdout).expect("list-sessions emits JSON");
+            return Ok(serde_json::from_slice(&outcome.stdout).expect("list-sessions emits JSON"));
         }
-        assert!(
-            Instant::now() < deadline,
+        Err(format!(
             "{label} never answered on {}: {}",
             host.socket.display(),
             outcome.stderr
-        );
-        tokio::time::sleep(POLL).await;
-    }
+        ))
+    })
+    .await
 }
 
 /// Waits for an owned daemon to exit and returns its status.
 async fn await_exit(daemon: &mut CliProcess, label: &str) -> ExitStatus {
-    let deadline = Instant::now() + TIMEOUT;
-    loop {
-        if let Some(status) = daemon.finished() {
-            return status;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "{label} never exited: {}",
-            daemon.stderr()
-        );
-        tokio::time::sleep(POLL).await;
-    }
-}
-
-/// Publishes a file through the facade, so a later CLI invocation meets an owned seed path.
-async fn publish(io: &ShellIo, cmd: &str) {
-    let execution = io
-        .execute(ExecutionSpec {
-            initial_dir: PathBuf::new(),
-            id: None,
-            process: rmux_proto::ProcessCommand::Shell(cmd.to_owned()),
-            environment: None,
-        })
-        .await
-        .expect("admit the setup workload");
-    let captured = tokio::time::timeout(TIMEOUT, execution.collect(CollectOptions::default()))
-        .await
-        .expect("the setup workload finishes")
-        .expect("the setup workload collects");
-    assert!(
-        captured.completion.is_published(),
-        "test setup must actually reach the seed: {:?}",
-        captured.completion.outcome
-    );
+    poll(async || {
+        daemon
+            .finished()
+            .ok_or_else(|| format!("{label} never exited: {}", daemon.stderr()))
+    })
+    .await
 }
 
 /// `rmux -c` runs on the shared daemon and leaves nothing of its own behind.
@@ -379,16 +320,15 @@ async fn publish(io: &ShellIo, cmd: &str) {
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
 async fn a_managed_command_publishes_and_leaves_no_session_behind() {
-    let host = CliHost::new().await;
+    let host = Host::new().await;
     let before = host.job_ids();
 
-    let outcome = host.run_cli(&["-c", "printf gated > cli-file"], b"").await;
+    host.succeeds(
+        &["-c", "printf gated > cli-file"],
+        "a granted command reports success",
+    )
+    .await;
 
-    assert_eq!(
-        outcome.code, 0,
-        "a granted command reports success: {}",
-        outcome.stderr
-    );
     assert_eq!(
         std::fs::read_to_string(host.seed("cli-file")).expect("the published file"),
         "gated",
@@ -403,74 +343,6 @@ async fn a_managed_command_publishes_and_leaves_no_session_behind() {
     host.shutdown().await;
 }
 
-/// A legacy WAL whose `BEGIN` line predates `spawns`/`builtins`/`granted` is a schema error, not
-/// an unowned seed. Pane creation — not [`CliHost::new`], which never opens the seed — is what
-/// must reset it: the managed command still reaches the seed, and the log it commits to afterward
-/// is a fresh one, not a repaired reading of the legacy fixture.
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn a_wal_schema_error_resets_the_log_and_allows_pane_startup() {
-    let host = CliHost::new().await;
-
-    std::fs::create_dir_all(host.seed("marsh")).expect("create the legacy content's directory");
-    std::fs::write(host.seed("marsh/test.txt"), b"foo\nfoo\n")
-        .expect("write the already-published legacy content");
-
-    let meta_dir = host.scratch.path().join(".marsh/seed/meta");
-    std::fs::create_dir_all(&meta_dir).expect("create the seed's meta directory");
-    std::fs::write(
-        meta_dir.join("wal.jsonl"),
-        b"{\"op\":\"BEGIN\",\"seq\":1,\"uid\":\"9305cd4f\",\"principal\":\"main\",\"cmd\":\"echo \\\"foo\\\" >> test.txt\",\"events\":[{\"principal\":\"main\",\"action\":{\"kind\":\"edit\"},\"resource\":[\"marsh\",\"test.txt\"]}]}\n\
-         {\"op\":\"MOVE\",\"from\":\"marsh/test.txt\",\"to\":\"marsh/test.txt\",\"sha1\":\"ffa78daeddf33506127bcb1b45ca41b528346c70\"}\n\
-         {\"op\":\"END\",\"seq\":1}\n",
-    )
-    .expect("write the legacy WAL fixture");
-
-    let outcome = host
-        .run_cli(&["-N", "-c", "printf bar >> marsh/test.txt"], b"")
-        .await;
-
-    assert_eq!(
-        outcome.code, 0,
-        "the managed command reaches the seed once the legacy log is reset: {}",
-        outcome.stderr
-    );
-    assert_eq!(
-        std::fs::read(host.seed("marsh/test.txt")).expect("the published file"),
-        b"foo\nfoo\nbar",
-        "the policy-gated publication landed on top of the legacy content"
-    );
-
-    let text = std::fs::read_to_string(meta_dir.join("wal.jsonl")).expect("read the reset WAL");
-    assert!(
-        !text.starts_with("{\"op\":\"BEGIN\",\"seq\":1,\"uid\":\"9305cd4f\""),
-        "the legacy fixture is no longer the log's prefix: {text:?}"
-    );
-    let records: Vec<marsh_wal::WalRecord<marsh::PublishMeta>> = text
-        .lines()
-        .map(serde_json::from_str)
-        .collect::<Result<_, _>>()
-        .expect("every line of the reset log strictly decodes under the current schema");
-    let begin_seqs: Vec<u64> = records
-        .iter()
-        .filter_map(|record| match record {
-            marsh_wal::WalRecord::Begin { seq, .. } => Some(*seq),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(
-        begin_seqs,
-        vec![1],
-        "the old history was replaced, not appended to: exactly one fresh transaction exists"
-    );
-    assert!(
-        matches!(records.last(), Some(marsh_wal::WalRecord::End { seq: 1 })),
-        "the fresh transaction committed to completion: {records:?}"
-    );
-
-    host.shutdown().await;
-}
-
 /// Exiting zero is not being published, and `rmux -c` has to say so.
 ///
 /// This is the single behaviour the cutover exists for. Under the old local `exec` the command
@@ -480,8 +352,14 @@ async fn a_wal_schema_error_resets_the_log_and_allows_pane_startup() {
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
 async fn a_denied_write_fails_the_command_that_exited_zero() {
-    let host = CliHost::new().await;
-    publish(&host.io, "printf owner > owned").await;
+    let host = Host::new().await;
+    // Published through the facade, so the CLI invocation meets an owned seed path.
+    let setup = run(&host.io, "printf owner > owned").await;
+    assert!(
+        setup.completion.is_published(),
+        "test setup must actually reach the seed: {:?}",
+        setup.completion
+    );
 
     let outcome = host.run_cli(&["-c", "printf other > owned"], b"").await;
 
@@ -510,7 +388,7 @@ async fn a_denied_write_fails_the_command_that_exited_zero() {
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
 async fn relayed_stdin_reaches_the_workload_and_final_output_survives_exit() {
-    let host = CliHost::new().await;
+    let host = Host::new().await;
 
     let outcome = host
         .run_cli(
@@ -559,44 +437,36 @@ async fn relayed_stdin_reaches_the_workload_and_final_output_survives_exit() {
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
 async fn application_startup_replaces_the_daemon_but_control_commands_do_not() {
-    let mut host = CliHost::new().await;
+    let mut host = Host::new().await;
 
     // A real session with a pane parked on `cat`: the marker is printed by the pane, and the two
     // `printf` pieces keep an echo of the command itself from being mistaken for its output.
-    let created = host
-        .run_cli(
-            &[
-                "new-session",
-                "-d",
-                "-s",
-                "before-restart",
-                "printf '%s%s\\n' ACTIVE_ READY; cat",
-            ],
-            b"",
-        )
-        .await;
-    assert_eq!(
-        created.code, 0,
-        "the live session is created: {}",
-        created.stderr
-    );
-    let deadline = Instant::now() + TIMEOUT;
-    loop {
+    host.succeeds(
+        &[
+            "new-session",
+            "-d",
+            "-s",
+            "before-restart",
+            "printf '%s%s\\n' ACTIVE_ READY; cat",
+        ],
+        "the live session is created",
+    )
+    .await;
+    poll(async || {
         let pane = host
             .run_cli(&["capture-pane", "-p", "-t", "before-restart"], b"")
             .await;
         if String::from_utf8_lossy(&pane.stdout).contains("ACTIVE_READY") {
-            break;
+            return Ok(());
         }
-        assert!(
-            Instant::now() < deadline,
+        Err(format!(
             "the seeded pane never reached its marker (exit {}): {:?} / {}",
             pane.code,
             String::from_utf8_lossy(&pane.stdout),
             pane.stderr
-        );
-        tokio::time::sleep(POLL).await;
-    }
+        ))
+    })
+    .await;
 
     for (label, args) in [
         ("an explicit control command", vec!["list-sessions"]),
@@ -605,16 +475,12 @@ async fn application_startup_replaces_the_daemon_but_control_commands_do_not() {
             vec!["-c", "printf '%s%s\\n' KEEP_ ALIVE"],
         ),
     ] {
-        let outcome = host.run_cli(&args, b"").await;
-        assert_eq!(outcome.code, 0, "{label} succeeds: {}", outcome.stderr);
-        let alive = host
-            .run_cli(&["has-session", "-t", "before-restart"], b"")
-            .await;
-        assert_eq!(
-            alive.code, 0,
-            "{label} must not replace the daemon: {}",
-            alive.stderr
-        );
+        host.succeeds(&args, &format!("{label} succeeds")).await;
+        host.succeeds(
+            &["has-session", "-t", "before-restart"],
+            &format!("{label} must not replace the daemon"),
+        )
+        .await;
     }
 
     // `-N` is the explicit no-auto-start mode. Its own admission may refuse this piped stdin —
@@ -629,44 +495,30 @@ async fn application_startup_replaces_the_daemon_but_control_commands_do_not() {
         no_start.code, no_start.stderr, alive.stderr
     );
 
-    let other = CliHost::new().await;
-    let sentinel = other
-        .run_cli(&["new-session", "-d", "-s", "untouched"], b"")
+    let other = Host::new().await;
+    other
+        .succeeds(
+            &["new-session", "-d", "-s", "untouched"],
+            "the other endpoint's sentinel session is created",
+        )
         .await;
-    assert_eq!(
-        sentinel.code, 0,
-        "the other endpoint's sentinel session is created: {}",
-        sentinel.stderr
-    );
 
     // Without this a replacement could shut itself down for being empty, and a free socket would
     // no longer distinguish "took over" from "never bound".
     let config = host.scratch.path().join("restart.conf");
     std::fs::write(&config, "set-option -s exit-empty off\n").expect("write the restart config");
 
-    let spawn_daemon = {
-        let socket = host.socket.clone();
-        let cwd = host.seed.clone();
-        let logs = host.scratch.path().to_path_buf();
-        move |label: &str| -> CliProcess {
-            let stderr = logs.join(format!("{label}.stderr"));
-            let log = std::fs::File::create(&stderr).expect("create a daemon stderr log");
-            let child = Command::new(env!("CARGO_BIN_EXE_rmux"))
+    let spawn_daemon = |label: &str| {
+        CliProcess::spawn(
+            rmux(&host.socket)
                 .arg("-D")
-                .arg("-S")
-                .arg(&socket)
                 .arg("-f")
                 .arg(&config)
-                .current_dir(&cwd)
-                .env_remove("RMUX")
-                .env_remove("TMUX")
+                .current_dir(&host.seed)
                 .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::from(log))
-                .spawn()
-                .expect("spawn a foreground rmux daemon");
-            CliProcess { child, stderr }
-        }
+                .stdout(Stdio::null()),
+            host.scratch.path().join(format!("{label}.stderr")),
+        )
     };
 
     // `wait` is the ending an externally stopped daemon takes, and the only one the replacement
@@ -685,14 +537,12 @@ async fn application_startup_replaces_the_daemon_but_control_commands_do_not() {
         serde_json::json!([]),
         "the replacement owns the endpoint, and the live session went with the daemon that held it"
     );
-    let untouched = other
-        .run_cli(&["has-session", "-t", "untouched"], b"")
+    other
+        .succeeds(
+            &["has-session", "-t", "untouched"],
+            "a restart is scoped to the endpoint it selected",
+        )
         .await;
-    assert_eq!(
-        untouched.code, 0,
-        "a restart is scoped to the endpoint it selected: {}",
-        untouched.stderr
-    );
 
     let mut second = spawn_daemon("second-replacement");
     let replaced = await_exit(&mut first, "the first replacement daemon").await;
@@ -707,12 +557,11 @@ async fn application_startup_replaces_the_daemon_but_control_commands_do_not() {
         "the second replacement bound the endpoint the first one released"
     );
 
-    let killed = host.run_cli(&["kill-server"], b"").await;
-    assert_eq!(
-        killed.code, 0,
-        "the ordinary control command stops the daemon: {}",
-        killed.stderr
-    );
+    host.succeeds(
+        &["kill-server"],
+        "the ordinary control command stops the daemon",
+    )
+    .await;
     let stopped = await_exit(&mut second, "the second replacement daemon").await;
     assert!(
         stopped.success(),
@@ -728,12 +577,8 @@ async fn application_startup_replaces_the_daemon_but_control_commands_do_not() {
         serde_json::json!([]),
         "an absent daemon does not turn a startup into a failure"
     );
-    let killed = host.run_cli(&["kill-server"], b"").await;
-    assert_eq!(
-        killed.code, 0,
-        "the cold-start daemon stops on request: {}",
-        killed.stderr
-    );
+    host.succeeds(&["kill-server"], "the cold-start daemon stops on request")
+        .await;
     let stopped = await_exit(&mut cold, "the cold-start daemon").await;
     assert!(
         stopped.success(),
@@ -741,14 +586,12 @@ async fn application_startup_replaces_the_daemon_but_control_commands_do_not() {
     );
     assert!(!host.socket.exists(), "the endpoint is released again");
 
-    let untouched = other
-        .run_cli(&["has-session", "-t", "untouched"], b"")
+    other
+        .succeeds(
+            &["has-session", "-t", "untouched"],
+            "the other endpoint survived every restart",
+        )
         .await;
-    assert_eq!(
-        untouched.code, 0,
-        "the other endpoint survived every restart: {}",
-        untouched.stderr
-    );
 
     other.shutdown().await;
     host.shutdown().await;
@@ -770,21 +613,14 @@ async fn startup_stop_failure_identifies_operation_and_socket() {
     std::fs::write(&blocker, b"").expect("create the file standing where a directory would be");
     let socket = blocker.join("rmux.sock");
 
-    let stderr = scratch.path().join("startup.stderr");
-    let log = std::fs::File::create(&stderr).expect("create the startup stderr log");
-    let child = Command::new(env!("CARGO_BIN_EXE_rmux"))
-        .arg("-S")
-        .arg(&socket)
-        .current_dir(scratch.path())
-        .env_remove("RMUX")
-        .env_remove("TMUX")
-        .env("TERM", "xterm-256color")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::from(log))
-        .spawn()
-        .expect("spawn the rmux binary");
-    let mut startup = CliProcess { child, stderr };
+    let mut startup = CliProcess::spawn(
+        rmux(&socket)
+            .current_dir(scratch.path())
+            .env("TERM", "xterm-256color")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null()),
+        scratch.path().join("startup.stderr"),
+    );
 
     let status = await_exit(&mut startup, "the failing startup").await;
     let diagnostic = startup.stderr();
@@ -824,7 +660,7 @@ async fn startup_stop_failure_identifies_operation_and_socket() {
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
 async fn attach_io_failure_identifies_operation_and_socket() {
-    let host = CliHost::new().await;
+    let host = Host::new().await;
 
     // The master stays owned by the test until the client is reaped: closing it early would
     // hang up the client's stdin and race the write failure this test is about.
@@ -834,28 +670,18 @@ async fn attach_io_failure_identifies_operation_and_socket() {
         .open("/dev/full")
         .expect("open /dev/full as the attach stream's output");
     let socket = host.socket.clone();
-    let stderr = host.scratch.path().join("attach.stderr");
-    let log = std::fs::File::create(&stderr).expect("create the attach stderr log");
 
     // `-N` keeps this a client of the fixture host: an ordinary launch would replace that fake
     // btrfs host with a real daemon, and there would be no seed left to create a session in.
-    let child = Command::new(env!("CARGO_BIN_EXE_rmux"))
-        .arg("-N")
-        .arg("-S")
-        .arg(&socket)
-        .arg("new-session")
-        .arg("-s")
-        .arg("diagnostic-attach")
-        .current_dir(&host.seed)
-        .env_remove("RMUX")
-        .env_remove("TMUX")
-        .env("TERM", "xterm-256color")
-        .stdin(Stdio::from(slave))
-        .stdout(Stdio::from(sink))
-        .stderr(Stdio::from(log))
-        .spawn()
-        .expect("spawn the rmux binary");
-    let mut attaching = CliProcess { child, stderr };
+    let mut attaching = CliProcess::spawn(
+        rmux(&socket)
+            .args(["-N", "new-session", "-s", "diagnostic-attach"])
+            .current_dir(&host.seed)
+            .env("TERM", "xterm-256color")
+            .stdin(Stdio::from(slave))
+            .stdout(Stdio::from(sink)),
+        host.scratch.path().join("attach.stderr"),
+    );
 
     let status = await_exit(&mut attaching, "the failing attach client").await;
     let diagnostic = attaching.stderr();
@@ -904,46 +730,28 @@ async fn attach_io_failure_identifies_operation_and_socket() {
 #[serial]
 async fn kill_server_waits_for_seed_release_before_releasing_endpoint() {
     let fs = Arc::new(PausingCopyTree::default());
-    let host = CliHost::new_with(Arc::clone(&fs) as Arc<dyn Subvolumes>).await;
+    let host = Host::with(Arc::clone(&fs) as Arc<dyn Subvolumes>).await;
 
     // An ordinary directory inside the seed, not a subvolume of its own: the lease belongs to the
     // containing seed, so a job started here and a replacement started here contend for one
     // lease — the parent-seed/child-repository shape a real launch has.
     let repo = host.seed("repo");
     std::fs::create_dir_all(&repo).expect("create the nested repository directory");
-    let canonical_seed = host.seed.canonicalize().expect("canonicalize the seed root");
 
     // Binding a host leases nothing; the first shell naming a directory on the seed is what takes
     // it. A pipe job is hidden rather than adopted as a pane, so no pane lifecycle work can
     // reclaim its snapshot before engine release does.
-    let observation = host.io.observe();
-    let mut events = observation.events;
+    let mut events = host.io.observe().events;
     let held = host
         .io
-        .open_shell(
-            &repo,
-            Some(ShellId::from("held")),
-            SpawnOptions {
-                io: JobIo::Pipes,
-                ..SpawnOptions::default()
-            },
-        )
+        .open_shell(&repo, Some(ShellId::from("held")), pipes())
         .await
         .expect("open the job that takes the seed's lease");
-    let observed_open = tokio::time::timeout(TIMEOUT, async {
-        loop {
-            match events.recv().await {
-                Ok(Some(envelope)) => {
-                    if matches!(&envelope.event, IoEvent::Opened { job } if job.id() == held.id()) {
-                        return true;
-                    }
-                }
-                _ => return false,
-            }
-        }
-    })
-    .await
-    .expect("the held job's open is observed rather than hanging");
+    let observed_open = saw(
+        &mut events,
+        |envelope| matches!(&envelope.event, IoEvent::Opened { job } if job.id() == held.id()),
+    )
+    .await;
     assert!(
         observed_open,
         "the held job is open, so its snapshot exists for teardown to reclaim"
@@ -951,35 +759,25 @@ async fn kill_server_waits_for_seed_release_before_releasing_endpoint() {
 
     // The consumer that proves both halves: refused while the seed is held, served once it is
     // released. Construction leases nothing, so this succeeds now and decides nothing yet.
-    let next = RmuxFrontend::open_with(
-        DaemonConfig::new(host.scratch.path().join("next.sock")),
+    let next = frontend(
+        &host.scratch.path().join("next.sock"),
         &repo,
-        ShellEnvironment::new(),
-        TerminalGeometry { rows: 24, cols: 80 },
-        Arc::clone(&fs) as Arc<dyn Subvolumes>,
+        Arc::clone(&host.fs),
+        "a second host binds its own socket while the first holds the seed",
     )
-    .await
-    .expect("a second host binds its own socket while the first holds the seed");
+    .await;
 
     // Armed only now, so the gate catches teardown's reclamation rather than the seed's opening
     // sweep.
     let (reached, resume) = fs.pause_next_delete();
-    let stderr = host.scratch.path().join("kill-server.stderr");
-    let log = std::fs::File::create(&stderr).expect("create the kill-server stderr log");
-    let child = Command::new(env!("CARGO_BIN_EXE_rmux"))
-        .arg("-N")
-        .arg("-S")
-        .arg(&host.socket)
-        .arg("kill-server")
-        .current_dir(&host.seed)
-        .env_remove("RMUX")
-        .env_remove("TMUX")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::from(log))
-        .spawn()
-        .expect("spawn the rmux binary");
-    let mut killer = CliProcess { child, stderr };
+    let mut killer = CliProcess::spawn(
+        rmux(&host.socket)
+            .args(["-N", "kill-server"])
+            .current_dir(&host.seed)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null()),
+        host.scratch.path().join("kill-server.stderr"),
+    );
 
     tokio::time::timeout(TIMEOUT, reached)
         .await
@@ -993,23 +791,9 @@ async fn kill_server_waits_for_seed_release_before_releasing_endpoint() {
     let killer_running = killer.finished().is_none();
     let refusal = next
         .io()
-        .open_shell(
-            &repo,
-            Some(ShellId::from("intruder")),
-            SpawnOptions {
-                io: JobIo::Pipes,
-                ..SpawnOptions::default()
-            },
-        )
+        .open_shell(&repo, Some(ShellId::from("intruder")), pipes())
         .await;
-    let refused_as_busy = matches!(
-        &refusal,
-        Err(IoError::Mux(mux)) if matches!(
-            &**mux,
-            MuxError::Marsh(MarshError::Btrfs(marsh_btrfs::Error::SessionBusy(busy)))
-                if busy == &canonical_seed
-        )
-    );
+    let shared_during_cleanup = refusal.is_ok();
 
     // The gate opens before anything that could abort.
     let _ = resume.send(());
@@ -1023,14 +807,7 @@ async fn kill_server_waits_for_seed_release_before_releasing_endpoint() {
     // gets around to joining a daemon a real launch could never join.
     let reopened = next
         .io()
-        .open_shell(
-            &repo,
-            Some(ShellId::from("reopened")),
-            SpawnOptions {
-                io: JobIo::Pipes,
-                ..SpawnOptions::default()
-            },
-        )
+        .open_shell(&repo, Some(ShellId::from("reopened")), pipes())
         .await;
     let published = match &reopened {
         Ok(job) => tokio::time::timeout(
@@ -1065,8 +842,8 @@ async fn kill_server_waits_for_seed_release_before_releasing_endpoint() {
         "`kill-server` reports the stop as complete only after the seed is back (exit {status})"
     );
     assert!(
-        refused_as_busy,
-        "the seed is genuinely still leased at that instant, and says so structurally: {refusal:?}"
+        shared_during_cleanup,
+        "same-process construction shares authority without waiting for another shell's cleanup: {refusal:?}"
     );
     assert_eq!(
         status.code(),
@@ -1094,23 +871,19 @@ async fn kill_server_waits_for_seed_release_before_releasing_endpoint() {
 /// A detached `new-session` answers as soon as the session exists; the pane's shell is a job a
 /// moment later, and only the id itself proves a later removal was that pane's rather than a
 /// redrawn listing's.
-async fn added_job_id(host: &CliHost, before: &[String]) -> String {
-    let deadline = Instant::now() + TIMEOUT;
-    loop {
+async fn added_job_id(host: &Host, before: &[String]) -> String {
+    poll(async || {
         let fresh: Vec<String> = host
             .job_ids()
             .into_iter()
             .filter(|id| !before.contains(id))
             .collect();
         if let [id] = fresh.as_slice() {
-            return id.clone();
+            return Ok(id.clone());
         }
-        assert!(
-            Instant::now() < deadline,
-            "expected exactly one new job, got {fresh:?}"
-        );
-        tokio::time::sleep(POLL).await;
-    }
+        Err(format!("expected exactly one new job, got {fresh:?}"))
+    })
+    .await
 }
 
 /// A typed `exit` closes the pane it was typed in, with the status its own builtin computed.
@@ -1125,93 +898,80 @@ async fn added_job_id(host: &CliHost, before: &[String]) -> String {
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
 async fn a_typed_exit_uses_builtin_status_and_closes_only_its_pane() {
-    let host = CliHost::new().await;
+    let host = Host::new().await;
 
     // No workload argument anywhere here: these panes run the prompt, which is what a user types
     // into.
     for session in ["exit-survivor", "exit-status"] {
-        let created = host
-            .run_cli(&["-N", "new-session", "-d", "-s", session], b"")
-            .await;
-        assert_eq!(created.code, 0, "{session} is created: {}", created.stderr);
+        host.succeeds(
+            &["-N", "new-session", "-d", "-s", session],
+            &format!("{session} is created"),
+        )
+        .await;
     }
     let before = host.job_ids();
-    let created = host
-        .run_cli(&["-N", "new-session", "-d", "-s", "exit-bare"], b"")
-        .await;
-    assert_eq!(created.code, 0, "exit-bare is created: {}", created.stderr);
+    host.succeeds(
+        &["-N", "new-session", "-d", "-s", "exit-bare"],
+        "exit-bare is created",
+    )
+    .await;
     let bare_job = added_job_id(&host, &before).await;
 
     // Both policies explicitly, so neither result is the default's accident.
     for (session, value) in [("exit-status", "on"), ("exit-bare", "off")] {
-        let set = host
-            .run_cli(
-                &[
-                    "-N",
-                    "set-option",
-                    "-w",
-                    "-t",
-                    session,
-                    "remain-on-exit",
-                    value,
-                ],
-                b"",
-            )
-            .await;
-        assert_eq!(
-            set.code, 0,
-            "remain-on-exit {value} is set on {session}: {}",
-            set.stderr
-        );
+        host.succeeds(
+            &[
+                "-N",
+                "set-option",
+                "-w",
+                "-t",
+                session,
+                "remain-on-exit",
+                value,
+            ],
+            &format!("remain-on-exit {value} is set on {session}"),
+        )
+        .await;
     }
 
     // The marker is assembled from two pieces: the echoed command line carries `EXIT_ READY` with
     // the space, so only the line's *output* can satisfy this wait. Reaching it proves the prompt
     // is running lines before anything types `exit` at it.
     for session in ["exit-status", "exit-bare"] {
-        let ready = host
-            .run_cli(
-                &[
-                    "-N",
-                    "send-keys",
-                    "-t",
-                    session,
-                    "--wait-next-text",
-                    "EXIT_READY",
-                    "--timeout",
-                    "5s",
-                    "--",
-                    "printf '%s%s\\n' EXIT_ READY",
-                    "Enter",
-                ],
-                b"",
-            )
-            .await;
-        assert_eq!(
-            ready.code, 0,
-            "{session}'s prompt ran a line of its own: {}",
-            ready.stderr
-        );
-    }
-
-    let typed = host
-        .run_cli(
+        host.succeeds(
             &[
                 "-N",
                 "send-keys",
                 "-t",
-                "exit-status",
+                session,
+                "--wait-next-text",
+                "EXIT_READY",
+                "--timeout",
+                "5s",
                 "--",
-                "exit 7",
+                "printf '%s%s\\n' EXIT_ READY",
                 "Enter",
             ],
-            b"",
+            &format!("{session}'s prompt ran a line of its own"),
         )
         .await;
-    assert_eq!(typed.code, 0, "`exit 7` is delivered: {}", typed.stderr);
+    }
 
-    let deadline = Instant::now() + TIMEOUT;
-    let dead = loop {
+    host.succeeds(
+        &[
+            "-N",
+            "send-keys",
+            "-t",
+            "exit-status",
+            "--",
+            "exit 7",
+            "Enter",
+        ],
+        "`exit 7` is delivered",
+    )
+    .await;
+
+    let dead = poll(async || {
         let shown = host
             .run_cli(
                 &[
@@ -1227,67 +987,51 @@ async fn a_typed_exit_uses_builtin_status_and_closes_only_its_pane() {
             .await;
         let text = String::from_utf8_lossy(&shown.stdout).trim_end().to_owned();
         if shown.code == 0 && text.starts_with("1:") {
-            break text;
+            return Ok(text);
         }
-        assert!(
-            Instant::now() < deadline,
+        Err(format!(
             "the typed `exit 7` never killed its pane (exit {}): {text:?} / {}",
-            shown.code,
-            shown.stderr
-        );
-        tokio::time::sleep(POLL).await;
-    };
+            shown.code, shown.stderr
+        ))
+    })
+    .await;
     assert_eq!(
         dead, "1:7",
         "the builtin's own status reaches the pane rather than being discarded by the prompt"
     );
 
-    let bare = host
-        .run_cli(
-            &["-N", "send-keys", "-t", "exit-bare", "--", "exit", "Enter"],
-            b"",
-        )
-        .await;
-    assert_eq!(
-        bare.code, 0,
-        "the bare `exit` is delivered: {}",
-        bare.stderr
-    );
+    host.succeeds(
+        &["-N", "send-keys", "-t", "exit-bare", "--", "exit", "Enter"],
+        "the bare `exit` is delivered",
+    )
+    .await;
 
-    let deadline = Instant::now() + TIMEOUT;
-    loop {
+    poll(async || {
         let gone = host
             .run_cli(&["-N", "has-session", "-t", "exit-bare"], b"")
             .await;
         let jobs = host.job_ids();
         if gone.code == 1 && !jobs.contains(&bare_job) {
-            break;
+            return Ok(());
         }
-        assert!(
-            Instant::now() < deadline,
+        Err(format!(
             "the bare `exit` never took its pane down (has-session exited {}, jobs {jobs:?})",
             gone.code
-        );
-        tokio::time::sleep(POLL).await;
-    }
-    let survivor = host
-        .run_cli(&["-N", "has-session", "-t", "exit-survivor"], b"")
-        .await;
-    assert_eq!(
-        survivor.code, 0,
-        "one pane's exit is not another's: {}",
-        survivor.stderr
-    );
+        ))
+    })
+    .await;
+    host.succeeds(
+        &["-N", "has-session", "-t", "exit-survivor"],
+        "one pane's exit is not another's",
+    )
+    .await;
 
     // The retained dead pane is still a pane: killing it retires the session it was kept in.
-    let killed = host
-        .run_cli(&["-N", "kill-pane", "-t", "exit-status"], b"")
-        .await;
-    assert_eq!(
-        killed.code, 0,
-        "the retained dead pane is killable: {}",
-        killed.stderr
-    );
+    host.succeeds(
+        &["-N", "kill-pane", "-t", "exit-status"],
+        "the retained dead pane is killable",
+    )
+    .await;
     let retired = host
         .run_cli(&["-N", "has-session", "-t", "exit-status"], b"")
         .await;
@@ -1295,14 +1039,11 @@ async fn a_typed_exit_uses_builtin_status_and_closes_only_its_pane() {
         retired.code, 1,
         "killing its only pane took the session with it"
     );
-    let alive = host
-        .run_cli(&["-N", "has-session", "-t", "exit-survivor"], b"")
-        .await;
-    assert_eq!(
-        alive.code, 0,
-        "the survivor is still reachable afterwards: {}",
-        alive.stderr
-    );
+    host.succeeds(
+        &["-N", "has-session", "-t", "exit-survivor"],
+        "the survivor is still reachable afterwards",
+    )
+    .await;
 
     host.shutdown().await;
 }

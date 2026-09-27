@@ -85,36 +85,15 @@ pub(super) async fn wait_for_bracketed_mode(
 
 pub(super) async fn attach_to(handler: &RequestHandler, session: &rmux_proto::SessionName) -> u32 {
     let requester_pid = std::process::id();
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, session.clone(), control_tx)
-        .await;
+    let _control_rx = handler.attach_client(requester_pid, session).await;
     requester_pid
 }
 
-async fn select_pane(handler: &RequestHandler, target: &PaneTarget) {
-    let selected = handler
-        .handle(Request::SelectPane(Box::new(SelectPaneRequest {
-            target: target.clone(),
-            title: None,
-            style: None,
-            input_disabled: None,
-            preserve_zoom: false,
-        })))
-        .await;
-    assert!(matches!(selected, Response::SelectPane(_)));
-}
-
 async fn set_synchronize_panes(handler: &RequestHandler, session: &rmux_proto::SessionName) {
-    let set_sync = handler
-        .handle(Request::SetOption(SetOptionRequest {
-            scope: ScopeSelector::Window(WindowTarget::with_window(session.clone(), 0)),
-            option: OptionName::SynchronizePanes,
-            value: "on".to_owned(),
-            mode: SetOptionMode::Replace,
-        }))
+    let scope = ScopeSelector::Window(WindowTarget::with_window(session.clone(), 0));
+    handler
+        .set_option(scope, OptionName::SynchronizePanes, "on")
         .await;
-    assert!(matches!(set_sync, Response::SetOption(_)));
 }
 
 /// Creates the session, waits for the pane child and returns its target.
@@ -258,11 +237,8 @@ async fn assert_mixed_synchronized_final_sink(label: &str, active_pane: u32) {
     wait_for_bracketed_mode(&handler, &unaware_target, false).await;
     assert_eq!(aware_target, PaneTarget::with_window(session.clone(), 0, 0));
 
-    select_pane(
-        &handler,
-        &PaneTarget::with_window(session.clone(), 0, active_pane),
-    )
-    .await;
+    let pane = PaneTarget::with_window(session.clone(), 0, active_pane);
+    handler.handle_ok(SelectPaneRequest::fixture(pane)).await;
     set_synchronize_panes(&handler, &session).await;
 
     let requester_pid = attach_to(&handler, &session).await;

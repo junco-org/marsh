@@ -1,6 +1,5 @@
 use super::*;
 use crate::handler::test_support::spawn_accounted_attach_control_drain;
-use crate::handler::QueuedLifecycleEvent;
 use rmux_core::LifecycleEvent;
 
 const LONG_PREFIX_CHAIN_REPETITIONS: usize = 8_192;
@@ -14,67 +13,30 @@ const ITERATIVE_INPUT_CHAIN_TIMEOUT: Duration = Duration::from_secs(30);
 const BOUNDED_REROUTE_CHAIN_TIMEOUT: Duration = Duration::from_secs(30);
 const BACKGROUND_RUN_SHELL_TIMEOUT: Duration = Duration::from_secs(10);
 
-async fn set_global_hook(handler: &RequestHandler, hook: HookName, command: &str) {
-    let response = handler
-        .handle(Request::SetHookMutation(SetHookMutationRequest {
-            scope: ScopeSelector::Global,
-            hook,
-            command: Some(command.to_owned()),
-            lifecycle: HookLifecycle::Persistent,
-            append: false,
-            unset: false,
-            run_immediately: false,
-            index: None,
-        }))
-        .await;
-    assert!(matches!(response, Response::SetHook(_)), "{response:?}");
-}
-
-async fn wait_for_buffer(handler: &RequestHandler, name: &str, expected: &str) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-    loop {
-        {
-            let state = handler.state.lock().await;
-            if let Ok((_, content)) = state.buffers.show(Some(name)) {
-                if String::from_utf8_lossy(content) == expected {
-                    return;
-                }
-            }
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "buffer {name} did not reach {expected:?}"
-        );
-        sleep(Duration::from_millis(10)).await;
-    }
-}
-
-async fn drain_lifecycle_hooks(
-    handler: &RequestHandler,
-    events: &mut tokio::sync::broadcast::Receiver<QueuedLifecycleEvent>,
-) {
-    loop {
-        match events.try_recv() {
-            Ok(event) => handler.dispatch_lifecycle_hook(event).await,
-            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
-            | Err(tokio::sync::broadcast::error::TryRecvError::Closed) => break,
-            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(skipped)) => {
-                panic!("lifecycle events lagged during test: {skipped}");
-            }
-        }
-    }
-}
-
 async fn enable_mouse(handler: &RequestHandler) {
-    let response = handler
-        .handle(Request::SetOption(SetOptionRequest {
-            scope: ScopeSelector::Global,
-            option: OptionName::Mouse,
-            value: "on".to_owned(),
-            mode: SetOptionMode::Replace,
-        }))
+    handler
+        .set_option(ScopeSelector::Global, OptionName::Mouse, "on")
         .await;
-    assert!(matches!(response, Response::SetOption(_)));
+}
+
+/// Starts the handler's lifecycle-hook consumer; sending `()` on the answered sender stops it.
+fn spawn_lifecycle_consumer(
+    handler: &RequestHandler,
+) -> (
+    tokio::sync::oneshot::Sender<()>,
+    tokio::task::JoinHandle<()>,
+) {
+    let lifecycle_events = handler
+        .take_lifecycle_dispatch_receiver()
+        .expect("lifecycle dispatch receiver activates once");
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let lifecycle_handler = handler.clone();
+    let lifecycle_task = tokio::spawn(async move {
+        lifecycle_handler
+            .consume_lifecycle_hooks(lifecycle_events, shutdown_rx)
+            .await;
+    });
+    (shutdown_tx, lifecycle_task)
 }
 
 #[tokio::test]
@@ -84,22 +46,15 @@ async fn send_keys_uses_runtime_extended_key_format_for_mode_two() {
 
     create_send_keys_test_session(&handler, &alpha).await;
 
-    let set_format = handler
-        .handle(Request::SetOption(SetOptionRequest {
-            scope: ScopeSelector::Global,
-            option: OptionName::ExtendedKeysFormat,
-            value: "csi-u".to_owned(),
-            mode: SetOptionMode::Replace,
-        }))
+    handler
+        .set_option(
+            ScopeSelector::Global,
+            OptionName::ExtendedKeysFormat,
+            "csi-u",
+        )
         .await;
-    assert!(matches!(set_format, Response::SetOption(_)));
 
-    {
-        let mut state = handler.state.lock().await;
-        state
-            .append_bytes_to_pane_transcript_for_test(&alpha, 0, 0, b"\x1b[>4;2m")
-            .expect("mode 2 transcript update");
-    }
+    append_pane_output(&handler, &alpha, b"\x1b[>4;2m").await;
 
     let expected = encode_key(
         mode::MODE_KEYS_EXTENDED_2,
@@ -111,16 +66,8 @@ async fn send_keys_uses_runtime_extended_key_format_for_mode_two() {
 
     let response = handler
         .handle(Request::SendKeysExt(SendKeysExtRequest {
-            target: Some(PaneTarget::new(alpha.clone(), 0)),
-            keys: vec!["M-C-a".to_owned()],
-            expand_formats: false,
-            hex: false,
-            literal: false,
             dispatch_key_table: false,
-            copy_mode_command: false,
-            forward_mouse_event: false,
-            reset_terminal: false,
-            repeat_count: None,
+            ..Fixture::fixture((PaneTarget::new(alpha.clone(), 0), ["M-C-a"]))
         }))
         .await;
     assert_eq!(
@@ -165,35 +112,18 @@ async fn live_attach_csi_u_ctrl_semicolon_enters_prefix_table() {
 
     create_send_keys_test_session(&handler, &alpha).await;
 
-    let set_prefix = handler
-        .handle(Request::SetOption(SetOptionRequest {
-            scope: ScopeSelector::Global,
-            option: OptionName::Prefix,
-            value: "C-;".to_owned(),
-            mode: SetOptionMode::Replace,
-        }))
+    handler
+        .set_option(ScopeSelector::Global, OptionName::Prefix, "C-;")
         .await;
-    assert!(matches!(set_prefix, Response::SetOption(_)));
 
-    let rebound = handler
-        .handle(Request::BindKey(Box::new(BindKeyRequest {
-            table_name: "prefix".to_owned(),
-            key: "X".to_owned(),
+    handler
+        .handle_ok(BindKeyRequest {
             note: Some("live-attach-csi-u-ctrl-semicolon".to_owned()),
-            repeat: false,
-            command: Some(vec![
-                "send-keys".to_owned(),
-                "-l".to_owned(),
-                "U".to_owned(),
-            ]),
-        })))
+            ..Fixture::fixture(("prefix", "X", ["send-keys", "-l", "U"]))
+        })
         .await;
-    assert!(matches!(rebound, Response::BindKey(_)));
 
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
     let capture =
         RawPaneInputProbe::start(&handler, &alpha, "live-attach-csi-u-c-semicolon-prefix", 1).await;
 
@@ -237,35 +167,21 @@ async fn assert_prefix_option_chunks(
     let requester_pid = std::process::id();
 
     create_send_keys_test_session(&handler, &alpha).await;
-    let set_prefix = handler
-        .handle(Request::SetOption(SetOptionRequest {
-            scope: ScopeSelector::Session(alpha.clone()),
-            option,
-            value: prefix.to_owned(),
-            mode: SetOptionMode::Replace,
-        }))
+    handler
+        .set_option(ScopeSelector::Session(alpha.clone()), option, prefix)
         .await;
-    assert!(matches!(set_prefix, Response::SetOption(_)));
-    let rebound = handler
-        .handle(Request::BindKey(Box::new(BindKeyRequest {
-            table_name: "prefix".to_owned(),
-            key: binding_key.to_owned(),
+    handler
+        .handle_ok(BindKeyRequest {
             note: Some("printable prefix chunking".to_owned()),
-            repeat: false,
-            command: Some(vec![
-                "set-buffer".to_owned(),
-                "-b".to_owned(),
-                "printable-prefix-hit".to_owned(),
-                "yes".to_owned(),
-            ]),
-        })))
+            ..Fixture::fixture((
+                "prefix",
+                binding_key,
+                ["set-buffer", "-b", "printable-prefix-hit", "yes"],
+            ))
+        })
         .await;
-    assert!(matches!(rebound, Response::BindKey(_)));
 
-    let (control_tx, control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
+    let control_rx = handler.attach_client(requester_pid, &alpha).await;
     let control_drain =
         spawn_accounted_attach_control_drain(&handler, requester_pid, control_rx).await;
     let capture =
@@ -279,7 +195,7 @@ async fn assert_prefix_option_chunks(
     }
     assert!(pending_input.is_empty());
 
-    wait_for_buffer(&handler, "printable-prefix-hit", "yes").await;
+    handler.wait_for_buffer("printable-prefix-hit", "yes").await;
     capture.finish(&handler, &alpha).await;
     capture.assert_contents(&handler, expected_pane_input).await;
     control_drain.abort();
@@ -331,20 +247,15 @@ async fn assert_unbound_meta_unicode_does_not_activate_plain_prefix(label: &str,
     let requester_pid = std::process::id();
 
     create_send_keys_test_session(&handler, &alpha).await;
-    let set_prefix = handler
-        .handle(Request::SetOption(SetOptionRequest {
-            scope: ScopeSelector::Session(alpha.clone()),
-            option: OptionName::Prefix,
-            value: "é".to_owned(),
-            mode: SetOptionMode::Replace,
-        }))
+    handler
+        .set_option(
+            ScopeSelector::Session(alpha.clone()),
+            OptionName::Prefix,
+            "é",
+        )
         .await;
-    assert!(matches!(set_prefix, Response::SetOption(_)));
 
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
     let expected = b"\x1b\xc3\xa9";
     let capture = RawPaneInputProbe::start(&handler, &alpha, label, expected.len()).await;
     let mut pending_input = Vec::new();
@@ -355,14 +266,11 @@ async fn assert_unbound_meta_unicode_does_not_activate_plain_prefix(label: &str,
             .expect("unbound Meta-Unicode input succeeds");
     }
     assert!(pending_input.is_empty());
-    {
-        let active_attach = handler.active_attach.lock().await;
-        let active = active_attach
-            .by_pid
-            .get(&requester_pid)
-            .expect("attached client remains active");
-        assert_eq!(active.key_table_name, None, "{label}");
-    }
+    assert_eq!(
+        client_key_table(&handler, requester_pid).await,
+        None,
+        "{label}"
+    );
 
     capture.finish(&handler, &alpha).await;
     capture.assert_contents(&handler, expected).await;
@@ -445,26 +353,18 @@ async fn live_attach_long_prefix_chain_is_processed_iteratively() {
 
     create_send_keys_test_session(&handler, &alpha).await;
 
-    let rebound = handler
-        .handle(Request::BindKey(Box::new(BindKeyRequest {
-            table_name: "prefix".to_owned(),
-            key: "X".to_owned(),
+    handler
+        .handle_ok(BindKeyRequest {
             note: Some("live-attach-long-prefix-chain".to_owned()),
-            repeat: false,
-            command: Some(vec![
-                "set-buffer".to_owned(),
-                "-b".to_owned(),
-                "long-prefix-chain".to_owned(),
-                "ok".to_owned(),
-            ]),
-        })))
+            ..Fixture::fixture((
+                "prefix",
+                "X",
+                ["set-buffer", "-b", "long-prefix-chain", "ok"],
+            ))
+        })
         .await;
-    assert!(matches!(rebound, Response::BindKey(_)));
 
-    let (control_tx, control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
+    let control_rx = handler.attach_client(requester_pid, &alpha).await;
     let control_drain =
         spawn_accounted_attach_control_drain(&handler, requester_pid, control_rx).await;
     let input = b"\x02X".repeat(LONG_PREFIX_CHAIN_REPETITIONS);
@@ -493,26 +393,18 @@ async fn live_attach_prompt_cancel_chain_is_processed_iteratively() {
 
     create_send_keys_test_session(&handler, &alpha).await;
 
-    let rebound = handler
-        .handle(Request::BindKey(Box::new(BindKeyRequest {
-            table_name: "prefix".to_owned(),
-            key: "X".to_owned(),
+    handler
+        .handle_ok(BindKeyRequest {
             note: Some("live-attach-prompt-cancel-chain".to_owned()),
-            repeat: false,
-            command: Some(vec![
-                "set-buffer".to_owned(),
-                "-b".to_owned(),
-                "prompt-cancel-chain".to_owned(),
-                "ok".to_owned(),
-            ]),
-        })))
+            ..Fixture::fixture((
+                "prefix",
+                "X",
+                ["set-buffer", "-b", "prompt-cancel-chain", "ok"],
+            ))
+        })
         .await;
-    assert!(matches!(rebound, Response::BindKey(_)));
 
-    let (control_tx, control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
+    let control_rx = handler.attach_client(requester_pid, &alpha).await;
     let control_drain =
         spawn_accounted_attach_control_drain(&handler, requester_pid, control_rx).await;
     let mut input = b"\x02:\x1b".repeat(PROMPT_CANCEL_CHAIN_REPETITIONS);
@@ -542,10 +434,7 @@ async fn live_attach_menu_close_reroutes_same_chunk_tail_to_pane() {
     let requester_pid = std::process::id();
 
     create_send_keys_test_session(&handler, &alpha).await;
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
     let parsed = handler
         .parse_control_commands(r#"display-menu -T Menu "Item" "i" "display-message selected""#)
         .await
@@ -577,10 +466,7 @@ async fn live_attach_menu_waits_for_fragmented_arrow_key() {
     let requester_pid = std::process::id();
 
     create_send_keys_test_session(&handler, &alpha).await;
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
     let parsed = handler
         .parse_control_commands(r#"display-menu -T Menu "Item" "i" "display-message selected""#)
         .await
@@ -616,10 +502,7 @@ async fn live_attach_popup_preserves_complete_meta_input() {
     let requester_pid = std::process::id();
 
     create_send_keys_test_session(&handler, &alpha).await;
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
     let parsed = handler
         .parse_control_commands("display-popup -N -T Popup -w 20 -h 6")
         .await
@@ -650,10 +533,7 @@ async fn live_attach_popup_escape_closes_only_after_timeout() {
     let requester_pid = std::process::id();
 
     create_send_keys_test_session(&handler, &alpha).await;
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
     let parsed = handler
         .parse_control_commands("display-popup -N -T Popup -w 20 -h 6")
         .await
@@ -690,10 +570,7 @@ async fn live_attach_copy_mode_entry_reroutes_same_chunk_paste_to_copy_mode() {
     let requester_pid = std::process::id();
 
     create_send_keys_test_session(&handler, &alpha).await;
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
     let capture = RawPaneInputProbe::start(&handler, &alpha, "copy-entry-tail", 0).await;
     let mut pending_input = Vec::new();
     let forwarded = handler
@@ -722,10 +599,7 @@ async fn live_attach_copy_mode_exit_reroutes_same_chunk_tail_to_pane() {
     let requester_pid = std::process::id();
 
     create_send_keys_test_session(&handler, &alpha).await;
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
     handler
         .handle_attached_live_input_for_test(requester_pid, b"\x02[")
         .await
@@ -757,10 +631,7 @@ async fn live_attach_clock_mode_exit_reroutes_same_chunk_tail_to_pane() {
     let requester_pid = std::process::id();
 
     create_send_keys_test_session(&handler, &alpha).await;
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
     let expected = b"TAIL\n";
     let capture =
         RawPaneInputProbe::start(&handler, &alpha, "clock-exit-tail", expected.len()).await;
@@ -783,10 +654,7 @@ async fn live_attach_clock_mode_consumes_complete_meta_key() {
     let requester_pid = std::process::id();
 
     create_send_keys_test_session(&handler, &alpha).await;
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
     handler
         .handle_attached_live_input_for_test(requester_pid, b"\x02t")
         .await
@@ -812,10 +680,7 @@ async fn live_attach_clock_mode_consumes_complete_x10_mouse_event() {
     let requester_pid = std::process::id();
 
     create_send_keys_test_session(&handler, &alpha).await;
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
     handler
         .handle_attached_live_input_for_test(requester_pid, b"\x02t")
         .await
@@ -841,10 +706,7 @@ async fn live_attach_clock_mode_waits_for_fragmented_arrow() {
     let requester_pid = std::process::id();
 
     create_send_keys_test_session(&handler, &alpha).await;
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
     handler
         .handle_attached_live_input_for_test(requester_pid, b"\x02t")
         .await
@@ -875,10 +737,7 @@ async fn live_attach_clock_mode_reroutes_complete_bracketed_paste() {
     let requester_pid = std::process::id();
 
     create_send_keys_test_session(&handler, &alpha).await;
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
     handler
         .handle_attached_live_input_for_test(requester_pid, b"\x02t")
         .await
@@ -909,10 +768,7 @@ async fn live_attach_copy_mode_waits_for_fragmented_meta_key() {
     let requester_pid = std::process::id();
 
     create_send_keys_test_session(&handler, &alpha).await;
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
     handler
         .handle_attached_live_input_for_test(requester_pid, b"\x02[")
         .await
@@ -943,10 +799,7 @@ async fn live_attach_clock_mode_consumes_escape_when_timeout_expires() {
     let requester_pid = std::process::id();
 
     create_send_keys_test_session(&handler, &alpha).await;
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
     handler
         .handle_attached_live_input_for_test(requester_pid, b"\x02t")
         .await
@@ -978,17 +831,9 @@ async fn send_keys_m_forwards_the_current_mouse_event_to_the_pane() {
 
     create_send_keys_test_session(&handler, &alpha).await;
 
-    {
-        let mut state = handler.state.lock().await;
-        state
-            .append_bytes_to_pane_transcript_for_test(&alpha, 0, 0, b"\x1b[?1000h")
-            .expect("mouse mode transcript update");
-    }
+    append_pane_output(&handler, &alpha, b"\x1b[?1000h").await;
 
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
 
     let (window_id, pane_id, pane_target) = {
         let state = handler.state.lock().await;
@@ -1034,16 +879,9 @@ async fn send_keys_m_forwards_the_current_mouse_event_to_the_pane() {
 
     let response = handler
         .handle(Request::SendKeysExt(SendKeysExtRequest {
-            target: Some(pane_target),
-            keys: Vec::new(),
-            expand_formats: false,
-            hex: false,
-            literal: false,
             dispatch_key_table: false,
-            copy_mode_command: false,
             forward_mouse_event: true,
-            reset_terminal: false,
-            repeat_count: None,
+            ..Fixture::fixture((pane_target, Vec::<String>::new()))
         }))
         .await;
     assert_eq!(
@@ -1063,10 +901,7 @@ async fn live_attach_extended_keys_are_reencoded_for_the_target_pane() {
 
     create_send_keys_test_session(&handler, &alpha).await;
 
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
 
     let expected = b"\x1b[Z";
     let capture =
@@ -1090,10 +925,7 @@ async fn read_only_live_attach_drops_decoded_key_input() {
 
     create_send_keys_test_session(&handler, &alpha).await;
 
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
     {
         let mut active_attach = handler.active_attach.lock().await;
         let active = active_attach
@@ -1124,27 +956,17 @@ async fn live_attach_shift_enter_csi_u_survives_extended_key_mode() {
 
     create_send_keys_test_session(&handler, &alpha).await;
 
-    let set_format = handler
-        .handle(Request::SetOption(SetOptionRequest {
-            scope: ScopeSelector::Global,
-            option: OptionName::ExtendedKeysFormat,
-            value: "csi-u".to_owned(),
-            mode: SetOptionMode::Replace,
-        }))
+    handler
+        .set_option(
+            ScopeSelector::Global,
+            OptionName::ExtendedKeysFormat,
+            "csi-u",
+        )
         .await;
-    assert!(matches!(set_format, Response::SetOption(_)));
 
-    {
-        let mut state = handler.state.lock().await;
-        state
-            .append_bytes_to_pane_transcript_for_test(&alpha, 0, 0, b"\x1b[>4;2m")
-            .expect("extended key mode transcript update");
-    }
+    append_pane_output(&handler, &alpha, b"\x1b[>4;2m").await;
 
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
 
     let expected = b"\x1b[13;2u";
     let capture =
@@ -1167,10 +989,7 @@ async fn live_attach_standalone_escape_flushes_when_timeout_expires() {
 
     create_send_keys_test_session(&handler, &alpha).await;
 
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
 
     let expected = b"\x1b";
     let capture =
@@ -1202,10 +1021,7 @@ async fn live_attach_fragmented_arrow_consumes_pending_escape_before_timeout() {
 
     create_send_keys_test_session(&handler, &alpha).await;
 
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
 
     let expected = encode_key(
         0,
@@ -1245,17 +1061,9 @@ async fn live_attach_fragmented_arrow_survives_target_extended_key_mode() {
 
     create_send_keys_test_session(&handler, &alpha).await;
 
-    {
-        let mut state = handler.state.lock().await;
-        state
-            .append_bytes_to_pane_transcript_for_test(&alpha, 0, 0, b"\x1b[>4;2m")
-            .expect("extended key mode transcript update");
-    }
+    append_pane_output(&handler, &alpha, b"\x1b[>4;2m").await;
 
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
 
     let expected = b"\x1b[A";
     let capture = RawPaneInputProbe::start(
@@ -1289,10 +1097,7 @@ async fn live_attach_invalid_extended_sequence_does_not_repeat_preceding_bytes()
     let requester_pid = std::process::id();
 
     create_send_keys_test_session(&handler, &alpha).await;
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
 
     // Cursor-position reports intentionally pass through to the pane. Their
     // numeric CSI prefix also enters the extended-key decoder before rejection.
@@ -1324,17 +1129,9 @@ async fn live_attach_ambiguous_escape_prefixes_wait_for_suffix() {
 
     create_send_keys_test_session(&handler, &alpha).await;
 
-    {
-        let mut state = handler.state.lock().await;
-        state
-            .append_bytes_to_pane_transcript_for_test(&alpha, 0, 0, b"\x1b[>4;2m")
-            .expect("extended key mode transcript update");
-    }
+    append_pane_output(&handler, &alpha, b"\x1b[>4;2m").await;
 
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
 
     for (label, chunks, expected) in [
         (
@@ -1393,10 +1190,7 @@ async fn live_attach_fragmented_meta_key_consumes_pending_escape_before_timeout(
 
     create_send_keys_test_session(&handler, &alpha).await;
 
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
 
     let expected = encode_key(
         0,
@@ -1436,10 +1230,7 @@ async fn live_attach_control_bytes_dispatch_tmux_distinct_bindings() {
 
     create_send_keys_test_session(&handler, &alpha).await;
 
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
 
     for (key, literal) in [
         ("C-h", "H"),
@@ -1454,15 +1245,8 @@ async fn live_attach_control_bytes_dispatch_tmux_distinct_bindings() {
     ] {
         let rebound = handler
             .handle(Request::BindKey(Box::new(BindKeyRequest {
-                table_name: "root".to_owned(),
-                key: key.to_owned(),
                 note: Some("live-attach-control-byte".to_owned()),
-                repeat: false,
-                command: Some(vec![
-                    "send-keys".to_owned(),
-                    "-l".to_owned(),
-                    literal.to_owned(),
-                ]),
+                ..Fixture::fixture(("root", key, ["send-keys", "-l", literal]))
             })))
             .await;
         assert!(matches!(rebound, Response::BindKey(_)), "{key} should bind");
@@ -1494,25 +1278,14 @@ async fn live_attach_plain_fast_path_dispatches_root_binding() {
     let requester_pid = std::process::id();
 
     create_send_keys_test_session(&handler, &alpha).await;
-    let rebound = handler
-        .handle(Request::BindKey(Box::new(BindKeyRequest {
-            table_name: "root".to_owned(),
-            key: "x".to_owned(),
+    handler
+        .handle_ok(BindKeyRequest {
             note: Some("plain fast path root binding".to_owned()),
-            repeat: false,
-            command: Some(vec![
-                "send-keys".to_owned(),
-                "-l".to_owned(),
-                "R".to_owned(),
-            ]),
-        })))
+            ..Fixture::fixture(("root", "x", ["send-keys", "-l", "R"]))
+        })
         .await;
-    assert!(matches!(rebound, Response::BindKey(_)), "{rebound:?}");
 
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
     let capture = RawPaneInputProbe::start(&handler, &alpha, "plain-fast-root-binding", 1).await;
 
     handler
@@ -1531,37 +1304,21 @@ async fn live_attach_plain_fast_path_dispatches_custom_default_table_binding() {
     let requester_pid = std::process::id();
 
     create_send_keys_test_session(&handler, &alpha).await;
-    let configured = handler
-        .handle(Request::SetOption(SetOptionRequest {
-            scope: ScopeSelector::Session(alpha.clone()),
-            option: OptionName::KeyTable,
-            value: "custom-fast".to_owned(),
-            mode: SetOptionMode::Replace,
-        }))
+    handler
+        .set_option(
+            ScopeSelector::Session(alpha.clone()),
+            OptionName::KeyTable,
+            "custom-fast",
+        )
         .await;
-    assert!(
-        matches!(configured, Response::SetOption(_)),
-        "{configured:?}"
-    );
-    let rebound = handler
-        .handle(Request::BindKey(Box::new(BindKeyRequest {
-            table_name: "custom-fast".to_owned(),
-            key: "x".to_owned(),
+    handler
+        .handle_ok(BindKeyRequest {
             note: Some("plain fast path custom binding".to_owned()),
-            repeat: false,
-            command: Some(vec![
-                "send-keys".to_owned(),
-                "-l".to_owned(),
-                "C".to_owned(),
-            ]),
-        })))
+            ..Fixture::fixture(("custom-fast", "x", ["send-keys", "-l", "C"]))
+        })
         .await;
-    assert!(matches!(rebound, Response::BindKey(_)), "{rebound:?}");
 
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
     let capture = RawPaneInputProbe::start(&handler, &alpha, "plain-fast-custom-binding", 1).await;
 
     handler
@@ -1581,10 +1338,7 @@ async fn live_attach_plain_fast_path_forwards_unbound_input_unchanged() {
     let input = b"plain text\r";
 
     create_send_keys_test_session(&handler, &alpha).await;
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
     let capture =
         RawPaneInputProbe::start(&handler, &alpha, "plain-fast-unbound", input.len()).await;
 
@@ -1604,25 +1358,14 @@ async fn live_attach_utf8_dispatches_bound_key_and_forwards_unbound_tail() {
     let requester_pid = std::process::id();
 
     create_send_keys_test_session(&handler, &alpha).await;
-    let rebound = handler
-        .handle(Request::BindKey(Box::new(BindKeyRequest {
-            table_name: "root".to_owned(),
-            key: "é".to_owned(),
+    handler
+        .handle_ok(BindKeyRequest {
             note: Some("utf8 root binding".to_owned()),
-            repeat: false,
-            command: Some(vec![
-                "send-keys".to_owned(),
-                "-l".to_owned(),
-                "R".to_owned(),
-            ]),
-        })))
+            ..Fixture::fixture(("root", "é", ["send-keys", "-l", "R"]))
+        })
         .await;
-    assert!(matches!(rebound, Response::BindKey(_)), "{rebound:?}");
 
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
     let expected = "Rλ".as_bytes();
     let capture =
         RawPaneInputProbe::start(&handler, &alpha, "utf8-root-binding", expected.len()).await;
@@ -1643,25 +1386,17 @@ async fn live_attach_named_key_table_dispatches_before_rerouted_plain_tail() {
     let requester_pid = std::process::id();
 
     create_send_keys_test_session(&handler, &alpha).await;
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
-    let bound = handler
-        .handle(Request::BindKey(Box::new(BindKeyRequest {
-            table_name: "named-live".to_owned(),
-            key: "x".to_owned(),
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
+    handler
+        .handle_ok(BindKeyRequest {
             note: Some("named live table".to_owned()),
-            repeat: false,
-            command: Some(vec![
-                "set-buffer".to_owned(),
-                "-b".to_owned(),
-                "named-live-hit".to_owned(),
-                "yes".to_owned(),
-            ]),
-        })))
+            ..Fixture::fixture((
+                "named-live",
+                "x",
+                ["set-buffer", "-b", "named-live-hit", "yes"],
+            ))
+        })
         .await;
-    assert!(matches!(bound, Response::BindKey(_)), "{bound:?}");
     let switched = handler
         .handle(Request::SwitchClientExt(SwitchClientExtRequest {
             target: None,
@@ -1682,7 +1417,7 @@ async fn live_attach_named_key_table_dispatches_before_rerouted_plain_tail() {
 
     assert!(forwarded);
     assert!(pending_input.is_empty());
-    wait_for_buffer(&handler, "named-live-hit", "yes").await;
+    handler.wait_for_buffer("named-live-hit", "yes").await;
     capture.finish(&handler, &alpha).await;
     capture.assert_contents(&handler, b"TAIL").await;
 }
@@ -1694,26 +1429,18 @@ async fn live_attach_prefix_precedes_a_transient_key_table() {
     let requester_pid = std::process::id();
 
     create_send_keys_test_session(&handler, &alpha).await;
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
 
-    let bound = handler
-        .handle(Request::BindKey(Box::new(BindKeyRequest {
-            table_name: "named-live".to_owned(),
-            key: "C-b".to_owned(),
+    handler
+        .handle_ok(BindKeyRequest {
             note: Some("must lose to live prefix input".to_owned()),
-            repeat: false,
-            command: Some(vec![
-                "set-buffer".to_owned(),
-                "-b".to_owned(),
-                "wrong-live-table-hit".to_owned(),
-                "yes".to_owned(),
-            ]),
-        })))
+            ..Fixture::fixture((
+                "named-live",
+                "C-b",
+                ["set-buffer", "-b", "wrong-live-table-hit", "yes"],
+            ))
+        })
         .await;
-    assert!(matches!(bound, Response::BindKey(_)), "{bound:?}");
     let switched = handler
         .handle(Request::SwitchClientExt(SwitchClientExtRequest {
             target: None,
@@ -1730,13 +1457,10 @@ async fn live_attach_prefix_precedes_a_transient_key_table() {
         .await
         .expect("live prefix input from a transient table");
 
-    let active_attach = handler.active_attach.lock().await;
-    let active = active_attach
-        .by_pid
-        .get(&requester_pid)
-        .expect("attached client should remain registered");
-    assert_eq!(active.key_table_name.as_deref(), Some("prefix"));
-    drop(active_attach);
+    assert_eq!(
+        client_key_table(&handler, requester_pid).await.as_deref(),
+        Some("prefix")
+    );
 
     let wrong_table_hit = handler
         .handle(Request::ShowBuffer(ShowBufferRequest {
@@ -1757,40 +1481,19 @@ async fn live_attach_key_table_off_keeps_prefix_disabled() {
 
     create_send_keys_test_session(&handler, &alpha).await;
     for (option, value) in [(OptionName::Prefix, "None"), (OptionName::KeyTable, "off")] {
-        let configured = handler
-            .handle(Request::SetOption(SetOptionRequest {
-                scope: ScopeSelector::Session(alpha.clone()),
-                option,
-                value: value.to_owned(),
-                mode: SetOptionMode::Replace,
-            }))
+        handler
+            .set_option(ScopeSelector::Session(alpha.clone()), option, value)
             .await;
-        assert!(
-            matches!(configured, Response::SetOption(_)),
-            "{configured:?}"
-        );
     }
 
-    let bound = handler
-        .handle(Request::BindKey(Box::new(BindKeyRequest {
-            table_name: "off".to_owned(),
-            key: "C-b".to_owned(),
-            note: Some("disabled-prefix table binding".to_owned()),
-            repeat: false,
-            command: Some(vec![
-                "set-buffer".to_owned(),
-                "-b".to_owned(),
-                "off-table-hit".to_owned(),
-                "yes".to_owned(),
-            ]),
-        })))
-        .await;
-    assert!(matches!(bound, Response::BindKey(_)), "{bound:?}");
-
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
     handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
+        .handle_ok(BindKeyRequest {
+            note: Some("disabled-prefix table binding".to_owned()),
+            ..Fixture::fixture(("off", "C-b", ["set-buffer", "-b", "off-table-hit", "yes"]))
+        })
         .await;
+
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
     handler
         .handle_attached_live_input_for_test(requester_pid, b"\x02")
         .await
@@ -1806,12 +1509,7 @@ async fn live_attach_key_table_off_keeps_prefix_disabled() {
     };
     assert_eq!(shown.command_output().stdout(), b"yes");
 
-    let active_attach = handler.active_attach.lock().await;
-    let active = active_attach
-        .by_pid
-        .get(&requester_pid)
-        .expect("attached client should remain registered");
-    assert_eq!(active.key_table_name, None);
+    assert_eq!(client_key_table(&handler, requester_pid).await, None);
 }
 
 #[tokio::test]
@@ -1822,25 +1520,14 @@ async fn live_attach_nul_dispatches_c_at_alias_binding() {
 
     create_send_keys_test_session(&handler, &alpha).await;
 
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
 
-    let rebound = handler
-        .handle(Request::BindKey(Box::new(BindKeyRequest {
-            table_name: "root".to_owned(),
-            key: "C-@".to_owned(),
+    handler
+        .handle_ok(BindKeyRequest {
             note: Some("live-attach-control-byte-alias".to_owned()),
-            repeat: false,
-            command: Some(vec![
-                "send-keys".to_owned(),
-                "-l".to_owned(),
-                "A".to_owned(),
-            ]),
-        })))
+            ..Fixture::fixture(("root", "C-@", ["send-keys", "-l", "A"]))
+        })
         .await;
-    assert!(matches!(rebound, Response::BindKey(_)));
 
     let capture = RawPaneInputProbe::start(&handler, &alpha, "live-attach-c-at-alias", 1).await;
 
@@ -1861,10 +1548,7 @@ async fn live_attach_meta_control_bytes_do_not_wait_for_following_input() {
 
     create_send_keys_test_session(&handler, &alpha).await;
 
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
 
     let expected = b"\x1b\x01\x1b\x7f";
     let capture =
@@ -1895,10 +1579,7 @@ async fn live_attach_committed_utf8_text_preserves_latin_and_ime_payload_chunks(
 
     create_send_keys_test_session(&handler, &alpha).await;
 
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
 
     let expected = "Latin ABC 123 | 日本語かな | 한글 | cafe\u{0301}".as_bytes();
     let capture = RawPaneInputProbe::start(
@@ -1930,10 +1611,7 @@ async fn live_attach_preserves_c1_and_malformed_utf8_bytes() {
 
     create_send_keys_test_session(&handler, &alpha).await;
 
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
 
     let input = b"\x9bA\xc3(\xe2(\xa1";
     let expected = input;
@@ -1961,16 +1639,8 @@ async fn live_attach_focus_sequences_are_consumed_at_attach_boundary() {
     let requester_pid = std::process::id();
 
     create_send_keys_test_session(&handler, &alpha).await;
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
-    {
-        let mut state = handler.state.lock().await;
-        state
-            .append_bytes_to_pane_transcript_for_test(&alpha, 0, 0, b"\x1b[?1004l")
-            .expect("focus mode reset transcript update");
-    }
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
+    append_pane_output(&handler, &alpha, b"\x1b[?1004l").await;
 
     let capture = RawPaneInputProbe::start(&handler, &alpha, "live-attach-focus", 0).await;
 
@@ -1990,16 +1660,8 @@ async fn live_attach_large_focus_chain_has_bounded_reroute_work() {
     let requester_pid = std::process::id();
 
     create_send_keys_test_session(&handler, &alpha).await;
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
-    {
-        let mut state = handler.state.lock().await;
-        state
-            .append_bytes_to_pane_transcript_for_test(&alpha, 0, 0, b"\x1b[?1004l")
-            .expect("focus mode reset transcript update");
-    }
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
+    append_pane_output(&handler, &alpha, b"\x1b[?1004l").await;
 
     let input = b"\x1b[I\x1b[O".repeat(LARGE_FOCUS_CHAIN_REPETITIONS);
     let capture = RawPaneInputProbe::start(&handler, &alpha, "large-focus-chain", 0).await;
@@ -2022,43 +1684,33 @@ async fn live_attach_focus_sequences_emit_client_and_pane_hooks_in_order() {
     let requester_pid = std::process::id();
 
     create_send_keys_test_session(&handler, &alpha).await;
-    set_global_hook(
-        &handler,
-        HookName::ClientFocusIn,
-        "set-buffer -a -b focus-hooks CFI,",
-    )
-    .await;
-    set_global_hook(
-        &handler,
-        HookName::PaneFocusIn,
-        "set-buffer -a -b focus-hooks PFI,",
-    )
-    .await;
-    set_global_hook(
-        &handler,
-        HookName::PaneFocusOut,
-        "set-buffer -a -b focus-hooks PFO,",
-    )
-    .await;
-    set_global_hook(
-        &handler,
-        HookName::ClientFocusOut,
-        "set-buffer -a -b focus-hooks CFO,",
-    )
-    .await;
-    let mut lifecycle = handler.subscribe_lifecycle_events();
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
+    handler
+        .set_global_hook(HookName::ClientFocusIn, "set-buffer -a -b focus-hooks CFI,")
         .await;
+    handler
+        .set_global_hook(HookName::PaneFocusIn, "set-buffer -a -b focus-hooks PFI,")
+        .await;
+    handler
+        .set_global_hook(HookName::PaneFocusOut, "set-buffer -a -b focus-hooks PFO,")
+        .await;
+    handler
+        .set_global_hook(
+            HookName::ClientFocusOut,
+            "set-buffer -a -b focus-hooks CFO,",
+        )
+        .await;
+    let mut lifecycle = handler.subscribe_lifecycle_events();
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
 
     handler
         .handle_attached_live_input_for_test(requester_pid, b"\x1b[I\x1b[O")
         .await
         .expect("live attach focus input");
 
-    drain_lifecycle_hooks(&handler, &mut lifecycle).await;
-    wait_for_buffer(&handler, "focus-hooks", "CFI,PFI,PFO,CFO,").await;
+    handler.drain_lifecycle_hooks_for_test(&mut lifecycle).await;
+    handler
+        .wait_for_buffer("focus-hooks", "CFI,PFI,PFO,CFO,")
+        .await;
 }
 
 #[tokio::test]
@@ -2068,28 +1720,13 @@ async fn live_attach_focus_hook_mode_transition_reroutes_same_chunk_paste() {
     let requester_pid = std::process::id();
 
     create_send_keys_test_session(&handler, &alpha).await;
-    set_global_hook(&handler, HookName::ClientFocusIn, "copy-mode").await;
-    let lifecycle_events = handler
-        .take_lifecycle_dispatch_receiver()
-        .expect("lifecycle dispatch receiver activates once");
-    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
-    let lifecycle_handler = handler.clone();
-    let lifecycle_task = tokio::spawn(async move {
-        lifecycle_handler
-            .consume_lifecycle_hooks(lifecycle_events, shutdown_rx)
-            .await;
-    });
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
+    handler
+        .set_global_hook(HookName::ClientFocusIn, "copy-mode")
         .await;
+    let (shutdown_tx, lifecycle_task) = spawn_lifecycle_consumer(&handler);
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
     let capture = RawPaneInputProbe::start(&handler, &alpha, "focus-copy-tail", 0).await;
-    {
-        let mut state = handler.state.lock().await;
-        state
-            .append_bytes_to_pane_transcript_for_test(&alpha, 0, 0, b"\x1b[?1004l")
-            .expect("focus mode reset transcript update");
-    }
+    append_pane_output(&handler, &alpha, b"\x1b[?1004l").await;
 
     let mut pending_input = Vec::new();
     let forwarded = handler
@@ -2120,28 +1757,11 @@ async fn live_attach_focus_hook_pane_transition_reloads_bracketed_paste_mode_for
     let requester_pid = std::process::id();
 
     create_send_keys_test_session(&handler, &alpha).await;
-    let split = handler
-        .handle(Request::SplitWindow(SplitWindowRequest {
-            target: SplitWindowTarget::Session(alpha.clone()),
-            direction: SplitDirection::Horizontal,
-            before: false,
-            environment: None,
-        }))
-        .await;
-    assert!(matches!(split, Response::SplitWindow(_)), "{split:?}");
+    split_window_horizontally(&handler, &alpha).await;
 
     let first = PaneTarget::with_window(alpha.clone(), 0, 0);
     let second = PaneTarget::with_window(alpha.clone(), 0, 1);
-    let selected = handler
-        .handle(Request::SelectPane(Box::new(SelectPaneRequest {
-            target: first.clone(),
-            title: None,
-            style: None,
-            input_disabled: None,
-            preserve_zoom: false,
-        })))
-        .await;
-    assert!(matches!(selected, Response::SelectPane(_)), "{selected:?}");
+    handler.handle_ok(SelectPaneRequest::fixture(&first)).await;
     {
         let mut state = handler.state.lock().await;
         state
@@ -2152,27 +1772,12 @@ async fn live_attach_focus_hook_pane_transition_reloads_bracketed_paste_mode_for
     }
 
     let select_second = format!("select-pane -t {}:0.1", alpha.as_str());
-    set_global_hook(&handler, HookName::ClientFocusIn, &select_second).await;
-    let lifecycle_events = handler
-        .take_lifecycle_dispatch_receiver()
-        .expect("lifecycle dispatch receiver activates once");
-    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
-    let lifecycle_handler = handler.clone();
-    let lifecycle_task = tokio::spawn(async move {
-        lifecycle_handler
-            .consume_lifecycle_hooks(lifecycle_events, shutdown_rx)
-            .await;
-    });
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
+    handler
+        .set_global_hook(HookName::ClientFocusIn, &select_second)
         .await;
-    {
-        let mut state = handler.state.lock().await;
-        state
-            .append_bytes_to_pane_transcript_for_test(&alpha, 0, 0, b"\x1b[?1004l")
-            .expect("first pane focus mode reset transcript update");
-    }
+    let (shutdown_tx, lifecycle_task) = spawn_lifecycle_consumer(&handler);
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
+    append_pane_output(&handler, &alpha, b"\x1b[?1004l").await;
 
     let paste = b"\x1b[200~MARKER\n\x1b[201~";
     let mut input = b"\x1b[I".to_vec();
@@ -2215,27 +1820,10 @@ async fn live_attach_focus_hook_reindexed_pane_identity_reloads_tail_capabilitie
     let requester_pid = std::process::id();
 
     create_send_keys_test_session(&handler, &alpha).await;
-    let split = handler
-        .handle(Request::SplitWindow(SplitWindowRequest {
-            target: SplitWindowTarget::Session(alpha.clone()),
-            direction: SplitDirection::Horizontal,
-            before: false,
-            environment: None,
-        }))
-        .await;
-    assert!(matches!(split, Response::SplitWindow(_)), "{split:?}");
+    split_window_horizontally(&handler, &alpha).await;
 
     let target = PaneTarget::with_window(alpha.clone(), 0, 0);
-    let selected = handler
-        .handle(Request::SelectPane(Box::new(SelectPaneRequest {
-            target: target.clone(),
-            title: None,
-            style: None,
-            input_disabled: None,
-            preserve_zoom: false,
-        })))
-        .await;
-    assert!(matches!(selected, Response::SelectPane(_)), "{selected:?}");
+    handler.handle_ok(SelectPaneRequest::fixture(&target)).await;
     let (removed_pane_id, surviving_pane_id) = {
         let mut state = handler.state.lock().await;
         let session = state.sessions.session(&alpha).expect("session exists");
@@ -2253,27 +1841,12 @@ async fn live_attach_focus_hook_reindexed_pane_identity_reloads_tail_capabilitie
     };
 
     let kill_first = format!("kill-pane -t {}:0.0", alpha.as_str());
-    set_global_hook(&handler, HookName::ClientFocusIn, &kill_first).await;
-    let lifecycle_events = handler
-        .take_lifecycle_dispatch_receiver()
-        .expect("lifecycle dispatch receiver activates once");
-    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
-    let lifecycle_handler = handler.clone();
-    let lifecycle_task = tokio::spawn(async move {
-        lifecycle_handler
-            .consume_lifecycle_hooks(lifecycle_events, shutdown_rx)
-            .await;
-    });
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
+    handler
+        .set_global_hook(HookName::ClientFocusIn, &kill_first)
         .await;
-    {
-        let mut state = handler.state.lock().await;
-        state
-            .append_bytes_to_pane_transcript_for_test(&alpha, 0, 0, b"\x1b[?1004l")
-            .expect("first pane focus mode reset transcript update");
-    }
+    let (shutdown_tx, lifecycle_task) = spawn_lifecycle_consumer(&handler);
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
+    append_pane_output(&handler, &alpha, b"\x1b[?1004l").await;
 
     let paste = b"\x1b[200~MARKER\n\x1b[201~";
     let mut input = b"\x1b[I".to_vec();
@@ -2325,27 +1898,12 @@ async fn live_attach_focus_hook_respawn_reloads_same_pane_tail_capabilities() {
     }
 
     let respawn = format!("respawn-pane -k -t {}:0.0", alpha.as_str());
-    set_global_hook(&handler, HookName::ClientFocusIn, &respawn).await;
-    let lifecycle_events = handler
-        .take_lifecycle_dispatch_receiver()
-        .expect("lifecycle dispatch receiver activates once");
-    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
-    let lifecycle_handler = handler.clone();
-    let lifecycle_task = tokio::spawn(async move {
-        lifecycle_handler
-            .consume_lifecycle_hooks(lifecycle_events, shutdown_rx)
-            .await;
-    });
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
+    handler
+        .set_global_hook(HookName::ClientFocusIn, &respawn)
         .await;
-    {
-        let mut state = handler.state.lock().await;
-        state
-            .append_bytes_to_pane_transcript_for_test(&alpha, 0, 0, b"\x1b[?1004l")
-            .expect("pane focus mode reset transcript update");
-    }
+    let (shutdown_tx, lifecycle_task) = spawn_lifecycle_consumer(&handler);
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
+    append_pane_output(&handler, &alpha, b"\x1b[?1004l").await;
 
     let body = b"MARKER\n";
     let mut input = b"\x1b[I\x1b[200~".to_vec();
@@ -2389,29 +1947,23 @@ async fn live_attach_first_typist_after_second_attach_marks_changed_client_activ
     let second_pid = first_pid.saturating_add(1);
 
     create_send_keys_test_session(&handler, &alpha).await;
-    set_global_hook(
-        &handler,
-        HookName::ClientActive,
-        "set-buffer -a -b client-active active,",
-    )
-    .await;
+    handler
+        .set_global_hook(
+            HookName::ClientActive,
+            "set-buffer -a -b client-active active,",
+        )
+        .await;
     let mut lifecycle = handler.subscribe_lifecycle_events();
-    let (first_tx, _first_rx) = mpsc::unbounded_channel();
-    let _first_attach = handler
-        .register_attach(first_pid, alpha.clone(), first_tx)
-        .await;
-    let (second_tx, _second_rx) = mpsc::unbounded_channel();
-    let _second_attach = handler
-        .register_attach(second_pid, alpha.clone(), second_tx)
-        .await;
+    let _first_rx = handler.attach_client(first_pid, &alpha).await;
+    let _second_rx = handler.attach_client(second_pid, &alpha).await;
 
     handler
         .handle_attached_live_input_for_test(first_pid, b"a")
         .await
         .expect("first client input");
 
-    drain_lifecycle_hooks(&handler, &mut lifecycle).await;
-    wait_for_buffer(&handler, "client-active", "active,").await;
+    handler.drain_lifecycle_hooks_for_test(&mut lifecycle).await;
+    handler.wait_for_buffer("client-active", "active,").await;
 }
 
 #[tokio::test]
@@ -2421,31 +1973,28 @@ async fn live_attach_theme_reports_emit_client_theme_hooks() {
     let requester_pid = std::process::id();
 
     create_send_keys_test_session(&handler, &alpha).await;
-    set_global_hook(
-        &handler,
-        HookName::ClientDarkTheme,
-        "set-buffer -a -b theme-hooks dark,",
-    )
-    .await;
-    set_global_hook(
-        &handler,
-        HookName::ClientLightTheme,
-        "set-buffer -a -b theme-hooks light,",
-    )
-    .await;
-    let mut lifecycle = handler.subscribe_lifecycle_events();
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
+    handler
+        .set_global_hook(
+            HookName::ClientDarkTheme,
+            "set-buffer -a -b theme-hooks dark,",
+        )
         .await;
+    handler
+        .set_global_hook(
+            HookName::ClientLightTheme,
+            "set-buffer -a -b theme-hooks light,",
+        )
+        .await;
+    let mut lifecycle = handler.subscribe_lifecycle_events();
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
 
     handler
         .handle_attached_live_input_for_test(requester_pid, b"\x1b[?997;1n\x1b[?997;2n")
         .await
         .expect("live attach theme reports");
 
-    drain_lifecycle_hooks(&handler, &mut lifecycle).await;
-    wait_for_buffer(&handler, "theme-hooks", "dark,light,").await;
+    handler.drain_lifecycle_hooks_for_test(&mut lifecycle).await;
+    handler.wait_for_buffer("theme-hooks", "dark,light,").await;
 }
 
 #[tokio::test]
@@ -2458,17 +2007,14 @@ async fn display_message_ignore_keys_keeps_streamed_focus_and_theme_protocol_liv
     let requester_pid = std::process::id();
 
     create_quiet_input_session(&handler, &alpha).await;
-    set_global_hook(
-        &handler,
-        HookName::ClientDarkTheme,
-        "set-buffer -a -b display-theme dark,",
-    )
-    .await;
-    let mut lifecycle = handler.subscribe_lifecycle_events();
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
     handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
+        .set_global_hook(
+            HookName::ClientDarkTheme,
+            "set-buffer -a -b display-theme dark,",
+        )
         .await;
+    let mut lifecycle = handler.subscribe_lifecycle_events();
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
     {
         let mut state = handler.state.lock().await;
         state
@@ -2483,20 +2029,14 @@ async fn display_message_ignore_keys_keeps_streamed_focus_and_theme_protocol_liv
             "focus mode must be active before the ignored message"
         );
     }
-    let response = handler
-        .handle(Request::DisplayMessageExt(Box::new(
-            DisplayMessageExtRequest {
-                target: None,
-                print: false,
-                message: Some("ignore keys".to_owned()),
-                target_client: Some(requester_pid.to_string()),
-                empty_target_context: false,
-                duration_ms: Some(rmux_proto::DisplayMessageDurationMillis::new(1_000)),
-                ignore_input: true,
-            },
-        )))
+    handler
+        .handle_ok(DisplayMessageExtRequest {
+            target_client: Some(requester_pid.to_string()),
+            duration_ms: Some(rmux_proto::DisplayMessageDurationMillis::new(1_000)),
+            ignore_input: true,
+            ..Fixture::fixture("ignore keys")
+        })
         .await;
-    assert!(matches!(response, Response::DisplayMessage(_)));
 
     let expected = b"\x1b[O\x1b[I";
     let capture =
@@ -2517,8 +2057,8 @@ async fn display_message_ignore_keys_keeps_streamed_focus_and_theme_protocol_liv
     }
     capture.finish(&handler, &alpha).await;
     capture.assert_contents(&handler, expected).await;
-    drain_lifecycle_hooks(&handler, &mut lifecycle).await;
-    wait_for_buffer(&handler, "display-theme", "dark,").await;
+    handler.drain_lifecycle_hooks_for_test(&mut lifecycle).await;
+    handler.wait_for_buffer("display-theme", "dark,").await;
     assert!(handler
         .active_attach
         .lock()
@@ -2534,56 +2074,23 @@ async fn display_message_ignore_protocol_reloads_target_after_each_focus_hook() 
     let alpha = session_name("display-ignore-focus-switch");
     let requester_pid = std::process::id();
     create_send_keys_test_session(&handler, &alpha).await;
-    assert!(matches!(
-        handler
-            .handle(Request::SplitWindow(SplitWindowRequest {
-                target: SplitWindowTarget::Session(alpha.clone()),
-                direction: SplitDirection::Horizontal,
-                before: false,
-                environment: None,
-            }))
-            .await,
-        Response::SplitWindow(_)
-    ));
+    split_window_horizontally(&handler, &alpha).await;
     let first = PaneTarget::with_window(alpha.clone(), 0, 0);
     let second = PaneTarget::with_window(alpha.clone(), 0, 1);
-    assert!(matches!(
-        handler
-            .handle(Request::SelectPane(Box::new(SelectPaneRequest {
-                target: first.clone(),
-                title: None,
-                style: None,
-                input_disabled: None,
-                preserve_zoom: false,
-            })))
-            .await,
-        Response::SelectPane(_)
-    ));
+    handler.handle_ok(SelectPaneRequest::fixture(&first)).await;
     {
         let state = handler.state.lock().await;
         state.start_pane_input_capture_for_test(&first);
         state.start_pane_input_capture_for_test(&second);
     }
-    set_global_hook(
-        &handler,
-        HookName::ClientFocusIn,
-        &format!("select-pane -t {}:0.1", alpha.as_str()),
-    )
-    .await;
-    let lifecycle_events = handler
-        .take_lifecycle_dispatch_receiver()
-        .expect("lifecycle dispatch receiver activates once");
-    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
-    let lifecycle_handler = handler.clone();
-    let lifecycle_task = tokio::spawn(async move {
-        lifecycle_handler
-            .consume_lifecycle_hooks(lifecycle_events, shutdown_rx)
-            .await;
-    });
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
     handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
+        .set_global_hook(
+            HookName::ClientFocusIn,
+            &format!("select-pane -t {}:0.1", alpha.as_str()),
+        )
         .await;
+    let (shutdown_tx, lifecycle_task) = spawn_lifecycle_consumer(&handler);
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
     {
         // Shell startup may enable focus reporting before the fixture takes
         // control. Pin both pane modes so this test measures target reload
@@ -2604,22 +2111,15 @@ async fn display_message_ignore_protocol_reloads_target_after_each_focus_hook() 
             );
         }
     }
-    assert!(matches!(
-        handler
-            .handle(Request::DisplayMessageExt(Box::new(
-                DisplayMessageExtRequest {
-                    target: Some(Target::Session(alpha.clone())),
-                    print: false,
-                    message: Some("ignore keys".to_owned()),
-                    target_client: Some(requester_pid.to_string()),
-                    empty_target_context: false,
-                    duration_ms: Some(rmux_proto::DisplayMessageDurationMillis::new(1_000)),
-                    ignore_input: true,
-                },
-            )))
-            .await,
-        Response::DisplayMessage(_)
-    ));
+    handler
+        .handle_ok(DisplayMessageExtRequest {
+            target: Some(Target::Session(alpha.clone())),
+            target_client: Some(requester_pid.to_string()),
+            duration_ms: Some(rmux_proto::DisplayMessageDurationMillis::new(1_000)),
+            ignore_input: true,
+            ..Fixture::fixture("ignore keys")
+        })
+        .await;
 
     handler
         .handle_attached_live_input_for_test(requester_pid, b"\x1b[I\x1b[O")
@@ -2644,16 +2144,8 @@ async fn live_attach_focus_sequences_forward_when_pane_focus_mode_is_enabled() {
     let requester_pid = std::process::id();
 
     create_send_keys_test_session(&handler, &alpha).await;
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
-    {
-        let mut state = handler.state.lock().await;
-        state
-            .append_bytes_to_pane_transcript_for_test(&alpha, 0, 0, b"\x1b[?1004h")
-            .expect("focus mode transcript update");
-    }
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
+    append_pane_output(&handler, &alpha, b"\x1b[?1004h").await;
 
     let expected = b"\x1b[I\x1b[O";
     let capture =
@@ -2675,10 +2167,7 @@ async fn live_attach_fragmented_mouse_does_not_repeat_preceding_bytes() {
     let requester_pid = std::process::id();
 
     create_send_keys_test_session(&handler, &alpha).await;
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
 
     let capture =
         RawPaneInputProbe::start(&handler, &alpha, "live-attach-fragmented-mouse-prefix", 1).await;
@@ -2708,28 +2197,16 @@ async fn live_attach_mouse_sequences_dispatch_default_mouse_bindings() {
     create_send_keys_test_session(&handler, &alpha).await;
     enable_mouse(&handler).await;
 
-    {
-        let mut state = handler.state.lock().await;
-        state
-            .append_bytes_to_pane_transcript_for_test(&alpha, 0, 0, b"\x1b[?1002h")
-            .expect("mouse motion mode transcript update");
-    }
+    append_pane_output(&handler, &alpha, b"\x1b[?1002h").await;
 
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
 
-    let rebound = handler
-        .handle(Request::BindKey(Box::new(BindKeyRequest {
-            table_name: "root".to_owned(),
-            key: "MouseDrag1Pane".to_owned(),
+    handler
+        .handle_ok(BindKeyRequest {
             note: Some("live-attach-mouse".to_owned()),
-            repeat: false,
-            command: Some(vec!["send-keys".to_owned(), "-M".to_owned()]),
-        })))
+            ..Fixture::fixture(("root", "MouseDrag1Pane", ["send-keys", "-M"]))
+        })
         .await;
-    assert!(matches!(rebound, Response::BindKey(_)));
 
     let expected = encode_mouse_event(
         mode::MODE_MOUSE_BUTTON,
@@ -2776,17 +2253,9 @@ async fn live_attach_forwards_pane_requested_mouse_when_mouse_option_is_off() {
 
     create_send_keys_test_session(&handler, &alpha).await;
 
-    {
-        let mut state = handler.state.lock().await;
-        state
-            .append_bytes_to_pane_transcript_for_test(&alpha, 0, 0, b"\x1b[?1002h\x1b[?1006h")
-            .expect("mouse motion mode transcript update");
-    }
+    append_pane_output(&handler, &alpha, b"\x1b[?1002h\x1b[?1006h").await;
 
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
 
     let expected = b"\x1b[<32;2;2M";
     let capture = RawPaneInputProbe::start(
@@ -2820,40 +2289,17 @@ async fn live_attach_focus_follows_active_pane_motion_when_mouse_option_is_off()
     let requester_pid = std::process::id();
 
     create_send_keys_test_session(&handler, &alpha).await;
-    let split = handler
-        .handle(Request::SplitWindow(SplitWindowRequest {
-            target: SplitWindowTarget::Session(alpha.clone()),
-            direction: SplitDirection::Horizontal,
-            before: false,
-            environment: None,
-        }))
+    split_window_horizontally(&handler, &alpha).await;
+    handler
+        .handle_ok(SelectPaneRequest::fixture(PaneTarget::new(
+            alpha.clone(),
+            0,
+        )))
         .await;
-    assert!(matches!(split, Response::SplitWindow(_)), "{split:?}");
-    let selected = handler
-        .handle(Request::SelectPane(Box::new(SelectPaneRequest {
-            target: PaneTarget::new(alpha.clone(), 0),
-            title: None,
-            style: None,
-            input_disabled: None,
-            preserve_zoom: false,
-        })))
+    append_pane_output(&handler, &alpha, b"\x1b[?1003h\x1b[?1006h").await;
+    handler
+        .set_option(ScopeSelector::Global, OptionName::FocusFollowsMouse, "on")
         .await;
-    assert!(matches!(selected, Response::SelectPane(_)), "{selected:?}");
-    {
-        let mut state = handler.state.lock().await;
-        state
-            .append_bytes_to_pane_transcript_for_test(&alpha, 0, 0, b"\x1b[?1003h\x1b[?1006h")
-            .expect("pane all-motion mode transcript update");
-    }
-    let enabled = handler
-        .handle(Request::SetOption(SetOptionRequest {
-            scope: ScopeSelector::Global,
-            option: OptionName::FocusFollowsMouse,
-            value: "on".to_owned(),
-            mode: SetOptionMode::Replace,
-        }))
-        .await;
-    assert!(matches!(enabled, Response::SetOption(_)), "{enabled:?}");
 
     let (control_tx, mut control_rx) = mpsc::unbounded_channel();
     handler
@@ -2880,7 +2326,7 @@ async fn live_attach_focus_follows_active_pane_motion_when_mouse_option_is_off()
         .await
         .expect("tracking refresh is bounded")
         .expect("attach control channel remains open");
-    let crate::pane_io::AttachControl::Switch(tracking) = tracking else {
+    let AttachControl::Switch(tracking) = tracking else {
         panic!("expected tracking switch refresh, got {tracking:?}");
     };
     let tracking = tracking.into_target();
@@ -2923,7 +2369,7 @@ async fn live_attach_focus_follows_active_pane_motion_when_mouse_option_is_off()
         .await
         .expect("focus refresh is bounded")
         .expect("attach control channel remains open");
-    let crate::pane_io::AttachControl::Switch(switched) = switched else {
+    let AttachControl::Switch(switched) = switched else {
         panic!("expected focus switch refresh, got {switched:?}");
     };
     let switched = switched.into_target();
@@ -2945,10 +2391,7 @@ async fn live_attach_ignores_mouse_when_option_and_pane_tracking_are_off() {
     let requester_pid = std::process::id();
 
     create_send_keys_test_session(&handler, &alpha).await;
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
     let capture = RawPaneInputProbe::start(&handler, &alpha, "live-attach-no-mouse", 0).await;
 
     handler
@@ -2974,33 +2417,18 @@ async fn live_attach_mouse_down_selects_the_clicked_pane() {
 
     create_send_keys_test_session(&handler, &alpha).await;
 
-    let split = handler
-        .handle(Request::SplitWindow(SplitWindowRequest {
-            target: SplitWindowTarget::Session(alpha.clone()),
-            direction: SplitDirection::Horizontal,
-            before: false,
-            environment: None,
-        }))
-        .await;
-    assert!(matches!(split, Response::SplitWindow(_)));
+    split_window_horizontally(&handler, &alpha).await;
 
-    let selected = handler
-        .handle(Request::SelectPane(Box::new(SelectPaneRequest {
-            target: PaneTarget::new(alpha.clone(), 0),
-            title: None,
-            style: None,
-            input_disabled: None,
-            preserve_zoom: false,
-        })))
+    handler
+        .handle_ok(SelectPaneRequest::fixture(PaneTarget::new(
+            alpha.clone(),
+            0,
+        )))
         .await;
-    assert!(matches!(selected, Response::SelectPane(_)));
 
     enable_mouse(&handler).await;
 
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
 
     let (click_x, click_y) = {
         let state = handler.state.lock().await;
@@ -3032,31 +2460,16 @@ async fn live_attach_focus_follows_mouse_selects_the_resized_hovered_pane_when_e
     let requester_pid = std::process::id();
 
     create_send_keys_test_session(&handler, &alpha).await;
-    let split = handler
-        .handle(Request::SplitWindow(SplitWindowRequest {
-            target: SplitWindowTarget::Session(alpha.clone()),
-            direction: SplitDirection::Horizontal,
-            before: false,
-            environment: None,
-        }))
+    split_window_horizontally(&handler, &alpha).await;
+    handler
+        .handle_ok(SelectPaneRequest::fixture(PaneTarget::new(
+            alpha.clone(),
+            0,
+        )))
         .await;
-    assert!(matches!(split, Response::SplitWindow(_)), "{split:?}");
-    let selected = handler
-        .handle(Request::SelectPane(Box::new(SelectPaneRequest {
-            target: PaneTarget::new(alpha.clone(), 0),
-            title: None,
-            style: None,
-            input_disabled: None,
-            preserve_zoom: false,
-        })))
-        .await;
-    assert!(matches!(selected, Response::SelectPane(_)), "{selected:?}");
     enable_mouse(&handler).await;
 
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
     handler
         .handle_attached_resize(
             requester_pid,
@@ -3094,15 +2507,9 @@ async fn live_attach_focus_follows_mouse_selects_the_resized_hovered_pane_when_e
         );
     }
 
-    let enabled = handler
-        .handle(Request::SetOption(SetOptionRequest {
-            scope: ScopeSelector::Global,
-            option: OptionName::FocusFollowsMouse,
-            value: "on".to_owned(),
-            mode: SetOptionMode::Replace,
-        }))
+    handler
+        .set_option(ScopeSelector::Global, OptionName::FocusFollowsMouse, "on")
         .await;
-    assert!(matches!(enabled, Response::SetOption(_)), "{enabled:?}");
     handler
         .handle_attached_live_input_for_test(requester_pid, mouse_move.as_bytes())
         .await
@@ -3129,30 +2536,15 @@ async fn stale_attached_mouse_focus_cannot_select_after_client_session_replaceme
 
     create_send_keys_test_session(&handler, &alpha).await;
     create_send_keys_test_session(&handler, &beta).await;
-    let split = handler
-        .handle(Request::SplitWindow(SplitWindowRequest {
-            target: SplitWindowTarget::Session(alpha.clone()),
-            direction: SplitDirection::Horizontal,
-            before: false,
-            environment: None,
-        }))
-        .await;
-    assert!(matches!(split, Response::SplitWindow(_)), "{split:?}");
-    let selected = handler
-        .handle(Request::SelectPane(Box::new(SelectPaneRequest {
-            target: PaneTarget::new(alpha.clone(), 0),
-            title: None,
-            style: None,
-            input_disabled: None,
-            preserve_zoom: false,
-        })))
-        .await;
-    assert!(matches!(selected, Response::SelectPane(_)), "{selected:?}");
-
-    let (alpha_tx, _alpha_rx) = mpsc::unbounded_channel();
+    split_window_horizontally(&handler, &alpha).await;
     handler
-        .register_attach(requester_pid, alpha.clone(), alpha_tx)
+        .handle_ok(SelectPaneRequest::fixture(PaneTarget::new(
+            alpha.clone(),
+            0,
+        )))
         .await;
+
+    let _alpha_rx = handler.attach_client(requester_pid, &alpha).await;
     let stale_identity = handler.active_attach_identity_for_test(requester_pid).await;
     let (session_id, window_id, pane_id) = {
         let state = handler.state.lock().await;
@@ -3164,10 +2556,7 @@ async fn stale_attached_mouse_focus_cannot_select_after_client_session_replaceme
         )
     };
 
-    let (beta_tx, _beta_rx) = mpsc::unbounded_channel();
-    handler
-        .register_attach(requester_pid, beta.clone(), beta_tx)
-        .await;
+    let _beta_rx = handler.attach_client(requester_pid, &beta).await;
     handler
         .select_attached_mouse_focus(stale_identity, &alpha, session_id, window_id, pane_id)
         .await
@@ -3183,15 +2572,7 @@ async fn stale_attached_mouse_focus_cannot_select_after_client_session_replaceme
             .active_pane_index(),
         0
     );
-    let active_attach = handler.active_attach.lock().await;
-    assert_eq!(
-        active_attach
-            .by_pid
-            .get(&requester_pid)
-            .expect("replacement attach exists")
-            .session_name,
-        beta
-    );
+    assert_eq!(active_session_name(&handler, requester_pid).await, beta);
 }
 
 /// Splits the window, keeps pane 0 active, and returns SGR mouse-down bytes
@@ -3200,35 +2581,17 @@ async fn setup_two_pane_mouse_click(
     handler: &RequestHandler,
     alpha: &rmux_proto::SessionName,
     requester_pid: u32,
-) -> (
-    String,
-    tokio::sync::mpsc::UnboundedReceiver<crate::pane_io::AttachControl>,
-) {
-    let split = handler
-        .handle(Request::SplitWindow(SplitWindowRequest {
-            target: SplitWindowTarget::Session(alpha.clone()),
-            direction: SplitDirection::Horizontal,
-            before: false,
-            environment: None,
-        }))
+) -> (String, mpsc::UnboundedReceiver<AttachControl>) {
+    split_window_horizontally(handler, alpha).await;
+    handler
+        .handle_ok(SelectPaneRequest::fixture(PaneTarget::new(
+            alpha.clone(),
+            0,
+        )))
         .await;
-    assert!(matches!(split, Response::SplitWindow(_)), "{split:?}");
-    let selected = handler
-        .handle(Request::SelectPane(Box::new(SelectPaneRequest {
-            target: PaneTarget::new(alpha.clone(), 0),
-            title: None,
-            style: None,
-            input_disabled: None,
-            preserve_zoom: false,
-        })))
-        .await;
-    assert!(matches!(selected, Response::SelectPane(_)), "{selected:?}");
     enable_mouse(handler).await;
 
-    let (control_tx, control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
+    let control_rx = handler.attach_client(requester_pid, alpha).await;
 
     let (click_x, click_y) = {
         let state = handler.state.lock().await;
@@ -3257,25 +2620,25 @@ async fn live_attach_mouse_binding_executes_every_command_in_the_sequence() {
     let requester_pid = std::process::id();
 
     create_send_keys_test_session(&handler, &alpha).await;
-    let rebound = handler
-        .handle(Request::BindKey(Box::new(BindKeyRequest {
-            table_name: "root".to_owned(),
-            key: "MouseDown1Pane".to_owned(),
+    handler
+        .handle_ok(BindKeyRequest {
             note: Some("issue-96-sequence".to_owned()),
-            repeat: false,
-            command: Some(vec![
-                "select-pane".to_owned(),
-                "-t".to_owned(),
-                "=".to_owned(),
-                ";".to_owned(),
-                "set-buffer".to_owned(),
-                "-b".to_owned(),
-                "mouse-hit".to_owned(),
-                "clicked".to_owned(),
-            ]),
-        })))
+            ..Fixture::fixture((
+                "root",
+                "MouseDown1Pane",
+                [
+                    "select-pane",
+                    "-t",
+                    "=",
+                    ";",
+                    "set-buffer",
+                    "-b",
+                    "mouse-hit",
+                    "clicked",
+                ],
+            ))
+        })
         .await;
-    assert!(matches!(rebound, Response::BindKey(_)), "{rebound:?}");
 
     let (mouse_down, control_rx) =
         setup_two_pane_mouse_click(&handler, &alpha, requester_pid).await;
@@ -3284,29 +2647,29 @@ async fn live_attach_mouse_binding_executes_every_command_in_the_sequence() {
         .await
         .expect("live attach mouse down input");
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-    loop {
-        let (active_pane, buffer) = {
+    wait_until(
+        Duration::from_secs(3),
+        Duration::from_millis(10),
+        async || {
             let state = handler.state.lock().await;
             let session = state.sessions.session(&alpha).expect("session exists");
-            (
-                session.window().active_pane_index(),
-                state
-                    .buffers
-                    .show(Some("mouse-hit"))
-                    .ok()
-                    .map(|(_, contents)| contents.to_vec()),
-            )
-        };
-        if active_pane == 1 && buffer.as_deref() == Some(b"clicked".as_slice()) {
-            break;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "mouse binding sequence incomplete: active_pane={active_pane}, buffer={buffer:?}"
-        );
-        sleep(Duration::from_millis(10)).await;
-    }
+            let active_pane = session.window().active_pane_index();
+            let buffer = state
+                .buffers
+                .show(Some("mouse-hit"))
+                .ok()
+                .map(|(_, contents)| contents.to_vec());
+            if active_pane == 1 && buffer.as_deref() == Some(b"clicked".as_slice()) {
+                Ok(())
+            } else {
+                Err((active_pane, buffer))
+            }
+        },
+    )
+    .await
+    .unwrap_or_else(|(active_pane, buffer)| {
+        panic!("mouse binding sequence incomplete: active_pane={active_pane}, buffer={buffer:?}")
+    });
     drop(control_rx);
 }
 
@@ -3319,25 +2682,25 @@ async fn live_attach_mouse_binding_switch_client_rebases_its_command_queue() {
 
     create_send_keys_test_session(&handler, &alpha).await;
     create_send_keys_test_session(&handler, &beta).await;
-    let rebound = handler
-        .handle(Request::BindKey(Box::new(BindKeyRequest {
-            table_name: "root".to_owned(),
-            key: "MouseDown1Pane".to_owned(),
+    handler
+        .handle_ok(BindKeyRequest {
             note: Some("mouse-switch-client-queue".to_owned()),
-            repeat: false,
-            command: Some(vec![
-                "switch-client".to_owned(),
-                "-t".to_owned(),
-                beta.to_string(),
-                ";".to_owned(),
-                "set-buffer".to_owned(),
-                "-b".to_owned(),
-                "mouse-switch-tail".to_owned(),
-                "done".to_owned(),
-            ]),
-        })))
+            ..Fixture::fixture((
+                "root",
+                "MouseDown1Pane",
+                [
+                    "switch-client".to_owned(),
+                    "-t".to_owned(),
+                    beta.to_string(),
+                    ";".to_owned(),
+                    "set-buffer".to_owned(),
+                    "-b".to_owned(),
+                    "mouse-switch-tail".to_owned(),
+                    "done".to_owned(),
+                ],
+            ))
+        })
         .await;
-    assert!(matches!(rebound, Response::BindKey(_)), "{rebound:?}");
 
     let (mouse_down, control_rx) =
         setup_two_pane_mouse_click(&handler, &alpha, requester_pid).await;
@@ -3346,13 +2709,8 @@ async fn live_attach_mouse_binding_switch_client_rebases_its_command_queue() {
         .await
         .expect("live attach mouse switch binding");
 
-    wait_for_buffer(&handler, "mouse-switch-tail", "done").await;
-    let active_attach = handler.active_attach.lock().await;
-    let active = active_attach
-        .by_pid
-        .get(&requester_pid)
-        .expect("attached client remains registered");
-    assert_eq!(active.session_name, beta);
+    handler.wait_for_buffer("mouse-switch-tail", "done").await;
+    assert_eq!(active_session_name(&handler, requester_pid).await, beta);
     drop(control_rx);
 }
 
@@ -3378,24 +2736,24 @@ async fn live_attach_mouse_binding_run_shell_tail_writes_its_file() {
         crate::test_shell::sh_quote_path(&output_path)
     );
 
-    let rebound = handler
-        .handle(Request::BindKey(Box::new(BindKeyRequest {
-            table_name: "root".to_owned(),
-            key: "MouseDown1Pane".to_owned(),
+    handler
+        .handle_ok(BindKeyRequest {
             note: Some("issue-96-run-shell".to_owned()),
-            repeat: false,
-            command: Some(vec![
-                "select-pane".to_owned(),
-                "-t".to_owned(),
-                "=".to_owned(),
-                ";".to_owned(),
-                "run-shell".to_owned(),
-                "-b".to_owned(),
-                shell_command,
-            ]),
-        })))
+            ..Fixture::fixture((
+                "root",
+                "MouseDown1Pane",
+                [
+                    "select-pane".to_owned(),
+                    "-t".to_owned(),
+                    "=".to_owned(),
+                    ";".to_owned(),
+                    "run-shell".to_owned(),
+                    "-b".to_owned(),
+                    shell_command,
+                ],
+            ))
+        })
         .await;
-    assert!(matches!(rebound, Response::BindKey(_)), "{rebound:?}");
 
     let (mouse_down, control_rx) =
         setup_two_pane_mouse_click(&handler, &alpha, requester_pid).await;
@@ -3404,29 +2762,31 @@ async fn live_attach_mouse_binding_run_shell_tail_writes_its_file() {
         .await
         .expect("live attach mouse down input");
 
-    let deadline = tokio::time::Instant::now() + BACKGROUND_RUN_SHELL_TIMEOUT;
-    loop {
-        {
-            let state = handler.state.lock().await;
-            let session = state.sessions.session(&alpha).expect("session exists");
-            if session.window().active_pane_index() == 1 {
-                // select-pane ran; keep polling for the run-shell tail below.
+    wait_until(
+        BACKGROUND_RUN_SHELL_TIMEOUT,
+        Duration::from_millis(25),
+        async || {
+            {
+                let state = handler.state.lock().await;
+                let session = state.sessions.session(&alpha).expect("session exists");
+                if session.window().active_pane_index() == 1 {
+                    // select-pane ran; keep polling for the run-shell tail below.
+                }
             }
-        }
-        match std::fs::read_to_string(&output_path) {
-            Ok(contents) if contents == "hit" => break,
-            Ok(contents) => assert!(
-                tokio::time::Instant::now() < deadline,
-                "run-shell tail wrote unexpected contents {contents:?}"
-            ),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => assert!(
-                tokio::time::Instant::now() < deadline,
-                "run-shell tail never wrote {output_path:?}: the mouse binding skipped it"
-            ),
-            Err(error) => panic!("reading {output_path:?}: {error}"),
-        }
-        sleep(Duration::from_millis(25)).await;
-    }
+            match std::fs::read_to_string(&output_path) {
+                Ok(contents) if contents == "hit" => Ok(()),
+                Ok(contents) => Err(format!(
+                    "run-shell tail wrote unexpected contents {contents:?}"
+                )),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(format!(
+                    "run-shell tail never wrote {output_path:?}: the mouse binding skipped it"
+                )),
+                Err(error) => panic!("reading {output_path:?}: {error}"),
+            }
+        },
+    )
+    .await
+    .unwrap_or_else(|message| panic!("{message}"));
     let state = handler.state.lock().await;
     let session = state.sessions.session(&alpha).expect("session exists");
     assert_eq!(
@@ -3444,28 +2804,11 @@ async fn live_attach_mouse_pane_transition_retargets_same_chunk_focus_tail() {
     let requester_pid = std::process::id();
 
     create_send_keys_test_session(&handler, &alpha).await;
-    let split = handler
-        .handle(Request::SplitWindow(SplitWindowRequest {
-            target: SplitWindowTarget::Session(alpha.clone()),
-            direction: SplitDirection::Horizontal,
-            before: false,
-            environment: None,
-        }))
-        .await;
-    assert!(matches!(split, Response::SplitWindow(_)), "{split:?}");
+    split_window_horizontally(&handler, &alpha).await;
 
     let first = PaneTarget::with_window(alpha.clone(), 0, 0);
     let second = PaneTarget::with_window(alpha.clone(), 0, 1);
-    let selected = handler
-        .handle(Request::SelectPane(Box::new(SelectPaneRequest {
-            target: first.clone(),
-            title: None,
-            style: None,
-            input_disabled: None,
-            preserve_zoom: false,
-        })))
-        .await;
-    assert!(matches!(selected, Response::SelectPane(_)), "{selected:?}");
+    handler.handle_ok(SelectPaneRequest::fixture(&first)).await;
     enable_mouse(&handler).await;
 
     let (click_x, click_y) = {
@@ -3486,10 +2829,7 @@ async fn live_attach_mouse_pane_transition_retargets_same_chunk_focus_tail() {
             pane.geometry().y().saturating_add(1),
         )
     };
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
     let mut lifecycle = handler.subscribe_lifecycle_events();
 
     let mouse_down = format!("\x1b[<0;{};{}M", click_x + 1, click_y + 1);
@@ -3540,31 +2880,20 @@ async fn live_attach_mouse_border_drag_pipeline_preserves_mouse_event() {
     create_send_keys_test_session(&handler, &alpha).await;
     enable_mouse(&handler).await;
 
-    let split = handler
-        .handle(Request::SplitWindow(SplitWindowRequest {
-            target: SplitWindowTarget::Session(alpha.clone()),
-            direction: SplitDirection::Horizontal,
-            before: false,
-            environment: None,
-        }))
-        .await;
-    assert!(matches!(split, Response::SplitWindow(_)));
+    split_window_horizontally(&handler, &alpha).await;
 
-    let rebound = handler
-        .handle(Request::BindKey(Box::new(BindKeyRequest {
-            table_name: "root".to_owned(),
-            key: "MouseDrag1Border".to_owned(),
+    handler
+        .handle_ok(BindKeyRequest {
             note: Some("live-border-drag-pipeline".to_owned()),
-            repeat: false,
-            command: Some(vec!["display-message dragged ; resize-pane -M".to_owned()]),
-        })))
+            ..Fixture::fixture((
+                "root",
+                "MouseDrag1Border",
+                ["display-message dragged ; resize-pane -M"],
+            ))
+        })
         .await;
-    assert!(matches!(rebound, Response::BindKey(_)));
 
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
 
     let (border_x, y, before_width) = {
         let state = handler.state.lock().await;
@@ -3610,17 +2939,9 @@ async fn live_attach_sgr_wheel_forwards_when_pane_mouse_any_is_enabled() {
     create_send_keys_test_session(&handler, &alpha).await;
     enable_mouse(&handler).await;
 
-    {
-        let mut state = handler.state.lock().await;
-        state
-            .append_bytes_to_pane_transcript_for_test(&alpha, 0, 0, b"\x1b[?1003h\x1b[?1006h")
-            .expect("mouse any and sgr transcript update");
-    }
+    append_pane_output(&handler, &alpha, b"\x1b[?1003h\x1b[?1006h").await;
 
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
 
     let expected = encode_mouse_event(
         mode::MODE_MOUSE_ALL | mode::MODE_MOUSE_SGR,
@@ -3678,10 +2999,7 @@ async fn live_attach_default_wheel_binding_enters_copy_mode() {
     create_send_keys_test_session(&handler, &alpha).await;
     enable_mouse(&handler).await;
 
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
 
     handler
         .handle_attached_live_input_for_test(requester_pid, b"\x1b[<64;2;2M")
@@ -3700,22 +3018,7 @@ async fn live_attach_default_wheel_binding_enters_copy_mode() {
     );
 
     let target = PaneTarget::new(alpha.clone(), 0);
-    assert!(matches!(
-        handler
-            .handle(Request::CopyMode(CopyModeRequest {
-                target: Some(target),
-                page_down: false,
-                exit_on_scroll: false,
-                hide_position: false,
-                mouse_drag_start: false,
-                cancel_mode: false,
-                scrollbar_scroll: false,
-                source: None,
-                page_up: false,
-            }))
-            .await,
-        Response::CopyMode(_)
-    ));
+    handler.handle_ok(CopyModeRequest::fixture(target)).await;
     let summary = {
         let state = handler.state.lock().await;
         state
@@ -3736,10 +3039,7 @@ async fn live_attach_wheel_copy_mode_transition_reroutes_same_chunk_paste() {
 
     create_send_keys_test_session(&handler, &alpha).await;
     enable_mouse(&handler).await;
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
 
     let capture = RawPaneInputProbe::start(&handler, &alpha, "wheel-copy-tail", 0).await;
     let mut pending_input = Vec::new();
@@ -3771,60 +3071,28 @@ async fn live_attach_second_click_dispatches_double_click_after_timer() {
     create_send_keys_test_session(&handler, &alpha).await;
     enable_mouse(&handler).await;
 
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
 
-    let rebound = handler
-        .handle(Request::BindKey(Box::new(BindKeyRequest {
-            table_name: "root".to_owned(),
-            key: "DoubleClick1Pane".to_owned(),
-            note: Some("double-click-timer".to_owned()),
-            repeat: false,
-            command: Some(vec![
-                "set-buffer".to_owned(),
-                "-b".to_owned(),
-                "double-click-timer".to_owned(),
-                "ok".to_owned(),
-            ]),
-        })))
-        .await;
-    assert!(matches!(rebound, Response::BindKey(_)));
+    bind_double_click_timer_buffer(&handler, "double-click-timer").await;
 
-    handler
-        .handle_attached_live_input_for_test(requester_pid, b"\x1b[<0;2;2M")
-        .await
-        .expect("first click");
-    handler
-        .handle_attached_live_input_for_test(requester_pid, b"\x1b[<0;2;2M")
-        .await
-        .expect("second click");
+    arm_attached_double_click_timer(&handler, requester_pid).await;
     tokio::time::sleep(Duration::from_millis(350)).await;
 
-    let contents = {
-        let state = handler.state.lock().await;
-        state.buffers.get("double-click-timer").map(Vec::from)
-    };
+    let contents = buffer_contents(&handler, "double-click-timer").await;
     assert_eq!(contents.as_deref(), Some(b"ok".as_slice()));
 }
 
 async fn bind_double_click_timer_buffer(handler: &RequestHandler, buffer_name: &str) {
-    let rebound = handler
-        .handle(Request::BindKey(Box::new(BindKeyRequest {
-            table_name: "root".to_owned(),
-            key: "DoubleClick1Pane".to_owned(),
+    handler
+        .handle_ok(BindKeyRequest {
             note: Some(buffer_name.to_owned()),
-            repeat: false,
-            command: Some(vec![
-                "set-buffer".to_owned(),
-                "-b".to_owned(),
-                buffer_name.to_owned(),
-                "ok".to_owned(),
-            ]),
-        })))
+            ..Fixture::fixture((
+                "root",
+                "DoubleClick1Pane",
+                ["set-buffer", "-b", buffer_name, "ok"],
+            ))
+        })
         .await;
-    assert!(matches!(rebound, Response::BindKey(_)), "{rebound:?}");
 }
 
 async fn arm_attached_double_click_timer(handler: &RequestHandler, requester_pid: u32) {
@@ -3851,10 +3119,7 @@ async fn normal_shutdown_cancels_pending_attached_mouse_click_timer() {
 
     create_send_keys_test_session(&handler, &alpha).await;
     enable_mouse(&handler).await;
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    handler
-        .register_attach(requester_pid, alpha, control_tx)
-        .await;
+    let _control_rx = handler.attach_client(requester_pid, alpha).await;
     bind_double_click_timer_buffer(&handler, "mouse-timer-shutdown").await;
     arm_attached_double_click_timer(&handler, requester_pid).await;
 
@@ -3881,10 +3146,7 @@ async fn attached_mouse_click_timer_drains_only_its_local_mutation() {
 
     create_send_keys_test_session(&handler, &alpha).await;
     enable_mouse(&handler).await;
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    handler
-        .register_attach(requester_pid, alpha, control_tx)
-        .await;
+    let _control_rx = handler.attach_client(requester_pid, alpha).await;
     bind_double_click_timer_buffer(&handler, "mouse-timer-boundary").await;
     let pause = handler.install_attached_mouse_timer_pause();
     arm_attached_double_click_timer(&handler, requester_pid).await;
@@ -3934,10 +3196,7 @@ async fn stale_attached_mouse_click_timer_cannot_mutate_same_pid_replacement() {
     create_send_keys_test_session(&handler, &alpha).await;
     create_send_keys_test_session(&handler, &beta).await;
     enable_mouse(&handler).await;
-    let (alpha_tx, _alpha_rx) = mpsc::unbounded_channel();
-    handler
-        .register_attach(requester_pid, alpha.clone(), alpha_tx)
-        .await;
+    let _alpha_rx = handler.attach_client(requester_pid, &alpha).await;
     bind_double_click_timer_buffer(&handler, "mouse-timer-stale").await;
     let pause = handler.install_attached_mouse_timer_pause();
     arm_attached_double_click_timer(&handler, requester_pid).await;
@@ -3961,10 +3220,7 @@ async fn stale_attached_mouse_click_timer_cannot_mutate_same_pid_replacement() {
         .await
         .expect("stale click reaches dispatch after its local mutation");
 
-    let (beta_tx, _beta_rx) = mpsc::unbounded_channel();
-    handler
-        .register_attach(requester_pid, beta.clone(), beta_tx)
-        .await;
+    let _beta_rx = handler.attach_client(requester_pid, &beta).await;
     pause.dispatch_release.notify_one();
     tokio::time::timeout(Duration::from_secs(2), pause.task_completed.notified())
         .await
@@ -4005,10 +3261,7 @@ async fn attached_mouse_click_timer_follows_same_session_identity_rename() {
 
     create_send_keys_test_session(&handler, &alpha).await;
     enable_mouse(&handler).await;
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
     bind_double_click_timer_buffer(&handler, "mouse-timer-rename").await;
     let pause = handler.install_attached_mouse_timer_pause();
     arm_attached_double_click_timer(&handler, requester_pid).await;
@@ -4066,10 +3319,7 @@ async fn attached_session_switch_resets_click_state_without_clearing_a_new_timer
     create_send_keys_test_session(&handler, &alpha).await;
     create_send_keys_test_session(&handler, &beta).await;
     enable_mouse(&handler).await;
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    handler
-        .register_attach(requester_pid, alpha, control_tx)
-        .await;
+    let _control_rx = handler.attach_client(requester_pid, alpha).await;
     let identity = handler.active_attach_identity_for_test(requester_pid).await;
     arm_attached_double_click_timer(&handler, requester_pid).await;
     let old_token = {
@@ -4149,30 +3399,11 @@ fn mouse_word_pane_command() -> Vec<String> {
 }
 
 async fn create_mouse_word_session(handler: &RequestHandler, session: &rmux_proto::SessionName) {
-    let created = handler
-        .handle(Request::NewSessionExt(Box::new(NewSessionExtRequest {
-            session_name: Some(session.clone()),
-            working_directory: None,
-            detached: true,
-            size: Some(TerminalSize { cols: 80, rows: 24 }),
-            environment: None,
-            group_target: None,
-            attach_if_exists: false,
-            detach_other_clients: false,
-            kill_other_clients: false,
-            flags: None,
-            window_name: None,
-            print_session_info: false,
-            print_format: None,
-            command: Some(mouse_word_pane_command()),
-            process_command: None,
-            client_environment: None,
-            skip_environment_update: false,
-        })))
-        .await;
-    assert!(matches!(created, Response::NewSession(_)), "{created:?}");
     handler
-        .wait_for_pane_startup_to_finish_for_test(&PaneTarget::new(session.clone(), 0))
+        .create_started_session(NewSessionExtRequest {
+            command: Some(mouse_word_pane_command()),
+            ..Fixture::fixture(session)
+        })
         .await;
 }
 
@@ -4183,24 +3414,30 @@ async fn wait_for_pane_text(handler: &RequestHandler, target: &PaneTarget, marke
             .transcript_handle(target)
             .expect("pane transcript exists")
     };
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    let mut last = Vec::new();
-    while tokio::time::Instant::now() < deadline {
-        last = transcript
-            .lock()
-            .expect("pane transcript mutex is not poisoned")
-            .screen()
-            .render_visible_line_independent(0, rmux_core::GridRenderOptions::default())
-            .unwrap_or_default();
-        if String::from_utf8_lossy(&last).contains(marker) {
-            return;
-        }
-        sleep(Duration::from_millis(10)).await;
-    }
-    panic!(
-        "pane output never contained {marker:?}; last={:?}",
-        String::from_utf8_lossy(&last)
-    );
+    wait_until(
+        Duration::from_secs(10),
+        Duration::from_millis(10),
+        async || {
+            let last = transcript
+                .lock()
+                .expect("pane transcript mutex is not poisoned")
+                .screen()
+                .render_visible_line_independent(0, rmux_core::GridRenderOptions::default())
+                .unwrap_or_default();
+            if String::from_utf8_lossy(&last).contains(marker) {
+                Ok(())
+            } else {
+                Err(last)
+            }
+        },
+    )
+    .await
+    .unwrap_or_else(|last| {
+        panic!(
+            "pane output never contained {marker:?}; last={:?}",
+            String::from_utf8_lossy(&last)
+        )
+    });
 }
 
 #[tokio::test]
@@ -4217,10 +3454,7 @@ async fn live_attach_default_double_click_copies_word_from_mouse_pane() {
     wait_for_pane_text(&handler, &target, "alpha beta gamma").await;
     enable_mouse(&handler).await;
 
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
 
     handler
         .handle_attached_live_input_for_test(requester_pid, b"\x1b[<0;2;1M")
@@ -4234,23 +3468,25 @@ async fn live_attach_default_double_click_copies_word_from_mouse_pane() {
     // The second click arms the double-click timer; the yank lands once it
     // fires. Content is now deterministic (inert pane), so poll for the copy
     // instead of sleeping a fixed interval that jitter can outrun.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-    let copied = loop {
-        let current = {
+    let copied = wait_until(
+        Duration::from_secs(3),
+        Duration::from_millis(10),
+        async || {
             let state = handler.state.lock().await;
-            state
+            let current = state
                 .buffers
                 .top_unnamed()
                 .and_then(|name| state.buffers.get(name))
-                .map(Vec::from)
-        };
-        if current.as_deref() == Some(b"alpha".as_slice())
-            || tokio::time::Instant::now() >= deadline
-        {
-            break current;
-        }
-        sleep(Duration::from_millis(10)).await;
-    };
+                .map(Vec::from);
+            if current.as_deref() == Some(b"alpha".as_slice()) {
+                Ok(current)
+            } else {
+                Err(current)
+            }
+        },
+    )
+    .await
+    .unwrap_or_else(|last| last);
     assert_eq!(copied.as_deref(), Some(b"alpha".as_slice()));
 }
 
@@ -4263,17 +3499,9 @@ async fn live_attach_sgr_motion_forwards_without_explicit_binding_when_mouse_all
     create_send_keys_test_session(&handler, &alpha).await;
     enable_mouse(&handler).await;
 
-    {
-        let mut state = handler.state.lock().await;
-        state
-            .append_bytes_to_pane_transcript_for_test(&alpha, 0, 0, b"\x1b[?1003h\x1b[?1006h")
-            .expect("mouse all and sgr transcript update");
-    }
+    append_pane_output(&handler, &alpha, b"\x1b[?1003h\x1b[?1006h").await;
 
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
 
     let expected = b"\x1b[<35;2;2M";
     let capture =
@@ -4297,17 +3525,9 @@ async fn read_only_live_attach_drops_mouse_forwarding() {
     create_send_keys_test_session(&handler, &alpha).await;
     enable_mouse(&handler).await;
 
-    {
-        let mut state = handler.state.lock().await;
-        state
-            .append_bytes_to_pane_transcript_for_test(&alpha, 0, 0, b"\x1b[?1003h\x1b[?1006h")
-            .expect("mouse all and sgr transcript update");
-    }
+    append_pane_output(&handler, &alpha, b"\x1b[?1003h\x1b[?1006h").await;
 
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
     {
         let mut active_attach = handler.active_attach.lock().await;
         let active = active_attach
@@ -4339,17 +3559,9 @@ async fn live_attach_sgr_release_forwards_without_explicit_binding_when_mouse_al
     create_send_keys_test_session(&handler, &alpha).await;
     enable_mouse(&handler).await;
 
-    {
-        let mut state = handler.state.lock().await;
-        state
-            .append_bytes_to_pane_transcript_for_test(&alpha, 0, 0, b"\x1b[?1003h\x1b[?1006h")
-            .expect("mouse all and sgr transcript update");
-    }
+    append_pane_output(&handler, &alpha, b"\x1b[?1003h\x1b[?1006h").await;
 
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
 
     let expected = b"\x1b[<0;2;2m";
     let capture =
@@ -4370,20 +3582,9 @@ async fn live_attach_manual_prompt_drag_sequence_does_not_error() {
     let alpha = session_name("alpha");
     let requester_pid = std::process::id();
 
-    let created = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name: alpha.clone(),
-            detached: true,
-            size: Some(TerminalSize { cols: 80, rows: 24 }),
-            environment: None,
-        }))
-        .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    handler.create_session(&alpha).await;
 
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha, control_tx)
-        .await;
+    let _control_rx = handler.attach_client(requester_pid, alpha).await;
 
     let result = handler
         .handle_attached_live_input_for_test(

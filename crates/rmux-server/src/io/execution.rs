@@ -656,7 +656,6 @@ impl ShellIo {
                     &shell,
                     &line,
                     CommandOptions {
-                        on_finish: None,
                         // A pipe shell is one-shot by construction; the core closes it after this
                         // command whatever this says, and saying so here keeps the two agreeing.
                         close_on_finish: true,

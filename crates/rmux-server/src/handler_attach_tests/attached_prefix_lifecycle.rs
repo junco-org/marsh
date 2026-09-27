@@ -1,19 +1,18 @@
 use super::*;
+use crate::test_fixtures::{wait_for_file_contents, wait_until};
+use crate::test_shell::command_quote;
+use rmux_proto::BindKeyRequest;
 
 const PROMPT_NEW_WINDOW_INPUT: &[u8] =
     b"\x02:new-window -- 'printf ISSUE8_WINDOW_READY; sleep 30'\r";
 
 async fn bind_attached_prompt_test_key(handler: &RequestHandler, key: &str, command: Vec<String>) {
-    let response = handler
-        .handle(Request::BindKey(Box::new(rmux_proto::BindKeyRequest {
-            table_name: "prefix".to_owned(),
-            key: key.to_owned(),
+    handler
+        .handle_ok(BindKeyRequest {
             note: Some("attached prompt target-client regression".to_owned()),
-            repeat: false,
-            command: Some(command),
-        })))
+            ..Fixture::fixture(("prefix", key, command))
+        })
         .await;
-    assert!(matches!(response, Response::BindKey(_)), "{response:?}");
 }
 
 #[tokio::test]
@@ -114,21 +113,21 @@ async fn attached_command_prompt_can_chain_choose_tree_overlay() {
     let prompted = session_name("prompted");
     let mut control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
 
-    let response = handler
-        .handle(Request::BindKey(Box::new(rmux_proto::BindKeyRequest {
-            table_name: "prefix".to_owned(),
-            key: "X".to_owned(),
+    handler
+        .handle_ok(BindKeyRequest {
             note: Some("prompt-then-choose-tree".to_owned()),
-            repeat: false,
-            command: Some(vec![
-                "command-prompt".to_owned(),
-                "-p".to_owned(),
-                "name:".to_owned(),
-                "new-session -d -s '%%' ; choose-tree -Zs".to_owned(),
-            ]),
-        })))
+            ..Fixture::fixture((
+                "prefix",
+                "X",
+                [
+                    "command-prompt",
+                    "-p",
+                    "name:",
+                    "new-session -d -s '%%' ; choose-tree -Zs",
+                ],
+            ))
+        })
         .await;
-    assert!(matches!(response, Response::BindKey(_)));
 
     handler
         .handle_attached_live_input_for_test(requester_pid, b"\x02X")
@@ -158,24 +157,24 @@ async fn attached_command_prompt_can_chain_choose_tree_overlay() {
         .handle_attached_live_input_for_test(requester_pid, b"q")
         .await
         .expect("q exits chained choose-tree");
-    let deadline = tokio::time::Instant::now() + ATTACH_LIFECYCLE_TIMEOUT;
-    loop {
-        {
+    wait_until(
+        ATTACH_LIFECYCLE_TIMEOUT,
+        Duration::from_millis(25),
+        async || {
             let active_attach = handler.active_attach.lock().await;
             let mode_active = active_attach
                 .by_pid
                 .get(&requester_pid)
                 .is_some_and(|active| active.mode_tree.is_some());
-            if !mode_active {
-                break;
+            if mode_active {
+                Err(())
+            } else {
+                Ok(())
             }
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "chained choose-tree did not exit after q"
-        );
-        sleep(Duration::from_millis(25)).await;
-    }
+        },
+    )
+    .await
+    .unwrap_or_else(|()| panic!("chained choose-tree did not exit after q"));
 }
 
 #[tokio::test]
@@ -185,10 +184,7 @@ async fn attached_foreground_prompts_resolve_explicit_target_client() {
     let target_pid = u32::MAX - 502;
     let alpha = session_name("attached-prompt-explicit-target");
     let _owner_rx = create_attached_session(&handler, owner_pid, &alpha).await;
-    let (target_tx, _target_rx) = mpsc::unbounded_channel();
-    handler
-        .register_attach(target_pid, alpha.clone(), target_tx)
-        .await;
+    let _target_rx = handler.attach_client(target_pid, &alpha).await;
 
     bind_attached_prompt_test_key(
         &handler,
@@ -322,10 +318,7 @@ async fn attached_foreground_prompts_without_target_stay_on_binding_owner() {
     let other_pid = u32::MAX - 505;
     let alpha = session_name("attached-prompt-default-target");
     let _owner_rx = create_attached_session(&handler, owner_pid, &alpha).await;
-    let (other_tx, _other_rx) = mpsc::unbounded_channel();
-    handler
-        .register_attach(other_pid, alpha.clone(), other_tx)
-        .await;
+    let _other_rx = handler.attach_client(other_pid, &alpha).await;
 
     bind_attached_prompt_test_key(
         &handler,
@@ -383,10 +376,7 @@ async fn targeted_attached_prompt_completion_rejects_replaced_binding_owner() {
     let target_pid = u32::MAX - 507;
     let alpha = session_name("attached-prompt-replaced-owner");
     let mut original_owner_rx = create_attached_session(&handler, owner_pid, &alpha).await;
-    let (target_tx, _target_rx) = mpsc::unbounded_channel();
-    handler
-        .register_attach(target_pid, alpha.clone(), target_tx)
-        .await;
+    let _target_rx = handler.attach_client(target_pid, &alpha).await;
 
     bind_attached_prompt_test_key(
         &handler,
@@ -407,10 +397,7 @@ async fn targeted_attached_prompt_completion_rejects_replaced_binding_owner() {
         .expect("owner opens command-prompt on target client");
     assert!(handler.prompt_active(target_pid).await);
 
-    let (replacement_tx, _replacement_rx) = mpsc::unbounded_channel();
-    handler
-        .register_attach(owner_pid, alpha, replacement_tx)
-        .await;
+    let _replacement_rx = handler.attach_client(owner_pid, alpha).await;
     recv_matching_attach_control(
         &mut original_owner_rx,
         "original prompt owner replacement",
@@ -459,16 +446,12 @@ async fn attached_binding_run_shell_expands_client_name() {
     let output_path = root.join("client-name.txt");
     let shell_command = client_name_file_shell_command(&output_path);
 
-    let response = handler
-        .handle(Request::BindKey(Box::new(rmux_proto::BindKeyRequest {
-            table_name: "prefix".to_owned(),
-            key: "T".to_owned(),
+    handler
+        .handle_ok(BindKeyRequest {
             note: Some("attached-client-name".to_owned()),
-            repeat: false,
-            command: Some(vec!["run-shell".to_owned(), "-b".to_owned(), shell_command]),
-        })))
+            ..Fixture::fixture(("prefix", "T", ["run-shell", "-b", &shell_command]))
+        })
         .await;
-    assert!(matches!(response, Response::BindKey(_)));
 
     handler
         .handle_attached_live_input_for_test(requester_pid, b"\x02T")
@@ -498,16 +481,12 @@ async fn attached_binding_new_window_shell_command_expands_client_name() {
 
     let mut command = vec!["new-window".to_owned(), "-d".to_owned(), "--".to_owned()];
     command.extend(pane_command);
-    let response = handler
-        .handle(Request::BindKey(Box::new(rmux_proto::BindKeyRequest {
-            table_name: "prefix".to_owned(),
-            key: "V".to_owned(),
+    handler
+        .handle_ok(BindKeyRequest {
             note: Some("attached-client-name-new-window".to_owned()),
-            repeat: false,
-            command: Some(command),
-        })))
+            ..Fixture::fixture(("prefix", "V", command))
+        })
         .await;
-    assert!(matches!(response, Response::BindKey(_)));
 
     handler
         .handle_attached_live_input_for_test(requester_pid, b"\x02V")
@@ -534,16 +513,12 @@ async fn attached_binding_split_window_shell_command_expands_client_name() {
 
     let mut command = vec!["split-window".to_owned(), "-d".to_owned(), "--".to_owned()];
     command.extend(pane_command);
-    let response = handler
-        .handle(Request::BindKey(Box::new(rmux_proto::BindKeyRequest {
-            table_name: "prefix".to_owned(),
-            key: "W".to_owned(),
+    handler
+        .handle_ok(BindKeyRequest {
             note: Some("attached-client-name-split-window".to_owned()),
-            repeat: false,
-            command: Some(command),
-        })))
+            ..Fixture::fixture(("prefix", "W", command))
+        })
         .await;
-    assert!(matches!(response, Response::BindKey(_)));
 
     handler
         .handle_attached_live_input_for_test(requester_pid, b"\x02W")
@@ -561,22 +536,22 @@ async fn attached_binding_set_option_format_expands_client_name() {
     let alpha = session_name("alpha");
     let _control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
 
-    let response = handler
-        .handle(Request::BindKey(Box::new(rmux_proto::BindKeyRequest {
-            table_name: "prefix".to_owned(),
-            key: "Y".to_owned(),
+    handler
+        .handle_ok(BindKeyRequest {
             note: Some("attached-client-name-set-option".to_owned()),
-            repeat: false,
-            command: Some(vec![
-                "set-option".to_owned(),
-                "-g".to_owned(),
-                "-F".to_owned(),
-                "@attached-client-context".to_owned(),
-                "#{client_name}:#{session_name}:#{pane_index}".to_owned(),
-            ]),
-        })))
+            ..Fixture::fixture((
+                "prefix",
+                "Y",
+                [
+                    "set-option",
+                    "-g",
+                    "-F",
+                    "@attached-client-context",
+                    "#{client_name}:#{session_name}:#{pane_index}",
+                ],
+            ))
+        })
         .await;
-    assert!(matches!(response, Response::BindKey(_)));
 
     handler
         .handle_attached_live_input_for_test(requester_pid, b"\x02Y")
@@ -618,7 +593,7 @@ async fn attached_binding_source_file_preserves_client_context() {
         "#{client_name}",
         "set-buffer -b source-client-if-shell yes",
         "set-buffer -b source-client-if-shell no",
-        quote_command_argument(&client_name_file_shell_command(&run_shell_path)),
+        command_quote(&client_name_file_shell_command(&run_shell_path)),
     );
     let source = format!(
         "{source}new-window -d -- {}\n\
@@ -628,19 +603,16 @@ async fn attached_binding_source_file_preserves_client_context() {
     );
     std::fs::write(&source_path, source).expect("source-file client context config");
 
-    let response = handler
-        .handle(Request::BindKey(Box::new(rmux_proto::BindKeyRequest {
-            table_name: "prefix".to_owned(),
-            key: "Z".to_owned(),
+    handler
+        .handle_ok(BindKeyRequest {
             note: Some("attached-client-context-source-file".to_owned()),
-            repeat: false,
-            command: Some(vec![
-                "source-file".to_owned(),
-                source_path.to_string_lossy().into_owned(),
-            ]),
-        })))
+            ..Fixture::fixture((
+                "prefix",
+                "Z",
+                ["source-file", &source_path.to_string_lossy()],
+            ))
+        })
         .await;
-    assert!(matches!(response, Response::BindKey(_)));
 
     handler
         .handle_attached_live_input_for_test(requester_pid, b"\x02Z")
@@ -654,7 +626,9 @@ async fn attached_binding_source_file_preserves_client_context() {
         &format!("{expected_client}:alpha:0"),
     )
     .await;
-    wait_for_buffer_contents(&handler, "source-client-if-shell", b"yes").await;
+    handler
+        .wait_for_buffer("source-client-if-shell", "yes")
+        .await;
     wait_for_file_contents(&run_shell_path, &expected_client).await;
     wait_for_file_contents(&new_window_path, &expected_client).await;
     wait_for_file_contents(&split_window_path, &expected_client).await;
@@ -667,10 +641,7 @@ async fn attached_binding_two_clients_get_distinct_client_names() {
     let second_pid = u32::MAX - 78;
     let alpha = session_name("alpha");
     let _first_rx = create_attached_session(&handler, first_pid, &alpha).await;
-    let (second_tx, _second_rx) = mpsc::unbounded_channel();
-    handler
-        .register_attach(second_pid, alpha.clone(), second_tx)
-        .await;
+    let _second_rx = handler.attach_client(second_pid, &alpha).await;
 
     let root = std::env::temp_dir().join(format!(
         "rmux-attached-two-client-names-{}",
@@ -679,16 +650,12 @@ async fn attached_binding_two_clients_get_distinct_client_names() {
     std::fs::create_dir_all(&root).expect("two-client name temp root");
     let shell_command = client_name_file_shell_command(&root.join("#{client_name}.txt"));
 
-    let response = handler
-        .handle(Request::BindKey(Box::new(rmux_proto::BindKeyRequest {
-            table_name: "prefix".to_owned(),
-            key: "X".to_owned(),
+    handler
+        .handle_ok(BindKeyRequest {
             note: Some("attached-two-client-names".to_owned()),
-            repeat: false,
-            command: Some(vec!["run-shell".to_owned(), "-b".to_owned(), shell_command]),
-        })))
+            ..Fixture::fixture(("prefix", "X", ["run-shell", "-b", &shell_command]))
+        })
         .await;
-    assert!(matches!(response, Response::BindKey(_)));
 
     handler
         .handle_attached_live_input_for_test(first_pid, b"\x02X")
@@ -714,29 +681,29 @@ async fn attached_binding_if_shell_condition_expands_client_name() {
     let _control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
     let buffer_name = "attached-client-name-if-shell";
 
-    let response = handler
-        .handle(Request::BindKey(Box::new(rmux_proto::BindKeyRequest {
-            table_name: "prefix".to_owned(),
-            key: "U".to_owned(),
+    handler
+        .handle_ok(BindKeyRequest {
             note: Some("attached-client-name-if-shell".to_owned()),
-            repeat: false,
-            command: Some(vec![
-                "if-shell".to_owned(),
-                "-F".to_owned(),
-                "#{client_name}".to_owned(),
-                format!("set-buffer -b {buffer_name} yes"),
-                format!("set-buffer -b {buffer_name} no"),
-            ]),
-        })))
+            ..Fixture::fixture((
+                "prefix",
+                "U",
+                [
+                    "if-shell",
+                    "-F",
+                    "#{client_name}",
+                    &format!("set-buffer -b {buffer_name} yes"),
+                    &format!("set-buffer -b {buffer_name} no"),
+                ],
+            ))
+        })
         .await;
-    assert!(matches!(response, Response::BindKey(_)));
 
     handler
         .handle_attached_live_input_for_test(requester_pid, b"\x02U")
         .await
         .expect("prefix U dispatches if-shell binding");
 
-    wait_for_buffer_contents(&handler, buffer_name, b"yes").await;
+    handler.wait_for_buffer(buffer_name, "yes").await;
 }
 
 #[tokio::test]
@@ -746,21 +713,21 @@ async fn attached_binding_if_shell_branch_expands_client_name() {
     let alpha = session_name("alpha");
     let _control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
 
-    let response = handler
-        .handle(Request::BindKey(Box::new(rmux_proto::BindKeyRequest {
-            table_name: "prefix".to_owned(),
-            key: "V".to_owned(),
+    handler
+        .handle_ok(BindKeyRequest {
             note: Some("attached-client-name-if-shell-branch".to_owned()),
-            repeat: false,
-            command: Some(vec![
-                "if-shell".to_owned(),
-                "-F".to_owned(),
-                "1".to_owned(),
-                "set-option -g -F @if-shell-branch-client '#{client_name}'".to_owned(),
-            ]),
-        })))
+            ..Fixture::fixture((
+                "prefix",
+                "V",
+                [
+                    "if-shell",
+                    "-F",
+                    "1",
+                    "set-option -g -F @if-shell-branch-client '#{client_name}'",
+                ],
+            ))
+        })
         .await;
-    assert!(matches!(response, Response::BindKey(_)));
 
     handler
         .handle_attached_live_input_for_test(requester_pid, b"\x02V")
@@ -782,17 +749,7 @@ async fn attached_single_switch_queue_completes_after_session_transition() {
     let alpha = session_name("single-switch-alpha");
     let beta = session_name("single-switch-beta");
     let _control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: beta.clone(),
-                detached: true,
-                size: Some(TerminalSize { cols: 80, rows: 24 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
+    handler.create_session(&beta).await;
     let identity = handler.active_attach_identity_for_test(requester_pid).await;
     let commands = handler
         .parse_control_commands(&format!("switch-client -t {beta}"))
@@ -899,47 +856,37 @@ async fn attached_binding_switch_client_rebases_its_command_queue() {
     let alpha = session_name("binding-switch-alpha");
     let beta = session_name("binding-switch-beta");
     let _control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: beta.clone(),
-                detached: true,
-                size: Some(TerminalSize { cols: 80, rows: 24 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
+    handler.create_session(&beta).await;
 
-    let response = handler
-        .handle(Request::BindKey(Box::new(rmux_proto::BindKeyRequest {
-            table_name: "prefix".to_owned(),
-            key: "W".to_owned(),
+    handler
+        .handle_ok(BindKeyRequest {
             note: Some("switch-client-queue".to_owned()),
-            repeat: false,
-            command: Some(vec![
-                "switch-client".to_owned(),
-                "-t".to_owned(),
-                beta.to_string(),
-                ";".to_owned(),
-                "new-window".to_owned(),
-                "-d".to_owned(),
-                ";".to_owned(),
-                "set-buffer".to_owned(),
-                "-b".to_owned(),
-                "switch-tail".to_owned(),
-                "done".to_owned(),
-            ]),
-        })))
+            ..Fixture::fixture((
+                "prefix",
+                "W",
+                [
+                    "switch-client",
+                    "-t",
+                    beta.as_str(),
+                    ";",
+                    "new-window",
+                    "-d",
+                    ";",
+                    "set-buffer",
+                    "-b",
+                    "switch-tail",
+                    "done",
+                ],
+            ))
+        })
         .await;
-    assert!(matches!(response, Response::BindKey(_)));
 
     handler
         .handle_attached_live_input_for_test(requester_pid, b"\x02W")
         .await
         .expect("prefix W dispatches switch-client queue");
 
-    wait_for_buffer_contents(&handler, "switch-tail", b"done").await;
+    handler.wait_for_buffer("switch-tail", "done").await;
     let active_attach = handler.active_attach.lock().await;
     let active = active_attach
         .by_pid
@@ -989,17 +936,7 @@ async fn attached_switch_rebases_wrappers_but_preserves_suffix_targets() {
         let alpha = session_name(&format!("explicit-{entry_path}-alpha"));
         let beta = session_name(&format!("explicit-{entry_path}-beta"));
         let _control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
-        assert!(matches!(
-            handler
-                .handle(Request::NewSession(NewSessionRequest {
-                    session_name: beta.clone(),
-                    detached: true,
-                    size: Some(TerminalSize { cols: 80, rows: 24 }),
-                    environment: None,
-                }))
-                .await,
-            Response::NewSession(_)
-        ));
+        handler.create_session(&beta).await;
 
         let suffix_has_explicit_target = entry_path == "run-shell-suffix-target";
         let nested = if suffix_has_explicit_target {
@@ -1016,14 +953,13 @@ async fn attached_switch_rebases_wrappers_but_preserves_suffix_targets() {
                 std::fs::write(&source_path, &nested).expect("explicit source-file fixture");
                 format!(
                     "source-file -t {alpha}:0.0 {}",
-                    quote_command_argument(&source_path.to_string_lossy())
+                    command_quote(&source_path.to_string_lossy())
                 )
             }
             "if-shell" => format!("if-shell -F -t {alpha}:0.0 1 {{ {nested} }}"),
-            "run-shell" | "run-shell-suffix-target" => format!(
-                "run-shell -C -t {alpha}:0.0 {}",
-                quote_command_argument(&nested)
-            ),
+            "run-shell" | "run-shell-suffix-target" => {
+                format!("run-shell -C -t {alpha}:0.0 {}", command_quote(&nested))
+            }
             _ => unreachable!("enumerated entry path"),
         };
         let identity = handler.active_attach_identity_for_test(requester_pid).await;
@@ -1085,32 +1021,22 @@ async fn attached_run_shell_inherited_target_rebases_after_switch() {
     let alpha = session_name("inherited-run-shell-alpha");
     let beta = session_name("inherited-run-shell-beta");
     let _control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: beta.clone(),
-                detached: true,
-                size: Some(TerminalSize { cols: 80, rows: 24 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
+    handler.create_session(&beta).await;
 
-    let response = handler
-        .handle(Request::BindKey(Box::new(rmux_proto::BindKeyRequest {
-            table_name: "prefix".to_owned(),
-            key: "W".to_owned(),
+    handler
+        .handle_ok(BindKeyRequest {
             note: Some("inherited run-shell target rebase".to_owned()),
-            repeat: false,
-            command: Some(vec![
-                "run-shell".to_owned(),
-                "-C".to_owned(),
-                format!("switch-client -t {beta} ; new-window -d"),
-            ]),
-        })))
+            ..Fixture::fixture((
+                "prefix",
+                "W",
+                [
+                    "run-shell",
+                    "-C",
+                    &format!("switch-client -t {beta} ; new-window -d"),
+                ],
+            ))
+        })
         .await;
-    assert!(matches!(response, Response::BindKey(_)), "{response:?}");
 
     handler
         .handle_attached_live_input_for_test(requester_pid, b"\x02W")
@@ -1164,17 +1090,7 @@ async fn attached_attach_session_rebases_every_queue_entry_path() {
         let beta = session_name(&format!("attach-{entry_path}-beta"));
         let buffer_name = format!("attach-{entry_path}-tail");
         let _control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
-        assert!(matches!(
-            handler
-                .handle(Request::NewSession(NewSessionRequest {
-                    session_name: beta.clone(),
-                    detached: true,
-                    size: Some(TerminalSize { cols: 80, rows: 24 }),
-                    environment: None,
-                }))
-                .await,
-            Response::NewSession(_)
-        ));
+        handler.create_session(&beta).await;
 
         let nested = format!("attach-session -t {beta} ; set-buffer -b {buffer_name} done");
         let command = match entry_path {
@@ -1187,7 +1103,7 @@ async fn attached_attach_session_rebases_every_queue_entry_path() {
                 std::fs::write(&source_path, &nested).expect("attach-session source fixture");
                 format!(
                     "source-file {}",
-                    quote_command_argument(&source_path.to_string_lossy())
+                    command_quote(&source_path.to_string_lossy())
                 )
             }
             "if-shell" => format!("if-shell -F 1 {{ {nested} }}"),
@@ -1208,7 +1124,7 @@ async fn attached_attach_session_rebases_every_queue_entry_path() {
         .await
         .expect("attach-session queue must continue after its session transition");
 
-        wait_for_buffer_contents(&handler, &buffer_name, b"done").await;
+        handler.wait_for_buffer(&buffer_name, "done").await;
         let active_attach = handler.active_attach.lock().await;
         assert_eq!(
             active_attach
@@ -1236,17 +1152,7 @@ async fn attached_switch_response_race_fails_closed_before_queue_continuation() 
     // the very attach the race is about is pruned before the assertions run.
     let _control_drain = tokio::spawn(async move { while control_rx.recv().await.is_some() {} });
     for session in [&beta, &gamma] {
-        assert!(matches!(
-            handler
-                .handle(Request::NewSession(NewSessionRequest {
-                    session_name: session.clone(),
-                    detached: true,
-                    size: Some(TerminalSize { cols: 80, rows: 24 }),
-                    environment: None,
-                }))
-                .await,
-            Response::NewSession(_)
-        ));
+        handler.create_session(session).await;
     }
 
     let identity = handler.active_attach_identity_for_test(requester_pid).await;
@@ -1272,12 +1178,11 @@ async fn attached_switch_response_race_fails_closed_before_queue_continuation() 
     tokio::time::timeout(ATTACH_LIFECYCLE_TIMEOUT, pause.reached.notified())
         .await
         .expect("first switch reaches response correlation pause");
-    let raced = handler
-        .handle(Request::SwitchClient(SwitchClientRequest {
+    handler
+        .handle_ok(SwitchClientRequest {
             target: gamma.clone(),
-        }))
+        })
         .await;
-    assert!(matches!(raced, Response::SwitchClient(_)), "{raced:?}");
     pause.release.notify_one();
 
     let error = queue
@@ -1338,15 +1243,12 @@ async fn attached_same_session_switch_race_uses_the_committed_pane_target() {
             );
         }
     });
-    let split = handler
-        .handle(Request::SplitWindow(SplitWindowRequest {
-            target: SplitWindowTarget::Session(alpha.clone()),
+    handler
+        .handle_ok(SplitWindowRequest {
             direction: rmux_proto::SplitDirection::Horizontal,
-            before: false,
-            environment: None,
-        }))
+            ..Fixture::fixture(&alpha)
+        })
         .await;
-    assert!(matches!(split, Response::SplitWindow(_)), "{split:?}");
     let (pane_zero_id, pane_one_id) = {
         let state = handler.state.lock().await;
         let window = state
@@ -1494,17 +1396,7 @@ async fn attached_switch_for_other_client_preserves_requester_queue_cursor() {
     let delta = session_name("other-switch-delta");
     let _requester_rx = create_attached_session(&handler, requester_pid, &alpha).await;
     for session in [&beta, &gamma, &delta] {
-        assert!(matches!(
-            handler
-                .handle(Request::NewSession(NewSessionRequest {
-                    session_name: session.clone(),
-                    detached: true,
-                    size: Some(TerminalSize { cols: 80, rows: 24 }),
-                    environment: None,
-                }))
-                .await,
-            Response::NewSession(_)
-        ));
+        handler.create_session(session).await;
     }
     let (other_tx, _other_rx) = mpsc::unbounded_channel();
     let other_attach_id = handler
@@ -1630,44 +1522,34 @@ async fn attached_binding_allows_an_explicit_cross_session_target() {
     let alpha = session_name("binding-cross-alpha");
     let beta = session_name("binding-cross-beta");
     let _control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: beta.clone(),
-                detached: true,
-                size: Some(TerminalSize { cols: 80, rows: 24 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
+    handler.create_session(&beta).await;
 
-    let response = handler
-        .handle(Request::BindKey(Box::new(rmux_proto::BindKeyRequest {
-            table_name: "prefix".to_owned(),
-            key: "Y".to_owned(),
+    handler
+        .handle_ok(BindKeyRequest {
             note: Some("explicit-cross-session-target".to_owned()),
-            repeat: false,
-            command: Some(vec![
-                "kill-session".to_owned(),
-                "-t".to_owned(),
-                beta.to_string(),
-                ";".to_owned(),
-                "set-buffer".to_owned(),
-                "-b".to_owned(),
-                "cross-tail".to_owned(),
-                "done".to_owned(),
-            ]),
-        })))
+            ..Fixture::fixture((
+                "prefix",
+                "Y",
+                [
+                    "kill-session",
+                    "-t",
+                    beta.as_str(),
+                    ";",
+                    "set-buffer",
+                    "-b",
+                    "cross-tail",
+                    "done",
+                ],
+            ))
+        })
         .await;
-    assert!(matches!(response, Response::BindKey(_)));
 
     handler
         .handle_attached_live_input_for_test(requester_pid, b"\x02Y")
         .await
         .expect("prefix Y dispatches cross-session queue");
 
-    wait_for_buffer_contents(&handler, "cross-tail", b"done").await;
+    handler.wait_for_buffer("cross-tail", "done").await;
     let state = handler.state.lock().await;
     assert!(state.sessions.contains_session(&alpha));
     assert!(!state.sessions.contains_session(&beta));
@@ -1680,17 +1562,7 @@ async fn attached_command_prompt_switch_client_rebases_its_continuation() {
     let alpha = session_name("prompt-switch-alpha");
     let beta = session_name("prompt-switch-beta");
     let _control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: beta.clone(),
-                detached: true,
-                size: Some(TerminalSize { cols: 80, rows: 24 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
+    handler.create_session(&beta).await;
 
     let input = format!(
         "\x02:switch-client -t {} ; set-buffer -b prompt-switch-tail done\r",
@@ -1701,7 +1573,7 @@ async fn attached_command_prompt_switch_client_rebases_its_continuation() {
         .await
         .expect("attached command prompt accepts switch-client queue");
 
-    wait_for_buffer_contents(&handler, "prompt-switch-tail", b"done").await;
+    handler.wait_for_buffer("prompt-switch-tail", "done").await;
     let active_attach = handler.active_attach.lock().await;
     let active = active_attach
         .by_pid
@@ -1717,17 +1589,7 @@ async fn attached_command_prompt_attach_session_rebases_its_continuation() {
     let alpha = session_name("prompt-attach-alpha");
     let beta = session_name("prompt-attach-beta");
     let _control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: beta.clone(),
-                detached: true,
-                size: Some(TerminalSize { cols: 80, rows: 24 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
+    handler.create_session(&beta).await;
 
     let input = format!(
         "\x02:attach-session -t {} ; set-buffer -b prompt-attach-tail done\r",
@@ -1738,7 +1600,7 @@ async fn attached_command_prompt_attach_session_rebases_its_continuation() {
         .await
         .expect("attached command prompt accepts attach-session queue");
 
-    wait_for_buffer_contents(&handler, "prompt-attach-tail", b"done").await;
+    handler.wait_for_buffer("prompt-attach-tail", "done").await;
     let active_attach = handler.active_attach.lock().await;
     assert_eq!(
         active_attach
@@ -1763,20 +1625,21 @@ async fn attached_command_prompt_renames_current_session() {
         .await
         .expect("prefix command prompt input");
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        let state = handler.state.lock().await;
-        if state.sessions.contains_session(&beta) {
-            assert!(!state.sessions.contains_session(&alpha));
-            break;
-        }
-        drop(state);
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "timed out waiting for command prompt rename-session"
-        );
-        sleep(Duration::from_millis(25)).await;
-    }
+    wait_until(
+        Duration::from_secs(5),
+        Duration::from_millis(25),
+        async || {
+            let state = handler.state.lock().await;
+            if state.sessions.contains_session(&beta) {
+                assert!(!state.sessions.contains_session(&alpha));
+                Ok(())
+            } else {
+                Err(())
+            }
+        },
+    )
+    .await
+    .unwrap_or_else(|()| panic!("timed out waiting for command prompt rename-session"));
 
     let frame = wait_for_switch_frame_containing(&mut control_rx, "[beta]").await;
     assert!(
@@ -1797,18 +1660,22 @@ async fn attached_command_prompt_can_create_window_from_same_read() {
         .await
         .expect("prefix command prompt input");
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        let windows = active_windows(&handler, &alpha).await;
-        if windows == "0:0\n1:1\n" {
-            break;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "timed out waiting for prompt-created window, got {windows:?}"
-        );
-        sleep(Duration::from_millis(25)).await;
-    }
+    wait_until(
+        Duration::from_secs(5),
+        Duration::from_millis(25),
+        async || {
+            let windows = active_windows(&handler, &alpha).await;
+            if windows == "0:0\n1:1\n" {
+                Ok(())
+            } else {
+                Err(windows)
+            }
+        },
+    )
+    .await
+    .unwrap_or_else(|windows| {
+        panic!("timed out waiting for prompt-created window, got {windows:?}")
+    });
 
     let target = PaneTarget::with_window(alpha.clone(), 1, 0);
     wait_for_capture_containing(
@@ -1849,17 +1716,12 @@ async fn attached_exit_notifies_after_command_prompt_rename_session() {
         .await
         .expect("exit input after rename-session");
 
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            match control_rx.recv().await {
-                Some(AttachControl::Exited) => break,
-                Some(_) => {}
-                None => panic!("attach control channel closed before exit notification"),
-            }
-        }
-    })
-    .await
-    .expect("timed out waiting for attach exit notification after renamed exit");
+    recv_matching_attach_control(
+        &mut control_rx,
+        "attach exit notification after renamed exit",
+        |control| matches!(control, AttachControl::Exited),
+    )
+    .await;
     wait_for_session_removed(&handler, &beta).await;
 }
 
@@ -1871,13 +1733,12 @@ async fn attached_session_status_updates_after_external_rename() {
     let beta = session_name("beta");
     let mut control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
 
-    let renamed = handler
-        .handle(Request::RenameSession(rmux_proto::RenameSessionRequest {
-            target: alpha.clone(),
-            new_name: beta.clone(),
-        }))
+    handler
+        .handle_ok(RenameSessionRequest {
+            target: alpha,
+            new_name: beta,
+        })
         .await;
-    assert!(matches!(renamed, Response::RenameSession(_)));
 
     let frame = wait_for_switch_frame_containing(&mut control_rx, "[beta]").await;
     assert!(
@@ -1927,110 +1788,66 @@ async fn attached_kill_last_pane_exits_the_session() {
         })
     );
 
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            match control_rx.recv().await {
-                Some(AttachControl::Exited) => break,
-                Some(_) => {}
-                None => panic!("attach control channel closed before exit notification"),
-            }
-        }
+    recv_matching_attach_control(&mut control_rx, "attach exit notification", |control| {
+        matches!(control, AttachControl::Exited)
     })
-    .await
-    .expect("timed out waiting for attach exit notification");
+    .await;
     wait_for_session_removed(&handler, &alpha).await;
 }
 
-async fn wait_for_buffer_contents(handler: &RequestHandler, name: &str, expected: &[u8]) {
-    let deadline = tokio::time::Instant::now() + ATTACH_LIFECYCLE_TIMEOUT;
-    loop {
-        let response = handler
-            .handle(Request::ShowBuffer(rmux_proto::ShowBufferRequest {
-                name: Some(name.to_owned()),
-            }))
-            .await;
-        if let Some(output) = response.command_output() {
-            if output.stdout() == expected {
-                return;
-            }
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "timed out waiting for buffer {name:?} to contain {expected:?}; last response: {response:?}"
-        );
-        sleep(Duration::from_millis(25)).await;
-    }
-}
-
 async fn wait_for_global_option_value(handler: &RequestHandler, name: &str, expected: &str) {
-    let deadline = tokio::time::Instant::now() + ATTACH_LIFECYCLE_TIMEOUT;
     let expected_stdout = format!("{expected}\n").into_bytes();
-    loop {
-        let response = handler
-            .handle(Request::ShowOptions(rmux_proto::ShowOptionsRequest {
-                scope: rmux_proto::OptionScopeSelector::SessionGlobal,
-                name: Some(name.to_owned()),
-                value_only: true,
-                include_inherited: false,
-                quiet: false,
-                include_hooks: false,
-            }))
-            .await;
-        if let Some(output) = response.command_output() {
-            if output.stdout() == expected_stdout {
-                return;
+    wait_until(
+        ATTACH_LIFECYCLE_TIMEOUT,
+        Duration::from_millis(25),
+        async || {
+            let response = handler
+                .handle(Request::ShowOptions(rmux_proto::ShowOptionsRequest {
+                    scope: rmux_proto::OptionScopeSelector::SessionGlobal,
+                    name: Some(name.to_owned()),
+                    value_only: true,
+                    include_inherited: false,
+                    quiet: false,
+                    include_hooks: false,
+                }))
+                .await;
+            match response.command_output() {
+                Some(output) if output.stdout() == expected_stdout => Ok(()),
+                _ => Err(response),
             }
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
+        },
+    )
+    .await
+    .unwrap_or_else(|response| {
+        panic!(
             "timed out waiting for option {name:?} to be {expected:?}; last response: {response:?}"
-        );
-        sleep(Duration::from_millis(25)).await;
-    }
+        )
+    });
 }
 
 async fn wait_for_active_panes(handler: &RequestHandler, session: &SessionName, expected: &str) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        let panes = active_panes(handler, session).await;
-        if panes == expected {
-            return;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "timed out waiting for active panes {expected:?}, got {panes:?}"
-        );
-        sleep(Duration::from_millis(25)).await;
-    }
-}
-
-async fn wait_for_file_contents(path: &Path, expected: &str) {
-    let deadline = tokio::time::Instant::now() + ATTACH_LIFECYCLE_TIMEOUT;
-    loop {
-        match std::fs::read_to_string(path) {
-            Ok(contents) if contents == expected => return,
-            Ok(contents) => assert!(
-                tokio::time::Instant::now() < deadline,
-                "timed out waiting for {path:?} to contain {expected:?}; got {contents:?}"
-            ),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => assert!(
-                tokio::time::Instant::now() < deadline,
-                "timed out waiting for {path:?} to be written"
-            ),
-            Err(error) => panic!("failed reading {path:?}: {error}"),
-        }
-        sleep(Duration::from_millis(25)).await;
-    }
-}
-
-fn quote_command_argument(value: &str) -> String {
-    crate::test_shell::command_quote(value)
+    wait_until(
+        Duration::from_secs(5),
+        Duration::from_millis(25),
+        async || {
+            let panes = active_panes(handler, session).await;
+            if panes == expected {
+                Ok(())
+            } else {
+                Err(panes)
+            }
+        },
+    )
+    .await
+    .unwrap_or_else(|panes| {
+        panic!("timed out waiting for active panes {expected:?}, got {panes:?}")
+    });
 }
 
 fn quote_command_arguments(values: &[String]) -> String {
     values
         .iter()
-        .map(|value| quote_command_argument(value))
+        .map(|value| command_quote(value))
         .collect::<Vec<_>>()
         .join(" ")
 }
@@ -2142,13 +1959,7 @@ async fn attached_resize_resizes_session_and_refreshes_status_frame() {
     let mut control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
 
     handler
-        .handle_attached_resize(
-            requester_pid,
-            TerminalSize {
-                cols: 132,
-                rows: 43,
-            },
-        )
+        .handle_attached_resize(requester_pid, TerminalSize::new(132, 43))
         .await
         .expect("attached resize succeeds");
 
@@ -2168,27 +1979,14 @@ async fn attached_resize_resizes_session_and_refreshes_status_frame() {
             .expect("session exists")
             .window()
             .size();
-        assert_eq!(
-            client_size,
-            TerminalSize {
-                cols: 132,
-                rows: 43
-            }
-        );
-        assert_eq!(
-            size,
-            TerminalSize {
-                cols: 132,
-                rows: 42
-            }
-        );
+        assert_eq!(client_size, TerminalSize::new(132, 43));
+        assert_eq!(size, TerminalSize::new(132, 42));
     }
     assert_eq!(
-        pane_terminal_size(&handler, &alpha, 0, 0).await,
-        TerminalSize {
-            cols: 132,
-            rows: 42
-        }
+        handler
+            .pane_terminal_size_for_test(&PaneTarget::with_window(alpha.clone(), 0, 0))
+            .await,
+        TerminalSize::new(132, 42)
     );
     let frame = recv_render_frame(&mut control_rx, "resize refresh").await;
     assert!(
@@ -2204,19 +2002,10 @@ async fn attached_refresh_renders_each_client_at_its_own_size() {
     let browser_pid = 202;
     let alpha = session_name("alpha");
     let mut local_rx = create_attached_session(&handler, local_pid, &alpha).await;
-    let (browser_tx, mut browser_rx) = mpsc::unbounded_channel();
-    handler
-        .register_attach(browser_pid, alpha.clone(), browser_tx)
-        .await;
+    let mut browser_rx = handler.attach_client(browser_pid, &alpha).await;
 
     handler
-        .handle_attached_resize(
-            browser_pid,
-            TerminalSize {
-                cols: 132,
-                rows: 43,
-            },
-        )
+        .handle_attached_resize(browser_pid, TerminalSize::new(132, 43))
         .await
         .expect("browser resize succeeds");
 

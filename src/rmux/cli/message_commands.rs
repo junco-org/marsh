@@ -1,6 +1,5 @@
 use std::path::Path;
 
-use rmux_client::connect;
 use rmux_proto::{ResolveTargetType, Response, Target};
 use serde_json::json;
 
@@ -8,8 +7,9 @@ use super::command_runner::{
     finish_command_success, inherited_pane_target, run_queued_server_command, write_command_output,
 };
 use super::json_output::{stdout_string, write_json_object};
-use super::{ExitFailure, expect_command_output, resolve_target_spec, unexpected_response};
-use crate::cli_args::{DisplayMessageArgs, parse_target_spec};
+use super::target_resolution::{connect_cli, parse_spec, response_failure};
+use super::{ExitFailure, expect_command_output, resolve_target_spec};
+use crate::cli_args::DisplayMessageArgs;
 
 /// Runs `display-message`, choosing the JSON, queued, or direct request path from `args`.
 pub(super) fn run_display_message(
@@ -23,43 +23,21 @@ pub(super) fn run_display_message(
         return run_queued_server_command(socket_path, "display-message", args.queue_command);
     }
 
-    run_display_message_direct(args, socket_path)
+    let print = args.print;
+    let response = send_display_message(args, socket_path, print)?;
+    if print {
+        write_command_output(expect_command_output(&response, "display-message")?)?;
+        return Ok(0);
+    }
+    finish_command_success(response, "display-message")
 }
 
 /// Runs `display-message` with `--json`, always printing the rendered message as JSON.
-pub(super) fn run_display_message_json(
+fn run_display_message_json(
     args: DisplayMessageArgs,
     socket_path: &Path,
 ) -> Result<i32, ExitFailure> {
-    run_display_message_json_inner(args, socket_path)
-}
-
-/// Sends the `display-message` request and writes its rendered text as a JSON `message` field.
-fn run_display_message_json_inner(
-    args: DisplayMessageArgs,
-    socket_path: &Path,
-) -> Result<i32, ExitFailure> {
-    let mut connection = connect(socket_path)
-        .map_err(|error| ExitFailure::from_client_connect(socket_path, error))?;
-    let target =
-        resolve_display_message_target(&mut connection, socket_path, args.target.as_deref())?;
-    let message = display_message_template(&args)?;
-    let duration_ms = display_message_duration(&args)?;
-    let response = if args.target_client.is_some() || duration_ms.is_some() || args.ignore_input {
-        connection.display_message_with_options(
-            target,
-            true,
-            message,
-            args.target_client,
-            duration_ms,
-            args.ignore_input,
-        )
-    } else {
-        connection.display_message(target, true, message)
-    }
-    .map_err(ExitFailure::from)?;
-
-    match response {
+    match send_display_message(args, socket_path, true)? {
         Response::DisplayMessage(response) => {
             let message = response
                 .command_output()
@@ -71,43 +49,35 @@ fn run_display_message_json_inner(
                 "display-message",
             )
         }
-        Response::Error(error) => Err(ExitFailure::new(1, error.error.to_string())),
-        other => Err(unexpected_response("display-message", &other)),
+        other => Err(response_failure("display-message", &other)),
     }
 }
 
-/// Sends the `display-message` request directly and prints or discards its output per `--print`.
-fn run_display_message_direct(
+/// Sends the `display-message` request, asking the server to return the rendered text when
+/// `print` is set.
+fn send_display_message(
     args: DisplayMessageArgs,
     socket_path: &Path,
-) -> Result<i32, ExitFailure> {
-    let mut connection = connect(socket_path)
-        .map_err(|error| ExitFailure::from_client_connect(socket_path, error))?;
+    print: bool,
+) -> Result<Response, ExitFailure> {
+    let mut connection = connect_cli(socket_path)?;
     let target =
         resolve_display_message_target(&mut connection, socket_path, args.target.as_deref())?;
     let message = display_message_template(&args)?;
     let duration_ms = display_message_duration(&args)?;
-    let response = if args.target_client.is_some() || duration_ms.is_some() || args.ignore_input {
+    if args.target_client.is_some() || duration_ms.is_some() || args.ignore_input {
         connection.display_message_with_options(
             target,
-            args.print,
+            print,
             message,
             args.target_client,
             duration_ms,
             args.ignore_input,
         )
     } else {
-        connection.display_message(target, args.print, message)
+        connection.display_message(target, print, message)
     }
-    .map_err(ExitFailure::from)?;
-
-    if args.print {
-        let output = expect_command_output(&response, "display-message")?;
-        write_command_output(output)?;
-        Ok(0)
-    } else {
-        finish_command_success(response, "display-message")
-    }
+    .map_err(ExitFailure::from)
 }
 
 /// Reports whether the flags are simple enough to skip the queued server-command path.
@@ -123,7 +93,7 @@ fn resolve_display_message_target(
 ) -> Result<Option<rmux_proto::Target>, ExitFailure> {
     match target {
         Some(target) => {
-            let target = parse_target_spec(target).map_err(|error| ExitFailure::new(1, error))?;
+            let target = parse_spec(target)?;
             resolve_target_spec(connection, &target, ResolveTargetType::Pane, false, false)
                 .map(Some)
         }

@@ -26,18 +26,13 @@ async fn linked_occurrence_fixture(
     attach_pid_offset: u32,
 ) -> LinkedOccurrenceFixture {
     let session_name = SessionName::new(label).expect("valid session");
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: session_name.clone(),
-                detached: true,
-                size: Some(TerminalSize { cols: 80, rows: 24 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
-    link_replacement_occurrence(handler, &session_name).await;
+    handler.create_session(&session_name).await;
+    handler
+        .handle_ok(LinkWindowRequest::fixture((
+            WindowTarget::with_window(session_name.clone(), 0),
+            WindowTarget::with_window(session_name.clone(), 2),
+        )))
+        .await;
 
     let (session_id, window_id, pane_id, pane_output_generation, old_occurrence_id) = {
         let state = handler.state.lock().await;
@@ -67,20 +62,7 @@ async fn linked_occurrence_fixture(
     let attach_id = handler
         .register_attach(attach_pid, session_name.clone(), control_tx)
         .await;
-    let parsed = CommandParser::new()
-        .parse_arguments(["choose-tree", "-w"])
-        .expect("choose-tree parses");
-    let command = RequestHandler::parse_mode_tree_queue_command(parsed.commands()[0].clone())
-        .expect("mode-tree command parses")
-        .expect("mode-tree command recognized");
-    handler
-        .execute_queued_mode_tree(
-            attach_pid,
-            command,
-            &QueueExecutionContext::without_caller_cwd(),
-        )
-        .await
-        .expect("mode-tree opens");
+    open_mode_tree(handler, attach_pid, &["choose-tree", "-w"]).await;
 
     LinkedOccurrenceFixture {
         session_name,
@@ -96,20 +78,6 @@ async fn linked_occurrence_fixture(
     }
 }
 
-async fn link_replacement_occurrence(handler: &RequestHandler, session_name: &SessionName) {
-    let response = handler
-        .handle(Request::LinkWindow(LinkWindowRequest {
-            source: WindowTarget::with_window(session_name.clone(), 0),
-            target: WindowTarget::with_window(session_name.clone(), 2),
-            after: false,
-            before: false,
-            kill_destination: false,
-            detached: true,
-        }))
-        .await;
-    assert!(matches!(response, Response::LinkWindow(_)), "{response:?}");
-}
-
 async fn replace_linked_occurrence(
     handler: &RequestHandler,
     fixture: &LinkedOccurrenceFixture,
@@ -122,14 +90,10 @@ async fn replace_linked_occurrence(
         )
         .expect("old occurrence unlinks");
     state
-        .link_window(LinkWindowRequest {
-            source: WindowTarget::with_window(fixture.session_name.clone(), 0),
-            target: WindowTarget::with_window(fixture.session_name.clone(), 2),
-            after: false,
-            before: false,
-            kill_destination: false,
-            detached: true,
-        })
+        .link_window(LinkWindowRequest::fixture((
+            WindowTarget::with_window(fixture.session_name.clone(), 0),
+            WindowTarget::with_window(fixture.session_name.clone(), 2),
+        )))
         .expect("replacement occurrence links");
     let replacement = state
         .sessions
@@ -142,18 +106,6 @@ async fn replace_linked_occurrence(
         .expect("replacement occurrence has an identity");
     assert_ne!(replacement_occurrence_id, fixture.old_occurrence_id);
     replacement_occurrence_id
-}
-
-async fn set_mode_tree_selection(handler: &RequestHandler, attach_pid: u32, selected_id: String) {
-    handler
-        .active_attach
-        .lock()
-        .await
-        .by_pid
-        .get_mut(&attach_pid)
-        .and_then(|active| active.mode_tree.as_mut())
-        .expect("mode-tree remains active")
-        .selected_id = Some(selected_id);
 }
 
 async fn assert_replacement_survives(
@@ -266,11 +218,9 @@ async fn choose_tree_stale_current_selection_does_not_kill_relinked_occurrence()
     let fixture =
         linked_occurrence_fixture(&handler, "choose-tree-window-occurrence-selection-aba", 503)
             .await;
-    set_mode_tree_selection(
-        &handler,
-        fixture.attach_pid,
-        fixture.old_window_item_id.clone(),
-    )
+    with_mode_tree(&handler, fixture.attach_pid, |mode| {
+        mode.selected_id = Some(fixture.old_window_item_id.clone());
+    })
     .await;
     let replacement_occurrence_id = replace_linked_occurrence(&handler, &fixture).await;
 
@@ -286,16 +236,10 @@ async fn choose_tree_stale_tag_does_not_kill_relinked_occurrence() {
     let handler = RequestHandler::new();
     let fixture =
         linked_occurrence_fixture(&handler, "choose-tree-window-occurrence-tag-aba", 504).await;
-    handler
-        .active_attach
-        .lock()
-        .await
-        .by_pid
-        .get_mut(&fixture.attach_pid)
-        .and_then(|active| active.mode_tree.as_mut())
-        .expect("mode-tree remains active")
-        .tagged
-        .insert(fixture.old_window_item_id.clone());
+    with_mode_tree(&handler, fixture.attach_pid, |mode| {
+        mode.tagged.insert(fixture.old_window_item_id.clone());
+    })
+    .await;
     let replacement_occurrence_id = replace_linked_occurrence(&handler, &fixture).await;
 
     handler
@@ -310,11 +254,9 @@ async fn choose_tree_accept_does_not_select_relinked_stale_occurrence() {
     let handler = RequestHandler::new();
     let fixture =
         linked_occurrence_fixture(&handler, "choose-tree-window-occurrence-accept-aba", 505).await;
-    set_mode_tree_selection(
-        &handler,
-        fixture.attach_pid,
-        fixture.old_window_item_id.clone(),
-    )
+    with_mode_tree(&handler, fixture.attach_pid, |mode| {
+        mode.selected_id = Some(fixture.old_window_item_id.clone());
+    })
     .await;
     let replacement_occurrence_id = replace_linked_occurrence(&handler, &fixture).await;
 

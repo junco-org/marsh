@@ -2,11 +2,12 @@ use super::pane_group_transfer_tests::{create_grouped_session, create_session};
 use super::RequestHandler;
 use rmux_core::WindowId;
 use rmux_proto::{
-    BindKeyRequest, HookLifecycle, HookName, JoinPaneRequest, LinkWindowRequest, MovePaneRequest,
+    BindKeyRequest, HookName, JoinPaneRequest, LinkWindowRequest, MovePaneRequest,
     NewWindowRequest, OptionName, OptionScopeSelector, PaneTarget, Request, Response,
-    ScopeSelector, SendKeysExtRequest, SendKeysResponse, SessionName, SetHookRequest,
-    SetOptionByNameRequest, SetOptionMode, SetOptionRequest, SplitDirection, WindowTarget,
+    ScopeSelector, SendKeysExtRequest, SendKeysResponse, SessionName, SetHookRequest, WindowTarget,
 };
+
+use crate::test_fixtures::Fixture;
 
 const SURVIVOR_OPTION: &str = "@w13-m10-survivor";
 
@@ -25,26 +26,10 @@ impl TransferCommand {
     }
 
     fn request(self, source: PaneTarget, target: PaneTarget) -> Request {
-        let join = JoinPaneRequest {
-            source,
-            target,
-            direction: SplitDirection::Vertical,
-            detached: true,
-            before: false,
-            full_size: false,
-            size: None,
-        };
+        let key = (source, target);
         match self {
-            Self::Join => Request::JoinPane(join),
-            Self::Move => Request::MovePane(MovePaneRequest {
-                source: join.source,
-                target: join.target,
-                direction: join.direction,
-                detached: join.detached,
-                before: join.before,
-                full_size: join.full_size,
-                size: join.size,
-            }),
+            Self::Join => Request::JoinPane(JoinPaneRequest::fixture(key)),
+            Self::Move => Request::MovePane(MovePaneRequest::fixture(key)),
         }
     }
 }
@@ -55,81 +40,49 @@ async fn create_window(
     window_index: u32,
     name: &str,
 ) {
-    let response = handler
-        .handle(Request::NewWindow(Box::new(NewWindowRequest {
-            target: session_name.clone(),
+    handler
+        .create_window(NewWindowRequest {
             name: Some(name.to_owned()),
-            detached: true,
-            environment: None,
-            command: None,
-            start_directory: None,
             target_window_index: Some(window_index),
-            insert_at_target: false,
-            process_command: None,
-        })))
+            ..Fixture::fixture(session_name)
+        })
         .await;
-    assert!(matches!(response, Response::NewWindow(_)), "{response:?}");
-    handler.wait_for_initial_panes_for_test().await;
 }
 
 async fn set_renumber(handler: &RequestHandler, session_name: &SessionName) {
-    let response = handler
-        .handle(Request::SetOption(SetOptionRequest {
-            scope: ScopeSelector::Session(session_name.clone()),
-            option: OptionName::RenumberWindows,
-            value: "on".to_owned(),
-            mode: SetOptionMode::Replace,
-        }))
+    handler
+        .set_option(
+            ScopeSelector::Session(session_name.clone()),
+            OptionName::RenumberWindows,
+            "on",
+        )
         .await;
-    assert!(matches!(response, Response::SetOption(_)), "{response:?}");
 }
 
 async fn mark_survivor(handler: &RequestHandler, target: &WindowTarget, marker: &str) -> WindowId {
-    let option = handler
-        .handle(Request::SetOptionByName(Box::new(SetOptionByNameRequest {
-            scope: OptionScopeSelector::Window(target.clone()),
-            name: SURVIVOR_OPTION.to_owned(),
-            value: Some(marker.to_owned()),
-            mode: SetOptionMode::Replace,
-            only_if_unset: false,
-            unset: false,
-            unset_pane_overrides: false,
-            format: false,
-            format_target: None,
-        })))
+    handler
+        .set_option_by_name(
+            OptionScopeSelector::Window(target.clone()),
+            SURVIVOR_OPTION,
+            marker,
+        )
         .await;
-    assert!(matches!(option, Response::SetOptionByName(_)), "{option:?}");
-
-    let automatic_rename = handler
-        .handle(Request::SetOption(SetOptionRequest {
-            scope: ScopeSelector::Window(target.clone()),
-            option: OptionName::AutomaticRename,
-            value: "off".to_owned(),
-            mode: SetOptionMode::Replace,
-        }))
+    handler
+        .set_option(
+            ScopeSelector::Window(target.clone()),
+            OptionName::AutomaticRename,
+            "off",
+        )
         .await;
-    assert!(
-        matches!(automatic_rename, Response::SetOption(_)),
-        "{automatic_rename:?}"
-    );
-
-    let hook = handler
-        .handle(Request::SetHook(SetHookRequest {
-            scope: ScopeSelector::Window(target.clone()),
-            hook: HookName::WindowLayoutChanged,
-            command: format!("display-message {marker}"),
-            lifecycle: HookLifecycle::Persistent,
-        }))
+    handler
+        .handle_ok(SetHookRequest::fixture((
+            ScopeSelector::Window(target.clone()),
+            HookName::WindowLayoutChanged,
+            format!("display-message {marker}").as_str(),
+        )))
         .await;
-    assert!(matches!(hook, Response::SetHook(_)), "{hook:?}");
 
-    let state = handler.state.lock().await;
-    state
-        .sessions
-        .session(target.session_name())
-        .and_then(|session| session.window_at(target.window_index()))
-        .map(rmux_core::Window::id)
-        .expect("marked survivor exists")
+    handler.window_id_for_test(target).await
 }
 
 async fn assert_renumbered_survivor(
@@ -285,7 +238,6 @@ async fn run_grouped_case(command: TransferCommand) {
         &owner,
     )
     .await;
-    handler.wait_for_initial_panes_for_test().await;
     set_renumber(&handler, &owner).await;
     set_renumber(&handler, &peer).await;
     let _ = mark_survivor(
@@ -331,17 +283,12 @@ async fn run_linked_case(command: TransferCommand) {
     .await;
     create_window(&handler, &source, 1, "SOURCE").await;
     create_window(&handler, &source, 2, "SURVIVOR").await;
-    let link = handler
-        .handle(Request::LinkWindow(LinkWindowRequest {
-            source: WindowTarget::with_window(source.clone(), 1),
-            target: WindowTarget::with_window(alias.clone(), 1),
-            after: false,
-            before: false,
-            kill_destination: false,
-            detached: true,
-        }))
+    handler
+        .handle_ok(LinkWindowRequest::fixture((
+            WindowTarget::with_window(source.clone(), 1),
+            WindowTarget::with_window(alias.clone(), 1),
+        )))
         .await;
-    assert!(matches!(link, Response::LinkWindow(_)), "{link:?}");
     create_window(&handler, &alias, 2, "SURVIVOR").await;
     set_renumber(&handler, &source).await;
     set_renumber(&handler, &alias).await;
@@ -416,42 +363,27 @@ async fn bind_key_join_and_move_renumber_destroyed_source() {
             &marker,
         )
         .await;
-        let requester_pid = std::process::id();
-        let (control_tx, _control_rx) = tokio::sync::mpsc::unbounded_channel();
+        let _control_rx = handler.attach_client(std::process::id(), &session).await;
         handler
-            .register_attach(requester_pid, session.clone(), control_tx)
-            .await;
-        let response = handler
-            .handle(Request::BindKey(Box::new(BindKeyRequest {
-                table_name: "prefix".to_owned(),
-                key: "x".to_owned(),
-                note: None,
-                repeat: false,
-                command: Some(vec![
+            .handle_ok(BindKeyRequest::fixture((
+                "prefix",
+                "x",
+                [
                     format!("{}-pane", command.label()),
                     "-d".to_owned(),
                     "-s".to_owned(),
                     format!("{session}:1.0"),
                     "-t".to_owned(),
                     format!("{session}:0.0"),
-                ]),
-            })))
+                ],
+            )))
             .await;
-        assert!(matches!(response, Response::BindKey(_)), "{response:?}");
 
         let response = handler
-            .handle(Request::SendKeysExt(SendKeysExtRequest {
-                target: Some(PaneTarget::with_window(session.clone(), 0, 0)),
-                keys: vec!["C-b".to_owned(), "x".to_owned()],
-                expand_formats: false,
-                hex: false,
-                literal: false,
-                dispatch_key_table: true,
-                copy_mode_command: false,
-                forward_mouse_event: false,
-                reset_terminal: false,
-                repeat_count: None,
-            }))
+            .handle(Request::SendKeysExt(SendKeysExtRequest::fixture((
+                PaneTarget::with_window(session.clone(), 0, 0),
+                ["C-b", "x"],
+            ))))
             .await;
         assert_eq!(
             response,

@@ -9,7 +9,9 @@
 
 use super::*;
 
-use rmux_proto::{NewSessionExtRequest, PaneTarget, SessionName, TerminalSize};
+use rmux_proto::{NewSessionExtRequest, PaneTarget, TerminalSize};
+
+use crate::test_fixtures::{quiet_command, Fixture};
 
 /// Async client end of the connection under test.
 pub(super) type TestClientStream = LocalStream;
@@ -111,10 +113,6 @@ where
     }
 }
 
-pub(super) fn quiet_command() -> Vec<String> {
-    vec!["/bin/sh".to_owned(), "-c".to_owned(), "sleep 60".to_owned()]
-}
-
 pub(super) async fn start_quiet_pane(handler: &Arc<RequestHandler>, name: &str) -> PaneTarget {
     start_quiet_pane_sized(handler, name, TerminalSize { cols: 12, rows: 4 }).await
 }
@@ -124,32 +122,12 @@ pub(super) async fn start_quiet_pane_sized(
     name: &str,
     size: TerminalSize,
 ) -> PaneTarget {
-    let session = SessionName::new(name).expect("valid session name");
-    let response = handler
-        .handle(Request::NewSessionExt(Box::new(NewSessionExtRequest {
-            session_name: Some(session.clone()),
-            working_directory: None,
-            detached: true,
+    let session = handler
+        .create_started_session(NewSessionExtRequest {
             size: Some(size),
-            environment: None,
-            group_target: None,
-            attach_if_exists: false,
-            detach_other_clients: false,
-            kill_other_clients: false,
-            flags: None,
-            window_name: None,
-            print_session_info: false,
-            print_format: None,
             command: Some(quiet_command()),
-            process_command: None,
-            client_environment: None,
-            skip_environment_update: false,
-        })))
+            ..Fixture::fixture(name)
+        })
         .await;
-    assert!(matches!(response, Response::NewSession(_)), "{response:?}");
-    let target = PaneTarget::with_window(session, 0, 0);
-    handler
-        .wait_for_pane_startup_to_finish_for_test(&target)
-        .await;
-    target
+    PaneTarget::with_window(session, 0, 0)
 }

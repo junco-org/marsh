@@ -1,3 +1,4 @@
+use marsh_lib::BoundedRetention;
 use rmux_core::events::{
     OutputCursor, OutputCursorItem, OutputEvent, OutputRing, DEFAULT_OUTPUT_RING_CAPACITY,
     DEFAULT_RECENT_LIVE_BUFFER_CAPACITY,
@@ -402,8 +403,7 @@ struct FastPaneOutput {
 
 struct PaneOutputState {
     ring: OutputRing,
-    passthroughs: VecDeque<PaneOutputPassthroughs>,
-    retained_passthrough_bytes: usize,
+    passthroughs: BoundedRetention<PaneOutputPassthroughs>,
     invalidation_revision: u64,
     process_exit_revision: u64,
     process_exit_revision_at_invalidation: u64,
@@ -461,8 +461,11 @@ impl PaneOutputState {
     fn new(event_capacity: usize, recent_byte_capacity: usize) -> Self {
         Self {
             ring: OutputRing::new(event_capacity, recent_byte_capacity),
-            passthroughs: VecDeque::with_capacity(PANE_OUTPUT_PASSTHROUGH_CAPACITY),
-            retained_passthrough_bytes: 0,
+            passthroughs: BoundedRetention::new(
+                PANE_OUTPUT_PASSTHROUGH_CAPACITY,
+                PANE_OUTPUT_PASSTHROUGH_BYTE_CAPACITY,
+                PANE_OUTPUT_PASSTHROUGH_CAPACITY,
+            ),
             invalidation_revision: 0,
             process_exit_revision: 0,
             process_exit_revision_at_invalidation: 0,
@@ -500,23 +503,14 @@ impl PaneOutputState {
             .push_shared_with_recent_retention(bytes, retain_recent);
         if retain_passthroughs && !passthroughs.is_empty() {
             let passthrough_bytes = passthrough_payload_bytes(&passthroughs);
-            self.retained_passthrough_bytes = self
-                .retained_passthrough_bytes
-                .saturating_add(passthrough_bytes);
-            self.passthroughs.push_back(PaneOutputPassthroughs {
-                sequence,
-                passthroughs,
-            });
-            while self.passthroughs.len() > PANE_OUTPUT_PASSTHROUGH_CAPACITY
-                || self.retained_passthrough_bytes > PANE_OUTPUT_PASSTHROUGH_BYTE_CAPACITY
-            {
-                let Some(evicted) = self.passthroughs.pop_front() else {
-                    break;
-                };
-                self.retained_passthrough_bytes = self
-                    .retained_passthrough_bytes
-                    .saturating_sub(passthrough_payload_bytes(&evicted.passthroughs));
-            }
+            self.passthroughs.push(
+                PaneOutputPassthroughs {
+                    sequence,
+                    passthroughs,
+                },
+                passthrough_bytes,
+                drop,
+            );
         }
         sequence
     }
@@ -536,7 +530,6 @@ impl PaneOutputState {
     fn clear_retained(&mut self) {
         self.ring.clear_retained();
         self.passthroughs.clear();
-        self.retained_passthrough_bytes = 0;
     }
 
     fn poll_cursor(
@@ -1805,7 +1798,7 @@ mod tests {
             .lock()
             .expect("pane output state mutex must not be poisoned");
         assert!(state.passthroughs.is_empty());
-        assert_eq!(state.retained_passthrough_bytes, 0);
+        assert_eq!(state.passthroughs.retained_bytes(), 0);
         assert_eq!(
             state.ring.retained_len(),
             1,
@@ -1838,7 +1831,7 @@ mod tests {
                 .lock()
                 .expect("pane output state mutex must not be poisoned");
             assert!(
-                state.retained_passthrough_bytes <= PANE_OUTPUT_PASSTHROUGH_BYTE_CAPACITY,
+                state.passthroughs.retained_bytes() <= PANE_OUTPUT_PASSTHROUGH_BYTE_CAPACITY,
                 "retained live-only side effects must stay within the per-pane byte budget"
             );
             assert_eq!(state.passthroughs.len(), 3);

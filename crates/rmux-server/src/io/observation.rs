@@ -43,7 +43,7 @@ pub(crate) async fn consume(
     // event carry something a receiver can act on rather than a name it would have to re-resolve
     // against a table that may already have reused it.
     let mut handles: std::collections::HashMap<
-        marsh_core::shellmux::SnapshotUid,
+        marsh_core::shellmux::Principal,
         crate::io::ShellHandle,
     > = std::collections::HashMap::new();
     // One gate per live job generation, opened when its adoption has finished. A job the server
@@ -51,11 +51,11 @@ pub(crate) async fn consume(
     // Stream workers wait on it before their first chunk, which is how adoption stops being
     // something the ingress loop has to wait for without letting bytes overtake it.
     let mut adoptions: std::collections::HashMap<
-        marsh_core::shellmux::SnapshotUid,
+        marsh_core::shellmux::Principal,
         tokio::sync::watch::Receiver<bool>,
     > = std::collections::HashMap::new();
     let mut deliveries: std::collections::HashMap<
-        (marsh_core::shellmux::SnapshotUid, OutputChannel),
+        (marsh_core::shellmux::Principal, OutputChannel),
         tokio::sync::mpsc::UnboundedSender<Delivery>,
     > = std::collections::HashMap::new();
 
@@ -394,7 +394,7 @@ async fn deliver(
                         }) {
                             for line in marsh_core::shellmux::repl::report_lines(
                                 &end.shell.id,
-                                &completion.outcome,
+                                &completion.result,
                             ) {
                                 let bytes = format!("{line}\r\n");
                                 handler

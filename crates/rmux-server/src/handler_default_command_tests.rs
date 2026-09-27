@@ -1,90 +1,24 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use rmux_core::command_parser::CommandParser;
 use rmux_proto::{
-    BindKeyRequest, NewSessionExtRequest, NewSessionRequest, NewWindowRequest, OptionName,
-    PaneTarget, ProcessCommand, Request, RespawnPaneRequest, RespawnWindowRequest, Response,
-    ScopeSelector, SessionName, SetOptionMode, SetOptionRequest, SourceFileRequest, SplitDirection,
-    SplitWindowRequest, SplitWindowTarget, TerminalSize, WindowTarget,
+    BindKeyRequest, NewWindowRequest, OptionName, PaneTarget, ProcessCommand, RespawnPaneRequest,
+    RespawnWindowRequest, ScopeSelector, SessionName, SourceFileRequest, SplitDirection,
+    SplitWindowRequest, WindowTarget,
 };
-use tokio::sync::mpsc;
 
 use super::RequestHandler;
 
+use crate::test_fixtures::{unique_temp_path, Fixture, Grouped};
 use crate::test_names::session_name;
 
 fn tagged_stdin_discard_command(tag: &str) -> String {
     format!("cat >/dev/null # {tag}")
 }
 
-fn unique_temp_path(label: &str) -> PathBuf {
-    let unique = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time after epoch")
-        .as_nanos();
-    std::env::temp_dir().join(format!(
-        "rmux-default-command-{label}-{}-{unique}",
-        std::process::id()
-    ))
-}
-
 fn expected_spawn_cwd(path: &Path) -> PathBuf {
     fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
-}
-
-async fn create_session(handler: &RequestHandler, session: &SessionName) {
-    let response = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name: session.clone(),
-            detached: true,
-            size: Some(TerminalSize { cols: 80, rows: 24 }),
-            environment: None,
-        }))
-        .await;
-    assert!(matches!(response, Response::NewSession(_)), "{response:?}");
-}
-
-async fn create_grouped_session(
-    handler: &RequestHandler,
-    session: &SessionName,
-    group_target: &SessionName,
-) {
-    let response = handler
-        .handle(Request::NewSessionExt(Box::new(NewSessionExtRequest {
-            session_name: Some(session.clone()),
-            working_directory: None,
-            detached: true,
-            size: Some(TerminalSize { cols: 80, rows: 24 }),
-            environment: None,
-            group_target: Some(group_target.clone()),
-            attach_if_exists: false,
-            detach_other_clients: false,
-            kill_other_clients: false,
-            flags: None,
-            window_name: None,
-            print_session_info: false,
-            print_format: None,
-            command: None,
-            process_command: None,
-            client_environment: None,
-            skip_environment_update: false,
-        })))
-        .await;
-    assert!(matches!(response, Response::NewSession(_)), "{response:?}");
-}
-
-async fn set_default_command(handler: &RequestHandler, scope: ScopeSelector, command: &str) {
-    let response = handler
-        .handle(Request::SetOption(SetOptionRequest {
-            scope,
-            option: OptionName::DefaultCommand,
-            value: command.to_owned(),
-            mode: SetOptionMode::Replace,
-        }))
-        .await;
-    assert!(matches!(response, Response::SetOption(_)), "{response:?}");
 }
 
 async fn pane_process_command(
@@ -127,111 +61,60 @@ async fn sdk_new_and_split_resolve_default_command_for_the_addressed_session() {
     let owner = session_name("default-command-owner");
     let alias = session_name("default-command-alias");
     let fallback = session_name("default-command-fallback");
-    create_session(&handler, &owner).await;
-    create_grouped_session(&handler, &alias, &owner).await;
-    create_session(&handler, &fallback).await;
+    handler.create_session(&owner).await;
+    handler.create_session(Grouped(&alias, &owner)).await;
+    handler.create_session(&fallback).await;
 
     let global_command = tagged_stdin_discard_command("global");
     let owner_command = tagged_stdin_discard_command("owner");
     let alias_command = tagged_stdin_discard_command("alias");
-    set_default_command(&handler, ScopeSelector::Global, &global_command).await;
-    set_default_command(
-        &handler,
-        ScopeSelector::Session(owner.clone()),
-        &owner_command,
-    )
-    .await;
-    set_default_command(
-        &handler,
-        ScopeSelector::Session(alias.clone()),
-        &alias_command,
-    )
-    .await;
-
-    let owner_window = handler
-        .handle(Request::NewWindow(Box::new(NewWindowRequest {
-            target: owner.clone(),
-            name: None,
-            detached: true,
-            environment: None,
-            command: None,
-            process_command: None,
-            start_directory: None,
-            target_window_index: None,
-            insert_at_target: false,
-        })))
+    handler
+        .set_option(
+            ScopeSelector::Global,
+            OptionName::DefaultCommand,
+            &global_command,
+        )
         .await;
-    let owner_window = match owner_window {
-        Response::NewWindow(response) => {
-            PaneTarget::with_window(owner.clone(), response.target.window_index(), 0)
-        }
-        response => panic!("expected new-window success, got {response:?}"),
-    };
+    handler
+        .set_option(
+            ScopeSelector::Session(owner.clone()),
+            OptionName::DefaultCommand,
+            &owner_command,
+        )
+        .await;
+    handler
+        .set_option(
+            ScopeSelector::Session(alias.clone()),
+            OptionName::DefaultCommand,
+            &alias_command,
+        )
+        .await;
+
+    let window = handler.create_window(&owner).await;
+    let owner_window = PaneTarget::with_window(owner.clone(), window.window_index(), 0);
     assert_eq!(
         pane_process_command(&handler, &owner_window).await,
         Some(ProcessCommand::Shell(owner_command))
     );
 
-    let alias_window = handler
-        .handle(Request::NewWindow(Box::new(NewWindowRequest {
-            target: alias.clone(),
-            name: None,
-            detached: true,
-            environment: None,
-            command: None,
-            process_command: None,
-            start_directory: None,
-            target_window_index: None,
-            insert_at_target: false,
-        })))
-        .await;
-    let alias_window = match alias_window {
-        Response::NewWindow(response) => {
-            PaneTarget::with_window(alias.clone(), response.target.window_index(), 0)
-        }
-        response => panic!("expected grouped new-window success, got {response:?}"),
-    };
+    let window = handler.create_window(&alias).await;
+    let alias_window = PaneTarget::with_window(alias.clone(), window.window_index(), 0);
     assert_eq!(
         pane_process_command(&handler, &alias_window).await,
         Some(ProcessCommand::Shell(alias_command))
     );
 
     let split = handler
-        .handle(Request::SplitWindow(SplitWindowRequest {
-            target: SplitWindowTarget::Pane(owner_window),
-            direction: SplitDirection::Vertical,
-            before: false,
-            environment: None,
-        }))
-        .await;
-    let split = match split {
-        Response::SplitWindow(response) => response.pane,
-        response => panic!("expected split-window success, got {response:?}"),
-    };
+        .handle_ok(SplitWindowRequest::fixture(owner_window))
+        .await
+        .pane;
     assert_eq!(
         pane_process_command(&handler, &split).await,
         Some(ProcessCommand::Shell(tagged_stdin_discard_command("owner")))
     );
 
-    let fallback_window = handler
-        .handle(Request::NewWindow(Box::new(NewWindowRequest {
-            target: fallback.clone(),
-            name: None,
-            detached: true,
-            environment: None,
-            command: None,
-            process_command: None,
-            start_directory: None,
-            target_window_index: None,
-            insert_at_target: false,
-        })))
-        .await;
-    let fallback_window = match fallback_window {
-        Response::NewWindow(response) => {
-            PaneTarget::with_window(fallback, response.target.window_index(), 0)
-        }
-        response => panic!("expected fallback new-window success, got {response:?}"),
-    };
+    let window = handler.create_window(&fallback).await;
+    let fallback_window = PaneTarget::with_window(fallback, window.window_index(), 0);
     assert_eq!(
         pane_process_command(&handler, &fallback_window).await,
         Some(ProcessCommand::Shell(global_command))
@@ -243,91 +126,65 @@ async fn sdk_explicit_command_wins_and_local_empty_masks_global_default_command(
     let handler = RequestHandler::new();
     let alpha = session_name("default-command-explicit");
     let masked = session_name("default-command-masked");
-    create_session(&handler, &alpha).await;
-    create_session(&handler, &masked).await;
-    set_default_command(
-        &handler,
-        ScopeSelector::Global,
-        &tagged_stdin_discard_command("global"),
-    )
-    .await;
-    set_default_command(&handler, ScopeSelector::Session(masked.clone()), "").await;
+    handler.create_session(&alpha).await;
+    handler.create_session(&masked).await;
+    handler
+        .set_option(
+            ScopeSelector::Global,
+            OptionName::DefaultCommand,
+            &tagged_stdin_discard_command("global"),
+        )
+        .await;
+    handler
+        .set_option(
+            ScopeSelector::Session(masked.clone()),
+            OptionName::DefaultCommand,
+            "",
+        )
+        .await;
 
     let explicit = ProcessCommand::Shell(tagged_stdin_discard_command("explicit"));
-    let response = handler
-        .handle(Request::NewWindow(Box::new(NewWindowRequest {
-            target: alpha,
-            name: None,
-            detached: true,
-            environment: None,
-            command: None,
+    let window = handler
+        .create_window(NewWindowRequest {
             process_command: Some(explicit.clone()),
-            start_directory: None,
-            target_window_index: None,
-            insert_at_target: false,
-        })))
+            ..Fixture::fixture(alpha)
+        })
         .await;
-    let explicit_target = match response {
-        Response::NewWindow(response) => PaneTarget::with_window(
-            response.target.session_name().clone(),
-            response.target.window_index(),
-            0,
-        ),
-        response => panic!("expected explicit new-window success, got {response:?}"),
-    };
+    let explicit_target =
+        PaneTarget::with_window(window.session_name().clone(), window.window_index(), 0);
     assert_eq!(
         pane_process_command(&handler, &explicit_target).await,
         Some(explicit)
     );
 
     let explicit_session = explicit_target.session_name().clone();
-    let remain = handler
-        .handle(Request::SetOption(SetOptionRequest {
-            scope: ScopeSelector::Session(explicit_session.clone()),
-            option: OptionName::RemainOnExit,
-            value: "on".to_owned(),
-            mode: SetOptionMode::Replace,
-        }))
+    handler
+        .set_option(
+            ScopeSelector::Session(explicit_session.clone()),
+            OptionName::RemainOnExit,
+            "on",
+        )
         .await;
-    assert!(matches!(remain, Response::SetOption(_)), "{remain:?}");
-    let empty = handler
-        .handle(Request::NewWindow(Box::new(NewWindowRequest {
-            target: explicit_session,
-            name: None,
-            detached: true,
-            environment: None,
+    let window = handler
+        .create_window(NewWindowRequest {
             command: Some(vec![String::new()]),
-            process_command: None,
-            start_directory: None,
-            target_window_index: None,
-            insert_at_target: false,
-        })))
+            ..Fixture::fixture(explicit_session)
+        })
         .await;
-    let empty_target = match empty {
-        Response::NewWindow(response) => PaneTarget::with_window(
-            response.target.session_name().clone(),
-            response.target.window_index(),
-            0,
-        ),
-        response => panic!("expected empty explicit new-window success, got {response:?}"),
-    };
+    let empty_target =
+        PaneTarget::with_window(window.session_name().clone(), window.window_index(), 0);
     assert_eq!(
         pane_process_command(&handler, &empty_target).await,
         Some(ProcessCommand::Shell(String::new()))
     );
 
-    let response = handler
-        .handle(Request::SplitWindow(SplitWindowRequest {
-            target: SplitWindowTarget::Session(masked),
+    let masked_target = handler
+        .handle_ok(SplitWindowRequest {
             direction: SplitDirection::Horizontal,
-            before: false,
-            environment: None,
-        }))
-        .await;
-    let masked_target = match response {
-        Response::SplitWindow(response) => response.pane,
-        response => panic!("expected masked split-window success, got {response:?}"),
-    };
+            ..Fixture::fixture(masked)
+        })
+        .await
+        .pane;
     assert_eq!(pane_process_command(&handler, &masked_target).await, None);
 }
 
@@ -342,29 +199,19 @@ async fn default_command_preserves_requested_cwd_and_respawn_provenance() {
     let cwd = crate::pane_terminals::seed_scratch_dir(&handler, "default-command-cwd")
         .path()
         .to_path_buf();
-    create_session(&handler, &alpha).await;
+    handler.create_session(&alpha).await;
 
     let original = tagged_stdin_discard_command("original");
-    set_default_command(&handler, ScopeSelector::Global, &original).await;
-    let response = handler
-        .handle(Request::NewWindow(Box::new(NewWindowRequest {
-            target: alpha.clone(),
-            name: None,
-            detached: true,
-            environment: None,
-            command: None,
-            process_command: None,
-            start_directory: Some(cwd.clone()),
-            target_window_index: None,
-            insert_at_target: false,
-        })))
+    handler
+        .set_option(ScopeSelector::Global, OptionName::DefaultCommand, &original)
         .await;
-    let target = match response {
-        Response::NewWindow(response) => {
-            PaneTarget::with_window(alpha.clone(), response.target.window_index(), 0)
-        }
-        response => panic!("expected cwd new-window success, got {response:?}"),
-    };
+    let window = handler
+        .create_window(NewWindowRequest {
+            start_directory: Some(cwd.clone()),
+            ..Fixture::fixture(&alpha)
+        })
+        .await;
+    let target = PaneTarget::with_window(alpha.clone(), window.window_index(), 0);
     {
         let state = handler.state.lock().await;
         let pane_id = state
@@ -383,50 +230,37 @@ async fn default_command_preserves_requested_cwd_and_respawn_provenance() {
         );
     }
 
-    set_default_command(
-        &handler,
-        ScopeSelector::Global,
-        &tagged_stdin_discard_command("changed"),
-    )
-    .await;
-    let respawn_window = handler
-        .handle(Request::RespawnWindow(Box::new(RespawnWindowRequest {
+    handler
+        .set_option(
+            ScopeSelector::Global,
+            OptionName::DefaultCommand,
+            &tagged_stdin_discard_command("changed"),
+        )
+        .await;
+    handler
+        .handle_ok(RespawnWindowRequest {
             target: WindowTarget::with_window(alpha.clone(), target.window_index()),
             kill: true,
             start_directory: None,
             environment: None,
             command: None,
-        })))
+        })
         .await;
-    assert!(
-        matches!(respawn_window, Response::RespawnWindow(_)),
-        "{respawn_window:?}"
-    );
     assert_eq!(
         pane_process_command(&handler, &target).await,
         Some(ProcessCommand::Shell(original.clone()))
     );
 
-    set_default_command(
-        &handler,
-        ScopeSelector::Global,
-        &tagged_stdin_discard_command("changed-again"),
-    )
-    .await;
-    let respawn_pane = handler
-        .handle(Request::RespawnPane(Box::new(RespawnPaneRequest {
-            target: target.clone(),
-            kill: true,
-            start_directory: None,
-            environment: None,
-            command: None,
-            process_command: None,
-        })))
+    handler
+        .set_option(
+            ScopeSelector::Global,
+            OptionName::DefaultCommand,
+            &tagged_stdin_discard_command("changed-again"),
+        )
         .await;
-    assert!(
-        matches!(respawn_pane, Response::RespawnPane(_)),
-        "{respawn_pane:?}"
-    );
+    handler
+        .handle_ok(RespawnPaneRequest::fixture(&target))
+        .await;
     assert_eq!(
         pane_process_command(&handler, &target).await,
         Some(ProcessCommand::Shell(original))
@@ -443,10 +277,16 @@ async fn queued_source_and_binding_paths_apply_default_command() {
     let sourced = session_name("default-command-sourced");
     let bound = session_name("default-command-bound");
     for session in [&queued, &sourced, &bound] {
-        create_session(&handler, session).await;
+        handler.create_session(session).await;
     }
     let default_command = tagged_stdin_discard_command("entry-paths");
-    set_default_command(&handler, ScopeSelector::Global, &default_command).await;
+    handler
+        .set_option(
+            ScopeSelector::Global,
+            OptionName::DefaultCommand,
+            &default_command,
+        )
+        .await;
 
     let parsed = CommandParser::new()
         .parse(&format!(
@@ -459,7 +299,7 @@ async fn queued_source_and_binding_paths_apply_default_command() {
         .expect("queued window commands execute");
     assert_default_command_on_new_and_split(&handler, &queued, &default_command).await;
 
-    let root = unique_temp_path("source-entry-path");
+    let root = unique_temp_path("default-command-source-entry-path");
     fs::create_dir_all(&root).expect("create source-file root");
     let config = root.join("windows.conf");
     fs::write(
@@ -467,26 +307,13 @@ async fn queued_source_and_binding_paths_apply_default_command() {
         format!("new-window -d -t {sourced}\nsplit-window -d -t {sourced}:0.0\n"),
     )
     .expect("write source-file commands");
-    let source = handler
-        .handle(Request::SourceFile(Box::new(SourceFileRequest {
-            paths: vec![config.to_string_lossy().into_owned()],
-            quiet: false,
-            parse_only: false,
-            verbose: false,
-            expand_paths: false,
-            target: None,
-            caller_cwd: None,
-            stdin: None,
-        })))
+    handler
+        .handle_ok(SourceFileRequest::fixture([config.to_string_lossy()]))
         .await;
-    assert!(matches!(source, Response::SourceFile(_)), "{source:?}");
     assert_default_command_on_new_and_split(&handler, &sourced, &default_command).await;
 
     let requester_pid = u32::MAX - 91;
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    handler
-        .register_attach(requester_pid, bound.clone(), control_tx)
-        .await;
+    let _control_rx = handler.attach_client(requester_pid, &bound).await;
     for (key, command) in [
         (
             "N",
@@ -507,16 +334,12 @@ async fn queued_source_and_binding_paths_apply_default_command() {
             ],
         ),
     ] {
-        let response = handler
-            .handle(Request::BindKey(Box::new(BindKeyRequest {
-                table_name: "prefix".to_owned(),
-                key: key.to_owned(),
+        handler
+            .handle_ok(BindKeyRequest {
                 note: Some("default-command regression".to_owned()),
-                repeat: false,
-                command: Some(command),
-            })))
+                ..Fixture::fixture(("prefix", key, command))
+            })
             .await;
-        assert!(matches!(response, Response::BindKey(_)), "{response:?}");
     }
     handler
         .handle_attached_live_input_for_test(requester_pid, b"\x02N\x02S")

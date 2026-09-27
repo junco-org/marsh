@@ -1,17 +1,13 @@
 use std::collections::HashMap;
-use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
 
 use rmux_proto::request::SwitchClientExt3Request;
-use rmux_proto::{
-    ControlMode, NewSessionRequest, NewWindowRequest, PaneTarget, Request, Response, SessionName,
-    SplitDirection, SplitWindowRequest, SplitWindowTarget, TerminalSize,
-};
+use rmux_proto::{PaneTarget, Response, SessionName, SplitDirection, SplitWindowRequest};
 use tokio::sync::mpsc;
 
 use super::RequestHandler;
 use crate::client_names::control_client_name;
-use crate::control::{ControlModeUpgrade, ControlServerEvent, CONTROL_SERVER_EVENT_CAPACITY};
+use crate::control::ControlServerEvent;
+use crate::test_fixtures::Fixture;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ProtocolSelectionModel {
@@ -118,15 +114,22 @@ struct SwitchFixture {
 impl SwitchFixture {
     async fn new(label: &str) -> Self {
         let handler = RequestHandler::new();
-        let source = session_name(&format!("{label}-source"));
-        let target = session_name(&format!("{label}-target"));
-        create_session(&handler, &source).await;
-        create_session(&handler, &target).await;
-        split_window(&handler, &target, 0).await;
-        let second_window = new_detached_window(&handler, &target).await;
+        let source = handler.create_session(format!("{label}-source")).await;
+        let target = handler.create_session(format!("{label}-target")).await;
+        handler
+            .handle_ok(SplitWindowRequest {
+                direction: SplitDirection::Horizontal,
+                ..Fixture::fixture(PaneTarget::with_window(target.clone(), 0, 0))
+            })
+            .await;
+        let second_window = handler.create_window(&target).await.window_index();
         assert_eq!(second_window, 1);
-        split_window(&handler, &target, second_window).await;
-        handler.wait_for_initial_panes_for_test().await;
+        handler
+            .handle_ok(SplitWindowRequest {
+                direction: SplitDirection::Horizontal,
+                ..Fixture::fixture(PaneTarget::with_window(target.clone(), second_window, 0))
+            })
+            .await;
 
         {
             let mut state = handler.state.lock().await;
@@ -151,83 +154,6 @@ impl SwitchFixture {
             target,
         }
     }
-}
-
-use crate::test_names::session_name;
-
-async fn create_session(handler: &RequestHandler, session_name: &SessionName) {
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: session_name.clone(),
-                detached: true,
-                size: Some(TerminalSize { cols: 80, rows: 24 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
-}
-
-async fn new_detached_window(handler: &RequestHandler, session_name: &SessionName) -> u32 {
-    let response = handler
-        .handle(Request::NewWindow(Box::new(NewWindowRequest {
-            target: session_name.clone(),
-            name: None,
-            detached: true,
-            start_directory: None,
-            environment: None,
-            command: None,
-            process_command: None,
-            target_window_index: None,
-            insert_at_target: false,
-        })))
-        .await;
-    let Response::NewWindow(response) = response else {
-        panic!("new-window failed: {response:?}");
-    };
-    response.target.window_index()
-}
-
-async fn split_window(handler: &RequestHandler, session_name: &SessionName, window_index: u32) {
-    let response = handler
-        .handle(Request::SplitWindow(SplitWindowRequest {
-            target: SplitWindowTarget::Pane(PaneTarget::with_window(
-                session_name.clone(),
-                window_index,
-                0,
-            )),
-            direction: SplitDirection::Horizontal,
-            before: false,
-            environment: None,
-        }))
-        .await;
-    assert!(matches!(response, Response::SplitWindow(_)), "{response:?}");
-}
-
-async fn register_control(
-    handler: &RequestHandler,
-    requester_pid: u32,
-    session_name: &SessionName,
-) -> (u64, mpsc::Receiver<ControlServerEvent>) {
-    let (event_tx, event_rx) = mpsc::channel(CONTROL_SERVER_EVENT_CAPACITY);
-    let control_id = handler
-        .register_control_with_closing(
-            requester_pid,
-            ControlModeUpgrade {
-                initial_command_count: 0,
-                mode: ControlMode::Plain,
-                terminal_context: crate::outer_terminal::OuterTerminalContext::default(),
-            },
-            event_tx,
-            Arc::new(AtomicBool::new(false)),
-        )
-        .await;
-    handler
-        .set_control_session(requester_pid, Some(session_name.clone()))
-        .await
-        .expect("control session set");
-    (control_id, event_rx)
 }
 
 fn drain_notifications(rx: &mut mpsc::Receiver<ControlServerEvent>) -> Vec<String> {
@@ -306,12 +232,13 @@ async fn pty_switch_selection_notifications_keep_protocol_model_current() {
         let fixture = SwitchFixture::new(&format!("pty-switch-{label}")).await;
         let attach_pid = 71_000 + u32::try_from(offset).expect("small test offset");
         let observer_pid = attach_pid + 1_000;
-        let (_observer_id, mut observer_rx) =
-            register_control(&fixture.handler, observer_pid, &fixture.target).await;
-        let (attach_tx, mut attach_rx) = mpsc::unbounded_channel();
-        fixture
+        let (_observer_id, mut observer_rx) = fixture
             .handler
-            .register_attach(attach_pid, fixture.source.clone(), attach_tx)
+            .register_control_for_test(observer_pid, Some(&fixture.target))
+            .await;
+        let mut attach_rx = fixture
+            .handler
+            .attach_client(attach_pid, &fixture.source)
             .await;
         let _ = drain_notifications(&mut observer_rx);
         while attach_rx.try_recv().is_ok() {}
@@ -370,8 +297,10 @@ async fn pty_switch_selection_notifications_keep_protocol_model_current() {
 async fn control_self_switch_selection_notifications_keep_protocol_model_current() {
     let fixture = SwitchFixture::new("control-self-switch").await;
     let requester_pid = 72_000;
-    let (control_id, mut event_rx) =
-        register_control(&fixture.handler, requester_pid, &fixture.source).await;
+    let (control_id, mut event_rx) = fixture
+        .handler
+        .register_control_for_test(requester_pid, Some(&fixture.source))
+        .await;
     let _ = drain_notifications(&mut event_rx);
     let mut model =
         ProtocolSelectionModel::capture(&fixture.handler, control_client_name(requester_pid)).await;

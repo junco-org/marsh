@@ -6,37 +6,22 @@ async fn attached_session_mutations_emit_refresh_switches() {
     let requester_pid = std::process::id();
     let alpha = session_name("alpha");
 
-    let created = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name: alpha.clone(),
-            detached: true,
-            size: Some(TerminalSize {
-                cols: 120,
-                rows: 40,
-            }),
-            environment: None,
-        }))
+    handler
+        .create_session((&alpha, TerminalSize::new(120, 40)))
         .await;
-    assert!(matches!(created, Response::NewSession(_)));
-
-    let (control_tx, mut control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
+    let mut control_rx = handler.attach_client(requester_pid, &alpha).await;
 
     let split = handler
-        .handle(Request::SplitWindow(SplitWindowRequest {
-            target: SplitWindowTarget::Session(alpha.clone()),
+        .handle_ok(SplitWindowRequest {
             direction: rmux_proto::SplitDirection::Horizontal,
-            before: false,
-            environment: None,
-        }))
+            ..Fixture::fixture(&alpha)
+        })
         .await;
     assert_eq!(
         split,
-        Response::SplitWindow(rmux_proto::SplitWindowResponse {
+        rmux_proto::SplitWindowResponse {
             pane: PaneTarget::new(alpha.clone(), 1),
-        })
+        }
     );
     let split_frame = recv_render_frame(&mut control_rx, "split refresh").await;
     assert!(split_frame.contains('│'));
@@ -73,19 +58,13 @@ async fn attached_session_mutations_emit_refresh_switches() {
     assert!(layout_frame.contains('│'));
 
     let selected_pane = handler
-        .handle(Request::SelectPane(Box::new(SelectPaneRequest {
-            target: PaneTarget::new(alpha, 1),
-            title: None,
-            style: None,
-            input_disabled: None,
-            preserve_zoom: false,
-        })))
+        .handle_ok(SelectPaneRequest::fixture(PaneTarget::new(alpha, 1)))
         .await;
     assert_eq!(
         selected_pane,
-        Response::SelectPane(rmux_proto::SelectPaneResponse {
+        rmux_proto::SelectPaneResponse {
             target: PaneTarget::new(session_name("alpha"), 1),
-        })
+        }
     );
     let select_frame = recv_render_frame(&mut control_rx, "pane refresh").await;
     assert!(select_frame.contains('│'));
@@ -99,32 +78,17 @@ async fn switch_client_updates_the_tracked_session_for_follow_up_refreshes() {
     let alpha = session_name("alpha");
     let beta = session_name("beta");
 
-    for session_name in [alpha.clone(), beta.clone()] {
-        let created = handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name,
-                detached: true,
-                size: Some(TerminalSize { cols: 80, rows: 24 }),
-                environment: None,
-            }))
-            .await;
-        assert!(matches!(created, Response::NewSession(_)));
+    for session in [&alpha, &beta] {
+        handler.create_session(session).await;
     }
 
-    let split = handler
-        .handle(Request::SplitWindow(SplitWindowRequest {
-            target: SplitWindowTarget::Session(beta.clone()),
+    handler
+        .handle_ok(SplitWindowRequest {
             direction: rmux_proto::SplitDirection::Horizontal,
-            before: false,
-            environment: None,
-        }))
+            ..Fixture::fixture(&beta)
+        })
         .await;
-    assert!(matches!(split, Response::SplitWindow(_)));
-
-    let (control_tx, mut control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha, control_tx)
-        .await;
+    let mut control_rx = handler.attach_client(requester_pid, alpha).await;
 
     let switched = handler
         .handle(Request::SwitchClient(SwitchClientRequest {
@@ -140,41 +104,35 @@ async fn switch_client_updates_the_tracked_session_for_follow_up_refreshes() {
     let switch_frame = recv_render_frame(&mut control_rx, "switch refresh").await;
     assert!(switch_frame.contains('│'));
 
-    let global_border = handler
-        .handle(Request::SetOption(SetOptionRequest {
-            scope: ScopeSelector::Global,
-            option: OptionName::PaneActiveBorderStyle,
-            value: "red".to_owned(),
-            mode: SetOptionMode::Replace,
-        }))
+    handler
+        .set_option(
+            ScopeSelector::Global,
+            OptionName::PaneActiveBorderStyle,
+            "red",
+        )
         .await;
-    assert!(matches!(global_border, Response::SetOption(_)));
     let global_frame = recv_render_frame(&mut control_rx, "global refresh").await;
     assert!(global_frame.contains("\u{1b}[31m"));
 
     let beta_window = WindowTarget::with_window(beta.clone(), 0);
-    let session_border = handler
-        .handle(Request::SetOption(SetOptionRequest {
-            scope: ScopeSelector::Window(beta_window),
-            option: OptionName::PaneActiveBorderStyle,
-            value: "blue".to_owned(),
-            mode: SetOptionMode::Replace,
-        }))
+    handler
+        .set_option(
+            ScopeSelector::Window(beta_window),
+            OptionName::PaneActiveBorderStyle,
+            "blue",
+        )
         .await;
-    assert!(matches!(session_border, Response::SetOption(_)));
     let session_frame = recv_render_frame(&mut control_rx, "session refresh").await;
     assert!(session_frame.contains("\u{1b}[34m"));
 
     let alpha_window = WindowTarget::with_window(session_name("alpha"), 0);
-    let other_session = handler
-        .handle(Request::SetOption(SetOptionRequest {
-            scope: ScopeSelector::Window(alpha_window),
-            option: OptionName::PaneBorderStyle,
-            value: "green".to_owned(),
-            mode: SetOptionMode::Replace,
-        }))
+    handler
+        .set_option(
+            ScopeSelector::Window(alpha_window),
+            OptionName::PaneBorderStyle,
+            "green",
+        )
         .await;
-    assert!(matches!(other_session, Response::SetOption(_)));
     assert!(matches!(control_rx.try_recv(), Err(TryRecvError::Empty)));
 }
 
@@ -186,15 +144,7 @@ async fn choose_tree_renders_after_cli_switch_client() {
     let beta = session_name("beta");
     let mut control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
 
-    let created = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name: beta.clone(),
-            detached: true,
-            size: Some(TerminalSize { cols: 80, rows: 24 }),
-            environment: None,
-        }))
-        .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    handler.create_session(&beta).await;
     drain_attach_controls(&mut control_rx);
 
     let switched = handler
@@ -234,15 +184,7 @@ async fn terminal_feature_mutations_refresh_attached_targets_with_client_context
     let requester_pid = 42;
     let alpha = session_name("alpha");
 
-    let created = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name: alpha.clone(),
-            detached: true,
-            size: Some(TerminalSize { cols: 80, rows: 24 }),
-            environment: None,
-        }))
-        .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    handler.create_session(&alpha).await;
 
     let (control_tx, mut control_rx) = mpsc::unbounded_channel();
     let _attach_id = handler
@@ -254,15 +196,16 @@ async fn terminal_feature_mutations_refresh_attached_targets_with_client_context
         )
         .await;
 
-    let set = handler
-        .handle(Request::SetOption(SetOptionRequest {
-            scope: ScopeSelector::Global,
-            option: OptionName::TerminalFeatures,
-            value: "xterm*:sync".to_owned(),
+    handler
+        .handle_ok(SetOptionRequest {
             mode: SetOptionMode::Append,
-        }))
+            ..Fixture::fixture((
+                ScopeSelector::Global,
+                OptionName::TerminalFeatures,
+                "xterm*:sync",
+            ))
+        })
         .await;
-    assert!(matches!(set, Response::SetOption(_)));
 
     let target = recv_switch_target(&mut control_rx, "terminal feature refresh").await;
     assert!(target.outer_terminal.features_string().contains("sync"));
@@ -278,15 +221,7 @@ async fn allow_passthrough_mutations_refresh_attached_targets() {
     let requester_pid = 43;
     let alpha = session_name("alpha");
 
-    let created = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name: alpha.clone(),
-            detached: true,
-            size: Some(TerminalSize { cols: 80, rows: 24 }),
-            environment: None,
-        }))
-        .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    handler.create_session(&alpha).await;
 
     let (control_tx, mut control_rx) = mpsc::unbounded_channel();
     let _attach_id = handler
@@ -298,15 +233,9 @@ async fn allow_passthrough_mutations_refresh_attached_targets() {
         )
         .await;
 
-    let set = handler
-        .handle(Request::SetOption(SetOptionRequest {
-            scope: ScopeSelector::Global,
-            option: OptionName::AllowPassthrough,
-            value: "on".to_owned(),
-            mode: SetOptionMode::Replace,
-        }))
+    handler
+        .set_option(ScopeSelector::Global, OptionName::AllowPassthrough, "on")
         .await;
-    assert!(matches!(set, Response::SetOption(_)));
 
     let target = recv_switch_target(&mut control_rx, "passthrough refresh").await;
     assert!(
@@ -325,15 +254,7 @@ async fn allow_passthrough_enables_sixel_for_sixel_terminals() {
     let requester_pid = 43;
     let alpha = session_name("alpha");
 
-    let created = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name: alpha.clone(),
-            detached: true,
-            size: Some(TerminalSize { cols: 80, rows: 24 }),
-            environment: None,
-        }))
-        .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    handler.create_session(&alpha).await;
 
     let (control_tx, mut control_rx) = mpsc::unbounded_channel();
     let _attach_id = handler
@@ -345,15 +266,9 @@ async fn allow_passthrough_enables_sixel_for_sixel_terminals() {
         )
         .await;
 
-    let set = handler
-        .handle(Request::SetOption(SetOptionRequest {
-            scope: ScopeSelector::Global,
-            option: OptionName::AllowPassthrough,
-            value: "on".to_owned(),
-            mode: SetOptionMode::Replace,
-        }))
+    handler
+        .set_option(ScopeSelector::Global, OptionName::AllowPassthrough, "on")
         .await;
-    assert!(matches!(set, Response::SetOption(_)));
 
     let target = recv_switch_target(&mut control_rx, "passthrough refresh").await;
     assert!(
@@ -368,15 +283,7 @@ async fn allow_passthrough_all_shares_the_active_pane_gate() {
     let requester_pid = 43;
     let alpha = session_name("alpha");
 
-    let created = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name: alpha.clone(),
-            detached: true,
-            size: Some(TerminalSize { cols: 80, rows: 24 }),
-            environment: None,
-        }))
-        .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    handler.create_session(&alpha).await;
 
     let (control_tx, mut control_rx) = mpsc::unbounded_channel();
     let _attach_id = handler
@@ -388,15 +295,9 @@ async fn allow_passthrough_all_shares_the_active_pane_gate() {
         )
         .await;
 
-    let set = handler
-        .handle(Request::SetOption(SetOptionRequest {
-            scope: ScopeSelector::Global,
-            option: OptionName::AllowPassthrough,
-            value: "all".to_owned(),
-            mode: SetOptionMode::Replace,
-        }))
+    handler
+        .set_option(ScopeSelector::Global, OptionName::AllowPassthrough, "all")
         .await;
-    assert!(matches!(set, Response::SetOption(_)));
 
     let target = recv_switch_target(&mut control_rx, "passthrough refresh").await;
     assert!(
@@ -412,15 +313,7 @@ async fn kitty_passthrough_is_disabled_while_active_pane_is_in_copy_mode() {
     let requester_pid = 43;
     let alpha = session_name("alpha");
 
-    let created = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name: alpha.clone(),
-            detached: true,
-            size: Some(TerminalSize { cols: 80, rows: 24 }),
-            environment: None,
-        }))
-        .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    handler.create_session(&alpha).await;
 
     let (control_tx, mut control_rx) = mpsc::unbounded_channel();
     let _attach_id = handler
@@ -432,35 +325,18 @@ async fn kitty_passthrough_is_disabled_while_active_pane_is_in_copy_mode() {
         )
         .await;
 
-    let set = handler
-        .handle(Request::SetOption(SetOptionRequest {
-            scope: ScopeSelector::Global,
-            option: OptionName::AllowPassthrough,
-            value: "on".to_owned(),
-            mode: SetOptionMode::Replace,
-        }))
+    handler
+        .set_option(ScopeSelector::Global, OptionName::AllowPassthrough, "on")
         .await;
-    assert!(matches!(set, Response::SetOption(_)));
     let target = recv_switch_target(&mut control_rx, "passthrough refresh").await;
     assert!(
         target.kitty_graphics_passthrough,
         "kitty passthrough should be available before modal pane modes"
     );
 
-    let copied = handler
-        .handle(Request::CopyMode(CopyModeRequest {
-            target: Some(PaneTarget::new(alpha, 0)),
-            page_down: false,
-            exit_on_scroll: false,
-            hide_position: false,
-            mouse_drag_start: false,
-            cancel_mode: false,
-            scrollbar_scroll: false,
-            source: None,
-            page_up: false,
-        }))
+    handler
+        .handle_ok(CopyModeRequest::fixture(PaneTarget::new(alpha, 0)))
         .await;
-    assert!(matches!(copied, Response::CopyMode(_)));
 
     let target = recv_switch_target(&mut control_rx, "copy-mode refresh").await;
     assert!(
@@ -477,22 +353,11 @@ async fn different_requester_pids_can_control_the_sole_active_attach() {
     let alpha = session_name("alpha");
     let beta = session_name("beta");
 
-    for session_name in [alpha.clone(), beta.clone()] {
-        let created = handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name,
-                detached: true,
-                size: Some(TerminalSize { cols: 80, rows: 24 }),
-                environment: None,
-            }))
-            .await;
-        assert!(matches!(created, Response::NewSession(_)));
+    for session in [&alpha, &beta] {
+        handler.create_session(session).await;
     }
 
-    let (control_tx, mut control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(owner_pid, alpha.clone(), control_tx)
-        .await;
+    let mut control_rx = handler.attach_client(owner_pid, &alpha).await;
 
     let switched = handler
         .dispatch(
@@ -538,30 +403,19 @@ async fn rename_session_preserves_ambiguity_rules_for_switch_and_detach() {
     let beta = session_name("beta");
     let gamma = session_name("gamma");
 
-    for session_name in [alpha.clone(), beta.clone()] {
-        let created = handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name,
-                detached: true,
-                size: Some(TerminalSize { cols: 80, rows: 24 }),
-                environment: None,
-            }))
-            .await;
-        assert!(matches!(created, Response::NewSession(_)));
+    for session in [&alpha, &beta] {
+        handler.create_session(session).await;
     }
 
-    let (first_tx, _first_rx) = mpsc::unbounded_channel();
-    let (second_tx, _second_rx) = mpsc::unbounded_channel();
-    let _first_attach = handler.register_attach(101, alpha.clone(), first_tx).await;
-    let _second_attach = handler.register_attach(202, alpha.clone(), second_tx).await;
+    let _first_rx = handler.attach_client(101, &alpha).await;
+    let _second_rx = handler.attach_client(202, &alpha).await;
 
-    let renamed = handler
-        .handle(Request::RenameSession(RenameSessionRequest {
+    handler
+        .handle_ok(RenameSessionRequest {
             target: alpha,
             new_name: gamma,
-        }))
+        })
         .await;
-    assert!(matches!(renamed, Response::RenameSession(_)));
 
     let switched = handler
         .dispatch(

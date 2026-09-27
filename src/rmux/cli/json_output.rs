@@ -1,11 +1,12 @@
 use std::fmt::Write as _;
-use std::io::{self, ErrorKind, Write};
+use std::io::{self, Write};
 
 use rmux_core::formats::is_truthy;
 use rmux_proto::{CommandOutput, ListClientsResponse, ListWindowsResponse};
 use serde_json::{Map, Value, json};
 
 use super::ExitFailure;
+use super::aux_command::stdout_written;
 
 const FIELD_SEPARATOR: char = '\x1f';
 const FIELD_SEPARATOR_STR: &str = "\x1f";
@@ -161,7 +162,7 @@ pub(super) fn write_length_prefixed_list_windows_json(
 ) -> Result<i32, ExitFailure> {
     let rows =
         parse_length_prefixed_rows(output.stdout(), LIST_WINDOWS_JSON_FIELDS, "list-windows")?;
-    write_json_value(&Value::Array(rows), "list-windows")
+    write_json_object(&Value::Array(rows), "list-windows")
 }
 
 /// Keeps only records whose leading filter field is truthy, dropping that field from each row.
@@ -208,7 +209,7 @@ pub(super) fn write_list_windows_json(response: &ListWindowsResponse) -> Result<
         })
         .collect::<Vec<_>>();
 
-    write_json_value(&Value::Array(rows), "list-windows")
+    write_json_object(&Value::Array(rows), "list-windows")
 }
 
 /// Decodes separator-delimited stdout into rows and writes them as one JSON array.
@@ -219,7 +220,7 @@ fn write_delimited_output_as_json(
 ) -> Result<i32, ExitFailure> {
     let stdout = stdout_string(output.stdout(), command_name)?;
     let rows = parse_delimited_rows(&stdout, fields, command_name)?;
-    write_json_value(&Value::Array(rows), command_name)
+    write_json_object(&Value::Array(rows), command_name)
 }
 
 /// Splits stdout into records, falling back to lines when no record separator is present.
@@ -419,12 +420,12 @@ fn parse_number(
     Ok(Value::Number(number.into()))
 }
 
-/// Writes an already-built JSON value for `command_name` to stdout.
+/// Writes an already-built JSON value for `command_name` to stdout as one line.
 pub(super) fn write_json_object(
-    value: &serde_json::Value,
+    value: &Value,
     command_name: &'static str,
 ) -> Result<i32, ExitFailure> {
-    write_json_value(value, command_name)
+    write_json_value(value, command_name, false)
 }
 
 /// Decodes captured stdout as UTF-8, failing with a `--json` specific message.
@@ -440,27 +441,23 @@ pub(super) fn stdout_string(
     })
 }
 
-/// Serializes `value` plus a newline to stdout, treating a broken pipe as success.
-fn write_json_value(value: &Value, command_name: &'static str) -> Result<i32, ExitFailure> {
+/// Serializes `value`, pretty-printed when `pretty`, plus a newline to stdout.
+///
+/// A broken pipe counts as success; any other failure reads `failed to write {command_name} JSON`.
+pub(super) fn write_json_value(
+    value: &Value,
+    command_name: &str,
+    pretty: bool,
+) -> Result<i32, ExitFailure> {
     let mut stdout = io::stdout().lock();
-    match serde_json::to_writer(&mut stdout, value) {
-        Ok(()) => Ok(0),
-        Err(error) if error.is_io() && error.io_error_kind() == Some(ErrorKind::BrokenPipe) => {
-            Ok(0)
-        }
-        Err(error) => Err(ExitFailure::new(
-            1,
-            format!("failed to write {command_name} JSON: {error}"),
-        )),
-    }?;
-    match stdout.write_all(b"\n") {
-        Ok(()) => Ok(0),
-        Err(error) if error.kind() == ErrorKind::BrokenPipe => Ok(0),
-        Err(error) => Err(ExitFailure::new(
-            1,
-            format!("failed to write {command_name} JSON: {error}"),
-        )),
-    }
+    let written = if pretty {
+        serde_json::to_writer_pretty(&mut stdout, value)
+    } else {
+        serde_json::to_writer(&mut stdout, value)
+    };
+    let describe = |error: io::Error| format!("failed to write {command_name} JSON: {error}");
+    stdout_written(written.map_err(io::Error::from), describe)?;
+    stdout_written(stdout.write_all(b"\n"), describe)
 }
 
 #[cfg(test)]

@@ -1,10 +1,11 @@
+use super::lifecycle::kill_window;
 use super::*;
+use crate::test_fixtures::Quiet;
 
 #[tokio::test]
 async fn list_windows_size_sort_uses_area_and_preserves_equal_area_order() {
     let handler = RequestHandler::new();
-    let alpha = session_name("list-windows-area-sort");
-    create_session(&handler, "list-windows-area-sort").await;
+    let alpha = create_session(&handler, "list-windows-area-sort").await;
     for window_index in 1..=3 {
         insert_window(&handler, &alpha, window_index).await;
     }
@@ -15,56 +16,42 @@ async fn list_windows_size_sort_uses_area_and_preserves_equal_area_order() {
         (2, "middle", 59, 5),
         (3, "large", 20, 24),
     ] {
-        assert!(matches!(
-            handler
-                .handle(Request::RenameWindow(RenameWindowRequest {
-                    target: WindowTarget::with_window(alpha.clone(), window_index),
-                    name: name.to_owned(),
-                }))
-                .await,
-            Response::RenameWindow(_)
-        ));
-        assert!(matches!(
-            handler
-                .handle(Request::ResizeWindow(ResizeWindowRequest {
-                    target: WindowTarget::with_window(alpha.clone(), window_index),
-                    width: Some(cols),
-                    height: Some(rows),
-                    adjustment: None,
-                }))
-                .await,
-            Response::ResizeWindow(_)
-        ));
+        handler
+            .handle_ok(RenameWindowRequest {
+                target: WindowTarget::with_window(alpha.clone(), window_index),
+                name: name.to_owned(),
+            })
+            .await;
+        handler
+            .handle_ok(ResizeWindowRequest {
+                target: WindowTarget::with_window(alpha.clone(), window_index),
+                width: Some(cols),
+                height: Some(rows),
+                adjustment: None,
+            })
+            .await;
     }
 
-    let list = |reversed| {
-        Request::ListWindows(Box::new(ListWindowsRequest {
-            target: alpha.clone(),
-            format: Some("#{window_index}".to_owned()),
-            filter: None,
-            sort_order: Some("size".to_owned()),
-            reversed,
-        }))
+    let list = |reversed| ListWindowsRequest {
+        target: alpha.clone(),
+        format: Some("#{window_index}".to_owned()),
+        filter: None,
+        sort_order: Some("size".to_owned()),
+        reversed,
     };
 
-    let Response::ListWindows(ascending) = handler.handle(list(false)).await else {
-        panic!("expected ascending list-windows response");
-    };
+    let ascending = handler.handle_ok(list(false)).await;
     assert_eq!(ascending.output.stdout(), b"0\n1\n2\n3\n");
 
-    let Response::ListWindows(descending) = handler.handle(list(true)).await else {
-        panic!("expected descending list-windows response");
-    };
+    let descending = handler.handle_ok(list(true)).await;
     assert_eq!(descending.output.stdout(), b"3\n2\n0\n1\n");
 }
 
 #[tokio::test]
 async fn navigation_commands_wrap_and_remain_session_scoped() {
     let handler = RequestHandler::new();
-    let alpha = session_name("alpha");
-    let beta = session_name("beta");
-    create_session(&handler, "alpha").await;
-    create_session(&handler, "beta").await;
+    let alpha = create_session(&handler, "alpha").await;
+    let beta = create_session(&handler, "beta").await;
     insert_window(&handler, &alpha, 3).await;
     insert_window(&handler, &alpha, 7).await;
     insert_window(&handler, &beta, 4).await;
@@ -131,8 +118,7 @@ async fn navigation_commands_wrap_and_remain_session_scoped() {
 #[tokio::test]
 async fn navigation_commands_return_tmux_style_errors_when_history_is_missing() {
     let handler = RequestHandler::new();
-    let alpha = session_name("alpha");
-    create_session(&handler, "alpha").await;
+    let alpha = create_session(&handler, "alpha").await;
     insert_window(&handler, &alpha, 2).await;
 
     assert_eq!(
@@ -147,15 +133,8 @@ async fn navigation_commands_return_tmux_style_errors_when_history_is_missing() 
     );
 
     assert_eq!(
-        handler
-            .handle(Request::KillWindow(KillWindowRequest {
-                target: WindowTarget::with_window(alpha.clone(), 2),
-                kill_all_others: false,
-            }))
-            .await,
-        Response::KillWindow(rmux_proto::KillWindowResponse {
-            target: WindowTarget::with_window(alpha.clone(), 0),
-        })
+        kill_window(&handler, &alpha, 2).await,
+        WindowTarget::with_window(alpha.clone(), 0)
     );
 
     assert_eq!(
@@ -174,41 +153,30 @@ async fn navigation_commands_return_tmux_style_errors_when_history_is_missing() 
 #[tokio::test]
 async fn list_windows_returns_structured_entries_and_rendered_stdout() {
     let handler = RequestHandler::new();
-    let alpha = session_name("alpha");
-    create_session(&handler, "alpha").await;
+    let alpha = create_session(&handler, "alpha").await;
     insert_window(&handler, &alpha, 2).await;
 
-    assert!(matches!(
-        handler
-            .handle(Request::RenameWindow(RenameWindowRequest {
-                target: WindowTarget::with_window(alpha.clone(), 2),
-                name: "logs".to_owned(),
-            }))
-            .await,
-        Response::RenameWindow(_)
-    ));
-    assert!(matches!(
-        handler
-            .handle(Request::SelectWindow(SelectWindowRequest {
-                target: WindowTarget::with_window(alpha.clone(), 2),
-            }))
-            .await,
-        Response::SelectWindow(_)
-    ));
+    handler
+        .handle_ok(RenameWindowRequest {
+            target: WindowTarget::with_window(alpha.clone(), 2),
+            name: "logs".to_owned(),
+        })
+        .await;
+    handler
+        .handle_ok(SelectWindowRequest {
+            target: WindowTarget::with_window(alpha.clone(), 2),
+        })
+        .await;
 
     let response = handler
-        .handle(Request::ListWindows(Box::new(ListWindowsRequest {
+        .handle_ok(ListWindowsRequest {
             target: alpha.clone(),
             format: Some("#{window_index}:#{window_id}:#{window_last_flag}".to_owned()),
             filter: None,
             sort_order: None,
             reversed: false,
-        })))
+        })
         .await;
-
-    let Response::ListWindows(response) = response else {
-        panic!("expected list-windows response");
-    };
     assert_eq!(response.windows.len(), 2);
     assert_eq!(
         response.windows[0].target,
@@ -235,20 +203,9 @@ async fn list_windows_returns_structured_entries_and_rendered_stdout() {
 #[tokio::test]
 async fn list_windows_format_uses_each_windows_active_pane_context() {
     let handler = RequestHandler::new();
-    let alpha = session_name("alpha");
-    create_session(&handler, "alpha").await;
+    let alpha = create_session(&handler, "alpha").await;
 
-    assert!(matches!(
-        handler
-            .handle(Request::SplitWindow(SplitWindowRequest {
-                target: SplitWindowTarget::Session(alpha.clone()),
-                direction: rmux_proto::SplitDirection::Vertical,
-                before: false,
-                environment: None,
-            }))
-            .await,
-        Response::SplitWindow(_)
-    ));
+    handler.handle_ok(SplitWindowRequest::fixture(&alpha)).await;
     insert_window(&handler, &alpha, 2).await;
 
     let expected_active_panes = {
@@ -264,18 +221,14 @@ async fn list_windows_format_uses_each_windows_active_pane_context() {
     };
 
     let response = handler
-        .handle(Request::ListWindows(Box::new(ListWindowsRequest {
+        .handle_ok(ListWindowsRequest {
             target: alpha.clone(),
             format: Some("#{window_index}:#{pane_index}".to_owned()),
             filter: None,
             sort_order: None,
             reversed: false,
-        })))
+        })
         .await;
-
-    let Response::ListWindows(response) = response else {
-        panic!("expected list-windows response");
-    };
     assert_eq!(
         response
             .windows
@@ -290,42 +243,19 @@ async fn list_windows_format_uses_each_windows_active_pane_context() {
 async fn window_mutations_refresh_attached_sessions() {
     let handler = RequestHandler::new();
     let requester_pid = std::process::id();
-    let alpha = session_name("alpha");
-    create_session(&handler, "alpha").await;
+    let alpha = create_session(&handler, "alpha").await;
 
-    let (control_tx, mut control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
+    let mut control_rx = handler.attach_client(requester_pid, &alpha).await;
     drain_attach_controls(&mut control_rx).await;
 
-    let new_window = handler
-        .handle(Request::NewWindow(Box::new(NewWindowRequest {
-            target: alpha.clone(),
-            name: None,
-            detached: true,
-            start_directory: None,
-            environment: None,
-            command: Some(quiet_window_test_command()),
-            process_command: None,
-            target_window_index: None,
-            insert_at_target: false,
-        })))
-        .await;
-    assert!(
-        matches!(new_window, Response::NewWindow(_)),
-        "{new_window:?}"
-    );
+    handler.create_window(Quiet(&alpha)).await;
     assert_refresh(control_rx.try_recv().expect("new-window refresh"));
 
-    assert!(matches!(
-        handler
-            .handle(Request::SelectWindow(SelectWindowRequest {
-                target: WindowTarget::with_window(alpha.clone(), 1),
-            }))
-            .await,
-        Response::SelectWindow(_)
-    ));
+    handler
+        .handle_ok(SelectWindowRequest {
+            target: WindowTarget::with_window(alpha.clone(), 1),
+        })
+        .await;
     assert_refresh(control_rx.try_recv().expect("select-window refresh"));
 
     assert!(matches!(
@@ -360,41 +290,27 @@ async fn window_mutations_refresh_attached_sessions() {
     ));
     assert_refresh(control_rx.try_recv().expect("last-window refresh"));
 
-    assert!(matches!(
-        handler
-            .handle(Request::RenameWindow(RenameWindowRequest {
-                target: WindowTarget::with_window(alpha.clone(), 1),
-                name: "logs".to_owned(),
-            }))
-            .await,
-        Response::RenameWindow(_)
-    ));
+    handler
+        .handle_ok(RenameWindowRequest {
+            target: WindowTarget::with_window(alpha.clone(), 1),
+            name: "logs".to_owned(),
+        })
+        .await;
     assert_refresh(control_rx.try_recv().expect("rename-window refresh"));
 
-    assert!(matches!(
-        handler
-            .handle(Request::KillWindow(KillWindowRequest {
-                target: WindowTarget::with_window(alpha.clone(), 1),
-                kill_all_others: false,
-            }))
-            .await,
-        Response::KillWindow(_)
-    ));
+    kill_window(&handler, &alpha, 1).await;
     assert_refresh(control_rx.try_recv().expect("kill-window refresh"));
     drain_attach_controls(&mut control_rx).await;
 
-    assert!(matches!(
-        handler
-            .handle(Request::ListWindows(Box::new(ListWindowsRequest {
-                target: alpha,
-                format: None,
-                filter: None,
-                sort_order: None,
-                reversed: false,
-            })))
-            .await,
-        Response::ListWindows(_)
-    ));
+    handler
+        .handle_ok(ListWindowsRequest {
+            target: alpha,
+            format: None,
+            filter: None,
+            sort_order: None,
+            reversed: false,
+        })
+        .await;
     match timeout(Duration::from_millis(100), control_rx.recv()).await {
         Err(_) | Ok(None) => {}
         Ok(Some(control)) => {

@@ -1,11 +1,11 @@
 //! Execution support for shell.
 
-use std::{io::Read, path::Path};
+use std::path::Path;
 
 use crate::{
     ExecutionControlFlow, ExecutionParameters, ExecutionResult, ProcessGroupPolicy, SourceInfo,
-    arithmetic::Evaluatable as _, callstack, error, interp::Execute as _, openfiles,
-    trace_categories,
+    arithmetic::Evaluatable as _, callstack, error, extensions::ExecutionObserver as _,
+    interp::Execute as _, openfiles, trace_categories,
 };
 
 impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
@@ -82,25 +82,37 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
         let path = path.as_ref();
         tracing::debug!("sourcing: {}", path.display());
 
-        let mut options = std::fs::File::options();
-        options.read(true);
-
-        let opened_file: openfiles::OpenFile = self
-            .open_file(&options, path, params)
-            .map_err(|e| error::ErrorKind::FailedSourcingFile(path.to_owned(), e))?;
-
-        if opened_file.is_dir() {
-            return Err(error::ErrorKind::FailedSourcingFile(
-                path.to_owned(),
-                std::io::Error::from(std::io::ErrorKind::IsADirectory),
-            )
-            .into());
-        }
-
         let source_info = crate::SourceInfo::from(path.to_owned());
 
+        // Opening and parsing the script is synchronous host I/O outside any scoped future;
+        // the guard ends before the program runs.
+        let parse_result = {
+            let _guard = self.execution_observer.enter_sync()?;
+
+            let mut options = std::fs::File::options();
+            options.read(true);
+
+            let opened_file: openfiles::OpenFile = self
+                .open_file(&options, path, params)
+                .map_err(|e| error::ErrorKind::FailedSourcingFile(path.to_owned(), e))?;
+
+            if opened_file.is_dir() {
+                return Err(error::ErrorKind::FailedSourcingFile(
+                    path.to_owned(),
+                    std::io::Error::from(std::io::ErrorKind::IsADirectory),
+                )
+                .into());
+            }
+
+            let mut reader = std::io::BufReader::new(opened_file);
+            let mut parser = brush_parser::Parser::new(&mut reader, &self.parser_options());
+
+            tracing::debug!(target: trace_categories::PARSE, "Parsing sourced file: {}", source_info.source);
+            parser.parse_program()
+        };
+
         let mut result = self
-            .source_file(opened_file, &source_info, args, params, call_type)
+            .run_parsed_script(parse_result, &source_info, args, params, call_type)
             .await?;
 
         // Handle control flow at script execution boundary. If execution completed
@@ -116,37 +128,38 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
         Ok(result)
     }
 
-    /// Source the given file as a shell script, returning the execution result.
+    /// Runs a parsed shell script in a new script frame, returning the execution result.
     ///
     /// # Arguments
     ///
-    /// * `file` - The file to source.
+    /// * `parse_result` - The result of parsing the script.
     /// * `source_info` - Information about the source of the script.
     /// * `args` - The arguments to pass to the script as positional parameters.
     /// * `params` - Execution parameters.
     /// * `call_type` - The type of script call being made.
-    async fn source_file<F: Read, S: Into<String>, I: Iterator<Item = S>>(
+    async fn run_parsed_script<S: Into<String>, I: Iterator<Item = S>>(
         &mut self,
-        file: F,
+        parse_result: Result<brush_parser::ast::Program, brush_parser::ParseError>,
         source_info: &crate::SourceInfo,
         args: I,
         params: &ExecutionParameters,
         call_type: callstack::ScriptCallType,
     ) -> Result<ExecutionResult, error::Error> {
-        let mut reader = std::io::BufReader::new(file);
-        let mut parser = brush_parser::Parser::new(&mut reader, &self.parser_options());
-
-        tracing::debug!(target: trace_categories::PARSE, "Parsing sourced file: {}", source_info.source);
-        let parse_result = parser.parse_program();
-
         let script_positional_args = args.map(Into::into);
 
         self.call_stack
             .push_script(call_type, source_info, script_positional_args);
 
-        let result = self
-            .run_parsed_result(parse_result, source_info, params)
-            .await;
+        // The script's program runs as a future scoped by the observer.
+        let observer = self.execution_observer.clone();
+        let result = match observer.scope_future(self.run_parsed_result(
+            parse_result,
+            source_info,
+            params,
+        )) {
+            Ok(scoped) => scoped.await,
+            Err(refused) => Err(refused),
+        };
 
         self.call_stack.pop();
 
@@ -163,6 +176,29 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
     pub async fn run_string<S: Into<String>>(
         &mut self,
         command: S,
+        source_info: &crate::SourceInfo,
+        params: &ExecutionParameters,
+    ) -> Result<ExecutionResult, error::Error> {
+        // The program runs as a future scoped by the observer.
+        let command = command.into();
+        let observer = self.execution_observer.clone();
+        observer
+            .scope_future(self.run_string_in_scope(command, source_info, params))?
+            .await
+    }
+
+    /// Parses and executes the given string as a shell program on behalf of code that already
+    /// runs within the observer's scope (e.g., a trap handler), returning the resulting exit
+    /// status.
+    ///
+    /// # Arguments
+    ///
+    /// * `command` - The command to execute.
+    /// * `source_info` - Information about the source of the command text.
+    /// * `params` - Execution parameters.
+    pub(crate) async fn run_string_in_scope(
+        &mut self,
+        command: String,
         source_info: &crate::SourceInfo,
         params: &ExecutionParameters,
     ) -> Result<ExecutionResult, error::Error> {
@@ -239,7 +275,7 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
     ) -> Result<ExecutionResult, error::Error> {
         // If parsing succeeded, run the program. If there's a parse error, it's fatal (per spec).
         let result = match parse_result {
-            Ok(prog) => self.run_program(prog, params).await,
+            Ok(prog) => prog.execute(self, params).await,
             Err(parse_err) => Err(error::Error::from(error::ErrorKind::ParseError(
                 parse_err,
                 source_info.clone(),
@@ -272,7 +308,11 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
         program: brush_parser::ast::Program,
         params: &ExecutionParameters,
     ) -> Result<ExecutionResult, error::Error> {
-        program.execute(self, params).await
+        // The program runs as a future scoped by the observer.
+        let observer = self.execution_observer.clone();
+        observer
+            .scope_future(async move { program.execute(self, params).await })?
+            .await
     }
 
     /// Evaluate the given arithmetic expression, returning the result.

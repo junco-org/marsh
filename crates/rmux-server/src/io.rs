@@ -33,7 +33,7 @@
 //! | Default directory, policy history | [`default_dir`](ShellIo::default_dir), [`history`](ShellIo::history) |
 //! | Shells, one shell, current selection | [`snapshot`](ShellIo::snapshot), [`jobs`](ShellIo::jobs), [`job`](ShellIo::job), [`current_job`](ShellIo::current_job), [`shell`](ShellIo::shell) |
 //! | Create a shell | [`open_shell`](ShellIo::open_shell), [`keep`](ShellIo::keep) |
-//! | Run a line and get its verdict | [`ShellHandle::run_command`], [`on_finish`](ShellIo::on_finish) |
+//! | Run a line and get its verdict | [`ShellHandle::run_command`], [`CommandHandle::wait`](marsh_core::shellmux::CommandHandle::wait) |
 //! | Selection, graceful/forced stop | [`switch`](ShellIo::switch), [`stop`](ShellIo::stop), [`ShellHandle::wait_closed`] |
 //! | Raw input and global resize | [`write_input`](ShellIo::write_input), [`resize`](ShellIo::resize), [`resize_all`](ShellIo::resize_all) |
 //! | Frontend output, lifecycle and errors | [`observe`](ShellIo::observe), [`output`](ShellIo::output), typed completion and closure watches |
@@ -64,14 +64,11 @@
 //! that answer.
 //!
 //! A denial outlives the process that earned it. The durable log records each transaction's
-//! granted capabilities together with the snapshot id that earned them, and reopening the seed
-//! reinstalls that history before any shell can run a line — so [`history`](ShellIo::history) is
-//! a property of the seed rather than of this daemon, and a restart does not hand the next
-//! caller a clean slate. An owner is named by its **snapshot id**, never by a job name: a name
-//! comes back when a pane index is reused or a daemon renumbers from one, and naming owners that
-//! way would let the next holder inherit the last holder's stake. A live denial therefore reads
-//! `owned is unstaged by 1` while that job is alive and `owned is unstaged by 4fe65b15` after a
-//! restart, naming the same stake both times.
+//! granted capabilities together with the Junco principal that earned them. Reopening the seed
+//! reinstalls that same ownership before any shell can run a line; a restart never hands the
+//! next caller a clean slate. A shell's principal is independent of its display name, which may
+//! be reused when a pane closes or the daemon restarts. Denials identify the same principal
+//! before and after recovery, so a new shell cannot inherit an earlier shell's stake.
 //!
 //! # The trust boundary
 //!
@@ -116,8 +113,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use marsh_core::shellmux::{
-    CommandHandle, CommandOptions, JobEnd, JobView, MuxError, OutputChannel, RunError, Shell,
-    ShellId, SnapshotUid, SpawnOptions, TerminalGeometry, WaitError,
+    CommandHandle, CommandOptions, JobEnd, JobView, MuxError, OutputChannel, Principal, RunError,
+    Shell, ShellId, SpawnOptions, TerminalGeometry, WaitError,
 };
 
 pub use events::{IoEnvelope, IoEvent, IoEventStream, IoPhase, IoSnapshot, Observation};
@@ -245,13 +242,13 @@ pub struct ShellHandle {
 }
 
 impl ShellHandle {
-    /// The shell's identity, which is also its capability principal.
+    /// The shell's reusable display/lookup name, not its capability principal.
     #[must_use]
     pub fn id(&self) -> &ShellId {
         self.job.id()
     }
 
-    /// The sandbox its commands run in: identity, directory label and snapshot id.
+    /// Its logical source, directory label and stable principal.
     #[must_use]
     pub fn sandbox(&self) -> &marsh_core::shellmux::Sandbox {
         self.job.sandbox()
@@ -377,8 +374,6 @@ pub(crate) struct IoService {
     /// lease — is dropped even while facade clones are still held. What a caller can still read
     /// afterwards is the frozen metadata below.
     mux: std::sync::Mutex<Option<Arc<marsh_core::shellmux::ShellMux>>>,
-    /// Executor metadata and policy history, captured before the mux is released.
-    frozen: std::sync::Mutex<Frozen>,
     /// The observation bus.
     bus: events::EventBus,
     /// Where the service is in its life.
@@ -403,28 +398,28 @@ pub(crate) struct IoService {
     streams: streams::Streams,
     /// Which rmux surface presents each job generation.
     ///
-    /// Keyed by snapshot id, never by name or index: a pane can be moved, linked or renamed, and
+    /// Keyed by principal, never by name or index: a pane can be moved, linked or renamed, and
     /// a name can be reused, so either of those would eventually address the wrong thing.
-    routes: std::sync::Mutex<std::collections::HashMap<marsh_core::shellmux::SnapshotUid, Route>>,
+    routes: std::sync::Mutex<std::collections::HashMap<marsh_core::shellmux::Principal, Route>>,
     /// The one selection the rmux surface and the engine have agreed on.
     ///
     /// Written by whichever side is about to propagate a change and read by the other side when
     /// it observes that change arriving, which is what keeps the two directions from handing one
-    /// selection back and forth forever. Stored as a stable instance — one snapshot id presented
+    /// selection back and forth forever. Stored as a stable instance — one principal presented
     /// by one stable pane id — because an index, a name or an output generation on its own can
     /// each name a different thing after a move, a rename or a respawn.
-    selection: std::sync::Mutex<Option<(marsh_core::shellmux::SnapshotUid, rmux_core::PaneId)>>,
+    selection: std::sync::Mutex<Option<(marsh_core::shellmux::Principal, rmux_core::PaneId)>>,
     /// The shell this front-end is looking at, with the generation that was selected.
     ///
     /// Selection is presentation, so it lives here and not in the engine: the collection indexes
-    /// shells by principal and has no opinion about what anyone is watching. The generation is
-    /// stored beside the name because a name comes back — a stopped shell's principal can be
-    /// reopened — and a stale selection must not silently follow the replacement.
+    /// shells by name and has no opinion about what anyone is watching. The principal is
+    /// stored beside the name because a name comes back after a shell closes, and a stale
+    /// selection must not silently follow the replacement.
     ///
     /// Deliberately not [`Self::selection`], which is the bidirectional echo-suppression claim
     /// rather than an authoritative choice, and deliberately not a [`ShellHandle`], which would
     /// hold an `Arc` back on this service and make the pair a cycle.
-    current_shell: std::sync::Mutex<Option<(ShellId, SnapshotUid)>>,
+    current_shell: std::sync::Mutex<Option<(ShellId, Principal)>>,
     /// The request handler this facade belongs to, once the daemon has installed it.
     ///
     /// Weak, and behind a lock because it is set after construction: the facade exists before the
@@ -466,18 +461,6 @@ impl std::fmt::Debug for IoService {
     }
 }
 
-/// Read-only state that outlives the mux.
-///
-/// Only paths and events: no executor, no validator, no session handle. That is what makes a
-/// retained facade clone answer after shutdown without holding a single seed lease open.
-#[derive(Debug)]
-struct Frozen {
-    /// Every seed the mux had opened, as of teardown.
-    seeds: Vec<marsh_core::shellmux::SeedInfo>,
-    /// Each of those seeds' policy history, as of teardown.
-    history: std::collections::BTreeMap<PathBuf, Vec<marsh_core::policy::Event>>,
-}
-
 /// What keeps this daemon from deciding it is idle.
 #[derive(Debug, Default)]
 pub(crate) struct Activity {
@@ -486,7 +469,7 @@ pub(crate) struct Activity {
     /// Operations accepted and not yet finished.
     operations: std::sync::atomic::AtomicUsize,
     /// Admitted jobs, until their closure or failed open.
-    instances: std::sync::Mutex<std::collections::HashSet<marsh_core::shellmux::SnapshotUid>>,
+    instances: std::sync::Mutex<std::collections::HashSet<marsh_core::shellmux::Principal>>,
     /// Wakes anything waiting for a retirement.
     retirement: tokio::sync::Notify,
     /// Verdicts a prompt has already rendered, so a job's close does not render them twice.
@@ -502,10 +485,7 @@ pub(crate) struct Activity {
     /// evicted and duplicate the verdict at close. Keyed by generation, so memory is bounded by
     /// the number of live jobs and nothing has to be evicted for correctness.
     rendered: std::sync::Mutex<
-        std::collections::HashMap<
-            marsh_core::shellmux::SnapshotUid,
-            marsh_core::shellmux::CommandId,
-        >,
+        std::collections::HashMap<marsh_core::shellmux::Principal, marsh_core::shellmux::CommandId>,
     >,
 }
 
@@ -639,17 +619,23 @@ impl ShellIo {
     ///
     /// Fails with [`IoError::Transport`] when `initial_dir` cannot be made absolute, and with
     /// [`IoError::Mux`] when a dimension of `geometry` is zero.
-    pub(crate) fn new(
+    pub(crate) fn new<F>(
         initial_dir: &std::path::Path,
         environment: brush_core::env::ShellEnvironment,
         geometry: TerminalGeometry,
-        filesystem: Arc<dyn marsh_btrfs::Subvolumes>,
         runtime: tokio::runtime::Handle,
         socket: PathBuf,
+        create_mux: F,
     ) -> IoResult<(
         Self,
         tokio::sync::mpsc::UnboundedReceiver<crate::shell_frontend::FrontendMessage>,
-    )> {
+    )>
+    where
+        F: FnOnce(
+            marsh_core::shellmux::MuxProfile,
+            Arc<std::sync::Mutex<crate::shell_frontend::FrontendQueue>>,
+        ) -> Result<Arc<marsh_core::shellmux::ShellMux>, MuxError>,
+    {
         use marsh_core::shellmux::ShellFrontend as _;
 
         let default_dir = std::path::absolute(if initial_dir.as_os_str().is_empty() {
@@ -664,10 +650,7 @@ impl ShellIo {
             .take()
             .expect("fresh frontend owns its observation queue");
 
-        // One profile, frozen here, applied to panes, popups and hidden helper jobs alike.
-        // Attaching a shell installs *one* process-wide instrumented builtin table, so a shell
-        // carrying a builtin the latest installation does not know fails that builtin outright:
-        // registering `__rmux_io` for helpers only would break `git` and `exec` for every pane.
+        // Each shell receives its own opaque builtin registration; no process-global installer.
         let mut builtins = std::collections::HashMap::new();
         builtins.insert(
             builtins::RMUX_IO_BUILTIN.to_string(),
@@ -678,20 +661,10 @@ impl ShellIo {
             builtins,
         };
 
-        let mux = marsh_core::shellmux::ShellMux::new_with(
-            profile,
-            Arc::new(std::sync::Mutex::new(frontend)),
-            filesystem,
-        )?;
-
-        let frozen = Frozen {
-            seeds: Vec::new(),
-            history: std::collections::BTreeMap::new(),
-        };
+        let mux = create_mux(profile, Arc::new(std::sync::Mutex::new(frontend)))?;
         let io = Self {
             service: Arc::new(IoService {
                 mux: std::sync::Mutex::new(Some(mux)),
-                frozen: std::sync::Mutex::new(frozen),
                 bus: events::EventBus::new(),
                 phase: std::sync::Mutex::new(IoPhase::Running),
                 runtime,
@@ -854,30 +827,6 @@ impl ShellIo {
         }
     }
 
-    /// Every seed this host's shells have opened, in canonical-path order.
-    ///
-    /// Empty before the first shell: a host leases nothing until a shell names a directory.
-    /// Answers after teardown too, from the frozen copy — where the seeds were is still a
-    /// legitimate question once their leases are gone.
-    ///
-    /// The live path only reads. Seed membership grows whenever any shell discovers a new one,
-    /// so a reader that also wrote its answer into the frozen copy could be pre-empted between
-    /// the two and land a stale list on top of the one [`IoService::release_core`] published —
-    /// permanently hiding a seed whose history the same facade still answers. `release_core` is
-    /// the sole writer, capturing the final membership once, after teardown has settled.
-    #[must_use]
-    pub fn seeds(&self) -> Vec<marsh_core::shellmux::SeedInfo> {
-        if let Some(mux) = self.service.mux_opt() {
-            return mux.seeds();
-        }
-        self.service
-            .frozen
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .seeds
-            .clone()
-    }
-
     /// Whether every shell this host builds carries the builtin `name`.
     ///
     /// A property of the frozen profile, so it can be checked before a single pane exists.
@@ -895,26 +844,6 @@ impl ShellIo {
     #[must_use]
     pub fn default_dir(&self) -> &std::path::Path {
         &self.service.default_dir
-    }
-
-    /// The committed capability history of `seed`, in grant order.
-    ///
-    /// `seed` is a canonical key, as [`Sandbox::seed`](marsh_core::shellmux::Sandbox) and
-    /// [`Self::seeds`] carry it. `None` says this host has not opened that seed, which is a
-    /// different answer from `Some(vec![])` — an opened seed that has granted nothing. After
-    /// teardown this is the copy captured before the mux was released.
-    #[must_use]
-    pub fn history(&self, seed: &std::path::Path) -> Option<Vec<marsh_core::policy::Event>> {
-        if let Some(mux) = self.service.mux_opt() {
-            return mux.history(seed);
-        }
-        self.service
-            .frozen
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .history
-            .get(seed)
-            .cloned()
     }
 
     /// One consistent look at the service, the core behind it, and this front-end's selection.
@@ -961,7 +890,7 @@ impl ShellIo {
     /// The selected shell, if one is selected and still visible as the generation that was
     /// selected.
     ///
-    /// Both halves are checked. A selected shell that was stopped and whose principal was then
+    /// Both halves are checked. A selected shell that was stopped and whose name was then
     /// reopened answers `None` rather than silently handing the replacement the selection its
     /// predecessor earned.
     #[must_use]
@@ -972,7 +901,7 @@ impl ShellIo {
     }
 
     /// This front-end's stored selection, name and generation together.
-    fn selected(&self) -> Option<(ShellId, SnapshotUid)> {
+    fn selected(&self) -> Option<(ShellId, Principal)> {
         self.service
             .current_shell
             .lock()
@@ -993,7 +922,7 @@ impl ShellIo {
     ///
     /// Generation-keyed on purpose: a late close of an older instance must not clear a selection
     /// that has since moved to a newer one.
-    fn clear_selection_of(&self, uid: &SnapshotUid) {
+    fn clear_selection_of(&self, uid: &Principal) {
         let mut current = self
             .service
             .current_shell
@@ -1017,7 +946,7 @@ impl ShellIo {
     /// visible answers to `id`.
     pub fn shell(&self, id: &ShellId) -> IoResult<ShellHandle> {
         let mux = self.service.mux()?;
-        mux.get_shell(id.principal())
+        mux.get_shell(id)
             .map(|job| self.wrap(job))
             .ok_or_else(|| IoError::from(MuxError::NoSuchJob(id.clone())))
     }
@@ -1027,8 +956,8 @@ impl ShellIo {
     /// `initial_dir` is a **host filesystem path** the shell starts in, and the seed it publishes
     /// into is discovered from it: an empty path selects [`Self::default_dir`], a relative one is
     /// joined onto that default, and an absolute one keeps its host meaning. One host therefore
-    /// serves shells over as many seeds as its callers name. `id` is the shell's name *and* its
-    /// capability principal; `None` draws the next automatic one. `SpawnOptions::default()` is a
+    /// serves shells over as many seeds as its callers name. `id` is only the shell's display and
+    /// lookup name; `None` draws the next automatic one. `SpawnOptions::default()` is a
     /// terminal shell at this host's default geometry, with no environment replacement, that
     /// persists across every command run in it.
     ///
@@ -1064,14 +993,13 @@ impl ShellIo {
         } else {
             self.service.default_dir.join(initial_dir)
         };
-        let principal = id.map(|id| id.principal().clone());
         // The instance is recorded inside the dispatched work, not after it: a caller that drops
         // this future has still admitted a shell, and the idle check has to see it either way.
         let service = Arc::clone(&self.service);
         let job = self
             .dispatch(async move {
                 let _work = work;
-                let job = mux.open_shell(&initial_dir, principal, options).await?;
+                let job = mux.open_shell(&initial_dir, id, options).await?;
                 service
                     .activity
                     .instances
@@ -1216,40 +1144,15 @@ impl ShellIo {
         }
     }
 
-    /// Registers the single legacy completion callback on a shell.
-    ///
-    /// **One slot, and it belongs to the shell rather than to a command.** Registering a second
-    /// callback replaces the first, which is what the `bool` reports: `true` means one was
-    /// already installed and has been displaced. The callback receives only an `i32` — the
-    /// completion's
-    /// [`legacy_status`](marsh_core::shellmux::CommandCompletion::legacy_status), which maps "no
-    /// execution result was obtained" onto `-1` — so through it a denied publication and a clean
-    /// exit are indistinguishable. It runs once, on this host's runtime, outside every mux lock.
-    ///
-    /// [`ShellHandle::run_command`] is what everything else should use: it carries the whole
-    /// verdict, with the process status and the publication answer kept apart.
-    ///
-    /// # Errors
-    ///
-    /// Fails for a foreign or stale handle, and after teardown.
-    pub fn on_finish(
-        &self,
-        job: &ShellHandle,
-        done: marsh_core::shellmux::OnFinish,
-    ) -> IoResult<bool> {
-        self.ensure_open()?;
-        Ok(self.owned(job)?.on_finish(done)?)
-    }
-
     /// Selects a terminal shell as the one this front-end is looking at.
     ///
-    /// Selection is presentation and lives here: the engine indexes shells by principal and has
+    /// Selection is presentation and lives here: the engine indexes shells by name and has
     /// no opinion about what anyone is watching. Nothing is started, and the shell's own state is
     /// unchanged apart from [`keep`](Self::keep) cancelling an automatic closure — a reader who
     /// brought a shell up means to look at it, so it is no longer one the series may reclaim.
     ///
     /// The stored selection is the `(name, generation)` pair, checked again on every read: a
-    /// shell that was stopped and whose principal was reopened cannot inherit the selection its
+    /// shell that was stopped and whose name was reopened cannot inherit the selection its
     /// predecessor earned.
     ///
     /// # Errors
@@ -1573,7 +1476,7 @@ impl ShellIo {
     ///
     /// The selection goes with it when it named *this* generation. A late close of an older
     /// instance leaves a newer selection alone, which is why the check is keyed by uid.
-    pub(crate) fn retire_instance(&self, uid: &marsh_core::shellmux::SnapshotUid) {
+    pub(crate) fn retire_instance(&self, uid: &marsh_core::shellmux::Principal) {
         self.service
             .activity
             .instances
@@ -1616,7 +1519,7 @@ impl ShellIo {
     /// outcome worse than showing it twice.
     pub(crate) fn mark_report_rendered(
         &self,
-        uid: &marsh_core::shellmux::SnapshotUid,
+        uid: &marsh_core::shellmux::Principal,
         command: marsh_core::shellmux::CommandId,
     ) {
         self.service
@@ -1635,7 +1538,7 @@ impl ShellIo {
     #[must_use]
     pub(crate) fn report_was_rendered(
         &self,
-        uid: &marsh_core::shellmux::SnapshotUid,
+        uid: &marsh_core::shellmux::Principal,
         command: marsh_core::shellmux::CommandId,
     ) -> bool {
         self.service
@@ -1697,7 +1600,7 @@ impl ShellIo {
     }
 
     /// Records which rmux surface presents one job generation.
-    pub(crate) fn install_route(&self, uid: marsh_core::shellmux::SnapshotUid, route: Route) {
+    pub(crate) fn install_route(&self, uid: marsh_core::shellmux::Principal, route: Route) {
         self.service
             .routes
             .lock()
@@ -1706,7 +1609,7 @@ impl ShellIo {
     }
 
     /// Whether one job generation already has a surface, whatever kind.
-    pub(crate) fn has_route(&self, uid: &marsh_core::shellmux::SnapshotUid) -> bool {
+    pub(crate) fn has_route(&self, uid: &marsh_core::shellmux::Principal) -> bool {
         self.service
             .routes
             .lock()
@@ -1720,7 +1623,7 @@ impl ShellIo {
     /// session, no stable pane id and no output generation: it belongs to one attached client's
     /// overlay. The observation consumer needs a single cheap lookup to decide which of the two
     /// surfaces a terminal chunk belongs to, and this is it.
-    pub(crate) fn is_popup_route(&self, uid: &marsh_core::shellmux::SnapshotUid) -> bool {
+    pub(crate) fn is_popup_route(&self, uid: &marsh_core::shellmux::Principal) -> bool {
         matches!(
             self.service
                 .routes
@@ -1739,7 +1642,7 @@ impl ShellIo {
     /// behind" into "there was never anything here" — byte loss reported as a clean end of file.
     /// Reclamation is instead tied to the readers themselves, in
     /// [`Streams::end`](streams::Streams::end) and [`Streams::release`](streams::Streams::release).
-    pub(crate) fn forget_route(&self, uid: &marsh_core::shellmux::SnapshotUid) {
+    pub(crate) fn forget_route(&self, uid: &marsh_core::shellmux::Principal) {
         self.service
             .routes
             .lock()
@@ -1798,7 +1701,7 @@ impl ShellIo {
     /// if the propagation did not happen after all.
     pub(crate) fn claim_selection(
         &self,
-        uid: &marsh_core::shellmux::SnapshotUid,
+        uid: &marsh_core::shellmux::Principal,
         pane: rmux_core::PaneId,
     ) -> Option<SelectionClaim> {
         let identity = (uid.clone(), pane);
@@ -1867,25 +1770,7 @@ impl ShellIo {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
-        if let Some(mux) = mux {
-            let mut frozen = self
-                .service
-                .frozen
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            // Every opened seed, captured before the mux goes: a retained clone then answers
-            // metadata and history out of plain values, holding no lease of its own.
-            let seeds = mux.seeds();
-            frozen.history = seeds
-                .iter()
-                .filter_map(|info| {
-                    mux.history(&info.seed)
-                        .map(|events| (info.seed.clone(), events))
-                })
-                .collect();
-            frozen.seeds = seeds;
-            drop(frozen);
-        }
+        drop(mux);
     }
 
     /// Tears the service down: no new work, outstanding work finished or discarded, core released.
@@ -2054,9 +1939,9 @@ pub(crate) enum Route {
 /// never happened does not permanently suppress the change it was meant to carry.
 pub(crate) struct SelectionClaim {
     /// The stable instance this claim installed as the agreed selection.
-    identity: (marsh_core::shellmux::SnapshotUid, rmux_core::PaneId),
+    identity: (marsh_core::shellmux::Principal, rmux_core::PaneId),
     /// What was agreed before, to be restored if the propagation is abandoned.
-    previous: Option<(marsh_core::shellmux::SnapshotUid, rmux_core::PaneId)>,
+    previous: Option<(marsh_core::shellmux::Principal, rmux_core::PaneId)>,
 }
 
 /// Keeps an accepted operation visible to the idle check until it finishes.

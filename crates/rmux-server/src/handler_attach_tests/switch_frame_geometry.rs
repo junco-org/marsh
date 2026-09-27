@@ -108,11 +108,10 @@ async fn switch_client_frames_the_target_with_the_joined_sessions_status() {
     for (source_status, target_status, expected) in SWITCH_FRAME_MATRIX {
         for policy in ["smallest", "largest", "latest"] {
             let handler = RequestHandler::new();
-            let (alpha, beta) = linked_alias_sessions(&handler, source_status, target_status).await;
-            set_window_size_policy(&handler, &alpha, SOURCE_WINDOW_INDEX, policy).await;
-            set_window_size_policy(&handler, &beta, TARGET_WINDOW_INDEX, policy).await;
-            let mut control_rx =
-                register_declared_attach(&handler, SWITCHING_PID, &alpha, CLIENT_SIZE).await;
+            let (alpha, beta) =
+                linked_aliases_with_policy(&handler, source_status, target_status, policy).await;
+            let (_, mut control_rx) =
+                register_sized_attach(&handler, SWITCHING_PID, &alpha, CLIENT_SIZE).await;
             drain_attach_controls(&mut control_rx);
 
             let response = handler
@@ -168,11 +167,10 @@ async fn attach_session_frames_the_target_with_the_joined_sessions_status() {
     for (source_status, target_status, expected) in SWITCH_FRAME_MATRIX {
         for policy in ["smallest", "largest"] {
             let handler = RequestHandler::new();
-            let (alpha, beta) = linked_alias_sessions(&handler, source_status, target_status).await;
-            set_window_size_policy(&handler, &alpha, SOURCE_WINDOW_INDEX, policy).await;
-            set_window_size_policy(&handler, &beta, TARGET_WINDOW_INDEX, policy).await;
-            let mut control_rx =
-                register_declared_attach(&handler, SWITCHING_PID, &alpha, CLIENT_SIZE).await;
+            let (alpha, beta) =
+                linked_aliases_with_policy(&handler, source_status, target_status, policy).await;
+            let (_, mut control_rx) =
+                register_sized_attach(&handler, SWITCHING_PID, &alpha, CLIENT_SIZE).await;
             drain_attach_controls(&mut control_rx);
 
             let response = handler
@@ -234,11 +232,10 @@ async fn a_migrating_client_replaces_its_own_stale_registration_in_the_selection
     for (source_status, target_status, expected) in SWITCH_FRAME_MATRIX {
         for policy in ["smallest", "largest", "latest"] {
             let handler = RequestHandler::new();
-            let (alpha, beta) = linked_alias_sessions(&handler, source_status, target_status).await;
-            set_window_size_policy(&handler, &alpha, SOURCE_WINDOW_INDEX, policy).await;
-            set_window_size_policy(&handler, &beta, TARGET_WINDOW_INDEX, policy).await;
-            let _control_rx =
-                register_declared_attach(&handler, SWITCHING_PID, &alpha, CLIENT_SIZE).await;
+            let (alpha, beta) =
+                linked_aliases_with_policy(&handler, source_status, target_status, policy).await;
+            let (_, _control_rx) =
+                register_sized_attach(&handler, SWITCHING_PID, &alpha, CLIENT_SIZE).await;
 
             let selected = handler
                 .selected_attached_session_size(
@@ -246,7 +243,7 @@ async fn a_migrating_client_replaces_its_own_stale_registration_in_the_selection
                     Some(super::super::attach_support::IncomingSizeClient::joining(
                         Some(attach_generation(&handler, SWITCHING_PID).await),
                         CLIENT_SIZE,
-                        super::super::attach_support::ClientFlags::default(),
+                        ClientFlags::default(),
                         // The order the switch commit would allocate for this
                         // client as it joins.
                         handler.next_client_size_sequence(),
@@ -290,12 +287,11 @@ async fn a_stale_attach_session_must_not_displace_a_same_pid_replacement() {
     let mut regressions = Vec::new();
     for policy in ["largest", "smallest"] {
         let handler = RequestHandler::new();
-        let (alpha, beta) = linked_alias_sessions(&handler, STATUS_OFF, STATUS_OFF).await;
-        set_window_size_policy(&handler, &alpha, SOURCE_WINDOW_INDEX, policy).await;
-        set_window_size_policy(&handler, &beta, TARGET_WINDOW_INDEX, policy).await;
+        let (alpha, beta) =
+            linked_aliases_with_policy(&handler, STATUS_OFF, STATUS_OFF, policy).await;
 
-        let mut stale_rx =
-            register_declared_attach(&handler, SWITCHING_PID, &alpha, STALE_CLIENT_SIZE).await;
+        let (_, mut stale_rx) =
+            register_sized_attach(&handler, SWITCHING_PID, &alpha, STALE_CLIENT_SIZE).await;
         drain_attach_controls(&mut stale_rx);
         let stale_identity = handler.active_attach_identity_for_test(SWITCHING_PID).await;
 
@@ -315,24 +311,13 @@ async fn a_stale_attach_session_must_not_displace_a_same_pid_replacement() {
             // applies the shared window's size.
             handler.dispatch(
                 SWITCHING_PID,
-                Request::AttachSessionExt2(Box::new(AttachSessionExt2Request {
-                    target: Some(beta.clone()),
-                    target_spec: Some(beta.to_string()),
-                    detach_other_clients: false,
-                    kill_other_clients: false,
-                    read_only: false,
-                    skip_environment_update: false,
-                    flags: None,
-                    working_directory: None,
-                    client_terminal: rmux_proto::ClientTerminalContext::default(),
-                    client_size: Some(STALE_CLIENT_SIZE),
-                })),
+                attach_session_request(&beta, STALE_CLIENT_SIZE),
             ),
         );
         let replace_the_registration = async {
             pause.reached.notified().await;
-            let mut replacement_rx =
-                register_declared_attach(&handler, SWITCHING_PID, &beta, REPLACEMENT_CLIENT_SIZE)
+            let (_, mut replacement_rx) =
+                register_sized_attach(&handler, SWITCHING_PID, &beta, REPLACEMENT_CLIENT_SIZE)
                     .await;
             drain_attach_controls(&mut replacement_rx);
             let replacement_generation = attach_generation_id(&handler, SWITCHING_PID).await;
@@ -461,12 +446,11 @@ async fn assert_lost_switch_delivery_fails_before_any_resize(lost: LostSwitchDel
     let mut regressions = Vec::new();
     for policy in ["largest", "smallest"] {
         let handler = RequestHandler::new();
-        let (alpha, beta) = linked_alias_sessions(&handler, STATUS_OFF, STATUS_OFF).await;
-        set_window_size_policy(&handler, &alpha, SOURCE_WINDOW_INDEX, policy).await;
-        set_window_size_policy(&handler, &beta, TARGET_WINDOW_INDEX, policy).await;
+        let (alpha, beta) =
+            linked_aliases_with_policy(&handler, STATUS_OFF, STATUS_OFF, policy).await;
 
-        let mut control_rx =
-            register_declared_attach(&handler, SWITCHING_PID, &alpha, HELD_CLIENT_SIZE).await;
+        let (_, mut control_rx) =
+            register_sized_attach(&handler, SWITCHING_PID, &alpha, HELD_CLIENT_SIZE).await;
         drain_attach_controls(&mut control_rx);
         let identity = handler.active_attach_identity_for_test(SWITCHING_PID).await;
         assert_held_geometry(&handler, &alpha, &beta, HELD_CLIENT_SIZE, "before").await;
@@ -484,18 +468,7 @@ async fn assert_lost_switch_delivery_fails_before_any_resize(lost: LostSwitchDel
             identity.session_id(),
             handler.dispatch(
                 SWITCHING_PID,
-                Request::AttachSessionExt2(Box::new(AttachSessionExt2Request {
-                    target: Some(beta.clone()),
-                    target_spec: Some(beta.to_string()),
-                    detach_other_clients: false,
-                    kill_other_clients: false,
-                    read_only: false,
-                    skip_environment_update: false,
-                    flags: None,
-                    working_directory: None,
-                    client_terminal: rmux_proto::ClientTerminalContext::default(),
-                    client_size: Some(REQUESTED_CLIENT_SIZE),
-                })),
+                attach_session_request(&beta, REQUESTED_CLIENT_SIZE),
             ),
         );
         let lose_the_delivery = async {
@@ -528,7 +501,8 @@ async fn assert_lost_switch_delivery_fails_before_any_resize(lost: LostSwitchDel
                      {settled:?}, expected the held {HELD_CLIENT_SIZE:?}"
                 ));
             }
-            let pty = pane_pty_size(&handler, alias, window_index).await;
+            let pane = PaneTarget::with_window(alias.clone(), window_index, 0);
+            let pty = handler.pane_terminal_size_for_test(&pane).await;
             if pty != HELD_CLIENT_SIZE {
                 regressions.push(format!(
                     "window-size={policy}: {lost:?}: the PTY behind {alias}:{window_index} \
@@ -636,29 +610,18 @@ async fn assert_held_geometry(
     phase: &str,
 ) {
     for (alias, window_index) in [(alpha, SOURCE_WINDOW_INDEX), (beta, TARGET_WINDOW_INDEX)] {
+        let pane = PaneTarget::with_window(alias.clone(), window_index, 0);
         assert_eq!(
             window_content_size(handler, alias, window_index).await,
             expected,
             "{phase}: alias {alias}:{window_index} must hold {expected:?}"
         );
         assert_eq!(
-            pane_pty_size(handler, alias, window_index).await,
+            handler.pane_terminal_size_for_test(&pane).await,
             expected,
             "{phase}: the PTY behind {alias}:{window_index} must hold {expected:?}"
         );
     }
-}
-
-/// The real pane PTY behind an alias, not the model geometry that drove it.
-pub(super) async fn pane_pty_size(
-    handler: &RequestHandler,
-    session: &SessionName,
-    window_index: u32,
-) -> TerminalSize {
-    let state = handler.state.lock().await;
-    state
-        .pane_terminal_size(session, window_index, 0)
-        .expect("pane terminal size is readable")
 }
 
 /// The geometry the switch payload really carries: the active pane rectangle is
@@ -681,24 +644,19 @@ pub(super) async fn linked_alias_sessions(
 ) -> (SessionName, SessionName) {
     let alpha = session_name("switch-frame-alpha");
     let beta = session_name("switch-frame-beta");
-    create_session(handler, &alpha).await;
-    create_session(handler, &beta).await;
-    set_session_status(handler, &alpha, source_status).await;
-    set_session_status(handler, &beta, target_status).await;
-    let linked = handler
-        .handle(Request::LinkWindow(LinkWindowRequest {
-            source: WindowTarget::with_window(alpha.clone(), SOURCE_WINDOW_INDEX),
-            target: WindowTarget::with_window(beta.clone(), TARGET_WINDOW_INDEX),
-            after: false,
-            before: false,
-            kill_destination: false,
+    handler.create_session((&alpha, CLIENT_SIZE)).await;
+    handler.create_session((&beta, CLIENT_SIZE)).await;
+    handler.set_session_status(&alpha, source_status).await;
+    handler.set_session_status(&beta, target_status).await;
+    handler
+        .handle_ok(LinkWindowRequest {
             detached: false,
-        }))
+            ..Fixture::fixture((
+                WindowTarget::with_window(alpha.clone(), SOURCE_WINDOW_INDEX),
+                WindowTarget::with_window(beta.clone(), TARGET_WINDOW_INDEX),
+            ))
+        })
         .await;
-    assert!(
-        matches!(linked, Response::LinkWindow(_)),
-        "expected link-window success, got {linked:?}"
-    );
     assert_eq!(
         active_window_index(handler, &beta).await,
         TARGET_WINDOW_INDEX,
@@ -707,92 +665,24 @@ pub(super) async fn linked_alias_sessions(
     (alpha, beta)
 }
 
-async fn create_session(handler: &RequestHandler, session: &SessionName) {
-    let created = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name: session.clone(),
-            detached: true,
-            size: Some(CLIENT_SIZE),
-            environment: None,
-        }))
-        .await;
-    assert!(
-        matches!(created, Response::NewSession(_)),
-        "expected new-session success, got {created:?}"
-    );
-}
-
-pub(super) async fn set_session_status(
+/// [`linked_alias_sessions`] under one `window-size` `policy`. tmux keys `window-size` on the
+/// window itself, so a linked window carries one policy through every alias. rmux keys window
+/// options per `(session, index)`, so both aliases are set to reproduce the oracle's single
+/// window option.
+pub(super) async fn linked_aliases_with_policy(
     handler: &RequestHandler,
-    session: &SessionName,
-    value: &str,
-) {
-    let response = handler
-        .handle(Request::SetOption(SetOptionRequest {
-            scope: ScopeSelector::Session(session.clone()),
-            option: OptionName::Status,
-            value: value.to_owned(),
-            mode: SetOptionMode::Replace,
-        }))
-        .await;
-    assert!(matches!(response, Response::SetOption(_)), "{response:?}");
-}
-
-/// tmux keys `window-size` on the window itself, so a linked window carries one
-/// policy through every alias. rmux keys window options per `(session, index)`,
-/// so both aliases are set here to reproduce the oracle's single window option.
-pub(super) async fn set_window_size_policy(
-    handler: &RequestHandler,
-    session: &SessionName,
-    window_index: u32,
-    value: &str,
-) {
-    let response = handler
-        .handle(Request::SetOption(SetOptionRequest {
-            scope: ScopeSelector::Window(WindowTarget::with_window(session.clone(), window_index)),
-            option: OptionName::WindowSize,
-            value: value.to_owned(),
-            mode: SetOptionMode::Replace,
-        }))
-        .await;
-    assert!(matches!(response, Response::SetOption(_)), "{response:?}");
-}
-
-pub(super) async fn register_declared_attach(
-    handler: &RequestHandler,
-    requester_pid: u32,
-    session: &SessionName,
-    size: TerminalSize,
-) -> mpsc::UnboundedReceiver<AttachControl> {
-    let (control_tx, control_rx) = mpsc::unbounded_channel();
-    let uid = current_owner_uid();
+    source_status: &str,
+    target_status: &str,
+    policy: &str,
+) -> (SessionName, SessionName) {
+    let (alpha, beta) = linked_alias_sessions(handler, source_status, target_status).await;
     handler
-        .register_attach_with_access(
-            requester_pid,
-            session.clone(),
-            None,
-            AttachRegistration {
-                control_tx,
-                control_backlog: Arc::new(AtomicUsize::new(0)),
-                closing: Arc::new(AtomicBool::new(false)),
-                persistent_overlay_epoch: Arc::new(AtomicU64::new(0)),
-                terminal_context: OuterTerminalContext::default(),
-                client_title: None,
-                flags: super::super::attach_support::ClientFlags::default(),
-                render_stream: false,
-                uid,
-                user: rmux_os::identity::UserIdentity::Uid(uid),
-                can_write: true,
-                client_size: Some(size),
-            },
-        )
-        .await
-        .expect("declared attach registration succeeds");
+        .set_window_size_policy(&alpha, SOURCE_WINDOW_INDEX, policy)
+        .await;
     handler
-        .handle_attached_resize(requester_pid, size)
-        .await
-        .expect("declared client size is accepted");
-    control_rx
+        .set_window_size_policy(&beta, TARGET_WINDOW_INDEX, policy)
+        .await;
+    (alpha, beta)
 }
 
 /// The exact registration `requester_pid` holds right now.
@@ -807,7 +697,7 @@ async fn attach_generation(
 }
 
 /// The generation half of that registration, which a same-pid re-attach bumps.
-async fn attach_generation_id(handler: &RequestHandler, requester_pid: u32) -> u64 {
+pub(super) async fn attach_generation_id(handler: &RequestHandler, requester_pid: u32) -> u64 {
     handler
         .active_attach_identity_for_test(requester_pid)
         .await

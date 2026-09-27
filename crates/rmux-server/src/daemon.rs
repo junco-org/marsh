@@ -372,47 +372,39 @@ impl RmuxFrontend {
     /// `environment` seeds every shell this daemon builds, on top of what the process inherited.
     /// `geometry` is the size terminal jobs open at when they ask for none.
     ///
-    /// Must be called from a multi-threaded Tokio runtime; see [`Self::open_with`].
-    ///
-    /// # Errors
-    ///
-    /// Fails for the reasons [`Self::open_with`] does.
+    /// Requires a multi-threaded Tokio runtime and an unused private socket endpoint.
     pub async fn open(
         config: DaemonConfig,
         initial_dir: &Path,
         environment: brush_core::env::ShellEnvironment,
         geometry: marsh_core::shellmux::TerminalGeometry,
     ) -> IoResult<Self> {
-        Self::open_with(
+        Self::open_configured(
             config,
             initial_dir,
             environment,
             geometry,
-            Arc::new(marsh_btrfs::LibBtrfs),
+            marsh_core::shellmux::ShellMux::new::<crate::shell_frontend::FrontendQueue>,
         )
         .await
     }
 
-    /// [`Self::open`] over an explicit snapshot backend.
-    ///
-    /// The only reason to reach for this is to substitute the btrfs implementation — a test
-    /// fixture's copy tree is the standing example. Everything else is identical: the same
-    /// per-shell seed discovery, the same single multiplexer, and the same bound socket.
-    ///
-    /// # Errors
-    ///
-    /// Fails with [`IoError::Transport`] wrapping [`io::ErrorKind::Unsupported`] when there is no
-    /// ambient Tokio runtime or it is current-thread; with [`IoError::Mux`] when a dimension of
-    /// `geometry` is zero; and with [`IoError::Transport`] wrapping
-    /// [`io::ErrorKind::AddrInUse`] when a live server already holds the socket — which is left
-    /// exactly where it is, while the engine this call opened is released.
-    pub async fn open_with(
+    /// Shared construction; only the feature-gated test factory substitutes configured builders.
+    pub(crate) async fn open_configured<F>(
         config: DaemonConfig,
         initial_dir: &Path,
         environment: brush_core::env::ShellEnvironment,
         geometry: marsh_core::shellmux::TerminalGeometry,
-        filesystem: Arc<dyn marsh_btrfs::Subvolumes>,
-    ) -> IoResult<Self> {
+        create_mux: F,
+    ) -> IoResult<Self>
+    where
+        F: FnOnce(
+                marsh_core::shellmux::MuxProfile,
+                Arc<StdMutex<crate::shell_frontend::FrontendQueue>>,
+            )
+                -> Result<Arc<marsh_core::shellmux::ShellMux>, marsh_core::shellmux::MuxError>
+            + Send,
+    {
         // The runtime captured here is the daemon's own. Every managed operation and every task
         // the facade creates lands on it, including ones requested from a status thread, a
         // foreign runtime or a detached command queue.
@@ -451,9 +443,9 @@ impl RmuxFrontend {
             initial_dir,
             environment,
             geometry,
-            filesystem,
             runtime,
             config.socket_path().to_path_buf(),
+            create_mux,
         )?;
         // From here on every early return drops `io`, and with it the only handle to the service:
         // the multiplexer goes, its executors go, and every seed lease its shells took is

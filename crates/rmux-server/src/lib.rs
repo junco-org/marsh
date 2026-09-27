@@ -64,9 +64,13 @@ mod terminal;
 #[cfg(test)]
 mod test_env;
 #[cfg(test)]
+pub(crate) mod test_fixtures;
+#[cfg(test)]
 mod test_names;
 #[cfg(test)]
 mod test_shell;
+#[cfg(any(test, feature = "testing"))]
+pub mod test_support;
 mod tmux_shim;
 mod unix_socket;
 mod unix_socket_access;
@@ -75,11 +79,6 @@ mod wait_for;
 mod web;
 
 pub use io::{IoError, IoResult, ShellHandle, ShellIo};
-/// The snapshot backend an explicit [`RmuxFrontend::open_with`] is given.
-///
-/// Re-exported rather than reimplemented: it is `marsh-btrfs`'s own trait, and a consumer
-/// substituting a fixture for real btrfs names the same one the executor does.
-pub use marsh_btrfs::Subvolumes;
 
 /// Fuzzing entry points for protocol parsers.
 #[cfg(all(unix, feature = "web", feature = "fuzzing"))]
@@ -102,18 +101,3 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub use daemon::{
     default_socket_path, ConfigFileSelection, ConfigLoadOptions, DaemonConfig, RmuxFrontend,
 };
-
-/// Runs the private platform FIFO reader helper when its hidden invocation flag is present.
-///
-/// This is an implementation detail shared by the full `rmux` and `rmux-daemon`
-/// entrypoints. Normal invocations return `None`; helper invocations write the
-/// FIFO payload to standard output and return the process exit code. Calling
-/// this function during normal process startup also advertises the current
-/// executable as a helper host for embedded [`RmuxFrontend`] instances.
-#[doc(hidden)]
-pub fn run_internal_fifo_reader_helper<I>(arguments: I) -> Option<i32>
-where
-    I: IntoIterator<Item = std::ffi::OsString>,
-{
-    buffer_file_io::run_internal_fifo_reader_helper(arguments)
-}

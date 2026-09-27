@@ -2,7 +2,7 @@
 
 use std::borrow::Cow;
 
-use crate::{Shell, error, extensions, prompt};
+use crate::{Shell, error, extensions, extensions::ExecutionObserver as _, prompt};
 
 impl<SE: extensions::ShellExtensions> Shell<SE> {
     /// Returns the default prompt string for the shell.
@@ -16,23 +16,36 @@ impl<SE: extensions::ShellExtensions> Shell<SE> {
 
     /// Composes the shell's post-input, pre-command prompt, applying all appropriate expansions.
     pub async fn compose_precmd_prompt(&mut self) -> Result<String, error::Error> {
-        self.expand_prompt_var("PS0", "").await
+        self.compose_prompt_var("PS0", "").await
     }
 
     /// Composes the shell's prompt, applying all appropriate expansions.
     pub async fn compose_prompt(&mut self) -> Result<String, error::Error> {
-        self.expand_prompt_var("PS1", self.default_prompt()).await
+        self.compose_prompt_var("PS1", self.default_prompt()).await
     }
 
     /// Composes the shell's alternate-side prompt, applying all appropriate expansions.
     pub async fn compose_alt_side_prompt(&mut self) -> Result<String, error::Error> {
         // This is a brush extension.
-        self.expand_prompt_var("BRUSH_PS_ALT", "").await
+        self.compose_prompt_var("BRUSH_PS_ALT", "").await
     }
 
     /// Composes the shell's continuation prompt.
     pub async fn compose_continuation_prompt(&mut self) -> Result<String, error::Error> {
-        self.expand_prompt_var("PS2", "> ").await
+        self.compose_prompt_var("PS2", "> ").await
+    }
+
+    /// Expands the named prompt variable (or `default`, if it's unset) as a future scoped by
+    /// the observer: prompt expansion can run commands (e.g., command substitutions).
+    async fn compose_prompt_var(
+        &mut self,
+        var_name: &str,
+        default: &str,
+    ) -> Result<String, error::Error> {
+        let observer = self.execution_observer.clone();
+        observer
+            .scope_future(self.expand_prompt_var(var_name, default))?
+            .await
     }
 
     pub(super) async fn expand_prompt_var(

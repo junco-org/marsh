@@ -38,11 +38,9 @@
 
 use super::*;
 
-use super::super::attach_support::ClientFlags;
 use super::switch_frame_geometry::{
-    active_window_index, frame_geometry, linked_alias_sessions, pane_pty_size,
-    register_declared_attach, set_session_status, set_window_size_policy, window_content_size,
-    CLIENT_SIZE, SOURCE_WINDOW_INDEX, STATUS_OFF, SWITCHING_PID, TARGET_WINDOW_INDEX,
+    active_window_index, frame_geometry, linked_alias_sessions, window_content_size, CLIENT_SIZE,
+    SOURCE_WINDOW_INDEX, STATUS_OFF, SWITCHING_PID, TARGET_WINDOW_INDEX,
 };
 
 /// The geometry the moving client owns. It registers *first*, so under `latest`
@@ -110,22 +108,14 @@ async fn an_attached_switch_makes_the_moving_client_the_newest_sizing_authority(
         for (policy, before, expected) in LATEST_SWITCH_MATRIX {
             let handler = RequestHandler::new();
             let family = linked_family_with_grouped_alias(&handler, policy).await;
-            let mut moving_rx = register_declared_attach(
-                &handler,
-                SWITCHING_PID,
-                &family.alpha,
-                MOVING_CLIENT_SIZE,
-            )
-            .await;
+            let (_, mut moving_rx) =
+                register_sized_attach(&handler, SWITCHING_PID, &family.alpha, MOVING_CLIENT_SIZE)
+                    .await;
             // Registered second, so this client is the newest vote until the
             // switch happens.
-            let _resident_rx = register_declared_attach(
-                &handler,
-                RESIDENT_PID,
-                &family.beta,
-                RESIDENT_CLIENT_SIZE,
-            )
-            .await;
+            let (_, _resident_rx) =
+                register_sized_attach(&handler, RESIDENT_PID, &family.beta, RESIDENT_CLIENT_SIZE)
+                    .await;
             drain_attach_controls(&mut moving_rx);
 
             let staged = window_content_size(&handler, &family.beta, TARGET_WINDOW_INDEX).await;
@@ -174,7 +164,9 @@ async fn an_attached_switch_makes_the_moving_client_the_newest_sizing_authority(
 
             // A later reconcile of the same window must reach the same answer:
             // re-applying the policy is a production trigger for exactly that.
-            set_window_size_policy(&handler, &family.beta, TARGET_WINDOW_INDEX, policy).await;
+            handler
+                .set_window_size_policy(&family.beta, TARGET_WINDOW_INDEX, policy)
+                .await;
             regressions.extend(
                 family_geometry_regressions(
                     &handler,
@@ -209,12 +201,10 @@ async fn a_current_session_attached_switch_still_makes_the_moving_client_newest(
     ] {
         let handler = RequestHandler::new();
         let family = linked_family_with_grouped_alias(&handler, "latest").await;
-        let mut moving_rx =
-            register_declared_attach(&handler, SWITCHING_PID, &family.alpha, MOVING_CLIENT_SIZE)
-                .await;
-        let _resident_rx =
-            register_declared_attach(&handler, RESIDENT_PID, &family.beta, RESIDENT_CLIENT_SIZE)
-                .await;
+        let (_, mut moving_rx) =
+            register_sized_attach(&handler, SWITCHING_PID, &family.alpha, MOVING_CLIENT_SIZE).await;
+        let (_, _resident_rx) =
+            register_sized_attach(&handler, RESIDENT_PID, &family.beta, RESIDENT_CLIENT_SIZE).await;
         drain_attach_controls(&mut moving_rx);
         assert_eq!(
             window_content_size(&handler, &family.beta, TARGET_WINDOW_INDEX).await,
@@ -248,7 +238,9 @@ async fn a_current_session_attached_switch_still_makes_the_moving_client_newest(
             )
             .await,
         );
-        set_window_size_policy(&handler, &family.beta, TARGET_WINDOW_INDEX, "latest").await;
+        handler
+            .set_window_size_policy(&family.beta, TARGET_WINDOW_INDEX, "latest")
+            .await;
         regressions.extend(
             family_geometry_regressions(
                 &handler,
@@ -305,7 +297,7 @@ async fn a_switch_under_latest_preserves_the_voter_field() {
             LatestVoterRow::MovingClientIsReadOnly => ClientFlags::READONLY,
             LatestVoterRow::ResidentIsSuspended => ClientFlags::default(),
         };
-        let mut moving_rx = register_flagged_attach(
+        let (_, mut moving_rx) = register_sized_attach_with_flags(
             &handler,
             SWITCHING_PID,
             &family.alpha,
@@ -313,9 +305,8 @@ async fn a_switch_under_latest_preserves_the_voter_field() {
             moving_flags,
         )
         .await;
-        let _resident_rx =
-            register_declared_attach(&handler, RESIDENT_PID, &family.beta, RESIDENT_CLIENT_SIZE)
-                .await;
+        let (_, _resident_rx) =
+            register_sized_attach(&handler, RESIDENT_PID, &family.beta, RESIDENT_CLIENT_SIZE).await;
         drain_attach_controls(&mut moving_rx);
         if matches!(row, LatestVoterRow::ResidentIsSuspended) {
             suspend_attached_client(&handler, RESIDENT_PID).await;
@@ -338,7 +329,9 @@ async fn a_switch_under_latest_preserves_the_voter_field() {
             family_geometry_regressions(&handler, &family, expected, &format!("{row:?} settled"))
                 .await,
         );
-        set_window_size_policy(&handler, &family.beta, TARGET_WINDOW_INDEX, "latest").await;
+        handler
+            .set_window_size_policy(&family.beta, TARGET_WINDOW_INDEX, "latest")
+            .await;
         regressions.extend(
             family_geometry_regressions(
                 &handler,
@@ -372,7 +365,8 @@ async fn family_geometry_regressions(
                 "{phase}: alias {alias}:{window_index} is {stored:?}, expected {expected:?}"
             ));
         }
-        let pty = pane_pty_size(handler, alias, window_index).await;
+        let pane = PaneTarget::with_window(alias.clone(), window_index, 0);
+        let pty = handler.pane_terminal_size_for_test(&pane).await;
         if pty != expected {
             regressions.push(format!(
                 "{phase}: the PTY behind {alias}:{window_index} is {pty:?}, \
@@ -409,18 +403,7 @@ async fn move_attached_client(
                 identity.session_id(),
                 handler.dispatch(
                     SWITCHING_PID,
-                    Request::AttachSessionExt2(Box::new(AttachSessionExt2Request {
-                        target: Some(target.clone()),
-                        target_spec: Some(target.to_string()),
-                        detach_other_clients: false,
-                        kill_other_clients: false,
-                        read_only: false,
-                        skip_environment_update: false,
-                        flags: None,
-                        working_directory: None,
-                        client_terminal: rmux_proto::ClientTerminalContext::default(),
-                        client_size: Some(MOVING_CLIENT_SIZE),
-                    })),
+                    attach_session_request(target, MOVING_CLIENT_SIZE),
                 ),
             )
             .await
@@ -442,7 +425,9 @@ async fn linked_family_with_grouped_alias(handler: &RequestHandler, policy: &str
         grouped,
     };
     for (alias, window_index) in family.aliases() {
-        set_window_size_policy(handler, alias, window_index, policy).await;
+        handler
+            .set_window_size_policy(alias, window_index, policy)
+            .await;
     }
     family
 }
@@ -451,79 +436,20 @@ async fn grouped_alias_session(
     handler: &RequestHandler,
     group_target: &SessionName,
 ) -> SessionName {
-    let grouped = session_name("switch-frame-grouped");
-    let created = handler
-        .handle(Request::NewSessionExt(Box::new(NewSessionExtRequest {
-            session_name: Some(grouped.clone()),
-            working_directory: None,
-            detached: true,
+    let grouped = handler
+        .create_session(NewSessionExtRequest {
             size: Some(CLIENT_SIZE),
-            environment: None,
             group_target: Some(group_target.clone()),
-            attach_if_exists: false,
-            detach_other_clients: false,
-            kill_other_clients: false,
-            flags: None,
-            window_name: None,
-            print_session_info: false,
-            print_format: None,
-            command: None,
-            process_command: None,
-            client_environment: None,
-            skip_environment_update: false,
-        })))
+            ..Fixture::fixture(session_name("switch-frame-grouped"))
+        })
         .await;
-    assert!(
-        matches!(created, Response::NewSession(_)),
-        "expected a grouped session, got {created:?}"
-    );
-    set_session_status(handler, &grouped, STATUS_OFF).await;
+    handler.set_session_status(&grouped, STATUS_OFF).await;
     assert_eq!(
         active_window_index(handler, &grouped).await,
         TARGET_WINDOW_INDEX,
         "the grouped alias must be showing the linked window"
     );
     grouped
-}
-
-/// `register_declared_attach` with the client flags a real `attach-session -r`
-/// or `-f ignore-size` would have parsed.
-async fn register_flagged_attach(
-    handler: &RequestHandler,
-    requester_pid: u32,
-    session: &SessionName,
-    size: TerminalSize,
-    flags: ClientFlags,
-) -> mpsc::UnboundedReceiver<AttachControl> {
-    let (control_tx, control_rx) = mpsc::unbounded_channel();
-    let uid = current_owner_uid();
-    handler
-        .register_attach_with_access(
-            requester_pid,
-            session.clone(),
-            None,
-            AttachRegistration {
-                control_tx,
-                control_backlog: Arc::new(AtomicUsize::new(0)),
-                closing: Arc::new(AtomicBool::new(false)),
-                persistent_overlay_epoch: Arc::new(AtomicU64::new(0)),
-                terminal_context: OuterTerminalContext::default(),
-                client_title: None,
-                flags,
-                render_stream: false,
-                uid,
-                user: rmux_os::identity::UserIdentity::Uid(uid),
-                can_write: true,
-                client_size: Some(size),
-            },
-        )
-        .await
-        .expect("flagged attach registration succeeds");
-    handler
-        .handle_attached_resize(requester_pid, size)
-        .await
-        .expect("declared client size is accepted");
-    control_rx
 }
 
 async fn suspend_attached_client(handler: &RequestHandler, attach_pid: u32) {

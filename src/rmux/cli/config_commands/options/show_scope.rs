@@ -1,14 +1,16 @@
 use rmux_client::Connection;
 use rmux_proto::types::OptionScopeSelector;
-use rmux_proto::{PaneTarget, ResolveTargetType, RmuxError, SessionName, Target, WindowTarget};
+use rmux_proto::{HookName, ResolveTargetType, RmuxError, Target};
 
 use crate::cli::ExitFailure;
+use crate::cli::target_resolution::{target_session, target_window};
 use crate::cli_args::{ShowOptionsArgs, ShowOptionsCommandKind, TargetSpec};
 
 use super::super::super::{
     resolve_current_pane_target, resolve_current_session_target, resolve_target_spec,
     resolve_window_target_or_current,
 };
+use super::{dummy_pane_target, option_name_supports_scope};
 
 /// Picks the option scope a `show-options` run reads, from its flags, target and option name.
 pub(in crate::cli::config_commands) fn resolve_show_options_scope(
@@ -17,65 +19,46 @@ pub(in crate::cli::config_commands) fn resolve_show_options_scope(
 ) -> Result<ShowOptionsScope, ExitFailure> {
     let force_window = matches!(command, ShowOptionsCommandKind::ShowWindowOptions);
     let hook = args.name.as_deref().and_then(show_options_hook_name);
+    // A named, non-hook option that cannot be read at the requested scope falls back to the
+    // scope the option itself defaults to.
+    let unsupported = move |scope: &OptionScopeSelector| {
+        args.name
+            .as_deref()
+            .filter(|name| hook.is_none() && !option_name_supports_scope(name, scope))
+    };
     if args.server {
-        if let Some(name) = args.name.as_deref() {
-            if hook.is_none()
-                && !option_supports_show_scope(name, &OptionScopeSelector::ServerGlobal)
-            {
-                return show_named_scope_fallback(args.target.as_ref(), name);
-            }
+        if let Some(name) = unsupported(&OptionScopeSelector::ServerGlobal) {
+            return show_named_scope_fallback(args.target.as_ref(), name);
         }
         return Ok(OptionScopeSelector::ServerGlobal.into());
     }
 
     match (args.window || force_window, args.pane, args.target.as_ref()) {
         (true, false, _) if args.global => Ok(OptionScopeSelector::WindowGlobal.into()),
-        (true, false, Some(target)) => {
-            if let Some(name) = args.name.as_deref() {
-                if hook.is_none()
-                    && !option_supports_show_scope(name, &OptionScopeSelector::WindowGlobal)
-                {
-                    return show_options_scope_for_target(target, Some(name));
-                }
-            }
-            Ok(ShowOptionsScope::Unresolved {
-                target: target.clone(),
-                kind: UnresolvedShowOptionsScope::Window,
-            })
-        }
-        (true, false, None) => {
-            if let Some(name) = args.name.as_deref() {
-                if hook.is_none()
-                    && !option_supports_show_scope(name, &OptionScopeSelector::WindowGlobal)
-                {
-                    return show_named_scope_fallback(None, name);
-                }
-            }
-            Ok(ShowOptionsScope::CurrentWindow)
-        }
-        (false, true, _) if args.global && hook.is_some() => {
-            Ok(show_pane_scope(args.target.as_ref()))
-        }
+        (true, false, target) => unsupported(&OptionScopeSelector::WindowGlobal).map_or_else(
+            || {
+                Ok(ShowOptionsScope::for_target(
+                    target,
+                    UnresolvedShowOptionsScope::Window,
+                ))
+            },
+            |name| show_named_scope_fallback(target, name),
+        ),
+        (false, true, target) if args.global && hook.is_some() => Ok(ShowOptionsScope::for_target(
+            target,
+            UnresolvedShowOptionsScope::Pane,
+        )),
         (false, true, _) if args.global => show_global_pane_options_scope(args),
-        (false, true, Some(target)) => {
-            if let Some(name) = args.name.as_deref() {
-                if hook.is_none() && !option_supports_show_scope(name, &dummy_pane_scope()) {
-                    return show_options_scope_for_target(target, Some(name));
-                }
-            }
-            Ok(ShowOptionsScope::Unresolved {
-                target: target.clone(),
-                kind: UnresolvedShowOptionsScope::Pane,
-            })
-        }
-        (false, true, None) => {
-            if let Some(name) = args.name.as_deref() {
-                if hook.is_none() && !option_supports_show_scope(name, &dummy_pane_scope()) {
-                    return show_named_scope_fallback(None, name);
-                }
-            }
-            Ok(ShowOptionsScope::CurrentPane)
-        }
+        (false, true, target) => unsupported(&OptionScopeSelector::Pane(dummy_pane_target()))
+            .map_or_else(
+                || {
+                    Ok(ShowOptionsScope::for_target(
+                        target,
+                        UnresolvedShowOptionsScope::Pane,
+                    ))
+                },
+                |name| show_named_scope_fallback(target, name),
+            ),
         (false, false, _) if args.global => Ok(if let Some(hook) = hook {
             global_hook_option_scope(hook)
         } else if let Some(name) = args.name.as_deref() {
@@ -88,17 +71,13 @@ pub(in crate::cli::config_commands) fn resolve_show_options_scope(
         }
         .into()),
         (false, false, Some(target)) => match hook {
-            Some(hook) => Ok(ShowOptionsScope::Unresolved {
-                target: target.clone(),
-                kind: hook_scope_kind(hook),
-            }),
+            Some(hook) => Ok(ShowOptionsScope::unresolved(target, hook_scope_kind(hook))),
             None => show_options_scope_for_target(target, args.name.as_deref()),
         },
         (false, false, None) if force_window => Ok(ShowOptionsScope::CurrentWindow),
-        (false, false, None) => Ok(match hook {
-            Some(hook) => current_hook_scope(hook),
-            None => ShowOptionsScope::CurrentSession,
-        }),
+        (false, false, None) => Ok(hook.map_or(ShowOptionsScope::CurrentSession, |hook| {
+            hook_scope_kind(hook).current()
+        })),
         (true, true, _) => unreachable!("clap scope group prevents -w and -p together"),
     }
 }
@@ -124,7 +103,31 @@ pub(in crate::cli::config_commands) enum UnresolvedShowOptionsScope {
     Pane,
 }
 
+impl UnresolvedShowOptionsScope {
+    /// The client's current scope of this kind.
+    const fn current(self) -> ShowOptionsScope {
+        match self {
+            Self::Session => ShowOptionsScope::CurrentSession,
+            Self::Window => ShowOptionsScope::CurrentWindow,
+            Self::Pane => ShowOptionsScope::CurrentPane,
+        }
+    }
+}
+
 impl ShowOptionsScope {
+    /// Defers resolving `target` as a `kind` scope until a connection is available.
+    fn unresolved(target: &TargetSpec, kind: UnresolvedShowOptionsScope) -> Self {
+        Self::Unresolved {
+            target: target.clone(),
+            kind,
+        }
+    }
+
+    /// The `kind` scope of `target`, or the client's current one when no target was named.
+    fn for_target(target: Option<&TargetSpec>, kind: UnresolvedShowOptionsScope) -> Self {
+        target.map_or_else(|| kind.current(), |target| Self::unresolved(target, kind))
+    }
+
     /// Resolves a deferred scope into a concrete `OptionScopeSelector` via the server.
     pub(in crate::cli::config_commands) fn resolve(
         self,
@@ -157,32 +160,22 @@ impl From<OptionScopeSelector> for ShowOptionsScope {
 
 /// Chooses between pane scope and the option's default global scope for `show-options -gp`.
 fn show_global_pane_options_scope(args: &ShowOptionsArgs) -> Result<ShowOptionsScope, ExitFailure> {
-    let pane_scope = dummy_pane_scope();
-    if let Some(name) = args.name.as_deref() {
-        match rmux_core::resolve_option_name(name) {
-            Ok(query) if query.is_user() || query.supports_scope(&pane_scope) => {
-                return Ok(show_pane_scope(args.target.as_ref()));
-            }
-            Ok(_) => {
-                return Ok(rmux_core::default_global_scope_for_option_name(name)
-                    .map_err(option_lookup_exit_failure)?
-                    .into());
-            }
-            Err(error) => return Err(option_lookup_exit_failure(error)),
+    let pane_scope =
+        || ShowOptionsScope::for_target(args.target.as_ref(), UnresolvedShowOptionsScope::Pane);
+    let Some(name) = args.name.as_deref() else {
+        return Ok(pane_scope());
+    };
+    match rmux_core::resolve_option_name(name) {
+        Ok(query)
+            if query.is_user()
+                || query.supports_scope(&OptionScopeSelector::Pane(dummy_pane_target())) =>
+        {
+            Ok(pane_scope())
         }
-    }
-
-    Ok(show_pane_scope(args.target.as_ref()))
-}
-
-/// Yields the given target's pane scope, or the client's current pane when no target was named.
-fn show_pane_scope(target: Option<&TargetSpec>) -> ShowOptionsScope {
-    match target {
-        Some(target) => ShowOptionsScope::Unresolved {
-            target: target.clone(),
-            kind: UnresolvedShowOptionsScope::Pane,
-        },
-        None => ShowOptionsScope::CurrentPane,
+        Ok(_) => Ok(rmux_core::default_global_scope_for_option_name(name)
+            .map_err(option_lookup_exit_failure)?
+            .into()),
+        Err(error) => Err(option_lookup_exit_failure(error)),
     }
 }
 
@@ -197,8 +190,10 @@ fn resolve_unresolved_show_options_scope(
         UnresolvedShowOptionsScope::Window => ResolveTargetType::Window,
         UnresolvedShowOptionsScope::Pane => ResolveTargetType::Pane,
     };
-    let target = resolve_target_spec(connection, target, target_type, false, false)?;
-    match (kind, target) {
+    match (
+        kind,
+        resolve_target_spec(connection, target, target_type, false, false)?,
+    ) {
         (UnresolvedShowOptionsScope::Pane, Target::Pane(target)) => {
             Ok(OptionScopeSelector::Pane(target))
         }
@@ -206,28 +201,32 @@ fn resolve_unresolved_show_options_scope(
             1,
             "show-options -p requires a pane target",
         )),
-        (UnresolvedShowOptionsScope::Session, Target::Session(session_name)) => {
-            Ok(OptionScopeSelector::Session(session_name))
+        (UnresolvedShowOptionsScope::Session, target) => {
+            Ok(OptionScopeSelector::Session(target_session(target)))
         }
-        (UnresolvedShowOptionsScope::Session, Target::Window(target)) => {
-            Ok(OptionScopeSelector::Session(target.session_name().clone()))
-        }
-        (UnresolvedShowOptionsScope::Session, Target::Pane(target)) => {
-            Ok(OptionScopeSelector::Session(target.session_name().clone()))
-        }
-        (UnresolvedShowOptionsScope::Window, Target::Session(session_name)) => {
-            Ok(OptionScopeSelector::Window(WindowTarget::new(session_name)))
-        }
-        (UnresolvedShowOptionsScope::Window, Target::Window(target)) => {
-            Ok(OptionScopeSelector::Window(target))
-        }
-        (UnresolvedShowOptionsScope::Window, Target::Pane(target)) => {
-            Ok(OptionScopeSelector::Window(WindowTarget::with_window(
-                target.session_name().clone(),
-                target.window_index(),
-            )))
+        (UnresolvedShowOptionsScope::Window, target) => {
+            Ok(OptionScopeSelector::Window(target_window(target)))
         }
     }
+}
+
+/// The deferred scope kind the named option's default global scope implies, `None` for a
+/// server option, which needs no target.
+fn option_scope_kind(name: &str) -> Result<Option<UnresolvedShowOptionsScope>, ExitFailure> {
+    Ok(
+        match rmux_core::default_global_scope_for_option_name(name)
+            .map_err(option_lookup_exit_failure)?
+        {
+            OptionScopeSelector::ServerGlobal => None,
+            OptionScopeSelector::WindowGlobal | OptionScopeSelector::Window(_) => {
+                Some(UnresolvedShowOptionsScope::Window)
+            }
+            OptionScopeSelector::Pane(_) => Some(UnresolvedShowOptionsScope::Pane),
+            OptionScopeSelector::SessionGlobal | OptionScopeSelector::Session(_) => {
+                Some(UnresolvedShowOptionsScope::Session)
+            }
+        },
+    )
 }
 
 /// Derives the deferred scope kind for a target from the named option's default global scope.
@@ -235,34 +234,14 @@ fn show_options_scope_for_target(
     target: &TargetSpec,
     name: Option<&str>,
 ) -> Result<ShowOptionsScope, ExitFailure> {
-    let Some(name) = name else {
-        return Ok(ShowOptionsScope::Unresolved {
-            target: target.clone(),
-            kind: UnresolvedShowOptionsScope::Session,
-        });
+    let kind = match name {
+        Some(name) => option_scope_kind(name)?,
+        None => Some(UnresolvedShowOptionsScope::Session),
     };
-
-    match rmux_core::default_global_scope_for_option_name(name)
-        .map_err(option_lookup_exit_failure)?
-    {
-        OptionScopeSelector::ServerGlobal => Ok(OptionScopeSelector::ServerGlobal.into()),
-        OptionScopeSelector::WindowGlobal | OptionScopeSelector::Window(_) => {
-            Ok(ShowOptionsScope::Unresolved {
-                target: target.clone(),
-                kind: UnresolvedShowOptionsScope::Window,
-            })
-        }
-        OptionScopeSelector::Pane(_) => Ok(ShowOptionsScope::Unresolved {
-            target: target.clone(),
-            kind: UnresolvedShowOptionsScope::Pane,
-        }),
-        OptionScopeSelector::SessionGlobal | OptionScopeSelector::Session(_) => {
-            Ok(ShowOptionsScope::Unresolved {
-                target: target.clone(),
-                kind: UnresolvedShowOptionsScope::Session,
-            })
-        }
-    }
+    Ok(kind.map_or(
+        ShowOptionsScope::Resolved(OptionScopeSelector::ServerGlobal),
+        |kind| ShowOptionsScope::unresolved(target, kind),
+    ))
 }
 
 /// Falls back to the named option's default scope when the requested scope does not support it.
@@ -273,51 +252,24 @@ fn show_named_scope_fallback(
     if let Some(target) = target {
         return show_options_scope_for_target(target, Some(name));
     }
-
-    match rmux_core::default_global_scope_for_option_name(name)
-        .map_err(option_lookup_exit_failure)?
-    {
-        OptionScopeSelector::ServerGlobal => Ok(OptionScopeSelector::ServerGlobal.into()),
-        OptionScopeSelector::WindowGlobal | OptionScopeSelector::Window(_) => {
-            Ok(ShowOptionsScope::CurrentWindow)
-        }
-        OptionScopeSelector::Pane(_) => Ok(ShowOptionsScope::CurrentPane),
-        OptionScopeSelector::SessionGlobal | OptionScopeSelector::Session(_) => {
-            Ok(ShowOptionsScope::CurrentSession)
-        }
-    }
-}
-
-/// Reports whether the named option may be read at `scope`, treating unknown names as unsupported.
-fn option_supports_show_scope(name: &str, scope: &OptionScopeSelector) -> bool {
-    rmux_core::resolve_option_name(name).is_ok_and(|query| query.supports_scope(scope))
-}
-
-/// Builds a throwaway pane scope used only to test whether an option is pane scoped.
-#[allow(
-    clippy::expect_used,
-    reason = "a fixed literal session name is valid by construction"
-)]
-fn dummy_pane_scope() -> OptionScopeSelector {
-    OptionScopeSelector::Pane(PaneTarget::with_window(
-        SessionName::new("show-scope").expect("valid session name"),
-        0,
-        0,
+    Ok(option_scope_kind(name)?.map_or(
+        ShowOptionsScope::Resolved(OptionScopeSelector::ServerGlobal),
+        UnresolvedShowOptionsScope::current,
     ))
 }
 
 /// Parses an option name as a hook name, tolerating a trailing `[index]` array subscript.
-fn show_options_hook_name(value: &str) -> Option<rmux_proto::HookName> {
+fn show_options_hook_name(value: &str) -> Option<HookName> {
     let name = match value.rsplit_once('[') {
         Some((name, index)) if index.strip_suffix(']')?.parse::<u32>().is_ok() => name,
         Some(_) => return None,
         None => value,
     };
-    rmux_proto::HookName::from_str(name)
+    HookName::from_str(name)
 }
 
 /// Maps a hook to the global scope its options live in, either session or window global.
-const fn global_hook_option_scope(hook: rmux_proto::HookName) -> OptionScopeSelector {
+const fn global_hook_option_scope(hook: HookName) -> OptionScopeSelector {
     match rmux_core::hook_global_root(hook) {
         rmux_core::HookGlobalRoot::Session => OptionScopeSelector::SessionGlobal,
         rmux_core::HookGlobalRoot::Window => OptionScopeSelector::WindowGlobal,
@@ -325,30 +277,12 @@ const fn global_hook_option_scope(hook: rmux_proto::HookName) -> OptionScopeSele
 }
 
 /// Reports whether a hook naturally resolves against a session, window or pane target.
-#[allow(
-    clippy::expect_used,
-    reason = "a fixed literal session name is valid by construction"
-)]
-fn hook_scope_kind(hook: rmux_proto::HookName) -> UnresolvedShowOptionsScope {
-    let target = Target::Pane(PaneTarget::with_window(
-        SessionName::new("show-hook-scope").expect("valid session name"),
-        0,
-        0,
-    ));
-    match rmux_core::hook_natural_scope_for_target(hook, target) {
+fn hook_scope_kind(hook: HookName) -> UnresolvedShowOptionsScope {
+    match rmux_core::hook_natural_scope_for_target(hook, Target::Pane(dummy_pane_target())) {
         rmux_proto::ScopeSelector::Session(_) => UnresolvedShowOptionsScope::Session,
         rmux_proto::ScopeSelector::Window(_) => UnresolvedShowOptionsScope::Window,
         rmux_proto::ScopeSelector::Pane(_) => UnresolvedShowOptionsScope::Pane,
         rmux_proto::ScopeSelector::Global => unreachable!("natural hook scope is local"),
-    }
-}
-
-/// Maps a hook to the client's matching current session, window or pane scope.
-fn current_hook_scope(hook: rmux_proto::HookName) -> ShowOptionsScope {
-    match hook_scope_kind(hook) {
-        UnresolvedShowOptionsScope::Session => ShowOptionsScope::CurrentSession,
-        UnresolvedShowOptionsScope::Window => ShowOptionsScope::CurrentWindow,
-        UnresolvedShowOptionsScope::Pane => ShowOptionsScope::CurrentPane,
     }
 }
 

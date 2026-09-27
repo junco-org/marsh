@@ -3,18 +3,7 @@ use super::*;
 #[tokio::test]
 async fn parsed_queue_accepts_display_message_format_flag() {
     let handler = RequestHandler::new();
-    let alpha = session_name("alpha");
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: alpha.clone(),
-                detached: true,
-                size: Some(TerminalSize { cols: 80, rows: 24 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
+    handler.create_session("alpha").await;
 
     let parsed = CommandParser::new()
         .parse("display-message -p -F '#{session_name}' -t alpha")
@@ -108,18 +97,7 @@ async fn parsed_queue_display_message_reports_tmux_delay_errors() {
 #[tokio::test]
 async fn parsed_queue_display_message_accepts_compact_print_target_cluster() {
     let handler = RequestHandler::new();
-    let alpha = session_name("alpha");
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: alpha.clone(),
-                detached: true,
-                size: Some(TerminalSize { cols: 80, rows: 24 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
+    handler.create_session("alpha").await;
 
     let parsed = CommandParser::new()
         .parse("display-message -pt alpha:0.0 'hi-#{pane_index}'")
@@ -167,22 +145,13 @@ async fn parsed_queue_display_message_targets_control_client_with_initiator_cont
     let handler = RequestHandler::new();
     let alpha = session_name("display-control-alpha");
     let detached = session_name("display-control-detached");
-    for session_name in [alpha.clone(), detached.clone()] {
-        assert!(matches!(
-            handler
-                .handle(Request::NewSession(NewSessionRequest {
-                    session_name,
-                    detached: true,
-                    size: Some(TerminalSize { cols: 80, rows: 24 }),
-                    environment: None,
-                }))
-                .await,
-            Response::NewSession(_)
-        ));
+    for session in [&alpha, &detached] {
+        handler.create_session(session).await;
     }
     let requester_pid = 99_613;
-    let (control_id, mut events) =
-        register_control_for_session(&handler, requester_pid, alpha.clone()).await;
+    let (control_id, mut events) = handler
+        .register_control_for_test(requester_pid, Some(&alpha))
+        .await;
     while events.try_recv().is_ok() {}
     let identity = ControlClientIdentity::new(requester_pid, control_id);
     let client_name = format!("client-{requester_pid}");
@@ -264,17 +233,7 @@ async fn parsed_queue_display_message_all_formats_uses_core_inventory() {
 async fn parsed_queue_list_panes_all_does_not_require_current_target() {
     let handler = RequestHandler::new();
     for name in ["alpha", "beta"] {
-        assert!(matches!(
-            handler
-                .handle(Request::NewSession(NewSessionRequest {
-                    session_name: session_name(name),
-                    detached: true,
-                    size: Some(TerminalSize { cols: 80, rows: 24 }),
-                    environment: None,
-                }))
-                .await,
-            Response::NewSession(_)
-        ));
+        handler.create_session(name).await;
     }
 
     let parsed = CommandParser::new()
@@ -330,17 +289,7 @@ async fn parsed_queue_set_environment_requires_a_value() {
 #[tokio::test]
 async fn parsed_queue_set_environment_uses_current_session_by_default() {
     let handler = RequestHandler::new();
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: session_name("alpha"),
-                detached: true,
-                size: Some(TerminalSize { cols: 80, rows: 24 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
+    handler.create_session("alpha").await;
 
     let parsed = CommandParser::new()
         .parse(
@@ -377,11 +326,7 @@ async fn hook_string_mode_newlines_share_one_abort_group() {
 
     assert!(result.is_err());
     assert!(matches!(
-        handler
-            .handle(Request::ShowBuffer(ShowBufferRequest {
-                name: Some("skipped".to_owned()),
-            }))
-            .await,
+        handler.handle(show_buffer_request("skipped")).await,
         Response::Error(_)
     ));
 }

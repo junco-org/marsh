@@ -14,7 +14,7 @@
 //! including `refresh_attached_client`, whose `expected_attach_id` is `None`.
 
 use super::set_titles_support::{
-    delivered_titles, new_detached_session, remembered_title, set_global, title_capable_context,
+    attach_sized_client, delivered_titles, remembered_title, set_global,
 };
 use super::*;
 
@@ -32,40 +32,6 @@ fn title_for(size: TerminalSize) -> String {
     format!("GEN={}x{}", size.cols, size.rows)
 }
 
-/// Registers one client exactly as `listener.rs` publishes a fresh attach.
-async fn attach_sized_client(
-    handler: &RequestHandler,
-    session: &rmux_proto::SessionName,
-    attach_pid: u32,
-    client_size: TerminalSize,
-) -> mpsc::UnboundedReceiver<AttachControl> {
-    let (control_tx, control_rx) = mpsc::unbounded_channel();
-    let uid = current_owner_uid();
-    handler
-        .register_attach_with_access(
-            attach_pid,
-            session.clone(),
-            None,
-            AttachRegistration {
-                control_tx,
-                control_backlog: Arc::new(AtomicUsize::new(0)),
-                closing: Arc::new(AtomicBool::new(false)),
-                persistent_overlay_epoch: Arc::new(AtomicU64::new(0)),
-                terminal_context: title_capable_context(),
-                client_title: None,
-                flags: crate::handler::attach_support::ClientFlags::default(),
-                render_stream: false,
-                uid,
-                user: rmux_os::identity::UserIdentity::Uid(uid),
-                can_write: true,
-                client_size: Some(client_size),
-            },
-        )
-        .await
-        .expect("attach registration succeeds");
-    control_rx
-}
-
 /// Arms a session whose title reports each client's own geometry, attaches the
 /// first generation and drains whatever its registration already produced.
 async fn armed_session(
@@ -78,7 +44,7 @@ async fn armed_session(
 ) {
     let handler = RequestHandler::new();
     let session = session_name(label);
-    new_detached_session(&handler, &session).await;
+    handler.create_session(&session).await;
     set_global(&handler, OptionName::SetTitlesString, GEOMETRY_TITLE_FORMAT).await;
     set_global(&handler, OptionName::SetTitles, "on").await;
 

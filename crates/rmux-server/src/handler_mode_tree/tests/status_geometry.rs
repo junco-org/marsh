@@ -1,6 +1,5 @@
 use super::*;
 
-use crate::pane_io::AttachControl;
 use rmux_core::PaneGeometry;
 
 #[derive(Clone, Copy)]
@@ -76,46 +75,23 @@ impl OriginCase {
     }
 }
 
-fn frame_visits_row(frame: &[u8], one_based_row: u16) -> bool {
-    let cursor = format!("\x1b[{one_based_row};1H");
-    frame
-        .windows(cursor.len())
-        .any(|window| window == cursor.as_bytes())
-}
-
 async fn set_status_case(handler: &RequestHandler, status_case: StatusCase) {
     let status = match status_case {
         StatusCase::MultiBottom => "3",
         StatusCase::Off => "off",
         StatusCase::Bottom | StatusCase::Top => "on",
     };
-    assert!(matches!(
-        handler
-            .handle(Request::SetOption(SetOptionRequest {
-                scope: ScopeSelector::Global,
-                option: OptionName::Status,
-                value: status.to_owned(),
-                mode: SetOptionMode::Replace,
-            }))
-            .await,
-        Response::SetOption(_)
-    ));
+    handler
+        .set_option(ScopeSelector::Global, OptionName::Status, status)
+        .await;
     let position = if matches!(status_case, StatusCase::Top) {
         "top"
     } else {
         "bottom"
     };
-    assert!(matches!(
-        handler
-            .handle(Request::SetOption(SetOptionRequest {
-                scope: ScopeSelector::Global,
-                option: OptionName::StatusPosition,
-                value: position.to_owned(),
-                mode: SetOptionMode::Replace,
-            }))
-            .await,
-        Response::SetOption(_)
-    ));
+    handler
+        .set_option(ScopeSelector::Global, OptionName::StatusPosition, position)
+        .await;
 }
 
 async fn overlay_geometry_case(
@@ -132,29 +108,13 @@ async fn overlay_geometry_case(
         origin_case.label()
     );
     let session_name = SessionName::new(label).expect("valid session");
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: session_name.clone(),
-                detached: true,
-                size: Some(TerminalSize { cols: 80, rows: 24 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
+    handler.create_session(&session_name).await;
     set_status_case(&handler, status_case).await;
 
     let observer_pid = std::process::id().saturating_add(pid_offset);
     let second_pid = observer_pid.saturating_add(1);
-    let (observer_tx, mut observer_rx) = mpsc::unbounded_channel();
-    let (second_tx, _second_rx) = mpsc::unbounded_channel();
-    handler
-        .register_attach(observer_pid, session_name.clone(), observer_tx)
-        .await;
-    handler
-        .register_attach(second_pid, session_name.clone(), second_tx)
-        .await;
+    let mut observer_rx = handler.attach_client(observer_pid, &session_name).await;
+    let _second_rx = handler.attach_client(second_pid, &session_name).await;
     while observer_rx.try_recv().is_ok() {}
 
     let target = format!("{}:0.0", session_name.as_str());
@@ -163,24 +123,11 @@ async fn overlay_geometry_case(
         ModeTreeKind::Client => vec!["choose-client"],
         other => panic!("unexpected mode-tree kind: {other:?}"),
     };
-    let parsed = CommandParser::new()
-        .parse_arguments(arguments)
-        .expect("mode-tree command parses");
-    let command = RequestHandler::parse_mode_tree_queue_command(parsed.commands()[0].clone())
-        .expect("mode-tree command parses")
-        .expect("mode-tree command recognized");
     let requester_pid = match origin_case {
         OriginCase::AttachedPty => observer_pid,
         OriginCase::Control => second_pid.saturating_add(100),
     };
-    handler
-        .execute_queued_mode_tree(
-            requester_pid,
-            command,
-            &QueueExecutionContext::without_caller_cwd(),
-        )
-        .await
-        .expect("mode-tree overlay opens");
+    open_mode_tree(&handler, requester_pid, &arguments).await;
 
     let mode = handler
         .active_attach

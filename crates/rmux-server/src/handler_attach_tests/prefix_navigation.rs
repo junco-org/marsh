@@ -6,29 +6,18 @@ async fn attached_prefix_right_dispatches_select_pane_right() {
     let requester_pid = std::process::id();
     let alpha = session_name("alpha");
     let _control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
-    assert!(matches!(
-        handler
-            .handle(Request::SplitWindow(SplitWindowRequest {
-                target: SplitWindowTarget::Session(alpha.clone()),
-                direction: rmux_proto::SplitDirection::Horizontal,
-                before: false,
-                environment: None,
-            }))
-            .await,
-        Response::SplitWindow(_)
-    ));
-    assert!(matches!(
-        handler
-            .handle(Request::SelectPane(Box::new(SelectPaneRequest {
-                target: PaneTarget::new(alpha.clone(), 0),
-                title: None,
-                style: None,
-                input_disabled: None,
-                preserve_zoom: false,
-            })))
-            .await,
-        Response::SelectPane(_)
-    ));
+    handler
+        .handle_ok(SplitWindowRequest {
+            direction: rmux_proto::SplitDirection::Horizontal,
+            ..Fixture::fixture(&alpha)
+        })
+        .await;
+    handler
+        .handle_ok(SelectPaneRequest::fixture(PaneTarget::new(
+            alpha.clone(),
+            0,
+        )))
+        .await;
 
     handler
         .handle_attached_live_input_for_test(requester_pid, b"\x02\x1b[C")
@@ -44,22 +33,7 @@ async fn attached_prefix_n_dispatches_next_window() {
     let requester_pid = std::process::id();
     let alpha = session_name("alpha");
     let _control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
-    assert!(matches!(
-        handler
-            .handle(Request::NewWindow(Box::new(NewWindowRequest {
-                target: alpha.clone(),
-                name: None,
-                detached: true,
-                start_directory: None,
-                environment: None,
-                command: None,
-                process_command: None,
-                target_window_index: None,
-                insert_at_target: false,
-            })))
-            .await,
-        Response::NewWindow(_)
-    ));
+    handler.create_window(&alpha).await;
 
     handler
         .handle_attached_live_input_for_test(requester_pid, b"\x02n")
@@ -125,17 +99,12 @@ async fn attached_prefix_o_cycles_to_the_next_pane() {
     let requester_pid = std::process::id();
     let alpha = session_name("alpha");
     let _control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
-    assert!(matches!(
-        handler
-            .handle(Request::SplitWindow(SplitWindowRequest {
-                target: SplitWindowTarget::Session(alpha.clone()),
-                direction: rmux_proto::SplitDirection::Horizontal,
-                before: false,
-                environment: None,
-            }))
-            .await,
-        Response::SplitWindow(_)
-    ));
+    handler
+        .handle_ok(SplitWindowRequest {
+            direction: rmux_proto::SplitDirection::Horizontal,
+            ..Fixture::fixture(&alpha)
+        })
+        .await;
 
     handler
         .handle_attached_live_input_for_test(requester_pid, b"\x02o")
@@ -169,17 +138,7 @@ async fn attached_prefix_meta_digits_select_tmux_layout_presets() {
         }
     });
     for _ in 0..2 {
-        assert!(matches!(
-            handler
-                .handle(Request::SplitWindow(SplitWindowRequest {
-                    target: SplitWindowTarget::Session(alpha.clone()),
-                    direction: rmux_proto::SplitDirection::Vertical,
-                    before: false,
-                    environment: None,
-                }))
-                .await,
-            Response::SplitWindow(_)
-        ));
+        handler.handle_ok(SplitWindowRequest::fixture(&alpha)).await;
     }
 
     for (bytes, expected_layout, starting_layout) in [
@@ -231,17 +190,7 @@ async fn attached_select_layout_main_horizontal_binding_command_executes() {
     let alpha = session_name("alpha");
     let _control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
     for _ in 0..2 {
-        assert!(matches!(
-            handler
-                .handle(Request::SplitWindow(SplitWindowRequest {
-                    target: SplitWindowTarget::Session(alpha.clone()),
-                    direction: rmux_proto::SplitDirection::Vertical,
-                    before: false,
-                    environment: None,
-                }))
-                .await,
-            Response::SplitWindow(_)
-        ));
+        handler.handle_ok(SplitWindowRequest::fixture(&alpha)).await;
     }
     select_layout(&handler, &alpha, LayoutName::Tiled).await;
 
@@ -267,17 +216,7 @@ async fn attached_prefix_meta_digit_dispatch_survives_escape_split_across_reads(
     let alpha = session_name("alpha");
     let _control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
     for _ in 0..2 {
-        assert!(matches!(
-            handler
-                .handle(Request::SplitWindow(SplitWindowRequest {
-                    target: SplitWindowTarget::Session(alpha.clone()),
-                    direction: rmux_proto::SplitDirection::Vertical,
-                    before: false,
-                    environment: None,
-                }))
-                .await,
-            Response::SplitWindow(_)
-        ));
+        handler.handle_ok(SplitWindowRequest::fixture(&alpha)).await;
     }
 
     select_layout(&handler, &alpha, LayoutName::Tiled).await;
@@ -316,17 +255,7 @@ async fn attached_prefix_space_cycles_next_layout_using_current_window_target() 
     let alpha = session_name("alpha");
     let _control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
     for _ in 0..2 {
-        assert!(matches!(
-            handler
-                .handle(Request::SplitWindow(SplitWindowRequest {
-                    target: SplitWindowTarget::Session(alpha.clone()),
-                    direction: rmux_proto::SplitDirection::Vertical,
-                    before: false,
-                    environment: None,
-                }))
-                .await,
-            Response::SplitWindow(_)
-        ));
+        handler.handle_ok(SplitWindowRequest::fixture(&alpha)).await;
     }
 
     select_layout(&handler, &alpha, LayoutName::Tiled).await;
@@ -349,17 +278,7 @@ async fn attached_prefix_q_emits_a_display_panes_overlay() {
     let requester_pid = std::process::id();
     let alpha = session_name("alpha");
     let mut control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
-    assert!(matches!(
-        handler
-            .handle(Request::SplitWindow(SplitWindowRequest {
-                target: SplitWindowTarget::Session(alpha.clone()),
-                direction: rmux_proto::SplitDirection::Vertical,
-                before: false,
-                environment: None,
-            }))
-            .await,
-        Response::SplitWindow(_)
-    ));
+    handler.handle_ok(SplitWindowRequest::fixture(&alpha)).await;
     drain_attach_controls(&mut control_rx);
 
     handler

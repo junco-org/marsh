@@ -1,5 +1,4 @@
 use super::*;
-use crate::pane_io::AttachControl;
 
 async fn register_delegated_attach(
     handler: &RequestHandler,
@@ -7,26 +6,7 @@ async fn register_delegated_attach(
     session: &rmux_proto::SessionName,
 ) -> mpsc::UnboundedReceiver<AttachControl> {
     create_send_keys_test_session(handler, session).await;
-    register_existing_delegated_attach(handler, requester_pid, session).await
-}
-
-async fn register_existing_delegated_attach(
-    handler: &RequestHandler,
-    requester_pid: u32,
-    session: &rmux_proto::SessionName,
-) -> mpsc::UnboundedReceiver<AttachControl> {
-    let (control_tx, control_rx) = mpsc::unbounded_channel();
-    handler
-        .register_attach(requester_pid, session.clone(), control_tx)
-        .await;
-    let mut active_attach = handler.active_attach.lock().await;
-    let active = active_attach
-        .by_pid
-        .get_mut(&requester_pid)
-        .expect("delegated attach is active");
-    active.can_write = false;
-    active.flags = active.flags.with_read_only();
-    control_rx
+    register_read_only_attach(handler, requester_pid, session).await
 }
 
 async fn bind_read_only_key(
@@ -35,48 +15,12 @@ async fn bind_read_only_key(
     key: &str,
     command: &[&str],
 ) {
-    let response = handler
-        .handle(Request::BindKey(Box::new(BindKeyRequest {
-            table_name: table_name.to_owned(),
-            key: key.to_owned(),
+    handler
+        .handle_ok(BindKeyRequest {
             note: Some("read-only client action test".to_owned()),
-            repeat: false,
-            command: Some(
-                command
-                    .iter()
-                    .map(|argument| (*argument).to_owned())
-                    .collect(),
-            ),
-        })))
+            ..Fixture::fixture((table_name, key, command.iter().copied()))
+        })
         .await;
-    assert!(matches!(response, Response::BindKey(_)), "{response:?}");
-}
-
-async fn active_session_name(
-    handler: &RequestHandler,
-    requester_pid: u32,
-) -> rmux_proto::SessionName {
-    handler
-        .active_attach
-        .lock()
-        .await
-        .by_pid
-        .get(&requester_pid)
-        .expect("delegated attach remains active")
-        .session_name
-        .clone()
-}
-
-async fn active_key_table(handler: &RequestHandler, requester_pid: u32) -> Option<String> {
-    handler
-        .active_attach
-        .lock()
-        .await
-        .by_pid
-        .get(&requester_pid)
-        .expect("delegated attach remains active")
-        .key_table_name
-        .clone()
 }
 
 async fn recv_detach(control_rx: &mut mpsc::UnboundedReceiver<AttachControl>) {
@@ -211,7 +155,7 @@ async fn delegated_read_only_attach_can_enter_and_use_a_custom_safe_table() {
         .await
         .expect("read-only key-table switch input");
     assert_eq!(
-        active_key_table(&handler, requester_pid).await.as_deref(),
+        client_key_table(&handler, requester_pid).await.as_deref(),
         Some("readonly-custom")
     );
     assert_eq!(active_session_name(&handler, requester_pid).await, alpha);
@@ -221,7 +165,7 @@ async fn delegated_read_only_attach_can_enter_and_use_a_custom_safe_table() {
         .await
         .expect("read-only custom-table navigation input");
     assert_eq!(active_session_name(&handler, requester_pid).await, beta);
-    assert_eq!(active_key_table(&handler, requester_pid).await, None);
+    assert_eq!(client_key_table(&handler, requester_pid).await, None);
     assert_no_detach_variant(&mut control_rx);
 }
 
@@ -242,14 +186,7 @@ async fn delegated_read_only_attach_allows_safe_session_order_navigation_repeate
         let mut pending_input = Vec::new();
         create_send_keys_test_session(&handler, &beta).await;
         if label == "last" {
-            let beta_id = handler
-                .state
-                .lock()
-                .await
-                .sessions
-                .session(&beta)
-                .expect("beta exists")
-                .id();
+            let beta_id = handler.session_id_for_test(&beta).await;
             let mut active_attach = handler.active_attach.lock().await;
             let active = active_attach
                 .by_pid
@@ -403,20 +340,12 @@ async fn delegated_read_only_attach_rejects_chained_detach_binding_product_diver
     let alpha = session_name("delegated-read-only-chained");
     let requester_pid = std::process::id();
     let mut control_rx = register_delegated_attach(&handler, requester_pid, &alpha).await;
-    let rebound = handler
-        .handle(Request::BindKey(Box::new(BindKeyRequest {
-            table_name: "prefix".to_owned(),
-            key: "d".to_owned(),
+    handler
+        .handle_ok(BindKeyRequest {
             note: Some("delegated detach must remain local".to_owned()),
-            repeat: false,
-            command: Some(vec![
-                "detach-client".to_owned(),
-                ";".to_owned(),
-                "new-window".to_owned(),
-            ]),
-        })))
+            ..Fixture::fixture(("prefix", "d", ["detach-client", ";", "new-window"]))
+        })
         .await;
-    assert!(matches!(rebound, Response::BindKey(_)), "{rebound:?}");
 
     handler
         .handle_attached_live_input_for_test(requester_pid, b"\x02d")

@@ -1,12 +1,15 @@
 use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
-use std::io::{self, ErrorKind, Write};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use super::ExitFailure;
+use super::aux_command::{AuxCommand, failure, user_home, write_stdout};
 
 const INSTALL_SKILL_COMMAND: &str = "install-skill";
-const SKILL_SOURCE_PATH: &str = "resources/claude/skills/rmux/SKILL.md";
+/// The command every install failure is worded for.
+const COMMAND: &str = "claude install-skill";
+const SKILL_SOURCE_PATH: &str = "src/rmux/assets/claude-skill.txt";
 // The skill text ships as application data next to the CLI that installs it, so the binary does
 // not depend on upstream's repository layout being present at build time.
 const SKILL_CONTENT: &str = include_str!("../assets/claude-skill.txt");
@@ -17,56 +20,48 @@ pub(super) enum ClaudeSkillInvocation {
     InstallSkill,
 }
 
-/// Recognizes `rmux claude install-skill`, rejecting any trailing argument.
-pub(super) fn parse_invocation(
-    arguments: &[OsString],
-) -> Result<Option<ClaudeSkillInvocation>, ExitFailure> {
-    if arguments
-        .first()
-        .and_then(|value| value.to_str())
-        .is_some_and(|value| value == INSTALL_SKILL_COMMAND)
-    {
-        if arguments.len() != 1 {
-            return Err(ExitFailure::new(1, "usage: rmux claude install-skill"));
+impl AuxCommand for ClaudeSkillInvocation {
+    /// Recognizes `install-skill` as the first argument after `claude`, rejecting any after it.
+    fn parse(arguments: &[OsString]) -> Result<Option<Self>, ExitFailure> {
+        match arguments {
+            [command] if command == INSTALL_SKILL_COMMAND => Ok(Some(Self::InstallSkill)),
+            [command, ..] if command == INSTALL_SKILL_COMMAND => {
+                Err(ExitFailure::new(1, "usage: rmux claude install-skill"))
+            }
+            _ => Ok(None),
         }
-        return Ok(Some(ClaudeSkillInvocation::InstallSkill));
     }
 
-    Ok(None)
-}
-
-/// Dispatches a parsed skill subcommand.
-pub(super) fn run(invocation: ClaudeSkillInvocation) -> Result<i32, ExitFailure> {
-    match invocation {
-        ClaudeSkillInvocation::InstallSkill => install_skill(),
+    /// Dispatches the parsed skill subcommand.
+    fn run(self, _argv: &[OsString]) -> Result<i32, ExitFailure> {
+        match self {
+            Self::InstallSkill => install_skill(),
+        }
     }
 }
 
 /// Installs the bundled skill text under the user's `.claude` skills directory.
 fn install_skill() -> Result<i32, ExitFailure> {
-    let path = claude_skill_path()?;
+    let path = user_home(COMMAND)?.join(".claude/skills/rmux/SKILL.md");
     let parent = path.parent().ok_or_else(|| {
-        ExitFailure::new(
-            1,
-            format!(
-                "rmux claude install-skill: invalid Claude skill path '{}'",
-                path.display()
-            ),
+        failure(
+            COMMAND,
+            format_args!("invalid Claude skill path '{}'", path.display()),
         )
     })?;
     fs::create_dir_all(parent).map_err(|error| {
-        ExitFailure::new(
-            1,
-            format!(
-                "rmux claude install-skill: failed to create '{}': {error}",
-                parent.display()
-            ),
+        failure(
+            COMMAND,
+            format_args!("failed to create '{}': {error}", parent.display()),
         )
     })?;
 
     let status = install_skill_file(&path)?;
 
-    write_stdout(&format_install_status(&path, status))
+    write_stdout(
+        format_install_status(&path, status).as_bytes(),
+        "claude skill",
+    )
 }
 
 /// What installing the skill file actually did on disk.
@@ -79,50 +74,39 @@ enum InstallSkillStatus {
 /// Writes the skill at `path`, backing up and replacing any differing regular file.
 fn install_skill_file(path: &Path) -> Result<InstallSkillStatus, ExitFailure> {
     let metadata = match fs::symlink_metadata(path) {
-        Ok(metadata) => Some(metadata),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            write_skill_atomic(path)?;
+            return Ok(InstallSkillStatus::Installed);
+        }
         Err(error) => {
-            return Err(ExitFailure::new(
-                1,
-                format!(
-                    "rmux claude install-skill: failed to inspect '{}': {error}",
-                    path.display()
-                ),
+            return Err(failure(
+                COMMAND,
+                format_args!("failed to inspect '{}': {error}", path.display()),
             ));
         }
     };
 
-    let Some(metadata) = metadata else {
-        write_skill_atomic(path)?;
-        return Ok(InstallSkillStatus::Installed);
-    };
-
     if metadata.file_type().is_symlink() {
-        return Err(ExitFailure::new(
-            1,
-            format!(
-                "rmux claude install-skill: '{}' is a symlink; refusing to overwrite it",
+        return Err(failure(
+            COMMAND,
+            format_args!(
+                "'{}' is a symlink; refusing to overwrite it",
                 path.display()
             ),
         ));
     }
     if !metadata.is_file() {
-        return Err(ExitFailure::new(
-            1,
-            format!(
-                "rmux claude install-skill: '{}' exists and is not a regular file",
-                path.display()
-            ),
+        return Err(failure(
+            COMMAND,
+            format_args!("'{}' exists and is not a regular file", path.display()),
         ));
     }
 
     let existing = fs::read(path).map_err(|error| {
-        ExitFailure::new(
-            1,
-            format!(
-                "rmux claude install-skill: failed to read '{}': {error}",
-                path.display()
-            ),
+        failure(
+            COMMAND,
+            format_args!("failed to read '{}': {error}", path.display()),
         )
     })?;
     if existing == SKILL_CONTENT.as_bytes() {
@@ -163,137 +147,84 @@ fn backup_existing_skill(path: &Path, existing: &[u8]) -> Result<PathBuf, ExitFa
         {
             Ok(mut file) => {
                 file.write_all(existing).map_err(|error| {
-                    ExitFailure::new(
-                        1,
-                        format!(
-                            "rmux claude install-skill: failed to write backup '{}': {error}",
-                            candidate.display()
-                        ),
+                    failure(
+                        COMMAND,
+                        format_args!("failed to write backup '{}': {error}", candidate.display()),
                     )
                 })?;
                 return Ok(candidate);
             }
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
             Err(error) => {
-                return Err(ExitFailure::new(
-                    1,
-                    format!(
-                        "rmux claude install-skill: failed to create backup '{}': {error}",
-                        candidate.display()
-                    ),
+                return Err(failure(
+                    COMMAND,
+                    format_args!("failed to create backup '{}': {error}", candidate.display()),
                 ));
             }
         }
     }
 
-    Err(ExitFailure::new(
-        1,
-        format!(
-            "rmux claude install-skill: failed to choose a backup path for '{}'",
-            path.display()
-        ),
+    Err(failure(
+        COMMAND,
+        format_args!("failed to choose a backup path for '{}'", path.display()),
     ))
 }
 
 /// Yields up to 1000 `rmux-backup` sibling names for `path`, numbering after the first.
 fn backup_path_candidates(path: &Path) -> impl Iterator<Item = PathBuf> + '_ {
     (0..1000).map(move |index| {
-        let file_name = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("SKILL.md");
         let suffix = if index == 0 {
             "rmux-backup".to_owned()
         } else {
             format!("rmux-backup.{index}")
         };
-        path.with_file_name(format!("{file_name}.{suffix}"))
+        path.with_file_name(format!("{}.{suffix}", skill_file_name(path)))
     })
 }
 
-/// Writes the skill text to a temporary sibling, then replaces `path` with it.
+/// Writes the skill text to a temporary sibling, then renames it over `path`.
 fn write_skill_atomic(path: &Path) -> Result<(), ExitFailure> {
-    let temp = temporary_skill_path(path);
+    let temp = path.with_file_name(format!(
+        ".{}.rmux-tmp-{}",
+        skill_file_name(path),
+        std::process::id()
+    ));
     fs::write(&temp, SKILL_CONTENT).map_err(|error| {
-        ExitFailure::new(
-            1,
-            format!(
-                "rmux claude install-skill: failed to write temporary skill '{}': {error}",
+        failure(
+            COMMAND,
+            format_args!(
+                "failed to write temporary skill '{}': {error}",
                 temp.display()
             ),
         )
     })?;
 
-    replace_file(&temp, path).map_err(|error| {
+    fs::rename(&temp, path).map_err(|error| {
         let _ = fs::remove_file(&temp);
-        ExitFailure::new(
-            1,
-            format!(
-                "rmux claude install-skill: failed to replace '{}': {error}",
-                path.display()
-            ),
+        failure(
+            COMMAND,
+            format_args!("failed to replace '{}': {error}", path.display()),
         )
     })
 }
 
-/// Hidden sibling of `path` named with this process id, used as the staging file.
-fn temporary_skill_path(path: &Path) -> PathBuf {
-    let file_name = path
-        .file_name()
+/// The skill file's own name, `SKILL.md` when `path` has no UTF-8 one.
+fn skill_file_name(path: &Path) -> &str {
+    path.file_name()
         .and_then(|name| name.to_str())
-        .unwrap_or("SKILL.md");
-    path.with_file_name(format!(".{file_name}.rmux-tmp-{}", std::process::id()))
-}
-
-/// Renames `temp` over `path` atomically.
-fn replace_file(temp: &Path, path: &Path) -> io::Result<()> {
-    fs::rename(temp, path)
-}
-
-/// Path of the installed skill, `~/.claude/skills/rmux/SKILL.md`.
-fn claude_skill_path() -> Result<PathBuf, ExitFailure> {
-    user_home().map(|home| {
-        home.join(".claude")
-            .join("skills")
-            .join("rmux")
-            .join("SKILL.md")
-    })
-}
-
-/// Home directory from `HOME`.
-fn user_home() -> Result<PathBuf, ExitFailure> {
-    std::env::var_os("HOME")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .ok_or_else(|| ExitFailure::new(1, "rmux claude install-skill: HOME is not set"))
-}
-
-/// Prints `output` to stdout, treating a broken pipe as success.
-fn write_stdout(output: &str) -> Result<i32, ExitFailure> {
-    match io::stdout().lock().write_all(output.as_bytes()) {
-        Ok(()) => Ok(0),
-        Err(error) if error.kind() == ErrorKind::BrokenPipe => Ok(0),
-        Err(error) => Err(ExitFailure::new(
-            1,
-            format!("failed to write claude skill output: {error}"),
-        )),
-    }
+        .unwrap_or("SKILL.md")
 }
 
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 mod tests {
-    use super::{ClaudeSkillInvocation, SKILL_CONTENT, parse_invocation};
-    use std::ffi::OsString;
-
-    fn args(values: &[&str]) -> Vec<OsString> {
-        values.iter().map(OsString::from).collect()
-    }
+    use super::ClaudeSkillInvocation;
+    use crate::cli::aux_command::{AuxCommand, args};
 
     #[test]
     fn parses_install_skill_subcommand() {
         assert_eq!(
-            parse_invocation(&args(&["install-skill"])).expect("parse succeeds"),
+            ClaudeSkillInvocation::parse(&args(&["install-skill"])).expect("parse succeeds"),
             Some(ClaudeSkillInvocation::InstallSkill)
         );
     }
@@ -301,7 +232,8 @@ mod tests {
     #[test]
     fn leaves_regular_claude_args_to_launcher() {
         assert_eq!(
-            parse_invocation(&args(&["--dangerously-skip-permissions"])).expect("parse succeeds"),
+            ClaudeSkillInvocation::parse(&args(&["--dangerously-skip-permissions"]))
+                .expect("parse succeeds"),
             None
         );
     }
@@ -309,23 +241,15 @@ mod tests {
     #[test]
     fn leaves_delimited_install_skill_arg_to_launcher() {
         assert_eq!(
-            parse_invocation(&args(&["--", "install-skill"])).expect("parse succeeds"),
+            ClaudeSkillInvocation::parse(&args(&["--", "install-skill"])).expect("parse succeeds"),
             None
         );
     }
 
     #[test]
     fn rejects_extra_install_skill_args() {
-        let error = parse_invocation(&args(&["install-skill", "--force"]))
+        let error = ClaudeSkillInvocation::parse(&args(&["install-skill", "--force"]))
             .expect_err("extra args should fail");
         assert_eq!(error.message(), "usage: rmux claude install-skill");
-    }
-
-    #[test]
-    fn bundled_skill_names_rmux_and_documents_project_skill_path() {
-        assert!(SKILL_CONTENT.contains("name: rmux"));
-        assert!(SKILL_CONTENT.contains("disable-model-invocation: true"));
-        assert!(SKILL_CONTENT.contains("resources/claude/skills/rmux/SKILL.md"));
-        assert!(SKILL_CONTENT.contains("~/.claude/skills/rmux"));
     }
 }

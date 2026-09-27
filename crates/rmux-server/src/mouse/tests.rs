@@ -1,20 +1,24 @@
 use super::{
     classify_mouse_event, classify_mouse_events, copy_mode_mouse_context,
-    copy_mode_mouse_context_with_line_numbers, layout_for_session, MouseDragHandler,
-    MouseForwardEvent, MouseLayout, MouseLocation, PaneBorderStatus, PaneMouseTarget,
-    PaneScrollbar, PaneScrollbarsMode, ScrollbarPosition, StatusLineLayout, StatusRange,
-    StatusRangeType,
+    copy_mode_mouse_context_with_line_numbers, layout_for_session, AttachedMouseEvent,
+    BorderControlRange, ClientMouseState, MouseDragHandler, MouseForwardEvent, MouseLayout,
+    MouseLocation, PaneBorderStatus, PaneMouseTarget, PaneScrollbar, PaneScrollbarsMode,
+    ScrollbarPosition, StatusLineLayout, StatusRange, StatusRangeType,
 };
 use crate::copy_mode::CopyModeLineNumberLayout;
 use crate::pane_terminals::HandlerState;
-use rmux_core::{key_string_lookup_string, PaneGeometry, PaneId};
+use rmux_core::{key_string_lookup_string, KeyCode, PaneGeometry, PaneId};
 use rmux_proto::{
     OptionName, PaneTarget, ScopeSelector, SessionName, SetOptionMode, TerminalSize, WindowTarget,
 };
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 fn pane_target(index: u32) -> PaneTarget {
     PaneTarget::with_window(SessionName::new("alpha").expect("valid session"), 0, index)
+}
+
+fn status_range(x: std::ops::RangeInclusive<u16>, kind: StatusRangeType) -> StatusRange {
+    StatusRange { line: 0, x, kind }
 }
 
 fn layout() -> MouseLayout {
@@ -24,36 +28,12 @@ fn layout() -> MouseLayout {
         status_lines: 1,
         status: Some(StatusLineLayout {
             ranges: vec![
-                StatusRange {
-                    line: 0,
-                    x: 0..=3,
-                    kind: StatusRangeType::Left,
-                },
-                StatusRange {
-                    line: 0,
-                    x: 4..=7,
-                    kind: StatusRangeType::Right,
-                },
-                StatusRange {
-                    line: 0,
-                    x: 8..=11,
-                    kind: StatusRangeType::Window(9),
-                },
-                StatusRange {
-                    line: 0,
-                    x: 12..=15,
-                    kind: StatusRangeType::Session(4),
-                },
-                StatusRange {
-                    line: 0,
-                    x: 16..=19,
-                    kind: StatusRangeType::User,
-                },
-                StatusRange {
-                    line: 0,
-                    x: 20..=23,
-                    kind: StatusRangeType::Control(3),
-                },
+                status_range(0..=3, StatusRangeType::Left),
+                status_range(4..=7, StatusRangeType::Right),
+                status_range(8..=11, StatusRangeType::Window(9)),
+                status_range(12..=15, StatusRangeType::Session(4)),
+                status_range(16..=19, StatusRangeType::User),
+                status_range(20..=23, StatusRangeType::Control(3)),
             ],
         }),
         pane_border_status: PaneBorderStatus::Off,
@@ -66,19 +46,10 @@ fn layout() -> MouseLayout {
                 window_id: 5,
                 geometry: PaneGeometry::new(0, 0, 40, 10),
                 scrollbar: Some(
-                    PaneScrollbar::from_view(
-                        10,
-                        30,
-                        false,
-                        PaneScrollbarsMode::On,
-                        ScrollbarPosition::Right,
-                        1,
-                        0,
-                        None,
-                    )
-                    .expect("scrollbar"),
+                    right_scrollbar(10, 30, false, PaneScrollbarsMode::On, 1, None)
+                        .expect("scrollbar"),
                 ),
-                border_controls: vec![super::BorderControlRange {
+                border_controls: vec![BorderControlRange {
                     x: 41..=41,
                     y: 4,
                     control: 2,
@@ -94,6 +65,116 @@ fn layout() -> MouseLayout {
             },
         ],
     }
+}
+
+/// `PaneScrollbar::from_view` on the right side with no padding.
+fn right_scrollbar(
+    rows: u16,
+    history_size: usize,
+    alternate_on: bool,
+    mode: PaneScrollbarsMode,
+    width: u16,
+    copy_mode_scroll_position: Option<usize>,
+) -> Option<PaneScrollbar> {
+    PaneScrollbar::from_view(
+        rows,
+        history_size,
+        alternate_on,
+        mode,
+        ScrollbarPosition::Right,
+        width,
+        0,
+        copy_mode_scroll_position,
+    )
+}
+
+fn fixed_scrollbar(
+    position: ScrollbarPosition,
+    width: u16,
+    pad: u16,
+    slider_y: u16,
+    slider_h: u16,
+) -> Option<PaneScrollbar> {
+    Some(PaneScrollbar {
+        position,
+        width,
+        pad,
+        slider_y,
+        slider_h,
+    })
+}
+
+/// A stationary event: the last position equals the current one.
+fn raw(b: u16, x: u16, y: u16) -> MouseForwardEvent {
+    MouseForwardEvent {
+        b,
+        lb: b,
+        x,
+        y,
+        lx: x,
+        ly: y,
+        sgr_b: b,
+        sgr_type: ' ',
+        ignore: false,
+    }
+}
+
+/// Button-1 drag motion from `(lx, ly)` to `(x, y)`.
+fn drag_motion(x: u16, y: u16, lx: u16, ly: u16) -> MouseForwardEvent {
+    MouseForwardEvent {
+        lb: 0,
+        lx,
+        ly,
+        ..raw(32, x, y)
+    }
+}
+
+/// Legacy button release after button 1 was held, moving from `(lx, ly)` to `(x, y)`.
+fn drag_release(x: u16, y: u16, lx: u16, ly: u16, sgr_type: char) -> MouseForwardEvent {
+    MouseForwardEvent {
+        lb: 0,
+        lx,
+        ly,
+        sgr_b: 0,
+        sgr_type,
+        ..raw(3, x, y)
+    }
+}
+
+/// Button-less SGR motion from `lx` to `x` on row `y`.
+fn hover(x: u16, y: u16, lx: u16) -> MouseForwardEvent {
+    MouseForwardEvent {
+        lx,
+        sgr_type: 'm',
+        ..raw(35, x, y)
+    }
+}
+
+fn attached_event(
+    raw: MouseForwardEvent,
+    pane: Option<u32>,
+    status_at: Option<u16>,
+    status_lines: u16,
+) -> AttachedMouseEvent {
+    AttachedMouseEvent {
+        raw,
+        session_id: 1,
+        window_id: Some(5),
+        pane_id: pane.map(PaneId::new),
+        pane_target: pane.map(pane_target),
+        location: MouseLocation::Pane,
+        status_at,
+        status_lines,
+        ignore: false,
+    }
+}
+
+fn key(name: &str) -> KeyCode {
+    key_string_lookup_string(name).unwrap()
+}
+
+fn after(base: Instant, millis: u64) -> Instant {
+    base + Duration::from_millis(millis)
 }
 
 #[test]
@@ -144,23 +225,9 @@ fn generated_mouse_scrollbar_uses_visible_pane_border_geometry() {
     assert_eq!(scrollbar.slider_h, 7);
 }
 
-fn raw(b: u16, x: u16, y: u16) -> MouseForwardEvent {
-    MouseForwardEvent {
-        b,
-        lb: b,
-        x,
-        y,
-        lx: x,
-        ly: y,
-        sgr_b: b,
-        sgr_type: ' ',
-        ignore: false,
-    }
-}
-
 #[test]
 fn status_ranges_hit_left_right_window_session_user_and_control() {
-    let mut state = super::ClientMouseState::default();
+    let mut state = ClientMouseState::default();
     let now = Instant::now();
 
     let left = classify_mouse_event(&mut state, &layout(), raw(0, 1, 0), now).expect("left");
@@ -185,7 +252,7 @@ fn status_ranges_hit_left_right_window_session_user_and_control() {
 
 #[test]
 fn status_ranges_are_matched_on_the_clicked_status_line() {
-    let mut state = super::ClientMouseState::default();
+    let mut state = ClientMouseState::default();
     let now = Instant::now();
     let mut layout = layout();
     layout.status_lines = 2;
@@ -210,104 +277,52 @@ fn status_ranges_are_matched_on_the_clicked_status_line() {
 
 #[test]
 fn click_sequence_resets_on_button_location_or_pane_change() {
-    let mut state = super::ClientMouseState::default();
+    let mut state = ClientMouseState::default();
     let base = Instant::now();
     let layout = layout();
 
     let down = classify_mouse_event(&mut state, &layout, raw(0, 5, 5), base).expect("down");
     assert_eq!(down.event.location, MouseLocation::Pane);
-    assert_eq!(
-        down.key,
-        key_string_lookup_string("MouseDown1Pane").unwrap()
-    );
+    assert_eq!(down.key, key("MouseDown1Pane"));
 
-    let second = classify_mouse_event(
-        &mut state,
-        &layout,
-        MouseForwardEvent {
-            lx: 5,
-            ly: 5,
-            ..raw(0, 5, 5)
-        },
-        base + std::time::Duration::from_millis(100),
-    )
-    .expect("second");
-    assert_eq!(
-        second.key,
-        key_string_lookup_string("SecondClick1Pane").unwrap()
-    );
+    let second =
+        classify_mouse_event(&mut state, &layout, raw(0, 5, 5), after(base, 100)).expect("second");
+    assert_eq!(second.key, key("SecondClick1Pane"));
 
     let reset = classify_mouse_event(
         &mut state,
         &layout,
         MouseForwardEvent {
             lx: 5,
-            ly: 5,
             ..raw(0, 50, 5)
         },
-        base + std::time::Duration::from_millis(150),
+        after(base, 150),
     )
     .expect("reset");
-    assert_eq!(
-        reset.key,
-        key_string_lookup_string("MouseDown1Pane").unwrap()
-    );
+    assert_eq!(reset.key, key("MouseDown1Pane"));
 
-    let expired = state.expire_click_timer(base + std::time::Duration::from_millis(700), &layout);
+    let expired = state.expire_click_timer(after(base, 700), &layout);
     assert!(expired.is_none(), "first click timeout just resets state");
 }
 
 #[test]
 fn second_click_timeout_yields_double_click_and_third_click_has_no_timer() {
-    let mut state = super::ClientMouseState::default();
+    let mut state = ClientMouseState::default();
     let base = Instant::now();
     let layout = layout();
 
     let _ = classify_mouse_event(&mut state, &layout, raw(0, 5, 5), base);
-    let _ = classify_mouse_event(
-        &mut state,
-        &layout,
-        MouseForwardEvent {
-            lx: 5,
-            ly: 5,
-            ..raw(0, 5, 5)
-        },
-        base + std::time::Duration::from_millis(100),
-    );
+    let _ = classify_mouse_event(&mut state, &layout, raw(0, 5, 5), after(base, 100));
     let double = state
-        .expire_click_timer(base + std::time::Duration::from_millis(500), &layout)
+        .expire_click_timer(after(base, 500), &layout)
         .expect("double click");
-    assert_eq!(
-        double.key,
-        key_string_lookup_string("DoubleClick1Pane").unwrap()
-    );
+    assert_eq!(double.key, key("DoubleClick1Pane"));
 
     let _ = classify_mouse_event(&mut state, &layout, raw(0, 5, 5), base);
-    let _ = classify_mouse_event(
-        &mut state,
-        &layout,
-        MouseForwardEvent {
-            lx: 5,
-            ly: 5,
-            ..raw(0, 5, 5)
-        },
-        base + std::time::Duration::from_millis(100),
-    );
-    let triple = classify_mouse_event(
-        &mut state,
-        &layout,
-        MouseForwardEvent {
-            lx: 5,
-            ly: 5,
-            ..raw(0, 5, 5)
-        },
-        base + std::time::Duration::from_millis(150),
-    )
-    .expect("triple");
-    assert_eq!(
-        triple.key,
-        key_string_lookup_string("TripleClick1Pane").unwrap()
-    );
+    let _ = classify_mouse_event(&mut state, &layout, raw(0, 5, 5), after(base, 100));
+    let triple =
+        classify_mouse_event(&mut state, &layout, raw(0, 5, 5), after(base, 150)).expect("triple");
+    assert_eq!(triple.key, key("TripleClick1Pane"));
     assert!(
         state.click_deadline.is_none(),
         "triple click skips the timer"
@@ -316,46 +331,25 @@ fn second_click_timeout_yields_double_click_and_third_click_has_no_timer() {
 
 #[test]
 fn late_third_click_does_not_drop_pending_double_click() {
-    let mut state = super::ClientMouseState::default();
+    let mut state = ClientMouseState::default();
     let base = Instant::now();
     let layout = layout();
 
     let _ = classify_mouse_event(&mut state, &layout, raw(0, 5, 5), base);
-    let _ = classify_mouse_event(
-        &mut state,
-        &layout,
-        MouseForwardEvent {
-            lx: 5,
-            ly: 5,
-            ..raw(0, 5, 5)
-        },
-        base + std::time::Duration::from_millis(100),
-    );
+    let _ = classify_mouse_event(&mut state, &layout, raw(0, 5, 5), after(base, 100));
 
-    let events = classify_mouse_events(
-        &mut state,
-        &layout,
-        MouseForwardEvent {
-            lx: 5,
-            ly: 5,
-            ..raw(0, 5, 5)
-        },
-        base + std::time::Duration::from_millis(500),
-    );
+    let events = classify_mouse_events(&mut state, &layout, raw(0, 5, 5), after(base, 500));
 
     assert_eq!(
         events.iter().map(|event| event.key).collect::<Vec<_>>(),
-        vec![
-            key_string_lookup_string("DoubleClick1Pane").unwrap(),
-            key_string_lookup_string("MouseDown1Pane").unwrap(),
-        ],
+        vec![key("DoubleClick1Pane"), key("MouseDown1Pane")],
         "the first two clicks should still dispatch DoubleClick1Pane before the late click"
     );
 }
 
 #[test]
 fn drag_update_uses_dragging_sentinel_and_release_synthesizes_drag_end() {
-    let mut state = super::ClientMouseState {
+    let mut state = ClientMouseState {
         drag_handler: Some(MouseDragHandler::CopyModeSelection {
             target: pane_target(0),
         }),
@@ -364,23 +358,8 @@ fn drag_update_uses_dragging_sentinel_and_release_synthesizes_drag_end() {
     let now = Instant::now();
     let layout = layout();
 
-    let start = classify_mouse_event(
-        &mut state,
-        &layout,
-        MouseForwardEvent {
-            b: 32,
-            lb: 0,
-            x: 6,
-            y: 6,
-            lx: 5,
-            ly: 5,
-            sgr_b: 32,
-            sgr_type: ' ',
-            ignore: false,
-        },
-        now,
-    )
-    .expect("drag start");
+    let start = classify_mouse_event(&mut state, &layout, drag_motion(6, 6, 5, 5), now)
+        .expect("drag start");
     assert_eq!(start.key, super::KEYC_DRAGGING);
     assert_eq!(start.event.raw.x, 5);
     assert_eq!(start.event.raw.y, 5);
@@ -393,31 +372,18 @@ fn drag_update_uses_dragging_sentinel_and_release_synthesizes_drag_end() {
     let end = classify_mouse_event(
         &mut state,
         &layout,
-        MouseForwardEvent {
-            b: 3,
-            lb: 0,
-            x: 7,
-            y: 7,
-            lx: 6,
-            ly: 6,
-            sgr_b: 0,
-            sgr_type: ' ',
-            ignore: false,
-        },
-        now + std::time::Duration::from_millis(10),
+        drag_release(7, 7, 6, 6, ' '),
+        after(now, 10),
     )
     .expect("drag end");
-    assert_eq!(
-        end.key,
-        key_string_lookup_string("MouseDragEnd1Pane").unwrap()
-    );
+    assert_eq!(end.key, key("MouseDragEnd1Pane"));
     assert_eq!(state.drag_flag, 0);
     assert_eq!(state.slider_mpos, -1);
 }
 
 #[test]
 fn plain_mouse_drag_keeps_current_coordinates_for_bindings() {
-    let mut state = super::ClientMouseState::default();
+    let mut state = ClientMouseState::default();
     let now = Instant::now();
     let layout = layout();
 
@@ -425,58 +391,27 @@ fn plain_mouse_drag_keeps_current_coordinates_for_bindings() {
         &mut state,
         &layout,
         MouseForwardEvent {
-            b: 32,
-            lb: 0,
-            x: 6,
-            y: 6,
-            lx: 5,
-            ly: 5,
-            sgr_b: 32,
             sgr_type: 'M',
-            ignore: false,
+            ..drag_motion(6, 6, 5, 5)
         },
         now,
     )
     .expect("drag event");
 
-    assert_eq!(
-        drag.key,
-        key_string_lookup_string("MouseDrag1Pane").unwrap()
-    );
+    assert_eq!(drag.key, key("MouseDrag1Pane"));
     assert_eq!(drag.event.raw.x, 6);
     assert_eq!(drag.event.raw.y, 6);
 }
 
 #[test]
 fn scrollbar_drag_forces_slider_location_and_tracks_relative_mpos() {
-    let mut state = super::ClientMouseState::default();
+    let mut state = ClientMouseState::default();
     let mut layout = layout();
-    layout.panes[0].scrollbar = Some(PaneScrollbar {
-        position: ScrollbarPosition::Right,
-        width: 1,
-        pad: 0,
-        slider_y: 2,
-        slider_h: 3,
-    });
+    layout.panes[0].scrollbar = fixed_scrollbar(ScrollbarPosition::Right, 1, 0, 2, 3);
     let now = Instant::now();
 
-    let drag = classify_mouse_event(
-        &mut state,
-        &layout,
-        MouseForwardEvent {
-            b: 32,
-            lb: 0,
-            x: 40,
-            y: 4,
-            lx: 40,
-            ly: 4,
-            sgr_b: 32,
-            sgr_type: ' ',
-            ignore: false,
-        },
-        now,
-    )
-    .expect("scrollbar drag");
+    let drag = classify_mouse_event(&mut state, &layout, drag_motion(40, 4, 40, 4), now)
+        .expect("scrollbar drag");
     assert_eq!(drag.event.location, MouseLocation::ScrollbarSlider);
     assert!(state.scrolling_flag);
     assert_eq!(state.slider_mpos, 1 + i32::from(layout.status_lines));
@@ -484,18 +419,8 @@ fn scrollbar_drag_forces_slider_location_and_tracks_relative_mpos() {
     let move_outside = classify_mouse_event(
         &mut state,
         &layout,
-        MouseForwardEvent {
-            b: 32,
-            lb: 0,
-            x: 10,
-            y: 8,
-            lx: 40,
-            ly: 4,
-            sgr_b: 32,
-            sgr_type: ' ',
-            ignore: false,
-        },
-        now + std::time::Duration::from_millis(5),
+        drag_motion(10, 8, 40, 4),
+        after(now, 5),
     )
     .expect("forced slider location");
     assert_eq!(move_outside.event.location, MouseLocation::ScrollbarSlider);
@@ -503,34 +428,16 @@ fn scrollbar_drag_forces_slider_location_and_tracks_relative_mpos() {
 
 #[test]
 fn focus_follows_mouse_returns_the_new_pane_target() {
-    let mut state = super::ClientMouseState::default();
-    let event = classify_mouse_event(
-        &mut state,
-        &layout(),
-        MouseForwardEvent {
-            b: 35,
-            lb: 35,
-            x: 50,
-            y: 6,
-            lx: 49,
-            ly: 6,
-            sgr_b: 35,
-            sgr_type: 'm',
-            ignore: false,
-        },
-        Instant::now(),
-    )
-    .expect("move");
-    assert_eq!(
-        event.key,
-        key_string_lookup_string("MouseMovePane").unwrap()
-    );
+    let mut state = ClientMouseState::default();
+    let event = classify_mouse_event(&mut state, &layout(), hover(50, 6, 49), Instant::now())
+        .expect("move");
+    assert_eq!(event.key, key("MouseMovePane"));
     assert_eq!(event.focus_target, Some(PaneId::new(1)));
 }
 
 #[test]
 fn border_controls_win_over_plain_border_hits() {
-    let mut state = super::ClientMouseState::default();
+    let mut state = ClientMouseState::default();
     let event =
         classify_mouse_event(&mut state, &layout(), raw(0, 41, 5), Instant::now()).expect("border");
     assert_eq!(event.event.location, MouseLocation::Control(2));
@@ -538,122 +445,57 @@ fn border_controls_win_over_plain_border_hits() {
 
 #[test]
 fn border_drag_stays_routed_to_border_after_cursor_moves_into_pane() {
-    let mut state = super::ClientMouseState::default();
+    let mut state = ClientMouseState::default();
     let now = Instant::now();
     let layout = layout();
 
     let down = classify_mouse_event(&mut state, &layout, raw(0, 41, 6), now).expect("down");
     assert_eq!(down.event.location, MouseLocation::Border);
-    assert_eq!(
-        down.key,
-        key_string_lookup_string("MouseDown1Border").unwrap()
-    );
+    assert_eq!(down.key, key("MouseDown1Border"));
 
-    let first_drag = classify_mouse_event(
-        &mut state,
-        &layout,
-        MouseForwardEvent {
-            b: 32,
-            lb: 0,
-            x: 39,
-            y: 6,
-            lx: 41,
-            ly: 6,
-            sgr_b: 32,
-            sgr_type: ' ',
-            ignore: false,
-        },
-        now + std::time::Duration::from_millis(5),
-    )
-    .expect("first drag");
-    assert_eq!(first_drag.event.location, MouseLocation::Border);
-    assert_eq!(first_drag.event.raw.lx, 41);
-    assert_eq!(first_drag.event.raw.ly, 6);
-    assert_eq!(
-        first_drag.key,
-        key_string_lookup_string("MouseDrag1Border").unwrap()
-    );
-
-    let later_drag = classify_mouse_event(
-        &mut state,
-        &layout,
-        MouseForwardEvent {
-            b: 32,
-            lb: 0,
-            x: 38,
-            y: 6,
-            lx: 39,
-            ly: 6,
-            sgr_b: 32,
-            sgr_type: ' ',
-            ignore: false,
-        },
-        now + std::time::Duration::from_millis(10),
-    )
-    .expect("later drag");
-    assert_eq!(later_drag.event.location, MouseLocation::Border);
-    assert_eq!(later_drag.event.raw.lx, 39);
-    assert_eq!(later_drag.event.raw.ly, 6);
-    assert_eq!(
-        later_drag.key,
-        key_string_lookup_string("MouseDrag1Border").unwrap()
-    );
+    for (x, lx, millis, label) in [(39, 41, 5, "first drag"), (38, 39, 10, "later drag")] {
+        let moved = classify_mouse_event(
+            &mut state,
+            &layout,
+            drag_motion(x, 6, lx, 6),
+            after(now, millis),
+        )
+        .expect(label);
+        assert_eq!(moved.event.location, MouseLocation::Border);
+        assert_eq!(moved.event.raw.lx, lx);
+        assert_eq!(moved.event.raw.ly, 6);
+        assert_eq!(moved.key, key("MouseDrag1Border"));
+    }
 
     let release = classify_mouse_event(
         &mut state,
         &layout,
-        MouseForwardEvent {
-            b: 3,
-            lb: 0,
-            x: 38,
-            y: 6,
-            lx: 38,
-            ly: 6,
-            sgr_b: 0,
-            sgr_type: 'm',
-            ignore: false,
-        },
-        now + std::time::Duration::from_millis(15),
+        drag_release(38, 6, 38, 6, 'm'),
+        after(now, 15),
     )
     .expect("release");
     assert_eq!(release.event.location, MouseLocation::Border);
-    assert_eq!(
-        release.key,
-        key_string_lookup_string("MouseDragEnd1Border").unwrap()
-    );
+    assert_eq!(release.key, key("MouseDragEnd1Border"));
     assert_eq!(state.drag_flag, 0);
     assert!(state.drag_start_event.is_none());
 }
 
 #[test]
 fn pane_drag_crossing_border_stays_routed_to_press_pane() {
-    let mut state = super::ClientMouseState::default();
+    let mut state = ClientMouseState::default();
     let now = Instant::now();
     let mut layout = layout();
     layout.panes[0].scrollbar = None;
 
     let down = classify_mouse_event(&mut state, &layout, raw(0, 39, 6), now).expect("down");
     assert_eq!(down.event.location, MouseLocation::Pane);
-    assert_eq!(
-        down.key,
-        key_string_lookup_string("MouseDown1Pane").unwrap()
-    );
+    assert_eq!(down.key, key("MouseDown1Pane"));
 
     let drag = classify_mouse_event(
         &mut state,
         &layout,
-        MouseForwardEvent {
-            b: 32,
-            lb: 0,
-            x: 42,
-            y: 6,
-            lx: 39,
-            ly: 6,
-            sgr_b: 32,
-            sgr_type: ' ',
-            ignore: false,
-        },
-        now + std::time::Duration::from_millis(5),
+        drag_motion(42, 6, 39, 6),
+        after(now, 5),
     )
     .expect("drag");
     assert_eq!(drag.event.location, MouseLocation::Pane);
@@ -661,39 +503,23 @@ fn pane_drag_crossing_border_stays_routed_to_press_pane() {
     assert_eq!(drag.event.pane_target, Some(pane_target(0)));
     assert_eq!(drag.event.raw.x, 42);
     assert_eq!(drag.event.raw.y, 6);
-    assert_eq!(
-        drag.key,
-        key_string_lookup_string("MouseDrag1Pane").unwrap()
-    );
+    assert_eq!(drag.key, key("MouseDrag1Pane"));
 
     let release = classify_mouse_event(
         &mut state,
         &layout,
-        MouseForwardEvent {
-            b: 3,
-            lb: 0,
-            x: 42,
-            y: 6,
-            lx: 42,
-            ly: 6,
-            sgr_b: 0,
-            sgr_type: 'm',
-            ignore: false,
-        },
-        now + std::time::Duration::from_millis(10),
+        drag_release(42, 6, 42, 6, 'm'),
+        after(now, 10),
     )
     .expect("release");
     assert_eq!(release.event.location, MouseLocation::Pane);
     assert_eq!(release.event.pane_id, Some(PaneId::new(0)));
-    assert_eq!(
-        release.key,
-        key_string_lookup_string("MouseDragEnd1Pane").unwrap()
-    );
+    assert_eq!(release.key, key("MouseDragEnd1Pane"));
 }
 
 #[test]
 fn adjacent_pane_down_moving_away_from_border_stays_pane_drag() {
-    let mut state = super::ClientMouseState::default();
+    let mut state = ClientMouseState::default();
     let now = Instant::now();
     let mut layout = layout();
     layout.panes[0].scrollbar = None;
@@ -704,40 +530,17 @@ fn adjacent_pane_down_moving_away_from_border_stays_pane_drag() {
     let drag = classify_mouse_event(
         &mut state,
         &layout,
-        MouseForwardEvent {
-            b: 32,
-            lb: 0,
-            x: 37,
-            y: 6,
-            lx: 39,
-            ly: 6,
-            sgr_b: 32,
-            sgr_type: ' ',
-            ignore: false,
-        },
-        now + std::time::Duration::from_millis(5),
+        drag_motion(37, 6, 39, 6),
+        after(now, 5),
     )
     .expect("drag");
     assert_eq!(drag.event.location, MouseLocation::Pane);
-    assert_eq!(
-        drag.key,
-        key_string_lookup_string("MouseDrag1Pane").unwrap()
-    );
+    assert_eq!(drag.key, key("MouseDrag1Pane"));
 }
 
 #[test]
 fn copy_mode_mouse_context_converts_to_content_coordinates() {
-    let event = super::AttachedMouseEvent {
-        raw: raw(0, 10, 6),
-        session_id: 1,
-        window_id: Some(5),
-        pane_id: Some(PaneId::new(0)),
-        pane_target: Some(pane_target(0)),
-        location: MouseLocation::Pane,
-        status_at: Some(0),
-        status_lines: 1,
-        ignore: false,
-    };
+    let event = attached_event(raw(0, 10, 6), Some(0), Some(0), 1);
     let context =
         copy_mode_mouse_context(&event, PaneGeometry::new(0, 0, 40, 10), 3).expect("context");
     assert_eq!(context.content_x, 10);
@@ -748,17 +551,7 @@ fn copy_mode_mouse_context_converts_to_content_coordinates() {
 
 #[test]
 fn copy_mode_mouse_context_unoffsets_the_line_number_gutter() {
-    let mut event = super::AttachedMouseEvent {
-        raw: raw(0, 2, 1),
-        session_id: 1,
-        window_id: Some(5),
-        pane_id: Some(PaneId::new(0)),
-        pane_target: Some(pane_target(0)),
-        location: MouseLocation::Pane,
-        status_at: None,
-        status_lines: 0,
-        ignore: false,
-    };
+    let mut event = attached_event(raw(0, 2, 1), Some(0), None, 0);
     let layout = CopyModeLineNumberLayout::resolve(Some("absolute"), true, 23, 8, 0, 0)
         .expect("line-number layout");
 
@@ -784,7 +577,7 @@ fn copy_mode_mouse_context_unoffsets_the_line_number_gutter() {
 
 #[test]
 fn expire_click_timer_is_noop_when_no_deadline_set() {
-    let mut state = super::ClientMouseState::default();
+    let mut state = ClientMouseState::default();
     assert!(state.click_deadline.is_none());
     state.triple_click_pending = true; // should not trigger DoubleClick
     let result = state.expire_click_timer(Instant::now(), &layout());
@@ -796,8 +589,8 @@ fn expire_click_timer_is_noop_when_no_deadline_set() {
 #[test]
 fn expire_click_timer_preserves_state_when_deadline_not_yet_reached() {
     let now = Instant::now();
-    let mut state = super::ClientMouseState {
-        click_deadline: Some(now + std::time::Duration::from_secs(10)),
+    let mut state = ClientMouseState {
+        click_deadline: Some(now + Duration::from_secs(10)),
         double_click_pending: true,
         ..Default::default()
     };
@@ -809,27 +602,22 @@ fn expire_click_timer_preserves_state_when_deadline_not_yet_reached() {
 
 #[test]
 fn drag_end_preserves_modifier_bits_from_release_event() {
-    let mut state = super::ClientMouseState {
+    let mut state = ClientMouseState {
         drag_flag: 1, // button 0 (drag_flag = mouse_buttons(b) + 1)
         ..Default::default()
     };
     let now = Instant::now();
     let layout = layout();
-    // Release with Ctrl held (bit 16 = MOUSE_MASK_CTRL)
-    let release = super::MouseForwardEvent {
-        b: 3,   // release
-        lb: 16, // last button was button 0 + Ctrl (MOUSE_MASK_CTRL)
-        x: 5,
-        y: 5,
-        lx: 5,
-        ly: 5,
+    // Release (b = 3) with Ctrl held: the last button was button 0 + Ctrl
+    // (bit 16 = MOUSE_MASK_CTRL).
+    let release = MouseForwardEvent {
+        lb: 16,
         sgr_b: 16,
-        sgr_type: 'm',
-        ignore: false,
+        ..drag_release(5, 5, 5, 5, 'm')
     };
     let event = classify_mouse_event(&mut state, &layout, release, now).expect("drag end");
     // Key should be MouseDragEnd1Pane with CTRL modifier
-    let base_key = key_string_lookup_string("MouseDragEnd1Pane").unwrap();
+    let base_key = key("MouseDragEnd1Pane");
     assert_eq!(event.key & !rmux_core::KEYC_CTRL, base_key);
     assert_ne!(
         event.key & rmux_core::KEYC_CTRL,
@@ -840,32 +628,27 @@ fn drag_end_preserves_modifier_bits_from_release_event() {
 
 #[test]
 fn sgr_release_provides_correct_button_for_mouse_up() {
-    let mut state = super::ClientMouseState::default();
+    let mut state = ClientMouseState::default();
     let now = Instant::now();
     let layout = layout();
-    // SGR release for button 2 (middle)
-    let release = super::MouseForwardEvent {
-        b: 3,  // release (legacy encoding)
-        lb: 1, // last was button 2
-        x: 5,
-        y: 5,
-        lx: 5,
-        ly: 5,
-        sgr_b: 1, // button 2 (SGR preserves button identity)
-        sgr_type: 'm',
-        ignore: false,
+    // SGR release for button 2 (middle): legacy b = 3 (release), the last
+    // button was button 2, and sgr_b preserves the button identity.
+    let release = MouseForwardEvent {
+        lb: 1,
+        sgr_b: 1,
+        ..drag_release(5, 5, 5, 5, 'm')
     };
     let event = classify_mouse_event(&mut state, &layout, release, now).expect("mouse up");
     assert_eq!(
         event.key,
-        key_string_lookup_string("MouseUp2Pane").unwrap(),
+        key("MouseUp2Pane"),
         "SGR release should use sgr_b for button identity"
     );
 }
 
 #[test]
 fn wheel_events_are_not_affected_by_active_drag() {
-    let mut state = super::ClientMouseState {
+    let mut state = ClientMouseState {
         drag_flag: 1,
         ..Default::default()
     };
@@ -876,7 +659,7 @@ fn wheel_events_are_not_affected_by_active_drag() {
     let event = classify_mouse_event(&mut state, &layout, wheel, now).expect("wheel");
     assert_eq!(
         event.key,
-        key_string_lookup_string("WheelUpPane").unwrap(),
+        key("WheelUpPane"),
         "wheel event is not converted to drag end"
     );
     assert_eq!(
@@ -887,17 +670,7 @@ fn wheel_events_are_not_affected_by_active_drag() {
 
 #[test]
 fn scrollbar_from_view_with_zero_history_returns_full_slider() {
-    let sb = PaneScrollbar::from_view(
-        10,
-        0,
-        false,
-        PaneScrollbarsMode::On,
-        ScrollbarPosition::Right,
-        1,
-        0,
-        None,
-    )
-    .expect("scrollbar");
+    let sb = right_scrollbar(10, 0, false, PaneScrollbarsMode::On, 1, None).expect("scrollbar");
     assert_eq!(sb.slider_y, 0);
     assert_eq!(
         sb.slider_h, 10,
@@ -907,93 +680,34 @@ fn scrollbar_from_view_with_zero_history_returns_full_slider() {
 
 #[test]
 fn scrollbar_from_view_alternate_on_returns_none() {
-    assert!(PaneScrollbar::from_view(
-        10,
-        100,
-        true,
-        PaneScrollbarsMode::On,
-        ScrollbarPosition::Right,
-        1,
-        0,
-        None,
-    )
-    .is_none());
+    assert!(right_scrollbar(10, 100, true, PaneScrollbarsMode::On, 1, None).is_none());
 }
 
 #[test]
 fn scrollbar_from_view_modal_without_copy_mode_returns_none() {
-    assert!(PaneScrollbar::from_view(
-        10,
-        100,
-        false,
-        PaneScrollbarsMode::Modal,
-        ScrollbarPosition::Right,
-        1,
-        0,
-        None,
-    )
-    .is_none());
+    assert!(right_scrollbar(10, 100, false, PaneScrollbarsMode::Modal, 1, None).is_none());
 }
 
 #[test]
 fn scrollbar_from_view_modal_with_copy_mode_returns_some() {
-    assert!(PaneScrollbar::from_view(
-        10,
-        100,
-        false,
-        PaneScrollbarsMode::Modal,
-        ScrollbarPosition::Right,
-        1,
-        0,
-        Some(0),
-    )
-    .is_some());
+    assert!(right_scrollbar(10, 100, false, PaneScrollbarsMode::Modal, 1, Some(0)).is_some());
 }
 
 #[test]
 fn scrollbar_from_view_zero_rows_returns_none() {
-    assert!(PaneScrollbar::from_view(
-        0,
-        100,
-        false,
-        PaneScrollbarsMode::On,
-        ScrollbarPosition::Right,
-        1,
-        0,
-        None,
-    )
-    .is_none());
+    assert!(right_scrollbar(0, 100, false, PaneScrollbarsMode::On, 1, None).is_none());
 }
 
 #[test]
 fn scrollbar_from_view_zero_width_returns_none() {
-    assert!(PaneScrollbar::from_view(
-        10,
-        100,
-        false,
-        PaneScrollbarsMode::On,
-        ScrollbarPosition::Right,
-        0,
-        0,
-        None,
-    )
-    .is_none());
+    assert!(right_scrollbar(10, 100, false, PaneScrollbarsMode::On, 0, None).is_none());
 }
 
 #[test]
 fn scrollbar_slider_never_exceeds_scrollbar_height() {
     // Large history with small viewport: slider should still fit
-    let sb = PaneScrollbar::from_view(
-        5,
-        10000,
-        false,
-        PaneScrollbarsMode::On,
-        ScrollbarPosition::Right,
-        1,
-        0,
-        Some(5000),
-    )
-    .expect("scrollbar");
+    let sb =
+        right_scrollbar(5, 10000, false, PaneScrollbarsMode::On, 1, Some(5000)).expect("scrollbar");
     assert!(sb.slider_y < 5, "slider_y within bounds");
     assert!(sb.slider_h >= 1, "slider_h at least 1");
     assert!(
@@ -1006,17 +720,8 @@ fn scrollbar_slider_never_exceeds_scrollbar_height() {
 
 #[test]
 fn scrollbar_copy_mode_offset_at_max_produces_slider_at_top() {
-    let sb = PaneScrollbar::from_view(
-        10,
-        100,
-        false,
-        PaneScrollbarsMode::On,
-        ScrollbarPosition::Right,
-        1,
-        0,
-        Some(100),
-    )
-    .expect("scrollbar");
+    let sb =
+        right_scrollbar(10, 100, false, PaneScrollbarsMode::On, 1, Some(100)).expect("scrollbar");
     // At max offset, slider should be near top
     assert!(sb.slider_y <= 10);
     assert!(sb.slider_h >= 1);
@@ -1032,17 +737,8 @@ fn scrollbar_copy_mode_offset_at_max_produces_slider_at_top() {
 fn scrollbar_slider_clamped_at_extreme_offsets() {
     // Test with offset that would push slider_y to the very bottom
     for offset in [0, 1, 50, 99, 100, 200, 500, 1000] {
-        let sb = PaneScrollbar::from_view(
-            3,
-            1000,
-            false,
-            PaneScrollbarsMode::On,
-            ScrollbarPosition::Right,
-            1,
-            0,
-            Some(offset),
-        )
-        .expect("scrollbar");
+        let sb = right_scrollbar(3, 1000, false, PaneScrollbarsMode::On, 1, Some(offset))
+            .expect("scrollbar");
         assert!(
             sb.slider_y + sb.slider_h <= 3,
             "offset {offset}: slider bottom within scrollbar: {} + {} <= 3",
@@ -1054,55 +750,31 @@ fn scrollbar_slider_clamped_at_extreme_offsets() {
 
 #[test]
 fn click_sequence_resets_on_different_button() {
-    let mut state = super::ClientMouseState::default();
+    let mut state = ClientMouseState::default();
     let base = Instant::now();
     let layout = layout();
 
     // First click with button 0
     let _ = classify_mouse_event(&mut state, &layout, raw(0, 5, 5), base);
     // Second click with button 1 (different button)
-    let second = classify_mouse_event(
-        &mut state,
-        &layout,
-        super::MouseForwardEvent {
-            lx: 5,
-            ly: 5,
-            ..raw(1, 5, 5)
-        },
-        base + std::time::Duration::from_millis(50),
-    )
-    .expect("reset to down");
+    let second = classify_mouse_event(&mut state, &layout, raw(1, 5, 5), after(base, 50))
+        .expect("reset to down");
     assert_eq!(
         second.key,
-        key_string_lookup_string("MouseDown2Pane").unwrap(),
+        key("MouseDown2Pane"),
         "different button resets to MouseDown"
     );
 }
 
 #[test]
 fn mouse_move_outside_active_pane_does_not_trigger_focus_change() {
-    let mut state = super::ClientMouseState::default();
+    let mut state = ClientMouseState::default();
     let mut layout = layout();
     layout.focus_follows_mouse = true;
     layout.active_pane = Some(PaneId::new(0));
     // Move within the active pane
-    let event = classify_mouse_event(
-        &mut state,
-        &layout,
-        super::MouseForwardEvent {
-            b: 35,
-            lb: 35,
-            x: 5,
-            y: 5,
-            lx: 4,
-            ly: 5,
-            sgr_b: 35,
-            sgr_type: 'm',
-            ignore: false,
-        },
-        Instant::now(),
-    )
-    .expect("move");
+    let event =
+        classify_mouse_event(&mut state, &layout, hover(5, 5, 4), Instant::now()).expect("move");
     assert_eq!(
         event.focus_target, None,
         "no focus change within active pane"
@@ -1111,7 +783,7 @@ fn mouse_move_outside_active_pane_does_not_trigger_focus_change() {
 
 #[test]
 fn nowhere_hit_returns_none() {
-    let mut state = super::ClientMouseState::default();
+    let mut state = ClientMouseState::default();
     let mut layout = layout();
     layout.panes.clear(); // no panes to hit
                           // Click at coordinates that don't match any pane
@@ -1121,15 +793,9 @@ fn nowhere_hit_returns_none() {
 
 #[test]
 fn left_scrollbar_position_hit_detection() {
-    let mut state = super::ClientMouseState::default();
+    let mut state = ClientMouseState::default();
     let mut layout = layout();
-    layout.panes[0].scrollbar = Some(PaneScrollbar {
-        position: ScrollbarPosition::Left,
-        width: 1,
-        pad: 0,
-        slider_y: 3,
-        slider_h: 4,
-    });
+    layout.panes[0].scrollbar = fixed_scrollbar(ScrollbarPosition::Left, 1, 0, 3, 4);
     layout.panes[0].geometry = PaneGeometry::new(1, 0, 39, 10);
     // Click on the left scrollbar column (x=0)
     let event = classify_mouse_event(&mut state, &layout, raw(0, 0, 2), Instant::now())
@@ -1149,16 +815,10 @@ fn scrollbar_padding_is_a_pane_binding_location_on_both_sides() {
         ),
         (ScrollbarPosition::Left, PaneGeometry::new(3, 0, 17, 10), 2),
     ] {
-        let mut state = super::ClientMouseState::default();
+        let mut state = ClientMouseState::default();
         let mut layout = layout();
         layout.panes[0].geometry = geometry;
-        layout.panes[0].scrollbar = Some(PaneScrollbar {
-            position,
-            width: 2,
-            pad: 1,
-            slider_y: 3,
-            slider_h: 4,
-        });
+        layout.panes[0].scrollbar = fixed_scrollbar(position, 2, 1, 3, 4);
 
         let event = classify_mouse_event(&mut state, &layout, raw(0, pad_x, 2), Instant::now())
             .expect("scrollbar padding belongs to the pane binding region");
@@ -1176,18 +836,12 @@ fn scrollbar_padding_is_a_pane_binding_location_on_both_sides() {
 fn left_scrollbar_rightmost_content_remains_pane() {
     let mut layout = layout();
     layout.panes[0].geometry = PaneGeometry::new(3, 0, 17, 10);
-    layout.panes[0].scrollbar = Some(PaneScrollbar {
-        position: ScrollbarPosition::Left,
-        width: 2,
-        pad: 1,
-        slider_y: 3,
-        slider_h: 4,
-    });
+    layout.panes[0].scrollbar = fixed_scrollbar(ScrollbarPosition::Left, 2, 1, 3, 4);
 
     // The geometry already excludes the three reserved scrollbar cells, so
     // every remaining visible content cell must stay mouse-addressable.
     for x in 17..=19 {
-        let mut state = super::ClientMouseState::default();
+        let mut state = ClientMouseState::default();
         let event = classify_mouse_event(&mut state, &layout, raw(0, x, 2), Instant::now())
             .expect("visible content remains mouse-addressable");
         assert_eq!(event.event.location, MouseLocation::Pane, "x={x}");
@@ -1228,14 +882,8 @@ fn pane_border_status_precedes_scrollbar_and_content_hit_regions() {
         layout.pane_border_status = pane_status;
         layout.panes.truncate(1);
         layout.panes[0].geometry = geometry;
-        layout.panes[0].scrollbar = Some(PaneScrollbar {
-            position,
-            width: 2,
-            pad: 1,
-            slider_y: 2,
-            slider_h: 3,
-        });
-        layout.panes[0].border_controls = vec![super::BorderControlRange {
+        layout.panes[0].scrollbar = fixed_scrollbar(position, 2, 1, 2, 3);
+        layout.panes[0].border_controls = vec![BorderControlRange {
             x: 3..=3,
             y: status_y,
             control: 9,
@@ -1244,7 +892,7 @@ fn pane_border_status_precedes_scrollbar_and_content_hit_regions() {
         // Oracle tmux 3.7b: the pane-status row remains a border across the
         // scrollbar track, padding and content; border controls still win.
         for x in [0, 1, 2, 3, 16, 19] {
-            let mut state = super::ClientMouseState::default();
+            let mut state = ClientMouseState::default();
             let event =
                 classify_mouse_event(&mut state, &layout, raw(0, x, status_y), Instant::now())
                     .expect("pane status row remains mouse-addressable");
@@ -1263,16 +911,6 @@ fn pane_border_status_precedes_scrollbar_and_content_hit_regions() {
 
 #[test]
 fn copy_mode_mouse_context_returns_none_without_pane_id() {
-    let event = super::AttachedMouseEvent {
-        raw: raw(0, 5, 5),
-        session_id: 1,
-        window_id: Some(5),
-        pane_id: None,
-        pane_target: None,
-        location: MouseLocation::Pane,
-        status_at: None,
-        status_lines: 0,
-        ignore: false,
-    };
+    let event = attached_event(raw(0, 5, 5), None, None, 0);
     assert!(copy_mode_mouse_context(&event, PaneGeometry::new(0, 0, 40, 10), 0).is_none());
 }

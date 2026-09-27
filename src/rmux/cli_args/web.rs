@@ -19,14 +19,11 @@ pub(crate) fn parse_web_share_args(arguments: Vec<String>) -> Result<WebShareArg
 /// Parsed `web-share` arguments: the mode, share target, role limits, expiry and tunnel settings.
 #[derive(Debug, Clone, Args)]
 #[command(
-    after_help = WEB_SHARE_AFTER_HELP
+    after_help = WEB_SHARE_AFTER_HELP,
+    group(
+        ArgGroup::new("mode").args(["list", "stop", "disconnect", "stop_all", "lookup", "config"])
+    )
 )]
-#[command(group(
-    ArgGroup::new("mode")
-        .required(false)
-        .multiple(false)
-        .args(["list", "stop", "disconnect", "stop_all", "lookup", "config"])
-))]
 pub(crate) struct WebShareArgs {
     #[arg(short = 'l', action = ArgAction::SetTrue, group = "mode")]
     pub(crate) list: bool,
@@ -147,37 +144,16 @@ fn normalize_web_share_args(arguments: Vec<String>) -> Vec<String> {
     };
     match command.as_str() {
         "list" => prefixed("-l", rest),
-        "stop" => normalize_stop(rest),
-        "disconnect" => normalize_disconnect(rest),
+        // `stop all` stops every share; `stop <share-id>` stops one.
+        "stop" => match rest.split_first() {
+            Some((target, tail)) if target == "all" => prefixed("-X", tail),
+            _ => prefixed("-K", rest),
+        },
+        "disconnect" => prefixed("--disconnect", rest),
         "off" => prefixed("-X", rest),
         "config" => prefixed("--config", rest),
         "lookup" => prefixed("--lookup", rest),
         _ => arguments,
-    }
-}
-
-/// Rewrites `disconnect [share-id]` into `--disconnect`, keeping any trailing arguments.
-fn normalize_disconnect(rest: &[String]) -> Vec<String> {
-    match rest.split_first() {
-        Some((target, tail)) => {
-            let mut normalized = vec!["--disconnect".to_owned(), target.clone()];
-            normalized.extend_from_slice(tail);
-            normalized
-        }
-        None => vec!["--disconnect".to_owned()],
-    }
-}
-
-/// Rewrites `stop <share-id>` into `-K`, mapping the literal `all` to `-X`.
-fn normalize_stop(rest: &[String]) -> Vec<String> {
-    match rest.split_first() {
-        Some((target, tail)) if target == "all" => prefixed("-X", tail),
-        Some((target, tail)) => {
-            let mut normalized = vec!["-K".to_owned(), target.clone()];
-            normalized.extend_from_slice(tail);
-            normalized
-        }
-        None => vec!["-K".to_owned()],
     }
 }
 

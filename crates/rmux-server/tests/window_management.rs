@@ -5,19 +5,22 @@ use std::time::{Duration, Instant};
 
 mod common;
 
-use common::{session_name, start_server, ClientConnection, TestHarness, PTY_TEST_LOCK};
+use common::{session_name, start_server, ClientConnection, Fixture, TestHarness, PTY_TEST_LOCK};
 use rmux_proto::{
     KillWindowRequest, LastWindowRequest, ListPanesRequest, ListWindowsRequest, MoveWindowRequest,
-    MoveWindowResponse, MoveWindowTarget, NewSessionRequest, NewWindowRequest, NextWindowRequest,
-    PaneTarget, PreviousWindowRequest, RenameWindowRequest, Request, Response,
-    RotateWindowDirection, RotateWindowRequest, RotateWindowResponse, SelectWindowRequest,
-    SessionName, SplitWindowRequest, SplitWindowTarget, SwapWindowRequest, SwapWindowResponse,
-    TerminalSize, WindowTarget,
+    MoveWindowResponse, MoveWindowTarget, NewWindowRequest, NextWindowRequest, PaneTarget,
+    PreviousWindowRequest, RenameWindowRequest, Request, Response, RotateWindowDirection,
+    RotateWindowRequest, RotateWindowResponse, SelectWindowRequest, SessionName,
+    SplitWindowRequest, SwapWindowRequest, SwapWindowResponse, TerminalSize, WindowTarget,
 };
 
 // PTY child processes can take a few seconds to appear consistently in
 // `/proc/<pid>/task/*/children` under full-workspace test load.
 const PTY_TIMEOUT: Duration = Duration::from_secs(5);
+const SESSION_SIZE: TerminalSize = TerminalSize {
+    cols: 120,
+    rows: 40,
+};
 
 #[tokio::test(flavor = "multi_thread")]
 async fn window_management_requests_round_trip_through_the_socket() -> Result<(), Box<dyn Error>> {
@@ -27,31 +30,13 @@ async fn window_management_requests_round_trip_through_the_socket() -> Result<()
     let mut client = ClientConnection::connect(&socket_path).await?;
     let session = session_name("alpha");
 
-    let created = client
-        .send_request(&Request::NewSession(NewSessionRequest {
-            session_name: session.clone(),
-            detached: true,
-            size: Some(TerminalSize {
-                cols: 120,
-                rows: 40,
-            }),
-            environment: None,
-        }))
-        .await?;
-    assert!(matches!(created, Response::NewSession(_)));
+    client.create_session((&session, SESSION_SIZE)).await?;
 
     let new_window = client
-        .send_request(&Request::NewWindow(Box::new(NewWindowRequest {
-            target: session.clone(),
+        .send(NewWindowRequest {
             name: Some("logs".to_owned()),
-            detached: true,
-            start_directory: None,
-            environment: None,
-            command: None,
-            process_command: None,
-            target_window_index: None,
-            insert_at_target: false,
-        })))
+            ..Fixture::fixture(&session)
+        })
         .await?;
     assert_eq!(
         new_window,
@@ -111,72 +96,21 @@ async fn kill_window_all_others_cleans_up_removed_window_ptys() -> Result<(), Bo
     let mut client = ClientConnection::connect(&socket_path).await?;
     let session = session_name("alpha");
 
-    let created = client
-        .send_request(&Request::NewSession(NewSessionRequest {
-            session_name: session.clone(),
-            detached: true,
-            size: Some(TerminalSize {
-                cols: 120,
-                rows: 40,
-            }),
-            environment: None,
-        }))
-        .await?;
-    assert!(matches!(created, Response::NewSession(_)));
+    client.create_session((&session, SESSION_SIZE)).await?;
 
-    assert!(matches!(
-        client
-            .send_request(&Request::NewWindow(Box::new(NewWindowRequest {
-                target: session.clone(),
-                name: None,
-                detached: true,
-                start_directory: None,
-                environment: None,
-                command: None,
-                process_command: None,
-                target_window_index: None,
-                insert_at_target: false,
-            })))
-            .await?,
-        Response::NewWindow(_)
-    ));
-    assert!(matches!(
-        client
-            .send_request(&Request::SelectWindow(SelectWindowRequest {
-                target: WindowTarget::with_window(session.clone(), 1),
-            }))
-            .await?,
-        Response::SelectWindow(_)
-    ));
+    client.send_ok(NewWindowRequest::fixture(&session)).await?;
+    client
+        .send_ok(SelectWindowRequest {
+            target: WindowTarget::with_window(session.clone(), 1),
+        })
+        .await?;
     assert_eq!(
-        client
-            .send_request(&Request::SplitWindow(SplitWindowRequest {
-                target: SplitWindowTarget::Session(session.clone()),
-                direction: rmux_proto::SplitDirection::Vertical,
-                before: false,
-                environment: None,
-            }))
-            .await?,
+        client.send(SplitWindowRequest::fixture(&session)).await?,
         Response::SplitWindow(rmux_proto::SplitWindowResponse {
             pane: PaneTarget::with_window(session.clone(), 1, 1),
         })
     );
-    assert!(matches!(
-        client
-            .send_request(&Request::NewWindow(Box::new(NewWindowRequest {
-                target: session.clone(),
-                name: None,
-                detached: true,
-                start_directory: None,
-                environment: None,
-                command: None,
-                process_command: None,
-                target_window_index: None,
-                insert_at_target: false,
-            })))
-            .await?,
-        Response::NewWindow(_)
-    ));
+    client.send_ok(NewWindowRequest::fixture(&session)).await?;
 
     let all_pane_ttys = wait_for_session_pane_ttys(&mut client, &session, 4).await?;
     let target_window_ttys = all_pane_ttys
@@ -219,52 +153,16 @@ async fn window_navigation_and_listing_requests_round_trip_through_the_socket(
     let mut client = ClientConnection::connect(&socket_path).await?;
     let session = session_name("alpha");
 
-    let created = client
-        .send_request(&Request::NewSession(NewSessionRequest {
-            session_name: session.clone(),
-            detached: true,
-            size: Some(TerminalSize {
-                cols: 120,
-                rows: 40,
-            }),
-            environment: None,
-        }))
-        .await?;
-    assert!(matches!(created, Response::NewSession(_)));
+    client.create_session((&session, SESSION_SIZE)).await?;
 
-    assert!(matches!(
+    for name in ["logs", "shell"] {
         client
-            .send_request(&Request::NewWindow(Box::new(NewWindowRequest {
-                target: session.clone(),
-                name: Some("logs".to_owned()),
-                detached: true,
-                start_directory: None,
-                environment: None,
-                command: None,
-                process_command: None,
-                target_window_index: None,
-                insert_at_target: false,
-            })))
-            .await?,
-        Response::NewWindow(_)
-    ));
-    assert!(matches!(
-        client
-            .send_request(&Request::NewWindow(Box::new(NewWindowRequest {
-                target: session.clone(),
-                name: Some("shell".to_owned()),
-                detached: true,
-                start_directory: None,
-                environment: None,
-                command: None,
-                process_command: None,
-                target_window_index: None,
-                insert_at_target: false,
-            })))
-            .await?,
-        Response::NewWindow(_)
-    ));
-
+            .send_ok(NewWindowRequest {
+                name: Some(name.to_owned()),
+                ..Fixture::fixture(&session)
+            })
+            .await?;
+    }
     assert_eq!(
         client
             .send_request(&Request::NextWindow(NextWindowRequest {
@@ -299,13 +197,10 @@ async fn window_navigation_and_listing_requests_round_trip_through_the_socket(
     );
 
     let listed = client
-        .send_request(&Request::ListWindows(Box::new(ListWindowsRequest {
-            target: session,
-            format: Some("#{window_index}:#{window_id}:#{window_active}".to_owned()),
-            filter: None,
-            sort_order: None,
-            reversed: false,
-        })))
+        .send(ListWindowsRequest::fixture((
+            session,
+            "#{window_index}:#{window_id}:#{window_active}",
+        )))
         .await?;
     let Response::ListWindows(listed) = listed else {
         panic!("expected list-windows response");
@@ -328,14 +223,10 @@ async fn wait_for_session_pane_ttys(
 
     while Instant::now() < deadline {
         let listed = client
-            .send_request(&Request::ListPanes(Box::new(ListPanesRequest {
-                target: session.clone(),
-                format: Some("#{window_index}:#{pane_index}:#{pane_tty}".to_owned()),
-                filter: None,
-                sort_order: None,
-                reversed: false,
-                target_window_index: None,
-            })))
+            .send(ListPanesRequest::fixture((
+                session,
+                "#{window_index}:#{pane_index}:#{pane_tty}",
+            )))
             .await?;
         let output = listed
             .command_output()
@@ -385,53 +276,18 @@ async fn window_move_swap_and_rotate_requests_round_trip_through_the_socket(
     let alpha = session_name("alpha");
     let beta = session_name("beta");
 
-    for session in [alpha.clone(), beta.clone()] {
-        let created = client
-            .send_request(&Request::NewSession(NewSessionRequest {
-                session_name: session,
-                detached: true,
-                size: Some(TerminalSize {
-                    cols: 120,
-                    rows: 40,
-                }),
-                environment: None,
-            }))
-            .await?;
-        assert!(matches!(created, Response::NewSession(_)));
+    for session in [&alpha, &beta] {
+        client.create_session((session, SESSION_SIZE)).await?;
     }
 
-    assert!(matches!(
+    for name in ["logs", "scratch"] {
         client
-            .send_request(&Request::NewWindow(Box::new(NewWindowRequest {
-                target: alpha.clone(),
-                name: Some("logs".to_owned()),
-                detached: true,
-                start_directory: None,
-                environment: None,
-                command: None,
-                process_command: None,
-                target_window_index: None,
-                insert_at_target: false,
-            })))
-            .await?,
-        Response::NewWindow(_)
-    ));
-    assert!(matches!(
-        client
-            .send_request(&Request::NewWindow(Box::new(NewWindowRequest {
-                target: alpha.clone(),
-                name: Some("scratch".to_owned()),
-                detached: true,
-                start_directory: None,
-                environment: None,
-                command: None,
-                process_command: None,
-                target_window_index: None,
-                insert_at_target: false,
-            })))
-            .await?,
-        Response::NewWindow(_)
-    ));
+            .send_ok(NewWindowRequest {
+                name: Some(name.to_owned()),
+                ..Fixture::fixture(&alpha)
+            })
+            .await?;
+    }
 
     let moved = client
         .send_request(&Request::MoveWindow(MoveWindowRequest {
@@ -469,12 +325,11 @@ async fn window_move_swap_and_rotate_requests_round_trip_through_the_socket(
 
     assert_eq!(
         client
-            .send_request(&Request::SplitWindow(SplitWindowRequest {
-                target: SplitWindowTarget::Pane(PaneTarget::with_window(alpha.clone(), 2, 0)),
-                direction: rmux_proto::SplitDirection::Vertical,
-                before: false,
-                environment: None,
-            }))
+            .send(SplitWindowRequest::fixture(PaneTarget::with_window(
+                alpha.clone(),
+                2,
+                0,
+            )))
             .await?,
         Response::SplitWindow(rmux_proto::SplitWindowResponse {
             pane: PaneTarget::with_window(alpha.clone(), 2, 1),
@@ -496,13 +351,10 @@ async fn window_move_swap_and_rotate_requests_round_trip_through_the_socket(
     );
 
     let listed = client
-        .send_request(&Request::ListWindows(Box::new(ListWindowsRequest {
-            target: alpha.clone(),
-            format: Some("#{window_index}:#{window_panes}".to_owned()),
-            filter: None,
-            sort_order: None,
-            reversed: false,
-        })))
+        .send(ListWindowsRequest::fixture((
+            alpha.clone(),
+            "#{window_index}:#{window_panes}",
+        )))
         .await?;
     let Response::ListWindows(listed) = listed else {
         panic!("expected list-windows response");

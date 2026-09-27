@@ -1,4 +1,5 @@
 use super::*;
+use crate::test_fixtures::Sizeless;
 
 #[tokio::test]
 async fn lock_client_emits_lock_control_before_refresh() {
@@ -6,23 +7,10 @@ async fn lock_client_emits_lock_control_before_refresh() {
     let requester_pid = std::process::id();
     let alpha = session_name("alpha");
 
-    let created = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name: alpha.clone(),
-            detached: true,
-            size: Some(TerminalSize {
-                cols: 120,
-                rows: 40,
-            }),
-            environment: None,
-        }))
+    handler
+        .create_session((&alpha, TerminalSize::new(120, 40)))
         .await;
-    assert!(matches!(created, Response::NewSession(_)));
-
-    let (control_tx, mut control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha, control_tx)
-        .await;
+    let mut control_rx = handler.attach_client(requester_pid, alpha).await;
 
     let response = handler
         .handle(Request::LockClient(rmux_proto::LockClientRequest {
@@ -48,20 +36,8 @@ async fn lock_server_skips_already_suspended_clients() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
 
-    let created = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name: alpha.clone(),
-            detached: true,
-            size: Some(TerminalSize { cols: 80, rows: 24 }),
-            environment: None,
-        }))
-        .await;
-    assert!(matches!(created, Response::NewSession(_)));
-
-    let (control_tx, mut control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(std::process::id(), alpha, control_tx)
-        .await;
+    handler.create_session(&alpha).await;
+    let mut control_rx = handler.attach_client(std::process::id(), alpha).await;
 
     let first_lock = handler
         .handle(Request::LockServer(rmux_proto::LockServerRequest))
@@ -124,20 +100,8 @@ async fn kill_server_sets_shutdown_flag() {
 async fn daemon_status_reports_version_and_activity_counts() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    let created = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name: alpha.clone(),
-            detached: true,
-            size: None,
-            environment: None,
-        }))
-        .await;
-    assert!(matches!(created, Response::NewSession(_)));
-
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(std::process::id(), alpha, control_tx)
-        .await;
+    handler.create_session(Sizeless(&alpha)).await;
+    let _control_rx = handler.attach_client(std::process::id(), alpha).await;
 
     let response = handler
         .handle(Request::DaemonStatus(rmux_proto::DaemonStatusRequest))
@@ -172,15 +136,7 @@ async fn shutdown_if_idle_queues_shutdown_only_when_empty() {
 #[tokio::test]
 async fn shutdown_if_idle_refuses_live_sessions() {
     let handler = RequestHandler::new();
-    let created = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name: session_name("alpha"),
-            detached: true,
-            size: None,
-            environment: None,
-        }))
-        .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    handler.create_session(Sizeless("alpha")).await;
 
     let response = handler
         .handle(Request::ShutdownIfIdle(rmux_proto::ShutdownIfIdleRequest))

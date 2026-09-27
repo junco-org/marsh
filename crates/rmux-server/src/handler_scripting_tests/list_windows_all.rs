@@ -18,42 +18,20 @@ async fn create_window_listing_fixture(handler: &RequestHandler) {
             "berry",
         ),
     ] {
-        let session = session_name(session);
-        let response = handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: session.clone(),
-                detached: true,
-                size: Some(size),
-                environment: None,
-            }))
-            .await;
-        assert!(matches!(response, Response::NewSession(_)), "{response:?}");
-        let response = handler
-            .handle(Request::RenameWindow(rmux_proto::RenameWindowRequest {
+        let session = handler.create_session((session, size)).await;
+        handler
+            .handle_ok(rmux_proto::RenameWindowRequest {
                 target: WindowTarget::with_window(session.clone(), 0),
                 name: first_name.to_owned(),
-            }))
+            })
             .await;
-        assert!(
-            matches!(response, Response::RenameWindow(_)),
-            "{response:?}"
-        );
-        let response = handler
-            .handle(Request::NewWindow(Box::new(NewWindowRequest {
-                target: session,
+        handler
+            .create_window(NewWindowRequest {
                 name: Some(second_name.to_owned()),
-                detached: true,
-                environment: None,
-                command: None,
-                start_directory: None,
-                target_window_index: None,
-                insert_at_target: false,
-                process_command: None,
-            })))
+                ..Fixture::fixture(session)
+            })
             .await;
-        assert!(matches!(response, Response::NewWindow(_)), "{response:?}");
     }
-    handler.wait_for_initial_panes_for_test().await;
 }
 
 async fn execute_list_windows_all(handler: &RequestHandler, command: &str) -> String {
@@ -162,23 +140,9 @@ async fn source_file_and_control_queue_share_list_windows_all_execution() {
     assert_eq!(source_stdout, "alpha:0\nalpha:1\nbeta:0\nbeta:1\n");
 
     let requester_pid = 49_102;
-    let (event_tx, _event_rx) = tokio::sync::mpsc::channel(CONTROL_SERVER_EVENT_CAPACITY);
-    handler
-        .register_control_with_closing(
-            requester_pid,
-            ControlModeUpgrade {
-                initial_command_count: 0,
-                mode: rmux_proto::ControlMode::Plain,
-                terminal_context: OuterTerminalContext::default(),
-            },
-            event_tx,
-            Arc::new(AtomicBool::new(false)),
-        )
+    let (_, _event_rx) = handler
+        .register_control_for_test(requester_pid, Some(&session_name("alpha")))
         .await;
-    handler
-        .set_control_session(requester_pid, Some(session_name("alpha")))
-        .await
-        .expect("control session set succeeds");
     let commands = handler
         .parse_control_commands(
             "list-windows -a -f '#{==:#{session_name},beta}' -F '#{session_name}:#{window_index}'",
@@ -293,10 +257,7 @@ async fn hook_binding_and_alias_entries_share_list_windows_all_execution() {
     wait_for_named_buffer(&handler, "list-windows-hook-entry", b"ok").await;
 
     let requester_pid = u32::MAX - 91_102;
-    let (attach_tx, _attach_rx) = tokio::sync::mpsc::unbounded_channel();
-    handler
-        .register_attach(requester_pid, session_name("alpha"), attach_tx)
-        .await;
+    let _attach_rx = handler.attach_client(requester_pid, "alpha").await;
     let binding = CommandParser::new()
         .parse(
             r#"bind-key X "run-shell -C 'list-windows -a ; set-buffer -b list-windows-binding-entry ok'""#,
@@ -312,17 +273,13 @@ async fn hook_binding_and_alias_entries_share_list_windows_all_execution() {
         .expect("binding executes");
     wait_for_named_buffer(&handler, "list-windows-binding-entry", b"ok").await;
 
-    assert!(matches!(
-        handler
-            .handle(Request::SetOption(SetOptionRequest {
-                scope: ScopeSelector::Global,
-                option: OptionName::CommandAlias,
-                value: "lwa=list-windows -a -F '#{session_name}:#{window_index}'".to_owned(),
-                mode: SetOptionMode::Replace,
-            }))
-            .await,
-        Response::SetOption(_)
-    ));
+    handler
+        .set_option(
+            ScopeSelector::Global,
+            OptionName::CommandAlias,
+            "lwa=list-windows -a -F '#{session_name}:#{window_index}'",
+        )
+        .await;
     let alias = handler
         .parse_command_string_one_group("lwa")
         .await
@@ -349,7 +306,7 @@ async fn startup_config_entry_executes_list_windows_all_and_continues() {
     )
     .expect("write startup config");
     let config = crate::DaemonConfig::new(root.join("rmux.sock")).with_config_files(
-        vec![std::path::PathBuf::from("startup.conf")],
+        vec![PathBuf::from("startup.conf")],
         false,
         Some(root.clone()),
     );

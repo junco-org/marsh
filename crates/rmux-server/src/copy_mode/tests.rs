@@ -3,6 +3,21 @@ use super::*;
 use rmux_core::input::InputParser;
 use rmux_proto::TerminalSize;
 
+/// At 10x8, `ABCDEFGHIJKLMNO` wraps onto a second physical row.
+const WRAPPED_LINES: &str = "ABCDEFGHIJKLMNO\r\none  \r\ntwo\r\n";
+
+/// The eight direct line-transfer commands as `(command, pipe, cancel, end_of_line)`.
+const LINE_TRANSFER_COMMANDS: [(&str, bool, bool, bool); 8] = [
+    ("copy-line", false, false, false),
+    ("copy-line-and-cancel", false, true, false),
+    ("copy-pipe-line", true, false, false),
+    ("copy-pipe-line-and-cancel", true, true, false),
+    ("copy-end-of-line", false, false, true),
+    ("copy-end-of-line-and-cancel", false, true, true),
+    ("copy-pipe-end-of-line", true, false, true),
+    ("copy-pipe-end-of-line-and-cancel", true, true, true),
+];
+
 fn build_screen(cols: u16, rows: u16, content: &str) -> Screen {
     let mut screen = Screen::new(TerminalSize { cols, rows }, 200);
     let mut parser = InputParser::new();
@@ -23,46 +38,9 @@ fn test_context() -> CopyModeCommandContext {
     }
 }
 
-#[test]
-fn summary_top_line_time_is_zero_for_visible_lines_at_bottom() {
-    let screen = build_screen(20, 5, "line1\r\nline2\r\n");
-    let state = CopyModeState::for_test(screen);
-
-    assert_eq!(state.summary().top_line_time, 0);
-}
-
-#[test]
-fn summary_top_line_time_is_preserved_for_history_lines() {
-    let screen = build_screen(
-        20,
-        3,
-        "line1\r\nline2\r\nline3\r\nline4\r\nline5\r\nline6\r\n",
-    );
-    let mut state = CopyModeState::for_test(screen);
-    let _ = state.execute_command("history-top", &[], &test_context());
-
-    assert!(
-        state.summary().top_line_time > 0,
-        "history lines should keep their timestamp for copy-mode-position-format"
-    );
-}
-
 fn vi_context() -> CopyModeCommandContext {
     CopyModeCommandContext {
         mode_keys: ModeKeys::Vi,
-        line_number_mode: CopyModeLineNumberMode::Off,
-        wrap_search: true,
-        word_separators: " -_@".to_owned(),
-        default_shell: "/bin/sh".to_owned(),
-        working_directory: None,
-        refresh_screen: None,
-        mouse: None,
-    }
-}
-
-fn punctuation_word_context() -> CopyModeCommandContext {
-    CopyModeCommandContext {
-        word_separators: " .-_@".to_owned(),
         ..test_context()
     }
 }
@@ -81,72 +59,234 @@ fn mouse_context(x: u32, y: u16) -> CopyModeCommandContext {
     }
 }
 
-#[test]
-fn cursor_down_and_cancel_only_cancels_at_bottom() {
-    let screen = build_screen(20, 3, "line1\r\nline2\r\nline3");
-    let mut state = CopyModeState::for_test(screen);
-    let ctx = test_context();
-
-    // Move to top first.
-    let _ = state.execute_command("history-top", &[], &ctx);
-
-    // cursor-down-and-cancel should NOT cancel when not at bottom.
-    let outcome = state
-        .execute_command("cursor-down-and-cancel", &[], &ctx)
-        .unwrap();
-    assert!(!outcome.cancel, "should not cancel when cursor moved down");
-
-    // Now go to bottom.
-    let _ = state.execute_command("history-bottom", &[], &ctx);
-
-    // cursor-down-and-cancel at the bottom should cancel.
-    let outcome = state
-        .execute_command("cursor-down-and-cancel", &[], &ctx)
-        .unwrap();
-    assert!(
-        outcome.cancel,
-        "should cancel when at bottom and cursor did not move"
-    );
+fn test_state(cols: u16, rows: u16, content: &str) -> CopyModeState {
+    CopyModeState::for_test(build_screen(cols, rows, content))
 }
 
-#[test]
-fn scroll_down_and_cancel_only_cancels_at_bottom() {
-    let screen = build_screen(20, 3, "line1\r\nline2\r\nline3\r\nline4\r\nline5");
-    let mut state = CopyModeState::for_test(screen);
-    let ctx = test_context();
-
-    // Move up to get scroll room.
-    let _ = state.execute_command("history-top", &[], &ctx);
-
-    let outcome = state
-        .execute_command("scroll-down-and-cancel", &[], &ctx)
-        .unwrap();
-    assert!(!outcome.cancel, "should not cancel when not at bottom");
-
-    // Go to bottom.
-    let _ = state.execute_command("history-bottom", &[], &ctx);
-
-    let outcome = state
-        .execute_command("scroll-down-and-cancel", &[], &ctx)
-        .unwrap();
-    assert!(outcome.cancel, "should cancel when at bottom");
+fn vi_state(cols: u16, rows: u16, content: &str) -> CopyModeState {
+    let screen = build_screen(cols, rows, content);
+    CopyModeState::new(screen, None, false, &vi_context(), false, true)
 }
 
-#[test]
-fn exit_on_scroll_cancels_scroll_down_at_bottom() {
+/// `foo.bar baz-qux end` scrolled to the top, with `.` as an extra word separator.
+fn punctuated_state() -> (CopyModeState, CopyModeCommandContext) {
+    let ctx = CopyModeCommandContext {
+        word_separators: " .-_@".to_owned(),
+        ..test_context()
+    };
+    let mut state = test_state(30, 5, "foo.bar baz-qux end\r\n");
+    state.execute_command("history-top", &[], &ctx).unwrap();
+    (state, ctx)
+}
+
+/// Runs argument-less `commands` in order, ignoring their results.
+fn run(state: &mut CopyModeState, ctx: &CopyModeCommandContext, commands: &[&str]) {
+    for command in commands {
+        let _ = state.execute_command(command, &[], ctx);
+    }
+}
+
+/// Runs argument-less `commands` in order; each one must succeed.
+fn run_ok(state: &mut CopyModeState, ctx: &CopyModeCommandContext, commands: &[&str]) {
+    for command in commands {
+        state.execute_command(command, &[], ctx).unwrap();
+    }
+}
+
+fn search_args(pattern: &str) -> [String; 2] {
+    ["--".to_owned(), pattern.to_owned()]
+}
+
+fn pipe_args(pipe: bool) -> Vec<String> {
+    if pipe {
+        vec!["cat".to_owned()]
+    } else {
+        Vec::new()
+    }
+}
+
+/// Runs the argument-less `command` and returns the bytes it transfers.
+fn transferred(state: &mut CopyModeState, ctx: &CopyModeCommandContext, command: &str) -> Vec<u8> {
+    state
+        .execute_command(command, &[], ctx)
+        .unwrap()
+        .transfer
+        .unwrap()
+        .data
+}
+
+/// Runs `commands` (ignoring results); `copy` must then transfer exactly `expected`.
+fn assert_transfer(
+    mut state: CopyModeState,
+    ctx: &CopyModeCommandContext,
+    commands: &[&str],
+    copy: &str,
+    expected: &[u8],
+) {
+    run(&mut state, ctx, commands);
+    assert_eq!(transferred(&mut state, ctx, copy), expected);
+}
+
+/// Runs `history-top`, then searches forward for `needle`, ignoring both results.
+fn search_needle_from_top(state: &mut CopyModeState, ctx: &CopyModeCommandContext) {
+    let _ = state.execute_command("history-top", &[], ctx);
+    let _ = state.execute_command("search-forward", &search_args("needle"), ctx);
+}
+
+/// `command` must not cancel after `history-top` but must cancel after `history-bottom`.
+fn assert_cancels_only_at_bottom(content: &str, command: &str, messages: [&str; 2]) {
+    let mut state = test_state(20, 3, content);
+    let ctx = test_context();
+
+    let _ = state.execute_command("history-top", &[], &ctx);
+    let outcome = state.execute_command(command, &[], &ctx).unwrap();
+    assert!(!outcome.cancel, "{}", messages[0]);
+
+    let _ = state.execute_command("history-bottom", &[], &ctx);
+    let outcome = state.execute_command(command, &[], &ctx).unwrap();
+    assert!(outcome.cancel, "{}", messages[1]);
+}
+
+fn exit_on_scroll_state() -> CopyModeState {
     let screen = build_screen(20, 3, "line1\r\nline2\r\nline3\r\nline4\r\nline5");
-    let mut state = CopyModeState::new(
+    CopyModeState::new(
         screen,
         None,
         false,
         &test_context(),
         true, // exit_on_scroll
         true,
+    )
+}
+
+/// Repeats `command` from `start` in [`punctuated_state`], checking every cursor stop.
+fn assert_punctuated_stops(start: Option<CopyPosition>, command: &str, stops: &[CopyPosition]) {
+    let (mut state, ctx) = punctuated_state();
+    if let Some(start) = start {
+        state.cursor = start;
+    }
+
+    for &expected in stops {
+        state.execute_command(command, &[], &ctx).unwrap();
+        assert_eq!(state.cursor, expected);
+    }
+}
+
+fn assert_mouse_selection(select: &str, expected: &[u8]) {
+    let mut state = test_state(20, 3, "alpha beta\r\ngamma delta\r\n");
+
+    let _ = state.execute_command("history-top", &[], &test_context());
+    let _ = state.execute_command(select, &[], &mouse_context(6, 1));
+
+    assert_eq!(
+        transferred(&mut state, &test_context(), "copy-selection"),
+        expected
     );
+}
+
+/// Selects the whole wrapped first line character-wise; `copy` must not add newlines.
+fn assert_wrapped_character_selection(copy: &str) {
+    let mut state = test_state(10, 8, "0123456789ABCDEFGHIJKLMNO\r\n");
     let ctx = test_context();
 
+    run_ok(
+        &mut state,
+        &ctx,
+        &[
+            "history-top",
+            "start-of-line",
+            "begin-selection",
+            "end-of-line",
+        ],
+    );
+
+    assert_eq!(
+        transferred(&mut state, &ctx, copy),
+        b"0123456789ABCDEFGHIJKLMNO"
+    );
+}
+
+/// Runs every [`LINE_TRANSFER_COMMANDS`] entry with `-N3` from the top of [`WRAPPED_LINES`].
+fn assert_counted_line_transfers(context: &CopyModeCommandContext) {
+    let screen = build_screen(10, 8, WRAPPED_LINES);
+
+    for (command, pipe, cancel, end_of_line) in LINE_TRANSFER_COMMANDS {
+        let mut state = CopyModeState::for_test(screen.clone());
+        state.execute_command("history-top", &[], context).unwrap();
+        if end_of_line {
+            run_ok(&mut state, context, &["cursor-right", "cursor-right"]);
+        }
+
+        let outcome = state
+            .execute_command_with_prefix(command, &pipe_args(pipe), context, 3)
+            .unwrap();
+        let transfer = outcome.transfer.expect("counted line transfer is produced");
+        let expected = if end_of_line {
+            b"CDEFGHIJKLMNO\none".as_slice()
+        } else {
+            b"ABCDEFGHIJKLMNO\none".as_slice()
+        };
+
+        assert_eq!(transfer.data, expected, "{command}");
+        assert_eq!(transfer.pipe_command.is_some(), pipe, "{command}");
+        assert_eq!(outcome.cancel, cancel, "{command}");
+    }
+}
+
+#[test]
+fn summary_top_line_time_is_zero_for_visible_lines_at_bottom() {
+    let state = test_state(20, 5, "line1\r\nline2\r\n");
+
+    assert_eq!(state.summary().top_line_time, 0);
+}
+
+#[test]
+fn summary_top_line_time_is_preserved_for_history_lines() {
+    let mut state = test_state(
+        20,
+        3,
+        "line1\r\nline2\r\nline3\r\nline4\r\nline5\r\nline6\r\n",
+    );
+    let _ = state.execute_command("history-top", &[], &test_context());
+
+    assert!(
+        state.summary().top_line_time > 0,
+        "history lines should keep their timestamp for copy-mode-position-format"
+    );
+}
+
+#[test]
+fn cursor_down_and_cancel_only_cancels_at_bottom() {
+    assert_cancels_only_at_bottom(
+        "line1\r\nline2\r\nline3",
+        "cursor-down-and-cancel",
+        [
+            "should not cancel when cursor moved down",
+            "should cancel when at bottom and cursor did not move",
+        ],
+    );
+}
+
+#[test]
+fn scroll_down_and_cancel_only_cancels_at_bottom() {
+    assert_cancels_only_at_bottom(
+        "line1\r\nline2\r\nline3\r\nline4\r\nline5",
+        "scroll-down-and-cancel",
+        [
+            "should not cancel when not at bottom",
+            "should cancel when at bottom",
+        ],
+    );
+}
+
+#[test]
+fn exit_on_scroll_cancels_scroll_down_at_bottom() {
+    let mut state = exit_on_scroll_state();
+
     // At the bottom already.
-    let outcome = state.execute_command("scroll-down", &[], &ctx).unwrap();
+    let outcome = state
+        .execute_command("scroll-down", &[], &test_context())
+        .unwrap();
     assert!(
         outcome.cancel,
         "scroll-down should cancel with exit_on_scroll at bottom"
@@ -155,18 +295,9 @@ fn exit_on_scroll_cancels_scroll_down_at_bottom() {
 
 #[test]
 fn exit_on_scroll_does_not_cancel_when_not_at_bottom() {
-    let screen = build_screen(20, 3, "line1\r\nline2\r\nline3\r\nline4\r\nline5");
-    let mut state = CopyModeState::new(
-        screen,
-        None,
-        false,
-        &test_context(),
-        true, // exit_on_scroll
-        true,
-    );
+    let mut state = exit_on_scroll_state();
     let ctx = test_context();
 
-    // Scroll up first.
     let _ = state.execute_command("history-top", &[], &ctx);
 
     let outcome = state.execute_command("scroll-down", &[], &ctx).unwrap();
@@ -178,15 +309,12 @@ fn exit_on_scroll_does_not_cancel_when_not_at_bottom() {
 
 #[test]
 fn search_again_advances_to_next_match() {
-    let screen = build_screen(20, 3, "foo bar foo baz foo");
-    let mut state = CopyModeState::for_test(screen);
+    let mut state = test_state(20, 3, "foo bar foo baz foo");
     let ctx = test_context();
 
-    // Initial search.
-    let _ = state.execute_command("search-forward", &["--".to_owned(), "foo".to_owned()], &ctx);
+    let _ = state.execute_command("search-forward", &search_args("foo"), &ctx);
     let first = state.cursor;
 
-    // search-again should advance to next match.
     let _ = state.execute_command("search-again", &[], &ctx);
     let second = state.cursor;
     assert!(
@@ -199,20 +327,12 @@ fn search_again_advances_to_next_match() {
 
 #[test]
 fn search_updates_an_active_selection_endpoint() {
-    let screen = build_screen(20, 3, "alpha beta gamma");
-    let mut state = CopyModeState::for_test(screen);
+    let mut state = test_state(20, 3, "alpha beta gamma");
     let context = test_context();
 
-    state.execute_command("history-top", &[], &context).unwrap();
+    run_ok(&mut state, &context, &["history-top", "begin-selection"]);
     state
-        .execute_command("begin-selection", &[], &context)
-        .unwrap();
-    state
-        .execute_command(
-            "search-forward",
-            &["--".to_owned(), "beta".to_owned()],
-            &context,
-        )
+        .execute_command("search-forward", &search_args("beta"), &context)
         .unwrap();
 
     assert_eq!(state.summary().selection_end, Some(state.cursor));
@@ -220,12 +340,10 @@ fn search_updates_an_active_selection_endpoint() {
 
 #[test]
 fn case_insensitive_plain_search_maps_unicode_expansion_to_original_cell() {
-    let screen = build_screen(10, 1, "İx");
-    let mut state = CopyModeState::for_test(screen);
-    let context = test_context();
+    let mut state = test_state(10, 1, "İx");
 
     state
-        .execute_command("search-forward-text", &["x".to_owned()], &context)
+        .execute_command("search-forward-text", &["x".to_owned()], &test_context())
         .unwrap();
 
     assert_eq!(state.search_results.len(), 1);
@@ -238,16 +356,10 @@ fn case_insensitive_plain_search_maps_unicode_expansion_to_original_cell() {
 
 #[test]
 fn oversized_regex_search_marks_partial_without_matches() {
-    let screen = build_screen(80, 3, &"a".repeat(1000));
-    let mut state = CopyModeState::for_test(screen);
-    let ctx = test_context();
+    let mut state = test_state(80, 3, &"a".repeat(1000));
 
     state
-        .execute_command(
-            "search-forward",
-            &["--".to_owned(), "a{50000}".to_owned()],
-            &ctx,
-        )
+        .execute_command("search-forward", &search_args("a{50000}"), &test_context())
         .unwrap();
 
     let summary = state.summary();
@@ -258,18 +370,15 @@ fn oversized_regex_search_marks_partial_without_matches() {
 #[test]
 fn search_again_respects_wrap_search_off() {
     let screen = build_screen(30, 3, "foo bar foo baz foo");
-    let mut context = test_context();
-    context.wrap_search = false;
+    let context = CopyModeCommandContext {
+        wrap_search: false,
+        ..test_context()
+    };
     let mut state = CopyModeState::new(screen, None, false, &context, false, true);
     state.cursor = CopyPosition { x: 0, y: 0 };
 
-    let _ = state.execute_command(
-        "search-forward",
-        &["--".to_owned(), "foo".to_owned()],
-        &context,
-    );
-    let _ = state.execute_command("search-again", &[], &context);
-    let _ = state.execute_command("search-again", &[], &context);
+    let _ = state.execute_command("search-forward", &search_args("foo"), &context);
+    run(&mut state, &context, &["search-again", "search-again"]);
     let last = state.cursor;
 
     let _ = state.execute_command("search-again", &[], &context);
@@ -279,13 +388,12 @@ fn search_again_respects_wrap_search_off() {
 
 #[test]
 fn search_reverse_goes_backward_without_changing_direction() {
-    let screen = build_screen(30, 3, "foo bar foo baz foo more text");
-    let mut state = CopyModeState::for_test(screen);
+    let mut state = test_state(30, 3, "foo bar foo baz foo more text");
     let ctx = test_context();
 
     // Initial forward search.
     let _ = state.execute_command("history-top", &[], &ctx);
-    let _ = state.execute_command("search-forward", &["--".to_owned(), "foo".to_owned()], &ctx);
+    let _ = state.execute_command("search-forward", &search_args("foo"), &ctx);
     let _ = state.execute_command("search-again", &[], &ctx);
     let before_reverse = state.cursor;
 
@@ -312,15 +420,9 @@ fn search_reverse_goes_backward_without_changing_direction() {
 
 #[test]
 fn vi_search_positions_at_match_start() {
-    let screen = build_screen(30, 3, "hello needle world");
-    let mut state = CopyModeState::new(screen, None, false, &vi_context(), false, true);
+    let mut state = vi_state(30, 3, "hello needle world");
 
-    let _ = state.execute_command("history-top", &[], &vi_context());
-    let _ = state.execute_command(
-        "search-forward",
-        &["--".to_owned(), "needle".to_owned()],
-        &vi_context(),
-    );
+    search_needle_from_top(&mut state, &vi_context());
     assert_eq!(
         state.cursor.x, 6,
         "vi search should position at match start"
@@ -329,8 +431,7 @@ fn vi_search_positions_at_match_start() {
 
 #[test]
 fn jump_to_forward_moves_before_the_matched_character_and_repeats() {
-    let screen = build_screen(20, 3, "aXbXcXdXe");
-    let mut state = CopyModeState::for_test(screen);
+    let mut state = test_state(20, 3, "aXbXcXdXe");
     let ctx = test_context();
 
     state.execute_command("history-top", &[], &ctx).unwrap();
@@ -345,32 +446,25 @@ fn jump_to_forward_moves_before_the_matched_character_and_repeats() {
 
 #[test]
 fn jump_to_backward_skips_adjacent_match_and_repeats() {
-    let screen = build_screen(20, 3, "aXbXcXdXe");
-    let mut state = CopyModeState::for_test(screen);
+    let mut state = test_state(20, 3, "aXbXcXdXe");
     let ctx = test_context();
 
-    state.execute_command("history-top", &[], &ctx).unwrap();
-    state.execute_command("end-of-line", &[], &ctx).unwrap();
+    run_ok(&mut state, &ctx, &["history-top", "end-of-line"]);
 
     state
         .execute_command("jump-to-backward", &["X".to_owned()], &ctx)
         .unwrap();
     assert_eq!(state.cursor, CopyPosition { x: 8, y: 0 });
 
-    state.execute_command("jump-again", &[], &ctx).unwrap();
-    assert_eq!(state.cursor, CopyPosition { x: 6, y: 0 });
-
-    state.execute_command("jump-again", &[], &ctx).unwrap();
-    assert_eq!(state.cursor, CopyPosition { x: 4, y: 0 });
-
-    state.execute_command("jump-again", &[], &ctx).unwrap();
-    assert_eq!(state.cursor, CopyPosition { x: 2, y: 0 });
+    for x in [6, 4, 2] {
+        state.execute_command("jump-again", &[], &ctx).unwrap();
+        assert_eq!(state.cursor, CopyPosition { x, y: 0 });
+    }
 }
 
 #[test]
 fn jump_to_backward_skips_adjacent_wide_match() {
-    let screen = build_screen(20, 3, "界a界b");
-    let mut state = CopyModeState::for_test(screen);
+    let mut state = test_state(20, 3, "界a界b");
     let ctx = test_context();
 
     state.execute_command("history-top", &[], &ctx).unwrap();
@@ -384,8 +478,7 @@ fn jump_to_backward_skips_adjacent_wide_match() {
 
 #[test]
 fn jump_to_forward_skips_adjacent_match_like_tmux() {
-    let screen = build_screen(20, 3, "abXd");
-    let mut state = CopyModeState::for_test(screen);
+    let mut state = test_state(20, 3, "abXd");
     let ctx = test_context();
 
     state.execute_command("history-top", &[], &ctx).unwrap();
@@ -398,91 +491,67 @@ fn jump_to_forward_skips_adjacent_match_like_tmux() {
 
 #[test]
 fn next_word_stops_on_separator_tokens_like_tmux() {
-    let screen = build_screen(30, 5, "foo.bar baz-qux end\r\n");
-    let mut state = CopyModeState::for_test(screen);
-    let ctx = punctuation_word_context();
-
-    state.execute_command("history-top", &[], &ctx).unwrap();
-
-    for expected in [
-        CopyPosition { x: 3, y: 0 },
-        CopyPosition { x: 4, y: 0 },
-        CopyPosition { x: 8, y: 0 },
-        CopyPosition { x: 11, y: 0 },
-        CopyPosition { x: 12, y: 0 },
-        CopyPosition { x: 16, y: 0 },
-        CopyPosition { x: 1, y: 4 },
-    ] {
-        state.execute_command("next-word", &[], &ctx).unwrap();
-        assert_eq!(state.cursor, expected);
-    }
+    assert_punctuated_stops(
+        None,
+        "next-word",
+        &[
+            CopyPosition { x: 3, y: 0 },
+            CopyPosition { x: 4, y: 0 },
+            CopyPosition { x: 8, y: 0 },
+            CopyPosition { x: 11, y: 0 },
+            CopyPosition { x: 12, y: 0 },
+            CopyPosition { x: 16, y: 0 },
+            CopyPosition { x: 1, y: 4 },
+        ],
+    );
 }
 
 #[test]
 fn next_word_end_stops_after_current_token_like_tmux() {
-    let screen = build_screen(30, 5, "foo.bar baz-qux end\r\n");
-    let mut state = CopyModeState::for_test(screen);
-    let ctx = punctuation_word_context();
-
-    state.execute_command("history-top", &[], &ctx).unwrap();
-
-    for expected in [
-        CopyPosition { x: 3, y: 0 },
-        CopyPosition { x: 4, y: 0 },
-        CopyPosition { x: 7, y: 0 },
-        CopyPosition { x: 11, y: 0 },
-        CopyPosition { x: 12, y: 0 },
-        CopyPosition { x: 15, y: 0 },
-        CopyPosition { x: 19, y: 0 },
-        CopyPosition { x: 0, y: 4 },
-    ] {
-        state.execute_command("next-word-end", &[], &ctx).unwrap();
-        assert_eq!(state.cursor, expected);
-    }
+    assert_punctuated_stops(
+        None,
+        "next-word-end",
+        &[
+            CopyPosition { x: 3, y: 0 },
+            CopyPosition { x: 4, y: 0 },
+            CopyPosition { x: 7, y: 0 },
+            CopyPosition { x: 11, y: 0 },
+            CopyPosition { x: 12, y: 0 },
+            CopyPosition { x: 15, y: 0 },
+            CopyPosition { x: 19, y: 0 },
+            CopyPosition { x: 0, y: 4 },
+        ],
+    );
 }
 
 #[test]
 fn previous_word_stops_on_separator_tokens_like_tmux() {
-    let screen = build_screen(30, 5, "foo.bar baz-qux end\r\n");
-    let mut state = CopyModeState::for_test(screen);
-    let ctx = punctuation_word_context();
-
-    state.execute_command("history-top", &[], &ctx).unwrap();
-    state.cursor = CopyPosition { x: 16, y: 0 };
-
-    for expected in [
-        CopyPosition { x: 12, y: 0 },
-        CopyPosition { x: 11, y: 0 },
-        CopyPosition { x: 8, y: 0 },
-        CopyPosition { x: 4, y: 0 },
-        CopyPosition { x: 3, y: 0 },
-        CopyPosition { x: 0, y: 0 },
-    ] {
-        state.execute_command("previous-word", &[], &ctx).unwrap();
-        assert_eq!(state.cursor, expected);
-    }
+    assert_punctuated_stops(
+        Some(CopyPosition { x: 16, y: 0 }),
+        "previous-word",
+        &[
+            CopyPosition { x: 12, y: 0 },
+            CopyPosition { x: 11, y: 0 },
+            CopyPosition { x: 8, y: 0 },
+            CopyPosition { x: 4, y: 0 },
+            CopyPosition { x: 3, y: 0 },
+            CopyPosition { x: 0, y: 0 },
+        ],
+    );
 }
 
 #[test]
 fn next_space_moves_to_the_terminal_boundary_after_the_last_word_like_tmux() {
-    let screen = build_screen(30, 5, "foo.bar baz-qux end\r\n");
-    let mut state = CopyModeState::for_test(screen);
-    let ctx = punctuation_word_context();
-
-    state.execute_command("history-top", &[], &ctx).unwrap();
-    state.cursor = CopyPosition { x: 16, y: 0 };
-
-    state.execute_command("next-space", &[], &ctx).unwrap();
-    assert_eq!(state.cursor, CopyPosition { x: 1, y: 4 });
+    assert_punctuated_stops(
+        Some(CopyPosition { x: 16, y: 0 }),
+        "next-space",
+        &[CopyPosition { x: 1, y: 4 }],
+    );
 }
 
 #[test]
 fn copy_cursor_word_uses_the_next_word_from_separators_like_tmux() {
-    let screen = build_screen(30, 5, "foo.bar baz-qux end\r\n");
-    let mut state = CopyModeState::for_test(screen);
-    let ctx = punctuation_word_context();
-
-    state.execute_command("history-top", &[], &ctx).unwrap();
+    let (mut state, _) = punctuated_state();
 
     state.cursor = CopyPosition { x: 3, y: 0 };
     assert_eq!(state.summary().copy_cursor_word, "bar");
@@ -497,8 +566,7 @@ fn copy_cursor_word_uses_the_next_word_from_separators_like_tmux() {
 #[test]
 fn matching_brackets_match_naive_ascii_oracle() {
     let text = "a(b[c{d}e]f) z";
-    let screen = build_screen(30, 3, text);
-    let mut state = CopyModeState::for_test(screen);
+    let mut state = test_state(30, 3, text);
 
     state
         .execute_command("history-top", &[], &test_context())
@@ -519,8 +587,7 @@ fn matching_brackets_match_naive_ascii_oracle() {
 
 #[test]
 fn matching_brackets_scan_across_lines_without_flattening_buffer() {
-    let screen = build_screen(10, 6, "(\r\n[\r\n]\r\n)");
-    let mut state = CopyModeState::for_test(screen);
+    let mut state = test_state(10, 6, "(\r\n[\r\n]\r\n)");
     state
         .execute_command("history-top", &[], &test_context())
         .unwrap();
@@ -591,16 +658,9 @@ fn naive_matching_bracket(text: &str, cursor_x: u32, forward: bool) -> Option<u3
 
 #[test]
 fn emacs_search_positions_past_match_end() {
-    let screen = build_screen(30, 3, "hello needle world");
-    let mut state = CopyModeState::for_test(screen);
-    let ctx = test_context();
+    let mut state = test_state(30, 3, "hello needle world");
 
-    let _ = state.execute_command("history-top", &[], &ctx);
-    let _ = state.execute_command(
-        "search-forward",
-        &["--".to_owned(), "needle".to_owned()],
-        &ctx,
-    );
+    search_needle_from_top(&mut state, &test_context());
     // "needle" starts at col 6, ends at col 11.
     assert_eq!(
         state.cursor.x, 11,
@@ -636,12 +696,10 @@ fn view_mode_blocks_non_readonly_commands() {
 
 #[test]
 fn copy_selection_with_no_selection_yields_empty_data() {
-    let screen = build_screen(20, 3, "hello");
-    let mut state = CopyModeState::for_test(screen);
-    let ctx = test_context();
+    let mut state = test_state(20, 3, "hello");
 
     let outcome = state
-        .execute_command("copy-selection-and-cancel", &[], &ctx)
+        .execute_command("copy-selection-and-cancel", &[], &test_context())
         .unwrap();
     assert!(outcome.cancel);
     let transfer = outcome.transfer.unwrap();
@@ -653,25 +711,23 @@ fn copy_selection_with_no_selection_yields_empty_data() {
 
 #[test]
 fn character_selection_excludes_the_cursor_cell_like_tmux() {
-    let screen = build_screen(20, 3, "alpha\r\nbeta\r\ngamma\r\n");
-    let mut state = CopyModeState::for_test(screen);
-    let ctx = test_context();
-
-    let _ = state.execute_command("history-top", &[], &ctx);
-    let _ = state.execute_command("cursor-down", &[], &ctx);
-    let _ = state.execute_command("begin-selection", &[], &ctx);
-    let _ = state.execute_command("cursor-right", &[], &ctx);
-
-    let outcome = state
-        .execute_command("copy-selection-and-cancel", &[], &ctx)
-        .unwrap();
-    assert_eq!(outcome.transfer.unwrap().data, b"b");
+    assert_transfer(
+        test_state(20, 3, "alpha\r\nbeta\r\ngamma\r\n"),
+        &test_context(),
+        &[
+            "history-top",
+            "cursor-down",
+            "begin-selection",
+            "cursor-right",
+        ],
+        "copy-selection-and-cancel",
+        b"b",
+    );
 }
 
 #[test]
 fn cursor_right_wraps_after_logical_line_end() {
-    let screen = build_screen(30, 5, "foo.bar baz-qux end\r\n\r\n");
-    let mut state = CopyModeState::for_test(screen);
+    let mut state = test_state(30, 5, "foo.bar baz-qux end\r\n\r\n");
     let ctx = test_context();
 
     let _ = state.execute_command("history-top", &[], &ctx);
@@ -687,33 +743,29 @@ fn cursor_right_wraps_after_logical_line_end() {
 
 #[test]
 fn multiline_character_selection_excludes_first_cell_of_end_line_like_tmux() {
-    let screen = build_screen(20, 3, "alpha\r\nbeta\r\ngamma\r\n");
-    let mut state = CopyModeState::for_test(screen);
-    let ctx = test_context();
-
-    let _ = state.execute_command("history-top", &[], &ctx);
-    let _ = state.execute_command("cursor-down", &[], &ctx);
-    let _ = state.execute_command("begin-selection", &[], &ctx);
-    let _ = state.execute_command("cursor-down", &[], &ctx);
-
-    let outcome = state
-        .execute_command("copy-selection-and-cancel", &[], &ctx)
-        .unwrap();
-    assert_eq!(outcome.transfer.unwrap().data, b"beta\n");
+    assert_transfer(
+        test_state(20, 3, "alpha\r\nbeta\r\ngamma\r\n"),
+        &test_context(),
+        &[
+            "history-top",
+            "cursor-down",
+            "begin-selection",
+            "cursor-down",
+        ],
+        "copy-selection-and-cancel",
+        b"beta\n",
+    );
 }
 
 #[test]
 fn middle_line_uses_upper_middle_on_even_height_like_tmux() {
-    let screen = build_screen(
+    let mut state = test_state(
         20,
         6,
         "line1\r\nline2\r\nline3\r\nline4\r\nline5\r\nline6\r\n",
     );
-    let mut state = CopyModeState::for_test(screen);
-    let ctx = test_context();
 
-    let _ = state.execute_command("history-top", &[], &ctx);
-    let _ = state.execute_command("middle-line", &[], &ctx);
+    run(&mut state, &test_context(), &["history-top", "middle-line"]);
 
     assert_eq!(state.summary().cursor_y, 2);
     assert_eq!(state.summary().copy_cursor_line, "line3");
@@ -721,25 +773,20 @@ fn middle_line_uses_upper_middle_on_even_height_like_tmux() {
 
 #[test]
 fn recentre_top_bottom_cycles_for_same_cursor_line() {
-    let screen = build_screen(
+    let mut state = test_state(
         20,
         5,
         "line1\r\nline2\r\nline3\r\nline4\r\nline5\r\nline6\r\nline7\r\nline8\r\nline9\r\nline10\r\n",
     );
-    let mut state = CopyModeState::for_test(screen);
     let ctx = test_context();
     state.cursor.y = 6;
     state.cursor.x = 0;
     state.top_line = 0;
 
-    let _ = state.execute_command("recentre-top-bottom", &[], &ctx);
-    assert_eq!(state.top_line, 4);
-
-    let _ = state.execute_command("recentre-top-bottom", &[], &ctx);
-    assert_eq!(state.top_line, 6);
-
-    let _ = state.execute_command("recentre-top-bottom", &[], &ctx);
-    assert_eq!(state.top_line, 2);
+    for top_line in [4, 6, 2] {
+        let _ = state.execute_command("recentre-top-bottom", &[], &ctx);
+        assert_eq!(state.top_line, top_line);
+    }
 
     state.cursor.y = 7;
     let _ = state.execute_command("recentre-top-bottom", &[], &ctx);
@@ -748,46 +795,40 @@ fn recentre_top_bottom_cycles_for_same_cursor_line() {
 
 #[test]
 fn goto_line_scrolls_from_bottom_like_tmux() {
-    let screen = build_screen(
+    let mut state = test_state(
         30,
         4,
         "L1\r\nL2\r\nL3\r\nL4\r\nL5\r\nL6\r\nL7\r\nL8\r\nL9\r\nL10\r\nPROMPT",
     );
-    let mut state = CopyModeState::for_test(screen);
     let ctx = test_context();
 
     state.set_show_position(false);
-    let _ = state.execute_command("goto-line", &["1".to_owned()], &ctx);
-    let summary = state.summary();
-    assert_eq!(summary.scroll_position, 1);
-    assert_eq!(summary.cursor_y, 3);
-    assert_eq!(summary.copy_cursor_line, "L10");
-
-    let _ = state.execute_command("goto-line", &["999".to_owned()], &ctx);
-    let summary = state.summary();
-    assert_eq!(summary.scroll_position, 7);
-    assert_eq!(summary.cursor_y, 3);
-    assert_eq!(summary.copy_cursor_line, "L4");
-
-    let _ = state.execute_command("goto-line", &["bad".to_owned()], &ctx);
-    let summary = state.summary();
-    assert_eq!(summary.scroll_position, 7);
-    assert_eq!(summary.copy_cursor_line, "L4");
-
-    let _ = state.execute_command("goto-line", &["-5".to_owned()], &ctx);
-    let summary = state.summary();
-    assert_eq!(summary.scroll_position, 7);
-    assert_eq!(summary.copy_cursor_line, "L4");
+    for (line, scroll_position, cursor_y, copy_cursor_line) in [
+        ("1", 1, Some(3), "L10"),
+        ("999", 7, Some(3), "L4"),
+        ("bad", 7, None, "L4"),
+        ("-5", 7, None, "L4"),
+    ] {
+        let _ = state.execute_command("goto-line", &[line.to_owned()], &ctx);
+        let summary = state.summary();
+        assert_eq!(summary.scroll_position, scroll_position, "goto-line {line}");
+        if let Some(cursor_y) = cursor_y {
+            assert_eq!(summary.cursor_y, cursor_y, "goto-line {line}");
+        }
+        assert_eq!(
+            summary.copy_cursor_line, copy_cursor_line,
+            "goto-line {line}"
+        );
+    }
 }
 
 #[test]
 fn goto_line_uses_top_relative_positions_for_absolute_line_numbers() {
-    let screen = build_screen(
+    let mut state = test_state(
         30,
         4,
         "L1\r\nL2\r\nL3\r\nL4\r\nL5\r\nL6\r\nL7\r\nL8\r\nL9\r\nL10\r\nPROMPT",
     );
-    let mut state = CopyModeState::for_test(screen);
     let ctx = CopyModeCommandContext {
         line_number_mode: CopyModeLineNumberMode::Absolute,
         ..test_context()
@@ -795,17 +836,14 @@ fn goto_line_uses_top_relative_positions_for_absolute_line_numbers() {
 
     // Measured against tmux 3.7b: with hsize=7, absolute goto-line 1
     // selects the oldest history viewport, while hsize+1 selects the bottom.
-    let _ = state.execute_command("goto-line", &["1".to_owned()], &ctx);
-    assert_eq!(state.summary().scroll_position, 7);
-
-    let _ = state.execute_command("goto-line", &["8".to_owned()], &ctx);
-    assert_eq!(state.summary().scroll_position, 0);
-
-    let _ = state.execute_command("goto-line", &["0".to_owned()], &ctx);
-    assert_eq!(state.summary().scroll_position, 7);
-
-    let _ = state.execute_command("goto-line", &["-1".to_owned()], &ctx);
-    assert_eq!(state.summary().scroll_position, 7);
+    for (line, scroll_position) in [("1", 7), ("8", 0), ("0", 7), ("-1", 7)] {
+        let _ = state.execute_command("goto-line", &[line.to_owned()], &ctx);
+        assert_eq!(
+            state.summary().scroll_position,
+            scroll_position,
+            "goto-line {line}"
+        );
+    }
 
     state.set_line_numbers_enabled(false);
     let _ = state.execute_command("goto-line", &["1".to_owned()], &ctx);
@@ -818,63 +856,34 @@ fn goto_line_uses_top_relative_positions_for_absolute_line_numbers() {
 
 #[test]
 fn line_selection_omits_trailing_newline() {
-    let screen = build_screen(20, 3, "alpha\r\nbeta\r\ngamma\r\n");
-    let mut state = CopyModeState::for_test(screen);
+    let mut state = test_state(20, 3, "alpha\r\nbeta\r\ngamma\r\n");
     let ctx = test_context();
 
-    let _ = state.execute_command("history-top", &[], &ctx);
-    let _ = state.execute_command("select-line", &[], &ctx);
+    run(&mut state, &ctx, &["history-top", "select-line"]);
     assert_eq!(state.summary().cursor_x, 5);
     assert_eq!(
         state.summary().selection_end.unwrap(),
         CopyPosition { x: 5, y: 0 }
     );
 
-    let outcome = state.execute_command("copy-selection", &[], &ctx).unwrap();
-    assert_eq!(outcome.transfer.unwrap().data, b"alpha");
+    assert_eq!(transferred(&mut state, &ctx, "copy-selection"), b"alpha");
 }
 
 #[test]
 fn line_selection_uses_mouse_position_when_available() {
-    let screen = build_screen(20, 3, "alpha beta\r\ngamma delta\r\n");
-    let mut state = CopyModeState::for_test(screen);
-    let ctx = mouse_context(6, 1);
-
-    let _ = state.execute_command("history-top", &[], &test_context());
-    let _ = state.execute_command("select-line", &[], &ctx);
-
-    let outcome = state
-        .execute_command("copy-selection", &[], &test_context())
-        .unwrap();
-    assert_eq!(outcome.transfer.unwrap().data, b"gamma delta");
+    assert_mouse_selection("select-line", b"gamma delta");
 }
 
 #[test]
 fn word_selection_uses_mouse_position_when_available() {
-    let screen = build_screen(20, 3, "alpha beta\r\ngamma delta\r\n");
-    let mut state = CopyModeState::for_test(screen);
-    let ctx = mouse_context(6, 1);
-
-    let _ = state.execute_command("history-top", &[], &test_context());
-    let _ = state.execute_command("select-word", &[], &ctx);
-
-    let outcome = state
-        .execute_command("copy-selection", &[], &test_context())
-        .unwrap();
-    assert_eq!(outcome.transfer.unwrap().data, b"delta");
+    assert_mouse_selection("select-word", b"delta");
 }
 
 #[test]
 fn generic_mouse_reposition_preserves_the_active_selection_endpoint() {
-    let screen = build_screen(20, 3, "alpha beta\r\ngamma delta\r\n");
-    let mut state = CopyModeState::for_test(screen);
+    let mut state = test_state(20, 3, "alpha beta\r\ngamma delta\r\n");
 
-    state
-        .execute_command("history-top", &[], &test_context())
-        .unwrap();
-    state
-        .execute_command("select-word", &[], &test_context())
-        .unwrap();
+    run_ok(&mut state, &test_context(), &["history-top", "select-word"]);
     let outcome = state
         .execute_command("copy-selection", &[], &mouse_context(1, 1))
         .unwrap();
@@ -887,94 +896,63 @@ fn generic_mouse_reposition_preserves_the_active_selection_endpoint() {
 
 #[test]
 fn vi_line_selection_includes_trailing_newline() {
-    let screen = build_screen(20, 3, "alpha\r\nbeta\r\ngamma\r\n");
-    let mut state = CopyModeState::new(screen, None, false, &vi_context(), false, true);
-    let ctx = vi_context();
-
-    let _ = state.execute_command("history-top", &[], &ctx);
-    let _ = state.execute_command("select-line", &[], &ctx);
-
-    let outcome = state.execute_command("copy-selection", &[], &ctx).unwrap();
-    assert_eq!(outcome.transfer.unwrap().data, b"alpha\n");
+    assert_transfer(
+        vi_state(20, 3, "alpha\r\nbeta\r\ngamma\r\n"),
+        &vi_context(),
+        &["history-top", "select-line"],
+        "copy-selection",
+        b"alpha\n",
+    );
 }
 
 #[test]
 fn line_selection_keeps_internal_newlines_without_trailing_newline() {
-    let screen = build_screen(20, 3, "alpha\r\nbeta\r\ngamma\r\n");
-    let mut state = CopyModeState::for_test(screen);
-    let ctx = test_context();
-
-    let _ = state.execute_command("history-top", &[], &ctx);
-    let _ = state.execute_command("select-line", &[], &ctx);
-    let _ = state.execute_command("cursor-down", &[], &ctx);
-
-    let outcome = state.execute_command("copy-selection", &[], &ctx).unwrap();
-    assert_eq!(outcome.transfer.unwrap().data, b"alpha\nbeta");
+    assert_transfer(
+        test_state(20, 3, "alpha\r\nbeta\r\ngamma\r\n"),
+        &test_context(),
+        &["history-top", "select-line", "cursor-down"],
+        "copy-selection",
+        b"alpha\nbeta",
+    );
 }
 
 #[test]
 fn line_selection_joins_wrapped_physical_rows_without_trailing_newline() {
-    let screen = build_screen(20, 4, "ABCDEFGHIJKLMNOPQRSTUVWXYZ\r\n");
-    let mut state = CopyModeState::for_test(screen);
-    let ctx = test_context();
-
-    let _ = state.execute_command("history-top", &[], &ctx);
-    let _ = state.execute_command("select-line", &[], &ctx);
-
-    let outcome = state.execute_command("copy-selection", &[], &ctx).unwrap();
-    assert_eq!(
-        outcome.transfer.unwrap().data,
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    assert_transfer(
+        test_state(20, 4, "ABCDEFGHIJKLMNOPQRSTUVWXYZ\r\n"),
+        &test_context(),
+        &["history-top", "select-line"],
+        "copy-selection",
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZ",
     );
 }
 
 #[test]
 fn character_selection_joins_wrapped_physical_rows_without_newlines() {
-    let screen = build_screen(10, 8, "0123456789ABCDEFGHIJKLMNO\r\n");
-    let mut state = CopyModeState::for_test(screen);
-    let ctx = test_context();
-
-    state.execute_command("history-top", &[], &ctx).unwrap();
-    state.execute_command("start-of-line", &[], &ctx).unwrap();
-    state.execute_command("begin-selection", &[], &ctx).unwrap();
-    state.execute_command("end-of-line", &[], &ctx).unwrap();
-
-    let outcome = state.execute_command("copy-selection", &[], &ctx).unwrap();
-    assert_eq!(outcome.transfer.unwrap().data, b"0123456789ABCDEFGHIJKLMNO");
+    assert_wrapped_character_selection("copy-selection");
 }
 
 #[test]
 fn copy_pipe_uses_wrapped_character_selection_without_newlines() {
-    let screen = build_screen(10, 8, "0123456789ABCDEFGHIJKLMNO\r\n");
-    let mut state = CopyModeState::for_test(screen);
-    let ctx = test_context();
-
-    state.execute_command("history-top", &[], &ctx).unwrap();
-    state.execute_command("start-of-line", &[], &ctx).unwrap();
-    state.execute_command("begin-selection", &[], &ctx).unwrap();
-    state.execute_command("end-of-line", &[], &ctx).unwrap();
-
-    let outcome = state.execute_command("copy-pipe", &[], &ctx).unwrap();
-    assert_eq!(outcome.transfer.unwrap().data, b"0123456789ABCDEFGHIJKLMNO");
+    assert_wrapped_character_selection("copy-pipe");
 }
 
 #[test]
 fn copy_line_omits_trailing_newline() {
-    let screen = build_screen(20, 3, "alpha\r\nbeta\r\n");
-    let mut state = CopyModeState::for_test(screen);
-    let ctx = test_context();
-
-    let _ = state.execute_command("history-top", &[], &ctx);
-
-    let outcome = state.execute_command("copy-line", &[], &ctx).unwrap();
-    assert_eq!(outcome.transfer.unwrap().data, b"alpha");
+    assert_transfer(
+        test_state(20, 3, "alpha\r\nbeta\r\n"),
+        &test_context(),
+        &["history-top"],
+        "copy-line",
+        b"alpha",
+    );
 }
 
 #[test]
 fn counted_line_transfers_preserve_wrapped_rows_and_line_boundaries() {
     // Oracle tmux 3.7b: at width 10, -N3 counts the two physical rows of
     // ABCDEFGHIJKLMNO plus the following row, while -N4 also includes "two".
-    let screen = build_screen(10, 8, "ABCDEFGHIJKLMNO\r\none  \r\ntwo\r\n");
+    let screen = build_screen(10, 8, WRAPPED_LINES);
     let context = test_context();
 
     for (command, count, cursor_x, expected) in [
@@ -1015,7 +993,7 @@ fn counted_line_transfers_distinguish_wrapped_logical_and_physical_starts() {
     // Oracle tmux 3.7b from the second physical row of ABCDEFGHIJKLMNO:
     // copy-line restarts at the logical beginning, while copy-end-of-line
     // counts from the physical row containing the cursor.
-    let screen = build_screen(10, 8, "ABCDEFGHIJKLMNO\r\none  \r\ntwo\r\n");
+    let screen = build_screen(10, 8, WRAPPED_LINES);
     let context = test_context();
 
     for (command, count, expected) in [
@@ -1046,51 +1024,13 @@ fn counted_line_transfers_distinguish_wrapped_logical_and_physical_starts() {
 fn line_transfer_family_consumes_prefix_as_one_counted_command() {
     // Oracle tmux 3.7b: every command below consumes -N3 as one counted
     // transfer. Pipe variants launch once; and-cancel variants then exit mode.
-    let screen = build_screen(10, 8, "ABCDEFGHIJKLMNO\r\none  \r\ntwo\r\n");
-    let context = test_context();
-
-    for (command, pipe, cancel, end_of_line) in [
-        ("copy-line", false, false, false),
-        ("copy-line-and-cancel", false, true, false),
-        ("copy-pipe-line", true, false, false),
-        ("copy-pipe-line-and-cancel", true, true, false),
-        ("copy-end-of-line", false, false, true),
-        ("copy-end-of-line-and-cancel", false, true, true),
-        ("copy-pipe-end-of-line", true, false, true),
-        ("copy-pipe-end-of-line-and-cancel", true, true, true),
-    ] {
+    for (command, ..) in LINE_TRANSFER_COMMANDS {
         assert_eq!(
             CopyModeState::prefix_behavior(command),
             CopyModePrefixBehavior::Count
         );
-        let mut state = CopyModeState::for_test(screen.clone());
-        state.execute_command("history-top", &[], &context).unwrap();
-        let cursor_x = if end_of_line { 2 } else { 0 };
-        for _ in 0..cursor_x {
-            state
-                .execute_command("cursor-right", &[], &context)
-                .unwrap();
-        }
-        let args = if pipe {
-            vec!["cat".to_owned()]
-        } else {
-            Vec::new()
-        };
-
-        let outcome = state
-            .execute_command_with_prefix(command, &args, &context, 3)
-            .unwrap();
-        let transfer = outcome.transfer.expect("line transfer is produced");
-        let expected = if end_of_line {
-            b"CDEFGHIJKLMNO\none".as_slice()
-        } else {
-            b"ABCDEFGHIJKLMNO\none".as_slice()
-        };
-
-        assert_eq!(transfer.data, expected, "{command}");
-        assert_eq!(transfer.pipe_command.is_some(), pipe, "{command}");
-        assert_eq!(outcome.cancel, cancel, "{command}");
     }
+    assert_counted_line_transfers(&test_context());
 
     // Oracle tmux 3.7b: cursor-right -N3 reaches x=3, so ordinary motion
     // remains repeat-based when counted line transfers move to one execution.
@@ -1104,140 +1044,76 @@ fn line_transfer_family_consumes_prefix_as_one_counted_command() {
 fn counted_vi_line_transfers_do_not_use_the_selection_newline() {
     // Oracle tmux 3.7b: counted direct transfers have the same bytes in vi and
     // emacs modes; only an explicit vi line selection gains a trailing LF.
-    let screen = build_screen(10, 8, "ABCDEFGHIJKLMNO\r\none  \r\ntwo\r\n");
-    let context = vi_context();
-
-    for (command, pipe, cancel, end_of_line) in [
-        ("copy-line", false, false, false),
-        ("copy-line-and-cancel", false, true, false),
-        ("copy-pipe-line", true, false, false),
-        ("copy-pipe-line-and-cancel", true, true, false),
-        ("copy-end-of-line", false, false, true),
-        ("copy-end-of-line-and-cancel", false, true, true),
-        ("copy-pipe-end-of-line", true, false, true),
-        ("copy-pipe-end-of-line-and-cancel", true, true, true),
-    ] {
-        let mut state = CopyModeState::for_test(screen.clone());
-        state.execute_command("history-top", &[], &context).unwrap();
-        if end_of_line {
-            state
-                .execute_command("cursor-right", &[], &context)
-                .unwrap();
-            state
-                .execute_command("cursor-right", &[], &context)
-                .unwrap();
-        }
-        let args = if pipe {
-            vec!["cat".to_owned()]
-        } else {
-            Vec::new()
-        };
-
-        let outcome = state
-            .execute_command_with_prefix(command, &args, &context, 3)
-            .unwrap();
-        let transfer = outcome.transfer.expect("counted vi line transfer");
-        let expected = if end_of_line {
-            b"CDEFGHIJKLMNO\none".as_slice()
-        } else {
-            b"ABCDEFGHIJKLMNO\none".as_slice()
-        };
-
-        assert_eq!(transfer.data, expected, "{command}");
-        assert_eq!(transfer.pipe_command.is_some(), pipe, "{command}");
-        assert_eq!(outcome.cancel, cancel, "{command}");
-    }
+    assert_counted_line_transfers(&vi_context());
 }
 
 #[test]
 fn vi_copy_line_omits_trailing_newline() {
-    let screen = build_screen(20, 3, "alpha\r\nbeta\r\n");
-    let mut state = CopyModeState::new(screen, None, false, &vi_context(), false, true);
-    let ctx = vi_context();
-
-    let _ = state.execute_command("history-top", &[], &ctx);
-
-    let outcome = state.execute_command("copy-line", &[], &ctx).unwrap();
-    assert_eq!(outcome.transfer.unwrap().data, b"alpha");
+    assert_transfer(
+        vi_state(20, 3, "alpha\r\nbeta\r\n"),
+        &vi_context(),
+        &["history-top"],
+        "copy-line",
+        b"alpha",
+    );
 }
 
 #[test]
 fn copy_line_on_empty_line_yields_empty_data() {
-    let screen = build_screen(20, 3, "\r\n");
-    let mut state = CopyModeState::for_test(screen);
-    let ctx = test_context();
-
-    let _ = state.execute_command("history-top", &[], &ctx);
-
-    let outcome = state.execute_command("copy-line", &[], &ctx).unwrap();
-    assert_eq!(outcome.transfer.unwrap().data, b"");
+    assert_transfer(
+        test_state(20, 3, "\r\n"),
+        &test_context(),
+        &["history-top"],
+        "copy-line",
+        b"",
+    );
 }
 
 #[test]
 fn vi_copy_line_on_empty_line_yields_empty_data() {
-    let screen = build_screen(20, 3, "\r\n");
-    let mut state = CopyModeState::new(screen, None, false, &vi_context(), false, true);
-    let ctx = vi_context();
-
-    let _ = state.execute_command("history-top", &[], &ctx);
-
-    let outcome = state.execute_command("copy-line", &[], &ctx).unwrap();
-    assert_eq!(outcome.transfer.unwrap().data, b"");
+    assert_transfer(
+        vi_state(20, 3, "\r\n"),
+        &vi_context(),
+        &["history-top"],
+        "copy-line",
+        b"",
+    );
 }
 
 #[test]
 fn copy_end_of_line_omits_trailing_newline() {
-    let screen = build_screen(20, 3, "alpha\r\nbeta\r\n");
-    let mut state = CopyModeState::for_test(screen);
-    let ctx = test_context();
-
-    let _ = state.execute_command("history-top", &[], &ctx);
-
-    let outcome = state
-        .execute_command("copy-end-of-line", &[], &ctx)
-        .unwrap();
-    assert_eq!(outcome.transfer.unwrap().data, b"alpha");
+    assert_transfer(
+        test_state(20, 3, "alpha\r\nbeta\r\n"),
+        &test_context(),
+        &["history-top"],
+        "copy-end-of-line",
+        b"alpha",
+    );
 }
 
 #[test]
 fn vi_copy_end_of_line_omits_trailing_newline() {
-    let screen = build_screen(20, 3, "alpha\r\nbeta\r\n");
-    let mut state = CopyModeState::new(screen, None, false, &vi_context(), false, true);
-    let ctx = vi_context();
-
-    let _ = state.execute_command("history-top", &[], &ctx);
-
-    let outcome = state
-        .execute_command("copy-end-of-line", &[], &ctx)
-        .unwrap();
-    assert_eq!(outcome.transfer.unwrap().data, b"alpha");
+    assert_transfer(
+        vi_state(20, 3, "alpha\r\nbeta\r\n"),
+        &vi_context(),
+        &["history-top"],
+        "copy-end-of-line",
+        b"alpha",
+    );
 }
 
 #[test]
 fn vi_direct_line_transfer_family_keeps_selection_newlines_out_of_payloads() {
     // Oracle tmux 3.7b: vi line selections retain a trailing newline, but the
     // eight direct line-transfer commands do not add one of their own.
-    for (command, pipe, cancel) in [
-        ("copy-line", false, false),
-        ("copy-line-and-cancel", false, true),
-        ("copy-pipe-line", true, false),
-        ("copy-pipe-line-and-cancel", true, true),
-        ("copy-end-of-line", false, false),
-        ("copy-end-of-line-and-cancel", false, true),
-        ("copy-pipe-end-of-line", true, false),
-        ("copy-pipe-end-of-line-and-cancel", true, true),
-    ] {
-        let screen = build_screen(20, 3, "alpha\r\nbeta\r\n");
-        let context = vi_context();
-        let mut state = CopyModeState::new(screen, None, false, &context, false, true);
+    let context = vi_context();
+    for (command, pipe, cancel, _) in LINE_TRANSFER_COMMANDS {
+        let mut state = vi_state(20, 3, "alpha\r\nbeta\r\n");
         state.execute_command("history-top", &[], &context).unwrap();
-        let args = if pipe {
-            vec!["cat".to_owned()]
-        } else {
-            Vec::new()
-        };
 
-        let outcome = state.execute_command(command, &args, &context).unwrap();
+        let outcome = state
+            .execute_command(command, &pipe_args(pipe), &context)
+            .unwrap();
         let transfer = outcome.transfer.expect("direct line transfer");
 
         assert_eq!(transfer.data, b"alpha", "{command}");
@@ -1248,12 +1124,9 @@ fn vi_direct_line_transfer_family_keeps_selection_newlines_out_of_payloads() {
 
 #[test]
 fn end_of_line_moves_to_wrapped_logical_line_end_like_tmux() {
-    let screen = build_screen(20, 4, "ABCDEFGHIJKLMNOPQRSTUVWXYZ\r\n");
-    let mut state = CopyModeState::for_test(screen);
-    let ctx = test_context();
+    let mut state = test_state(20, 4, "ABCDEFGHIJKLMNOPQRSTUVWXYZ\r\n");
 
-    let _ = state.execute_command("history-top", &[], &ctx);
-    let _ = state.execute_command("end-of-line", &[], &ctx);
+    run(&mut state, &test_context(), &["history-top", "end-of-line"]);
 
     assert_eq!(state.summary().cursor_x, 6);
     assert_eq!(state.summary().cursor_y, 1);
@@ -1261,45 +1134,30 @@ fn end_of_line_moves_to_wrapped_logical_line_end_like_tmux() {
 
 #[test]
 fn copy_end_of_line_uses_wrapped_logical_line_without_trailing_newline() {
-    let screen = build_screen(20, 4, "ABCDEFGHIJKLMNOPQRSTUVWXYZ\r\n");
-    let mut state = CopyModeState::for_test(screen);
-    let ctx = test_context();
-
-    let _ = state.execute_command("history-top", &[], &ctx);
-
-    let outcome = state
-        .execute_command("copy-end-of-line", &[], &ctx)
-        .unwrap();
-    assert_eq!(
-        outcome.transfer.unwrap().data,
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    assert_transfer(
+        test_state(20, 4, "ABCDEFGHIJKLMNOPQRSTUVWXYZ\r\n"),
+        &test_context(),
+        &["history-top"],
+        "copy-end-of-line",
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZ",
     );
 }
 
 #[test]
 fn end_of_line_stops_after_content_like_tmux() {
-    let screen = build_screen(20, 3, "alpha\r\nbeta\r\ngamma\r\n");
-    let mut state = CopyModeState::for_test(screen);
-    let ctx = test_context();
+    let mut state = test_state(20, 3, "alpha\r\nbeta\r\ngamma\r\n");
 
-    let _ = state.execute_command("history-top", &[], &ctx);
-    let _ = state.execute_command("end-of-line", &[], &ctx);
+    run(&mut state, &test_context(), &["history-top", "end-of-line"]);
 
     assert_eq!(state.summary().cursor_x, 5);
 }
 
 #[test]
 fn clear_policy_emacs_only_clears_in_emacs_mode() {
-    let screen = build_screen(30, 3, "hello world needle");
-    let mut state = CopyModeState::for_test(screen);
+    let mut state = test_state(30, 3, "hello world needle");
     let ctx = test_context();
 
-    let _ = state.execute_command("history-top", &[], &ctx);
-    let _ = state.execute_command(
-        "search-forward",
-        &["--".to_owned(), "needle".to_owned()],
-        &ctx,
-    );
+    search_needle_from_top(&mut state, &ctx);
     assert!(state.search_highlighted);
 
     // cursor-down has EmacsOnly clear policy; in emacs mode it should clear.
@@ -1312,16 +1170,10 @@ fn clear_policy_emacs_only_clears_in_emacs_mode() {
 
 #[test]
 fn clear_policy_emacs_only_does_not_clear_in_vi_mode() {
-    let screen = build_screen(30, 3, "hello world needle");
-    let mut state = CopyModeState::new(screen, None, false, &vi_context(), false, true);
+    let mut state = vi_state(30, 3, "hello world needle");
     let ctx = vi_context();
 
-    let _ = state.execute_command("history-top", &[], &ctx);
-    let _ = state.execute_command(
-        "search-forward",
-        &["--".to_owned(), "needle".to_owned()],
-        &ctx,
-    );
+    search_needle_from_top(&mut state, &ctx);
     assert!(state.search_highlighted);
 
     // cursor-down has EmacsOnly clear policy; in vi mode it should NOT clear.
@@ -1334,8 +1186,7 @@ fn clear_policy_emacs_only_does_not_clear_in_vi_mode() {
 
 #[test]
 fn selection_mode_switches_existing_selection() {
-    let screen = build_screen(30, 3, "hello world");
-    let mut state = CopyModeState::for_test(screen);
+    let mut state = test_state(30, 3, "hello world");
     let ctx = test_context();
 
     let _ = state.execute_command("begin-selection", &[], &ctx);
@@ -1347,16 +1198,13 @@ fn selection_mode_switches_existing_selection() {
 
 #[test]
 fn mark_and_jump_to_mark() {
-    let screen = build_screen(20, 5, "line1\r\nline2\r\nline3\r\nline4\r\nline5");
-    let mut state = CopyModeState::for_test(screen);
+    let mut state = test_state(20, 5, "line1\r\nline2\r\nline3\r\nline4\r\nline5");
     let ctx = test_context();
 
-    let _ = state.execute_command("history-top", &[], &ctx);
-    let _ = state.execute_command("set-mark", &[], &ctx);
+    run(&mut state, &ctx, &["history-top", "set-mark"]);
     let mark_pos = state.cursor;
 
-    let _ = state.execute_command("cursor-down", &[], &ctx);
-    let _ = state.execute_command("cursor-down", &[], &ctx);
+    run(&mut state, &ctx, &["cursor-down", "cursor-down"]);
     assert_ne!(state.cursor, mark_pos);
 
     let _ = state.execute_command("jump-to-mark", &[], &ctx);
@@ -1365,18 +1213,15 @@ fn mark_and_jump_to_mark() {
 
 #[test]
 fn unknown_command_returns_error() {
-    let screen = build_screen(20, 3, "hello");
-    let mut state = CopyModeState::for_test(screen);
-    let ctx = test_context();
+    let mut state = test_state(20, 3, "hello");
 
-    let result = state.execute_command("not-a-real-command", &[], &ctx);
+    let result = state.execute_command("not-a-real-command", &[], &test_context());
     assert!(result.is_err());
 }
 
 #[test]
 fn rg15_next_word_at_end_lands_after_last_word_when_last_row_is_populated() {
-    let screen = build_screen(30, 3, "alpha\r\nbeta\r\ngamma");
-    let mut state = CopyModeState::for_test(screen);
+    let mut state = test_state(30, 3, "alpha\r\nbeta\r\ngamma");
     let ctx = test_context();
 
     state.execute_command("history-top", &[], &ctx).unwrap();
@@ -1391,8 +1236,7 @@ fn rg15_next_word_at_end_lands_after_last_word_when_last_row_is_populated() {
 
 #[test]
 fn rg15_next_word_single_line_lands_after_only_word() {
-    let screen = build_screen(30, 1, "alpharbeta");
-    let mut state = CopyModeState::for_test(screen);
+    let mut state = test_state(30, 1, "alpharbeta");
     let ctx = test_context();
 
     state.execute_command("history-top", &[], &ctx).unwrap();
@@ -1410,13 +1254,13 @@ fn rg15_next_word_single_line_lands_after_only_word() {
 
 #[test]
 fn next_word_at_full_width_final_line_stays_at_logical_end() {
-    let screen = build_screen(5, 1, "abcde");
-    let mut state = CopyModeState::for_test(screen);
-    let ctx = test_context();
+    let mut state = test_state(5, 1, "abcde");
 
-    state.execute_command("history-top", &[], &ctx).unwrap();
-    state.execute_command("next-word", &[], &ctx).unwrap();
-    state.execute_command("next-word", &[], &ctx).unwrap();
+    run_ok(
+        &mut state,
+        &test_context(),
+        &["history-top", "next-word", "next-word"],
+    );
 
     assert_eq!(state.cursor, CopyPosition { x: 5, y: 0 });
     assert_eq!(state.summary().copy_cursor_word, "");
@@ -1424,8 +1268,7 @@ fn next_word_at_full_width_final_line_stays_at_logical_end() {
 
 #[test]
 fn rg15_next_space_at_end_lands_after_last_word_when_last_row_is_populated() {
-    let screen = build_screen(30, 3, "alpha\r\nbeta\r\ngamma");
-    let mut state = CopyModeState::for_test(screen);
+    let mut state = test_state(30, 3, "alpha\r\nbeta\r\ngamma");
     let ctx = test_context();
 
     state.execute_command("history-top", &[], &ctx).unwrap();

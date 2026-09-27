@@ -93,7 +93,7 @@ async fn sizeless_attach_status_changes_subtract_status_rows_exactly_once() {
         ("off", TERMINAL_SIZE),
         ("2", TWO_LINE_CONTENT_SIZE),
     ] {
-        set_session_status(&handler, &session, value).await;
+        handler.set_session_status(&session, value).await;
         assert_eq!(
             session_content_size(&handler, &session).await,
             expected,
@@ -142,7 +142,8 @@ async fn sizeless_attach_switch_carries_the_outer_terminal_anchor() {
     let alpha = session_name("sizeless-switch-alpha");
     let beta = session_name("sizeless-switch-beta");
     let sizeless_pid = 92_131;
-    create_session_with_status_two(&handler, &beta).await;
+    handler.create_session((&beta, TERMINAL_SIZE)).await;
+    handler.set_session_status(&beta, "2").await;
     let _declared_rx = seed_two_line_status_geometry(&handler, &alpha, 92_130).await;
 
     let _sizeless_rx = register_sizeless_attach(&handler, sizeless_pid, &alpha).await;
@@ -176,22 +177,21 @@ async fn sizeless_attach_destroy_rehoming_carries_the_outer_terminal_anchor() {
     let handler = RequestHandler::new();
     let alpha = session_name("sizeless-destroy-alpha");
     let beta = session_name("sizeless-destroy-beta");
-    create_session_with_status_two(&handler, &beta).await;
+    handler.create_session((&beta, TERMINAL_SIZE)).await;
+    handler.set_session_status(&beta, "2").await;
     let _declared_rx = seed_two_line_status_geometry(&handler, &alpha, 92_140).await;
-    set_session_option(&handler, &alpha, OptionName::DetachOnDestroy, "off").await;
+    handler
+        .set_option(
+            ScopeSelector::Session(alpha.clone()),
+            OptionName::DetachOnDestroy,
+            "off",
+        )
+        .await;
 
     let mut sizeless_rx = register_sizeless_attach(&handler, 92_141, &alpha).await;
     while sizeless_rx.try_recv().is_ok() {}
 
-    let response = handler
-        .handle(Request::KillSession(KillSessionRequest {
-            target: alpha.clone(),
-            kill_all_except_target: false,
-            clear_alerts: false,
-            kill_group: false,
-        }))
-        .await;
-    assert!(matches!(response, Response::KillSession(_)), "{response:?}");
+    handler.handle_ok(KillSessionRequest::fixture(&alpha)).await;
 
     assert_eq!(
         session_terminal_size(&handler, &beta).await,
@@ -285,7 +285,7 @@ async fn sizeless_attach_preserves_both_dimensions_under_every_policy() {
             )
             .await
             .expect("declared client resize succeeds");
-        set_window_size_policy(&handler, &session, policy).await;
+        handler.set_window_size_policy(&session, 0, policy).await;
 
         let _sizeless_rx = register_sizeless_attach(&handler, 92_161, &session).await;
         // The sizeless client anchors to the 100x30 the declared client owns,
@@ -342,7 +342,7 @@ async fn a_still_inferred_client_competes_on_outer_terminal_rows_under_every_pol
             .await
             .expect("declared client resize succeeds");
 
-        set_window_size_policy(&handler, &session, policy).await;
+        handler.set_window_size_policy(&session, 0, policy).await;
 
         assert_eq!(
             session_terminal_size(&handler, &session).await,
@@ -368,11 +368,11 @@ async fn manual_window_size_never_resizes_for_a_sizeless_client() {
     let handler = RequestHandler::new();
     let session = session_name("sizeless-manual");
     let _declared_rx = seed_two_line_status_geometry(&handler, &session, 92_170).await;
-    set_window_size_policy(&handler, &session, "manual").await;
+    handler.set_window_size_policy(&session, 0, "manual").await;
 
     let _sizeless_rx = register_sizeless_attach(&handler, 92_171, &session).await;
     for value in ["off", "2"] {
-        set_session_status(&handler, &session, value).await;
+        handler.set_session_status(&session, value).await;
     }
 
     assert_eq!(
@@ -404,7 +404,7 @@ async fn read_only_sizeless_attach_acquires_no_sizing_authority() {
         &handler,
         92_181,
         &session,
-        super::super::attach_support::ClientFlags::default().with_read_only(),
+        ClientFlags::default().with_read_only(),
     )
     .await;
     handler
@@ -432,15 +432,11 @@ async fn ignore_size_sizeless_attach_acquires_no_sizing_authority() {
     let session = session_name("sizeless-ignore-size");
     let _declared_rx = seed_two_line_status_geometry(&handler, &session, 92_190).await;
 
-    let _ignored_rx = register_sizeless_attach_with_flags(
-        &handler,
-        92_191,
-        &session,
-        super::super::attach_support::ClientFlags::IGNORESIZE,
-    )
-    .await;
+    let _ignored_rx =
+        register_sizeless_attach_with_flags(&handler, 92_191, &session, ClientFlags::IGNORESIZE)
+            .await;
     for value in ["off", "2"] {
-        set_session_status(&handler, &session, value).await;
+        handler.set_session_status(&session, value).await;
     }
 
     assert_eq!(
@@ -461,15 +457,10 @@ async fn seed_two_line_status_geometry(
     session: &SessionName,
     declared_pid: u32,
 ) -> mpsc::UnboundedReceiver<AttachControl> {
-    create_session_with_status_two(handler, session).await;
-    let (_attach_id, mut control_rx) = register_declared_attach(
-        handler,
-        declared_pid,
-        session,
-        TERMINAL_SIZE,
-        super::super::attach_support::ClientFlags::default(),
-    )
-    .await;
+    handler.create_session((session, TERMINAL_SIZE)).await;
+    handler.set_session_status(session, "2").await;
+    let (_attach_id, mut control_rx) =
+        register_sized_attach(handler, declared_pid, session, TERMINAL_SIZE).await;
     while control_rx.try_recv().is_ok() {}
     assert_eq!(session_terminal_size(handler, session).await, TERMINAL_SIZE);
     assert_eq!(
@@ -494,38 +485,20 @@ fn cursor_row_before(frame: &str, needle: &str) -> u16 {
         .unwrap_or_else(|| panic!("no cursor positioning before {needle:?}, got {frame:?}"))
 }
 
-async fn create_session_with_status_two(handler: &RequestHandler, session: &SessionName) {
-    let created = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name: session.clone(),
-            detached: true,
-            size: Some(TERMINAL_SIZE),
-            environment: None,
-        }))
-        .await;
-    assert!(matches!(created, Response::NewSession(_)), "{created:?}");
-    set_session_status(handler, session, "2").await;
-}
-
-async fn register_sizeless_attach(
+pub(super) async fn register_sizeless_attach(
     handler: &RequestHandler,
     requester_pid: u32,
     session: &SessionName,
 ) -> mpsc::UnboundedReceiver<AttachControl> {
-    register_sizeless_attach_with_flags(
-        handler,
-        requester_pid,
-        session,
-        super::super::attach_support::ClientFlags::default(),
-    )
-    .await
+    register_sizeless_attach_with_flags(handler, requester_pid, session, ClientFlags::default())
+        .await
 }
 
 async fn register_sizeless_attach_with_flags(
     handler: &RequestHandler,
     requester_pid: u32,
     session: &SessionName,
-    flags: super::super::attach_support::ClientFlags,
+    flags: ClientFlags,
 ) -> mpsc::UnboundedReceiver<AttachControl> {
     let (control_tx, control_rx) = mpsc::unbounded_channel();
     handler
@@ -533,57 +506,15 @@ async fn register_sizeless_attach_with_flags(
             requester_pid,
             session.clone(),
             None,
-            attach_registration(control_tx, flags, None),
+            AttachRegistration {
+                flags,
+                client_size: None,
+                ..Fixture::fixture((control_tx, current_owner_uid()))
+            },
         )
         .await
         .expect("sizeless attach registration succeeds");
     control_rx
-}
-
-async fn register_declared_attach(
-    handler: &RequestHandler,
-    requester_pid: u32,
-    session: &SessionName,
-    size: TerminalSize,
-    flags: super::super::attach_support::ClientFlags,
-) -> (u64, mpsc::UnboundedReceiver<AttachControl>) {
-    let (control_tx, control_rx) = mpsc::unbounded_channel();
-    let attach_id = handler
-        .register_attach_with_access(
-            requester_pid,
-            session.clone(),
-            None,
-            attach_registration(control_tx, flags, Some(size)),
-        )
-        .await
-        .expect("declared attach registration succeeds");
-    handler
-        .handle_attached_resize(requester_pid, size)
-        .await
-        .expect("initial declared client size is accepted");
-    (attach_id, control_rx)
-}
-
-fn attach_registration(
-    control_tx: mpsc::UnboundedSender<AttachControl>,
-    flags: super::super::attach_support::ClientFlags,
-    client_size: Option<TerminalSize>,
-) -> AttachRegistration {
-    let uid = current_owner_uid();
-    AttachRegistration {
-        control_tx,
-        control_backlog: Arc::new(AtomicUsize::new(0)),
-        closing: Arc::new(AtomicBool::new(false)),
-        persistent_overlay_epoch: Arc::new(AtomicU64::new(0)),
-        terminal_context: OuterTerminalContext::default(),
-        client_title: None,
-        flags,
-        render_stream: false,
-        uid,
-        user: rmux_os::identity::UserIdentity::Uid(uid),
-        can_write: true,
-        client_size,
-    }
 }
 
 async fn attached_client_size(handler: &RequestHandler, attach_pid: u32) -> TerminalSize {
@@ -597,7 +528,10 @@ async fn attached_client_size(handler: &RequestHandler, attach_pid: u32) -> Term
         .client_size
 }
 
-async fn attached_client_size_is_inferred(handler: &RequestHandler, attach_pid: u32) -> bool {
+pub(super) async fn attached_client_size_is_inferred(
+    handler: &RequestHandler,
+    attach_pid: u32,
+) -> bool {
     handler
         .active_attach
         .lock()
@@ -629,37 +563,4 @@ async fn session_content_size(handler: &RequestHandler, session: &SessionName) -
         .expect("session exists")
         .window()
         .size()
-}
-
-async fn set_session_status(handler: &RequestHandler, session: &SessionName, value: &str) {
-    set_session_option(handler, session, OptionName::Status, value).await;
-}
-
-async fn set_session_option(
-    handler: &RequestHandler,
-    session: &SessionName,
-    option: OptionName,
-    value: &str,
-) {
-    let response = handler
-        .handle(Request::SetOption(SetOptionRequest {
-            scope: ScopeSelector::Session(session.clone()),
-            option,
-            value: value.to_owned(),
-            mode: SetOptionMode::Replace,
-        }))
-        .await;
-    assert!(matches!(response, Response::SetOption(_)), "{response:?}");
-}
-
-async fn set_window_size_policy(handler: &RequestHandler, session: &SessionName, value: &str) {
-    let response = handler
-        .handle(Request::SetOption(SetOptionRequest {
-            scope: ScopeSelector::Window(WindowTarget::with_window(session.clone(), 0)),
-            option: OptionName::WindowSize,
-            value: value.to_owned(),
-            mode: SetOptionMode::Replace,
-        }))
-        .await;
-    assert!(matches!(response, Response::SetOption(_)), "{response:?}");
 }

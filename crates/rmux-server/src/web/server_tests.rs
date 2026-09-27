@@ -1,7 +1,8 @@
 use super::http::{path_from_target, HttpRequest};
-use super::pre_auth::PreAuthQueue;
+use super::pre_auth::{PreAuthAdmission, PreAuthQueue};
 use super::{is_fd_exhaustion, serve_admitted_connection, should_continue_accept_loop};
 use crate::handler::RequestHandler;
+use crate::test_fixtures::{operator_token, spectator_token, wait_until, Fixture, SessionSpec};
 use crate::web::protocol::{
     AUTH_FRAME_TIMEOUT, PANE_RECOVERY_COVERAGE_CAPABILITY, WEB_SHARE_PROTOCOL_VERSION,
 };
@@ -9,14 +10,15 @@ use crate::web::SecretHashForCrypto;
 use base64::Engine;
 use rmux_proto::{
     CreateWebShareRequest, KillSessionRequest, ListSessionsRequest, ListWindowsRequest,
-    NewSessionExtRequest, NewSessionRequest, NewWindowRequest, PaneTarget, Request, Response,
-    SessionName, SplitDirection, SplitWindowRequest, SplitWindowTarget, StopWebShareRequest,
-    TerminalSize, WebShareCreatedResponse, WebShareRequest, WebShareResponse, WebShareScope,
+    NewSessionExtRequest, NewWindowRequest, PaneTarget, Request, Response, SessionName,
+    SplitDirection, SplitWindowRequest, StopWebShareRequest, WebShareCreatedResponse,
+    WebShareRequest, WebShareResponse, WebShareScope,
 };
 use rmux_web_crypto::{derive_client_session, generate_ephemeral, Message, Opener, Sealer};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::io;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -128,46 +130,7 @@ async fn shutdown_closes_an_admitted_partial_http_connection() {
 
 #[tokio::test]
 async fn shutdown_closes_established_pane_and_session_websockets_and_forwarder() {
-    let handler = Arc::new(RequestHandler::new());
-    let session_name = create_session(&handler, "websocket-shutdown-drain").await;
-    let pane_share = create_share(
-        &handler,
-        share_request(WebShareScope::Pane(
-            PaneTarget::new(session_name.clone(), 0).into(),
-        )),
-    )
-    .await;
-    let session_share = create_share(
-        &handler,
-        share_request(WebShareScope::Session(session_name)),
-    )
-    .await;
-    let mut pane = TestWebSocket::connect(
-        Arc::clone(&handler),
-        &token_from_url(
-            pane_share
-                .spectator_url
-                .as_deref()
-                .expect("pane spectator URL"),
-        ),
-    )
-    .await;
-    let mut session = TestWebSocket::connect(
-        Arc::clone(&handler),
-        &token_from_url(
-            session_share
-                .spectator_url
-                .as_deref()
-                .expect("session spectator URL"),
-        ),
-    )
-    .await;
-    assert_eq!(pane.read_json().await["scope"], "pane");
-    pane.read_binary_with_prefix(0x10, "pane snapshot").await;
-    assert_eq!(session.read_json().await["scope"], "session");
-    session
-        .read_binary_with_prefix(0x10, "session snapshot")
-        .await;
+    let (handler, pane, session) = pane_and_session_spectators("websocket-shutdown-drain").await;
 
     handler.close_normal_request_admission();
     let TestWebSocket {
@@ -333,17 +296,11 @@ async fn incomplete_loopback_tunnel_peers_do_not_starve_complete_requests() {
 
 #[tokio::test]
 async fn auth_frame_timeout_releases_pre_auth_slot() {
-    let handler = Arc::new(RequestHandler::new());
-    let session_name = create_session(&handler, "websocket-auth-timeout").await;
-    let created = create_share(
-        &handler,
-        share_request(WebShareScope::Pane(PaneTarget::new(session_name, 0).into())),
-    )
-    .await;
-    let token = token_from_url(created.spectator_url.as_deref().expect("spectator URL"));
-    let token_id = SecretHashForCrypto::from_secret(&token).token_id();
+    let host = ShareHost::new("websocket-auth-timeout").await;
+    let created = host.share_as(host.pane_scope(), Role::Spectator).await;
+    let token_id = SecretHashForCrypto::from_secret(&spectator_token(&created)).token_id();
     let queue = PreAuthQueue::new(1);
-    let (mut stream, task) = websocket_client_with_queue(Arc::clone(&handler), queue.clone()).await;
+    let (mut stream, task) = websocket_client(Arc::clone(&host.handler), queue.clone()).await;
 
     wait_for_pending_pre_auth(&queue, 1).await;
     write_client_hello(&mut stream, &token_id).await;
@@ -410,21 +367,12 @@ async fn share_websocket_upgrade_requires_version_13_and_valid_key() {
 
 #[tokio::test]
 async fn share_websocket_auth_ready_snapshot_operator_and_revoke_loop() {
-    let handler = Arc::new(RequestHandler::new());
-    let session_name = create_session(&handler, "websocket-e2e").await;
-    let created = create_share(
-        &handler,
-        CreateWebShareRequest {
-            operator: true,
-            ..share_request(WebShareScope::Pane(PaneTarget::new(session_name, 0).into()))
-        },
-    )
-    .await;
-    let auth = auth_text_with_pane_recovery_coverage();
-    let mut client = TestWebSocket::connect_with_auth(
-        Arc::clone(&handler),
-        &token_from_url(created.operator_url.as_deref().expect("operator URL")),
-        &auth,
+    let host = ShareHost::new("websocket-e2e").await;
+    let created = host.share_as(host.pane_scope(), Role::Operator).await;
+    let mut client = TestWebSocket::handshake(
+        &host.handler,
+        &operator_token(&created),
+        &auth_text_with_pane_recovery_coverage(),
     )
     .await;
     let ready = client.read_json().await;
@@ -448,7 +396,7 @@ async fn share_websocket_auth_ready_snapshot_operator_and_revoke_loop() {
         .any(|capability| capability == "e2ee-token-auth"));
 
     let snapshot = client
-        .read_binary_with_prefix_payload(0x13, "bounded pane recovery snapshot")
+        .read_binary_with_prefix(0x13, "bounded pane recovery snapshot")
         .await;
     assert!(snapshot.len() > 18);
     assert_eq!(
@@ -462,17 +410,13 @@ async fn share_websocket_auth_ready_snapshot_operator_and_revoke_loop() {
     assert_eq!(snapshot[17], 1);
 
     client.send_binary(&[0x80, b'p', b'w', b'd', b'\n']).await;
-    let stopped = handler
-        .handle(Request::WebShare(Box::new(WebShareRequest::Stop(
-            StopWebShareRequest {
-                share_id: created.share_id,
-            },
-        ))))
+    let stopped = host
+        .handler
+        .handle_ok(WebShareRequest::Stop(StopWebShareRequest {
+            share_id: created.share_id,
+        }))
         .await;
-    assert!(matches!(
-        stopped,
-        Response::WebShare(response) if matches!(response.as_ref(), WebShareResponse::Stopped(_))
-    ));
+    assert!(matches!(*stopped, WebShareResponse::Stopped(_)));
 
     let revoked = client.read_json().await;
     assert_eq!(revoked["type"], "share_revoked");
@@ -488,10 +432,17 @@ async fn pane_keyframe_redacts_spectator_metadata_and_preserves_operator_access(
     const CURRENT_DIRECTORY: &[u8] = b"file:///home/owner/private-project";
     const VISIBLE_CONTENT: &[u8] = b"visible terminal content";
 
-    let handler = Arc::new(RequestHandler::new());
-    let session_name = create_quiet_session(&handler, "websocket-metadata-policy").await;
-    let target = PaneTarget::new(session_name.clone(), 0);
-    handler
+    let host = ShareHost::new(NewSessionExtRequest {
+        command: Some(
+            ["/bin/sh", "-c", "exec sleep 120"]
+                .map(str::to_owned)
+                .into(),
+        ),
+        ..Fixture::fixture("websocket-metadata-policy")
+    })
+    .await;
+    let target = PaneTarget::new(host.session_name.clone(), 0);
+    host.handler
         .wait_for_pane_startup_to_finish_for_test(&target)
         .await;
     let mut pane_bytes = b"\x1b]2;".to_vec();
@@ -502,71 +453,38 @@ async fn pane_keyframe_redacts_spectator_metadata_and_preserves_operator_access(
     pane_bytes.extend_from_slice(CURRENT_DIRECTORY);
     pane_bytes.extend_from_slice(b"\x1b\\");
     pane_bytes.extend_from_slice(VISIBLE_CONTENT);
-    handler
-        .publish_web_pane_bytes_for_test(&target.clone().into(), pane_bytes)
+    host.handler
+        .publish_web_pane_bytes_for_test(&target.into(), pane_bytes)
         .await
         .expect("publish pane metadata and visible content");
 
-    let spectator_share = create_share(
-        &handler,
-        share_request(WebShareScope::Pane(target.clone().into())),
-    )
-    .await;
-    let operator_share = create_share(
-        &handler,
-        CreateWebShareRequest {
-            operator: true,
-            ..share_request(WebShareScope::Pane(target.into()))
-        },
-    )
-    .await;
+    let spectator_share = host.share_as(host.pane_scope(), Role::Spectator).await;
+    let operator_share = host.share_as(host.pane_scope(), Role::Operator).await;
     let auth = auth_text_with_pane_recovery_coverage();
 
-    let mut spectator = TestWebSocket::connect_with_auth(
-        Arc::clone(&handler),
-        &token_from_url(
-            spectator_share
-                .spectator_url
-                .as_deref()
-                .expect("spectator URL"),
-        ),
-        &auth,
-    )
-    .await;
+    let mut spectator =
+        TestWebSocket::handshake(&host.handler, &spectator_token(&spectator_share), &auth).await;
     assert_eq!(spectator.read_json().await["role"], "spectator");
     let spectator_keyframe = spectator
-        .read_binary_with_prefix_payload(0x13, "spectator pane recovery keyframe")
+        .read_binary_with_prefix(0x13, "spectator pane recovery keyframe")
         .await;
     assert!(
-        spectator_keyframe
-            .windows(VISIBLE_CONTENT.len())
-            .any(|window| window == VISIBLE_CONTENT),
+        contains(&spectator_keyframe, VISIBLE_CONTENT),
         "spectator keyframe must retain terminal rendering content"
     );
     for private_metadata in [STACKED_TITLE, CURRENT_TITLE, CURRENT_DIRECTORY] {
         assert!(
-            !spectator_keyframe
-                .windows(private_metadata.len())
-                .any(|window| window == private_metadata),
+            !contains(&spectator_keyframe, private_metadata),
             "spectator keyframe leaked pane metadata {:?}",
             String::from_utf8_lossy(private_metadata)
         );
     }
 
-    let mut operator = TestWebSocket::connect_with_auth(
-        Arc::clone(&handler),
-        &token_from_url(
-            operator_share
-                .operator_url
-                .as_deref()
-                .expect("operator URL"),
-        ),
-        &auth,
-    )
-    .await;
+    let mut operator =
+        TestWebSocket::handshake(&host.handler, &operator_token(&operator_share), &auth).await;
     assert_eq!(operator.read_json().await["role"], "operator");
     let operator_keyframe = operator
-        .read_binary_with_prefix_payload(0x13, "operator pane recovery keyframe")
+        .read_binary_with_prefix(0x13, "operator pane recovery keyframe")
         .await;
     for authorized_content in [
         STACKED_TITLE,
@@ -575,9 +493,7 @@ async fn pane_keyframe_redacts_spectator_metadata_and_preserves_operator_access(
         VISIBLE_CONTENT,
     ] {
         assert!(
-            operator_keyframe
-                .windows(authorized_content.len())
-                .any(|window| window == authorized_content),
+            contains(&operator_keyframe, authorized_content),
             "operator keyframe lost authorized content {:?}",
             String::from_utf8_lossy(authorized_content)
         );
@@ -589,46 +505,7 @@ async fn pane_keyframe_redacts_spectator_metadata_and_preserves_operator_access(
 
 #[tokio::test]
 async fn authenticated_idle_pane_and_session_shares_survive_with_matching_pongs() {
-    let handler = Arc::new(RequestHandler::new());
-    let session_name = create_session(&handler, "websocket-idle-keepalive").await;
-    let pane_share = create_share(
-        &handler,
-        share_request(WebShareScope::Pane(
-            PaneTarget::new(session_name.clone(), 0).into(),
-        )),
-    )
-    .await;
-    let session_share = create_share(
-        &handler,
-        share_request(WebShareScope::Session(session_name)),
-    )
-    .await;
-    let mut pane = TestWebSocket::connect(
-        Arc::clone(&handler),
-        &token_from_url(
-            pane_share
-                .spectator_url
-                .as_deref()
-                .expect("pane spectator URL"),
-        ),
-    )
-    .await;
-    let mut session = TestWebSocket::connect(
-        handler,
-        &token_from_url(
-            session_share
-                .spectator_url
-                .as_deref()
-                .expect("session spectator URL"),
-        ),
-    )
-    .await;
-    assert_eq!(pane.read_json().await["scope"], "pane");
-    pane.read_binary_with_prefix(0x10, "pane snapshot").await;
-    assert_eq!(session.read_json().await["scope"], "session");
-    session
-        .read_binary_with_prefix(0x10, "session snapshot")
-        .await;
+    let (_, mut pane, mut session) = pane_and_session_spectators("websocket-idle-keepalive").await;
 
     for _ in 0..4 {
         for client in [&mut pane, &mut session] {
@@ -646,46 +523,8 @@ async fn authenticated_idle_pane_and_session_shares_survive_with_matching_pongs(
 
 #[tokio::test]
 async fn authenticated_idle_pane_and_session_shares_close_without_pongs() {
-    let handler = Arc::new(RequestHandler::new());
-    let session_name = create_session(&handler, "websocket-idle-pong-timeout").await;
-    let pane_share = create_share(
-        &handler,
-        share_request(WebShareScope::Pane(
-            PaneTarget::new(session_name.clone(), 0).into(),
-        )),
-    )
-    .await;
-    let session_share = create_share(
-        &handler,
-        share_request(WebShareScope::Session(session_name)),
-    )
-    .await;
-    let mut pane = TestWebSocket::connect(
-        Arc::clone(&handler),
-        &token_from_url(
-            pane_share
-                .spectator_url
-                .as_deref()
-                .expect("pane spectator URL"),
-        ),
-    )
-    .await;
-    let mut session = TestWebSocket::connect(
-        handler,
-        &token_from_url(
-            session_share
-                .spectator_url
-                .as_deref()
-                .expect("session spectator URL"),
-        ),
-    )
-    .await;
-    assert_eq!(pane.read_json().await["scope"], "pane");
-    pane.read_binary_with_prefix(0x10, "pane snapshot").await;
-    assert_eq!(session.read_json().await["scope"], "session");
-    session
-        .read_binary_with_prefix(0x10, "session snapshot")
-        .await;
+    let (_, mut pane, mut session) =
+        pane_and_session_spectators("websocket-idle-pong-timeout").await;
 
     pause();
     for _ in 0..3 {
@@ -710,38 +549,34 @@ async fn authenticated_idle_pane_and_session_shares_close_without_pongs() {
 
     advance(Duration::from_secs(2)).await;
     tokio::task::yield_now().await;
-    pane.read_close(4009, "pong_timeout").await;
-    session.read_close(4009, "pong_timeout").await;
+    assert_close(&mut pane.stream, 4009, "pong_timeout").await;
+    assert_close(&mut session.stream, 4009, "pong_timeout").await;
     assert!(pane.task.is_finished() && session.task.is_finished());
 }
 
 #[tokio::test]
 async fn ready_exposes_spectator_pairing_code_only_to_operator() {
-    let handler = Arc::new(RequestHandler::new());
-    let session_name = create_session(&handler, "websocket-ready-pairing-code").await;
-    let created = create_share(
-        &handler,
-        CreateWebShareRequest {
+    let host = ShareHost::new("websocket-ready-pairing-code").await;
+    let created = host
+        .share(CreateWebShareRequest {
             require_pin: true,
             operator: true,
             spectator: true,
-            ..share_request(WebShareScope::Pane(PaneTarget::new(session_name, 0).into()))
-        },
-    )
-    .await;
-    let operator_token = token_from_url(created.operator_url.as_deref().expect("operator URL"));
+            ..share_request(host.pane_scope())
+        })
+        .await;
     let operator_pin = created
         .operator_pairing_code
         .as_deref()
         .expect("operator pin");
-    let spectator_token = token_from_url(created.spectator_url.as_deref().expect("spectator URL"));
     let spectator_pin = created
         .spectator_pairing_code
         .as_deref()
         .expect("spectator pin");
 
     let mut operator =
-        TestWebSocket::connect_with_pin(Arc::clone(&handler), &operator_token, operator_pin).await;
+        TestWebSocket::connect_with_pin(&host.handler, &operator_token(&created), operator_pin)
+            .await;
     let operator_ready = operator.read_json().await;
     assert_eq!(operator_ready["type"], "ready");
     assert_eq!(operator_ready["role"], "operator");
@@ -751,7 +586,7 @@ async fn ready_exposes_spectator_pairing_code_only_to_operator() {
     );
 
     let mut spectator =
-        TestWebSocket::connect_with_pin(Arc::clone(&handler), &spectator_token, spectator_pin)
+        TestWebSocket::connect_with_pin(&host.handler, &spectator_token(&created), spectator_pin)
             .await;
     let spectator_ready = spectator.read_json().await;
     assert_eq!(spectator_ready["type"], "ready");
@@ -767,58 +602,24 @@ async fn ready_exposes_spectator_pairing_code_only_to_operator() {
 
 #[tokio::test]
 async fn pane_share_rejects_browser_resize() {
-    let handler = Arc::new(RequestHandler::new());
-    let session_name = create_session(&handler, "websocket-pane-no-browser-resize").await;
-    let created = create_share(
-        &handler,
-        CreateWebShareRequest {
-            operator: true,
-            ..share_request(WebShareScope::Pane(PaneTarget::new(session_name, 0).into()))
-        },
-    )
-    .await;
-    let mut client = TestWebSocket::connect(
-        Arc::clone(&handler),
-        &token_from_url(created.operator_url.as_deref().expect("operator URL")),
-    )
-    .await;
-    let ready = client.read_json().await;
-    assert_eq!(ready["scope"], "pane");
-    assert_eq!(ready["role"], "operator");
+    let host = ShareHost::new("websocket-pane-no-browser-resize").await;
+    let mut client = host.join(host.pane_scope(), Role::Operator).await;
 
     client.read_binary_with_prefix(0x10, "snapshot").await;
     client.send_binary(&[0x82, 0x00, 0x2c, 0x00, 0x24]).await;
-    client.read_close(4006, "web_resize_unsupported").await;
+    assert_close(&mut client.stream, 4006, "web_resize_unsupported").await;
     client.close().await;
 }
 
 #[tokio::test]
 async fn session_operator_prefix_w_is_not_web_filtered() {
-    let handler = Arc::new(RequestHandler::new());
-    let session_name = create_session(&handler, "websocket-session-prefix-w").await;
-    let created = create_share(
-        &handler,
-        CreateWebShareRequest {
-            operator: true,
-            ..share_request(WebShareScope::Session(session_name))
-        },
+    let (client, redraw) = session_operator_prefix_redraw(
+        "websocket-session-prefix-w",
+        b'w',
+        b"\x1b[s\x1b[?25l",
+        "prefix w redraw",
     )
     .await;
-    let mut client = TestWebSocket::connect(
-        Arc::clone(&handler),
-        &token_from_url(created.operator_url.as_deref().expect("operator URL")),
-    )
-    .await;
-    let ready = client.read_json().await;
-    assert_eq!(ready["scope"], "session");
-    assert_eq!(ready["role"], "operator");
-
-    client.read_binary_with_prefix(0x10, "snapshot").await;
-    client.send_binary(&[0x83, 0x02, b'w']).await;
-    let redraw = client
-        .read_binary_with_prefix_payload_containing(0x01, b"\x1b[s\x1b[?25l", "prefix w redraw")
-        .await;
-    let redraw = String::from_utf8_lossy(&redraw[1..]);
     assert!(
         !redraw.contains("command is not allowed through web controls"),
         "operator prefix commands should not be filtered, got {redraw:?}"
@@ -833,31 +634,13 @@ async fn session_operator_prefix_w_is_not_web_filtered() {
 
 #[tokio::test]
 async fn session_operator_prefix_q_overlay_reaches_browser() {
-    let handler = Arc::new(RequestHandler::new());
-    let session_name = create_session(&handler, "websocket-session-prefix-q").await;
-    let created = create_share(
-        &handler,
-        CreateWebShareRequest {
-            operator: true,
-            ..share_request(WebShareScope::Session(session_name))
-        },
+    let (client, redraw) = session_operator_prefix_redraw(
+        "websocket-session-prefix-q",
+        b'q',
+        b"\x1b[?25l",
+        "prefix q redraw",
     )
     .await;
-    let mut client = TestWebSocket::connect(
-        Arc::clone(&handler),
-        &token_from_url(created.operator_url.as_deref().expect("operator URL")),
-    )
-    .await;
-    let ready = client.read_json().await;
-    assert_eq!(ready["scope"], "session");
-    assert_eq!(ready["role"], "operator");
-
-    client.read_binary_with_prefix(0x10, "snapshot").await;
-    client.send_binary(&[0x83, 0x02, b'q']).await;
-    let redraw = client
-        .read_binary_with_prefix_payload_containing(0x01, b"\x1b[?25l", "prefix q redraw")
-        .await;
-    let redraw = String::from_utf8_lossy(&redraw[1..]);
     assert!(
         redraw.contains("\x1b[?25l"),
         "display-panes overlay should be forwarded to the browser, got {redraw:?}"
@@ -868,24 +651,8 @@ async fn session_operator_prefix_q_overlay_reaches_browser() {
 
 #[tokio::test]
 async fn session_operator_command_prompt_rename_keeps_share_alive() {
-    let handler = Arc::new(RequestHandler::new());
-    let session_name = create_session(&handler, "websocket-session-rename").await;
-    let created = create_share(
-        &handler,
-        CreateWebShareRequest {
-            operator: true,
-            ..share_request(WebShareScope::Session(session_name))
-        },
-    )
-    .await;
-    let mut client = TestWebSocket::connect(
-        Arc::clone(&handler),
-        &token_from_url(created.operator_url.as_deref().expect("operator URL")),
-    )
-    .await;
-    let ready = client.read_json().await;
-    assert_eq!(ready["scope"], "session");
-    assert_eq!(ready["role"], "operator");
+    let host = ShareHost::new("websocket-session-rename").await;
+    let mut client = host.join(host.session_scope(), Role::Operator).await;
 
     client.read_binary_with_prefix(0x10, "snapshot").await;
     for bytes in [&b"\x02"[..], b":", b"rename-session renamed", b"\r"] {
@@ -894,17 +661,37 @@ async fn session_operator_command_prompt_rename_keeps_share_alive() {
         frame.extend_from_slice(bytes);
         client.send_binary(&frame).await;
     }
-    wait_for_session_name(&handler, "renamed").await;
+    wait_until(
+        Duration::from_secs(10),
+        Duration::from_millis(10),
+        async || {
+            let Response::ListSessions(listed) = host
+                .handler
+                .handle(Request::ListSessions(ListSessionsRequest {
+                    format: Some("#{session_name}".to_owned()),
+                    filter: None,
+                    sort_order: None,
+                    reversed: false,
+                }))
+                .await
+            else {
+                panic!("list-sessions should succeed");
+            };
+            let stdout = String::from_utf8_lossy(listed.output.stdout());
+            if stdout.lines().any(|line| line == "renamed") {
+                Ok(())
+            } else {
+                Err(())
+            }
+        },
+    )
+    .await
+    .unwrap_or_else(|()| panic!("session \"renamed\" was not created"));
     let mut seen = Vec::new();
     let output = loop {
-        let payload = client.read_binary_payload("rename refresh").await;
-        let summary = String::from_utf8_lossy(&payload).into_owned();
-        seen.push(summary);
-        if payload.first() == Some(&0x01)
-            && payload
-                .windows(b"[renamed]".len())
-                .any(|w| w == b"[renamed]")
-        {
+        let payload = client.read_binary("rename refresh").await;
+        seen.push(String::from_utf8_lossy(&payload).into_owned());
+        if payload.first() == Some(&0x01) && contains(&payload, b"[renamed]") {
             break payload;
         }
         assert!(
@@ -923,31 +710,15 @@ async fn session_operator_command_prompt_rename_keeps_share_alive() {
 
 #[tokio::test]
 async fn session_share_sends_revoked_before_closing_when_session_is_killed() {
-    let handler = Arc::new(RequestHandler::new());
-    let session_name = create_session(&handler, "websocket-session-gone").await;
-    let created = create_share(
-        &handler,
-        share_request(WebShareScope::Session(session_name.clone())),
-    )
-    .await;
-    let mut client = TestWebSocket::connect(
-        Arc::clone(&handler),
-        &token_from_url(created.spectator_url.as_deref().expect("spectator URL")),
-    )
-    .await;
+    let host = ShareHost::new("websocket-session-gone").await;
+    let mut client = host.connect(host.session_scope(), Role::Spectator).await;
     let ready = client.read_json().await;
     assert_eq!(ready["type"], "ready");
     assert_eq!(ready["scope"], "session");
 
-    let killed = handler
-        .handle(Request::KillSession(KillSessionRequest {
-            target: session_name,
-            kill_all_except_target: false,
-            clear_alerts: false,
-            kill_group: false,
-        }))
+    host.handler
+        .handle_ok(KillSessionRequest::fixture(&host.session_name))
         .await;
-    assert!(matches!(killed, Response::KillSession(_)));
 
     let revoked = client.read_json().await;
     assert_eq!(revoked["type"], "share_revoked");
@@ -958,23 +729,13 @@ async fn session_share_sends_revoked_before_closing_when_session_is_killed() {
 
 #[tokio::test]
 async fn session_share_streams_attach_output_without_replacing_snapshot() {
-    let handler = Arc::new(RequestHandler::new());
-    let session_name = create_session(&handler, "websocket-session-snapshot").await;
-    let created = create_share(
-        &handler,
-        share_request(WebShareScope::Session(session_name.clone())),
-    )
-    .await;
-    let mut client = TestWebSocket::connect(
-        Arc::clone(&handler),
-        &token_from_url(created.spectator_url.as_deref().expect("spectator URL")),
-    )
-    .await;
+    let host = ShareHost::new("websocket-session-snapshot").await;
+    let mut client = host.connect(host.session_scope(), Role::Spectator).await;
     let ready = client.read_json().await;
     assert_eq!(ready["scope"], "session");
 
     let first = client
-        .read_binary_with_prefix_payload(0x10, "initial session snapshot")
+        .read_binary_with_prefix(0x10, "initial session snapshot")
         .await;
     let first = String::from_utf8_lossy(&first[1..]);
     assert!(
@@ -983,7 +744,7 @@ async fn session_share_streams_attach_output_without_replacing_snapshot() {
     );
 
     let redraw = client
-        .read_binary_with_prefix_payload(0x01, "session attach output")
+        .read_binary_with_prefix(0x01, "session attach output")
         .await;
     assert!(
         redraw.len() > 1,
@@ -994,78 +755,37 @@ async fn session_share_streams_attach_output_without_replacing_snapshot() {
 
 #[tokio::test]
 async fn spectator_session_share_rejects_binary_frames() {
-    let handler = Arc::new(RequestHandler::new());
-    let session_name = create_session(&handler, "websocket-spectator-binary").await;
-    let created = create_share(
-        &handler,
-        share_request(WebShareScope::Session(session_name)),
-    )
-    .await;
-    let mut client = TestWebSocket::connect(
-        Arc::clone(&handler),
-        &token_from_url(created.spectator_url.as_deref().expect("spectator URL")),
-    )
-    .await;
-    let ready = client.read_json().await;
-    assert_eq!(ready["scope"], "session");
-    assert_eq!(ready["role"], "spectator");
+    let host = ShareHost::new("websocket-spectator-binary").await;
+    let mut client = host.join(host.session_scope(), Role::Spectator).await;
 
     client.send_binary(&[0x82, 0x00, 0x64, 0x00, 0x28]).await;
-    client.read_close(4006, "spectator_no_binary").await;
+    assert_close(&mut client.stream, 4006, "spectator_no_binary").await;
     client.close().await;
 }
 
 #[tokio::test]
 async fn spectator_session_share_allows_scroll_text_frames() {
-    let handler = Arc::new(RequestHandler::new());
-    let session_name = create_session(&handler, "websocket-spectator-scroll").await;
-    let created = create_share(
-        &handler,
-        share_request(WebShareScope::Session(session_name)),
-    )
-    .await;
-    let mut client = TestWebSocket::connect(
-        Arc::clone(&handler),
-        &token_from_url(created.spectator_url.as_deref().expect("spectator URL")),
-    )
-    .await;
-    let ready = client.read_json().await;
-    assert_eq!(ready["scope"], "session");
-    assert_eq!(ready["role"], "spectator");
+    let host = ShareHost::new("websocket-spectator-scroll").await;
+    let mut client = host.join(host.session_scope(), Role::Spectator).await;
 
     client.read_binary_with_prefix(0x10, "snapshot").await;
     client
         .send_json(r#"{"type":"pane_scroll","pane_id":0,"delta":-1}"#)
         .await;
-    read_session_view_until(&mut client, "spectator scroll session view", |view| {
-        view["panes"]
-            .as_array()
-            .is_some_and(|panes| !panes.is_empty())
-    })
-    .await;
+    client
+        .read_session_view_until("spectator scroll session view", |view| {
+            view["panes"]
+                .as_array()
+                .is_some_and(|panes| !panes.is_empty())
+        })
+        .await;
     client.close().await;
 }
 
 #[tokio::test]
 async fn session_operator_browser_resize_queues_fresh_snapshot() {
-    let handler = Arc::new(RequestHandler::new());
-    let session_name = create_session(&handler, "websocket-session-browser-resize").await;
-    let created = create_share(
-        &handler,
-        CreateWebShareRequest {
-            operator: true,
-            ..share_request(WebShareScope::Session(session_name))
-        },
-    )
-    .await;
-    let mut client = TestWebSocket::connect(
-        Arc::clone(&handler),
-        &token_from_url(created.operator_url.as_deref().expect("operator URL")),
-    )
-    .await;
-    let ready = client.read_json().await;
-    assert_eq!(ready["scope"], "session");
-    assert_eq!(ready["role"], "operator");
+    let host = ShareHost::new("websocket-session-browser-resize").await;
+    let mut client = host.join(host.session_scope(), Role::Operator).await;
 
     client
         .read_binary_with_prefix(0x10, "initial snapshot")
@@ -1077,16 +797,15 @@ async fn session_operator_browser_resize_queues_fresh_snapshot() {
     client.send_binary(&[0x82, 0x00, 0x78, 0x00, 0x28]).await;
 
     let resized_snapshot = client
-        .read_binary_with_prefix_payload(0x10, "browser resize snapshot")
+        .read_binary_with_prefix(0x10, "browser resize snapshot")
         .await;
     assert!(
         resized_snapshot.len() > 1,
         "browser resize should produce a full session snapshot"
     );
     let resized_view = client
-        .read_binary_with_prefix_payload(0x11, "browser resize session view")
+        .read_session_view("browser resize session view")
         .await;
-    let resized_view = parse_session_view(&resized_view);
     assert_eq!(resized_view["size"]["cols"], 120);
 
     client.close().await;
@@ -1094,42 +813,18 @@ async fn session_operator_browser_resize_queues_fresh_snapshot() {
 
 #[tokio::test]
 async fn session_operator_can_resize_pane_by_id() {
-    let handler = Arc::new(RequestHandler::new());
-    let session_name = create_session(&handler, "websocket-session-pane-resize").await;
-    assert!(matches!(
-        handler
-            .handle(Request::SplitWindow(SplitWindowRequest {
-                target: SplitWindowTarget::Session(session_name.clone()),
-                direction: SplitDirection::Horizontal,
-                before: false,
-                environment: None,
-            }))
-            .await,
-        Response::SplitWindow(_)
-    ));
+    let host = ShareHost::new("websocket-session-pane-resize").await;
+    host.handler
+        .handle_ok(SplitWindowRequest {
+            direction: SplitDirection::Horizontal,
+            ..Fixture::fixture(&host.session_name)
+        })
+        .await;
 
-    let created = create_share(
-        &handler,
-        CreateWebShareRequest {
-            operator: true,
-            ..share_request(WebShareScope::Session(session_name.clone()))
-        },
-    )
-    .await;
-    let mut client = TestWebSocket::connect(
-        Arc::clone(&handler),
-        &token_from_url(created.operator_url.as_deref().expect("operator URL")),
-    )
-    .await;
-    let ready = client.read_json().await;
-    assert_eq!(ready["scope"], "session");
-    assert_eq!(ready["role"], "operator");
+    let mut client = host.join(host.session_scope(), Role::Operator).await;
 
     client.read_binary_with_prefix(0x10, "snapshot").await;
-    let initial_view = client
-        .read_binary_with_prefix_payload(0x11, "initial session view")
-        .await;
-    let initial_view = parse_session_view(&initial_view);
+    let initial_view = client.read_session_view("initial session view").await;
     let (pane_id, initial_width) = first_pane_id_and_width(&initial_view);
 
     let mut frame = vec![0x84];
@@ -1138,10 +833,11 @@ async fn session_operator_can_resize_pane_by_id() {
     frame.extend_from_slice(&5u16.to_be_bytes());
     client.send_binary(&frame).await;
 
-    let resized_view = read_session_view_until(&mut client, "resized session view", |view| {
-        pane_width(view, pane_id) > initial_width
-    })
-    .await;
+    let resized_view = client
+        .read_session_view_until("resized session view", |view| {
+            pane_width(view, pane_id) > initial_width
+        })
+        .await;
     assert!(
         pane_width(&resized_view, pane_id) > initial_width,
         "operator pane resize should update the target pane"
@@ -1152,30 +848,15 @@ async fn session_operator_can_resize_pane_by_id() {
 
 #[tokio::test]
 async fn session_operator_can_run_typed_window_actions() {
-    let handler = Arc::new(RequestHandler::new());
-    let session_name = create_session(&handler, "websocket-session-window-actions").await;
-    let created = create_share(
-        &handler,
-        CreateWebShareRequest {
-            operator: true,
-            ..share_request(WebShareScope::Session(session_name))
-        },
-    )
-    .await;
-    let mut client = TestWebSocket::connect(
-        Arc::clone(&handler),
-        &token_from_url(created.operator_url.as_deref().expect("operator URL")),
-    )
-    .await;
-    let ready = client.read_json().await;
-    assert_eq!(ready["scope"], "session");
-    assert_eq!(ready["role"], "operator");
+    let host = ShareHost::new("websocket-session-window-actions").await;
+    let mut client = host.join(host.session_scope(), Role::Operator).await;
 
     client.read_binary_with_prefix(0x10, "snapshot").await;
-    let initial = read_session_view_until(&mut client, "initial session view", |view| {
-        window_count(view) == 1 && active_window_index(view) == Some(0)
-    })
-    .await;
+    let initial = client
+        .read_session_view_until("initial session view", |view| {
+            window_count(view) == 1 && active_window_index(view) == Some(0)
+        })
+        .await;
     let initial_panes = pane_count(&initial);
     assert_eq!(
         active_pane_count(&initial),
@@ -1184,97 +865,72 @@ async fn session_operator_can_run_typed_window_actions() {
     );
 
     client.send_json(r#"{"type":"new_window"}"#).await;
-    read_session_view_until(&mut client, "new window view", |view| {
-        window_count(view) == 2
-    })
-    .await;
+    client
+        .read_session_view_until("new window view", |view| window_count(view) == 2)
+        .await;
 
     client
         .send_json(r#"{"type":"rename_window","window_index":1,"name":"logs"}"#)
         .await;
-    read_session_view_until(&mut client, "renamed window view", |view| {
-        window_named(view, 1, "logs")
-    })
-    .await;
+    client
+        .read_session_view_until("renamed window view", |view| window_named(view, 1, "logs"))
+        .await;
 
     client
         .send_json(r#"{"type":"select_window","window_index":0}"#)
         .await;
-    read_session_view_until(&mut client, "selected window view", |view| {
-        active_window_index(view) == Some(0)
-    })
-    .await;
+    client
+        .read_session_view_until("selected window view", |view| {
+            active_window_index(view) == Some(0)
+        })
+        .await;
 
     client
         .send_json(r#"{"type":"split_pane","direction":"horizontal"}"#)
         .await;
-    read_session_view_until(&mut client, "split pane view", |view| {
-        pane_count(view) > initial_panes
-    })
-    .await;
+    client
+        .read_session_view_until("split pane view", |view| pane_count(view) > initial_panes)
+        .await;
 
     client.close().await;
 }
 
 #[tokio::test]
 async fn session_spectator_can_select_windows_without_operator_access() {
-    let handler = Arc::new(RequestHandler::new());
-    let session_name = create_session(&handler, "websocket-spectator-window-select").await;
-    assert!(matches!(
-        handler
-            .handle(Request::NewWindow(Box::new(NewWindowRequest {
-                target: session_name.clone(),
-                name: Some("logs".to_owned()),
-                detached: true,
-                environment: None,
-                command: None,
-                start_directory: None,
-                target_window_index: None,
-                insert_at_target: false,
-                process_command: None,
-            })))
-            .await,
-        Response::NewWindow(_)
-    ));
-    let created = create_share(
-        &handler,
-        share_request(WebShareScope::Session(session_name.clone())),
-    )
-    .await;
-    let mut client = TestWebSocket::connect(
-        Arc::clone(&handler),
-        &token_from_url(created.spectator_url.as_deref().expect("spectator URL")),
-    )
-    .await;
-    let ready = client.read_json().await;
-    assert_eq!(ready["scope"], "session");
-    assert_eq!(ready["role"], "spectator");
+    let host = ShareHost::new("websocket-spectator-window-select").await;
+    host.handler
+        .create_window(NewWindowRequest {
+            name: Some("logs".to_owned()),
+            ..Fixture::fixture(&host.session_name)
+        })
+        .await;
+    let mut client = host.join(host.session_scope(), Role::Spectator).await;
 
     client.read_binary_with_prefix(0x10, "snapshot").await;
-    read_session_view_until(&mut client, "initial spectator session view", |view| {
-        window_count(view) == 2 && active_window_index(view) == Some(0)
-    })
-    .await;
+    client
+        .read_session_view_until("initial spectator session view", |view| {
+            window_count(view) == 2 && active_window_index(view) == Some(0)
+        })
+        .await;
 
     client
         .send_json(r#"{"type":"select_window","window_index":1}"#)
         .await;
-    read_session_view_until(&mut client, "spectator selected window view", |view| {
-        active_window_index(view) == Some(1)
-    })
-    .await;
-    let Response::ListWindows(listed) = handler
-        .handle(Request::ListWindows(Box::new(ListWindowsRequest {
-            target: session_name,
+    client
+        .read_session_view_until("spectator selected window view", |view| {
+            active_window_index(view) == Some(1)
+        })
+        .await;
+    let listed = host
+        .handler
+        .handle_ok(ListWindowsRequest {
+            target: host.session_name.clone(),
             format: None,
             filter: None,
             sort_order: None,
             reversed: false,
-        })))
-        .await
-    else {
-        panic!("expected list-windows response");
-    };
+        })
+        .await;
     assert!(listed
         .windows
         .iter()
@@ -1294,7 +950,8 @@ async fn handshake_rejects_unknown_token_with_collapsed_close() {
     // ever emits a challenge.
     let handler = Arc::new(RequestHandler::new());
     let unknown_token_id = SecretHashForCrypto::from_secret("no-such-token").token_id();
-    let (mut stream, task) = send_hello_only(Arc::clone(&handler), &unknown_token_id).await;
+    let (mut stream, task) = websocket_client(handler, PreAuthQueue::new(16)).await;
+    write_client_hello(&mut stream, &unknown_token_id).await;
 
     assert_close(&mut stream, 4000, "handshake_rejected").await;
 
@@ -1308,128 +965,66 @@ async fn handshake_rejects_wrong_pin_with_same_collapsed_close() {
     // the encrypted auth frame carries a wrong PIN. The auth failure must
     // surface the IDENTICAL (4000, "handshake_rejected") pair as the unknown
     // token above, proving the close code is not a PIN oracle.
-    let handler = Arc::new(RequestHandler::new());
-    let session_name = create_session(&handler, "websocket-wrong-pin").await;
-    let created = create_share(
-        &handler,
-        CreateWebShareRequest {
-            require_pin: true,
-            ..share_request(WebShareScope::Pane(PaneTarget::new(session_name, 0).into()))
-        },
-    )
-    .await;
-    let pairing_code = created
-        .spectator_pairing_code
-        .as_deref()
-        .expect("pin-enabled spectator share returns pairing code");
-    let wrong_pin = if pairing_code == "000000" {
-        "111111"
-    } else {
-        "000000"
-    };
+    let host = ShareHost::new("websocket-wrong-pin").await;
+    let (token, pin) = host.pin_share(host.pane_scope()).await;
 
-    let token = token_from_url(created.spectator_url.as_deref().expect("spectator URL"));
-    let token_id = SecretHashForCrypto::from_secret(&token).token_id();
-    let HandshakeSession {
-        mut stream, task, ..
-    } = drive_handshake_through_auth(
-        Arc::clone(&handler),
-        &token,
-        &token_id,
-        &auth_text_with_pin(wrong_pin),
-    )
-    .await;
-
-    assert_close(&mut stream, 4000, "handshake_rejected").await;
-
-    drop(stream);
-    let _ = task.await.expect("server task joins");
+    expect_rejected(&host.handler, &token, &auth_text_with_pin(wrong_pin(&pin)))
+        .await
+        .close()
+        .await;
 }
 
 #[tokio::test]
 async fn loopback_backoff_waiters_do_not_block_another_share_over_websocket() {
-    let handler = Arc::new(RequestHandler::new_with_web_authentication_limits(
-        1, 8, 8, 4,
-    ));
-    let protected_session = create_session(&handler, "websocket-protected-wait").await;
-    let protected = create_share(
-        &handler,
-        CreateWebShareRequest {
-            require_pin: true,
-            ..share_request(WebShareScope::Pane(
-                PaneTarget::new(protected_session, 0).into(),
-            ))
-        },
+    let host = ShareHost::with_handler(
+        RequestHandler::new_with_web_authentication_limits(1, 8, 8, 4),
+        "websocket-protected-wait",
     )
     .await;
-    let unrelated_session = create_session(&handler, "websocket-unrelated-wait").await;
-    let unrelated = create_share(
-        &handler,
-        share_request(WebShareScope::Pane(
-            PaneTarget::new(unrelated_session, 0).into(),
-        )),
-    )
-    .await;
-    let protected_token =
-        token_from_url(protected.spectator_url.as_deref().expect("protected URL"));
-    let protected_pin = protected
-        .spectator_pairing_code
-        .as_deref()
-        .expect("protected share has a PIN");
-    let wrong_pin = if protected_pin == "000000" {
-        "111111"
-    } else {
-        "000000"
-    };
-    let protected_token_id = SecretHashForCrypto::from_secret(&protected_token).token_id();
-    let unrelated_token =
-        token_from_url(unrelated.spectator_url.as_deref().expect("unrelated URL"));
+    let (protected_token, protected_pin) = host.pin_share(host.pane_scope()).await;
+    let unrelated_session = host
+        .handler
+        .create_session("websocket-unrelated-wait")
+        .await;
+    let unrelated = host
+        .share_as(
+            WebShareScope::Pane(PaneTarget::new(unrelated_session, 0).into()),
+            Role::Spectator,
+        )
+        .await;
+    let unrelated_token = spectator_token(&unrelated);
 
     // Four settled failures make the next attempt wait 800 ms, leaving enough
     // time to complete a real encrypted handshake for the unrelated share.
+    let wrong_auth = auth_text_with_pin(wrong_pin(&protected_pin));
     for _ in 0..4 {
-        let HandshakeSession {
-            mut stream, task, ..
-        } = drive_handshake_through_auth(
-            Arc::clone(&handler),
-            &protected_token,
-            &protected_token_id,
-            &auth_text_with_pin(wrong_pin),
-        )
-        .await;
-        assert_close(&mut stream, 4000, "handshake_rejected").await;
-        drop(stream);
-        let _ = task.await.expect("failed PIN task joins");
+        expect_rejected(&host.handler, &protected_token, &wrong_auth)
+            .await
+            .close()
+            .await;
     }
 
     let mut waiters = Vec::with_capacity(4);
     for _ in 0..4 {
         waiters.push(
-            drive_handshake_through_auth(
-                Arc::clone(&handler),
-                &protected_token,
-                &protected_token_id,
-                &auth_text_with_pin(protected_pin),
-            )
-            .await,
+            TestWebSocket::connect_with_pin(&host.handler, &protected_token, &protected_pin).await,
         );
     }
     tokio::time::timeout(Duration::from_millis(100), async {
-        while handler.web_authentication_wait_count() != 4 {
+        while host.handler.web_authentication_wait_count() != 4 {
             tokio::task::yield_now().await;
         }
     })
     .await
     .expect("four loopback connections enter authentication backoff");
 
-    let mut unrelated = TestWebSocket::connect(Arc::clone(&handler), &unrelated_token).await;
+    let mut unrelated = TestWebSocket::connect(&host.handler, &unrelated_token).await;
     let ready = tokio::time::timeout(Duration::from_millis(600), unrelated.read_json())
         .await
         .expect("unrelated share reaches ready while protected share waits");
     assert_eq!(ready["type"], "ready");
 
-    for waiter in waiters {
-        let HandshakeSession { stream, task, .. } = waiter;
+    for TestWebSocket { stream, task, .. } in waiters {
         drop(stream);
         task.abort();
         assert!(
@@ -1440,73 +1035,49 @@ async fn loopback_backoff_waiters_do_not_block_another_share_over_websocket() {
         );
     }
     unrelated.close().await;
-    assert_eq!(handler.web_authentication_wait_count(), 0);
+    assert_eq!(host.handler.web_authentication_wait_count(), 0);
 }
 
 #[tokio::test]
 async fn shutdown_cancels_authentication_backoff_before_web_open_admission() {
-    let handler = Arc::new(RequestHandler::new_with_web_authentication_limits(
-        1, 8, 8, 4,
-    ));
-    let session_name = create_session(&handler, "websocket-shutdown-auth-wait").await;
-    let created = create_share(
-        &handler,
-        CreateWebShareRequest {
-            require_pin: true,
-            ..share_request(WebShareScope::Pane(PaneTarget::new(session_name, 0).into()))
-        },
+    let host = ShareHost::with_handler(
+        RequestHandler::new_with_web_authentication_limits(1, 8, 8, 4),
+        "websocket-shutdown-auth-wait",
     )
     .await;
-    let token = token_from_url(created.spectator_url.as_deref().expect("spectator URL"));
-    let pin = created
-        .spectator_pairing_code
-        .as_deref()
-        .expect("protected share has a PIN");
-    let wrong_pin = if pin == "000000" { "111111" } else { "000000" };
-    let token_id = SecretHashForCrypto::from_secret(&token).token_id();
+    let (token, pin) = host.pin_share(host.pane_scope()).await;
 
     // Four settled failures make the next valid attempt wait 800 ms.
+    let wrong_auth = auth_text_with_pin(wrong_pin(&pin));
     for _ in 0..4 {
-        let HandshakeSession {
-            mut stream, task, ..
-        } = drive_handshake_through_auth(
-            Arc::clone(&handler),
-            &token,
-            &token_id,
-            &auth_text_with_pin(wrong_pin),
-        )
-        .await;
-        assert_close(&mut stream, 4000, "handshake_rejected").await;
-        drop(stream);
-        task.await
+        let rejected = expect_rejected(&host.handler, &token, &wrong_auth).await;
+        drop(rejected.stream);
+        rejected
+            .task
+            .await
             .expect("failed PIN task joins")
             .expect("failed PIN task exits cleanly");
     }
 
-    let HandshakeSession { stream, task, .. } = drive_handshake_through_auth(
-        Arc::clone(&handler),
-        &token,
-        &token_id,
-        &auth_text_with_pin(pin),
-    )
-    .await;
+    let TestWebSocket { stream, task, .. } =
+        TestWebSocket::connect_with_pin(&host.handler, &token, &pin).await;
     timeout(Duration::from_millis(100), async {
-        while handler.web_authentication_wait_count() != 1 {
+        while host.handler.web_authentication_wait_count() != 1 {
             tokio::task::yield_now().await;
         }
     })
     .await
     .expect("valid connection enters authentication backoff");
 
-    handler.close_normal_request_admission();
+    host.handler.close_normal_request_admission();
     timeout(Duration::from_millis(500), task)
         .await
         .expect("shutdown cancels authentication before the 800 ms backoff")
         .expect("authentication task joins")
         .expect("authentication task exits cleanly");
     drop(stream);
-    assert_eq!(handler.web_authentication_wait_count(), 0);
-    assert!(handler.normal_requests_quiesced());
+    assert_eq!(host.handler.web_authentication_wait_count(), 0);
+    assert!(host.handler.normal_requests_quiesced());
 }
 
 #[tokio::test]
@@ -1514,133 +1085,64 @@ async fn handshake_rejects_capacity_reached_with_collapsed_close() {
     // The share caps spectators at 1. Once that slot is held by a live viewer,
     // a second spectator hits the capacity-reached path after token auth. Keep
     // the wire close collapsed so PIN-protected shares do not expose an oracle.
-    let handler = Arc::new(RequestHandler::new());
-    let session_name = create_session(&handler, "websocket-capacity").await;
-    let created = create_share(
-        &handler,
-        share_request(WebShareScope::Session(session_name)),
-    )
-    .await;
-    let token = token_from_url(created.spectator_url.as_deref().expect("spectator URL"));
+    let host = ShareHost::new("websocket-capacity").await;
+    let token = spectator_token(&host.share_as(host.session_scope(), Role::Spectator).await);
 
     // First spectator occupies the only slot and stays connected.
-    let mut first = TestWebSocket::connect(Arc::clone(&handler), &token).await;
+    let mut first = TestWebSocket::connect(&host.handler, &token).await;
     let ready = first.read_json().await;
     assert_eq!(ready["type"], "ready");
 
     // Second spectator must be rejected with the collapsed pair.
-    let token_id = SecretHashForCrypto::from_secret(&token).token_id();
-    let HandshakeSession {
-        mut stream, task, ..
-    } = drive_handshake_through_auth(Arc::clone(&handler), &token, &token_id, &auth_text()).await;
-
-    assert_close(&mut stream, 4000, "handshake_rejected").await;
-
-    drop(stream);
-    let _ = task.await.expect("server task joins");
+    expect_rejected(&host.handler, &token, &auth_text())
+        .await
+        .close()
+        .await;
     first.close().await;
 }
 
 #[tokio::test]
 async fn handshake_rejects_pin_protected_capacity_after_valid_pin_with_collapsed_close() {
-    let handler = Arc::new(RequestHandler::new());
-    let session_name = create_session(&handler, "websocket-pin-capacity").await;
-    let created = create_share(
-        &handler,
-        CreateWebShareRequest {
-            require_pin: true,
-            ..share_request(WebShareScope::Session(session_name))
-        },
-    )
-    .await;
-    let token = token_from_url(created.spectator_url.as_deref().expect("spectator URL"));
-    let pin = created
-        .spectator_pairing_code
-        .as_deref()
-        .expect("pin-enabled spectator share returns pairing code");
+    let host = ShareHost::new("websocket-pin-capacity").await;
+    let (token, pin) = host.pin_share(host.session_scope()).await;
 
-    let first = TestWebSocket::connect_with_pin(Arc::clone(&handler), &token, pin).await;
+    let first = TestWebSocket::connect_with_pin(&host.handler, &token, &pin).await;
 
-    let token_id = SecretHashForCrypto::from_secret(&token).token_id();
-    let HandshakeSession {
-        mut stream, task, ..
-    } = drive_handshake_through_auth(
-        Arc::clone(&handler),
-        &token,
-        &token_id,
-        &auth_text_with_pin(pin),
-    )
-    .await;
-
-    assert_close(&mut stream, 4000, "handshake_rejected").await;
-
-    drop(stream);
-    let _ = task.await.expect("server task joins");
+    expect_rejected(&host.handler, &token, &auth_text_with_pin(&pin))
+        .await
+        .close()
+        .await;
     first.close().await;
 }
 
 #[tokio::test]
 async fn handshake_rejects_wrong_pin_before_capacity_with_collapsed_close() {
-    let handler = Arc::new(RequestHandler::new());
-    let session_name = create_session(&handler, "websocket-wrong-pin-capacity").await;
-    let created = create_share(
-        &handler,
-        CreateWebShareRequest {
-            require_pin: true,
-            ..share_request(WebShareScope::Session(session_name))
-        },
-    )
-    .await;
-    let token = token_from_url(created.spectator_url.as_deref().expect("spectator URL"));
-    let pin = created
-        .spectator_pairing_code
-        .as_deref()
-        .expect("pin-enabled spectator share returns pairing code");
-    let wrong_pin = if pin == "000000" { "111111" } else { "000000" };
+    let host = ShareHost::new("websocket-wrong-pin-capacity").await;
+    let (token, pin) = host.pin_share(host.session_scope()).await;
 
-    let first = TestWebSocket::connect_with_pin(Arc::clone(&handler), &token, pin).await;
+    let first = TestWebSocket::connect_with_pin(&host.handler, &token, &pin).await;
 
-    let token_id = SecretHashForCrypto::from_secret(&token).token_id();
-    let HandshakeSession {
-        mut stream, task, ..
-    } = drive_handshake_through_auth(
-        Arc::clone(&handler),
-        &token,
-        &token_id,
-        &auth_text_with_pin(wrong_pin),
-    )
-    .await;
-
-    assert_close(&mut stream, 4000, "handshake_rejected").await;
-
-    drop(stream);
-    let _ = task.await.expect("server task joins");
+    expect_rejected(&host.handler, &token, &auth_text_with_pin(wrong_pin(&pin)))
+        .await
+        .close()
+        .await;
     first.close().await;
 }
 
 #[tokio::test]
 async fn handshake_rejects_missing_pin_with_pin_required_close() {
-    let handler = Arc::new(RequestHandler::new());
-    let session_name = create_session(&handler, "websocket-missing-pin").await;
-    let created = create_share(
-        &handler,
-        CreateWebShareRequest {
+    let host = ShareHost::new("websocket-missing-pin").await;
+    let created = host
+        .share(CreateWebShareRequest {
             require_pin: true,
-            ..share_request(WebShareScope::Session(session_name))
-        },
-    )
-    .await;
-    let token = token_from_url(created.spectator_url.as_deref().expect("spectator URL"));
-    let token_id = SecretHashForCrypto::from_secret(&token).token_id();
+            ..share_request(host.session_scope())
+        })
+        .await;
 
-    let HandshakeSession {
-        mut stream, task, ..
-    } = drive_handshake_through_auth(Arc::clone(&handler), &token, &token_id, &auth_text()).await;
-
-    assert_close(&mut stream, 4008, "pin_required").await;
-
-    drop(stream);
-    let _ = task.await.expect("server task joins");
+    let mut client =
+        TestWebSocket::handshake(&host.handler, &spectator_token(&created), &auth_text()).await;
+    assert_close(&mut client.stream, 4008, "pin_required").await;
+    client.close().await;
 }
 
 fn request_with_headers<const N: usize>(headers: [(&str, &str); N]) -> HttpRequest {
@@ -1671,118 +1173,179 @@ fn transient_accept_errors_keep_listener_alive() {
     assert!(!should_continue_accept_loop(&error));
 }
 
-async fn create_session(handler: &RequestHandler, name: &str) -> SessionName {
-    let session_name = SessionName::new(name).expect("valid session");
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: session_name.clone(),
-                detached: true,
-                size: Some(TerminalSize { cols: 80, rows: 24 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
-    session_name
+/// A handler with one detached session to share over live WebSockets.
+struct ShareHost {
+    handler: Arc<RequestHandler>,
+    session_name: SessionName,
 }
 
-fn quiet_pane_command() -> Vec<String> {
-    vec![
-        "/bin/sh".to_owned(),
-        "-c".to_owned(),
-        "exec sleep 120".to_owned(),
-    ]
+/// The share URL a client connects through.
+#[derive(Clone, Copy)]
+enum Role {
+    Spectator,
+    Operator,
 }
 
-async fn create_quiet_session(handler: &RequestHandler, name: &str) -> SessionName {
-    let session_name = SessionName::new(name).expect("valid session");
-    let response = handler
-        .handle(Request::NewSessionExt(Box::new(NewSessionExtRequest {
-            session_name: Some(session_name.clone()),
-            working_directory: None,
-            detached: true,
-            size: Some(TerminalSize { cols: 80, rows: 24 }),
-            environment: None,
-            group_target: None,
-            attach_if_exists: false,
-            detach_other_clients: false,
-            kill_other_clients: false,
-            flags: None,
-            window_name: None,
-            print_session_info: false,
-            print_format: None,
-            command: Some(quiet_pane_command()),
-            process_command: None,
-            client_environment: None,
-            skip_environment_update: false,
-        })))
-        .await;
-    assert!(matches!(response, Response::NewSession(_)), "{response:?}");
-    session_name
-}
-
-async fn create_share(
-    handler: &RequestHandler,
-    request: CreateWebShareRequest,
-) -> WebShareCreatedResponse {
-    handler.mark_web_listener_available();
-    let response = handler
-        .handle(Request::WebShare(Box::new(WebShareRequest::Create(
-            request,
-        ))))
-        .await;
-    let Response::WebShare(response) = response else {
-        panic!("expected web share creation");
-    };
-    let WebShareResponse::Created(created) = *response else {
-        panic!("expected web share creation");
-    };
-    created
-}
-
-async fn wait_for_session_name(handler: &RequestHandler, name: &str) {
-    timeout(Duration::from_secs(10), async {
-        loop {
-            let Response::ListSessions(listed) = handler
-                .handle(Request::ListSessions(ListSessionsRequest {
-                    format: Some("#{session_name}".to_owned()),
-                    filter: None,
-                    sort_order: None,
-                    reversed: false,
-                }))
-                .await
-            else {
-                panic!("list-sessions should succeed");
-            };
-            let stdout = String::from_utf8_lossy(listed.output.stdout());
-            if stdout.lines().any(|line| line == name) {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .unwrap_or_else(|_| panic!("session {name:?} was not created"));
-}
-
-fn parse_session_view(frame: &[u8]) -> Value {
-    serde_json::from_slice(&frame[1..]).expect("session view json")
-}
-
-async fn read_session_view_until(
-    client: &mut TestWebSocket,
-    label: &str,
-    matches: impl Fn(&Value) -> bool,
-) -> Value {
-    for _ in 0..40 {
-        let frame = client.read_binary_with_prefix_payload(0x11, label).await;
-        let view = parse_session_view(&frame);
-        if matches(&view) {
-            return view;
+impl Role {
+    /// The role a `ready` frame reports.
+    fn name(self) -> &'static str {
+        match self {
+            Self::Spectator => "spectator",
+            Self::Operator => "operator",
         }
     }
-    panic!("did not receive matching {label}");
+}
+
+impl ShareHost {
+    async fn new(session: impl SessionSpec) -> Self {
+        Self::with_handler(RequestHandler::new(), session).await
+    }
+
+    async fn with_handler(handler: RequestHandler, session: impl SessionSpec) -> Self {
+        let handler = Arc::new(handler);
+        let session_name = handler.create_session(session).await;
+        Self {
+            handler,
+            session_name,
+        }
+    }
+
+    fn pane_scope(&self) -> WebShareScope {
+        WebShareScope::Pane(PaneTarget::new(self.session_name.clone(), 0).into())
+    }
+
+    fn session_scope(&self) -> WebShareScope {
+        WebShareScope::Session(self.session_name.clone())
+    }
+
+    async fn share(&self, request: CreateWebShareRequest) -> WebShareCreatedResponse {
+        self.handler.mark_web_listener_available();
+        let response = self
+            .handler
+            .handle_ok(WebShareRequest::Create(request))
+            .await;
+        let WebShareResponse::Created(created) = *response else {
+            panic!("expected web share creation");
+        };
+        created
+    }
+
+    /// Shares `scope` with [`share_request`] defaults, adding operator access for
+    /// [`Role::Operator`].
+    async fn share_as(&self, scope: WebShareScope, role: Role) -> WebShareCreatedResponse {
+        self.share(CreateWebShareRequest {
+            operator: matches!(role, Role::Operator),
+            ..share_request(scope)
+        })
+        .await
+    }
+
+    /// Shares `scope` behind a required PIN and answers with the spectator token and PIN.
+    async fn pin_share(&self, scope: WebShareScope) -> (String, String) {
+        let created = self
+            .share(CreateWebShareRequest {
+                require_pin: true,
+                ..share_request(scope)
+            })
+            .await;
+        let token = spectator_token(&created);
+        let pin = created
+            .spectator_pairing_code
+            .expect("pin-enabled spectator share returns pairing code");
+        (token, pin)
+    }
+
+    /// Shares `scope` as [`share_as`](Self::share_as) does and connects through `role`'s URL.
+    async fn connect(&self, scope: WebShareScope, role: Role) -> TestWebSocket {
+        let created = self.share_as(scope, role).await;
+        let token = match role {
+            Role::Spectator => spectator_token(&created),
+            Role::Operator => operator_token(&created),
+        };
+        TestWebSocket::connect(&self.handler, &token).await
+    }
+
+    /// [`connect`](Self::connect)s, then checks that `ready` reports `scope`'s kind and `role`.
+    async fn join(&self, scope: WebShareScope, role: Role) -> TestWebSocket {
+        let kind = if scope.is_pane() { "pane" } else { "session" };
+        let mut client = self.connect(scope, role).await;
+        let ready = client.read_json().await;
+        assert_eq!(ready["scope"], kind);
+        assert_eq!(ready["role"], role.name());
+        client
+    }
+}
+
+/// A one-minute share of `scope` behind a public base URL, capped at one spectator.
+fn share_request(scope: WebShareScope) -> CreateWebShareRequest {
+    CreateWebShareRequest {
+        public_base_url: Some("https://terminal.example".to_owned()),
+        ttl_seconds: Some(60),
+        max_spectators: Some(1),
+        ..Fixture::fixture(scope)
+    }
+}
+
+/// Spectators of a pane share and of a session share of a fresh session `name`, each past its
+/// `ready` frame and initial snapshot.
+async fn pane_and_session_spectators(
+    name: &str,
+) -> (Arc<RequestHandler>, TestWebSocket, TestWebSocket) {
+    let host = ShareHost::new(name).await;
+    let pane_share = host.share_as(host.pane_scope(), Role::Spectator).await;
+    let session_share = host.share_as(host.session_scope(), Role::Spectator).await;
+    let mut pane = TestWebSocket::connect(&host.handler, &spectator_token(&pane_share)).await;
+    let mut session = TestWebSocket::connect(&host.handler, &spectator_token(&session_share)).await;
+    assert_eq!(pane.read_json().await["scope"], "pane");
+    pane.read_binary_with_prefix(0x10, "pane snapshot").await;
+    assert_eq!(session.read_json().await["scope"], "session");
+    session
+        .read_binary_with_prefix(0x10, "session snapshot")
+        .await;
+    (host.handler, pane, session)
+}
+
+/// Joins a fresh session `name`'s share as operator, sends the prefix key then `key` and answers
+/// with the client and the text of the first redraw containing `needle`.
+async fn session_operator_prefix_redraw(
+    name: &str,
+    key: u8,
+    needle: &[u8],
+    label: &str,
+) -> (TestWebSocket, String) {
+    let host = ShareHost::new(name).await;
+    let mut client = host.join(host.session_scope(), Role::Operator).await;
+    client.read_binary_with_prefix(0x10, "snapshot").await;
+    client.send_binary(&[0x83, 0x02, key]).await;
+    let redraw = client
+        .read_binary_where(label, |payload| {
+            payload.first() == Some(&0x01) && contains(payload, needle)
+        })
+        .await;
+    let redraw = String::from_utf8_lossy(&redraw[1..]).into_owned();
+    (client, redraw)
+}
+
+/// Authenticates with `token` and `auth` and expects the collapsed `handshake_rejected` close.
+async fn expect_rejected(handler: &Arc<RequestHandler>, token: &str, auth: &str) -> TestWebSocket {
+    let mut client = TestWebSocket::handshake(handler, token, auth).await;
+    assert_close(&mut client.stream, 4000, "handshake_rejected").await;
+    client
+}
+
+/// A PIN that differs from `pin`.
+fn wrong_pin(pin: &str) -> &'static str {
+    if pin == "000000" {
+        "111111"
+    } else {
+        "000000"
+    }
+}
+
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
 }
 
 fn pane_count(view: &Value) -> usize {
@@ -1852,53 +1415,9 @@ fn pane_width(view: &Value, pane_id: u32) -> u64 {
         .expect("pane cols")
 }
 
-fn share_request(scope: WebShareScope) -> CreateWebShareRequest {
-    CreateWebShareRequest {
-        scope,
-        public_base_url: Some("https://terminal.example".to_owned()),
-        tunnel_provider: None,
-        frontend_url: None,
-        ttl_seconds: Some(60),
-        expires_at_unix: None,
-        max_spectators: Some(1),
-        max_operators: None,
-        url_options: Default::default(),
-        require_pin: false,
-        operator_pin: None,
-        spectator_pin: None,
-        terminal_palette: None,
-        operator: false,
-        spectator: true,
-        controls: false,
-        kill_session_on_expire: false,
-    }
-}
-
 async fn response_for(request: impl AsRef<[u8]>) -> String {
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind test listener");
-    let addr = listener.local_addr().expect("listener addr");
-    let client = TcpStream::connect(addr);
-    let server = listener.accept();
-    let (client, server) = tokio::join!(client, server);
-    let mut client = client.expect("client connects");
-    let (server, _) = server.expect("server accepts");
-    let pre_auth = PreAuthQueue::new(16);
-    let pre_auth_admission = pre_auth.try_register().expect("pre-auth slot");
-    let handler = Arc::new(RequestHandler::new());
-    let shutdown = handler.normal_request_shutdown_receiver();
-    let connection_admission = handler
-        .try_begin_normal_request(false)
-        .expect("test connection is admitted");
-    let task = tokio::spawn(serve_admitted_connection(
-        server,
-        handler,
-        pre_auth_admission,
-        shutdown,
-        connection_admission,
-    ));
-
+    let (mut client, task) =
+        raw_connection(Arc::new(RequestHandler::new()), PreAuthQueue::new(16)).await;
     client
         .write_all(request.as_ref())
         .await
@@ -1912,14 +1431,8 @@ async fn response_for(request: impl AsRef<[u8]>) -> String {
 
 async fn websocket_client(
     handler: Arc<RequestHandler>,
-) -> (TcpStream, tokio::task::JoinHandle<io::Result<()>>) {
-    websocket_client_with_queue(handler, PreAuthQueue::new(16)).await
-}
-
-async fn websocket_client_with_queue(
-    handler: Arc<RequestHandler>,
     pre_auth: PreAuthQueue,
-) -> (TcpStream, tokio::task::JoinHandle<io::Result<()>>) {
+) -> (TcpStream, ServerTask) {
     let (mut client, task) = raw_connection(handler, pre_auth).await;
     client
         .write_all(
@@ -1945,32 +1458,76 @@ async fn websocket_client_with_queue(
     (client, task)
 }
 
+type ServerTask = tokio::task::JoinHandle<io::Result<()>>;
+
 struct TestWebSocket {
     stream: TcpStream,
-    task: tokio::task::JoinHandle<io::Result<()>>,
+    task: ServerTask,
     opener: Opener,
     sealer: Sealer,
 }
 
 impl TestWebSocket {
-    async fn connect(handler: Arc<RequestHandler>, token: &str) -> Self {
-        let auth = auth_text();
-        Self::connect_with_auth(handler, token, &auth).await
+    async fn connect(handler: &Arc<RequestHandler>, token: &str) -> Self {
+        Self::handshake(handler, token, &auth_text()).await
     }
 
-    async fn connect_with_pin(handler: Arc<RequestHandler>, token: &str, pin: &str) -> Self {
-        let auth = auth_text_with_pin(pin);
-        Self::connect_with_auth(handler, token, &auth).await
+    async fn connect_with_pin(handler: &Arc<RequestHandler>, token: &str, pin: &str) -> Self {
+        Self::handshake(handler, token, &auth_text_with_pin(pin)).await
     }
 
-    async fn connect_with_auth(handler: Arc<RequestHandler>, token: &str, auth: &str) -> Self {
+    /// Drives a real v1 handshake for `token` all the way through sending the encrypted `auth`
+    /// frame. A wrong PIN inside `auth` exercises the rejection paths; the caller decides
+    /// whether to expect `ready` or a close frame.
+    async fn handshake(handler: &Arc<RequestHandler>, token: &str, auth: &str) -> Self {
         let token_id = SecretHashForCrypto::from_secret(token).token_id();
-        let HandshakeSession {
-            stream,
-            task,
-            opener,
-            sealer,
-        } = drive_handshake_through_auth(handler, token, &token_id, auth).await;
+        let psk = SecretHashForCrypto::from_secret(token).as_bytes();
+        let (mut stream, task) = websocket_client(Arc::clone(handler), PreAuthQueue::new(16)).await;
+
+        // Generate the client ephemeral X25519 key and the ML-KEM keypair, and
+        // advertise the X25519 public key + ML-KEM encapsulation key.
+        let client_eph = generate_ephemeral();
+        let ml_kem = rmux_web_crypto::ml_kem::KeyPair::generate([0x21u8; 64]);
+        let hello = client_hello(
+            &token_id,
+            &client_eph.public_bytes(),
+            &ml_kem.encapsulation_key(),
+        );
+        write_client_text_frame(&mut stream, hello.as_bytes()).await;
+
+        // The server binds the exact challenge bytes it sends, so we must bind
+        // the exact challenge bytes we received.
+        let challenge = read_server_frame(&mut stream).await;
+        assert_eq!(challenge.opcode, OPCODE_TEXT);
+        let challenge_value: Value =
+            serde_json::from_slice(&challenge.payload).expect("challenge is json");
+        assert_eq!(challenge_value["type"], "challenge");
+        assert_eq!(
+            challenge_value["protocol_version"].as_u64(),
+            Some(u64::from(WEB_SHARE_PROTOCOL_VERSION))
+        );
+        assert!(challenge_value["server_nonce"].as_str().is_some());
+        let server_public = decode_public(
+            challenge_value["server_public"]
+                .as_str()
+                .expect("challenge has server public"),
+        );
+        // Decapsulate the server ML-KEM ciphertext into the hybrid shared secret.
+        let ml_kem_ct = decode_ml_kem_ct(
+            challenge_value["server_ml_kem_ct"]
+                .as_str()
+                .expect("challenge has ml-kem ciphertext"),
+        );
+        let ml_kem_ss = ml_kem.decapsulate(&ml_kem_ct);
+
+        // Complete the DH and derive the hybrid client session over the EXACT
+        // hello + challenge transcript bytes.
+        let dh = client_eph.into_shared_secret(&server_public);
+        let (mut sealer, opener) =
+            derive_client_session(&psk, &dh, &ml_kem_ss, hello.as_bytes(), &challenge.payload)
+                .expect("client crypto");
+        write_client_binary_frame(&mut stream, &sealer.seal_text(auth).expect("seal auth")).await;
+
         Self {
             stream,
             task,
@@ -1979,38 +1536,72 @@ impl TestWebSocket {
         }
     }
 
+    /// Reads the next server frame and opens it, failing on a close or non-binary frame.
+    async fn read_message(&mut self, label: &str) -> Message {
+        let frame = read_server_frame(&mut self.stream).await;
+        match frame.opcode {
+            OPCODE_BINARY => self
+                .opener
+                .open(&frame.payload)
+                .expect("encrypted server frame opens"),
+            OPCODE_CLOSE => panic!("websocket closed before {label} frame"),
+            opcode => panic!("unexpected websocket opcode {opcode} before {label} frame"),
+        }
+    }
+
     async fn read_json(&mut self) -> Value {
-        serde_json::from_str(&read_encrypted_text(&mut self.stream, &mut self.opener).await)
-            .expect("encrypted text frame json")
+        loop {
+            if let Message::Text(text) = self.read_message("encrypted text").await {
+                return serde_json::from_str(&text).expect("encrypted text frame json");
+            }
+        }
     }
 
-    async fn read_binary_with_prefix(&mut self, prefix: u8, label: &str) {
-        self.read_binary_with_prefix_payload(prefix, label).await;
+    /// Reads the next encrypted binary payload, skipping text messages.
+    async fn read_binary(&mut self, label: &str) -> Vec<u8> {
+        loop {
+            if let Message::Binary(payload) = self.read_message(label).await {
+                return payload;
+            }
+        }
     }
 
-    async fn read_binary_with_prefix_payload(&mut self, prefix: u8, label: &str) -> Vec<u8> {
-        read_encrypted_binary_frame_with_prefix(&mut self.stream, &mut self.opener, prefix, label)
+    /// Reads up to [`MAX_INTERLEAVED_WEBSOCKET_FRAMES`] frames for a binary payload that
+    /// `matches`.
+    async fn read_binary_where(&mut self, label: &str, matches: impl Fn(&[u8]) -> bool) -> Vec<u8> {
+        for _ in 0..MAX_INTERLEAVED_WEBSOCKET_FRAMES {
+            if let Message::Binary(payload) = self.read_message(label).await {
+                if matches(&payload) {
+                    return payload;
+                }
+            }
+        }
+        panic!("did not receive {label} frame");
+    }
+
+    async fn read_binary_with_prefix(&mut self, prefix: u8, label: &str) -> Vec<u8> {
+        self.read_binary_where(label, |payload| payload.first() == Some(&prefix))
             .await
     }
 
-    async fn read_binary_payload(&mut self, label: &str) -> Vec<u8> {
-        read_encrypted_binary_frame(&mut self.stream, &mut self.opener, label).await
+    /// Reads the next session view frame (prefix `0x11`) as JSON.
+    async fn read_session_view(&mut self, label: &str) -> Value {
+        let frame = self.read_binary_with_prefix(0x11, label).await;
+        serde_json::from_slice(&frame[1..]).expect("session view json")
     }
 
-    async fn read_binary_with_prefix_payload_containing(
+    async fn read_session_view_until(
         &mut self,
-        prefix: u8,
-        needle: &[u8],
         label: &str,
-    ) -> Vec<u8> {
-        read_encrypted_binary_frame_with_prefix_containing(
-            &mut self.stream,
-            &mut self.opener,
-            prefix,
-            needle,
-            label,
-        )
-        .await
+        matches: impl Fn(&Value) -> bool,
+    ) -> Value {
+        for _ in 0..40 {
+            let view = self.read_session_view(label).await;
+            if matches(&view) {
+                return view;
+            }
+        }
+        panic!("did not receive matching {label}");
     }
 
     async fn send_binary(&mut self, payload: &[u8]) {
@@ -2029,135 +1620,28 @@ impl TestWebSocket {
         .await;
     }
 
-    async fn read_close(&mut self, code: u16, reason: &str) {
-        for _ in 0..8 {
-            let frame = read_server_frame(&mut self.stream).await;
-            if frame.opcode != OPCODE_CLOSE {
-                continue;
-            }
-            assert!(
-                frame.payload.len() >= 2,
-                "close frame should include a status code"
-            );
-            assert_eq!(
-                u16::from_be_bytes([frame.payload[0], frame.payload[1]]),
-                code
-            );
-            assert_eq!(String::from_utf8_lossy(&frame.payload[2..]), reason);
-            return;
-        }
-        panic!("websocket did not close with {code} {reason}");
-    }
-
     async fn close(self) {
         drop(self.stream);
         let _ = self.task.await.expect("server task joins");
     }
 }
 
-struct HandshakeSession {
-    stream: TcpStream,
-    task: tokio::task::JoinHandle<io::Result<()>>,
-    opener: Opener,
-    sealer: Sealer,
-}
-
-/// Drives a real v1 handshake all the way through sending the encrypted auth
-/// frame and returns the live client session.
-///
-/// `token` derives the PSK and `token_id` is sent on the wire; passing a
-/// mismatching pair (or a wrong PIN inside `auth`) exercises the rejection
-/// paths. The caller decides whether to expect `ready` or a close frame.
-async fn drive_handshake_through_auth(
-    handler: Arc<RequestHandler>,
-    token: &str,
-    token_id: &str,
-    auth: &str,
-) -> HandshakeSession {
-    let psk = SecretHashForCrypto::from_secret(token).as_bytes();
-    let (mut stream, task) = websocket_client(handler).await;
-
-    // Generate the client ephemeral X25519 key and the ML-KEM keypair, and
-    // advertise the X25519 public key + ML-KEM encapsulation key.
-    let client_eph = generate_ephemeral();
-    let client_public = client_eph.public_bytes();
-    let ml_kem = rmux_web_crypto::ml_kem::KeyPair::generate([0x21u8; 64]);
-    let ml_kem_ek = ml_kem.encapsulation_key();
-    let hello = format!(
+/// A v1 hello for `token_id` advertising the client's X25519 and ML-KEM public keys.
+fn client_hello(token_id: &str, client_public: &[u8], ml_kem_ek: &[u8]) -> String {
+    format!(
         r#"{{"type":"hello","protocol_version":{},"capabilities":["e2ee-token-auth","terminal-palette-v1"],"token_id":"{}","client_nonce":"{}","client_public":"{}","client_ml_kem_ek":"{}"}}"#,
         WEB_SHARE_PROTOCOL_VERSION,
         token_id,
         TEST_CLIENT_NONCE,
-        b64url(&client_public),
-        b64url(&ml_kem_ek),
-    );
-    write_client_text_frame(&mut stream, hello.as_bytes()).await;
-
-    // The server binds the exact challenge bytes it sends, so we must bind
-    // the exact challenge bytes we received.
-    let challenge = read_server_frame(&mut stream).await;
-    assert_eq!(challenge.opcode, OPCODE_TEXT);
-    let challenge_value: Value =
-        serde_json::from_slice(&challenge.payload).expect("challenge is json");
-    assert_eq!(challenge_value["type"], "challenge");
-    assert_eq!(
-        challenge_value["protocol_version"].as_u64(),
-        Some(u64::from(WEB_SHARE_PROTOCOL_VERSION))
-    );
-    assert!(challenge_value["server_nonce"].as_str().is_some());
-    let server_public = decode_public(
-        challenge_value["server_public"]
-            .as_str()
-            .expect("challenge has server public"),
-    );
-    // Decapsulate the server ML-KEM ciphertext into the hybrid shared secret.
-    let ml_kem_ct = decode_ml_kem_ct(
-        challenge_value["server_ml_kem_ct"]
-            .as_str()
-            .expect("challenge has ml-kem ciphertext"),
-    );
-    let ml_kem_ss = ml_kem.decapsulate(&ml_kem_ct);
-
-    // Complete the DH and derive the hybrid client session over the EXACT
-    // hello + challenge transcript bytes.
-    let dh = client_eph.into_shared_secret(&server_public);
-    let (mut sealer, opener) =
-        derive_client_session(&psk, &dh, &ml_kem_ss, hello.as_bytes(), &challenge.payload)
-            .expect("client crypto");
-    write_client_binary_frame(&mut stream, &sealer.seal_text(auth).expect("seal auth")).await;
-
-    HandshakeSession {
-        stream,
-        task,
-        opener,
-        sealer,
-    }
-}
-
-/// Sends a v1 hello carrying `token_id` and returns the raw stream after the
-/// upgrade. Used to exercise pre-challenge rejection paths (e.g. unknown token)
-/// where the server collapses to `handshake_rejected` BEFORE emitting a
-/// challenge.
-async fn send_hello_only(
-    handler: Arc<RequestHandler>,
-    token_id: &str,
-) -> (TcpStream, tokio::task::JoinHandle<io::Result<()>>) {
-    let (mut stream, task) = websocket_client(handler).await;
-    write_client_hello(&mut stream, token_id).await;
-    (stream, task)
+        b64url(client_public),
+        b64url(ml_kem_ek),
+    )
 }
 
 async fn write_client_hello(stream: &mut TcpStream, token_id: &str) {
     let client_public = generate_ephemeral().public_bytes();
     let ml_kem_ek = rmux_web_crypto::ml_kem::KeyPair::generate([0x33u8; 64]).encapsulation_key();
-    let hello = format!(
-        r#"{{"type":"hello","protocol_version":{},"capabilities":["e2ee-token-auth","terminal-palette-v1"],"token_id":"{}","client_nonce":"{}","client_public":"{}","client_ml_kem_ek":"{}"}}"#,
-        WEB_SHARE_PROTOCOL_VERSION,
-        token_id,
-        TEST_CLIENT_NONCE,
-        b64url(&client_public),
-        b64url(&ml_kem_ek),
-    );
+    let hello = client_hello(token_id, &client_public, &ml_kem_ek);
     write_client_text_frame(stream, hello.as_bytes()).await;
 }
 
@@ -2230,35 +1714,28 @@ fn decode_ml_kem_ct(value: &str) -> [u8; rmux_web_crypto::ml_kem::CIPHERTEXT_LEN
 async fn raw_connection(
     handler: Arc<RequestHandler>,
     pre_auth: PreAuthQueue,
-) -> (TcpStream, tokio::task::JoinHandle<io::Result<()>>) {
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind test listener");
-    let addr = listener.local_addr().expect("listener addr");
-    let client = TcpStream::connect(addr);
-    let server = listener.accept();
-    let (client, server) = tokio::join!(client, server);
-    let client = client.expect("client connects");
-    let (server, _) = server.expect("server accepts");
+) -> (TcpStream, ServerTask) {
+    let (client, server, _) = loopback_pair().await;
     let pre_auth_admission = pre_auth.try_register().expect("pre-auth slot");
-    let shutdown = handler.normal_request_shutdown_receiver();
-    let connection_admission = handler
-        .try_begin_normal_request(false)
-        .expect("test connection is admitted");
-    let task = tokio::spawn(serve_admitted_connection(
-        server,
-        handler,
-        pre_auth_admission,
-        shutdown,
-        connection_admission,
-    ));
+    let task =
+        serve_connection(server, handler, pre_auth_admission).expect("test connection is admitted");
     (client, task)
 }
 
 async fn raw_peer_connection(
     handler: Arc<RequestHandler>,
     pre_auth: PreAuthQueue,
-) -> Option<(TcpStream, tokio::task::JoinHandle<io::Result<()>>)> {
+) -> Option<(TcpStream, ServerTask)> {
+    let (client, server, peer_addr) = loopback_pair().await;
+    let pre_auth_admission = pre_auth.admit_peer(peer_addr.ip()).await?;
+    Some((
+        client,
+        serve_connection(server, handler, pre_auth_admission)?,
+    ))
+}
+
+/// A connected loopback client, the accepted server end and the client address it reports.
+async fn loopback_pair() -> (TcpStream, TcpStream, SocketAddr) {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind test listener");
@@ -2268,17 +1745,24 @@ async fn raw_peer_connection(
     let (client, server) = tokio::join!(client, server);
     let client = client.expect("client connects");
     let (server, peer_addr) = server.expect("server accepts");
-    let pre_auth_admission = pre_auth.admit_peer(peer_addr.ip()).await?;
+    (client, server, peer_addr)
+}
+
+/// Serves `server` once the handler admits it as a normal request.
+fn serve_connection(
+    server: TcpStream,
+    handler: Arc<RequestHandler>,
+    pre_auth_admission: PreAuthAdmission,
+) -> Option<ServerTask> {
     let shutdown = handler.normal_request_shutdown_receiver();
     let connection_admission = handler.try_begin_normal_request(false)?;
-    let task = tokio::spawn(serve_admitted_connection(
+    Some(tokio::spawn(serve_admitted_connection(
         server,
         handler,
         pre_auth_admission,
         shutdown,
         connection_admission,
-    ));
-    Some((client, task))
+    )))
 }
 
 async fn wait_for_pending_pre_auth(queue: &PreAuthQueue, expected: usize) {
@@ -2342,101 +1826,6 @@ fn push_client_frame_len(frame: &mut Vec<u8>, len: usize) {
         frame.push(0x80 | 127);
         frame.extend_from_slice(&(len as u64).to_be_bytes());
     }
-}
-
-async fn read_encrypted_text(stream: &mut TcpStream, opener: &mut Opener) -> String {
-    loop {
-        let frame = read_server_frame(stream).await;
-        match frame.opcode {
-            OPCODE_BINARY => {
-                if let Message::Text(text) = opener
-                    .open(&frame.payload)
-                    .expect("encrypted server text opens")
-                {
-                    return text;
-                }
-            }
-            OPCODE_CLOSE => panic!("websocket closed before encrypted text frame"),
-            opcode => panic!("unexpected websocket opcode {opcode} before encrypted text frame"),
-        }
-    }
-}
-
-async fn read_encrypted_binary_frame(
-    stream: &mut TcpStream,
-    opener: &mut Opener,
-    label: &str,
-) -> Vec<u8> {
-    loop {
-        let frame = read_server_frame(stream).await;
-        match frame.opcode {
-            OPCODE_BINARY => {
-                if let Message::Binary(payload) = opener
-                    .open(&frame.payload)
-                    .expect("encrypted server binary opens")
-                {
-                    return payload;
-                }
-            }
-            OPCODE_CLOSE => panic!("websocket closed before {label} frame"),
-            opcode => panic!("unexpected websocket opcode {opcode} before {label} frame"),
-        }
-    }
-}
-
-async fn read_encrypted_binary_frame_with_prefix(
-    stream: &mut TcpStream,
-    opener: &mut Opener,
-    prefix: u8,
-    label: &str,
-) -> Vec<u8> {
-    for _ in 0..MAX_INTERLEAVED_WEBSOCKET_FRAMES {
-        let frame = read_server_frame(stream).await;
-        match frame.opcode {
-            OPCODE_BINARY => {
-                if let Message::Binary(payload) = opener
-                    .open(&frame.payload)
-                    .expect("encrypted server binary opens")
-                {
-                    if payload.first() == Some(&prefix) {
-                        return payload;
-                    }
-                }
-            }
-            OPCODE_CLOSE => panic!("websocket closed before {label} frame"),
-            opcode => panic!("unexpected websocket opcode {opcode} before {label} frame"),
-        }
-    }
-    panic!("did not receive {label} frame");
-}
-
-async fn read_encrypted_binary_frame_with_prefix_containing(
-    stream: &mut TcpStream,
-    opener: &mut Opener,
-    prefix: u8,
-    needle: &[u8],
-    label: &str,
-) -> Vec<u8> {
-    for _ in 0..MAX_INTERLEAVED_WEBSOCKET_FRAMES {
-        let frame = read_server_frame(stream).await;
-        match frame.opcode {
-            OPCODE_BINARY => {
-                if let Message::Binary(payload) = opener
-                    .open(&frame.payload)
-                    .expect("encrypted server binary opens")
-                {
-                    if payload.first() == Some(&prefix)
-                        && payload.windows(needle.len()).any(|window| window == needle)
-                    {
-                        return payload;
-                    }
-                }
-            }
-            OPCODE_CLOSE => panic!("websocket closed before {label} frame"),
-            opcode => panic!("unexpected websocket opcode {opcode} before {label} frame"),
-        }
-    }
-    panic!("did not receive {label} frame");
 }
 
 async fn read_server_frame(stream: &mut TcpStream) -> ServerFrame {
@@ -2508,17 +1897,6 @@ async fn read_server_frame_inner(stream: &mut TcpStream) -> io::Result<ServerFra
 struct ServerFrame {
     opcode: u8,
     payload: Vec<u8>,
-}
-
-fn token_from_url(url: &str) -> String {
-    url.split_once("#")
-        .and_then(|(_, fragment)| {
-            fragment.split('&').find_map(|param| {
-                let (key, value) = param.split_once('=')?;
-                (key == "t").then_some(value.to_owned())
-            })
-        })
-        .expect("URL contains access token")
 }
 
 const OPCODE_TEXT: u8 = 0x1;

@@ -1,11 +1,52 @@
 //! The records the multiplexer's operations take and answer with: geometry, I/O shape, the
-//! per-operation options, and the one profile every shell of a mux is built from.
+//! per-operation options, a shell's closure record, and the one profile every shell of a mux is
+//! built from.
 //!
 //! Nothing here holds a lock, a descriptor or a handle. These are plain values, so a caller can
 //! build them before it owns anything and a frontend can copy them out of a callback.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::sync::Arc;
+
+use crate::shellmux::{CommandCompletion, MuxError, Sandbox};
+
+/// Why a shell is to close once its command finishes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JobCloseMode {
+    /// A shell opened with [`SpawnOptions::automatic_close`]; a reader may keep it.
+    Automatic,
+    /// Close after normal command completion, because a reader or the command's own options asked.
+    Graceful,
+    /// Abort and retire the shell immediately.
+    Force,
+}
+
+impl JobCloseMode {
+    /// Whether this closure is a decision rather than the `1`, `2`, … series' default.
+    pub(crate) const fn explicit(self) -> bool {
+        !matches!(self, Self::Automatic)
+    }
+}
+
+/// How one shell ended.
+///
+/// Delivered once per shell, after every byte of every one of its streams and after its snapshot
+/// has been reclaimed. A shell whose construction failed reports that failure here without ever
+/// having been [`Opened`](crate::shellmux::FrontendEvent::Opened).
+#[derive(Debug)]
+pub struct JobEnd {
+    /// The shell that ended.
+    pub shell: Sandbox,
+    /// Why it closed, or `None` when its streams simply ended.
+    pub close_mode: Option<JobCloseMode>,
+    /// The verdict of the last command that ran in it, when one did.
+    pub completion: Option<Arc<CommandCompletion>>,
+    /// The infrastructure failure that ended it, when one did.
+    ///
+    /// A construction that never produced a usable shell reports here. This is not an exit status
+    /// and must never be rendered as one.
+    pub error: Option<Arc<MuxError>>,
+}
 
 /// A terminal's size, in character cells.
 ///
@@ -65,6 +106,24 @@ impl JobIo {
     pub const fn is_terminal(self) -> bool {
         matches!(self, Self::Terminal { .. })
     }
+
+    /// The requested size, or `None` for pipes or for a terminal asking for the default.
+    pub(crate) const fn geometry(self) -> Option<TerminalGeometry> {
+        match self {
+            Self::Terminal { geometry } => geometry,
+            Self::Pipes => None,
+        }
+    }
+
+    /// This shape with a terminal's unspecified size resolved to `default`.
+    pub(crate) const fn resolved(self, default: TerminalGeometry) -> Self {
+        match self {
+            Self::Terminal { geometry: None } => Self::Terminal {
+                geometry: Some(default),
+            },
+            other => other,
+        }
+    }
 }
 
 /// Which of a job's output streams a chunk of bytes came from.
@@ -99,13 +158,6 @@ pub struct SpawnOptions {
     /// `false` — the default — is an ordinary persistent shell: opening one runs nothing, and it
     /// outlives every command submitted into it until something stops it.
     pub automatic_close: bool,
-    /// Whether a named shell is a stable agent identity whose capabilities survive closing and
-    /// reopening the seed, as [`ShellId::durable`](crate::shellmux::ShellId::durable) describes.
-    ///
-    /// An explicit authority choice by the embedding caller, which must control the name and keep
-    /// it stable for the same agent. Ignored for an unnamed shell: the `1`, `2`, … series reuses
-    /// its numbers by design, so such a shell is always session-local.
-    pub durable: bool,
 }
 
 impl Default for JobIo {
@@ -118,12 +170,6 @@ impl Default for JobIo {
 /// How one command submitted into an open shell is to be treated.
 #[derive(Default)]
 pub struct CommandOptions {
-    /// Called once when this command ends, when a caller asked to be told.
-    ///
-    /// One slot per shell, kept for the callers that only have to stop waiting.
-    /// [`CommandHandle::wait`](crate::shellmux::CommandHandle::wait) is the cloneable form and
-    /// does not occupy it.
-    pub on_finish: Option<crate::shellmux::OnFinish>,
     /// Whether the shell closes once this command ends.
     ///
     /// Recorded on the *command* when it is admitted, and applied to the shell in the same
@@ -151,31 +197,21 @@ impl std::fmt::Debug for CommandOptions {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("CommandOptions")
-            .field("on_finish", &self.on_finish.is_some())
             .field("close_on_finish", &self.close_on_finish)
             .field("on_accept", &self.on_accept.is_some())
             .finish()
     }
 }
 
-/// The one shell profile a mux builds every one of its shells from.
-///
-/// Frozen at [`ShellMux::new`](crate::shellmux::ShellMux::new) and applied identically to panes,
-/// popups and hidden helper jobs. That uniformity is not a convenience:
-/// [`MarshExecutor::attach`](crate::MarshExecutor) installs *one* process-wide instrumentation
-/// table, so every attached shell in the process must hold the same builtin names — a shell
-/// carrying a builtin the latest installation does not know fails that builtin outright. Register
-/// every extra builtin here; never after a shell is attached.
+/// Ordinary shell configuration applied independently to every shell built by this mux.
 #[derive(Default)]
 pub struct MuxProfile {
     /// Variables seeded into every shell, on top of what the process inherited.
     pub environment: brush_core::env::ShellEnvironment,
     /// Builtins registered on every shell in addition to stock brush's and marsh's own.
     ///
-    /// Registered *before* `Shell::attach`, so the instrumentation covers them exactly as it
-    /// covers `git` and `exec`. A builtin doing native work reaches its command through
-    /// [`current_command_context`](crate::shellmux::current_command_context).
-    pub builtins: HashMap<String, brush_core::builtins::Registration<crate::MarshShellExtensions>>,
+    /// Native work uses [`crate::builtins::current_context`] for logical I/O and cancellation.
+    pub builtins: HashMap<String, crate::builtins::Registration>,
 }
 
 impl std::fmt::Debug for MuxProfile {
@@ -188,33 +224,4 @@ impl std::fmt::Debug for MuxProfile {
             .field("builtins", &names)
             .finish()
     }
-}
-
-/// What a mux will say about one seed it has opened, without handing its executor out.
-///
-/// The raw [`MarshExecutor`](crate::MarshExecutor) is deliberately not reachable through a mux: it
-/// is both an ungated spawner and a publication capability, and a caller that only wants to know
-/// where a seed is must not have to hold one to find out.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SeedInfo {
-    /// The canonical seed, which is also the key every query about it is asked with.
-    pub seed: PathBuf,
-    /// The directory whose immediate children are this seed's per-job snapshots.
-    ///
-    /// Deliberately not called `snapshot_root`: that is
-    /// [`JobView::snapshot_root`](crate::shellmux::JobView::snapshot_root), one *job's own* tree,
-    /// and the two were once spelled alike. This is their shared parent.
-    ///
-    /// What it is for: recognizing a path a client handed over from inside one of this daemon's
-    /// panes. A pane's shell starts at its job's snapshot, so it spells its own directory
-    /// `<snapshot_parent>/<uid>/<rest>` — the same place in the seed as `<seed>/<rest>`.
-    pub snapshot_parent: PathBuf,
-    /// Whether an approved publication failed and this seed's durable log still has to be
-    /// replayed.
-    ///
-    /// While this is true the session admits no new work and every gate over *this* seed refuses:
-    /// continuing against a partially applied seed would publish on top of a state nobody has
-    /// verified. Other seeds of the same mux are unaffected. The snapshot that failed is kept on
-    /// disk as the recovery source, and an explicit reopen is what replays it.
-    pub recovery_required: bool,
 }

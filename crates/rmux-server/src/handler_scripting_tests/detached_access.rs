@@ -1,7 +1,6 @@
 use super::*;
 
 use rmux_ipc::PeerIdentity;
-use rmux_os::identity::UserIdentity;
 
 use crate::server_access::{current_owner_uid, ServerAccessAdmission};
 
@@ -205,7 +204,7 @@ async fn background_prompt_keeps_valid_detached_origin_after_request_scope_ends(
         .handle_attached_live_input_for_test(requester_pid, b"ok\r")
         .await
         .expect("prompt accepts input");
-    wait_for_background_task(&handler, "rmux-prompt-finish").await;
+    wait_for_background_task(&handler, "rmux-prompt-finish", Duration::from_secs(2)).await;
     wait_for_named_buffer(&handler, buffer_name, b"accepted").await;
     assert_no_detached_scope(&handler, requester_pid);
 }
@@ -239,7 +238,7 @@ async fn background_prompt_rejects_remove_regrant_epoch_even_with_attach_pid_col
         .handle_attached_live_input_for_test(requester_pid, b"ok\r")
         .await
         .expect("prompt input is consumed");
-    wait_for_background_task(&handler, "rmux-prompt-finish").await;
+    wait_for_background_task(&handler, "rmux-prompt-finish", Duration::from_secs(2)).await;
     assert_buffer_absent(&handler, buffer_name).await;
     assert_no_detached_scope(&handler, requester_pid);
 }
@@ -264,7 +263,7 @@ async fn incremental_prompt_revalidates_its_origin_on_every_dispatch() {
         .execute_parsed_commands_for_test(requester_pid, prompt)
         .await
         .expect("incremental prompt starts");
-    wait_for_background_task(&handler, "rmux-prompt-dispatch").await;
+    wait_for_background_task(&handler, "rmux-prompt-dispatch", Duration::from_secs(2)).await;
     let initial = show_buffer(&handler, buffer_name)
         .await
         .expect("initial incremental dispatch writes");
@@ -278,7 +277,7 @@ async fn incremental_prompt_revalidates_its_origin_on_every_dispatch() {
         .handle_attached_live_input_for_test(requester_pid, b"x")
         .await
         .expect("incremental input is consumed");
-    wait_for_background_task(&handler, "rmux-prompt-dispatch").await;
+    wait_for_background_task(&handler, "rmux-prompt-dispatch", Duration::from_secs(2)).await;
     assert_eq!(show_buffer(&handler, buffer_name).await, Some(initial));
     handler
         .handle_attached_live_input_for_test(requester_pid, b"\x1b")
@@ -316,7 +315,7 @@ async fn confirm_before_rejects_stale_origin_after_remove_regrant() {
         .handle_attached_live_input_for_test(requester_pid, b"y")
         .await
         .expect("confirmation input is consumed");
-    wait_for_background_task(&handler, "rmux-prompt-finish").await;
+    wait_for_background_task(&handler, "rmux-prompt-finish", Duration::from_secs(2)).await;
     assert_buffer_absent(&handler, buffer_name).await;
     assert_no_detached_scope(&handler, requester_pid);
 }
@@ -363,7 +362,7 @@ async fn popup_internal_menu_captures_interacting_attach_origin_and_target() {
     let alpha = SessionName::new("popup-menu-origin-alpha").expect("valid session");
     let beta = SessionName::new("popup-menu-origin-beta").expect("valid session");
     let _control_rx = create_callback_attach(&handler, attach_pid, alpha.as_str()).await;
-    create_detached_callback_session(&handler, beta.clone()).await;
+    handler.create_session(&beta).await;
     let admission = grant_admission(&handler, uid, AccessMode::ReadWrite);
     let scope = handler.begin_detached_requester_access(popup_requester_pid, admission);
     let popup = CommandParser::new()
@@ -494,7 +493,9 @@ async fn mode_tree_default_action_rejects_stale_origin_before_buffer_mutation() 
     let uid = synthetic_uid(21_029);
     let buffer_name = "mode-default-stale";
     let _control_rx = create_callback_attach(&handler, requester_pid, "mode-default-stale").await;
-    set_named_buffer(&handler, buffer_name, b"preserved").await;
+    handler
+        .handle_ok(SetBufferRequest::fixture((buffer_name, b"preserved")))
+        .await;
     let admission = grant_admission(&handler, uid, AccessMode::ReadWrite);
     let scope = handler.begin_detached_requester_access(requester_pid, admission);
     open_mode_tree(&handler, requester_pid, "choose-buffer").await;
@@ -524,7 +525,9 @@ async fn mode_tree_custom_template_rejects_stale_origin() {
     let source_buffer = "mode-custom-source";
     let marker = "mode-custom-stale";
     let _control_rx = create_callback_attach(&handler, requester_pid, "mode-custom-stale").await;
-    set_named_buffer(&handler, source_buffer, b"source").await;
+    handler
+        .handle_ok(SetBufferRequest::fixture((source_buffer, b"source")))
+        .await;
     let admission = grant_admission(&handler, uid, AccessMode::ReadWrite);
     let scope = handler.begin_detached_requester_access(requester_pid, admission);
     open_mode_tree(
@@ -556,7 +559,9 @@ async fn mode_tree_command_prompt_preserves_stale_origin() {
     let source_buffer = "mode-prompt-source";
     let marker = "mode-prompt-stale";
     let _control_rx = create_callback_attach(&handler, requester_pid, "mode-prompt-stale").await;
-    set_named_buffer(&handler, source_buffer, b"source").await;
+    handler
+        .handle_ok(SetBufferRequest::fixture((source_buffer, b"source")))
+        .await;
     let admission = grant_admission(&handler, uid, AccessMode::ReadWrite);
     let scope = handler.begin_detached_requester_access(requester_pid, admission);
     open_mode_tree(&handler, requester_pid, "choose-buffer").await;
@@ -588,7 +593,9 @@ async fn mode_tree_confirmation_preserves_stale_origin() {
     let uid = synthetic_uid(21_032);
     let buffer_name = "mode-confirm-stale";
     let _control_rx = create_callback_attach(&handler, requester_pid, "mode-confirm-stale").await;
-    set_named_buffer(&handler, buffer_name, b"preserved").await;
+    handler
+        .handle_ok(SetBufferRequest::fixture((buffer_name, b"preserved")))
+        .await;
     let admission = grant_admission(&handler, uid, AccessMode::ReadWrite);
     let scope = handler.begin_detached_requester_access(requester_pid, admission);
     open_mode_tree(&handler, requester_pid, "choose-buffer").await;
@@ -622,9 +629,15 @@ async fn detached_mode_tree_command_prompt_targets_interacting_attach() {
     let uid = synthetic_uid(21_033);
     let session_name = SessionName::new("mode-prompt-multiple-attaches").expect("valid session");
     let _first_rx = create_callback_attach(&handler, first_attach_pid, session_name.as_str()).await;
-    let _interacting_rx =
-        register_callback_attach(&handler, interacting_attach_pid, session_name.clone()).await;
-    set_named_buffer(&handler, "mode-prompt-multiple-source", b"source").await;
+    let _interacting_rx = handler
+        .attach_client(interacting_attach_pid, &session_name)
+        .await;
+    handler
+        .handle_ok(SetBufferRequest::fixture((
+            "mode-prompt-multiple-source",
+            b"source",
+        )))
+        .await;
     let admission = grant_admission(&handler, uid, AccessMode::ReadWrite);
     let _scope = handler.begin_detached_requester_access(requester_pid, admission);
 
@@ -657,9 +670,15 @@ async fn detached_mode_tree_confirmation_targets_interacting_attach() {
     let uid = synthetic_uid(21_036);
     let session_name = SessionName::new("mode-confirm-multiple-attaches").expect("valid session");
     let _first_rx = create_callback_attach(&handler, first_attach_pid, session_name.as_str()).await;
-    let _interacting_rx =
-        register_callback_attach(&handler, interacting_attach_pid, session_name.clone()).await;
-    set_named_buffer(&handler, "mode-confirm-multiple-source", b"preserved").await;
+    let _interacting_rx = handler
+        .attach_client(interacting_attach_pid, &session_name)
+        .await;
+    handler
+        .handle_ok(SetBufferRequest::fixture((
+            "mode-confirm-multiple-source",
+            b"preserved",
+        )))
+        .await;
     let admission = grant_admission(&handler, uid, AccessMode::ReadWrite);
     let _scope = handler.begin_detached_requester_access(requester_pid, admission);
 
@@ -724,11 +743,7 @@ async fn assert_stale_callback_rejected(
 
     run_callback(&handler, requester_pid, path, &buffer_name).await;
     assert!(matches!(
-        handler
-            .handle(Request::ShowBuffer(ShowBufferRequest {
-                name: Some(buffer_name),
-            }))
-            .await,
+        handler.handle(show_buffer_request(&buffer_name)).await,
         Response::Error(_)
     ));
     drop(callback_scope);
@@ -755,16 +770,11 @@ async fn run_callback(
             let response = handler
                 .dispatch(
                     requester_pid,
-                    Request::SourceFile(Box::new(SourceFileRequest {
-                        paths: vec!["-".to_owned()],
-                        quiet: false,
-                        parse_only: false,
-                        verbose: false,
-                        expand_paths: false,
-                        target: None,
-                        caller_cwd: None,
+                    SourceFileRequest {
                         stdin: Some(format!("set-buffer -b {buffer_name} forbidden\n")),
-                    })),
+                        ..Fixture::fixture(vec!["-".to_owned()])
+                    }
+                    .into_request(),
                 )
                 .await
                 .response;
@@ -810,60 +820,9 @@ async fn create_callback_attach(
     handler: &RequestHandler,
     requester_pid: u32,
     name: &str,
-) -> tokio::sync::mpsc::UnboundedReceiver<crate::pane_io::AttachControl> {
-    let session_name = SessionName::new(name).expect("valid callback session name");
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: session_name.clone(),
-                detached: true,
-                size: Some(TerminalSize { cols: 80, rows: 24 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
-    register_callback_attach(handler, requester_pid, session_name).await
-}
-
-async fn register_callback_attach(
-    handler: &RequestHandler,
-    requester_pid: u32,
-    session_name: SessionName,
-) -> tokio::sync::mpsc::UnboundedReceiver<crate::pane_io::AttachControl> {
-    let (control_tx, control_rx) = tokio::sync::mpsc::unbounded_channel();
-    handler
-        .register_attach(requester_pid, session_name, control_tx)
-        .await;
-    control_rx
-}
-
-async fn create_detached_callback_session(handler: &RequestHandler, session_name: SessionName) {
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name,
-                detached: true,
-                size: Some(TerminalSize { cols: 80, rows: 24 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
-}
-
-async fn set_named_buffer(handler: &RequestHandler, name: &str, content: &[u8]) {
-    let response = handler
-        .handle(Request::SetBuffer(Box::new(rmux_proto::SetBufferRequest {
-            name: Some(name.to_owned()),
-            content: content.to_vec(),
-            append: false,
-            new_name: None,
-            set_clipboard: false,
-            target_client: None,
-        })))
-        .await;
-    assert!(matches!(response, Response::SetBuffer(_)), "{response:?}");
+) -> mpsc::UnboundedReceiver<AttachControl> {
+    let session_name = handler.create_session(name).await;
+    handler.attach_client(requester_pid, session_name).await
 }
 
 async fn open_mode_tree(handler: &RequestHandler, requester_pid: u32, command: &str) {
@@ -895,20 +854,9 @@ fn sgr_mouse(button: u16, x: u16, y: u16) -> Vec<u8> {
     .into_bytes()
 }
 
-async fn wait_for_background_task(handler: &RequestHandler, name: &'static str) {
-    tokio::task::yield_now().await;
-    tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        while handler.background_task_running_for_test(name) {
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
-    })
-    .await
-    .unwrap_or_else(|_| panic!("background task {name} did not finish"));
-}
-
 async fn wait_for_no_detached_scope(handler: &RequestHandler, requester_pid: u32) {
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    tokio::time::timeout(Duration::from_secs(2), async {
         loop {
             if !handler
                 .active_detached_requester_access
@@ -918,7 +866,7 @@ async fn wait_for_no_detached_scope(handler: &RequestHandler, requester_pid: u32
             {
                 return;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
         }
     })
     .await
@@ -927,9 +875,7 @@ async fn wait_for_no_detached_scope(handler: &RequestHandler, requester_pid: u32
 
 async fn show_buffer(handler: &RequestHandler, name: &str) -> Option<Vec<u8>> {
     handler
-        .handle(Request::ShowBuffer(ShowBufferRequest {
-            name: Some(name.to_owned()),
-        }))
+        .handle(show_buffer_request(name))
         .await
         .command_output()
         .map(|output| output.stdout().to_vec())

@@ -9,44 +9,9 @@
 //! clients of different sizes are handed the same string.
 
 use super::set_titles_support::{
-    delivered_titles, new_detached_session, remembered_title, set_global, title_capable_context,
+    attach_sized_client, delivered_titles, remembered_title, set_global,
 };
 use super::*;
-
-/// Registers one client with its own identity and geometry, exactly as
-/// `listener.rs` publishes a fresh attach.
-async fn attach_sized_client(
-    handler: &RequestHandler,
-    session: &rmux_proto::SessionName,
-    attach_pid: u32,
-    client_size: TerminalSize,
-) -> mpsc::UnboundedReceiver<AttachControl> {
-    let (control_tx, control_rx) = mpsc::unbounded_channel();
-    let uid = current_owner_uid();
-    handler
-        .register_attach_with_access(
-            attach_pid,
-            session.clone(),
-            None,
-            AttachRegistration {
-                control_tx,
-                control_backlog: Arc::new(AtomicUsize::new(0)),
-                closing: Arc::new(AtomicBool::new(false)),
-                persistent_overlay_epoch: Arc::new(AtomicU64::new(0)),
-                terminal_context: title_capable_context(),
-                client_title: None,
-                flags: crate::handler::attach_support::ClientFlags::default(),
-                render_stream: false,
-                uid,
-                user: rmux_os::identity::UserIdentity::Uid(uid),
-                can_write: true,
-                client_size: Some(client_size),
-            },
-        )
-        .await
-        .expect("attach registration succeeds");
-    control_rx
-}
 
 /// The same variables, resolved through the independent `list-clients` format
 /// path, keyed by client pid. This is the oracle the title must agree with.
@@ -81,7 +46,7 @@ async fn list_clients_bindings(handler: &RequestHandler) -> Vec<(String, String)
 async fn two_clients_expand_their_own_size_and_name_into_the_title() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    new_detached_session(&handler, &alpha).await;
+    handler.create_session(&alpha).await;
 
     let wide_pid = 41_821;
     let narrow_pid = 41_822;
@@ -168,7 +133,7 @@ async fn two_clients_expand_their_own_size_and_name_into_the_title() {
 async fn the_title_resolves_the_client_key_table_and_terminal() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    new_detached_session(&handler, &alpha).await;
+    handler.create_session(&alpha).await;
 
     let attach_pid = 41_823;
     let mut control_rx = attach_sized_client(

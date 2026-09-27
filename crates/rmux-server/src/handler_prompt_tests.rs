@@ -1,7 +1,7 @@
 use super::RequestHandler;
 use crate::pane_io::AttachControl;
 use rmux_core::command_parser::CommandParser;
-use rmux_proto::{NewSessionRequest, Request, Response, RmuxError, TerminalSize};
+use rmux_proto::RmuxError;
 use tokio::sync::mpsc;
 use tokio::time::{timeout, Duration};
 
@@ -12,24 +12,8 @@ async fn create_attached_session(
     requester_pid: u32,
     name: &str,
 ) -> mpsc::UnboundedReceiver<AttachControl> {
-    let session_name = session_name(name);
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: session_name.clone(),
-                detached: true,
-                size: Some(TerminalSize { cols: 80, rows: 24 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
-
-    let (control_tx, control_rx) = mpsc::unbounded_channel();
-    handler
-        .register_attach(requester_pid, session_name, control_tx)
-        .await;
-    control_rx
+    let session = handler.create_session(name).await;
+    handler.attach_client(requester_pid, session).await
 }
 
 async fn recv_switch_frame(control_rx: &mut mpsc::UnboundedReceiver<AttachControl>) -> String {
@@ -216,16 +200,12 @@ async fn rename_session_rekeys_the_active_prompt_execution_context() {
     });
     let _ = recv_switch_frame_containing(&mut control_rx, "go ").await;
 
-    let response = handler
-        .handle(Request::RenameSession(rmux_proto::RenameSessionRequest {
+    handler
+        .handle_ok(rmux_proto::RenameSessionRequest {
             target: alpha,
             new_name: beta.clone(),
-        }))
+        })
         .await;
-    assert!(
-        matches!(response, Response::RenameSession(_)),
-        "{response:?}"
-    );
     handler
         .handle_attached_live_input_for_test(requester_pid, b"\r")
         .await
@@ -354,17 +334,7 @@ async fn confirm_before_accepts_enter_with_default_yes_and_skips_on_decline() {
 #[tokio::test]
 async fn prompt_commands_return_tmux_style_errors_for_unknown_target_clients() {
     let handler = RequestHandler::new();
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: session_name("alpha"),
-                detached: true,
-                size: Some(TerminalSize { cols: 80, rows: 24 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
+    handler.create_session("alpha").await;
 
     let prompt_error = handler
         .execute_parsed_commands_for_test(

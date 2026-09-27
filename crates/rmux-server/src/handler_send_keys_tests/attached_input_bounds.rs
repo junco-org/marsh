@@ -4,14 +4,9 @@ async fn create_attached_live_session(
     handler: &RequestHandler,
     name: &rmux_proto::SessionName,
     requester_pid: u32,
-) -> mpsc::UnboundedReceiver<crate::pane_io::AttachControl> {
+) -> mpsc::UnboundedReceiver<AttachControl> {
     create_quiet_input_session(handler, name).await;
-
-    let (control_tx, control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, name.clone(), control_tx)
-        .await;
-    control_rx
+    handler.attach_client(requester_pid, name).await
 }
 
 #[tokio::test]
@@ -273,22 +268,11 @@ async fn live_attach_chunked_sgr_mouse_sequence_still_dispatches() {
     let alpha = session_name("alpha");
     let requester_pid = std::process::id();
     let _control_rx = create_attached_live_session(&handler, &alpha, requester_pid).await;
-    let mouse_enabled = handler
-        .handle(Request::SetOption(SetOptionRequest {
-            scope: ScopeSelector::Global,
-            option: OptionName::Mouse,
-            value: "on".to_owned(),
-            mode: SetOptionMode::Replace,
-        }))
+    handler
+        .set_option(ScopeSelector::Global, OptionName::Mouse, "on")
         .await;
-    assert!(matches!(mouse_enabled, Response::SetOption(_)));
 
-    {
-        let mut state = handler.state.lock().await;
-        state
-            .append_bytes_to_pane_transcript_for_test(&alpha, 0, 0, b"\x1b[?1003h\x1b[?1006h")
-            .expect("mouse any and sgr transcript update");
-    }
+    append_pane_output(&handler, &alpha, b"\x1b[?1003h\x1b[?1006h").await;
 
     let mut pending_input = Vec::new();
     handler

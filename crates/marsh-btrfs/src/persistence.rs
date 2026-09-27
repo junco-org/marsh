@@ -49,7 +49,23 @@ pub struct PersistenceLayer {
     pub root: PathBuf,
     /// Exclusive ownership of this session's persistent state, taken by [`Self::acquire`].
     /// Dropping the layer releases it.
-    lock: Option<File>,
+    lock: Option<Lease>,
+}
+
+/// The `flock` on a seed's `session.lock` that proves this process owns the seed.
+///
+/// The lock belongs to the open file description, which every child forked before its `exec`
+/// shares: closing this descriptor alone would leave the claim with such a child for as long as it
+/// lingers there. Dropping unlocks explicitly instead, which ends the claim for every duplicate.
+#[derive(Debug)]
+struct Lease(File);
+
+impl Drop for Lease {
+    fn drop(&mut self) {
+        // SAFETY: the descriptor stays open until the `File` drops after this body, and `flock`
+        // receives only that scalar descriptor.
+        unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
+    }
 }
 
 impl PersistenceLayer {
@@ -81,17 +97,17 @@ impl PersistenceLayer {
     /// it is a btrfs subvolume, or when the seed is its mount's root — there would be nowhere
     /// beside it to keep state.
     pub fn discover(initial_dir: &Path, fs: &dyn Subvolumes) -> Result<(Self, PathBuf), Error> {
-        let start = initial_dir.canonicalize().map_err(|error| Error::SeedDir {
+        let unusable = |reason: String| Error::SeedDir {
             path: initial_dir.to_path_buf(),
-            reason: error.to_string(),
-        })?;
+            reason,
+        };
+        let start = initial_dir
+            .canonicalize()
+            .map_err(|error| unusable(error.to_string()))?;
         // A regular file canonicalizes fine and would otherwise seed off its parent, silently
         // starting a shell somewhere the caller never named.
         if !start.is_dir() {
-            return Err(Error::SeedDir {
-                path: initial_dir.to_path_buf(),
-                reason: "not a directory".to_owned(),
-            });
+            return Err(unusable("not a directory".to_owned()));
         }
         let seed = find_seed(&start, &|candidate| fs.is_subvolume(candidate))
             .ok_or_else(|| Error::NoSubvolume(start.clone()))?;
@@ -100,15 +116,11 @@ impl PersistenceLayer {
         if fs.is_mount_root(&seed)? {
             return Err(Error::SeedIsMountRoot(seed));
         }
-        let root = {
-            let parent = seed
-                .parent()
-                .ok_or_else(|| Error::SeedIsMountRoot(seed.clone()))?;
-            let name = seed
-                .file_name()
-                .ok_or_else(|| Error::SeedIsMountRoot(seed.clone()))?;
-            parent.join(STATE_DIR).join(name)
-        };
+        let root = seed
+            .parent()
+            .zip(seed.file_name())
+            .map(|(parent, name)| parent.join(STATE_DIR).join(name))
+            .ok_or_else(|| Error::SeedIsMountRoot(seed.clone()))?;
         Ok((Self::new(seed, root), start))
     }
 
@@ -170,7 +182,7 @@ impl PersistenceLayer {
             }
             return Err(error.into());
         }
-        self.lock = Some(lock);
+        self.lock = Some(Lease(lock));
         Ok(())
     }
 
@@ -241,6 +253,7 @@ fn find_seed(start: &Path, is_subvolume: &dyn Fn(&Path) -> bool) -> Option<PathB
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::snapshot::MockSubvolumes;
 
     /// The id names a directory the console shows in its prompt, so its derivation is pinned.
     #[test]
@@ -298,15 +311,53 @@ mod tests {
 
         let mut second = PersistenceLayer::new(seed.clone(), root);
         let error = second.acquire().expect_err("the second claim is refused");
-        assert!(
-            matches!(&error, Error::SessionBusy(path) if *path == seed),
-            "got {error:?}"
-        );
+        assert_error!(error, Error::SessionBusy(path) if *path == seed);
 
         drop(first);
         second
             .acquire()
             .expect("the lease is released with the layer");
+    }
+
+    /// A child forked while the lease is held shares its descriptor until it execs — and a traced
+    /// host's children stop there for as long as the tracer takes. Dropping the layer must end the
+    /// claim all the same, or the next session over the seed is refused by a process that never
+    /// owned it.
+    #[test]
+    fn dropping_the_layer_releases_the_lease_a_forked_child_still_shares() {
+        let scratch = tempfile::tempdir().expect("scratch directory");
+        let seed = scratch.path().join("seed");
+        let root = scratch.path().join("state");
+        std::fs::create_dir_all(&seed).expect("seed");
+        let mut first = PersistenceLayer::new(seed.clone(), root.clone());
+        first.acquire().expect("the first claim succeeds");
+
+        let (held, release) = std::io::pipe().expect("pipe");
+        let (held_fd, release_fd) = (held.as_raw_fd(), release.as_raw_fd());
+        // SAFETY: the child calls only the async-signal-safe `close`, `read` and `_exit`, so
+        // forking this multithreaded test process is sound.
+        let child = unsafe { libc::fork() };
+        if child == 0 {
+            let mut byte = 0_u8;
+            // SAFETY: `release_fd` is the child's own copy of the write end; closing it lets the
+            // read below see end-of-file once the parent's copy closes too.
+            unsafe { libc::close(release_fd) };
+            // SAFETY: `held_fd` is the child's own copy of the read end, and `byte` outlives it.
+            unsafe { libc::read(held_fd, (&raw mut byte).cast(), 1) };
+            // SAFETY: `_exit` ends the child without running the parent's destructors.
+            unsafe { libc::_exit(0) };
+        }
+        assert!(child > 0, "fork: {}", std::io::Error::last_os_error());
+
+        drop(first);
+        let mut second = PersistenceLayer::new(seed, root);
+        let reclaimed = second.acquire();
+        drop(release);
+        let mut status = 0;
+        // SAFETY: `child` is this process's own unreaped child, and `status` outlives the call.
+        assert_eq!(unsafe { libc::waitpid(child, &raw mut status, 0) }, child);
+        drop(held);
+        reclaimed.expect("the lease ends with the layer, not with its last shared descriptor");
     }
 
     /// A canonicalized scratch directory: `discover` canonicalizes `start`, so expectations keyed
@@ -317,13 +368,14 @@ mod tests {
         (dir, root)
     }
 
-    /// A mock answering `is_subvolume` true for exactly `seed` and reporting no mount roots.
-    fn subvolume_at(seed: &Path) -> crate::snapshot::MockSubvolumes {
+    /// A mock answering `is_subvolume` true for exactly `seed`, and `is_mount_root` with
+    /// `mount_root`.
+    fn subvolume_at(seed: &Path, mount_root: fn(&Path) -> Result<bool, Error>) -> MockSubvolumes {
         let seed = seed.to_path_buf();
-        let mut fs = crate::snapshot::MockSubvolumes::new();
+        let mut fs = MockSubvolumes::new();
         fs.expect_is_subvolume()
             .returning(move |candidate| candidate == seed);
-        fs.expect_is_mount_root().returning(|_| Ok(false));
+        fs.expect_is_mount_root().returning(mount_root);
         fs
     }
 
@@ -339,9 +391,9 @@ mod tests {
         std::fs::create_dir_all(&start).expect("start directory");
         let alias = base.join("alias");
         std::os::unix::fs::symlink(&seed, &alias).expect("alias to the seed");
+        let fs = subvolume_at(&seed, |_| Ok(false));
 
-        let (layer, canonical) =
-            PersistenceLayer::discover(&start, &subvolume_at(&seed)).expect("discovery");
+        let (layer, canonical) = PersistenceLayer::discover(&start, &fs).expect("discovery");
 
         assert_eq!(layer.seed, seed);
         assert_eq!(layer.root, base.join(STATE_DIR).join("seed"));
@@ -349,9 +401,8 @@ mod tests {
         assert_eq!(layer.meta(), layer.root.join("meta"));
         assert_eq!(canonical, start);
 
-        let (layer, canonical) =
-            PersistenceLayer::discover(&alias.join("src/deep"), &subvolume_at(&seed))
-                .expect("discovery through a symlink");
+        let (layer, canonical) = PersistenceLayer::discover(&alias.join("src/deep"), &fs)
+            .expect("discovery through a symlink");
         assert_eq!(layer.seed, seed);
         assert_eq!(
             canonical, start,
@@ -366,17 +417,10 @@ mod tests {
         let (_dir, base) = scratch();
         let seed = base.join("seed");
         std::fs::create_dir_all(&seed).expect("seed directory");
-        let mut fs = crate::snapshot::MockSubvolumes::new();
-        let expected = seed.clone();
-        fs.expect_is_subvolume()
-            .returning(move |candidate| candidate == expected);
-        fs.expect_is_mount_root().returning(|_| Ok(true));
+        let fs = subvolume_at(&seed, |_| Ok(true));
 
         let error = PersistenceLayer::discover(&seed, &fs).expect_err("refused");
-        assert!(
-            matches!(&error, Error::SeedIsMountRoot(path) if *path == seed),
-            "got {error:?}"
-        );
+        assert_error!(error, Error::SeedIsMountRoot(path) if *path == seed);
     }
 
     /// Nothing on the way up is a subvolume: there is no seed to commit into.
@@ -385,14 +429,11 @@ mod tests {
         let (_dir, base) = scratch();
         let start = base.join("plain");
         std::fs::create_dir_all(&start).expect("start directory");
-        let mut fs = crate::snapshot::MockSubvolumes::new();
+        let mut fs = MockSubvolumes::new();
         fs.expect_is_subvolume().returning(|_| false);
 
         let error = PersistenceLayer::discover(&start, &fs).expect_err("refused");
-        assert!(
-            matches!(&error, Error::NoSubvolume(path) if *path == start),
-            "got {error:?}"
-        );
+        assert_error!(error, Error::NoSubvolume(path) if *path == start);
     }
 
     /// An unreadable mount table is not a "not a mount root" answer: it surfaces as the failure it
@@ -402,13 +443,12 @@ mod tests {
         let (_dir, base) = scratch();
         let seed = base.join("seed");
         std::fs::create_dir_all(&seed).expect("seed directory");
-        let mut fs = crate::snapshot::MockSubvolumes::new();
-        fs.expect_is_subvolume().returning(|_| true);
-        fs.expect_is_mount_root()
-            .returning(|_| Err(Error::Io(std::io::Error::other("no mount table"))));
+        let fs = subvolume_at(&seed, |_| {
+            Err(Error::Io(std::io::Error::other("no mount table")))
+        });
 
         let error = PersistenceLayer::discover(&seed, &fs).expect_err("refused");
-        assert!(matches!(&error, Error::Io(_)), "got {error:?}");
+        assert_error!(error, Error::Io(_));
     }
 
     /// A starting directory that does not exist is reported with its path and the reason, rather
@@ -417,14 +457,11 @@ mod tests {
     fn a_starting_directory_that_cannot_be_resolved_is_reported_as_such() {
         let (_dir, base) = scratch();
         let start = base.join("absent");
-        let fs = crate::snapshot::MockSubvolumes::new();
+        let fs = MockSubvolumes::new();
 
         let error = PersistenceLayer::discover(&start, &fs).expect_err("refused");
-        assert!(
-            matches!(&error, Error::SeedDir { path, reason }
-                if *path == start && !reason.is_empty()),
-            "got {error:?}"
-        );
+        assert_error!(error, Error::SeedDir { path, reason }
+            if *path == start && !reason.is_empty());
     }
 
     /// A file is not a place a shell can start: it resolves, so without the check it would seed
@@ -437,12 +474,10 @@ mod tests {
         let file = seed.join("file");
         std::fs::write(&file, b"not a directory").expect("a regular file");
 
-        let error = PersistenceLayer::discover(&file, &subvolume_at(&seed)).expect_err("refused");
-        assert!(
-            matches!(&error, Error::SeedDir { path, reason }
-                if *path == file && reason == "not a directory"),
-            "got {error:?}"
-        );
+        let error = PersistenceLayer::discover(&file, &subvolume_at(&seed, |_| Ok(false)))
+            .expect_err("refused");
+        assert_error!(error, Error::SeedDir { path, reason }
+            if *path == file && reason == "not a directory");
     }
 
     /// Materialization is what makes the layout usable: both state subtrees exist afterwards, and
@@ -451,7 +486,7 @@ mod tests {
     fn materializing_creates_the_state_layout_and_is_repeatable() {
         let (_dir, base) = scratch();
         let layer = PersistenceLayer::new(base.join("seed"), base.join("state"));
-        let mut fs = crate::snapshot::MockSubvolumes::new();
+        let mut fs = MockSubvolumes::new();
         fs.expect_assert_btrfs().returning(|_| Ok(()));
         fs.expect_assert_user_subvol_rm_allowed()
             .returning(|_| Ok(()));
@@ -474,26 +509,20 @@ mod tests {
         let (_dir, base) = scratch();
         let layer = PersistenceLayer::new(base.join("seed"), base.join("state"));
 
-        let mut not_btrfs = crate::snapshot::MockSubvolumes::new();
+        let mut not_btrfs = MockSubvolumes::new();
         not_btrfs
             .expect_assert_btrfs()
             .returning(|path| Err(Error::NotBtrfs(path.to_path_buf())));
         let error = layer.materialize(&not_btrfs).expect_err("refused");
-        assert!(
-            matches!(&error, Error::NotBtrfs(path) if *path == layer.root),
-            "got {error:?}"
-        );
+        assert_error!(error, Error::NotBtrfs(path) if *path == layer.root);
 
-        let mut not_allowed = crate::snapshot::MockSubvolumes::new();
+        let mut not_allowed = MockSubvolumes::new();
         not_allowed.expect_assert_btrfs().returning(|_| Ok(()));
         not_allowed
             .expect_assert_user_subvol_rm_allowed()
             .returning(|path| Err(Error::NotUserSubvolRmAllowed(path.to_path_buf())));
         let error = layer.materialize(&not_allowed).expect_err("refused");
-        assert!(
-            matches!(&error, Error::NotUserSubvolRmAllowed(path) if *path == layer.root),
-            "got {error:?}"
-        );
+        assert_error!(error, Error::NotUserSubvolRmAllowed(path) if *path == layer.root);
     }
 
     /// A file where the state root belongs would otherwise surface as a bare `EEXIST` from
@@ -504,13 +533,10 @@ mod tests {
         let root = base.join("state");
         std::fs::write(&root, b"not a directory").expect("occupying file");
         let layer = PersistenceLayer::new(base.join("seed"), root.clone());
-        let fs = crate::snapshot::MockSubvolumes::new();
+        let fs = MockSubvolumes::new();
 
         let error = layer.materialize(&fs).expect_err("refused");
-        assert!(
-            matches!(&error, Error::StateNotDirectory(path) if *path == root),
-            "got {error:?}"
-        );
+        assert_error!(error, Error::StateNotDirectory(path) if *path == root);
 
         let mut layer = layer;
         let error = layer.acquire().expect_err("refused");

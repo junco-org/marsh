@@ -4,13 +4,13 @@ use rmux_proto::{PaneOutputSubscriptionId, PaneOutputSubscriptionStart, Response
 use serde_json::json;
 
 use crate::cli_args::{CollectPaneOutputArgs, StreamPaneArgs};
-use crate::cli_response::tmux_cli_error_message;
 
 use super::super::ExitFailure;
+use super::super::target_resolution::connect_cli;
 use super::common::{
-    PaneProcessState, SCHEMA_VERSION, StdoutWrite, check_disabled, connect_cli, pane_process_state,
-    pane_snapshot, resolve_pane_ref, sleep_poll_interval, stdout_closed, visible_lines,
-    visible_text, write_json, write_stderr_line, write_stdout_bytes,
+    PaneProcessState, SCHEMA_VERSION, StdoutWrite, check_disabled, pane_process_state,
+    pane_snapshot, resolve_pane_ref, response_error, sleep_poll_interval, stdout_closed,
+    visible_lines, visible_text, write_json_line, write_stderr_line, write_stdout_bytes,
     write_stdout_bytes_or_broken_pipe,
 };
 
@@ -36,22 +36,15 @@ pub(crate) fn run_stream_pane(
     let mut line_buffer = Vec::new();
     let mut line_buffer_force_flushed = false;
     let mut wrote_stdout = false;
-    loop {
-        if stdout_closed() {
-            let _ = connection.unsubscribe_pane_output(subscription_id);
-            return Ok(0);
-        }
-        let batch = poll_output(&mut connection, subscription_id, "stream-pane")?;
+    'stream: while !stdout_closed() {
+        let batch = poll_output(&mut connection, subscription_id, "stream-pane", true)?;
         if batch.lag.is_some() {
             line_buffer.clear();
             line_buffer_force_flushed = false;
             if !wrote_stdout {
                 match write_lag_snapshot_seed(&mut connection, target.clone(), line_mode)? {
                     LagSnapshotSeed::Written => wrote_stdout = true,
-                    LagSnapshotSeed::BrokenPipe => {
-                        let _ = connection.unsubscribe_pane_output(subscription_id);
-                        return Ok(0);
-                    }
+                    LagSnapshotSeed::BrokenPipe => break,
                     LagSnapshotSeed::Empty => {}
                 }
             }
@@ -59,8 +52,7 @@ pub(crate) fn run_stream_pane(
         for bytes in batch.chunks {
             if line_mode {
                 if write_lines(&mut line_buffer, &mut line_buffer_force_flushed, &bytes)? {
-                    let _ = connection.unsubscribe_pane_output(subscription_id);
-                    return Ok(0);
+                    break 'stream;
                 }
                 wrote_stdout |= bytes.contains(&b'\n');
             } else {
@@ -68,22 +60,22 @@ pub(crate) fn run_stream_pane(
                     write_stdout_bytes_or_broken_pipe(&bytes)?,
                     StdoutWrite::BrokenPipe
                 ) {
-                    let _ = connection.unsubscribe_pane_output(subscription_id);
-                    return Ok(0);
+                    break 'stream;
                 }
                 wrote_stdout = true;
             }
         }
         if batch.saw_eof {
-            if line_mode && flush_line_buffer(&mut line_buffer)? {
-                let _ = connection.unsubscribe_pane_output(subscription_id);
-                return Ok(0);
+            if line_mode {
+                flush_line_buffer(&mut line_buffer)?;
             }
-            let _ = connection.unsubscribe_pane_output(subscription_id);
-            return Ok(0);
+            break;
         }
         sleep_poll_interval();
     }
+    // Stdout hung up, a write hit a broken pipe, or the pane's output ended.
+    let _ = connection.unsubscribe_pane_output(subscription_id);
+    Ok(0)
 }
 
 /// Outcome of seeding stdout from a pane snapshot after a lag gap.
@@ -153,7 +145,12 @@ pub(crate) fn run_collect_pane_output(
     let mut saw_eof = false;
     let mut missed_events = 0_u64;
     let pane_exit = loop {
-        let batch = poll_output(&mut connection, subscription_id, "collect-pane-output")?;
+        let batch = poll_output(
+            &mut connection,
+            subscription_id,
+            "collect-pane-output",
+            true,
+        )?;
         saw_eof |= batch.saw_eof;
         if let Some(lag) = batch.lag {
             missed_events = missed_events.saturating_add(lag.missed_events);
@@ -186,7 +183,7 @@ pub(crate) fn run_collect_pane_output(
     let _ = connection.unsubscribe_pane_output(subscription_id);
     if missed_events > 0 {
         if args.json {
-            return write_json(&json!({
+            return write_json_line(&json!({
                 "schema_version": SCHEMA_VERSION,
                 "ok": false,
                 "error": "pane-output-lag",
@@ -206,7 +203,7 @@ pub(crate) fn run_collect_pane_output(
         ));
     }
     if args.json {
-        return write_json(&json!({
+        return write_json_line(&json!({
             "schema_version": SCHEMA_VERSION,
             "ok": true,
             "bytes": total_bytes,
@@ -243,40 +240,13 @@ pub(super) fn subscribe(
         .map_err(ExitFailure::from)?
     {
         Response::SubscribePaneOutput(response) => Ok(response.subscription_id),
-        Response::Error(error) => Err(ExitFailure::new(
-            1,
-            tmux_cli_error_message("stream-pane", &error.error),
-        )),
-        other => Err(ExitFailure::new(
-            1,
-            format!(
-                "protocol error: unexpected '{}' response for stream-pane",
-                other.command_name()
-            ),
-        )),
+        other => Err(response_error(&other, "stream-pane", "for stream-pane")),
     }
 }
 
-/// Polls the pane output cursor, reporting any lag gap on stderr.
+/// Polls the pane output cursor, splitting events into chunks, EOF, and lag, and reporting a
+/// lag gap on stderr when `report_lag` is set.
 pub(super) fn poll_output(
-    connection: &mut rmux_client::Connection,
-    subscription_id: PaneOutputSubscriptionId,
-    command_name: &'static str,
-) -> Result<OutputBatch, ExitFailure> {
-    poll_output_inner(connection, subscription_id, command_name, true)
-}
-
-/// Polls the pane output cursor without printing a lag warning, for callers that handle it.
-pub(super) fn poll_output_silent_lag(
-    connection: &mut rmux_client::Connection,
-    subscription_id: PaneOutputSubscriptionId,
-    command_name: &'static str,
-) -> Result<OutputBatch, ExitFailure> {
-    poll_output_inner(connection, subscription_id, command_name, false)
-}
-
-/// Shared pane output cursor poll that splits events into chunks, EOF, and lag.
-fn poll_output_inner(
     connection: &mut rmux_client::Connection,
     subscription_id: PaneOutputSubscriptionId,
     command_name: &'static str,
@@ -321,16 +291,10 @@ fn poll_output_inner(
                 }),
             })
         }
-        Response::Error(error) => Err(ExitFailure::new(
-            1,
-            tmux_cli_error_message(command_name, &error.error),
-        )),
-        other => Err(ExitFailure::new(
-            1,
-            format!(
-                "protocol error: unexpected '{}' response for {command_name}",
-                other.command_name()
-            ),
+        other => Err(response_error(
+            &other,
+            command_name,
+            &format!("for {command_name}"),
         )),
     }
 }
@@ -343,24 +307,15 @@ fn write_lines(
 ) -> Result<bool, ExitFailure> {
     let mut broken_pipe = false;
     split_lines_bounded(buffer, force_flushed, bytes, |line| {
-        if matches!(write_line(line)?, StdoutWrite::BrokenPipe) {
-            broken_pipe = true;
-        }
+        broken_pipe |= matches!(write_line(line)?, StdoutWrite::BrokenPipe);
         Ok(())
     })?;
     Ok(broken_pipe)
 }
 
-/// Writes any trailing partial line left in the buffer, signalling a broken pipe.
-fn flush_line_buffer(buffer: &mut Vec<u8>) -> Result<bool, ExitFailure> {
-    let mut broken_pipe = false;
-    flush_line_buffer_into(buffer, |line| {
-        if matches!(write_line(line)?, StdoutWrite::BrokenPipe) {
-            broken_pipe = true;
-        }
-        Ok(())
-    })?;
-    Ok(broken_pipe)
+/// Writes any trailing partial line left in the buffer.
+fn flush_line_buffer(buffer: &mut Vec<u8>) -> Result<(), ExitFailure> {
+    flush_line_buffer_into(buffer, |line| write_line(line).map(drop))
 }
 
 /// Hands the buffer's trailing partial line to `emit`, leaving the buffer empty.

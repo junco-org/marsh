@@ -9,7 +9,7 @@
 //! until an unrelated title mutation or a reattach.
 
 use super::set_titles_support::{
-    delivered_titles, new_detached_session, remembered_title, set_global, title_capable_context,
+    attach_title_capable_client, delivered_titles, remembered_title, set_global,
 };
 use super::*;
 
@@ -47,18 +47,10 @@ async fn dismiss_mode_tree_and_refresh(handler: &RequestHandler, attach_pid: u32
 async fn a_title_discarded_by_an_overlay_barrier_reaches_the_successor_refresh() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    new_detached_session(&handler, &alpha).await;
+    handler.create_session(&alpha).await;
 
     let attach_pid = std::process::id();
-    let (control_tx, mut control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach_with_terminal_context(
-            attach_pid,
-            alpha.clone(),
-            control_tx,
-            title_capable_context(),
-        )
-        .await;
+    let mut control_rx = attach_title_capable_client(&handler, &alpha, attach_pid).await;
 
     set_global(&handler, OptionName::SetTitlesString, "BEFORE").await;
     set_global(&handler, OptionName::SetTitles, "on").await;
@@ -98,18 +90,10 @@ async fn a_title_discarded_by_an_overlay_barrier_reaches_the_successor_refresh()
 async fn a_title_surviving_its_overlay_barrier_is_not_re_emitted() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    new_detached_session(&handler, &alpha).await;
+    handler.create_session(&alpha).await;
 
     let attach_pid = std::process::id();
-    let (control_tx, mut control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach_with_terminal_context(
-            attach_pid,
-            alpha.clone(),
-            control_tx,
-            title_capable_context(),
-        )
-        .await;
+    let mut control_rx = attach_title_capable_client(&handler, &alpha, attach_pid).await;
 
     set_global(&handler, OptionName::SetTitlesString, "STABLE").await;
     set_global(&handler, OptionName::SetTitles, "on").await;
@@ -147,18 +131,10 @@ async fn a_title_surviving_its_overlay_barrier_is_not_re_emitted() {
 async fn an_unstamped_title_is_never_reverted_by_a_barrier() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    new_detached_session(&handler, &alpha).await;
+    handler.create_session(&alpha).await;
 
     let attach_pid = std::process::id();
-    let (control_tx, mut control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach_with_terminal_context(
-            attach_pid,
-            alpha.clone(),
-            control_tx,
-            title_capable_context(),
-        )
-        .await;
+    let mut control_rx = attach_title_capable_client(&handler, &alpha, attach_pid).await;
 
     set_global(&handler, OptionName::SetTitlesString, "PLAIN").await;
     set_global(&handler, OptionName::SetTitles, "on").await;

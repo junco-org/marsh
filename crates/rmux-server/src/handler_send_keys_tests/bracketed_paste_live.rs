@@ -8,10 +8,7 @@ async fn live_attach_bracketed_paste_strips_wrappers_when_pane_mode_is_off() {
 
     create_quiet_input_session(&handler, &alpha).await;
 
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
 
     let input = b"\x1b[200~paste\x1b[201~";
     let expected = b"paste";
@@ -47,17 +44,9 @@ async fn live_attach_bracketed_paste_preserves_wrappers_when_pane_mode_is_enable
     let requester_pid = std::process::id();
 
     create_quiet_input_session(&handler, &alpha).await;
-    {
-        let mut state = handler.state.lock().await;
-        state
-            .append_bytes_to_pane_transcript_for_test(&alpha, 0, 0, b"\x1b[?2004h")
-            .expect("bracketed paste mode transcript update");
-    }
+    append_pane_output(&handler, &alpha, b"\x1b[?2004h").await;
 
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
 
     let expected = b"\x1b[200~paste\x1b[201~";
     let capture = RawPaneInputProbe::start(
@@ -84,25 +73,11 @@ async fn live_attach_bracketed_paste_is_consumed_without_pane_leak_in_copy_mode(
     let requester_pid = std::process::id();
 
     create_quiet_input_session(&handler, &alpha).await;
-    let entered = handler
-        .handle(Request::CopyMode(CopyModeRequest {
-            target: Some(PaneTarget::new(alpha.clone(), 0)),
-            page_down: false,
-            exit_on_scroll: false,
-            hide_position: false,
-            mouse_drag_start: false,
-            cancel_mode: false,
-            scrollbar_scroll: false,
-            source: None,
-            page_up: false,
-        }))
+    handler
+        .handle_ok(CopyModeRequest::fixture(PaneTarget::new(alpha.clone(), 0)))
         .await;
-    assert!(matches!(entered, Response::CopyMode(_)));
 
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
 
     let capture =
         RawPaneInputProbe::start(&handler, &alpha, "live-attach-bracketed-paste-copy-mode", 0)
@@ -124,25 +99,11 @@ async fn live_attach_chunked_bracketed_paste_is_consumed_without_pane_leak_in_co
     let requester_pid = std::process::id();
 
     create_quiet_input_session(&handler, &alpha).await;
-    let entered = handler
-        .handle(Request::CopyMode(CopyModeRequest {
-            target: Some(PaneTarget::new(alpha.clone(), 0)),
-            page_down: false,
-            exit_on_scroll: false,
-            hide_position: false,
-            mouse_drag_start: false,
-            cancel_mode: false,
-            scrollbar_scroll: false,
-            source: None,
-            page_up: false,
-        }))
+    handler
+        .handle_ok(CopyModeRequest::fixture(PaneTarget::new(alpha.clone(), 0)))
         .await;
-    assert!(matches!(entered, Response::CopyMode(_)));
 
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
 
     let capture = RawPaneInputProbe::start(
         &handler,
@@ -173,10 +134,7 @@ async fn live_attach_bracketed_paste_preserves_multiline_special_payload() {
 
     create_quiet_input_session(&handler, &alpha).await;
 
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
 
     let input = b"\x1b[200~line one\r\nline\ttwo \x02 literal \xe6\x9d\xb1\xe4\xba\xac\x1b[201~";
     let expected = bracketed_paste_body(input);
@@ -215,10 +173,7 @@ async fn live_attach_bracketed_paste_forwards_embedded_control_sequences_as_payl
 
     create_quiet_input_session(&handler, &alpha).await;
 
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
 
     let chunks: [&[u8]; 7] = [
         b"\x1b[200~literal ",
@@ -250,8 +205,4 @@ async fn live_attach_bracketed_paste_forwards_embedded_control_sequences_as_payl
 
     capture.finish(&handler, &alpha).await;
     capture.assert_contents(&handler, expected).await;
-}
-
-fn bracketed_paste_body(bytes: &[u8]) -> &[u8] {
-    &bytes[b"\x1b[200~".len()..bytes.len() - b"\x1b[201~".len()]
 }

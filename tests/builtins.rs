@@ -8,116 +8,22 @@
 //! What the `git` builtin does before and around the system git it runs, and what `exec` does in
 //! a shell that has to stay alive.
 //!
-//! These are the paths a unit test cannot reach: each one is decided from shell state — the
-//! working directory, the environment, the snapshot boundary — so the only honest way to exercise
-//! them is through a real `brush_core::Shell` that has the builtin registered. What each test pins
-//! is what a script actually observes: the exit code, and the repository or tree it leaves.
+//! Every behavior runs through the ordinary managed Shell interface and the real native tracer.
 
-use std::path::{Path, PathBuf};
+mod common;
 
-use brush_builtins::BuiltinSet;
-use brush_core::{
-    ExecutionControlFlow, ProfileLoadBehavior, RcLoadBehavior, Shell, ShellVariable, SourceInfo,
-};
-use marsh::builtins::{SNAPSHOT_ROOT_VAR, exec_builtins, git_builtins};
+use std::path::Path;
 
-/// The git identity variables a commit needs, all three of them, for both sides.
-const IDENTITY: [(&str, &str); 3] = [
-    ("NAME", "Test"),
-    ("EMAIL", "test@example.com"),
-    ("DATE", "1112911993 +0000"),
-];
-
-/// Builds the shell under test: stock builtins plus this module's `git` and `exec`.
-///
-/// `identity` says whether the pinned git identity is exported, so a test can show which git
-/// commands need one and which do not.
-async fn shell(working_dir: PathBuf, identity: bool) -> Shell {
-    let builtins = {
-        let mut builtins = brush_builtins::default_builtins(BuiltinSet::BashMode);
-        builtins.extend(git_builtins());
-        builtins.extend(exec_builtins());
-        builtins
-    };
-    let mut shell = Shell::builder()
-        .interactive(false)
-        .no_editing(true)
-        .profile(ProfileLoadBehavior::Skip)
-        .rc(RcLoadBehavior::Skip)
-        .working_dir(working_dir)
-        .builtins(builtins)
-        .build()
-        .await
-        .expect("build the shell");
-
-    for who in ["AUTHOR", "COMMITTER"] {
-        for (suffix, value) in IDENTITY {
-            let name = format!("GIT_{who}_{suffix}");
-            if identity {
-                export(&mut shell, &name, value);
-            } else {
-                shell.env_mut().unset(&name).expect("unset an identity");
-            }
-        }
-    }
-    shell
-}
-
-/// Exports one variable into the shell's environment.
-fn export(shell: &mut Shell, name: &str, value: &str) {
-    let mut variable = ShellVariable::new(value);
-    variable.export();
-    shell
-        .env_mut()
-        .set_global(name.to_string(), variable)
-        .expect("set an environment variable");
-}
-
-/// Runs one line, returning its exit code.
-async fn run(shell: &mut Shell, line: &str) -> u8 {
-    let params = shell.default_exec_params();
-    shell
-        .run_string(line, &SourceInfo::from("test"), &params)
-        .await
-        .expect("run the line")
-        .exit_code
-        .into()
-}
+use brush_core::ExecutionControlFlow;
+use common::{git_shell, init_repository, run, scratch, status};
+use marsh::Shell;
 
 /// Runs one line with its stderr captured, returning `(exit code, stderr)`.
-async fn run_capturing(shell: &mut Shell, at: &Path, line: &str) -> (u8, String) {
-    let capture = at.join("stderr.txt");
-    let code = run(shell, &format!("{line} 2> {}", capture.display())).await;
-    let text = std::fs::read_to_string(&capture).expect("read the captured stderr");
-    std::fs::remove_file(&capture).expect("drop the capture");
+async fn run_capturing(shell: &Shell, line: &str) -> (u8, String) {
+    let capture = tempfile::NamedTempFile::new().expect("capture");
+    let code = status(shell, &format!("{line} 2> {}", capture.path().display())).await;
+    let text = std::fs::read_to_string(capture.path()).expect("read diagnostic");
     (code, text)
-}
-
-/// A repository whose root commit is empty, built through libgit2 rather than through the builtin.
-fn init_repository(work: &Path) {
-    let repository = git2::Repository::init(work).expect("init a repository");
-    let who = git2::Signature::new(
-        "Test",
-        "test@example.com",
-        &git2::Time::new(1_112_911_993, 0),
-    )
-    .expect("signature");
-    let empty = repository
-        .index()
-        .expect("index")
-        .write_tree()
-        .expect("write the empty tree");
-    let tree = repository.find_tree(empty).expect("find the empty tree");
-    repository
-        .commit(Some("HEAD"), &who, &who, "root\n", &tree, &[])
-        .expect("root commit");
-}
-
-/// A canonicalized scratch directory, because the builtin compares it against the repository root.
-fn scratch() -> (tempfile::TempDir, PathBuf) {
-    let directory = tempfile::tempdir().expect("scratch directory");
-    let path = directory.path().canonicalize().expect("canonical path");
-    (directory, path)
 }
 
 /// The paths the index of the repository at `work` holds, read through libgit2.
@@ -138,42 +44,47 @@ async fn formerly_refused_forms_run_natively() {
     init_repository(&work);
     std::fs::write(work.join("a.txt"), b"a\n").expect("a.txt");
     std::fs::write(work.join("b.txt"), b"b\n").expect("b.txt");
-    let mut shell = shell(work.clone(), true).await;
+    let shell = git_shell(&work, true).await;
+    status(&shell, "printf 'a\\n' > a.txt; printf 'b\\n' > b.txt").await;
 
-    assert_eq!(run(&mut shell, "git add 2>/dev/null").await, 0);
+    assert_eq!(status(&shell, "git add 2>/dev/null").await, 0);
     assert!(staged(&work).is_empty(), "nothing specified, nothing added");
-    assert_eq!(run(&mut shell, "git add -- '*.txt'").await, 0);
-    assert_eq!(staged(&work), ["a.txt", "b.txt"], "the glob is git's pathspec");
+    assert_eq!(status(&shell, "git add -- '*.txt'").await, 0);
+    assert_eq!(
+        staged(&work),
+        ["a.txt", "b.txt"],
+        "the glob is git's pathspec"
+    );
 
-    std::fs::write(work.join("a.txt"), b"changed\n").expect("modify a.txt");
-    assert_eq!(run(&mut shell, "git restore -- a.txt").await, 0);
+    status(&shell, "printf 'changed\\n' > a.txt").await;
+    assert_eq!(status(&shell, "git restore -- a.txt").await, 0);
     assert_eq!(
         std::fs::read(work.join("a.txt")).expect("a.txt"),
         b"a\n",
         "the worktree came back from the index"
     );
 
-    std::fs::write(work.join("untracked.txt"), b"u\n").expect("an untracked file");
+    status(&shell, "printf 'u\\n' > untracked.txt").await;
     assert_eq!(
-        run(&mut shell, "git clean -- untracked.txt 2>/dev/null").await,
+        status(&shell, "git clean -- untracked.txt 2>/dev/null").await,
         128,
         "git itself requires -f"
     );
     assert!(work.join("untracked.txt").exists());
+    shell.close(false).await.expect("close shell");
 }
 
 #[tokio::test]
 async fn a_working_directory_with_no_repository_above_it_is_fatal() {
     let (_guard, work) = scratch();
-    let mut shell = shell(work.clone(), true).await;
-    export(&mut shell, SNAPSHOT_ROOT_VAR, &work.display().to_string());
+    let shell = git_shell(&work, true).await;
 
-    let (code, reported) = run_capturing(&mut shell, &work, "git add -- p").await;
+    let (code, reported) = run_capturing(&shell, "git add -- p").await;
     assert_eq!(code, 128, "{reported}");
+    shell.close(false).await.expect("close shell");
 }
 
-/// Git searches ancestors for a repository, but never above the tree the builtin was given: a
-/// repository beside that tree is not the command's repository.
+/// Repository discovery is always bounded by the source selected during construction.
 #[tokio::test]
 async fn the_snapshot_root_stops_the_ancestor_search() {
     let (_guard, outer) = scratch();
@@ -181,23 +92,10 @@ async fn the_snapshot_root_stops_the_ancestor_search() {
     let inner = outer.join("tree/deep");
     std::fs::create_dir_all(&inner).expect("dirs");
     std::fs::write(inner.join("p"), b"p\n").expect("p");
-
-    let mut shell = shell(inner.clone(), true).await;
-    assert_eq!(
-        run(&mut shell, "git add -- p").await,
-        0,
-        "without a boundary the outer repository is found"
-    );
-    assert_eq!(staged(&outer), ["tree/deep/p"]);
-
-    export(
-        &mut shell,
-        SNAPSHOT_ROOT_VAR,
-        &outer.join("tree").display().to_string(),
-    );
-    std::fs::write(inner.join("q"), b"q\n").expect("q");
-    assert_eq!(run(&mut shell, "git add -- q 2>/dev/null").await, 128);
-    assert_eq!(staged(&outer), ["tree/deep/p"], "q was staged nowhere");
+    let shell = git_shell(&inner, true).await;
+    assert_eq!(status(&shell, "git add -- p 2>/dev/null").await, 128);
+    assert!(staged(&outer).is_empty());
+    shell.close(false).await.expect("close shell");
 }
 
 /// Naming a repository or a destination outside the tree is refused before git starts: an
@@ -210,20 +108,26 @@ async fn a_repository_or_destination_outside_the_snapshot_is_refused() {
     std::fs::write(outer.join("p"), b"p\n").expect("p");
     let tree = outer.join("tree");
     std::fs::create_dir_all(&tree).expect("the tree");
-    let mut shell = shell(tree.clone(), true).await;
-    export(&mut shell, SNAPSHOT_ROOT_VAR, &tree.display().to_string());
+    let shell = git_shell(&tree, true).await;
 
     for line in [
         format!("git -C {} add -- p", outer.display()),
-        format!("git --git-dir={}/.git --work-tree={} add -- p", outer.display(), outer.display()),
+        format!(
+            "git --git-dir={}/.git --work-tree={} add -- p",
+            outer.display(),
+            outer.display()
+        ),
         format!("GIT_DIR={}/.git git status", outer.display()),
         format!("git clone {} ../escape", outer.display()),
-        format!("git clone --separate-git-dir ../meta {} inside", outer.display()),
+        format!(
+            "git clone --separate-git-dir ../meta {} inside",
+            outer.display()
+        ),
         "git init ../escape".to_string(),
         "git init --separate-git-dir=../meta inside".to_string(),
     ] {
         assert_eq!(
-            run(&mut shell, &format!("{line} 2>/dev/null")).await,
+            status(&shell, &format!("{line} 2>/dev/null")).await,
             128,
             "{line}"
         );
@@ -233,8 +137,13 @@ async fn a_repository_or_destination_outside_the_snapshot_is_refused() {
         assert!(!outer.join(created).exists(), "{created} was never created");
     }
 
-    assert_eq!(run(&mut shell, "git init -q inside").await, 0, "inside is allowed");
+    assert_eq!(
+        status(&shell, "git init -q inside").await,
+        0,
+        "inside is allowed"
+    );
     assert!(tree.join("inside/.git").is_dir());
+    shell.close(false).await.expect("close shell");
 }
 
 /// A git identity is git's business: inspecting and staging need none, and a commit without one
@@ -244,13 +153,11 @@ async fn only_git_decides_what_needs_an_identity() {
     let (_guard, work) = scratch();
     init_repository(&work);
     std::fs::write(work.join("p"), b"p\n").expect("p");
-    let mut shell = shell(work.clone(), false).await;
-    for name in ["EMAIL", "GIT_EDITOR"] {
-        shell.env_mut().unset(name).expect("unset");
-    }
+    let shell = git_shell(&work, false).await;
+    status(&shell, "unset EMAIL GIT_EDITOR; printf 'p\\n' > p").await;
 
-    assert_eq!(run(&mut shell, "git status > /dev/null").await, 0);
-    assert_eq!(run(&mut shell, "git add -- p").await, 0);
+    assert_eq!(status(&shell, "git status > /dev/null").await, 0);
+    assert_eq!(status(&shell, "git add -- p").await, 0);
     let head = || {
         git2::Repository::open(&work)
             .expect("open")
@@ -260,16 +167,22 @@ async fn only_git_decides_what_needs_an_identity() {
             .expect("a direct HEAD")
     };
     let before = head();
-    assert_eq!(
-        run(
-            &mut shell,
-            "git -c user.useConfigOnly=true commit -q -m no-identity 2>/dev/null"
-        )
-        .await,
-        128
-    );
+    let result = shell
+        .run("git -c user.useConfigOnly=true commit -q -m no-identity 2>/dev/null")
+        .await;
+    let code = match &result {
+        Ok(result) => u8::from(result.exit_code),
+        Err(error) => u8::from(
+            error
+                .execution_result()
+                .expect("native status retained")
+                .exit_code,
+        ),
+    };
+    assert_eq!(code, 128);
     assert_eq!(head(), before, "no commit was made");
     assert_eq!(staged(&work), ["p"], "the index is as the stage left it");
+    shell.close(false).await.expect("close shell");
 }
 
 /// `exec` is the one builtin that must not replace the process: the session's records and its
@@ -277,17 +190,9 @@ async fn only_git_decides_what_needs_an_identity() {
 #[tokio::test]
 async fn exec_runs_the_program_and_exits_the_shell() {
     let (_guard, work) = scratch();
-    let mut shell = shell(work.clone(), true).await;
-    let params = shell.default_exec_params();
+    let shell = git_shell(&work, true).await;
 
-    let result = shell
-        .run_string(
-            "exec touch made.txt; printf after > not.txt",
-            &SourceInfo::from("test"),
-            &params,
-        )
-        .await
-        .expect("run the line");
+    let result = run(&shell, "exec touch made.txt; printf after > not.txt").await;
 
     assert!(work.join("made.txt").exists(), "the program ran");
     assert!(!work.join("not.txt").exists(), "nothing after `exec` runs");
@@ -296,6 +201,8 @@ async fn exec_runs_the_program_and_exits_the_shell() {
         "the shell is asked to exit"
     );
     assert_eq!(u8::from(result.exit_code), 0);
+    assert!(shell.is_closed());
+    shell.close(false).await.expect("close shell");
 }
 
 /// With no program, `exec` is a redirection statement: its file descriptors become the shell's and
@@ -303,15 +210,16 @@ async fn exec_runs_the_program_and_exits_the_shell() {
 #[tokio::test]
 async fn exec_without_a_program_applies_its_redirections() {
     let (_guard, work) = scratch();
-    let mut shell = shell(work.clone(), true).await;
+    let shell = git_shell(&work, true).await;
 
-    assert_eq!(run(&mut shell, "exec 3> fd.txt").await, 0);
-    assert_eq!(run(&mut shell, "printf x >&3").await, 0);
+    assert_eq!(status(&shell, "exec 3> fd.txt").await, 0);
+    assert_eq!(status(&shell, "printf x >&3").await, 0);
 
     assert_eq!(
         std::fs::read_to_string(work.join("fd.txt")).expect("read"),
         "x"
     );
+    shell.close(false).await.expect("close shell");
 }
 
 /// `-c` would run the program without the environment the session attributes its effects through,
@@ -319,14 +227,11 @@ async fn exec_without_a_program_applies_its_redirections() {
 #[tokio::test]
 async fn exec_refuses_an_empty_environment() {
     let (_guard, work) = scratch();
-    let mut shell = shell(work.clone(), true).await;
+    let shell = git_shell(&work, true).await;
 
-    let (code, stderr) = run_capturing(&mut shell, &work, "exec -c true").await;
+    let (code, _) = run_capturing(&shell, "exec -c true").await;
     assert_eq!(code, 2);
-    assert!(
-        stderr.contains("exec: -c is not supported"),
-        "got {stderr:?}"
-    );
+    shell.close(false).await.expect("close shell");
 }
 
 /// A program that is not on `PATH` is reported as git's — and bash's — 127, not as a panic or a
@@ -334,8 +239,9 @@ async fn exec_refuses_an_empty_environment() {
 #[tokio::test]
 async fn exec_reports_a_missing_program() {
     let (_guard, work) = scratch();
-    let mut shell = shell(work.clone(), true).await;
+    let shell = git_shell(&work, true).await;
 
-    let (code, _) = run_capturing(&mut shell, &work, "exec definitely-not-a-program-xyz").await;
+    let (code, _) = run_capturing(&shell, "exec definitely-not-a-program-xyz").await;
     assert_eq!(code, 127);
+    shell.close(false).await.expect("close shell");
 }

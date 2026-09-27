@@ -1,10 +1,10 @@
 use std::io::{self, ErrorKind, Write};
-use std::path::Path;
 use std::time::{Duration, Instant};
 
-use rmux_client::{Connection, connect};
+use rmux_client::Connection;
 use rmux_proto::{
-    PaneId, PaneSnapshotCell, PaneSnapshotResponse, PaneTarget, PaneTargetRef, Response,
+    CommandOutput, ErrorResponse, PaneId, PaneSnapshotCell, PaneSnapshotResponse, PaneTarget,
+    PaneTargetRef, Response, SessionName, Target,
 };
 use serde_json::{Value, json};
 
@@ -30,27 +30,14 @@ pub(super) fn check_disabled(env_name: &str, command_name: &str) -> Result<(), E
     Ok(())
 }
 
-/// Connects to the server socket, mapping client errors into a CLI `ExitFailure`.
-pub(super) fn connect_cli(socket_path: &Path) -> Result<Connection, ExitFailure> {
-    connect(socket_path).map_err(|error| ExitFailure::from_client_connect(socket_path, error))
-}
-
-/// Resolves the positional pane slot for `target`, defaulting to the current pane.
-pub(super) fn resolve_pane_slot(
-    connection: &mut Connection,
-    target: Option<&TargetSpec>,
-    command_name: &'static str,
-) -> Result<PaneTarget, ExitFailure> {
-    resolve_pane_target_or_current(connection, target, command_name)
-}
-
-/// Resolves `target` to a pane reference pinned by pane id, immune to later renumbering.
-pub(super) fn resolve_stable_pane_target(
+/// Resolves `target` (or the current pane) to a reference pinned by pane id, immune to later
+/// renumbering.
+pub(super) fn resolve_pane_ref(
     connection: &mut Connection,
     target: Option<&TargetSpec>,
     command_name: &'static str,
 ) -> Result<PaneTargetRef, ExitFailure> {
-    let slot = resolve_pane_slot(connection, target, command_name)?;
+    let slot = resolve_pane_target_or_current(connection, target, command_name)?;
     stable_pane_ref_for_slot(connection, &slot, command_name)
 }
 
@@ -64,15 +51,6 @@ pub(in crate::cli) fn stable_pane_ref_for_slot(
     Ok(PaneTargetRef::by_id(slot.session_name().clone(), pane_id))
 }
 
-/// Resolves `target` to a stable pane reference for automation commands.
-pub(super) fn resolve_pane_ref(
-    connection: &mut Connection,
-    target: Option<&TargetSpec>,
-    command_name: &'static str,
-) -> Result<PaneTargetRef, ExitFailure> {
-    resolve_stable_pane_target(connection, target, command_name)
-}
-
 /// Fetches the current cell grid of `target`, turning error responses into failures.
 pub(super) fn pane_snapshot(
     connection: &mut Connection,
@@ -83,17 +61,45 @@ pub(super) fn pane_snapshot(
         .map_err(ExitFailure::from)?
     {
         Response::PaneSnapshot(snapshot) => Ok(snapshot),
-        Response::Error(error) => Err(ExitFailure::new(
-            1,
-            tmux_cli_error_message("pane-snapshot", &error.error),
-        )),
-        other => Err(ExitFailure::new(
-            1,
-            format!(
-                "protocol error: unexpected '{}' response for pane-snapshot",
-                other.command_name()
-            ),
-        )),
+        other => Err(response_error(&other, "pane-snapshot", "for pane-snapshot")),
+    }
+}
+
+/// The failure for a server error answering `command_name`, in tmux's wording.
+pub(super) fn command_error(command_name: &str, error: &ErrorResponse) -> ExitFailure {
+    ExitFailure::new(1, tmux_cli_error_message(command_name, &error.error))
+}
+
+/// The protocol failure for a response that does not fit `context`, such as `for send-keys`.
+pub(super) fn protocol_mismatch(response: &Response, context: &str) -> ExitFailure {
+    ExitFailure::new(
+        1,
+        format!(
+            "protocol error: unexpected '{}' response {context}",
+            response.command_name()
+        ),
+    )
+}
+
+/// The failure for a response `command_name` did not expect: a server error in tmux's wording,
+/// anything else as a protocol mismatch described by `context`.
+pub(super) fn response_error(
+    response: &Response,
+    command_name: &str,
+    context: &str,
+) -> ExitFailure {
+    match response {
+        Response::Error(error) => command_error(command_name, error),
+        other => protocol_mismatch(other, context),
+    }
+}
+
+/// The human-readable kind word for a resolved `Target`.
+pub(super) const fn target_kind_name(target: &Target) -> &'static str {
+    match target {
+        Target::Session(_) => "session",
+        Target::Window(_) => "window",
+        Target::Pane(_) => "pane",
     }
 }
 
@@ -254,7 +260,7 @@ fn next_char_boundary_after(value: &str, index: usize) -> usize {
 }
 
 /// Writes `value` as one JSON line on stdout and yields the success exit code.
-pub(super) fn write_json(value: &Value) -> Result<i32, ExitFailure> {
+pub(super) fn write_json_line(value: &Value) -> Result<i32, ExitFailure> {
     let mut stdout = io::stdout().lock();
     serde_json::to_writer(&mut stdout, value)
         .map_err(|error| ExitFailure::new(1, format!("failed to encode JSON: {error}")))?;
@@ -264,8 +270,7 @@ pub(super) fn write_json(value: &Value) -> Result<i32, ExitFailure> {
 
 /// Writes raw bytes to stdout and yields the success exit code.
 pub(super) fn write_stdout_bytes(bytes: &[u8]) -> Result<i32, ExitFailure> {
-    let mut stdout = io::stdout().lock();
-    write_all_stdout(&mut stdout, bytes)?;
+    write_stdout_bytes_or_broken_pipe(bytes)?;
     Ok(0)
 }
 
@@ -291,15 +296,7 @@ pub(super) fn stdout_closed() -> bool {
 
 /// Writes bytes to stdout, reporting a broken pipe as an outcome rather than an error.
 pub(super) fn write_stdout_bytes_or_broken_pipe(bytes: &[u8]) -> Result<StdoutWrite, ExitFailure> {
-    let mut stdout = io::stdout().lock();
-    match stdout.write_all(bytes) {
-        Ok(()) => Ok(StdoutWrite::Written),
-        Err(error) if error.kind() == ErrorKind::BrokenPipe => Ok(StdoutWrite::BrokenPipe),
-        Err(error) => Err(ExitFailure::new(
-            1,
-            format!("failed to write stdout: {error}"),
-        )),
-    }
+    write_all_stdout(&mut io::stdout().lock(), bytes)
 }
 
 /// Writes `line` and a newline to stdout, yielding the success exit code.
@@ -310,16 +307,24 @@ pub(super) fn write_stdout_line(line: &str) -> Result<i32, ExitFailure> {
     Ok(0)
 }
 
+/// Writes `text` and a newline to stdout, or nothing at all when `text` is empty.
+pub(super) fn write_stdout_text(text: &str) -> Result<i32, ExitFailure> {
+    if text.is_empty() {
+        return write_stdout_bytes(b"");
+    }
+    write_stdout_line(text)
+}
+
 /// Writes `line` and a newline to stderr, ignoring write failures.
 pub(super) fn write_stderr_line(line: &str) {
     let _ = writeln!(io::stderr().lock(), "{line}");
 }
 
-/// Writes all of `bytes` to `stdout`, treating a broken pipe as success.
-fn write_all_stdout(stdout: &mut impl Write, bytes: &[u8]) -> Result<(), ExitFailure> {
+/// Writes all of `bytes` to `stdout`, reporting a broken pipe as an outcome rather than an error.
+fn write_all_stdout(stdout: &mut impl Write, bytes: &[u8]) -> Result<StdoutWrite, ExitFailure> {
     match stdout.write_all(bytes) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == ErrorKind::BrokenPipe => Ok(()),
+        Ok(()) => Ok(StdoutWrite::Written),
+        Err(error) if error.kind() == ErrorKind::BrokenPipe => Ok(StdoutWrite::BrokenPipe),
         Err(error) => Err(ExitFailure::new(
             1,
             format!("failed to write stdout: {error}"),
@@ -367,55 +372,64 @@ pub(in crate::cli) fn pane_process_state(
     }
 }
 
+/// Lists the panes of one window of `session_name` (or all its windows) rendered with `format`,
+/// handing a server error back for the caller to judge and failing any other mismatch as a
+/// protocol error described by `context`.
+pub(super) fn list_panes_output(
+    connection: &mut Connection,
+    session_name: SessionName,
+    window_index: Option<u32>,
+    format: String,
+    context: &str,
+) -> Result<Result<CommandOutput, ErrorResponse>, ExitFailure> {
+    match connection
+        .list_panes_in_window(session_name, window_index, Some(format))
+        .map_err(ExitFailure::from)?
+    {
+        Response::ListPanes(response) => Ok(Ok(response.output)),
+        Response::Error(error) => Ok(Err(error)),
+        other => Err(protocol_mismatch(&other, context)),
+    }
+}
+
+/// The fields after the leading pane index pair on the first listed row naming `target`'s slot.
+pub(super) fn slot_row_fields<'a>(
+    listing: &'a str,
+    target: &PaneTarget,
+) -> Option<impl Iterator<Item = &'a str>> {
+    listing
+        .lines()
+        .map(|line| line.split('\t'))
+        .find_map(|mut fields| {
+            listed_pane_index_matches_target(
+                target,
+                fields.next().unwrap_or_default(),
+                fields.next().unwrap_or_default(),
+            )
+            .then_some(fields)
+        })
+}
+
 /// Looks up the stable pane id currently occupying the positional slot `target`.
 fn pane_id_for_slot(
     connection: &mut Connection,
     target: &PaneTarget,
     command_name: &'static str,
 ) -> Result<PaneId, ExitFailure> {
-    let response = connection
-        .list_panes_in_window(
-            target.session_name().clone(),
-            Some(target.window_index()),
-            Some("#{pane_index}\t#{pane-base-index}\t#{pane_id}\n".to_owned()),
-        )
-        .map_err(ExitFailure::from)?;
-    let output = match response {
-        Response::ListPanes(response) => response.output,
-        Response::Error(error) => {
-            return Err(ExitFailure::new(
-                1,
-                tmux_cli_error_message(command_name, &error.error),
-            ));
-        }
-        other => {
-            return Err(ExitFailure::new(
-                1,
-                format!(
-                    "protocol error: unexpected '{}' response while resolving pane id",
-                    other.command_name()
-                ),
-            ));
-        }
-    };
-    for line in String::from_utf8_lossy(output.stdout()).lines() {
-        let mut fields = line.split('\t');
-        if !listed_pane_index_matches_target(
-            target,
-            fields.next().unwrap_or_default(),
-            fields.next().unwrap_or_default(),
-        ) {
-            continue;
-        }
-        if let Some(pane_id) = fields.next().and_then(parse_pane_id) {
-            return Ok(pane_id);
-        }
-        break;
-    }
-    Err(ExitFailure::new(
-        1,
-        format!("unable to resolve pane id for target {target}"),
-    ))
+    let output = list_panes_output(
+        connection,
+        target.session_name().clone(),
+        Some(target.window_index()),
+        "#{pane_index}\t#{pane-base-index}\t#{pane_id}\n".to_owned(),
+        "while resolving pane id",
+    )?
+    .map_err(|error| command_error(command_name, &error))?;
+    let listing = String::from_utf8_lossy(output.stdout());
+    slot_row_fields(&listing, target)
+        .and_then(|mut fields| fields.next().and_then(parse_pane_id))
+        .ok_or_else(|| {
+            ExitFailure::new(1, format!("unable to resolve pane id for target {target}"))
+        })
 }
 
 /// Reads pane liveness from a positional slot listing, treating a vanished pane as exited.
@@ -423,50 +437,22 @@ fn pane_process_state_for_slot(
     connection: &mut Connection,
     target: &PaneTarget,
 ) -> Result<PaneProcessState, ExitFailure> {
-    let response = connection
-        .list_panes_in_window(
-            target.session_name().clone(),
-            Some(target.window_index()),
-            Some(
-                "#{pane_index}\t#{pane-base-index}\t#{pane_dead}\t#{pane_dead_status}\t#{pane_dead_signal}\n"
-                    .to_owned(),
-            ),
-        )
-        .map_err(ExitFailure::from)?;
-    let output = match response {
-        Response::ListPanes(response) => response.output,
-        Response::Error(_) => {
-            return Ok(PaneProcessState::Exited(PaneExitStatus::stale()));
-        }
-        other => {
-            return Err(ExitFailure::new(
-                1,
-                format!(
-                    "protocol error: unexpected '{}' response for pane process state",
-                    other.command_name()
-                ),
-            ));
-        }
+    let Ok(output) = list_panes_output(
+        connection,
+        target.session_name().clone(),
+        Some(target.window_index()),
+        "#{pane_index}\t#{pane-base-index}\t#{pane_dead}\t#{pane_dead_status}\t#{pane_dead_signal}\n"
+            .to_owned(),
+        "for pane process state",
+    )?
+    else {
+        return Ok(PaneProcessState::Exited(PaneExitStatus::stale()));
     };
-    let text = String::from_utf8_lossy(output.stdout());
-    for line in text.lines() {
-        let mut fields = line.split('\t');
-        if !listed_pane_index_matches_target(
-            target,
-            fields.next().unwrap_or_default(),
-            fields.next().unwrap_or_default(),
-        ) {
-            continue;
-        }
-        if fields.next() == Some("1") {
-            return Ok(PaneProcessState::Exited(PaneExitStatus::known(
-                parse_i32_field(fields.next()),
-                parse_i32_field(fields.next()),
-            )));
-        }
-        return Ok(PaneProcessState::Alive);
-    }
-    Ok(PaneProcessState::Exited(PaneExitStatus::stale()))
+    let listing = String::from_utf8_lossy(output.stdout());
+    Ok(slot_row_fields(&listing, target).map_or_else(
+        || PaneProcessState::Exited(PaneExitStatus::stale()),
+        listed_process_state,
+    ))
 }
 
 /// Reads pane liveness by pane id, treating a vanished pane as exited.
@@ -476,50 +462,41 @@ fn pane_process_state_for_slot(
 )]
 fn pane_process_state_for_id(
     connection: &mut Connection,
-    session_name: &rmux_proto::SessionName,
+    session_name: &SessionName,
     pane_id: PaneId,
 ) -> Result<PaneProcessState, ExitFailure> {
-    let response = connection
-        .list_panes_in_window(
-            session_name.clone(),
-            None,
-            Some("#{pane_id}\t#{pane_dead}\t#{pane_dead_status}\t#{pane_dead_signal}\n".to_owned()),
-        )
-        .map_err(ExitFailure::from)?;
-    let output = match response {
-        Response::ListPanes(response) => response.output,
-        Response::Error(_) => {
-            return Ok(PaneProcessState::Exited(PaneExitStatus::stale()));
-        }
-        other => {
-            return Err(ExitFailure::new(
-                1,
-                format!(
-                    "protocol error: unexpected '{}' response for pane process state",
-                    other.command_name()
-                ),
-            ));
-        }
+    let Ok(output) = list_panes_output(
+        connection,
+        session_name.clone(),
+        None,
+        "#{pane_id}\t#{pane_dead}\t#{pane_dead_status}\t#{pane_dead_signal}\n".to_owned(),
+        "for pane process state",
+    )?
+    else {
+        return Ok(PaneProcessState::Exited(PaneExitStatus::stale()));
     };
-    let text = String::from_utf8_lossy(output.stdout());
-    for line in text.lines() {
-        let fields = line.split('\t').collect::<Vec<_>>();
-        if fields.first().and_then(|value| parse_pane_id(value)) != Some(pane_id) {
-            continue;
+    for line in String::from_utf8_lossy(output.stdout()).lines() {
+        let mut fields = line.split('\t');
+        if fields.next().and_then(parse_pane_id) == Some(pane_id) {
+            return Ok(listed_process_state(fields));
         }
-        if fields.get(1).copied() == Some("1") {
-            return Ok(PaneProcessState::Exited(PaneExitStatus::known(
-                parse_i32_field(fields.get(2).copied()),
-                parse_i32_field(fields.get(3).copied()),
-            )));
-        }
-        return Ok(PaneProcessState::Alive);
     }
     Ok(PaneProcessState::Exited(PaneExitStatus::stale()))
 }
 
-/// Parses a `%`-prefixed pane id, returning `None` for malformed input.
-fn parse_pane_id(value: &str) -> Option<PaneId> {
+/// Reads a listed pane's `dead` flag, exit status and exit signal fields into its state.
+fn listed_process_state<'a>(mut fields: impl Iterator<Item = &'a str>) -> PaneProcessState {
+    if fields.next() != Some("1") {
+        return PaneProcessState::Alive;
+    }
+    PaneProcessState::Exited(PaneExitStatus::known(
+        parse_i32_field(fields.next()),
+        parse_i32_field(fields.next()),
+    ))
+}
+
+/// Parses a `%`-prefixed pane id such as `%3`, returning `None` for malformed input.
+pub(super) fn parse_pane_id(value: &str) -> Option<PaneId> {
     value
         .strip_prefix('%')?
         .parse::<u32>()
@@ -528,19 +505,18 @@ fn parse_pane_id(value: &str) -> Option<PaneId> {
 }
 
 /// Parses a present, non-empty tab-separated field as an `i32`.
-fn parse_i32_field(value: Option<&str>) -> Option<i32> {
+pub(super) fn parse_i32_field(value: Option<&str>) -> Option<i32> {
     value
         .filter(|value| !value.is_empty())
         .and_then(|value| value.parse::<i32>().ok())
 }
 
+/// Snapshot fixtures shared by the automation unit tests.
 #[cfg(test)]
-#[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
-mod tests {
+pub(super) mod fixtures {
     use rmux_proto::{PaneSnapshotCell, PaneSnapshotCursor, PaneSnapshotResponse};
 
-    use super::{find_visible_text, visible_lines};
-
+    /// One cell `width` columns wide, or the padding cell that trails a wide glyph.
     fn cell(text: &str, width: u8, padding: bool) -> PaneSnapshotCell {
         PaneSnapshotCell {
             text: text.to_owned(),
@@ -554,11 +530,17 @@ mod tests {
         }
     }
 
-    fn snapshot(cells: Vec<PaneSnapshotCell>) -> PaneSnapshotResponse {
+    /// A one-row, four-column grid holding `A`, a wide `界` plus its padding cell, then `B`.
+    pub(in crate::cli::automation) fn wide_glyph_snapshot() -> PaneSnapshotResponse {
         PaneSnapshotResponse {
             cols: 4,
             rows: 1,
-            cells,
+            cells: vec![
+                cell("A", 1, false),
+                cell("界", 2, false),
+                cell(" ", 0, true),
+                cell("B", 1, false),
+            ],
             cursor: PaneSnapshotCursor {
                 row: 0,
                 col: 0,
@@ -568,15 +550,17 @@ mod tests {
             revision: 1,
         }
     }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
+mod tests {
+    use super::fixtures::wide_glyph_snapshot;
+    use super::{find_visible_text, visible_lines};
 
     #[test]
     fn visible_text_coordinates_use_terminal_columns_for_wide_cells() {
-        let snapshot = snapshot(vec![
-            cell("A", 1, false),
-            cell("界", 2, false),
-            cell(" ", 0, true),
-            cell("B", 1, false),
-        ]);
+        let snapshot = wide_glyph_snapshot();
 
         assert_eq!(visible_lines(&snapshot), vec!["A界B"]);
         let matches = find_visible_text(&snapshot, "界B");

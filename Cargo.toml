@@ -23,6 +23,11 @@ name = "rmux"
 path = "src/rmux/main.rs"
 bench = false
 
+[[bin]]
+name = "marsh-trace"
+path = "src/trace/main.rs"
+bench = false
+
 [features]
 default = ["web"]
 web = ["rmux-server/web"]
@@ -31,6 +36,7 @@ perf-instrument = ["rmux-server/perf-instrument"]
 [dependencies]
 marsh-core = { path = "crates/marsh-core" }
 marsh-lib = { path = "crates/marsh-lib", default-features = false }
+marsh-instrument = { path = "crates/marsh-instrument" }
 
 # The server is the one rmux crate that is local: its pane, popup and workload backends are
 # marsh's. Everything else is upstream at the pinned commit.
@@ -67,17 +73,20 @@ tokio = { version = "1.52.3", features = [
 ] }
 
 [dev-dependencies]
+marsh-core = { path = "crates/marsh-core", features = ["testing"] }
+rmux-server = { version = "=0.10.0", default-features = false, features = ["testing"] }
 brush-core.workspace = true
 brush-builtins.workspace = true
 marsh-btrfs = { path = "crates/marsh-btrfs", features = ["fake"] }
 marsh-wal = { path = "crates/marsh-wal" }
-marsh-instrument = { path = "crates/marsh-instrument" }
+# The WAL smoke's own transaction metadata derives its serde implementations.
+serde = { version = "1", features = ["derive"] }
 git2 = { version = "0.21", default-features = false, features = ["vendored-libgit2"] }
 tempfile = "3.27.0"
 hex = "0.4"
 serial_test = "3"
 sha1 = "0.10"
-tokio = { version = "1.52.3", features = ["macros", "rt", "sync", "time"] }
+tokio = { version = "1.52.3", features = ["macros", "process", "rt", "sync", "time"] }
 
 [lints]
 workspace = true
@@ -97,6 +106,11 @@ rust-version = "1.95.0"
 brush-core = "0.5.0"
 brush-builtins = "0.2.0"
 
+# Unmodified crates.io library. marsh-instrument supplies host observation and file identity
+# through its own wrapper around lurk's public types, argument tables and filters.
+lurk-cli = "=0.3.14"
+syscalls = { version = "=0.8.1", features = ["full"] }
+
 # Every rmux library except the server comes from upstream, pinned to the exact commit the
 # vendored server was copied from. The server itself is local — its pane, popup and workload
 # backends are marsh's — and is selected through `[patch.crates-io]` so that both this package
@@ -112,10 +126,9 @@ rmux-web-crypto = { version = "=0.10.0", git = "https://github.com/Helvesec/rmux
 
 # brush-core carries changes that are not released: the ExternalCommandSpawner seam
 # (https://github.com/reubeno/brush/pull/1382), which MarshExecutor is an implementation of, a
-# public accessor for a shell's spawner, and the pipeline's process group carried into a
-# builtin's ExecutionContext, which the `git` builtin needs to start the system git through that
-# spawner in the right group. crates/brush-core is crates.io's 0.5.0 plus those; every other
-# brush crate is stock.
+# public accessor for a shell's spawner, the pipeline's process group carried into a builtin's
+# ExecutionContext, and a generic ExecutionObserver that scopes builtins and scheduled work.
+# crates/brush-core is crates.io's 0.5.0 plus those; every other brush crate is stock.
 [patch.crates-io]
 brush-core = { path = "crates/brush-core" }
 rmux-server = { path = "crates/rmux-server" }

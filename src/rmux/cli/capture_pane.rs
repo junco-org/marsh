@@ -1,37 +1,22 @@
 use std::path::Path;
 
-use rmux_client::{Connection, connect};
+use rmux_client::Connection;
 use rmux_proto::{CapturePaneRequest, CapturePaneTargetActionRequest, Response};
 
 use crate::cli_args::{CapturePaneArgs, TargetSpec};
 
+use super::target_resolution::connect_cli;
 use super::{
     ExitFailure, capture_target_action_needs_legacy_retry, cli_target_actions_enabled,
     resolve_pane_target_or_current,
 };
 
 /// A validated `capture-pane` invocation held until a target and transport are chosen.
-#[derive(Clone)]
 pub(super) struct PendingCapturePaneRequest {
+    /// The parsed `-t` spec, resolved locally only for the legacy request shape.
     target: Option<TargetSpec>,
-    start: Option<i64>,
-    end: Option<i64>,
-    print: bool,
-    buffer_name: Option<String>,
-    alternate: bool,
-    escape_ansi: bool,
-    escape_sequences: bool,
-    include_format: bool,
-    hyperlinks: bool,
-    line_numbers: bool,
-    join_wrapped: bool,
-    use_mode_screen: bool,
-    preserve_trailing_spaces: bool,
-    do_not_trim_spaces: bool,
-    pending_input: bool,
-    quiet: bool,
-    start_is_absolute: bool,
-    end_is_absolute: bool,
+    /// The request as the server-side target action sends it, carrying the raw `-t` text.
+    request: CapturePaneTargetActionRequest,
 }
 
 /// Validates `capture-pane` arguments, parsing the `-S`/`-E` bounds into a pending request.
@@ -42,37 +27,41 @@ pub(super) fn capture_pane_request(
     let (end, end_is_absolute) = parse_capture_bound(args.end.as_deref(), "-E")?;
 
     Ok(PendingCapturePaneRequest {
+        request: CapturePaneTargetActionRequest {
+            target: args.target.as_ref().map(|target| target.raw().to_owned()),
+            start,
+            end,
+            print: args.print,
+            buffer_name: args.buffer_name,
+            alternate: args.alternate,
+            escape_ansi: args.escape_ansi,
+            escape_sequences: args.escape_sequences,
+            include_format: args.include_format,
+            hyperlinks: args.hyperlinks,
+            line_numbers: args.line_numbers,
+            join_wrapped: args.join_wrapped,
+            use_mode_screen: args.use_mode_screen,
+            preserve_trailing_spaces: args.preserve_trailing_spaces,
+            do_not_trim_spaces: args.do_not_trim_spaces,
+            pending_input: args.pending_input,
+            quiet: args.quiet,
+            start_is_absolute,
+            end_is_absolute,
+        },
         target: args.target,
-        start,
-        end,
-        print: args.print,
-        buffer_name: args.buffer_name,
-        alternate: args.alternate,
-        escape_ansi: args.escape_ansi,
-        escape_sequences: args.escape_sequences,
-        include_format: args.include_format,
-        hyperlinks: args.hyperlinks,
-        line_numbers: args.line_numbers,
-        join_wrapped: args.join_wrapped,
-        use_mode_screen: args.use_mode_screen,
-        preserve_trailing_spaces: args.preserve_trailing_spaces,
-        do_not_trim_spaces: args.do_not_trim_spaces,
-        pending_input: args.pending_input,
-        quiet: args.quiet,
-        start_is_absolute,
-        end_is_absolute,
     })
 }
 
 /// Resolves the pending request's target to a concrete pane for the legacy request shape.
-pub(super) fn build_capture_pane_request(
+fn build_capture_pane_request(
     connection: &mut Connection,
-    request: PendingCapturePaneRequest,
+    pending: PendingCapturePaneRequest,
 ) -> Result<CapturePaneRequest, ExitFailure> {
+    let request = pending.request;
     Ok(CapturePaneRequest {
         target: resolve_pane_target_or_current(
             connection,
-            request.target.as_ref(),
+            pending.target.as_ref(),
             "capture-pane",
         )?,
         start: request.start,
@@ -96,57 +85,24 @@ pub(super) fn build_capture_pane_request(
     })
 }
 
-/// Converts the pending request into the target-action shape, leaving the target unresolved.
-pub(super) fn build_capture_pane_target_action_request(
-    request: PendingCapturePaneRequest,
-) -> CapturePaneTargetActionRequest {
-    CapturePaneTargetActionRequest {
-        target: request
-            .target
-            .as_ref()
-            .map(|target| target.raw().to_owned()),
-        start: request.start,
-        end: request.end,
-        print: request.print,
-        buffer_name: request.buffer_name,
-        alternate: request.alternate,
-        escape_ansi: request.escape_ansi,
-        escape_sequences: request.escape_sequences,
-        include_format: request.include_format,
-        hyperlinks: request.hyperlinks,
-        line_numbers: request.line_numbers,
-        join_wrapped: request.join_wrapped,
-        use_mode_screen: request.use_mode_screen,
-        preserve_trailing_spaces: request.preserve_trailing_spaces,
-        do_not_trim_spaces: request.do_not_trim_spaces,
-        pending_input: request.pending_input,
-        quiet: request.quiet,
-        start_is_absolute: request.start_is_absolute,
-        end_is_absolute: request.end_is_absolute,
-    }
-}
-
 /// Sends the capture, preferring server-side target actions and retrying on a legacy server.
 pub(super) fn send_capture_pane_request(
     connection: &mut Connection,
     socket_path: &Path,
-    request: PendingCapturePaneRequest,
+    pending: PendingCapturePaneRequest,
 ) -> Result<Response, ExitFailure> {
     if !cli_target_actions_enabled() {
-        let request = build_capture_pane_request(connection, request)?;
+        let request = build_capture_pane_request(connection, pending)?;
         return connection.capture_pane(request).map_err(ExitFailure::from);
     }
 
-    let legacy_request = request.clone();
-    let response =
-        connection.capture_pane_target_action(build_capture_pane_target_action_request(request));
+    let response = connection.capture_pane_target_action(pending.request.clone());
     if !capture_target_action_needs_legacy_retry(&response) {
         return response.map_err(ExitFailure::from);
     }
 
-    let mut legacy_connection = connect(socket_path)
-        .map_err(|error| ExitFailure::from_client_connect(socket_path, error))?;
-    let request = build_capture_pane_request(&mut legacy_connection, legacy_request)?;
+    let mut legacy_connection = connect_cli(socket_path)?;
+    let request = build_capture_pane_request(&mut legacy_connection, pending)?;
     legacy_connection
         .capture_pane(request)
         .map_err(ExitFailure::from)

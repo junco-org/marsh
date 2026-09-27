@@ -6,57 +6,24 @@ use crate::pane_io::PaneExitEvent;
 use crate::pane_state_journal::{PaneStateChange, PANE_STATE_JOURNAL_CAPACITY};
 use rmux_core::{LifecycleEvent, PaneId};
 use rmux_proto::{
-    BreakPaneRequest, HookLifecycle, HookName, KillWindowRequest, LinkWindowRequest,
-    MoveWindowRequest, MoveWindowTarget, NewSessionRequest, NewWindowRequest, PaneKillRequest,
-    PaneOptionSetRequest, PaneStateClosedReason, PaneStateCursorRequest, PaneStateEventDto,
-    PaneStateSubscriptionId, PaneTarget, PaneTargetRef, Request, RespawnPaneRequest, Response,
-    ScopeSelector, SessionName, SetHookRequest, SetOptionMode, SplitDirection, SplitWindowRequest,
-    SplitWindowTarget, SubscribePaneStateRequest, TerminalSize, UnlinkWindowRequest, WindowTarget,
+    BreakPaneRequest, HookName, KillWindowRequest, LinkWindowRequest, MoveWindowRequest,
+    NewWindowRequest, PaneKillRequest, PaneOptionSetRequest, PaneStateClosedReason,
+    PaneStateEventDto, PaneStateSubscriptionId, PaneTarget, PaneTargetRef, Request,
+    RespawnPaneRequest, Response, ScopeSelector, SessionName, SetHookRequest, SetOptionMode,
+    SplitWindowRequest, SubscribePaneStateRequest, UnlinkWindowRequest, WindowTarget,
 };
 
-use crate::test_names::session_name;
-
-async fn create_session(handler: &RequestHandler, value: &str) -> SessionName {
-    let session = session_name(value);
-    let response = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name: session.clone(),
-            detached: true,
-            size: Some(TerminalSize { cols: 80, rows: 24 }),
-            environment: None,
-        }))
-        .await;
-    assert!(matches!(response, Response::NewSession(_)), "{response:?}");
-    session
-}
-
-async fn create_window(handler: &RequestHandler, session: &SessionName, index: u32) {
-    let response = handler
-        .handle(Request::NewWindow(Box::new(NewWindowRequest {
-            target: session.clone(),
-            name: None,
-            detached: true,
-            environment: None,
-            command: None,
-            start_directory: None,
-            target_window_index: Some(index),
-            insert_at_target: false,
-            process_command: None,
-        })))
-        .await;
-    assert!(matches!(response, Response::NewWindow(_)), "{response:?}");
-}
+use crate::test_fixtures::Fixture;
+use crate::test_shell::stdin_discard_command;
 
 async fn install_destructive_window_hook(handler: &RequestHandler, hook: HookName) {
-    let response = handler
-        .handle(Request::SetHook(SetHookRequest {
-            scope: ScopeSelector::Global,
+    handler
+        .handle_ok(SetHookRequest::fixture((
+            ScopeSelector::Global,
             hook,
-            command: "kill-window".to_owned(),
-            lifecycle: HookLifecycle::Persistent,
-        }))
+            "kill-window",
+        )))
         .await;
-    assert!(matches!(response, Response::SetHook(_)), "{response:?}");
 }
 
 async fn create_window_direct(
@@ -68,15 +35,8 @@ async fn create_window_direct(
         .handle_new_window(
             std::process::id(),
             NewWindowRequest {
-                target: session.clone(),
-                name: None,
-                detached: true,
-                environment: None,
-                command: None,
-                start_directory: None,
                 target_window_index: Some(index),
-                insert_at_target: false,
-                process_command: None,
+                ..Fixture::fixture(session)
             },
         )
         .await
@@ -152,44 +112,21 @@ async fn subscribe(
     target: PaneTarget,
     include_options: bool,
 ) -> (PaneStateSubscriptionId, u64, PaneId) {
-    match handler
-        .handle_subscribe_pane_state(
+    let response = handler
+        .subscribe_ok(
             connection_id,
             SubscribePaneStateRequest {
-                target: PaneTargetRef::slot(target),
                 include_title: true,
                 include_options,
-                include_foreground: false,
+                ..Fixture::fixture(target)
             },
         )
-        .await
-    {
-        Response::SubscribePaneState(response) => (
-            response.subscription_id,
-            response.snapshot.revision,
-            response.pane_id,
-        ),
-        response => panic!("subscribe-pane-state failed: {response:?}"),
-    }
-}
-
-async fn read_cursor(
-    handler: &RequestHandler,
-    connection_id: u64,
-    subscription_id: PaneStateSubscriptionId,
-    after_revision: u64,
-) -> Response {
-    handler
-        .handle_pane_state_cursor(
-            connection_id,
-            PaneStateCursorRequest {
-                subscription_id,
-                after_revision,
-                wait: false,
-                max_events: Some(16),
-            },
-        )
-        .await
+        .await;
+    (
+        response.subscription_id,
+        response.snapshot.revision,
+        response.pane_id,
+    )
 }
 
 fn assert_killed_closed(response: Response, pane_id: PaneId) {
@@ -208,20 +145,15 @@ fn assert_killed_closed(response: Response, pane_id: PaneId) {
 
 fn move_request(source: WindowTarget, target: WindowTarget) -> Request {
     Request::MoveWindow(MoveWindowRequest {
-        source: Some(source),
-        target: MoveWindowTarget::Window(target),
-        renumber: false,
         kill_destination: true,
-        detached: true,
-        after: false,
-        before: false,
+        ..Fixture::fixture((source, target))
     })
 }
 
 #[tokio::test]
 async fn natural_exit_journals_closed_before_the_removed_pane_becomes_observable() {
     let handler = Arc::new(RequestHandler::new());
-    let session = create_session(&handler, "a01-natural-exit").await;
+    let session = handler.create_session("a01-natural-exit").await;
     handler.wait_for_initial_panes_for_test().await;
     let target = PaneTarget::with_window(session.clone(), 0, 0);
     let (subscription_id, revision, pane_id) =
@@ -243,7 +175,10 @@ async fn natural_exit_journals_closed_before_the_removed_pane_becomes_observable
         .await
         .expect("natural exit reaches post-commit pause");
 
-    match read_cursor(&handler, 1000, subscription_id, revision).await {
+    match handler
+        .read_pane_state_cursor_for_test(1000, subscription_id, revision)
+        .await
+    {
         Response::PaneStateCursor(response) => assert!(matches!(
             response.events.as_slice(),
             [PaneStateEventDto::Closed {
@@ -262,7 +197,7 @@ async fn natural_exit_journals_closed_before_the_removed_pane_becomes_observable
 #[tokio::test]
 async fn kept_exit_interposed_by_respawn_cannot_touch_the_new_generation() {
     let handler = Arc::new(RequestHandler::new());
-    let session = create_session(&handler, "a01-kept-exit-respawn").await;
+    let session = handler.create_session("a01-kept-exit-respawn").await;
     handler.wait_for_initial_panes_for_test().await;
     let target = PaneTarget::with_window(session.clone(), 0, 0);
     let pane_id = {
@@ -320,20 +255,12 @@ async fn kept_exit_interposed_by_respawn_cannot_touch_the_new_generation() {
         .await
         .expect("kept exit reaches post-plan pause");
 
-    let respawned = handler
-        .handle(Request::RespawnPane(Box::new(RespawnPaneRequest {
-            target: target.clone(),
-            kill: true,
-            start_directory: None,
-            environment: None,
-            command: Some(vec![crate::test_shell::stdin_discard_command()]),
-            process_command: None,
-        })))
+    handler
+        .handle_ok(RespawnPaneRequest {
+            command: Some(vec![stdin_discard_command()]),
+            ..Fixture::fixture(&target)
+        })
         .await;
-    assert!(
-        matches!(respawned, Response::RespawnPane(_)),
-        "{respawned:?}"
-    );
     let (current_generation, replacement_output_sequence) = {
         let mut state = handler.state.lock().await;
         let generation = state.pane_output_generation_for_target(&target, pane_id);
@@ -378,7 +305,10 @@ async fn kept_exit_interposed_by_respawn_cannot_touch_the_new_generation() {
         }))
         .await;
     assert!(matches!(changed, Response::PaneOptionSet(_)), "{changed:?}");
-    match read_cursor(&handler, 1004, subscription_id, subscription_revision).await {
+    match handler
+        .read_pane_state_cursor_for_test(1004, subscription_id, subscription_revision)
+        .await
+    {
         Response::PaneStateCursor(response) => assert!(matches!(
             response.events.as_slice(),
             [PaneStateEventDto::OptionSet {
@@ -405,9 +335,9 @@ async fn kept_exit_interposed_by_respawn_cannot_touch_the_new_generation() {
 #[tokio::test]
 async fn move_window_k_journals_the_destination_removed_at_commit_for_two_connections() {
     let handler = Arc::new(RequestHandler::new());
-    let source = create_session(&handler, "a01-move-source").await;
-    let destination = create_session(&handler, "a01-move-destination").await;
-    let interloper = create_session(&handler, "a01-move-interloper").await;
+    let source = handler.create_session("a01-move-source").await;
+    let destination = handler.create_session("a01-move-destination").await;
+    let interloper = handler.create_session("a01-move-interloper").await;
     handler.wait_for_initial_panes_for_test().await;
     let destination_target = PaneTarget::with_window(destination.clone(), 0, 0);
     let (old_subscription, old_revision, old_pane_id) =
@@ -440,7 +370,9 @@ async fn move_window_k_journals_the_destination_removed_at_commit_for_two_connec
         "{interposed:?}"
     );
     assert_killed_closed(
-        read_cursor(&handler, 1001, old_subscription, old_revision).await,
+        handler
+            .read_pane_state_cursor_for_test(1001, old_subscription, old_revision)
+            .await,
         old_pane_id,
     );
 
@@ -451,7 +383,9 @@ async fn move_window_k_journals_the_destination_removed_at_commit_for_two_connec
     let moved = moving.await.expect("move-window task joins");
     assert!(matches!(moved, Response::MoveWindow(_)), "{moved:?}");
     assert_killed_closed(
-        read_cursor(&handler, 1002, current_subscription, current_revision).await,
+        handler
+            .read_pane_state_cursor_for_test(1002, current_subscription, current_revision)
+            .await,
         current_pane_id,
     );
 }
@@ -459,9 +393,9 @@ async fn move_window_k_journals_the_destination_removed_at_commit_for_two_connec
 #[tokio::test]
 async fn link_window_journals_the_destination_removed_at_commit_for_two_connections() {
     let handler = Arc::new(RequestHandler::new());
-    let source = create_session(&handler, "a01-link-source").await;
-    let destination = create_session(&handler, "a01-link-destination").await;
-    let interloper = create_session(&handler, "a01-link-interloper").await;
+    let source = handler.create_session("a01-link-source").await;
+    let destination = handler.create_session("a01-link-destination").await;
+    let interloper = handler.create_session("a01-link-interloper").await;
     handler.wait_for_initial_panes_for_test().await;
     let destination_target = PaneTarget::with_window(destination.clone(), 0, 0);
     let (old_subscription, old_revision, old_pane_id) =
@@ -474,12 +408,11 @@ async fn link_window_journals_the_destination_removed_at_commit_for_two_connecti
     let linking = tokio::spawn(async move {
         link_handler
             .handle(Request::LinkWindow(LinkWindowRequest {
-                source: WindowTarget::with_window(link_source, 0),
-                target: WindowTarget::with_window(link_destination, 0),
-                after: false,
-                before: false,
                 kill_destination: true,
-                detached: true,
+                ..Fixture::fixture((
+                    WindowTarget::with_window(link_source, 0),
+                    WindowTarget::with_window(link_destination, 0),
+                ))
             }))
             .await
     });
@@ -498,7 +431,9 @@ async fn link_window_journals_the_destination_removed_at_commit_for_two_connecti
         "{interposed:?}"
     );
     assert_killed_closed(
-        read_cursor(&handler, 1011, old_subscription, old_revision).await,
+        handler
+            .read_pane_state_cursor_for_test(1011, old_subscription, old_revision)
+            .await,
         old_pane_id,
     );
 
@@ -508,7 +443,9 @@ async fn link_window_journals_the_destination_removed_at_commit_for_two_connecti
     let linked = linking.await.expect("link-window task joins");
     assert!(matches!(linked, Response::LinkWindow(_)), "{linked:?}");
     assert_killed_closed(
-        read_cursor(&handler, 1012, current_subscription, current_revision).await,
+        handler
+            .read_pane_state_cursor_for_test(1012, current_subscription, current_revision)
+            .await,
         current_pane_id,
     );
 }
@@ -516,22 +453,26 @@ async fn link_window_journals_the_destination_removed_at_commit_for_two_connecti
 #[tokio::test]
 async fn unlink_window_journals_last_link_decided_at_commit_for_two_connections() {
     let handler = Arc::new(RequestHandler::new());
-    let owner = create_session(&handler, "a01-unlink-owner").await;
-    let peer = create_session(&handler, "a01-unlink-peer").await;
-    create_window(&handler, &owner, 1).await;
-    create_window(&handler, &peer, 1).await;
+    let owner = handler.create_session("a01-unlink-owner").await;
+    let peer = handler.create_session("a01-unlink-peer").await;
+    for session in [&owner, &peer] {
+        handler
+            .create_window(NewWindowRequest {
+                target_window_index: Some(1),
+                ..Fixture::fixture(session)
+            })
+            .await;
+    }
     handler.wait_for_initial_panes_for_test().await;
-    let linked = handler
-        .handle(Request::LinkWindow(LinkWindowRequest {
-            source: WindowTarget::with_window(owner.clone(), 0),
-            target: WindowTarget::with_window(peer.clone(), 0),
-            after: false,
-            before: false,
+    handler
+        .handle_ok(LinkWindowRequest {
             kill_destination: true,
-            detached: true,
-        }))
+            ..Fixture::fixture((
+                WindowTarget::with_window(owner.clone(), 0),
+                WindowTarget::with_window(peer.clone(), 0),
+            ))
+        })
         .await;
-    assert!(matches!(linked, Response::LinkWindow(_)), "{linked:?}");
 
     let watched_target = PaneTarget::with_window(owner.clone(), 0, 0);
     let (first_subscription, first_revision, shared_pane_id) =
@@ -555,16 +496,12 @@ async fn unlink_window_journals_last_link_decided_at_commit_for_two_connections(
         .await
         .expect("unlink-window reaches pre-mutation pause");
 
-    let peer_unlinked = handler
-        .handle(Request::UnlinkWindow(UnlinkWindowRequest {
+    handler
+        .handle_ok(UnlinkWindowRequest {
             target: WindowTarget::with_window(peer, 0),
             kill_if_last: false,
-        }))
+        })
         .await;
-    assert!(
-        matches!(peer_unlinked, Response::UnlinkWindow(_)),
-        "{peer_unlinked:?}"
-    );
     pause.release.notify_one();
     let owner_unlinked = unlinking.await.expect("unlink-window task joins");
     assert!(
@@ -573,11 +510,15 @@ async fn unlink_window_journals_last_link_decided_at_commit_for_two_connections(
     );
 
     assert_killed_closed(
-        read_cursor(&handler, 1021, first_subscription, first_revision).await,
+        handler
+            .read_pane_state_cursor_for_test(1021, first_subscription, first_revision)
+            .await,
         shared_pane_id,
     );
     assert_killed_closed(
-        read_cursor(&handler, 1022, second_subscription, second_revision).await,
+        handler
+            .read_pane_state_cursor_for_test(1022, second_subscription, second_revision)
+            .await,
         shared_pane_id,
     );
 }
@@ -585,8 +526,13 @@ async fn unlink_window_journals_last_link_decided_at_commit_for_two_connections(
 #[tokio::test]
 async fn kill_window_prepares_lifecycle_identity_before_same_slot_reuse() {
     let handler = Arc::new(RequestHandler::new());
-    let session = create_session(&handler, "lifecycle-kill-slot-reuse").await;
-    create_window(&handler, &session, 1).await;
+    let session = handler.create_session("lifecycle-kill-slot-reuse").await;
+    handler
+        .create_window(NewWindowRequest {
+            target_window_index: Some(1),
+            ..Fixture::fixture(&session)
+        })
+        .await;
     install_destructive_window_hook(&handler, HookName::WindowUnlinked).await;
     let mut events = handler.subscribe_lifecycle_events();
     let pause = handler.install_window_lifecycle_emit_pause();
@@ -605,7 +551,12 @@ async fn kill_window_prepares_lifecycle_identity_before_same_slot_reuse() {
         .await
         .expect("kill-window reaches post-commit lifecycle pause");
 
-    create_window(&handler, &session, 0).await;
+    handler
+        .create_window(NewWindowRequest {
+            target_window_index: Some(0),
+            ..Fixture::fixture(&session)
+        })
+        .await;
     let replacement_id = handler
         .state
         .lock()
@@ -636,20 +587,20 @@ async fn kill_window_prepares_lifecycle_identity_before_same_slot_reuse() {
 #[tokio::test]
 async fn unlink_window_prepares_lifecycle_identity_before_same_slot_reuse() {
     let handler = Arc::new(RequestHandler::new());
-    let owner = create_session(&handler, "lifecycle-unlink-slot-reuse").await;
-    let external = create_session(&handler, "lifecycle-unlink-external").await;
-    create_window(&handler, &owner, 1).await;
-    let linked = handler
-        .handle(Request::LinkWindow(LinkWindowRequest {
-            source: WindowTarget::with_window(owner.clone(), 0),
-            target: WindowTarget::with_window(external, 1),
-            after: false,
-            before: false,
-            kill_destination: false,
-            detached: true,
-        }))
+    let owner = handler.create_session("lifecycle-unlink-slot-reuse").await;
+    let external = handler.create_session("lifecycle-unlink-external").await;
+    handler
+        .create_window(NewWindowRequest {
+            target_window_index: Some(1),
+            ..Fixture::fixture(&owner)
+        })
         .await;
-    assert!(matches!(linked, Response::LinkWindow(_)), "{linked:?}");
+    handler
+        .handle_ok(LinkWindowRequest::fixture((
+            WindowTarget::with_window(owner.clone(), 0),
+            WindowTarget::with_window(external, 1),
+        )))
+        .await;
     install_destructive_window_hook(&handler, HookName::WindowUnlinked).await;
     let mut events = handler.subscribe_lifecycle_events();
     let pause = handler.install_window_lifecycle_emit_pause();
@@ -705,7 +656,7 @@ async fn unlink_window_prepares_lifecycle_identity_before_same_slot_reuse() {
 #[tokio::test]
 async fn new_window_prepares_lifecycle_identity_before_same_slot_reuse() {
     let handler = Arc::new(RequestHandler::new());
-    let session = create_session(&handler, "lifecycle-new-slot-reuse").await;
+    let session = handler.create_session("lifecycle-new-slot-reuse").await;
     install_destructive_window_hook(&handler, HookName::WindowLinked).await;
     let mut events = handler.subscribe_lifecycle_events();
     let pause = handler.install_window_lifecycle_emit_pause();
@@ -773,8 +724,8 @@ async fn new_window_prepares_lifecycle_identity_before_same_slot_reuse() {
 #[tokio::test]
 async fn link_window_prepares_lifecycle_identity_before_same_slot_reuse() {
     let handler = Arc::new(RequestHandler::new());
-    let source = create_session(&handler, "lifecycle-link-source").await;
-    let destination = create_session(&handler, "lifecycle-link-destination").await;
+    let source = handler.create_session("lifecycle-link-source").await;
+    let destination = handler.create_session("lifecycle-link-destination").await;
     handler.wait_for_initial_panes_for_test().await;
     install_destructive_window_hook(&handler, HookName::WindowLinked).await;
     let mut events = handler.subscribe_lifecycle_events();
@@ -785,14 +736,10 @@ async fn link_window_prepares_lifecycle_identity_before_same_slot_reuse() {
     let link_destination = destination.clone();
     let linking = tokio::spawn(async move {
         link_handler
-            .handle_link_window(LinkWindowRequest {
-                source: WindowTarget::with_window(link_source, 0),
-                target: WindowTarget::with_window(link_destination, 1),
-                after: false,
-                before: false,
-                kill_destination: false,
-                detached: true,
-            })
+            .handle_link_window(LinkWindowRequest::fixture((
+                WindowTarget::with_window(link_source, 0),
+                WindowTarget::with_window(link_destination, 1),
+            )))
             .await
     });
     tokio::time::timeout(Duration::from_secs(1), pause.reached.notified())
@@ -855,8 +802,8 @@ async fn link_window_prepares_lifecycle_identity_before_same_slot_reuse() {
 #[tokio::test]
 async fn move_window_prepares_linked_identity_before_same_slot_reuse() {
     let handler = Arc::new(RequestHandler::new());
-    let source = create_session(&handler, "lifecycle-move-source").await;
-    let destination = create_session(&handler, "lifecycle-move-destination").await;
+    let source = handler.create_session("lifecycle-move-source").await;
+    let destination = handler.create_session("lifecycle-move-destination").await;
     handler.wait_for_initial_panes_for_test().await;
     install_destructive_window_hook(&handler, HookName::WindowLinked).await;
     let mut events = handler.subscribe_lifecycle_events();
@@ -867,15 +814,10 @@ async fn move_window_prepares_linked_identity_before_same_slot_reuse() {
     let move_destination = destination.clone();
     let moving = tokio::spawn(async move {
         move_handler
-            .handle_move_window(MoveWindowRequest {
-                source: Some(WindowTarget::with_window(move_source, 0)),
-                target: MoveWindowTarget::Window(WindowTarget::with_window(move_destination, 1)),
-                renumber: false,
-                kill_destination: false,
-                detached: true,
-                after: false,
-                before: false,
-            })
+            .handle_move_window(MoveWindowRequest::fixture((
+                WindowTarget::with_window(move_source, 0),
+                WindowTarget::with_window(move_destination, 1),
+            )))
             .await
     });
     tokio::time::timeout(Duration::from_secs(1), pause.reached.notified())
@@ -935,16 +877,10 @@ async fn move_window_prepares_linked_identity_before_same_slot_reuse() {
 #[tokio::test]
 async fn break_pane_prepares_linked_identity_before_same_slot_reuse() {
     let handler = Arc::new(RequestHandler::new());
-    let session = create_session(&handler, "lifecycle-break-slot-reuse").await;
-    let split = handler
-        .handle(Request::SplitWindow(SplitWindowRequest {
-            target: SplitWindowTarget::Session(session.clone()),
-            direction: SplitDirection::Vertical,
-            before: false,
-            environment: None,
-        }))
+    let session = handler.create_session("lifecycle-break-slot-reuse").await;
+    handler
+        .handle_ok(SplitWindowRequest::fixture(&session))
         .await;
-    assert!(matches!(split, Response::SplitWindow(_)), "{split:?}");
     install_destructive_window_hook(&handler, HookName::WindowLinked).await;
     let mut events = handler.subscribe_lifecycle_events();
     let pause = handler.install_window_lifecycle_emit_pause();
@@ -953,16 +889,10 @@ async fn break_pane_prepares_linked_identity_before_same_slot_reuse() {
     let break_session = session.clone();
     let breaking = tokio::spawn(async move {
         break_handler
-            .handle_break_pane(BreakPaneRequest {
-                source: PaneTarget::with_window(break_session.clone(), 0, 1),
-                target: Some(WindowTarget::with_window(break_session, 1)),
-                name: None,
-                detached: true,
-                after: false,
-                before: false,
-                print_target: false,
-                format: None,
-            })
+            .handle_break_pane(BreakPaneRequest::fixture((
+                PaneTarget::with_window(break_session.clone(), 0, 1),
+                WindowTarget::with_window(break_session, 1),
+            )))
             .await
     });
     tokio::time::timeout(Duration::from_secs(1), pause.reached.notified())
@@ -1022,7 +952,7 @@ async fn break_pane_prepares_linked_identity_before_same_slot_reuse() {
 #[tokio::test]
 async fn kill_during_lag_rebase_returns_current_snapshot_then_terminal_closed() {
     let handler = Arc::new(RequestHandler::new());
-    let session = create_session(&handler, "a03-kill-during-lag").await;
+    let session = handler.create_session("a03-kill-during-lag").await;
     handler.wait_for_initial_panes_for_test().await;
     let target = PaneTarget::with_window(session.clone(), 0, 0);
     let (lag_subscription, lag_revision, watched_pane_id) =
@@ -1043,7 +973,9 @@ async fn kill_during_lag_rebase_returns_current_snapshot_then_terminal_closed() 
     let pause = handler.install_pane_state_lag_rebase_pause();
     let cursor_handler = Arc::clone(&handler);
     let lag_cursor = tokio::spawn(async move {
-        read_cursor(&cursor_handler, 1031, lag_subscription, lag_revision).await
+        cursor_handler
+            .read_pane_state_cursor_for_test(1031, lag_subscription, lag_revision)
+            .await
     });
     tokio::time::timeout(Duration::from_secs(1), pause.reached.notified())
         .await
@@ -1062,7 +994,9 @@ async fn kill_during_lag_rebase_returns_current_snapshot_then_terminal_closed() 
         .expect("pane-state journal lock")
         .current_revision();
     assert_killed_closed(
-        read_cursor(&handler, 1032, second_subscription, second_revision).await,
+        handler
+            .read_pane_state_cursor_for_test(1032, second_subscription, second_revision)
+            .await,
         watched_pane_id,
     );
 
@@ -1081,7 +1015,9 @@ async fn kill_during_lag_rebase_returns_current_snapshot_then_terminal_closed() 
         response => panic!("kill during lag must not return pane-not-found: {response:?}"),
     };
     assert_killed_closed(
-        read_cursor(&handler, 1031, lag_subscription, snapshot_revision).await,
+        handler
+            .read_pane_state_cursor_for_test(1031, lag_subscription, snapshot_revision)
+            .await,
         watched_pane_id,
     );
 }
@@ -1089,7 +1025,7 @@ async fn kill_during_lag_rebase_returns_current_snapshot_then_terminal_closed() 
 #[tokio::test]
 async fn respawn_during_lag_rebase_does_not_snapshot_the_new_generation() {
     let handler = Arc::new(RequestHandler::new());
-    let session = create_session(&handler, "a04-respawn-during-lag").await;
+    let session = handler.create_session("a04-respawn-during-lag").await;
     handler.wait_for_initial_panes_for_test().await;
     let target = PaneTarget::with_window(session, 0, 0);
     let (subscription, initial_revision, pane_id) =
@@ -1105,20 +1041,9 @@ async fn respawn_during_lag_rebase_does_not_snapshot_the_new_generation() {
             },
         );
     }
-    let respawned = handler
-        .handle(Request::RespawnPane(Box::new(RespawnPaneRequest {
-            target: target.clone(),
-            kill: true,
-            start_directory: None,
-            environment: None,
-            command: None,
-            process_command: None,
-        })))
+    handler
+        .handle_ok(RespawnPaneRequest::fixture(&target))
         .await;
-    assert!(
-        matches!(respawned, Response::RespawnPane(_)),
-        "{respawned:?}"
-    );
     let closed_revision = handler
         .pane_state_journal
         .lock()
@@ -1136,7 +1061,9 @@ async fn respawn_during_lag_rebase_does_not_snapshot_the_new_generation() {
         .await;
     assert!(matches!(changed, Response::PaneOptionSet(_)), "{changed:?}");
 
-    let snapshot_revision = match read_cursor(&handler, 1033, subscription, initial_revision).await
+    let snapshot_revision = match handler
+        .read_pane_state_cursor_for_test(1033, subscription, initial_revision)
+        .await
     {
         Response::PaneStateLag(response) => {
             assert_eq!(
@@ -1152,7 +1079,9 @@ async fn respawn_during_lag_rebase_does_not_snapshot_the_new_generation() {
         response => panic!("expected lag rebase, got {response:?}"),
     };
     assert_killed_closed(
-        read_cursor(&handler, 1033, subscription, snapshot_revision).await,
+        handler
+            .read_pane_state_cursor_for_test(1033, subscription, snapshot_revision)
+            .await,
         pane_id,
     );
 }
@@ -1160,7 +1089,7 @@ async fn respawn_during_lag_rebase_does_not_snapshot_the_new_generation() {
 #[tokio::test]
 async fn pane_option_mutation_and_journal_order_are_linearized() {
     let handler = Arc::new(RequestHandler::new());
-    let session = create_session(&handler, "pane-option-linearized").await;
+    let session = handler.create_session("pane-option-linearized").await;
     handler.wait_for_initial_panes_for_test().await;
     let target = PaneTarget::with_window(session.clone(), 0, 0);
     let (subscription, revision, pane_id) = subscribe(&handler, 1041, target.clone(), true).await;
@@ -1211,7 +1140,10 @@ async fn pane_option_mutation_and_journal_order_are_linearized() {
         Response::PaneOptionSet(_)
     ));
 
-    match read_cursor(&handler, 1041, subscription, revision).await {
+    match handler
+        .read_pane_state_cursor_for_test(1041, subscription, revision)
+        .await
+    {
         Response::PaneStateCursor(response) => assert!(matches!(
             response.events.as_slice(),
             [

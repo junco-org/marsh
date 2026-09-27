@@ -1,20 +1,24 @@
 use std::error::Error;
-use std::fs;
-use std::io;
-use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 mod common;
 
-use common::{session_name, start_server, ClientConnection, TestHarness, PTY_TEST_LOCK};
+use common::{
+    session_name, start_server, wait_for_file_contents, ClientConnection, Fixture, TestHarness,
+    PTY_TEST_LOCK,
+};
 use rmux_proto::{
     BreakPaneRequest, JoinPaneRequest, KillPaneRequest, LastPaneRequest, ListPanesRequest,
-    ListSessionsRequest, NewSessionExtRequest, NewSessionRequest, NewWindowRequest, PaneTarget,
-    Request, Response, SelectPaneRequest, SendKeysRequest, SplitDirection, SplitWindowRequest,
-    SplitWindowTarget, SwapPaneRequest, TerminalSize, WindowTarget,
+    ListSessionsRequest, NewSessionExtRequest, NewWindowRequest, PaneTarget, Request, Response,
+    SelectPaneRequest, SendKeysRequest, SplitWindowRequest, SwapPaneRequest, TerminalSize,
+    WindowTarget,
 };
 
 const FILE_TIMEOUT: Duration = Duration::from_secs(15);
+const SESSION_SIZE: TerminalSize = TerminalSize {
+    cols: 120,
+    rows: 40,
+};
 
 #[tokio::test(flavor = "multi_thread")]
 async fn break_pane_last_source_window_to_other_session_removes_source_session(
@@ -28,34 +32,15 @@ async fn break_pane_last_source_window_to_other_session_removes_source_session(
     let hidden = session_name("hidden");
 
     for session in [&source, &hidden] {
-        assert!(matches!(
-            client
-                .send_request(&Request::NewSession(NewSessionRequest {
-                    session_name: session.clone(),
-                    detached: true,
-                    size: Some(TerminalSize {
-                        cols: 120,
-                        rows: 40
-                    }),
-                    environment: None,
-                }))
-                .await?,
-            Response::NewSession(_)
-        ));
+        client.create_session((session, SESSION_SIZE)).await?;
     }
 
     assert_eq!(
         client
-            .send_request(&Request::BreakPane(Box::new(BreakPaneRequest {
-                source: PaneTarget::new(source.clone(), 0),
-                target: Some(WindowTarget::with_window(hidden.clone(), 1)),
-                name: None,
-                detached: true,
-                after: false,
-                before: false,
-                print_target: false,
-                format: None,
-            })))
+            .send(BreakPaneRequest::fixture((
+                PaneTarget::new(source.clone(), 0),
+                WindowTarget::with_window(hidden.clone(), 1),
+            )))
             .await?,
         Response::BreakPane(rmux_proto::BreakPaneResponse {
             target: PaneTarget::with_window(hidden.clone(), 1, 0),
@@ -64,12 +49,7 @@ async fn break_pane_last_source_window_to_other_session_removes_source_session(
     );
 
     let sessions = client
-        .send_request(&Request::ListSessions(ListSessionsRequest {
-            format: Some("#{session_name}".to_owned()),
-            filter: None,
-            sort_order: None,
-            reversed: false,
-        }))
+        .send(ListSessionsRequest::fixture("#{session_name}"))
         .await?;
     let Response::ListSessions(sessions) = sessions else {
         panic!("expected list-sessions response");
@@ -79,14 +59,10 @@ async fn break_pane_last_source_window_to_other_session_removes_source_session(
     assert!(sessions.lines().any(|line| line == hidden.as_str()));
 
     let panes = client
-        .send_request(&Request::ListPanes(Box::new(ListPanesRequest {
-            target: hidden.clone(),
-            target_window_index: None,
-            format: Some("#{window_index}.#{pane_index}:#{pane_id}".to_owned()),
-            filter: None,
-            sort_order: None,
-            reversed: false,
-        })))
+        .send(ListPanesRequest::fixture((
+            &hidden,
+            "#{window_index}.#{pane_index}:#{pane_id}",
+        )))
         .await?;
     let Response::ListPanes(panes) = panes else {
         panic!("expected list-panes response");
@@ -111,76 +87,26 @@ async fn break_pane_last_grouped_source_removes_entire_source_group() -> Result<
     let hidden = session_name("hidden");
 
     for session in [&source, &hidden] {
-        assert!(matches!(
-            client
-                .send_request(&Request::NewSession(NewSessionRequest {
-                    session_name: session.clone(),
-                    detached: true,
-                    size: Some(TerminalSize {
-                        cols: 120,
-                        rows: 40
-                    }),
-                    environment: None,
-                }))
-                .await?,
-            Response::NewSession(_)
-        ));
+        client.create_session((session, SESSION_SIZE)).await?;
     }
-    assert!(matches!(
-        client
-            .send_request(&Request::NewSessionExt(Box::new(NewSessionExtRequest {
-                session_name: Some(grouped.clone()),
-                working_directory: None,
-                detached: true,
-                size: Some(TerminalSize {
-                    cols: 120,
-                    rows: 40
-                }),
-                environment: None,
-                group_target: Some(source.clone()),
-                attach_if_exists: false,
-                detach_other_clients: false,
-                kill_other_clients: false,
-                flags: None,
-                window_name: None,
-                print_session_info: false,
-                print_format: None,
-                command: None,
-                process_command: None,
-                client_environment: None,
-                skip_environment_update: false,
-            })))
-            .await?,
-        Response::NewSession(_)
-    ));
+    client
+        .create_session(NewSessionExtRequest {
+            size: Some(SESSION_SIZE),
+            group_target: Some(source.clone()),
+            ..Fixture::fixture(&grouped)
+        })
+        .await?;
 
-    assert!(matches!(
-        client
-            .send_request(&Request::BreakPane(Box::new(BreakPaneRequest {
-                source: PaneTarget::new(source.clone(), 0),
-                target: Some(WindowTarget::with_window(hidden.clone(), 1)),
-                name: None,
-                detached: true,
-                after: false,
-                before: false,
-                print_target: false,
-                format: None,
-            })))
-            .await?,
-        Response::BreakPane(_)
-    ));
+    client
+        .send_ok(BreakPaneRequest::fixture((
+            PaneTarget::new(source.clone(), 0),
+            WindowTarget::with_window(hidden.clone(), 1),
+        )))
+        .await?;
 
-    let Response::ListSessions(sessions) = client
-        .send_request(&Request::ListSessions(ListSessionsRequest {
-            format: Some("#{session_name}".to_owned()),
-            filter: None,
-            sort_order: None,
-            reversed: false,
-        }))
-        .await?
-    else {
-        panic!("expected list-sessions response");
-    };
+    let sessions = client
+        .send_ok(ListSessionsRequest::fixture("#{session_name}"))
+        .await?;
     let sessions = String::from_utf8(sessions.output.stdout)?;
     assert!(!sessions.lines().any(|line| line == source.as_str()));
     assert!(!sessions.lines().any(|line| line == grouped.as_str()));
@@ -201,33 +127,15 @@ async fn join_pane_last_source_window_to_other_session_removes_source_session(
     let hidden = session_name("hidden");
 
     for session in [&source, &hidden] {
-        assert!(matches!(
-            client
-                .send_request(&Request::NewSession(NewSessionRequest {
-                    session_name: session.clone(),
-                    detached: true,
-                    size: Some(TerminalSize {
-                        cols: 120,
-                        rows: 40
-                    }),
-                    environment: None,
-                }))
-                .await?,
-            Response::NewSession(_)
-        ));
+        client.create_session((session, SESSION_SIZE)).await?;
     }
 
     assert_eq!(
         client
-            .send_request(&Request::JoinPane(JoinPaneRequest {
-                source: PaneTarget::new(source.clone(), 0),
-                target: PaneTarget::new(hidden.clone(), 0),
-                direction: SplitDirection::Vertical,
-                detached: true,
-                before: false,
-                full_size: false,
-                size: None,
-            }))
+            .send(JoinPaneRequest::fixture((
+                PaneTarget::new(source.clone(), 0),
+                PaneTarget::new(hidden.clone(), 0),
+            )))
             .await?,
         Response::JoinPane(rmux_proto::JoinPaneResponse {
             target: PaneTarget::with_window(hidden.clone(), 0, 1),
@@ -235,12 +143,7 @@ async fn join_pane_last_source_window_to_other_session_removes_source_session(
     );
 
     let sessions = client
-        .send_request(&Request::ListSessions(ListSessionsRequest {
-            format: Some("#{session_name}".to_owned()),
-            filter: None,
-            sort_order: None,
-            reversed: false,
-        }))
+        .send(ListSessionsRequest::fixture("#{session_name}"))
         .await?;
     let Response::ListSessions(sessions) = sessions else {
         panic!("expected list-sessions response");
@@ -250,14 +153,10 @@ async fn join_pane_last_source_window_to_other_session_removes_source_session(
     assert!(sessions.lines().any(|line| line == hidden.as_str()));
 
     let panes = client
-        .send_request(&Request::ListPanes(Box::new(ListPanesRequest {
-            target: hidden.clone(),
-            target_window_index: None,
-            format: Some("#{window_index}.#{pane_index}:#{pane_id}".to_owned()),
-            filter: None,
-            sort_order: None,
-            reversed: false,
-        })))
+        .send(ListPanesRequest::fixture((
+            &hidden,
+            "#{window_index}.#{pane_index}:#{pane_id}",
+        )))
         .await?;
     let Response::ListPanes(panes) = panes else {
         panic!("expected list-panes response");
@@ -281,75 +180,26 @@ async fn join_pane_last_grouped_source_removes_entire_source_group() -> Result<(
     let hidden = session_name("hidden");
 
     for session in [&source, &hidden] {
-        assert!(matches!(
-            client
-                .send_request(&Request::NewSession(NewSessionRequest {
-                    session_name: session.clone(),
-                    detached: true,
-                    size: Some(TerminalSize {
-                        cols: 120,
-                        rows: 40
-                    }),
-                    environment: None,
-                }))
-                .await?,
-            Response::NewSession(_)
-        ));
+        client.create_session((session, SESSION_SIZE)).await?;
     }
-    assert!(matches!(
-        client
-            .send_request(&Request::NewSessionExt(Box::new(NewSessionExtRequest {
-                session_name: Some(grouped.clone()),
-                working_directory: None,
-                detached: true,
-                size: Some(TerminalSize {
-                    cols: 120,
-                    rows: 40
-                }),
-                environment: None,
-                group_target: Some(source.clone()),
-                attach_if_exists: false,
-                detach_other_clients: false,
-                kill_other_clients: false,
-                flags: None,
-                window_name: None,
-                print_session_info: false,
-                print_format: None,
-                command: None,
-                process_command: None,
-                client_environment: None,
-                skip_environment_update: false,
-            })))
-            .await?,
-        Response::NewSession(_)
-    ));
+    client
+        .create_session(NewSessionExtRequest {
+            size: Some(SESSION_SIZE),
+            group_target: Some(source.clone()),
+            ..Fixture::fixture(&grouped)
+        })
+        .await?;
 
-    assert!(matches!(
-        client
-            .send_request(&Request::JoinPane(JoinPaneRequest {
-                source: PaneTarget::new(source.clone(), 0),
-                target: PaneTarget::new(hidden.clone(), 0),
-                direction: SplitDirection::Vertical,
-                detached: true,
-                before: false,
-                full_size: false,
-                size: None,
-            }))
-            .await?,
-        Response::JoinPane(_)
-    ));
+    client
+        .send_ok(JoinPaneRequest::fixture((
+            PaneTarget::new(source.clone(), 0),
+            PaneTarget::new(hidden.clone(), 0),
+        )))
+        .await?;
 
-    let Response::ListSessions(sessions) = client
-        .send_request(&Request::ListSessions(ListSessionsRequest {
-            format: Some("#{session_name}".to_owned()),
-            filter: None,
-            sort_order: None,
-            reversed: false,
-        }))
-        .await?
-    else {
-        panic!("expected list-sessions response");
-    };
+    let sessions = client
+        .send_ok(ListSessionsRequest::fixture("#{session_name}"))
+        .await?;
     let sessions = String::from_utf8(sessions.output.stdout)?;
     assert!(!sessions.lines().any(|line| line == source.as_str()));
     assert!(!sessions.lines().any(|line| line == grouped.as_str()));
@@ -374,43 +224,20 @@ async fn pane_transfer_commands_move_live_ptys_between_windows() -> Result<(), B
     let swap_source_path = root.join("swap-source.txt");
     let swap_target_path = root.join("swap-target.txt");
 
-    assert!(matches!(
-        client
-            .send_request(&Request::NewSession(NewSessionRequest {
-                session_name: session.clone(),
-                detached: true,
-                size: Some(TerminalSize {
-                    cols: 120,
-                    rows: 40,
-                }),
-                environment: None,
-            }))
-            .await?,
-        Response::NewSession(_)
-    ));
+    client.create_session((&session, SESSION_SIZE)).await?;
 
     assert_eq!(
-        client
-            .send_request(&Request::SplitWindow(SplitWindowRequest {
-                target: SplitWindowTarget::Session(session.clone()),
-                direction: SplitDirection::Vertical,
-                before: false,
-                environment: None,
-            }))
-            .await?,
+        client.send(SplitWindowRequest::fixture(&session)).await?,
         Response::SplitWindow(rmux_proto::SplitWindowResponse {
             pane: PaneTarget::new(session.clone(), 1),
         })
     );
     assert_eq!(
         client
-            .send_request(&Request::SelectPane(Box::new(SelectPaneRequest {
-                target: PaneTarget::new(session.clone(), 1),
-                title: None,
-                style: None,
-                input_disabled: None,
-                preserve_zoom: false,
-            })))
+            .send(SelectPaneRequest::fixture(PaneTarget::new(
+                session.clone(),
+                1
+            )))
             .await?,
         Response::SelectPane(rmux_proto::SelectPaneResponse {
             target: PaneTarget::new(session.clone(), 1),
@@ -418,13 +245,10 @@ async fn pane_transfer_commands_move_live_ptys_between_windows() -> Result<(), B
     );
     assert_eq!(
         client
-            .send_request(&Request::SelectPane(Box::new(SelectPaneRequest {
-                target: PaneTarget::new(session.clone(), 0),
-                title: None,
-                style: None,
-                input_disabled: None,
-                preserve_zoom: false,
-            })))
+            .send(SelectPaneRequest::fixture(PaneTarget::new(
+                session.clone(),
+                0
+            )))
             .await?,
         Response::SelectPane(rmux_proto::SelectPaneResponse {
             target: PaneTarget::new(session.clone(), 0),
@@ -443,32 +267,19 @@ async fn pane_transfer_commands_move_live_ptys_between_windows() -> Result<(), B
         })
     );
 
-    assert!(matches!(
-        client
-            .send_request(&Request::SendKeys(SendKeysRequest {
-                target: PaneTarget::new(session.clone(), 1),
-                keys: vec![
-                    "export RMUX_TRANSFER_MARK=joined".to_owned(),
-                    "Enter".to_owned()
-                ],
-            }))
-            .await?,
-        Response::SendKeys(_)
-    ));
+    client
+        .send_ok(SendKeysRequest::fixture((
+            PaneTarget::new(session.clone(), 1),
+            ["export RMUX_TRANSFER_MARK=joined", "Enter"],
+        )))
+        .await?;
 
     assert_eq!(
         client
-            .send_request(&Request::NewWindow(Box::new(NewWindowRequest {
-                target: session.clone(),
+            .send(NewWindowRequest {
                 name: Some("dest".to_owned()),
-                detached: true,
-                start_directory: None,
-                environment: None,
-                command: None,
-                process_command: None,
-                target_window_index: None,
-                insert_at_target: false,
-            })))
+                ..Fixture::fixture(&session)
+            })
             .await?,
         Response::NewWindow(rmux_proto::NewWindowResponse {
             target: WindowTarget::with_window(session.clone(), 1),
@@ -476,114 +287,77 @@ async fn pane_transfer_commands_move_live_ptys_between_windows() -> Result<(), B
     );
     assert_eq!(
         client
-            .send_request(&Request::JoinPane(JoinPaneRequest {
-                source: PaneTarget::new(session.clone(), 1),
-                target: PaneTarget::with_window(session.clone(), 1, 0),
-                direction: SplitDirection::Vertical,
-                detached: true,
-                before: false,
-                full_size: false,
-                size: None,
-            }))
+            .send(JoinPaneRequest::fixture((
+                PaneTarget::new(session.clone(), 1),
+                PaneTarget::with_window(session.clone(), 1, 0),
+            )))
             .await?,
         Response::JoinPane(rmux_proto::JoinPaneResponse {
             target: PaneTarget::with_window(session.clone(), 1, 1),
         })
     );
-    assert!(matches!(
-        client
-            .send_request(&Request::SendKeys(SendKeysRequest {
-                target: PaneTarget::with_window(session.clone(), 1, 1),
-                keys: vec![
-                    format!("printf \"$RMUX_TRANSFER_MARK\" > {}", join_path.display()),
-                    "Enter".to_owned(),
-                ],
-            }))
-            .await?,
-        Response::SendKeys(_)
-    ));
-    wait_for_file_contents(&join_path, "joined").await?;
+    client
+        .send_ok(SendKeysRequest::fixture((
+            PaneTarget::with_window(session.clone(), 1, 1),
+            [
+                format!("printf \"$RMUX_TRANSFER_MARK\" > {}", join_path.display()),
+                "Enter".to_owned(),
+            ],
+        )))
+        .await?;
+    wait_for_file_contents(&join_path, "joined", FILE_TIMEOUT).await?;
 
     assert_eq!(
         client
-            .send_request(&Request::BreakPane(Box::new(BreakPaneRequest {
-                source: PaneTarget::with_window(session.clone(), 1, 1),
-                target: Some(WindowTarget::with_window(session.clone(), 2)),
+            .send(BreakPaneRequest {
                 name: Some("broken".to_owned()),
-                detached: true,
-                after: false,
-                before: false,
-                print_target: false,
-                format: None,
-            })))
+                ..Fixture::fixture((
+                    PaneTarget::with_window(session.clone(), 1, 1),
+                    WindowTarget::with_window(session.clone(), 2),
+                ))
+            })
             .await?,
         Response::BreakPane(rmux_proto::BreakPaneResponse {
             target: PaneTarget::with_window(session.clone(), 2, 0),
             output: None,
         })
     );
-    assert!(matches!(
-        client
-            .send_request(&Request::SendKeys(SendKeysRequest {
-                target: PaneTarget::with_window(session.clone(), 2, 0),
-                keys: vec![
-                    format!("printf \"$RMUX_TRANSFER_MARK\" > {}", break_path.display()),
-                    "Enter".to_owned(),
-                ],
-            }))
-            .await?,
-        Response::SendKeys(_)
-    ));
-    wait_for_file_contents(&break_path, "joined").await?;
+    client
+        .send_ok(SendKeysRequest::fixture((
+            PaneTarget::with_window(session.clone(), 2, 0),
+            [
+                format!("printf \"$RMUX_TRANSFER_MARK\" > {}", break_path.display()),
+                "Enter".to_owned(),
+            ],
+        )))
+        .await?;
+    wait_for_file_contents(&break_path, "joined", FILE_TIMEOUT).await?;
 
-    assert!(matches!(
-        client
-            .send_request(&Request::NewWindow(Box::new(NewWindowRequest {
-                target: session.clone(),
-                name: Some("swap".to_owned()),
-                detached: true,
-                start_directory: None,
-                environment: None,
-                command: None,
-                process_command: None,
-                target_window_index: None,
-                insert_at_target: false,
-            })))
-            .await?,
-        Response::NewWindow(_)
-    ));
-    assert!(matches!(
-        client
-            .send_request(&Request::SplitWindow(SplitWindowRequest {
-                target: SplitWindowTarget::Pane(PaneTarget::with_window(session.clone(), 3, 0)),
-                direction: SplitDirection::Vertical,
-                before: false,
-                environment: None,
-            }))
-            .await?,
-        Response::SplitWindow(_)
-    ));
-    assert!(matches!(
-        client
-            .send_request(&Request::KillPane(KillPaneRequest {
-                target: PaneTarget::with_window(session.clone(), 3, 0),
-                kill_all_except: false,
-            }))
-            .await?,
-        Response::KillPane(_)
-    ));
-    assert!(matches!(
-        client
-            .send_request(&Request::SendKeys(SendKeysRequest {
-                target: PaneTarget::with_window(session.clone(), 3, 0),
-                keys: vec![
-                    "export RMUX_TRANSFER_MARK=swapped".to_owned(),
-                    "Enter".to_owned()
-                ],
-            }))
-            .await?,
-        Response::SendKeys(_)
-    ));
+    client
+        .send_ok(NewWindowRequest {
+            name: Some("swap".to_owned()),
+            ..Fixture::fixture(&session)
+        })
+        .await?;
+    client
+        .send_ok(SplitWindowRequest::fixture(PaneTarget::with_window(
+            session.clone(),
+            3,
+            0,
+        )))
+        .await?;
+    client
+        .send_ok(KillPaneRequest {
+            target: PaneTarget::with_window(session.clone(), 3, 0),
+            kill_all_except: false,
+        })
+        .await?;
+    client
+        .send_ok(SendKeysRequest::fixture((
+            PaneTarget::with_window(session.clone(), 3, 0),
+            ["export RMUX_TRANSFER_MARK=swapped", "Enter"],
+        )))
+        .await?;
 
     assert_eq!(
         client
@@ -600,57 +374,33 @@ async fn pane_transfer_commands_move_live_ptys_between_windows() -> Result<(), B
             target: PaneTarget::with_window(session.clone(), 3, 0),
         })
     );
-    assert!(matches!(
-        client
-            .send_request(&Request::SendKeys(SendKeysRequest {
-                target: PaneTarget::with_window(session.clone(), 2, 0),
-                keys: vec![
-                    format!(
-                        "printf \"$RMUX_TRANSFER_MARK\" > {}",
-                        swap_source_path.display()
-                    ),
-                    "Enter".to_owned(),
-                ],
-            }))
-            .await?,
-        Response::SendKeys(_)
-    ));
-    assert!(matches!(
-        client
-            .send_request(&Request::SendKeys(SendKeysRequest {
-                target: PaneTarget::with_window(session.clone(), 3, 0),
-                keys: vec![
-                    format!(
-                        "printf \"$RMUX_TRANSFER_MARK\" > {}",
-                        swap_target_path.display()
-                    ),
-                    "Enter".to_owned(),
-                ],
-            }))
-            .await?,
-        Response::SendKeys(_)
-    ));
-    wait_for_file_contents(&swap_source_path, "swapped").await?;
-    wait_for_file_contents(&swap_target_path, "joined").await?;
+    client
+        .send_ok(SendKeysRequest::fixture((
+            PaneTarget::with_window(session.clone(), 2, 0),
+            [
+                format!(
+                    "printf \"$RMUX_TRANSFER_MARK\" > {}",
+                    swap_source_path.display()
+                ),
+                "Enter".to_owned(),
+            ],
+        )))
+        .await?;
+    client
+        .send_ok(SendKeysRequest::fixture((
+            PaneTarget::with_window(session.clone(), 3, 0),
+            [
+                format!(
+                    "printf \"$RMUX_TRANSFER_MARK\" > {}",
+                    swap_target_path.display()
+                ),
+                "Enter".to_owned(),
+            ],
+        )))
+        .await?;
+    wait_for_file_contents(&swap_source_path, "swapped", FILE_TIMEOUT).await?;
+    wait_for_file_contents(&swap_target_path, "joined", FILE_TIMEOUT).await?;
 
     handle.shutdown().await?;
     Ok(())
-}
-
-async fn wait_for_file_contents(path: &Path, expected: &str) -> Result<(), Box<dyn Error>> {
-    let deadline = Instant::now() + FILE_TIMEOUT;
-
-    while Instant::now() < deadline {
-        match fs::read_to_string(path) {
-            Ok(contents) if contents == expected => return Ok(()),
-            Ok(_) | Err(_) => tokio::time::sleep(Duration::from_millis(25)).await,
-        }
-    }
-
-    Err(io::Error::other(format!(
-        "timed out waiting for '{}' to contain '{}'",
-        path.display(),
-        expected
-    ))
-    .into())
 }

@@ -1,13 +1,13 @@
 use rmux_core::{PaneJoinOptions, PaneSwapOptions, SessionPaneTarget};
 use rmux_proto::{
-    CopyModeRequest, HookLifecycle, HookName, LinkWindowRequest, NewSessionRequest,
-    NewWindowRequest, PaneTarget, Request, RespawnPaneRequest, Response, ScopeSelector,
-    SessionName, SetHookMutationRequest, SplitDirection, SplitWindowRequest, SplitWindowTarget,
-    Target, TerminalSize, UnlinkWindowRequest, WindowTarget,
+    CopyModeRequest, HookName, LinkWindowRequest, NewWindowRequest, PaneTarget, Request,
+    RespawnPaneRequest, Response, ScopeSelector, SessionName, SetHookMutationRequest,
+    SplitDirection, SplitWindowRequest, Target, TerminalSize, UnlinkWindowRequest, WindowTarget,
 };
 
 use super::{LeaseResolution, LifecycleTargetLease};
 use crate::handler::RequestHandler;
+use crate::test_fixtures::Fixture;
 
 use crate::test_names::session_name;
 
@@ -22,34 +22,25 @@ fn assert_retired(lease: &LifecycleTargetLease, state: &crate::pane_terminals::H
     );
 }
 
-async fn create_handler_session(handler: &RequestHandler, name: &str) -> SessionName {
+fn create_session_in_state(
+    state: &mut crate::pane_terminals::HandlerState,
+    name: &str,
+) -> SessionName {
     let name = session_name(name);
-    let response = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name: name.clone(),
-            detached: true,
-            size: Some(terminal_size()),
-            environment: None,
-        }))
-        .await;
-    assert!(matches!(response, Response::NewSession(_)), "{response:?}");
+    state
+        .sessions
+        .create_session(name.clone(), terminal_size())
+        .expect("create session");
     name
 }
 
 async fn set_global_activity_hook(handler: &RequestHandler, index: u32, command: &str) {
-    let response = handler
-        .handle(Request::SetHookMutation(SetHookMutationRequest {
-            scope: ScopeSelector::Global,
-            hook: HookName::AlertActivity,
-            command: Some(command.to_owned()),
-            lifecycle: HookLifecycle::Persistent,
-            append: false,
-            unset: false,
-            run_immediately: false,
+    handler
+        .handle_ok(SetHookMutationRequest {
             index: Some(index),
-        }))
+            ..Fixture::fixture((ScopeSelector::Global, HookName::AlertActivity, command))
+        })
         .await;
-    assert!(matches!(response, Response::SetHook(_)), "{response:?}");
 }
 
 async fn retained_alert_binding(
@@ -74,8 +65,8 @@ async fn retained_alert_binding(
 #[tokio::test]
 async fn retired_alert_target_keeps_its_deferred_hook_chain_alive() {
     let handler = RequestHandler::new();
-    let session_name = create_handler_session(&handler, "retained-alert-dispatch").await;
-    let fallback_session = create_handler_session(&handler, "retained-alert-fallback").await;
+    let session_name = handler.create_session("retained-alert-dispatch").await;
+    let fallback_session = handler.create_session("retained-alert-fallback").await;
     for (index, command) in [
         (0, "rename-window stale-retired-target"),
         (1, "set-buffer -b retained-alert-dispatch continued"),
@@ -192,7 +183,7 @@ async fn live_alert_target_follows_a_surviving_window_alias_before_dispatch() {
 #[tokio::test]
 async fn replaced_alert_target_rejects_the_deferred_hook_chain() {
     let handler = RequestHandler::new();
-    let session_name = create_handler_session(&handler, "retained-replaced-alert").await;
+    let session_name = handler.create_session("retained-replaced-alert").await;
     set_global_activity_hook(
         &handler,
         0,

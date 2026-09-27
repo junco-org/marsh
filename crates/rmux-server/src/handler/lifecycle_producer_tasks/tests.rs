@@ -11,6 +11,12 @@ fn close_normal_gate_without_notifying_watch(registry: &LifecycleProducerRegistr
         .accepting_normal = false;
 }
 
+/// Spawns the final close of `registry`, so a test can observe it while the lane drains.
+fn spawn_close(registry: &Arc<LifecycleProducerRegistry>) -> tokio::task::JoinHandle<()> {
+    let registry = Arc::clone(registry);
+    tokio::spawn(async move { registry.close_and_wait().await })
+}
+
 #[tokio::test]
 async fn close_cancels_a_pending_task_before_mutation() {
     let registry = Arc::new(LifecycleProducerRegistry::new());
@@ -67,10 +73,7 @@ async fn close_waits_for_mutation_and_publication() {
     };
 
     mutation_reached.notified().await;
-    let close = tokio::spawn({
-        let registry = Arc::clone(&registry);
-        async move { registry.close_and_wait().await }
-    });
+    let close = spawn_close(&registry);
     tokio::time::sleep(Duration::from_millis(10)).await;
     assert!(!close.is_finished(), "shutdown must wait for publication");
 
@@ -147,10 +150,7 @@ async fn cancellation_cleanup_completes_before_the_lane_drains() {
     };
 
     mutation_started.notified().await;
-    let close = tokio::spawn({
-        let registry = Arc::clone(&registry);
-        async move { registry.close_and_wait().await }
-    });
+    let close = spawn_close(&registry);
     cancellation.cancelled().await;
     tokio::task::yield_now().await;
     assert!(
@@ -294,10 +294,7 @@ async fn mutation_admitted_before_close_completes_without_cleanup() {
     ));
 
     mutation_started.notified().await;
-    let close = tokio::spawn({
-        let registry = Arc::clone(&registry);
-        async move { registry.close_and_wait().await }
-    });
+    let close = spawn_close(&registry);
     registry.wait_until_normal_closing_for_test().await;
     release_mutation.notify_one();
 
@@ -314,10 +311,7 @@ async fn nested_mutation_guards_keep_the_producer_mutating_until_the_outer_guard
         .try_begin_mutation()
         .expect("outer mutation admitted");
     let mut cancellation = registration.cancellation();
-    let close = tokio::spawn({
-        let registry = Arc::clone(&registry);
-        async move { registry.close_and_wait().await }
-    });
+    let close = spawn_close(&registry);
 
     cancellation.cancelled().await;
     let inner = registration
@@ -385,10 +379,7 @@ async fn close_during_parent_handoff_cancels_child_before_first_poll() {
             was_polled.store(true, Ordering::SeqCst);
         }
     }));
-    let close = tokio::spawn({
-        let registry = Arc::clone(&registry);
-        async move { registry.close_and_wait().await }
-    });
+    let close = spawn_close(&registry);
 
     tokio::task::yield_now().await;
     assert!(!close.is_finished(), "close waits for the parent handoff");
@@ -426,10 +417,7 @@ async fn close_during_cleanup_handoff_runs_cleanup_once_before_drain() {
             }
         },
     ));
-    let close = tokio::spawn({
-        let registry = Arc::clone(&registry);
-        async move { registry.close_and_wait().await }
-    });
+    let close = spawn_close(&registry);
 
     tokio::task::yield_now().await;
     assert!(!close.is_finished(), "close waits for the parent handoff");
@@ -450,10 +438,7 @@ async fn lane_close_wins_against_a_new_mutation_boundary() {
     let registry = Arc::new(LifecycleProducerRegistry::new());
     let registration = registry.try_register().expect("producer registered");
     let mut cancellation = registration.cancellation();
-    let close = tokio::spawn({
-        let registry = Arc::clone(&registry);
-        async move { registry.close_and_wait().await }
-    });
+    let close = spawn_close(&registry);
 
     cancellation.cancelled().await;
     assert!(

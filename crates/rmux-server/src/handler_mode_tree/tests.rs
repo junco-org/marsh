@@ -18,15 +18,17 @@ use super::mode_tree_selection::{
 };
 use super::mode_tree_sort::stable_order;
 use super::*;
+use crate::handler::test_support::{open_mode_tree, parse_mode_tree};
+use crate::pane_io::AttachControl;
 use crate::pane_terminals::HandlerState;
+use crate::test_fixtures::Fixture;
 use rmux_core::{command_parser::CommandParser, input::InputParser, Screen, Style, Utf8Config};
 use rmux_proto::{
-    NewSessionRequest, OptionName, PaneTarget, Request, Response, ScopeSelector, SessionName,
-    SetOptionMode, SetOptionRequest, SplitDirection, SplitWindowRequest, SplitWindowTarget,
-    TerminalSize,
+    OptionName, PaneTarget, Response, ScopeSelector, SessionName, SetOptionMode, SplitDirection,
+    SplitWindowRequest, TerminalSize,
 };
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use tokio::sync::mpsc;
 
 fn test_origin() -> RequesterOrigin {
@@ -65,32 +67,107 @@ fn test_mode(list_rows: usize) -> ModeTreeClientState {
     }
 }
 
-fn flat_build(ids: &[&str]) -> ModeTreeBuild {
-    let mut items = BTreeMap::new();
-    let roots: Vec<String> = ids.iter().map(|id| id.to_string()).collect();
-    for id in ids {
-        items.insert(
-            id.to_string(),
-            ModeTreeItem {
-                id: id.to_string(),
-                parent: None,
-                children: Vec::new(),
-                depth: 0,
-                line: id.to_string(),
-                search_text: id.to_string(),
-                preview: Vec::new(),
-                no_tag: false,
-                action: ModeTreeAction::None,
-            },
-        );
+/// A plain, taggable, unlabelled item `id` under `parent`, at `depth`.
+fn tree_item(id: &str, parent: Option<&str>, children: &[&str], depth: usize) -> ModeTreeItem {
+    ModeTreeItem {
+        id: id.to_owned(),
+        parent: parent.map(str::to_owned),
+        children: children.iter().map(|child| (*child).to_owned()).collect(),
+        depth,
+        line: String::new(),
+        search_text: String::new(),
+        preview: Vec::new(),
+        no_tag: false,
+        action: ModeTreeAction::None,
     }
+}
+
+/// A build of `items` in display order, every item visible and the parentless ones roots.
+fn tree_build(items: Vec<ModeTreeItem>) -> ModeTreeBuild {
+    let order: Vec<String> = items.iter().map(|item| item.id.clone()).collect();
+    let roots = items
+        .iter()
+        .filter(|item| item.parent.is_none())
+        .map(|item| item.id.clone())
+        .collect();
     ModeTreeBuild {
-        items,
-        roots: roots.clone(),
-        order: roots.clone(),
-        visible: roots,
+        items: items
+            .into_iter()
+            .map(|item| (item.id.clone(), item))
+            .collect(),
+        roots,
+        visible: order.clone(),
+        order,
         no_matches: false,
     }
+}
+
+fn flat_build(ids: &[&str]) -> ModeTreeBuild {
+    tree_build(
+        ids.iter()
+            .map(|id| ModeTreeItem {
+                line: (*id).to_owned(),
+                search_text: (*id).to_owned(),
+                ..tree_item(id, None, &[], 0)
+            })
+            .collect(),
+    )
+}
+
+/// Parses the command line `source` as a mode-tree command.
+fn parse_mode_tree_source(source: &str) -> Result<Option<ParsedModeTreeCommand>, RmuxError> {
+    let parsed = CommandParser::new()
+        .parse_one_group(source)
+        .expect("parses");
+    RequestHandler::parse_mode_tree_queue_command(parsed.commands()[0].clone())
+}
+
+/// Whether `frame` moves the cursor to the start of the one-based `row`.
+fn frame_visits_row(frame: &[u8], row: u16) -> bool {
+    let cursor = format!("\x1b[{row};1H");
+    frame
+        .windows(cursor.len())
+        .any(|window| window == cursor.as_bytes())
+}
+
+/// Runs `edit` on `attach_pid`'s active mode tree while holding the attach lock.
+async fn with_mode_tree<T>(
+    handler: &RequestHandler,
+    attach_pid: u32,
+    edit: impl FnOnce(&mut ModeTreeClientState) -> T,
+) -> T {
+    let mut active_attach = handler.active_attach.lock().await;
+    let mode = active_attach
+        .by_pid
+        .get_mut(&attach_pid)
+        .and_then(|active| active.mode_tree.as_mut())
+        .expect("mode tree remains active");
+    edit(mode)
+}
+
+/// Confirms the open prompt with `y`, then waits until the confirmed action refreshes the
+/// mode-tree overlay.
+async fn confirm_prompt_and_wait_for_action(
+    handler: &RequestHandler,
+    attach_pid: u32,
+    control_rx: &mut mpsc::UnboundedReceiver<AttachControl>,
+) {
+    while control_rx.try_recv().is_ok() {}
+    handler
+        .handle_attached_live_input_for_test(attach_pid, b"y")
+        .await
+        .expect("confirmation input succeeds");
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            match control_rx.recv().await {
+                Some(AttachControl::Overlay(_)) => break,
+                Some(_) => {}
+                None => panic!("attach control channel closed before action refresh"),
+            }
+        }
+    })
+    .await
+    .expect("the confirmed action refreshes the mode-tree overlay");
 }
 
 #[path = "tests/parse_and_tag.rs"]

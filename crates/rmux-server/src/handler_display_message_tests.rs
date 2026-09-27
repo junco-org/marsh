@@ -2,10 +2,10 @@ use super::attach_support::TransientMessageInput;
 use super::RequestHandler;
 use crate::pane_io::AttachControl;
 use rmux_proto::{
-    DisplayMessageExtRequest, DisplayMessageRequest, NewSessionRequest, NewWindowRequest,
-    OptionName, OptionScopeSelector, PaneTarget, Request, Response, ScopeSelector,
-    SelectPaneMarkRequest, SelectWindowRequest, SessionName, SetOptionMode, SetOptionRequest,
-    SplitDirection, SplitWindowRequest, SplitWindowTarget, Target, TerminalSize, WindowTarget,
+    DisplayMessageExtRequest, DisplayMessageRequest, NewWindowRequest, OptionName,
+    OptionScopeSelector, PaneTarget, Request, Response, ScopeSelector, SelectPaneMarkRequest,
+    SelectWindowRequest, SessionName, SetOptionMode, SplitDirection, SplitWindowRequest, Target,
+    TerminalSize, WindowTarget,
 };
 use tokio::sync::mpsc;
 use tokio::time::{timeout, Duration};
@@ -17,11 +17,8 @@ mod status_overlay;
 #[path = "handler_display_message_tests/synchronize_panes.rs"]
 mod synchronize_panes;
 
+use crate::test_fixtures::{Fixture, DEFAULT_SHELL_WINDOW_NAME};
 use crate::test_names::session_name;
-
-fn default_shell_window_name() -> String {
-    "bash".to_owned()
-}
 
 async fn recv_overlay_control(
     control_rx: &mut mpsc::UnboundedReceiver<AttachControl>,
@@ -123,17 +120,7 @@ async fn client_less_display_message_prefers_requester_tmux_pane_over_attached_c
     let attached = session_name("issue83-attached");
     let detached = session_name("issue83-detached");
     for name in [&attached, &detached] {
-        assert!(matches!(
-            handler
-                .handle(Request::NewSession(NewSessionRequest {
-                    session_name: name.clone(),
-                    detached: true,
-                    size: Some(TerminalSize { cols: 80, rows: 24 }),
-                    environment: None,
-                }))
-                .await,
-            Response::NewSession(_)
-        ));
+        handler.create_session(name).await;
     }
     let pane_id = {
         let state = handler.state.lock().await;
@@ -189,12 +176,7 @@ async fn client_less_display_message_prefers_requester_tmux_pane_over_attached_c
     let outcome = handler
         .dispatch(
             requester_pid,
-            Request::DisplayMessage(DisplayMessageRequest {
-                target: None,
-                print: true,
-                message: Some("#S".to_owned()),
-                empty_target_context: false,
-            }),
+            Request::DisplayMessage(DisplayMessageRequest::fixture("#S")),
         )
         .await;
     let Response::DisplayMessage(response) = outcome.response else {
@@ -215,37 +197,15 @@ async fn display_message_print_expands_shared_formats_without_attached_client() 
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
 
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: alpha.clone(),
-                detached: true,
-                size: Some(TerminalSize { cols: 80, rows: 24 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
+    handler.create_session(&alpha).await;
 
-    let response = handler
-        .handle(Request::DisplayMessage(DisplayMessageRequest {
-            target: Some(Target::Pane(PaneTarget::new(alpha, 0))),
-            print: true,
-            message: Some(
-                "#{session_name}:#{session_windows}:#{window_index}:#{pane_index}:#{pane_active}"
-                    .to_owned(),
-            ),
-            empty_target_context: false,
-        }))
+    let output = handler
+        .display_print(
+            PaneTarget::new(alpha, 0),
+            "#{session_name}:#{session_windows}:#{window_index}:#{pane_index}:#{pane_active}",
+        )
         .await;
-
-    let Response::DisplayMessage(response) = response else {
-        panic!("expected display-message response");
-    };
-    let output = response
-        .command_output()
-        .expect("display-message -p returns output");
-    assert_eq!(output.stdout(), b"alpha:1:0:0:1\n");
+    assert_eq!(output, b"alpha:1:0:0:1\n");
 }
 
 #[tokio::test]
@@ -253,50 +213,21 @@ async fn display_message_last_window_index_is_highest_session_window_index() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
 
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: alpha.clone(),
-                detached: true,
-                size: Some(TerminalSize { cols: 80, rows: 24 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
-    assert!(matches!(
-        handler
-            .handle(Request::NewWindow(Box::new(NewWindowRequest {
-                target: alpha.clone(),
-                name: Some("detached".to_owned()),
-                detached: true,
-                start_directory: None,
-                environment: None,
-                command: None,
-                process_command: None,
-                target_window_index: None,
-                insert_at_target: false,
-            })))
-            .await,
-        Response::NewWindow(_)
-    ));
-
-    let response = handler
-        .handle(Request::DisplayMessage(DisplayMessageRequest {
-            target: Some(Target::Pane(PaneTarget::new(alpha, 0))),
-            print: true,
-            message: Some("#{active_window_index}:#{last_window_index}".to_owned()),
-            empty_target_context: false,
-        }))
+    handler.create_session(&alpha).await;
+    handler
+        .create_window(NewWindowRequest {
+            name: Some("detached".to_owned()),
+            ..Fixture::fixture(&alpha)
+        })
         .await;
 
-    let Response::DisplayMessage(response) = response else {
-        panic!("expected display-message response");
-    };
-    let output = response
-        .command_output()
-        .expect("display-message -p returns output");
-    assert_eq!(output.stdout(), b"0:1\n");
+    let output = handler
+        .display_print(
+            PaneTarget::new(alpha, 0),
+            "#{active_window_index}:#{last_window_index}",
+        )
+        .await;
+    assert_eq!(output, b"0:1\n");
 }
 
 #[tokio::test]
@@ -304,72 +235,34 @@ async fn display_message_reports_session_and_window_stack_order() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
 
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: alpha.clone(),
-                detached: true,
-                size: Some(TerminalSize { cols: 80, rows: 24 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
+    handler.create_session(&alpha).await;
 
     for index in 1..=2 {
-        assert!(matches!(
-            handler
-                .handle(Request::NewWindow(Box::new(NewWindowRequest {
-                    target: alpha.clone(),
-                    name: Some(format!("w{index}")),
-                    detached: true,
-                    start_directory: None,
-                    environment: None,
-                    command: None,
-                    process_command: None,
-                    target_window_index: Some(index),
-                    insert_at_target: false,
-                })))
-                .await,
-            Response::NewWindow(_)
-        ));
+        handler
+            .create_window(NewWindowRequest {
+                name: Some(format!("w{index}")),
+                target_window_index: Some(index),
+                ..Fixture::fixture(&alpha)
+            })
+            .await;
     }
 
     for index in [0, 2] {
-        assert!(matches!(
-            handler
-                .handle(Request::SelectWindow(SelectWindowRequest {
-                    target: WindowTarget::with_window(alpha.clone(), index),
-                }))
-                .await,
-            Response::SelectWindow(_)
-        ));
+        handler
+            .handle_ok(SelectWindowRequest {
+                target: WindowTarget::with_window(alpha.clone(), index),
+            })
+            .await;
     }
 
     for (window_index, expected_index) in [(2, "0"), (0, "1"), (1, "2")] {
-        let response = handler
-            .handle(Request::DisplayMessage(DisplayMessageRequest {
-                target: Some(Target::Pane(PaneTarget::with_window(
-                    alpha.clone(),
-                    window_index,
-                    0,
-                ))),
-                print: true,
-                message: Some("#{session_stack}:#{window_stack_index}".to_owned()),
-                empty_target_context: false,
-            }))
+        let output = handler
+            .display_print(
+                PaneTarget::with_window(alpha.clone(), window_index, 0),
+                "#{session_stack}:#{window_stack_index}",
+            )
             .await;
-
-        let Response::DisplayMessage(response) = response else {
-            panic!("expected display-message response");
-        };
-        let output = response
-            .command_output()
-            .expect("display-message -p returns output");
-        assert_eq!(
-            output.stdout(),
-            format!("2,0,1:{expected_index}\n").as_bytes()
-        );
+        assert_eq!(output, format!("2,0,1:{expected_index}\n").as_bytes());
     }
 }
 
@@ -378,48 +271,16 @@ async fn display_message_print_uses_full_detached_geometry_for_window_and_pane_f
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
 
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: alpha.clone(),
-                detached: true,
-                size: Some(TerminalSize { cols: 80, rows: 24 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
-    assert!(matches!(
-        handler
-            .handle(Request::SplitWindow(SplitWindowRequest {
-                target: SplitWindowTarget::Session(alpha.clone()),
-                direction: SplitDirection::Vertical,
-                before: false,
-                environment: None,
-            }))
-            .await,
-        Response::SplitWindow(_)
-    ));
+    handler.create_session(&alpha).await;
+    handler.handle_ok(SplitWindowRequest::fixture(&alpha)).await;
 
-    let response = handler
-        .handle(Request::DisplayMessage(DisplayMessageRequest {
-            target: Some(Target::Pane(PaneTarget::new(alpha, 0))),
-            print: true,
-            message: Some(
-                "#{session_width}x#{session_height}|#{window_width}x#{window_height}|#{window_layout}|#{pane_width}x#{pane_height}"
-                    .to_owned(),
-            ),
-            empty_target_context: false,
-            }))
+    let output = handler
+        .display_print(
+            PaneTarget::new(alpha, 0),
+            "#{session_width}x#{session_height}|#{window_width}x#{window_height}|#{window_layout}|#{pane_width}x#{pane_height}",
+        )
         .await;
-
-    let Response::DisplayMessage(response) = response else {
-        panic!("expected display-message response");
-    };
-    let output = response
-        .command_output()
-        .expect("display-message -p returns output");
-    let rendered = std::str::from_utf8(output.stdout()).expect("utf-8 output");
+    let rendered = std::str::from_utf8(&output).expect("utf-8 output");
     let (prefix, suffix) = rendered
         .trim_end()
         .split_once('|')
@@ -440,17 +301,7 @@ async fn display_message_print_uses_lone_session_context_for_user_options() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
 
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: alpha,
-                detached: true,
-                size: Some(TerminalSize { cols: 80, rows: 24 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
+    handler.create_session(alpha).await;
 
     {
         let mut state = handler.state.lock().await;
@@ -468,22 +319,8 @@ async fn display_message_print_uses_lone_session_context_for_user_options() {
             .expect("user option set succeeds");
     }
 
-    let response = handler
-        .handle(Request::DisplayMessage(DisplayMessageRequest {
-            target: None,
-            print: true,
-            message: Some("opt=#{@my-user-opt}".to_owned()),
-            empty_target_context: false,
-        }))
-        .await;
-
-    let Response::DisplayMessage(response) = response else {
-        panic!("expected display-message response");
-    };
-    let output = response
-        .command_output()
-        .expect("display-message -p returns output");
-    assert_eq!(output.stdout(), b"opt=hello-world\n");
+    let output = handler.display_print(None, "opt=#{@my-user-opt}").await;
+    assert_eq!(output, b"opt=hello-world\n");
 }
 
 #[tokio::test]
@@ -491,37 +328,15 @@ async fn display_message_print_leaves_lone_session_size_formats_empty_without_ex
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
 
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: alpha,
-                detached: true,
-                size: Some(TerminalSize { cols: 80, rows: 24 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
+    handler.create_session(alpha).await;
 
-    let response = handler
-        .handle(Request::DisplayMessage(DisplayMessageRequest {
-            target: None,
-            print: true,
-            message: Some(
-                "#{session_name}|#{session_attached}|#{session_width}|#{session_height}|#{window_width}|#{window_height}|#{pane_width}|#{pane_height}"
-                    .to_owned(),
-            ),
-            empty_target_context: false,
-            }))
+    let output = handler
+        .display_print(
+            None,
+            "#{session_name}|#{session_attached}|#{session_width}|#{session_height}|#{window_width}|#{window_height}|#{pane_width}|#{pane_height}",
+        )
         .await;
-
-    let Response::DisplayMessage(response) = response else {
-        panic!("expected display-message response");
-    };
-    let output = response
-        .command_output()
-        .expect("display-message -p returns output");
-    assert_eq!(output.stdout(), b"alpha|0|||80|24|80|24\n");
+    assert_eq!(output, b"alpha|0|||80|24|80|24\n");
 }
 
 #[tokio::test]
@@ -543,37 +358,10 @@ async fn display_message_print_uses_stored_default_window_name_for_detached_sess
             .expect("test default-shell is valid");
     }
 
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: alpha.clone(),
-                detached: true,
-                size: Some(TerminalSize { cols: 80, rows: 24 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
+    handler.create_session(&alpha).await;
 
-    let response = handler
-        .handle(Request::DisplayMessage(DisplayMessageRequest {
-            target: Some(Target::Session(alpha)),
-            print: true,
-            message: Some("#{window_name}".to_owned()),
-            empty_target_context: false,
-        }))
-        .await;
-
-    let Response::DisplayMessage(response) = response else {
-        panic!("expected display-message response");
-    };
-    let output = response
-        .command_output()
-        .expect("display-message -p returns output");
-    assert_eq!(
-        output.stdout(),
-        format!("{}\n", default_shell_window_name()).as_bytes()
-    );
+    let output = handler.display_print(alpha, "#{window_name}").await;
+    assert_eq!(output, format!("{DEFAULT_SHELL_WINDOW_NAME}\n").as_bytes());
 }
 
 #[tokio::test]
@@ -581,28 +369,13 @@ async fn display_message_print_reports_marked_pane_runtime_flags() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
 
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: alpha.clone(),
-                detached: true,
-                size: Some(TerminalSize { cols: 80, rows: 24 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
-    assert!(matches!(
-        handler
-            .handle(Request::SplitWindow(SplitWindowRequest {
-                target: SplitWindowTarget::Pane(PaneTarget::with_window(alpha.clone(), 0, 0)),
-                direction: SplitDirection::Horizontal,
-                before: false,
-                environment: None,
-            }))
-            .await,
-        Response::SplitWindow(_)
-    ));
+    handler.create_session(&alpha).await;
+    handler
+        .handle_ok(SplitWindowRequest {
+            direction: SplitDirection::Horizontal,
+            ..Fixture::fixture(PaneTarget::with_window(alpha.clone(), 0, 0))
+        })
+        .await;
     assert!(matches!(
         handler
             .handle(Request::SelectPaneMark(SelectPaneMarkRequest {
@@ -616,42 +389,13 @@ async fn display_message_print_reports_marked_pane_runtime_flags() {
 
     let format = "#{pane_marked}|#{pane_marked_set}|#{session_marked}|#{window_marked_flag}";
     let pane0 = handler
-        .handle(Request::DisplayMessage(DisplayMessageRequest {
-            target: Some(Target::Pane(PaneTarget::with_window(alpha.clone(), 0, 0))),
-            print: true,
-            message: Some(format.to_owned()),
-            empty_target_context: false,
-        }))
+        .display_print(PaneTarget::with_window(alpha.clone(), 0, 0), format)
         .await;
     let pane1 = handler
-        .handle(Request::DisplayMessage(DisplayMessageRequest {
-            target: Some(Target::Pane(PaneTarget::with_window(alpha, 0, 1))),
-            print: true,
-            message: Some(format.to_owned()),
-            empty_target_context: false,
-        }))
+        .display_print(PaneTarget::with_window(alpha, 0, 1), format)
         .await;
-
-    let Response::DisplayMessage(pane0) = pane0 else {
-        panic!("expected display-message response for pane 0");
-    };
-    let Response::DisplayMessage(pane1) = pane1 else {
-        panic!("expected display-message response for pane 1");
-    };
-    assert_eq!(
-        pane0
-            .command_output()
-            .expect("display-message -p returns output")
-            .stdout(),
-        b"0|1|1|1\n"
-    );
-    assert_eq!(
-        pane1
-            .command_output()
-            .expect("display-message -p returns output")
-            .stdout(),
-        b"1|1|1|1\n"
-    );
+    assert_eq!(pane0, b"0|1|1|1\n");
+    assert_eq!(pane1, b"1|1|1|1\n");
 }
 
 #[tokio::test]
@@ -659,34 +403,15 @@ async fn display_message_print_treats_flag_options_like_tmux_in_conditionals() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
 
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: alpha.clone(),
-                detached: true,
-                size: Some(TerminalSize { cols: 80, rows: 24 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
+    handler.create_session(&alpha).await;
 
-    let response = handler
-        .handle(Request::DisplayMessage(DisplayMessageRequest {
-            target: Some(Target::Pane(PaneTarget::with_window(alpha, 0, 0))),
-            print: true,
-            message: Some("#{synchronize-panes}|#{?synchronize-panes,yes,no}".to_owned()),
-            empty_target_context: false,
-        }))
+    let output = handler
+        .display_print(
+            PaneTarget::with_window(alpha, 0, 0),
+            "#{synchronize-panes}|#{?synchronize-panes,yes,no}",
+        )
         .await;
-
-    let Response::DisplayMessage(response) = response else {
-        panic!("expected display-message response");
-    };
-    let output = response
-        .command_output()
-        .expect("display-message -p returns output");
-    assert_eq!(output.stdout(), b"0|no\n");
+    assert_eq!(output, b"0|no\n");
 }
 
 #[tokio::test]
@@ -694,68 +419,31 @@ async fn display_message_print_expands_runtime_session_window_and_pane_loops() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
 
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: alpha.clone(),
-                detached: true,
-                size: Some(TerminalSize { cols: 80, rows: 24 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
-    assert!(matches!(
-        handler
-            .handle(Request::SplitWindow(SplitWindowRequest {
-                target: SplitWindowTarget::Pane(PaneTarget::with_window(alpha.clone(), 0, 0)),
-                direction: SplitDirection::Horizontal,
-                before: false,
-                environment: None,
-            }))
-            .await,
-        Response::SplitWindow(_)
-    ));
+    handler.create_session(&alpha).await;
+    handler
+        .handle_ok(SplitWindowRequest {
+            direction: SplitDirection::Horizontal,
+            ..Fixture::fixture(PaneTarget::with_window(alpha.clone(), 0, 0))
+        })
+        .await;
 
     let window_name = handler
-        .handle(Request::DisplayMessage(DisplayMessageRequest {
-            target: Some(Target::Pane(PaneTarget::with_window(alpha.clone(), 0, 0))),
-            print: true,
-            message: Some("#{window_name}".to_owned()),
-            empty_target_context: false,
-        }))
+        .display_print(
+            PaneTarget::with_window(alpha.clone(), 0, 0),
+            "#{window_name}",
+        )
         .await;
-    let Response::DisplayMessage(window_name) = window_name else {
-        panic!("expected display-message response for window name");
-    };
-    let window_name = String::from_utf8(
-        window_name
-            .command_output()
-            .expect("display-message -p returns output")
-            .stdout()
-            .to_vec(),
-    )
-    .expect("window name output is utf-8");
+    let window_name = String::from_utf8(window_name).expect("window name output is utf-8");
     let window_name = window_name.trim_end().to_owned();
 
     let loops = handler
-        .handle(Request::DisplayMessage(DisplayMessageRequest {
-            target: Some(Target::Pane(PaneTarget::with_window(alpha, 0, 0))),
-            print: true,
-            message: Some(
-                "#{S:#W}|#{W:#W,[#W]}|#{P:#{pane_index},[#{pane_index}]}|#{N:#W}".to_owned(),
-            ),
-            empty_target_context: false,
-        }))
+        .display_print(
+            PaneTarget::with_window(alpha, 0, 0),
+            "#{S:#W}|#{W:#W,[#W]}|#{P:#{pane_index},[#{pane_index}]}|#{N:#W}",
+        )
         .await;
-    let Response::DisplayMessage(loops) = loops else {
-        panic!("expected display-message response for runtime loops");
-    };
     assert_eq!(
-        loops
-            .command_output()
-            .expect("display-message -p returns output")
-            .stdout(),
+        loops,
         format!("{window_name}|[{window_name}]|0[1]|1\n").as_bytes()
     );
 }
@@ -766,47 +454,16 @@ async fn display_message_session_loop_keeps_comma_body() {
     let alpha = session_name("alpha");
     let beta = session_name("beta");
 
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: alpha.clone(),
-                detached: true,
-                size: Some(TerminalSize { cols: 80, rows: 24 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: beta,
-                detached: true,
-                size: Some(TerminalSize { cols: 80, rows: 24 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
+    handler.create_session(&alpha).await;
+    handler.create_session(beta).await;
 
     let response = handler
-        .handle(Request::DisplayMessage(DisplayMessageRequest {
-            target: Some(Target::Pane(PaneTarget::with_window(alpha, 0, 0))),
-            print: true,
-            message: Some("#{S:#{session_name},CURRENT}".to_owned()),
-            empty_target_context: false,
-        }))
+        .display_print(
+            PaneTarget::with_window(alpha, 0, 0),
+            "#{S:#{session_name},CURRENT}",
+        )
         .await;
-    let Response::DisplayMessage(response) = response else {
-        panic!("expected display-message response");
-    };
-    assert_eq!(
-        response
-            .command_output()
-            .expect("display-message -p returns output")
-            .stdout(),
-        b"alpha,CURRENTbeta,CURRENT\n"
-    );
+    assert_eq!(response, b"alpha,CURRENTbeta,CURRENT\n");
 }
 
 #[tokio::test]
@@ -814,52 +471,21 @@ async fn display_message_name_exists_modifier_checks_window_names_not_window_cou
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
 
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: alpha.clone(),
-                detached: true,
-                size: Some(TerminalSize { cols: 80, rows: 24 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
-    assert!(matches!(
-        handler
-            .handle(Request::NewWindow(Box::new(NewWindowRequest {
-                target: alpha.clone(),
-                name: Some("w1".to_owned()),
-                detached: true,
-                environment: None,
-                command: None,
-                process_command: None,
-                start_directory: None,
-                target_window_index: None,
-                insert_at_target: false,
-            })))
-            .await,
-        Response::NewWindow(_)
-    ));
+    handler.create_session(&alpha).await;
+    handler
+        .create_window(NewWindowRequest {
+            name: Some("w1".to_owned()),
+            ..Fixture::fixture(&alpha)
+        })
+        .await;
 
     let name_exists = handler
-        .handle(Request::DisplayMessage(DisplayMessageRequest {
-            target: Some(Target::Pane(PaneTarget::with_window(alpha, 0, 0))),
-            print: true,
-            message: Some("#{N:#W}|#{N/w:w1}|#{N/s:alpha}|#{N/s:missing}".to_owned()),
-            empty_target_context: false,
-        }))
+        .display_print(
+            PaneTarget::with_window(alpha, 0, 0),
+            "#{N:#W}|#{N/w:w1}|#{N/s:alpha}|#{N/s:missing}",
+        )
         .await;
-    let Response::DisplayMessage(name_exists) = name_exists else {
-        panic!("expected display-message response for name-exists modifiers");
-    };
-    assert_eq!(
-        name_exists
-            .command_output()
-            .expect("display-message -p returns output")
-            .stdout(),
-        b"1|1|1|0\n"
-    );
+    assert_eq!(name_exists, b"1|1|1|0\n");
 }
 
 #[tokio::test]
@@ -867,17 +493,9 @@ async fn display_message_content_search_modifier_reports_visible_line() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
 
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: alpha.clone(),
-                detached: true,
-                size: Some(TerminalSize { cols: 80, rows: 8 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
+    handler
+        .create_session((&alpha, TerminalSize::new(80, 8)))
+        .await;
     {
         let mut state = handler.state.lock().await;
         state
@@ -891,43 +509,26 @@ async fn display_message_content_search_modifier_reports_visible_line() {
     }
 
     let response = handler
-        .handle(Request::DisplayMessage(DisplayMessageRequest {
-            target: Some(Target::Pane(PaneTarget::with_window(alpha, 0, 0))),
-            print: true,
-            message: Some(
-                "#{C:alpha}|#{C:Needle}|#{C:absent}|#{C/i:needle}|#{C/r:N.*le}".to_owned(),
-            ),
-            empty_target_context: false,
-        }))
+        .display_print(
+            PaneTarget::with_window(alpha, 0, 0),
+            "#{C:alpha}|#{C:Needle}|#{C:absent}|#{C/i:needle}|#{C/r:N.*le}",
+        )
         .await;
-    let Response::DisplayMessage(response) = response else {
-        panic!("expected display-message response for content search modifier");
-    };
-    assert_eq!(
-        response
-            .command_output()
-            .expect("display-message -p returns output")
-            .stdout(),
-        b"1|2|0|2|2\n"
-    );
+    assert_eq!(response, b"1|2|0|2|2\n");
 }
 
 #[tokio::test]
 async fn bare_display_message_without_target_or_attached_client_is_a_silent_noop() {
     let handler = RequestHandler::new();
 
-    let response = handler
-        .handle(Request::DisplayMessage(DisplayMessageRequest {
-            target: None,
-            print: false,
-            message: Some("unused".to_owned()),
-            empty_target_context: false,
-        }))
-        .await;
-
     assert_eq!(
-        response,
-        Response::DisplayMessage(rmux_proto::DisplayMessageResponse::no_output())
+        handler
+            .handle_ok(DisplayMessageRequest {
+                print: false,
+                ..Fixture::fixture("unused")
+            })
+            .await,
+        rmux_proto::DisplayMessageResponse::no_output()
     );
 }
 
@@ -937,31 +538,20 @@ async fn bare_display_message_uses_status_overlay_for_attached_session() {
     let alpha = session_name("alpha");
     let (control_tx, mut control_rx) = mpsc::unbounded_channel();
 
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: alpha.clone(),
-                detached: true,
-                size: Some(TerminalSize { cols: 20, rows: 4 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
+    handler
+        .create_session((&alpha, TerminalSize::new(20, 4)))
+        .await;
     handler.register_attach(42, alpha.clone(), control_tx).await;
 
-    let response = handler
-        .handle(Request::DisplayMessage(DisplayMessageRequest {
-            target: Some(Target::Session(alpha)),
-            print: false,
-            message: Some("hello #{session_name}".to_owned()),
-            empty_target_context: false,
-        }))
-        .await;
-
     assert_eq!(
-        response,
-        Response::DisplayMessage(rmux_proto::DisplayMessageResponse::no_output())
+        handler
+            .handle_ok(DisplayMessageRequest {
+                target: Some(Target::Session(alpha)),
+                print: false,
+                ..Fixture::fixture("hello #{session_name}")
+            })
+            .await,
+        rmux_proto::DisplayMessageResponse::no_output()
     );
     let overlay = control_rx.try_recv().expect("overlay control");
     let AttachControl::Overlay(overlay) = overlay else {
@@ -979,37 +569,20 @@ async fn display_message_target_client_delivers_only_to_that_client() {
     let (first_tx, mut first_rx) = mpsc::unbounded_channel();
     let (second_tx, mut second_rx) = mpsc::unbounded_channel();
 
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: alpha.clone(),
-                detached: true,
-                size: Some(TerminalSize { cols: 20, rows: 4 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
+    handler
+        .create_session((&alpha, TerminalSize::new(20, 4)))
+        .await;
     handler.register_attach(42, alpha.clone(), first_tx).await;
     handler.register_attach(43, alpha, second_tx).await;
 
-    let response = handler
-        .handle(Request::DisplayMessageExt(Box::new(
-            DisplayMessageExtRequest {
-                target: None,
-                print: false,
-                message: Some("for second".to_owned()),
-                target_client: Some("43".to_owned()),
-                empty_target_context: false,
-                duration_ms: None,
-                ignore_input: false,
-            },
-        )))
-        .await;
-
     assert_eq!(
-        response,
-        Response::DisplayMessage(rmux_proto::DisplayMessageResponse::no_output())
+        handler
+            .handle_ok(DisplayMessageExtRequest {
+                target_client: Some("43".to_owned()),
+                ..Fixture::fixture("for second")
+            })
+            .await,
+        rmux_proto::DisplayMessageResponse::no_output()
     );
     assert!(first_rx.try_recv().is_err());
     let overlay = second_rx.try_recv().expect("targeted overlay control");
@@ -1026,17 +599,9 @@ async fn display_message_stale_explicit_client_does_not_fall_back_to_a_peer() {
     let alpha = session_name("display-stale-alpha");
     let beta = session_name("display-stale-beta");
     for session_name in [&alpha, &beta] {
-        assert!(matches!(
-            handler
-                .handle(Request::NewSession(NewSessionRequest {
-                    session_name: session_name.clone(),
-                    detached: true,
-                    size: Some(TerminalSize { cols: 20, rows: 4 }),
-                    environment: None,
-                }))
-                .await,
-            Response::NewSession(_)
-        ));
+        handler
+            .create_session((session_name, TerminalSize::new(20, 4)))
+            .await;
     }
 
     let requester_pid = 43_101;
@@ -1055,13 +620,8 @@ async fn display_message_stale_explicit_client_does_not_fall_back_to_a_peer() {
             .dispatch(
                 requester_pid,
                 Request::DisplayMessageExt(Box::new(DisplayMessageExtRequest {
-                    target: None,
-                    print: false,
-                    message: Some("must not reach peer".to_owned()),
                     target_client: Some("=".to_owned()),
-                    empty_target_context: false,
-                    duration_ms: None,
-                    ignore_input: false,
+                    ..Fixture::fixture("must not reach peer")
                 })),
             )
             .await
@@ -1097,17 +657,9 @@ async fn queued_display_message_ignore_input_is_scoped_to_its_attached_initiator
     let peer_pid = 45;
     let (initiator_tx, mut initiator_rx) = mpsc::unbounded_channel();
     let (peer_tx, mut peer_rx) = mpsc::unbounded_channel();
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: alpha.clone(),
-                detached: true,
-                size: Some(TerminalSize { cols: 20, rows: 4 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
+    handler
+        .create_session((&alpha, TerminalSize::new(20, 4)))
+        .await;
     handler
         .register_attach(initiator_pid, alpha.clone(), initiator_tx)
         .await;
@@ -1160,17 +712,9 @@ async fn direct_display_message_delivers_to_recent_client_but_formats_for_target
     let alpha = session_name("format-alpha");
     let beta = session_name("display-beta");
     for session_name in [alpha.clone(), beta.clone()] {
-        assert!(matches!(
-            handler
-                .handle(Request::NewSession(NewSessionRequest {
-                    session_name,
-                    detached: true,
-                    size: Some(TerminalSize { cols: 100, rows: 4 }),
-                    environment: None,
-                }))
-                .await,
-            Response::NewSession(_)
-        ));
+        handler
+            .create_session((session_name, TerminalSize::new(100, 4)))
+            .await;
     }
     let alpha_pid = u32::MAX - 100;
     let beta_pid = u32::MAX - 99;
@@ -1188,15 +732,11 @@ async fn direct_display_message_delivers_to_recent_client_but_formats_for_target
             7_777,
             DisplayMessageExtRequest {
                 target: Some(Target::Session(alpha)),
-                print: false,
-                message: Some(
-                    "format=#{session_name}|client=#{client_session}|name=#{client_name}"
-                        .to_owned(),
-                ),
-                target_client: None,
-                empty_target_context: false,
                 duration_ms: Some(rmux_proto::DisplayMessageDurationMillis::new(5_000)),
                 ignore_input: true,
+                ..Fixture::fixture(
+                    "format=#{session_name}|client=#{client_session}|name=#{client_name}",
+                )
             },
         )
         .await;
@@ -1225,11 +765,8 @@ async fn direct_display_message_delivers_to_recent_client_but_formats_for_target
             DisplayMessageExtRequest {
                 target: Some(Target::Session(session_name("format-alpha"))),
                 print: true,
-                message: Some("#{session_name}|#{client_session}|#{client_name}".to_owned()),
                 target_client: Some(beta_pid.to_string()),
-                empty_target_context: false,
-                duration_ms: None,
-                ignore_input: false,
+                ..Fixture::fixture("#{session_name}|#{client_session}|#{client_name}")
             },
         )
         .await;
@@ -1249,12 +786,9 @@ async fn direct_display_message_delivers_to_recent_client_but_formats_for_target
             7_778,
             DisplayMessageExtRequest {
                 target: Some(Target::Session(session_name("format-alpha"))),
-                print: false,
-                message: Some("active alpha".to_owned()),
-                target_client: None,
-                empty_target_context: false,
                 duration_ms: Some(rmux_proto::DisplayMessageDurationMillis::new(5_000)),
                 ignore_input: true,
+                ..Fixture::fixture("active alpha")
             },
         )
         .await;
@@ -1274,17 +808,9 @@ async fn direct_display_message_target_client_does_not_replace_current_format_cl
     let beta = session_name("direct-format-beta");
     let detached = session_name("direct-target-detached");
     for session_name in [alpha.clone(), beta.clone(), detached.clone()] {
-        assert!(matches!(
-            handler
-                .handle(Request::NewSession(NewSessionRequest {
-                    session_name,
-                    detached: true,
-                    size: Some(TerminalSize { cols: 100, rows: 4 }),
-                    environment: None,
-                }))
-                .await,
-            Response::NewSession(_)
-        ));
+        handler
+            .create_session((session_name, TerminalSize::new(100, 4)))
+            .await;
     }
     let alpha_pid = u32::MAX - 98;
     let beta_pid = u32::MAX - 97;
@@ -1298,13 +824,9 @@ async fn direct_display_message_target_client_does_not_replace_current_format_cl
         .handle_display_message_ext(
             7_779,
             DisplayMessageExtRequest {
-                target: None,
                 print: true,
-                message: Some(template.to_owned()),
                 target_client: Some(alpha_pid.to_string()),
-                empty_target_context: false,
-                duration_ms: None,
-                ignore_input: false,
+                ..Fixture::fixture(template)
             },
         )
         .await;
@@ -1319,11 +841,8 @@ async fn direct_display_message_target_client_does_not_replace_current_format_cl
             DisplayMessageExtRequest {
                 target: Some(Target::Session(detached.clone())),
                 print: true,
-                message: Some(template.to_owned()),
                 target_client: Some(alpha_pid.to_string()),
-                empty_target_context: false,
-                duration_ms: None,
-                ignore_input: false,
+                ..Fixture::fixture(template)
             },
         )
         .await;
@@ -1336,13 +855,9 @@ async fn direct_display_message_target_client_does_not_replace_current_format_cl
         .handle_display_message_ext(
             7_781,
             DisplayMessageExtRequest {
-                target: None,
-                print: false,
-                message: Some(template.to_owned()),
                 target_client: Some(alpha_pid.to_string()),
-                empty_target_context: false,
                 duration_ms: Some(rmux_proto::DisplayMessageDurationMillis::new(5_000)),
-                ignore_input: false,
+                ..Fixture::fixture(template)
             },
         )
         .await;
@@ -1367,17 +882,9 @@ async fn queued_display_message_cross_client_detached_target_keeps_initiator_for
     let beta = session_name("queued-delivery-beta");
     let detached = session_name("queued-target-detached");
     for session_name in [alpha.clone(), beta.clone(), detached.clone()] {
-        assert!(matches!(
-            handler
-                .handle(Request::NewSession(NewSessionRequest {
-                    session_name,
-                    detached: true,
-                    size: Some(TerminalSize { cols: 100, rows: 4 }),
-                    environment: None,
-                }))
-                .await,
-            Response::NewSession(_)
-        ));
+        handler
+            .create_session((session_name, TerminalSize::new(100, 4)))
+            .await;
     }
     let initiator_pid = u32::MAX - 96;
     let delivery_pid = u32::MAX - 95;
@@ -1447,17 +954,9 @@ async fn stable_pane_run_shell_message_broadcasts_only_to_the_target_session() {
     let alpha = session_name("run-shell-output-alpha");
     let beta = session_name("run-shell-output-beta");
     for session_name in [alpha.clone(), beta.clone()] {
-        assert!(matches!(
-            handler
-                .handle(Request::NewSession(NewSessionRequest {
-                    session_name,
-                    detached: true,
-                    size: Some(TerminalSize { cols: 20, rows: 4 }),
-                    environment: None,
-                }))
-                .await,
-            Response::NewSession(_)
-        ));
+        handler
+            .create_session((session_name, TerminalSize::new(20, 4)))
+            .await;
     }
     let pane_id = handler
         .state
@@ -1485,8 +984,7 @@ async fn stable_pane_run_shell_message_broadcasts_only_to_the_target_session() {
             DisplayMessageRequest {
                 target: Some(Target::Session(alpha)),
                 print: false,
-                message: Some("RS".to_owned()),
-                empty_target_context: false,
+                ..Fixture::fixture("RS")
             },
         )
         .await;
@@ -1508,46 +1006,26 @@ async fn display_message_missing_target_client_is_noop_unless_printing() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
 
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: alpha,
-                detached: true,
-                size: Some(TerminalSize { cols: 20, rows: 4 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
-
-    let response = handler
-        .handle(Request::DisplayMessageExt(Box::new(
-            DisplayMessageExtRequest {
-                target: None,
-                print: false,
-                message: Some("hidden".to_owned()),
-                target_client: Some("999999".to_owned()),
-                empty_target_context: false,
-                duration_ms: None,
-                ignore_input: false,
-            },
-        )))
+    handler
+        .create_session((alpha, TerminalSize::new(20, 4)))
         .await;
+
     assert_eq!(
-        response,
-        Response::DisplayMessage(rmux_proto::DisplayMessageResponse::no_output())
+        handler
+            .handle_ok(DisplayMessageExtRequest {
+                target_client: Some("999999".to_owned()),
+                ..Fixture::fixture("hidden")
+            })
+            .await,
+        rmux_proto::DisplayMessageResponse::no_output()
     );
 
     let response = handler
         .handle(Request::DisplayMessageExt(Box::new(
             DisplayMessageExtRequest {
-                target: None,
                 print: true,
-                message: Some("hello".to_owned()),
                 target_client: Some("999999".to_owned()),
-                empty_target_context: false,
-                duration_ms: None,
-                ignore_input: false,
+                ..Fixture::fixture("hello")
             },
         )))
         .await;
@@ -1565,37 +1043,21 @@ async fn display_message_target_client_uses_client_session_for_overlay_delivery(
     let (control_tx, mut control_rx) = mpsc::unbounded_channel();
 
     for session_name in [alpha.clone(), beta.clone()] {
-        assert!(matches!(
-            handler
-                .handle(Request::NewSession(NewSessionRequest {
-                    session_name,
-                    detached: true,
-                    size: Some(TerminalSize { cols: 20, rows: 4 }),
-                    environment: None,
-                }))
-                .await,
-            Response::NewSession(_)
-        ));
+        handler
+            .create_session((session_name, TerminalSize::new(20, 4)))
+            .await;
     }
     handler.register_attach(42, alpha, control_tx).await;
 
-    let response = handler
-        .handle(Request::DisplayMessageExt(Box::new(
-            DisplayMessageExtRequest {
-                target: Some(Target::Session(beta)),
-                print: false,
-                message: Some("format #{session_name} #{client_session}".to_owned()),
-                target_client: Some("42".to_owned()),
-                empty_target_context: false,
-                duration_ms: None,
-                ignore_input: false,
-            },
-        )))
-        .await;
-
     assert_eq!(
-        response,
-        Response::DisplayMessage(rmux_proto::DisplayMessageResponse::no_output())
+        handler
+            .handle_ok(DisplayMessageExtRequest {
+                target: Some(Target::Session(beta)),
+                target_client: Some("42".to_owned()),
+                ..Fixture::fixture("format #{session_name} #{client_session}")
+            })
+            .await,
+        rmux_proto::DisplayMessageResponse::no_output()
     );
     let overlay = control_rx.try_recv().expect("targeted overlay control");
     let AttachControl::Overlay(overlay) = overlay else {
@@ -1611,17 +1073,9 @@ async fn display_message_uses_display_time_option_for_overlay_clear() {
     let alpha = session_name("alpha");
     let (control_tx, mut control_rx) = mpsc::unbounded_channel();
 
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: alpha.clone(),
-                detached: true,
-                size: Some(TerminalSize { cols: 20, rows: 4 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
+    handler
+        .create_session((&alpha, TerminalSize::new(20, 4)))
+        .await;
     {
         let mut state = handler.state.lock().await;
         state
@@ -1636,18 +1090,15 @@ async fn display_message_uses_display_time_option_for_overlay_clear() {
     }
     handler.register_attach(43, alpha.clone(), control_tx).await;
 
-    let response = handler
-        .handle(Request::DisplayMessage(DisplayMessageRequest {
-            target: Some(Target::Session(alpha)),
-            print: false,
-            message: Some("quick clear".to_owned()),
-            empty_target_context: false,
-        }))
-        .await;
-
     assert_eq!(
-        response,
-        Response::DisplayMessage(rmux_proto::DisplayMessageResponse::no_output())
+        handler
+            .handle_ok(DisplayMessageRequest {
+                target: Some(Target::Session(alpha)),
+                print: false,
+                ..Fixture::fixture("quick clear")
+            })
+            .await,
+        rmux_proto::DisplayMessageResponse::no_output()
     );
 
     let first = recv_overlay_control(&mut control_rx).await;
@@ -1676,35 +1127,21 @@ async fn display_message_zero_delay_waits_for_input_and_forwards_that_input() {
     let alpha = session_name("alpha");
     let attach_pid = 44;
     let (control_tx, mut control_rx) = mpsc::unbounded_channel();
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: alpha.clone(),
-                detached: true,
-                size: Some(TerminalSize { cols: 20, rows: 4 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
+    handler
+        .create_session((&alpha, TerminalSize::new(20, 4)))
+        .await;
     handler
         .register_attach(attach_pid, alpha.clone(), control_tx)
         .await;
 
-    let response = handler
-        .handle(Request::DisplayMessageExt(Box::new(
-            DisplayMessageExtRequest {
-                target: Some(Target::Session(alpha)),
-                print: false,
-                message: Some("wait for input".to_owned()),
-                target_client: None,
-                empty_target_context: false,
-                duration_ms: Some(rmux_proto::DisplayMessageDurationMillis::new(0)),
-                ignore_input: true,
-            },
-        )))
+    handler
+        .handle_ok(DisplayMessageExtRequest {
+            target: Some(Target::Session(alpha)),
+            duration_ms: Some(rmux_proto::DisplayMessageDurationMillis::new(0)),
+            ignore_input: true,
+            ..Fixture::fixture("wait for input")
+        })
         .await;
-    assert!(matches!(response, Response::DisplayMessage(_)));
     let _overlay = recv_overlay_control(&mut control_rx).await;
     assert!(
         timeout(Duration::from_millis(20), control_rx.recv())
@@ -1740,17 +1177,9 @@ async fn display_message_zero_display_time_does_not_enable_ignore_input() {
     let alpha = session_name("zero-display-time");
     let attach_pid = 48;
     let (control_tx, mut control_rx) = mpsc::unbounded_channel();
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: alpha.clone(),
-                detached: true,
-                size: Some(TerminalSize { cols: 20, rows: 4 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
+    handler
+        .create_session((&alpha, TerminalSize::new(20, 4)))
+        .await;
     {
         let mut state = handler.state.lock().await;
         state
@@ -1770,12 +1199,9 @@ async fn display_message_zero_display_time_does_not_enable_ignore_input() {
         .handle(Request::DisplayMessageExt(Box::new(
             DisplayMessageExtRequest {
                 target: Some(Target::Session(alpha)),
-                print: false,
-                message: Some("wait for key".to_owned()),
                 target_client: Some(attach_pid.to_string()),
-                empty_target_context: false,
-                duration_ms: None,
                 ignore_input: true,
+                ..Fixture::fixture("wait for key")
             },
         )))
         .await;
@@ -1805,17 +1231,9 @@ async fn display_message_ignore_input_swallows_keys_until_positive_delay_expires
     let alpha = session_name("alpha");
     let attach_pid = 45;
     let (control_tx, mut control_rx) = mpsc::unbounded_channel();
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: alpha.clone(),
-                detached: true,
-                size: Some(TerminalSize { cols: 20, rows: 4 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
+    handler
+        .create_session((&alpha, TerminalSize::new(20, 4)))
+        .await;
     handler
         .register_attach(attach_pid, alpha.clone(), control_tx)
         .await;
@@ -1823,12 +1241,9 @@ async fn display_message_ignore_input_swallows_keys_until_positive_delay_expires
         .handle(Request::DisplayMessageExt(Box::new(
             DisplayMessageExtRequest {
                 target: Some(Target::Session(alpha)),
-                print: false,
-                message: Some("ignore input".to_owned()),
-                target_client: None,
-                empty_target_context: false,
                 duration_ms: Some(rmux_proto::DisplayMessageDurationMillis::new(40)),
                 ignore_input: true,
+                ..Fixture::fixture("ignore input")
             },
         )))
         .await;
@@ -1876,17 +1291,9 @@ async fn display_message_expiry_preserves_an_open_bracketed_paste_boundary() {
     let alpha = session_name("message-paste-expiry");
     let attach_pid = 45_001;
     let (control_tx, mut control_rx) = mpsc::unbounded_channel();
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: alpha.clone(),
-                detached: true,
-                size: Some(TerminalSize { cols: 20, rows: 4 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
+    handler
+        .create_session((&alpha, TerminalSize::new(20, 4)))
+        .await;
     handler
         .register_attach(attach_pid, alpha.clone(), control_tx)
         .await;
@@ -1899,12 +1306,10 @@ async fn display_message_expiry_preserves_an_open_bracketed_paste_boundary() {
         .handle(Request::DisplayMessageExt(Box::new(
             DisplayMessageExtRequest {
                 target: Some(Target::Session(alpha)),
-                print: false,
-                message: Some("ignore paste prefix".to_owned()),
                 target_client: Some(attach_pid.to_string()),
-                empty_target_context: false,
                 duration_ms: Some(rmux_proto::DisplayMessageDurationMillis::new(40)),
                 ignore_input: true,
+                ..Fixture::fixture("ignore paste prefix")
             },
         )))
         .await;
@@ -1941,17 +1346,9 @@ async fn rearmed_display_message_preserves_an_expired_open_paste_boundary() {
     let alpha = session_name("message-paste-expiry-rearm");
     let attach_pid = 45_002;
     let (control_tx, mut control_rx) = mpsc::unbounded_channel();
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: alpha.clone(),
-                detached: true,
-                size: Some(TerminalSize { cols: 20, rows: 4 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
+    handler
+        .create_session((&alpha, TerminalSize::new(20, 4)))
+        .await;
     handler
         .register_attach(attach_pid, alpha.clone(), control_tx)
         .await;
@@ -1962,22 +1359,15 @@ async fn rearmed_display_message_preserves_an_expired_open_paste_boundary() {
     stamp_bracketed_paste_mode(&handler, &target).await;
 
     for message in ["first ignore", "replacement ignore"] {
-        assert!(matches!(
-            handler
-                .handle(Request::DisplayMessageExt(Box::new(
-                    DisplayMessageExtRequest {
-                        target: Some(Target::Session(alpha.clone())),
-                        print: false,
-                        message: Some(message.to_owned()),
-                        target_client: Some(attach_pid.to_string()),
-                        empty_target_context: false,
-                        duration_ms: Some(rmux_proto::DisplayMessageDurationMillis::new(10_000)),
-                        ignore_input: true,
-                    },
-                )))
-                .await,
-            Response::DisplayMessage(_)
-        ));
+        handler
+            .handle_ok(DisplayMessageExtRequest {
+                target: Some(Target::Session(alpha.clone())),
+                target_client: Some(attach_pid.to_string()),
+                duration_ms: Some(rmux_proto::DisplayMessageDurationMillis::new(10_000)),
+                ignore_input: true,
+                ..Fixture::fixture(message.to_owned())
+            })
+            .await;
         let _message = recv_overlay_control(&mut control_rx).await;
         if message == "first ignore" {
             let mut pending = Vec::new();
@@ -2043,17 +1433,9 @@ async fn display_message_ignore_input_preserves_outer_terminal_responses() {
     let alpha = session_name("alpha");
     let attach_pid = 46;
     let (control_tx, mut control_rx) = mpsc::unbounded_channel();
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: alpha.clone(),
-                detached: true,
-                size: Some(TerminalSize { cols: 20, rows: 4 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
+    handler
+        .create_session((&alpha, TerminalSize::new(20, 4)))
+        .await;
     handler
         .register_attach(attach_pid, alpha.clone(), control_tx)
         .await;
@@ -2072,12 +1454,9 @@ async fn display_message_ignore_input_preserves_outer_terminal_responses() {
         .handle(Request::DisplayMessageExt(Box::new(
             DisplayMessageExtRequest {
                 target: Some(Target::Session(alpha.clone())),
-                print: false,
-                message: Some("protocol response".to_owned()),
-                target_client: None,
-                empty_target_context: false,
                 duration_ms: Some(rmux_proto::DisplayMessageDurationMillis::new(10_000)),
                 ignore_input: true,
+                ..Fixture::fixture("protocol response")
             },
         )))
         .await;
@@ -2123,17 +1502,9 @@ async fn display_message_ignore_input_discards_generic_terminal_strings() {
     let alpha = session_name("ignored-terminal-strings");
     let attach_pid = 4_612;
     let (control_tx, mut control_rx) = mpsc::unbounded_channel();
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: alpha.clone(),
-                detached: true,
-                size: Some(TerminalSize { cols: 20, rows: 4 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
+    handler
+        .create_session((&alpha, TerminalSize::new(20, 4)))
+        .await;
     handler
         .register_attach(attach_pid, alpha.clone(), control_tx)
         .await;
@@ -2146,22 +1517,15 @@ async fn display_message_ignore_input_discards_generic_terminal_strings() {
         .lock()
         .await
         .start_pane_input_capture_for_test(&target);
-    assert!(matches!(
-        handler
-            .handle(Request::DisplayMessageExt(Box::new(
-                DisplayMessageExtRequest {
-                    target: Some(Target::Session(alpha)),
-                    print: false,
-                    message: Some("ignore terminal strings".to_owned()),
-                    target_client: Some(attach_pid.to_string()),
-                    empty_target_context: false,
-                    duration_ms: Some(rmux_proto::DisplayMessageDurationMillis::new(10_000)),
-                    ignore_input: true,
-                },
-            )))
-            .await,
-        Response::DisplayMessage(_)
-    ));
+    handler
+        .handle_ok(DisplayMessageExtRequest {
+            target: Some(Target::Session(alpha)),
+            target_client: Some(attach_pid.to_string()),
+            duration_ms: Some(rmux_proto::DisplayMessageDurationMillis::new(10_000)),
+            ignore_input: true,
+            ..Fixture::fixture("ignore terminal strings")
+        })
+        .await;
     let _message = recv_overlay_control(&mut control_rx).await;
 
     for terminal_string in [
@@ -2236,38 +1600,21 @@ async fn status_refresh_does_not_cover_an_active_display_message() {
         let session = session_name(name);
         let attach_pid = if ignore_input { 4_602 } else { 4_601 };
         let (control_tx, mut control_rx) = mpsc::unbounded_channel();
-        assert!(matches!(
-            handler
-                .handle(Request::NewSession(NewSessionRequest {
-                    session_name: session.clone(),
-                    detached: true,
-                    size: Some(TerminalSize { cols: 20, rows: 4 }),
-                    environment: None,
-                }))
-                .await,
-            Response::NewSession(_)
-        ));
+        handler
+            .create_session((&session, TerminalSize::new(20, 4)))
+            .await;
         handler
             .register_attach(attach_pid, session.clone(), control_tx)
             .await;
-        assert!(matches!(
-            handler
-                .handle(Request::DisplayMessageExt(Box::new(
-                    DisplayMessageExtRequest {
-                        target: Some(Target::Session(session.clone())),
-                        print: false,
-                        message: Some("must remain visible".to_owned()),
-                        target_client: Some(attach_pid.to_string()),
-                        empty_target_context: false,
-                        duration_ms: Some(rmux_proto::DisplayMessageDurationMillis::new(
-                            duration_ms,
-                        )),
-                        ignore_input,
-                    },
-                )))
-                .await,
-            Response::DisplayMessage(_)
-        ));
+        handler
+            .handle_ok(DisplayMessageExtRequest {
+                target: Some(Target::Session(session.clone())),
+                target_client: Some(attach_pid.to_string()),
+                duration_ms: Some(rmux_proto::DisplayMessageDurationMillis::new(duration_ms)),
+                ignore_input,
+                ..Fixture::fixture("must remain visible")
+            })
+            .await;
         let _message = recv_overlay_control(&mut control_rx).await;
 
         handler
@@ -2296,17 +1643,7 @@ async fn display_message_initial_frame_uses_the_target_clients_geometry() {
     let session = session_name("message-client-geometry");
     let attach_pid = 4_601;
     let (control_tx, mut control_rx) = mpsc::unbounded_channel();
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: session.clone(),
-                detached: true,
-                size: Some(TerminalSize { cols: 80, rows: 24 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
+    handler.create_session(&session).await;
     handler
         .register_attach(attach_pid, session.clone(), control_tx)
         .await;
@@ -2320,22 +1657,15 @@ async fn display_message_initial_frame_uses_the_target_clients_geometry() {
             .set_declared_client_size(client_size);
     }
     let message = "CLIENT-GEOMETRY-MESSAGE";
-    assert!(matches!(
-        handler
-            .handle(Request::DisplayMessageExt(Box::new(
-                DisplayMessageExtRequest {
-                    target: Some(Target::Session(session.clone())),
-                    print: false,
-                    message: Some(message.to_owned()),
-                    target_client: Some(attach_pid.to_string()),
-                    empty_target_context: false,
-                    duration_ms: Some(rmux_proto::DisplayMessageDurationMillis::new(10_000)),
-                    ignore_input: true,
-                },
-            )))
-            .await,
-        Response::DisplayMessage(_)
-    ));
+    handler
+        .handle_ok(DisplayMessageExtRequest {
+            target: Some(Target::Session(session.clone())),
+            target_client: Some(attach_pid.to_string()),
+            duration_ms: Some(rmux_proto::DisplayMessageDurationMillis::new(10_000)),
+            ignore_input: true,
+            ..Fixture::fixture(message)
+        })
+        .await;
     let AttachControl::Overlay(overlay) = recv_overlay_control(&mut control_rx).await else {
         panic!("display-message emits an overlay");
     };
@@ -2377,17 +1707,7 @@ async fn resize_rerenders_an_ignored_display_message_at_the_new_geometry() {
     let session = session_name("message-resize-geometry");
     let attach_pid = 4_602;
     let (control_tx, mut control_rx) = mpsc::unbounded_channel();
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: session.clone(),
-                detached: true,
-                size: Some(TerminalSize { cols: 80, rows: 24 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
+    handler.create_session(&session).await;
     handler
         .register_attach(attach_pid, session.clone(), control_tx)
         .await;
@@ -2396,12 +1716,10 @@ async fn resize_rerenders_an_ignored_display_message_at_the_new_geometry() {
         .handle(Request::DisplayMessageExt(Box::new(
             DisplayMessageExtRequest {
                 target: Some(Target::Session(session.clone())),
-                print: false,
-                message: Some(message.to_owned()),
                 target_client: Some(attach_pid.to_string()),
-                empty_target_context: false,
                 duration_ms: Some(rmux_proto::DisplayMessageDurationMillis::new(10_000)),
                 ignore_input: true,
+                ..Fixture::fixture(message)
             },
         )))
         .await;
@@ -2453,17 +1771,9 @@ async fn closing_a_popup_repaints_an_ignored_display_message() {
     let session = session_name("message-popup-restore");
     let attach_pid = 4_604;
     let (control_tx, mut control_rx) = mpsc::unbounded_channel();
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: session.clone(),
-                detached: true,
-                size: Some(TerminalSize { cols: 60, rows: 12 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
+    handler
+        .create_session((&session, TerminalSize::new(60, 12)))
+        .await;
     handler
         .register_attach(attach_pid, session.clone(), control_tx)
         .await;
@@ -2472,12 +1782,10 @@ async fn closing_a_popup_repaints_an_ignored_display_message() {
         .handle(Request::DisplayMessageExt(Box::new(
             DisplayMessageExtRequest {
                 target: Some(Target::Session(session.clone())),
-                print: false,
-                message: Some(message.to_owned()),
                 target_client: Some(attach_pid.to_string()),
-                empty_target_context: false,
                 duration_ms: Some(rmux_proto::DisplayMessageDurationMillis::new(10_000)),
                 ignore_input: true,
+                ..Fixture::fixture(message)
             },
         )))
         .await;
@@ -2540,17 +1848,9 @@ async fn display_message_composes_with_an_existing_popup() {
     let session = session_name("popup-before-message");
     let attach_pid = 4_605;
     let (control_tx, mut control_rx) = mpsc::unbounded_channel();
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: session.clone(),
-                detached: true,
-                size: Some(TerminalSize { cols: 60, rows: 12 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
+    handler
+        .create_session((&session, TerminalSize::new(60, 12)))
+        .await;
     handler
         .register_attach(attach_pid, session.clone(), control_tx)
         .await;
@@ -2568,12 +1868,10 @@ async fn display_message_composes_with_an_existing_popup() {
         .handle(Request::DisplayMessageExt(Box::new(
             DisplayMessageExtRequest {
                 target: Some(Target::Session(session)),
-                print: false,
-                message: Some("MESSAGE-OVER-POPUP".to_owned()),
                 target_client: Some(attach_pid.to_string()),
-                empty_target_context: false,
                 duration_ms: Some(rmux_proto::DisplayMessageDurationMillis::new(10_000)),
                 ignore_input: true,
+                ..Fixture::fixture("MESSAGE-OVER-POPUP")
             },
         )))
         .await;
@@ -2592,17 +1890,9 @@ async fn display_panes_composes_with_an_ignored_display_message() {
     let session = session_name("message-with-display-panes");
     let attach_pid = 4_603;
     let (control_tx, mut control_rx) = mpsc::unbounded_channel();
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: session.clone(),
-                detached: true,
-                size: Some(TerminalSize { cols: 40, rows: 8 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
+    handler
+        .create_session((&session, TerminalSize::new(40, 8)))
+        .await;
     handler
         .register_attach(attach_pid, session.clone(), control_tx)
         .await;
@@ -2614,22 +1904,15 @@ async fn display_panes_composes_with_an_ignored_display_message() {
             .expect("display-panes session exists");
         crate::renderer::render_display_panes_overlay(session_state, &state.options)
     };
-    assert!(matches!(
-        handler
-            .handle(Request::DisplayMessageExt(Box::new(
-                DisplayMessageExtRequest {
-                    target: Some(Target::Session(session.clone())),
-                    print: false,
-                    message: Some("VISIBLE-MESSAGE".to_owned()),
-                    target_client: Some(attach_pid.to_string()),
-                    empty_target_context: false,
-                    duration_ms: Some(rmux_proto::DisplayMessageDurationMillis::new(10_000)),
-                    ignore_input: true,
-                },
-            )))
-            .await,
-        Response::DisplayMessage(_)
-    ));
+    handler
+        .handle_ok(DisplayMessageExtRequest {
+            target: Some(Target::Session(session.clone())),
+            target_client: Some(attach_pid.to_string()),
+            duration_ms: Some(rmux_proto::DisplayMessageDurationMillis::new(10_000)),
+            ignore_input: true,
+            ..Fixture::fixture("VISIBLE-MESSAGE")
+        })
+        .await;
     let _message = recv_overlay_control(&mut control_rx).await;
     let display_panes = handler
         .parse_control_commands("display-panes -b -d 60000")
@@ -2673,17 +1956,9 @@ async fn display_message_composes_with_existing_display_panes() {
     let session = session_name("display-panes-before-message");
     let attach_pid = 4_606;
     let (control_tx, mut control_rx) = mpsc::unbounded_channel();
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: session.clone(),
-                detached: true,
-                size: Some(TerminalSize { cols: 40, rows: 8 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
+    handler
+        .create_session((&session, TerminalSize::new(40, 8)))
+        .await;
     handler
         .register_attach(attach_pid, session.clone(), control_tx)
         .await;
@@ -2709,12 +1984,10 @@ async fn display_message_composes_with_existing_display_panes() {
         .handle(Request::DisplayMessageExt(Box::new(
             DisplayMessageExtRequest {
                 target: Some(Target::Session(session)),
-                print: false,
-                message: Some("MESSAGE-OVER-LABELS".to_owned()),
                 target_client: Some(attach_pid.to_string()),
-                empty_target_context: false,
                 duration_ms: Some(rmux_proto::DisplayMessageDurationMillis::new(10_000)),
                 ignore_input: true,
+                ..Fixture::fixture("MESSAGE-OVER-LABELS")
             },
         )))
         .await;
@@ -2740,17 +2013,9 @@ async fn expiring_message_restores_display_panes_and_popup_in_order() {
     let session = session_name("restore-display-panes-and-popup");
     let attach_pid = 4_607;
     let (control_tx, mut control_rx) = mpsc::unbounded_channel();
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: session.clone(),
-                detached: true,
-                size: Some(TerminalSize { cols: 40, rows: 8 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
+    handler
+        .create_session((&session, TerminalSize::new(40, 8)))
+        .await;
     handler
         .register_attach(attach_pid, session.clone(), control_tx)
         .await;
@@ -2781,22 +2046,15 @@ async fn expiring_message_restores_display_panes_and_popup_in_order() {
         .expect("popup opens");
     let _popup = recv_overlay_control(&mut control_rx).await;
 
-    assert!(matches!(
-        handler
-            .handle(Request::DisplayMessageExt(Box::new(
-                DisplayMessageExtRequest {
-                    target: Some(Target::Session(session.clone())),
-                    print: false,
-                    message: Some("TRANSIENT-OVER-BOTH".to_owned()),
-                    target_client: Some(attach_pid.to_string()),
-                    empty_target_context: false,
-                    duration_ms: Some(rmux_proto::DisplayMessageDurationMillis::new(10_000)),
-                    ignore_input: true,
-                },
-            )))
-            .await,
-        Response::DisplayMessage(_)
-    ));
+    handler
+        .handle_ok(DisplayMessageExtRequest {
+            target: Some(Target::Session(session.clone())),
+            target_client: Some(attach_pid.to_string()),
+            duration_ms: Some(rmux_proto::DisplayMessageDurationMillis::new(10_000)),
+            ignore_input: true,
+            ..Fixture::fixture("TRANSIENT-OVER-BOTH")
+        })
+        .await;
     let _message = recv_overlay_control(&mut control_rx).await;
     while control_rx.try_recv().is_ok() {}
 
@@ -2871,17 +2129,9 @@ async fn older_display_message_timer_cannot_clear_a_newer_message() {
     let alpha = session_name("alpha");
     let attach_pid = 47;
     let (control_tx, mut control_rx) = mpsc::unbounded_channel();
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: alpha.clone(),
-                detached: true,
-                size: Some(TerminalSize { cols: 20, rows: 4 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
+    handler
+        .create_session((&alpha, TerminalSize::new(20, 4)))
+        .await;
     handler
         .register_attach(attach_pid, alpha.clone(), control_tx)
         .await;
@@ -2891,12 +2141,8 @@ async fn older_display_message_timer_cannot_clear_a_newer_message() {
             .handle(Request::DisplayMessageExt(Box::new(
                 DisplayMessageExtRequest {
                     target: Some(Target::Session(alpha.clone())),
-                    print: false,
-                    message: Some(message.to_owned()),
-                    target_client: None,
-                    empty_target_context: false,
                     duration_ms: Some(rmux_proto::DisplayMessageDurationMillis::new(delay)),
-                    ignore_input: false,
+                    ..Fixture::fixture(message)
                 },
             )))
             .await;
@@ -2932,17 +2178,9 @@ async fn dismissed_message_restore_cannot_overwrite_a_newer_persistent_surface()
     let alpha = session_name("transient-restore-generation");
     let attach_pid = 49;
     let (control_tx, mut control_rx) = mpsc::unbounded_channel();
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: alpha.clone(),
-                detached: true,
-                size: Some(TerminalSize { cols: 20, rows: 4 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
+    handler
+        .create_session((&alpha, TerminalSize::new(20, 4)))
+        .await;
     handler
         .register_attach(attach_pid, alpha.clone(), control_tx)
         .await;
@@ -2950,12 +2188,9 @@ async fn dismissed_message_restore_cannot_overwrite_a_newer_persistent_surface()
         .handle(Request::DisplayMessageExt(Box::new(
             DisplayMessageExtRequest {
                 target: Some(Target::Session(alpha)),
-                print: false,
-                message: Some("old transient".to_owned()),
                 target_client: Some(attach_pid.to_string()),
-                empty_target_context: false,
                 duration_ms: Some(rmux_proto::DisplayMessageDurationMillis::new(0)),
-                ignore_input: false,
+                ..Fixture::fixture("old transient")
             },
         )))
         .await;

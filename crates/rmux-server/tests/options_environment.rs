@@ -2,10 +2,10 @@ use std::error::Error;
 
 mod common;
 
-use common::{send_request, session_name, start_server, TestHarness};
+use common::{create_session, send, session_name, start_server, Fixture, Sizeless, TestHarness};
 use rmux_proto::{
-    NewSessionRequest, OptionName, Request, Response, RmuxError, ScopeSelector,
-    SetEnvironmentRequest, SetOptionMode, SetOptionRequest,
+    OptionName, Response, RmuxError, ScopeSelector, SetEnvironmentRequest, SetOptionMode,
+    SetOptionRequest,
 };
 
 #[tokio::test(flavor = "multi_thread")]
@@ -14,26 +14,11 @@ async fn set_option_round_trips_and_invalid_variants_fail_cleanly() -> Result<()
     let socket_path = harness.socket_path().to_path_buf();
     let handle = start_server(&harness).await?;
 
-    let created = send_request(
-        &socket_path,
-        &Request::NewSession(NewSessionRequest {
-            session_name: session_name("alpha"),
-            detached: true,
-            size: None,
-            environment: None,
-        }),
-    )
-    .await?;
-    assert!(matches!(created, Response::NewSession(_)));
+    create_session(&socket_path, Sizeless("alpha")).await?;
 
-    let global_status = send_request(
+    let global_status = send(
         &socket_path,
-        &Request::SetOption(SetOptionRequest {
-            scope: ScopeSelector::Global,
-            option: OptionName::Status,
-            value: "off".to_owned(),
-            mode: SetOptionMode::Replace,
-        }),
+        SetOptionRequest::fixture((ScopeSelector::Global, OptionName::Status, "off")),
     )
     .await?;
     assert_eq!(
@@ -45,14 +30,13 @@ async fn set_option_round_trips_and_invalid_variants_fail_cleanly() -> Result<()
         })
     );
 
-    let session_status = send_request(
+    let session_status = send(
         &socket_path,
-        &Request::SetOption(SetOptionRequest {
-            scope: ScopeSelector::Session(session_name("alpha")),
-            option: OptionName::Status,
-            value: "on".to_owned(),
-            mode: SetOptionMode::Replace,
-        }),
+        SetOptionRequest::fixture((
+            ScopeSelector::Session(session_name("alpha")),
+            OptionName::Status,
+            "on",
+        )),
     )
     .await?;
     assert_eq!(
@@ -64,14 +48,12 @@ async fn set_option_round_trips_and_invalid_variants_fail_cleanly() -> Result<()
         })
     );
 
-    let scalar_append = send_request(
+    let scalar_append = send(
         &socket_path,
-        &Request::SetOption(SetOptionRequest {
-            scope: ScopeSelector::Global,
-            option: OptionName::Status,
-            value: "off".to_owned(),
+        SetOptionRequest {
             mode: SetOptionMode::Append,
-        }),
+            ..Fixture::fixture((ScopeSelector::Global, OptionName::Status, "off"))
+        },
     )
     .await?;
     assert_eq!(
@@ -83,14 +65,13 @@ async fn set_option_round_trips_and_invalid_variants_fail_cleanly() -> Result<()
         })
     );
 
-    let explicit_local_scope = send_request(
+    let explicit_local_scope = send(
         &socket_path,
-        &Request::SetOption(SetOptionRequest {
-            scope: ScopeSelector::Session(session_name("alpha")),
-            option: OptionName::TerminalFeatures,
-            value: "xterm*:RGB".to_owned(),
-            mode: SetOptionMode::Replace,
-        }),
+        SetOptionRequest::fixture((
+            ScopeSelector::Session(session_name("alpha")),
+            OptionName::TerminalFeatures,
+            "xterm*:RGB",
+        )),
     )
     .await?;
     assert_eq!(
@@ -102,14 +83,9 @@ async fn set_option_round_trips_and_invalid_variants_fail_cleanly() -> Result<()
         })
     );
 
-    let invalid_value = send_request(
+    let invalid_value = send(
         &socket_path,
-        &Request::SetOption(SetOptionRequest {
-            scope: ScopeSelector::Global,
-            option: OptionName::Status,
-            value: "maybe".to_owned(),
-            mode: SetOptionMode::Replace,
-        }),
+        SetOptionRequest::fixture((ScopeSelector::Global, OptionName::Status, "maybe")),
     )
     .await?;
     assert_eq!(
@@ -130,28 +106,11 @@ async fn set_environment_round_trips_and_requires_existing_sessions() -> Result<
     let socket_path = harness.socket_path().to_path_buf();
     let handle = start_server(&harness).await?;
 
-    let created = send_request(
-        &socket_path,
-        &Request::NewSession(NewSessionRequest {
-            session_name: session_name("alpha"),
-            detached: true,
-            size: None,
-            environment: None,
-        }),
-    )
-    .await?;
-    assert!(matches!(created, Response::NewSession(_)));
+    create_session(&socket_path, Sizeless("alpha")).await?;
 
-    let global = send_request(
+    let global = send(
         &socket_path,
-        &Request::SetEnvironment(Box::new(SetEnvironmentRequest {
-            scope: ScopeSelector::Global,
-            name: "TERM".to_owned(),
-            value: "screen".to_owned(),
-            mode: None,
-            hidden: false,
-            format: false,
-        })),
+        SetEnvironmentRequest::fixture((ScopeSelector::Global, "TERM", "screen")),
     )
     .await?;
     assert_eq!(
@@ -162,16 +121,13 @@ async fn set_environment_round_trips_and_requires_existing_sessions() -> Result<
         })
     );
 
-    let session = send_request(
+    let session = send(
         &socket_path,
-        &Request::SetEnvironment(Box::new(SetEnvironmentRequest {
-            scope: ScopeSelector::Session(session_name("alpha")),
-            name: "TERM".to_owned(),
-            value: "tmux-256color".to_owned(),
-            mode: None,
-            hidden: false,
-            format: false,
-        })),
+        SetEnvironmentRequest::fixture((
+            ScopeSelector::Session(session_name("alpha")),
+            "TERM",
+            "tmux-256color",
+        )),
     )
     .await?;
     assert_eq!(
@@ -182,16 +138,13 @@ async fn set_environment_round_trips_and_requires_existing_sessions() -> Result<
         })
     );
 
-    let missing_session = send_request(
+    let missing_session = send(
         &socket_path,
-        &Request::SetEnvironment(Box::new(SetEnvironmentRequest {
-            scope: ScopeSelector::Session(session_name("missing")),
-            name: "TERM".to_owned(),
-            value: "screen".to_owned(),
-            mode: None,
-            hidden: false,
-            format: false,
-        })),
+        SetEnvironmentRequest::fixture((
+            ScopeSelector::Session(session_name("missing")),
+            "TERM",
+            "screen",
+        )),
     )
     .await?;
     assert_eq!(

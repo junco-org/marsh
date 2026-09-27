@@ -1,39 +1,5 @@
 use super::*;
 
-use crate::handler::scripting_support::parse_request_from_parts;
-use rmux_core::{OptionStore, SessionStore};
-use rmux_proto::RmuxError;
-
-fn parser_fixture() -> (SessionStore, TargetFindContext) {
-    let alpha = session_name("alpha");
-    let mut sessions = SessionStore::new();
-    sessions
-        .create_session(alpha.clone(), TerminalSize { cols: 80, rows: 24 })
-        .expect("parser fixture session");
-    let find_context =
-        TargetFindContext::from_target(Target::Pane(PaneTarget::with_window(alpha, 0, 0)));
-    (sessions, find_context)
-}
-
-fn parse_server_request(
-    command: &str,
-    arguments: &[&str],
-    sessions: &SessionStore,
-    find_context: &TargetFindContext,
-) -> Result<Request, RmuxError> {
-    parse_request_from_parts(
-        command.to_owned(),
-        arguments
-            .iter()
-            .map(|argument| (*argument).to_owned())
-            .collect(),
-        None,
-        sessions,
-        &OptionStore::default(),
-        find_context,
-    )
-}
-
 #[test]
 fn server_new_positional_parsers_reject_unknown_option_shapes() {
     let (sessions, find_context) = parser_fixture();

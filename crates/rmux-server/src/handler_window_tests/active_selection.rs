@@ -3,8 +3,7 @@ use super::*;
 #[tokio::test]
 async fn move_window_with_d_keeps_the_next_window_active_when_moving_the_current_slot() {
     let handler = RequestHandler::new();
-    let alpha = session_name("alpha");
-    create_session(&handler, "alpha").await;
+    let alpha = create_session(&handler, "alpha").await;
     insert_window(&handler, &alpha, 2).await;
 
     {
@@ -17,24 +16,17 @@ async fn move_window_with_d_keeps_the_next_window_active_when_moving_the_current
         session.select_window(0).expect("window 0 select succeeds");
     }
 
-    let response = handler
-        .handle(Request::MoveWindow(MoveWindowRequest {
-            source: Some(WindowTarget::with_window(alpha.clone(), 0)),
-            target: MoveWindowTarget::Window(WindowTarget::with_window(alpha.clone(), 4)),
-            renumber: false,
-            kill_destination: false,
-            detached: true,
-            after: false,
-            before: false,
-        }))
-        .await;
-
     assert_eq!(
-        response,
-        Response::MoveWindow(rmux_proto::MoveWindowResponse {
+        handler
+            .handle_ok(MoveWindowRequest::fixture((
+                WindowTarget::with_window(alpha.clone(), 0),
+                WindowTarget::with_window(alpha.clone(), 4),
+            )))
+            .await,
+        rmux_proto::MoveWindowResponse {
             session_name: alpha.clone(),
             target: Some(WindowTarget::with_window(alpha.clone(), 4)),
-        })
+        }
     );
 
     let state = handler.state.lock().await;
@@ -50,32 +42,28 @@ async fn move_window_with_d_keeps_the_next_window_active_when_moving_the_current
 #[tokio::test]
 async fn swap_window_same_source_and_destination_is_a_noop() {
     let handler = RequestHandler::new();
-    let alpha = session_name("alpha");
-    create_session(&handler, "alpha").await;
+    let alpha = create_session(&handler, "alpha").await;
     insert_window(&handler, &alpha, 2).await;
 
-    let response = handler
-        .handle(Request::SwapWindow(SwapWindowRequest {
-            source: WindowTarget::with_window(alpha.clone(), 2),
-            target: WindowTarget::with_window(alpha.clone(), 2),
-            detached: false,
-        }))
-        .await;
-
     assert_eq!(
-        response,
-        Response::SwapWindow(rmux_proto::SwapWindowResponse {
+        handler
+            .handle_ok(SwapWindowRequest {
+                source: WindowTarget::with_window(alpha.clone(), 2),
+                target: WindowTarget::with_window(alpha.clone(), 2),
+                detached: false,
+            })
+            .await,
+        rmux_proto::SwapWindowResponse {
             source: WindowTarget::with_window(alpha.clone(), 2),
             target: WindowTarget::with_window(alpha.clone(), 2),
-        })
+        }
     );
 }
 
 #[tokio::test]
 async fn swap_window_without_d_preserves_active_slot() {
     let handler = RequestHandler::new();
-    let alpha = session_name("alpha");
-    create_session(&handler, "alpha").await;
+    let alpha = create_session(&handler, "alpha").await;
     insert_window(&handler, &alpha, 2).await;
     insert_window(&handler, &alpha, 5).await;
 
@@ -91,20 +79,18 @@ async fn swap_window_without_d_preserves_active_slot() {
 
     // Without -d, tmux preserves the active winlink. Here it already points to
     // index 2, so active remains 2 while the swapped content changes.
-    let response = handler
-        .handle(Request::SwapWindow(SwapWindowRequest {
-            source: WindowTarget::with_window(alpha.clone(), 2),
-            target: WindowTarget::with_window(alpha.clone(), 5),
-            detached: false,
-        }))
-        .await;
-
     assert_eq!(
-        response,
-        Response::SwapWindow(rmux_proto::SwapWindowResponse {
+        handler
+            .handle_ok(SwapWindowRequest {
+                source: WindowTarget::with_window(alpha.clone(), 2),
+                target: WindowTarget::with_window(alpha.clone(), 5),
+                detached: false,
+            })
+            .await,
+        rmux_proto::SwapWindowResponse {
             source: WindowTarget::with_window(alpha.clone(), 2),
             target: WindowTarget::with_window(alpha.clone(), 5),
-        })
+        }
     );
 
     let state = handler.state.lock().await;
@@ -116,21 +102,18 @@ async fn swap_window_without_d_preserves_active_slot() {
 #[tokio::test]
 async fn swap_window_without_d_preserves_active_when_active_is_elsewhere() {
     let handler = RequestHandler::new();
-    let alpha = session_name("alpha");
-    create_session(&handler, "alpha").await;
+    let alpha = create_session(&handler, "alpha").await;
     insert_window(&handler, &alpha, 2).await;
     insert_window(&handler, &alpha, 5).await;
 
     // Active is at window 0 (default). Source=2, target=5.
-    let response = handler
-        .handle(Request::SwapWindow(SwapWindowRequest {
+    handler
+        .handle_ok(SwapWindowRequest {
             source: WindowTarget::with_window(alpha.clone(), 2),
             target: WindowTarget::with_window(alpha.clone(), 5),
             detached: false,
-        }))
+        })
         .await;
-
-    assert!(matches!(response, Response::SwapWindow(_)));
 
     // Without -d, tmux preserves the active winlink at 0.
     let state = handler.state.lock().await;
@@ -142,21 +125,18 @@ async fn swap_window_without_d_preserves_active_when_active_is_elsewhere() {
 #[tokio::test]
 async fn swap_window_with_d_selects_target_window_within_session() {
     let handler = RequestHandler::new();
-    let alpha = session_name("alpha");
-    create_session(&handler, "alpha").await;
+    let alpha = create_session(&handler, "alpha").await;
     insert_window(&handler, &alpha, 2).await;
     insert_window(&handler, &alpha, 5).await;
 
     // Active is at window 0 (default). Source=2, target=5.
-    let response = handler
-        .handle(Request::SwapWindow(SwapWindowRequest {
+    handler
+        .handle_ok(SwapWindowRequest {
             source: WindowTarget::with_window(alpha.clone(), 2),
             target: WindowTarget::with_window(alpha.clone(), 5),
             detached: true,
-        }))
+        })
         .await;
-
-    assert!(matches!(response, Response::SwapWindow(_)));
 
     // With -d, tmux selects the destination winlink after swapping.
     let state = handler.state.lock().await;
@@ -168,28 +148,21 @@ async fn swap_window_with_d_selects_target_window_within_session() {
 #[tokio::test]
 async fn move_window_reindex_with_source_ignores_source_and_preserves_active_window() {
     let handler = RequestHandler::new();
-    let alpha = session_name("alpha");
-    create_session(&handler, "alpha").await;
+    let alpha = create_session(&handler, "alpha").await;
     insert_window(&handler, &alpha, 2).await;
 
-    let response = handler
-        .handle(Request::MoveWindow(MoveWindowRequest {
-            source: Some(WindowTarget::with_window(alpha.clone(), 2)),
-            target: MoveWindowTarget::Session(alpha.clone()),
-            renumber: true,
-            kill_destination: false,
-            detached: false,
-            after: false,
-            before: false,
-        }))
-        .await;
-
     assert_eq!(
-        response,
-        Response::MoveWindow(rmux_proto::MoveWindowResponse {
+        handler
+            .handle_ok(MoveWindowRequest {
+                renumber: true,
+                detached: false,
+                ..Fixture::fixture((WindowTarget::with_window(alpha.clone(), 2), &alpha))
+            })
+            .await,
+        rmux_proto::MoveWindowResponse {
             session_name: alpha.clone(),
             target: None,
-        })
+        }
     );
 
     let state = handler.state.lock().await;
@@ -204,10 +177,8 @@ async fn move_window_reindex_with_source_ignores_source_and_preserves_active_win
 #[tokio::test]
 async fn move_window_across_sessions_removes_source_session_when_moving_its_last_window() {
     let handler = RequestHandler::new();
-    let alpha = session_name("alpha");
-    let beta = session_name("beta");
-    create_session(&handler, "alpha").await;
-    create_session(&handler, "beta").await;
+    let alpha = create_session(&handler, "alpha").await;
+    let beta = create_session(&handler, "beta").await;
     let moved_pane_id = {
         let state = handler.state.lock().await;
         state
@@ -218,24 +189,20 @@ async fn move_window_across_sessions_removes_source_session_when_moving_its_last
             .expect("source pane exists")
     };
 
-    let response = handler
-        .handle(Request::MoveWindow(MoveWindowRequest {
-            source: Some(WindowTarget::with_window(alpha.clone(), 0)),
-            target: MoveWindowTarget::Window(WindowTarget::with_window(beta.clone(), 5)),
-            renumber: false,
-            kill_destination: false,
-            detached: false,
-            after: false,
-            before: false,
-        }))
-        .await;
-
     assert_eq!(
-        response,
-        Response::MoveWindow(rmux_proto::MoveWindowResponse {
+        handler
+            .handle_ok(MoveWindowRequest {
+                detached: false,
+                ..Fixture::fixture((
+                    WindowTarget::with_window(alpha.clone(), 0),
+                    WindowTarget::with_window(beta.clone(), 5),
+                ))
+            })
+            .await,
+        rmux_proto::MoveWindowResponse {
             session_name: beta.clone(),
             target: Some(WindowTarget::with_window(beta.clone(), 5)),
-        })
+        }
     );
 
     let state = handler.state.lock().await;
@@ -261,8 +228,7 @@ async fn move_window_across_sessions_removes_source_session_when_moving_its_last
 #[tokio::test]
 async fn swap_window_rejects_cross_session_swap_within_same_session_group() {
     let handler = RequestHandler::new();
-    create_session(&handler, "alpha").await;
-    let alpha = session_name("alpha");
+    let alpha = create_session(&handler, "alpha").await;
     let beta = session_name("beta");
 
     // Create beta as a grouped session in the same group as alpha.
@@ -296,23 +262,16 @@ async fn swap_window_rejects_cross_session_swap_within_same_session_group() {
 #[tokio::test]
 async fn swap_window_allows_cross_session_swap_between_different_groups() {
     let handler = RequestHandler::new();
-    create_session(&handler, "alpha").await;
-    create_session(&handler, "beta").await;
-    let alpha = session_name("alpha");
-    let beta = session_name("beta");
+    let alpha = create_session(&handler, "alpha").await;
+    let beta = create_session(&handler, "beta").await;
     insert_window(&handler, &alpha, 1).await;
     insert_window(&handler, &beta, 1).await;
 
-    let response = handler
-        .handle(Request::SwapWindow(SwapWindowRequest {
+    handler
+        .handle_ok(SwapWindowRequest {
             source: WindowTarget::with_window(alpha.clone(), 0),
             target: WindowTarget::with_window(beta.clone(), 0),
             detached: false,
-        }))
+        })
         .await;
-
-    assert!(
-        matches!(response, Response::SwapWindow(_)),
-        "expected swap success between ungrouped sessions, got {response:?}"
-    );
 }

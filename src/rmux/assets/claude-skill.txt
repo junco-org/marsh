@@ -19,12 +19,8 @@ rmux list-commands send-keys
 If RMUX is missing, suggest installing the published package for the user's
 platform or `cargo install rmux --locked`.
 
-This repository ships this source copy at `resources/claude/skills/rmux/SKILL.md`
-so the project can package and install it without keeping a hidden `.claude`
-directory in the source tree. To use the guidance, run
-`rmux claude install-skill`; it installs a user-level copy under
-`~/.claude/skills/rmux` on Linux/macOS or `%USERPROFILE%\.claude\skills\rmux`
-on Windows.
+This repository bundles this guidance from `src/rmux/assets/claude-skill.txt`.
+Run `rmux claude install-skill` to install it under `~/.claude/skills/rmux`.
 
 ## Claude Code
 
@@ -43,10 +39,10 @@ drive RMUX panes without replacing the user's system tmux. Set
 shim.
 
 For reliable Claude Code workflows, prefer `rmux claude` over starting a plain
-daemon from inside an arbitrary Claude shell. On Unix, if the user is not using
+daemon from inside an arbitrary Claude shell. If the user is not using
 `rmux claude` and their daemon is killed when Claude recycles a shell, starting
 the daemon with `setsid rmux new-session -d -s NAME` can detach it from that
-shell. `setsid` is Unix-only; on Windows, use `rmux claude`.
+shell.
 
 ## Agent Automation
 

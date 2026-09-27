@@ -5,16 +5,20 @@ use std::time::Duration;
 
 mod common;
 
-use common::{send_request, session_name, start_server, wait_for_socket_removal, TestHarness};
+use common::{
+    create_session, send, send_ok, send_request, session_name, start_server, wait_for_capture,
+    wait_for_socket_removal, Fixture, TestHarness,
+};
 use rmux_proto::{
     CapturePaneRequest, DeleteBufferRequest, DisplayMessageRequest, HasSessionRequest,
     IfShellRequest, KillServerRequest, ListBuffersRequest, ListPanesRequest, ListSessionsRequest,
-    LoadBufferRequest, NewSessionRequest, NewWindowRequest, PaneTarget, PasteBufferRequest,
-    RenameSessionRequest, Request, Response, RunShellRequest, SaveBufferRequest, SendKeysRequest,
-    SetBufferRequest, ShowBufferRequest, SplitDirection, SplitWindowRequest, SplitWindowTarget,
-    Target, TerminalSize, WaitForMode, WaitForRequest,
+    LoadBufferRequest, NewWindowRequest, PaneTarget, PasteBufferRequest, RenameSessionRequest,
+    Request, Response, RunShellRequest, SaveBufferRequest, SendKeysRequest, SetBufferRequest,
+    ShowBufferRequest, SplitWindowRequest, Target, TerminalSize, WaitForMode, WaitForRequest,
 };
 use tokio::time::sleep;
+
+const CAPTURE_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[test]
 fn buffer_capture_and_scripting_requests_round_trip_over_real_socket() -> Result<(), Box<dyn Error>>
@@ -65,22 +69,17 @@ async fn buffer_capture_and_scripting_requests_round_trip() -> Result<(), Box<dy
 }
 
 async fn create_detached_test_session(socket_path: &Path) -> Result<(), Box<dyn Error>> {
-    assert!(matches!(
-        send_request(
-            socket_path,
-            &Request::NewSession(NewSessionRequest {
-                session_name: session_name("alpha"),
-                detached: true,
-                size: Some(TerminalSize {
-                    cols: 120,
-                    rows: 40
-                }),
-                environment: None,
-            }),
-        )
-        .await?,
-        Response::NewSession(_)
-    ));
+    create_session(
+        socket_path,
+        (
+            "alpha",
+            TerminalSize {
+                cols: 120,
+                rows: 40,
+            },
+        ),
+    )
+    .await?;
     Ok(())
 }
 
@@ -90,21 +89,7 @@ async fn exercise_buffer_file_requests(
     load_path: &Path,
     paste_command: &str,
 ) -> Result<(), Box<dyn Error>> {
-    assert!(matches!(
-        send_request(
-            socket_path,
-            &Request::SetBuffer(Box::new(SetBufferRequest {
-                name: Some("empty".to_owned()),
-                content: Vec::new(),
-                append: false,
-                new_name: None,
-                set_clipboard: false,
-                target_client: None,
-            })),
-        )
-        .await?,
-        Response::SetBuffer(_)
-    ));
+    send_ok(socket_path, named_buffer("empty", b"")).await?;
     let empty = send_request(
         socket_path,
         &Request::ShowBuffer(ShowBufferRequest {
@@ -114,37 +99,12 @@ async fn exercise_buffer_file_requests(
     .await?;
     assert!(matches!(empty, Response::Error(_)));
 
-    assert!(matches!(
-        send_request(
-            socket_path,
-            &Request::SetBuffer(Box::new(SetBufferRequest {
-                name: Some("delete-me".to_owned()),
-                content: b"x".to_vec(),
-                append: false,
-                new_name: None,
-                set_clipboard: false,
-                target_client: None,
-            })),
-        )
-        .await?,
-        Response::SetBuffer(_)
-    ));
-
-    assert!(matches!(
-        send_request(
-            socket_path,
-            &Request::SetBuffer(Box::new(SetBufferRequest {
-                name: Some("pastecmd".to_owned()),
-                content: paste_command.as_bytes().to_vec(),
-                append: false,
-                new_name: None,
-                set_clipboard: false,
-                target_client: None,
-            })),
-        )
-        .await?,
-        Response::SetBuffer(_)
-    ));
+    send_ok(socket_path, named_buffer("delete-me", b"x")).await?;
+    send_ok(
+        socket_path,
+        named_buffer("pastecmd", paste_command.as_bytes()),
+    )
+    .await?;
 
     let listed = send_request(
         socket_path,
@@ -161,36 +121,19 @@ async fn exercise_buffer_file_requests(
     assert!(listed_stdout.contains("delete-me:"));
     assert!(listed_stdout.contains("pastecmd:"));
 
-    assert!(matches!(
-        send_request(
-            socket_path,
-            &Request::SaveBuffer(SaveBufferRequest {
-                path: save_path.to_string_lossy().into_owned(),
-                cwd: None,
-                name: Some("pastecmd".to_owned()),
-                append: false,
-            }),
-        )
-        .await?,
-        Response::SaveBuffer(_)
-    ));
+    send_ok(
+        socket_path,
+        SaveBufferRequest::fixture((save_path.to_string_lossy(), "pastecmd")),
+    )
+    .await?;
     assert_eq!(fs::read_to_string(save_path)?, paste_command);
 
     fs::write(load_path, "loaded-over-socket")?;
-    assert!(matches!(
-        send_request(
-            socket_path,
-            &Request::LoadBuffer(Box::new(LoadBufferRequest {
-                path: load_path.to_string_lossy().into_owned(),
-                cwd: None,
-                name: Some("loaded".to_owned()),
-                set_clipboard: false,
-                target_client: None,
-            })),
-        )
-        .await?,
-        Response::LoadBuffer(_)
-    ));
+    send_ok(
+        socket_path,
+        LoadBufferRequest::fixture((load_path.to_string_lossy(), "loaded")),
+    )
+    .await?;
     let loaded = send_request(
         socket_path,
         &Request::ShowBuffer(ShowBufferRequest {
@@ -208,67 +151,40 @@ async fn exercise_buffer_file_requests(
     Ok(())
 }
 
+/// `set-buffer -b name content`.
+fn named_buffer(name: &str, content: impl Into<Vec<u8>>) -> SetBufferRequest {
+    SetBufferRequest {
+        name: Some(name.to_owned()),
+        ..Fixture::fixture(content)
+    }
+}
+
 async fn exercise_paste_capture_and_delete_requests(
     socket_path: &Path,
     pane: &PaneTarget,
     paste_marker: &str,
 ) -> Result<(), Box<dyn Error>> {
-    assert!(matches!(
-        send_request(
-            socket_path,
-            &Request::PasteBuffer(Box::new(PasteBufferRequest {
-                name: Some("pastecmd".to_owned()),
-                target: pane.clone(),
-                delete_after: false,
-                separator: None,
-                linefeed: false,
-                raw: false,
-                bracketed: false,
-            })),
-        )
-        .await?,
-        Response::PasteBuffer(_)
-    ));
-    assert!(matches!(
-        send_request(
-            socket_path,
-            &Request::SendKeys(SendKeysRequest {
-                target: pane.clone(),
-                keys: vec!["Enter".to_owned()],
-            }),
-        )
-        .await?,
-        Response::SendKeys(_)
-    ));
-    let capture = wait_for_capture(socket_path, pane.clone(), paste_marker).await?;
-    assert!(capture.contains(paste_marker));
-
-    let captured = send_request(
+    send_ok(
         socket_path,
-        &Request::CapturePane(Box::new(CapturePaneRequest {
-            target: pane.clone(),
-            start: None,
-            end: None,
-            print: false,
-            buffer_name: Some("captured".to_owned()),
-            alternate: false,
-            escape_ansi: false,
-            escape_sequences: false,
-            include_format: false,
-            hyperlinks: false,
-            line_numbers: false,
-            join_wrapped: false,
-            use_mode_screen: false,
-            preserve_trailing_spaces: false,
-            do_not_trim_spaces: false,
-            pending_input: false,
-            quiet: false,
-            start_is_absolute: false,
-            end_is_absolute: false,
-        })),
+        PasteBufferRequest {
+            name: Some("pastecmd".to_owned()),
+            ..Fixture::fixture(pane)
+        },
     )
     .await?;
-    assert!(matches!(captured, Response::CapturePane(_)));
+    send_ok(socket_path, SendKeysRequest::fixture((pane, ["Enter"]))).await?;
+    let capture = wait_for_capture(socket_path, pane, paste_marker, CAPTURE_TIMEOUT).await?;
+    assert!(capture.contains(paste_marker));
+
+    send_ok(
+        socket_path,
+        CapturePaneRequest {
+            print: false,
+            buffer_name: Some("captured".to_owned()),
+            ..Fixture::fixture(pane)
+        },
+    )
+    .await?;
     let show_captured = send_request(
         socket_path,
         &Request::ShowBuffer(ShowBufferRequest {
@@ -284,16 +200,13 @@ async fn exercise_paste_capture_and_delete_requests(
     )?
     .contains(paste_marker));
 
-    assert!(matches!(
-        send_request(
-            socket_path,
-            &Request::DeleteBuffer(DeleteBufferRequest {
-                name: Some("delete-me".to_owned()),
-            }),
-        )
-        .await?,
-        Response::DeleteBuffer(_)
-    ));
+    send_ok(
+        socket_path,
+        DeleteBufferRequest {
+            name: Some("delete-me".to_owned()),
+        },
+    )
+    .await?;
     let listed_after_delete = send_request(
         socket_path,
         &Request::ListBuffers(ListBuffersRequest::default()),
@@ -313,14 +226,12 @@ async fn exercise_scripting_requests(
     socket_path: &Path,
     pane: &PaneTarget,
 ) -> Result<(), Box<dyn Error>> {
-    let display = send_request(
+    let display = send(
         socket_path,
-        &Request::DisplayMessage(DisplayMessageRequest {
+        DisplayMessageRequest {
             target: Some(Target::Pane(pane.clone())),
-            print: true,
-            message: Some("#{session_name}:#{pane_index}:#{missing}".to_owned()),
-            empty_target_context: false,
-        }),
+            ..Fixture::fixture("#{session_name}:#{pane_index}:#{missing}")
+        },
     )
     .await?;
     assert_eq!(
@@ -331,19 +242,12 @@ async fn exercise_scripting_requests(
         b"alpha:0:\n"
     );
 
-    let shell = send_request(
+    let shell = send(
         socket_path,
-        &Request::RunShell(Box::new(RunShellRequest {
-            command: "printf server-run-shell-output".to_owned(),
-            arguments: Vec::new(),
-            background: false,
-            as_commands: false,
+        RunShellRequest {
             show_stderr: true,
-            delay_seconds: None,
-            start_directory: None,
-            target: None,
-            source_depth: None,
-        })),
+            ..Fixture::fixture("printf server-run-shell-output")
+        },
     )
     .await?;
     match shell {
@@ -361,20 +265,15 @@ async fn exercise_scripting_requests(
         other => panic!("expected run-shell response, got {other:?}"),
     }
 
-    let if_shell = send_request(
+    send_ok(
         socket_path,
-        &Request::IfShell(Box::new(IfShellRequest {
-            condition: "#{pane_active}".to_owned(),
-            format_mode: true,
-            then_command: "set-buffer -b branch chosen".to_owned(),
+        IfShellRequest {
             else_command: Some("set-buffer -b branch skipped".to_owned()),
             target: Some(Target::Pane(pane.clone())),
-            caller_cwd: None,
-            background: false,
-        })),
+            ..Fixture::fixture(("#{pane_active}", "set-buffer -b branch chosen"))
+        },
     )
     .await?;
-    assert!(matches!(if_shell, Response::IfShell(_)));
     let branch = send_request(
         socket_path,
         &Request::ShowBuffer(ShowBufferRequest {
@@ -400,64 +299,30 @@ async fn rename_listing_and_wait_for_requests_round_trip_over_real_socket(
     let alpha = session_name("alpha");
     let gamma = session_name("gamma");
 
-    assert!(matches!(
-        send_request(
-            harness.socket_path(),
-            &Request::NewSession(NewSessionRequest {
-                session_name: alpha.clone(),
-                detached: true,
-                size: Some(TerminalSize {
-                    cols: 120,
-                    rows: 40
-                }),
-                environment: None,
-            }),
-        )
-        .await?,
-        Response::NewSession(_)
-    ));
-    assert!(matches!(
-        send_request(
-            harness.socket_path(),
-            &Request::SplitWindow(SplitWindowRequest {
-                target: SplitWindowTarget::Session(alpha.clone()),
-                direction: SplitDirection::Vertical,
-                before: false,
-                environment: None,
-            }),
-        )
-        .await?,
-        Response::SplitWindow(_)
-    ));
-    assert!(matches!(
-        send_request(
-            harness.socket_path(),
-            &Request::NewWindow(Box::new(NewWindowRequest {
-                target: alpha.clone(),
-                name: Some("logs".to_owned()),
-                detached: true,
-                start_directory: None,
-                environment: None,
-                command: None,
-                process_command: None,
-                target_window_index: None,
-                insert_at_target: false,
-            })),
-        )
-        .await?,
-        Response::NewWindow(_)
-    ));
-
-    let listed_before = send_request(
+    create_session(
         harness.socket_path(),
-        &Request::ListPanes(Box::new(ListPanesRequest {
-            target: alpha.clone(),
-            format: Some("#{session_name}:#{window_index}:#{pane_index}".to_owned()),
-            filter: None,
-            sort_order: None,
-            reversed: false,
-            target_window_index: None,
-        })),
+        (
+            &alpha,
+            TerminalSize {
+                cols: 120,
+                rows: 40,
+            },
+        ),
+    )
+    .await?;
+    send_ok(harness.socket_path(), SplitWindowRequest::fixture(&alpha)).await?;
+    send_ok(
+        harness.socket_path(),
+        NewWindowRequest {
+            name: Some("logs".to_owned()),
+            ..Fixture::fixture(&alpha)
+        },
+    )
+    .await?;
+
+    let listed_before = send(
+        harness.socket_path(),
+        ListPanesRequest::fixture((&alpha, "#{session_name}:#{window_index}:#{pane_index}")),
     )
     .await?;
     let before_lines = nonempty_lines(std::str::from_utf8(
@@ -469,15 +334,14 @@ async fn rename_listing_and_wait_for_requests_round_trip_over_real_socket(
     assert_eq!(before_lines.len(), 3);
     assert!(before_lines.iter().all(|line| line.starts_with("alpha:")));
 
-    let renamed = send_request(
+    send_ok(
         harness.socket_path(),
-        &Request::RenameSession(RenameSessionRequest {
+        RenameSessionRequest {
             target: alpha.clone(),
             new_name: gamma.clone(),
-        }),
+        },
     )
     .await?;
-    assert!(matches!(renamed, Response::RenameSession(_)));
 
     assert_eq!(
         send_request(
@@ -500,16 +364,11 @@ async fn rename_listing_and_wait_for_requests_round_trip_over_real_socket(
         Response::HasSession(rmux_proto::HasSessionResponse { exists: true })
     );
 
-    let sessions = send_request(
+    let sessions = send(
         harness.socket_path(),
-        &Request::ListSessions(ListSessionsRequest {
-            format: Some(
-                "#{session_name}:#{session_windows}:#{session_width}x#{session_height}".to_owned(),
-            ),
-            filter: None,
-            sort_order: None,
-            reversed: false,
-        }),
+        ListSessionsRequest::fixture(
+            "#{session_name}:#{session_windows}:#{session_width}x#{session_height}",
+        ),
     )
     .await?;
     assert_eq!(
@@ -520,16 +379,9 @@ async fn rename_listing_and_wait_for_requests_round_trip_over_real_socket(
         b"gamma:2:x\n"
     );
 
-    let panes_after = send_request(
+    let panes_after = send(
         harness.socket_path(),
-        &Request::ListPanes(Box::new(ListPanesRequest {
-            target: gamma.clone(),
-            format: Some("#{session_name}:#{window_index}:#{pane_index}".to_owned()),
-            filter: None,
-            sort_order: None,
-            reversed: false,
-            target_window_index: None,
-        })),
+        ListPanesRequest::fixture((&gamma, "#{session_name}:#{window_index}:#{pane_index}")),
     )
     .await?;
     let after_lines = nonempty_lines(std::str::from_utf8(
@@ -557,30 +409,24 @@ async fn rename_listing_and_wait_for_requests_round_trip_over_real_socket(
         !ready_waiter.is_finished(),
         "plain wait-for should block until signalled"
     );
-    assert!(matches!(
-        send_request(
-            harness.socket_path(),
-            &Request::WaitFor(WaitForRequest {
-                channel: "ready".to_owned(),
-                mode: WaitForMode::Signal,
-            }),
-        )
-        .await?,
-        Response::WaitFor(_)
-    ));
+    send_ok(
+        harness.socket_path(),
+        WaitForRequest {
+            channel: "ready".to_owned(),
+            mode: WaitForMode::Signal,
+        },
+    )
+    .await?;
     assert!(matches!(ready_waiter.await?, Response::WaitFor(_)));
 
-    assert!(matches!(
-        send_request(
-            harness.socket_path(),
-            &Request::WaitFor(WaitForRequest {
-                channel: "check".to_owned(),
-                mode: WaitForMode::Lock,
-            }),
-        )
-        .await?,
-        Response::WaitFor(_)
-    ));
+    send_ok(
+        harness.socket_path(),
+        WaitForRequest {
+            channel: "check".to_owned(),
+            mode: WaitForMode::Lock,
+        },
+    )
+    .await?;
     let gate_socket = harness.socket_path().to_path_buf();
     let lock_waiter = tokio::spawn(async move {
         let request = Request::WaitFor(WaitForRequest {
@@ -596,69 +442,18 @@ async fn rename_listing_and_wait_for_requests_round_trip_over_real_socket(
         !lock_waiter.is_finished(),
         "wait-for -L should block while the lock is held"
     );
-    assert!(matches!(
-        send_request(
-            harness.socket_path(),
-            &Request::WaitFor(WaitForRequest {
-                channel: "check".to_owned(),
-                mode: WaitForMode::Unlock,
-            }),
-        )
-        .await?,
-        Response::WaitFor(_)
-    ));
+    send_ok(
+        harness.socket_path(),
+        WaitForRequest {
+            channel: "check".to_owned(),
+            mode: WaitForMode::Unlock,
+        },
+    )
+    .await?;
     assert!(matches!(lock_waiter.await?, Response::WaitFor(_)));
 
     handle.shutdown().await?;
     Ok(())
-}
-
-async fn wait_for_capture(
-    socket_path: &Path,
-    target: PaneTarget,
-    marker: &str,
-) -> Result<String, Box<dyn Error>> {
-    for _ in 0..100 {
-        let response = send_request(
-            socket_path,
-            &Request::CapturePane(Box::new(CapturePaneRequest {
-                target: target.clone(),
-                start: None,
-                end: None,
-                print: true,
-                buffer_name: None,
-                alternate: false,
-                escape_ansi: false,
-                escape_sequences: false,
-                include_format: false,
-                hyperlinks: false,
-                line_numbers: false,
-                join_wrapped: false,
-                use_mode_screen: false,
-                preserve_trailing_spaces: false,
-                do_not_trim_spaces: false,
-                pending_input: false,
-                quiet: false,
-                start_is_absolute: false,
-                end_is_absolute: false,
-            })),
-        )
-        .await?;
-        let output = std::str::from_utf8(
-            response
-                .command_output()
-                .expect("capture-pane -p returns command output")
-                .stdout(),
-        )?
-        .to_owned();
-        if output.contains(marker) {
-            return Ok(output);
-        }
-
-        sleep(Duration::from_millis(20)).await;
-    }
-
-    Err(format!("capture-pane -p never surfaced marker {marker}").into())
 }
 
 fn nonempty_lines(output: &str) -> Vec<&str> {

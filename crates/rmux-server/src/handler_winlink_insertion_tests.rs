@@ -1,73 +1,31 @@
 use super::RequestHandler;
 use rmux_core::{AlertFlags, WINLINK_ACTIVITY, WINLINK_BELL};
 use rmux_proto::{
-    BreakPaneRequest, LinkWindowRequest, MoveWindowRequest, MoveWindowTarget, NewSessionExtRequest,
-    NewWindowRequest, PaneTarget, Request, Response, SessionName, SplitDirection,
-    SplitWindowExtRequest, SplitWindowTarget, TerminalSize, WindowTarget,
+    BreakPaneRequest, LinkWindowRequest, MoveWindowRequest, NewSessionExtRequest, NewWindowRequest,
+    PaneTarget, SessionName, SplitWindowExtRequest, WindowTarget,
 };
 
+use crate::test_fixtures::{Fixture, Grouped};
 use crate::test_names::session_name;
 
-async fn create_session(
-    handler: &RequestHandler,
-    name: &str,
-    group_target: Option<SessionName>,
-) -> SessionName {
-    let session = session_name(name);
-    let response = handler
-        .handle(Request::NewSessionExt(Box::new(NewSessionExtRequest {
-            session_name: Some(session.clone()),
-            working_directory: None,
-            detached: true,
-            size: Some(TerminalSize { cols: 80, rows: 24 }),
-            environment: None,
-            group_target,
-            attach_if_exists: false,
-            detach_other_clients: false,
-            kill_other_clients: false,
-            flags: None,
-            window_name: None,
-            print_session_info: false,
-            print_format: None,
-            command: None,
-            process_command: None,
-            client_environment: None,
-            skip_environment_update: false,
-        })))
-        .await;
-    assert!(matches!(response, Response::NewSession(_)), "{response:?}");
-    if handler
-        .state
-        .lock()
-        .await
-        .sessions
-        .session(&session)
-        .is_some_and(|created| created.group_name().is_none())
-    {
-        handler
-            .wait_for_pane_startup_to_finish_for_test(&PaneTarget::new(session.clone(), 0))
-            .await;
-    }
-    session
+async fn create_session(handler: &RequestHandler, name: &str) -> SessionName {
+    let request = NewSessionExtRequest::fixture(session_name(name));
+    handler.create_started_session(request).await
 }
 
 async fn create_duplicate_group(
     handler: &RequestHandler,
     label: &str,
 ) -> (SessionName, SessionName) {
-    let owner = create_session(handler, &format!("{label}-owner"), None).await;
-    let linked = handler
-        .handle(Request::LinkWindow(LinkWindowRequest {
-            source: WindowTarget::with_window(owner.clone(), 0),
-            target: WindowTarget::with_window(owner.clone(), 1),
-            after: false,
-            before: false,
-            kill_destination: false,
-            detached: true,
-        }))
+    let owner = create_session(handler, &format!("{label}-owner")).await;
+    handler
+        .handle_ok(LinkWindowRequest::fixture((
+            WindowTarget::with_window(owner.clone(), 0),
+            WindowTarget::with_window(owner.clone(), 1),
+        )))
         .await;
-    assert!(matches!(linked, Response::LinkWindow(_)), "{linked:?}");
-    let peer = create_session(handler, &format!("{label}-peer"), Some(owner.clone())).await;
+    let peer = session_name(&format!("{label}-peer"));
+    let peer = handler.create_session(Grouped(peer, &owner)).await;
     (owner, peer)
 }
 
@@ -98,20 +56,13 @@ async fn grouped_new_window_insertion_preserves_peer_duplicate_alias_winlink_fla
     let (owner, peer) = create_duplicate_group(&handler, "new-window-insert-alerts").await;
     seed_peer_duplicate_flags(&handler, &peer).await;
 
-    let response = handler
-        .handle(Request::NewWindow(Box::new(NewWindowRequest {
-            target: owner,
-            name: None,
-            detached: true,
-            start_directory: None,
-            environment: None,
-            command: None,
-            process_command: None,
+    handler
+        .handle_ok(NewWindowRequest {
             target_window_index: Some(0),
             insert_at_target: true,
-        })))
+            ..Fixture::fixture(owner)
+        })
         .await;
-    assert!(matches!(response, Response::NewWindow(_)), "{response:?}");
 
     assert_peer_duplicate_flags_shifted(&handler, &peer).await;
 }
@@ -120,20 +71,18 @@ async fn grouped_new_window_insertion_preserves_peer_duplicate_alias_winlink_fla
 async fn grouped_link_window_insertion_preserves_peer_duplicate_alias_winlink_flags() {
     let handler = RequestHandler::new();
     let (owner, peer) = create_duplicate_group(&handler, "link-window-insert-alerts").await;
-    let source = create_session(&handler, "link-window-insert-source", None).await;
+    let source = create_session(&handler, "link-window-insert-source").await;
     seed_peer_duplicate_flags(&handler, &peer).await;
 
-    let response = handler
-        .handle(Request::LinkWindow(LinkWindowRequest {
-            source: WindowTarget::with_window(source, 0),
-            target: WindowTarget::with_window(owner, 0),
-            after: false,
+    handler
+        .handle_ok(LinkWindowRequest {
             before: true,
-            kill_destination: false,
-            detached: true,
-        }))
+            ..Fixture::fixture((
+                WindowTarget::with_window(source, 0),
+                WindowTarget::with_window(owner, 0),
+            ))
+        })
         .await;
-    assert!(matches!(response, Response::LinkWindow(_)), "{response:?}");
 
     assert_peer_duplicate_flags_shifted(&handler, &peer).await;
 }
@@ -142,39 +91,23 @@ async fn grouped_link_window_insertion_preserves_peer_duplicate_alias_winlink_fl
 async fn grouped_break_pane_insertion_preserves_peer_duplicate_alias_winlink_flags() {
     let handler = RequestHandler::new();
     let (owner, peer) = create_duplicate_group(&handler, "group-break-insert-alerts").await;
-    let split = handler
-        .handle(Request::SplitWindowExt(Box::new(SplitWindowExtRequest {
-            target: SplitWindowTarget::Pane(PaneTarget::with_window(owner.clone(), 0, 0)),
-            direction: SplitDirection::Vertical,
-            before: false,
-            environment: None,
-            command: None,
-            process_command: None,
-            start_directory: None,
-            keep_alive_on_exit: None,
+    handler
+        .handle_ok(SplitWindowExtRequest {
             detached: true,
-            size: None,
-            preserve_zoom: false,
-            full_size: false,
-            stdin_payload: None,
-        })))
+            ..Fixture::fixture(PaneTarget::with_window(owner.clone(), 0, 0))
+        })
         .await;
-    assert!(matches!(split, Response::SplitWindow(_)), "{split:?}");
     seed_peer_duplicate_flags(&handler, &peer).await;
 
-    let response = handler
-        .handle(Request::BreakPane(Box::new(BreakPaneRequest {
-            source: PaneTarget::with_window(owner.clone(), 1, 1),
-            target: Some(WindowTarget::with_window(owner, 0)),
-            name: None,
-            detached: true,
-            after: false,
+    handler
+        .handle_ok(BreakPaneRequest {
             before: true,
-            print_target: false,
-            format: None,
-        })))
+            ..Fixture::fixture((
+                PaneTarget::with_window(owner.clone(), 1, 1),
+                WindowTarget::with_window(owner, 0),
+            ))
+        })
         .await;
-    assert!(matches!(response, Response::BreakPane(_)), "{response:?}");
 
     assert_peer_duplicate_flags_shifted(&handler, &peer).await;
 }
@@ -182,35 +115,26 @@ async fn grouped_break_pane_insertion_preserves_peer_duplicate_alias_winlink_fla
 async fn assert_cross_session_break_preserves_flags(label: &str, linked_source: bool) {
     let handler = RequestHandler::new();
     let (owner, peer) = create_duplicate_group(&handler, label).await;
-    let source = create_session(&handler, &format!("{label}-source"), None).await;
+    let source = create_session(&handler, &format!("{label}-source")).await;
     if linked_source {
-        let linked = handler
-            .handle(Request::LinkWindow(LinkWindowRequest {
-                source: WindowTarget::with_window(source.clone(), 0),
-                target: WindowTarget::with_window(source.clone(), 1),
-                after: false,
-                before: false,
-                kill_destination: false,
-                detached: true,
-            }))
+        handler
+            .handle_ok(LinkWindowRequest::fixture((
+                WindowTarget::with_window(source.clone(), 0),
+                WindowTarget::with_window(source.clone(), 1),
+            )))
             .await;
-        assert!(matches!(linked, Response::LinkWindow(_)), "{linked:?}");
     }
     seed_peer_duplicate_flags(&handler, &peer).await;
 
-    let response = handler
-        .handle(Request::BreakPane(Box::new(BreakPaneRequest {
-            source: PaneTarget::with_window(source, 0, 0),
-            target: Some(WindowTarget::with_window(owner, 0)),
-            name: None,
-            detached: true,
-            after: false,
+    handler
+        .handle_ok(BreakPaneRequest {
             before: true,
-            print_target: false,
-            format: None,
-        })))
+            ..Fixture::fixture((
+                PaneTarget::with_window(source, 0, 0),
+                WindowTarget::with_window(owner, 0),
+            ))
+        })
         .await;
-    assert!(matches!(response, Response::BreakPane(_)), "{response:?}");
 
     assert_peer_duplicate_flags_shifted(&handler, &peer).await;
 }
@@ -228,34 +152,26 @@ async fn linked_last_break_pane_insertion_preserves_peer_duplicate_alias_winlink
 async fn assert_relative_move_preserves_flags(label: &str, linked_source: bool) {
     let handler = RequestHandler::new();
     let (owner, peer) = create_duplicate_group(&handler, label).await;
-    let source = create_session(&handler, &format!("{label}-source"), None).await;
+    let source = create_session(&handler, &format!("{label}-source")).await;
     if linked_source {
-        let linked = handler
-            .handle(Request::LinkWindow(LinkWindowRequest {
-                source: WindowTarget::with_window(source.clone(), 0),
-                target: WindowTarget::with_window(source.clone(), 1),
-                after: false,
-                before: false,
-                kill_destination: false,
-                detached: true,
-            }))
+        handler
+            .handle_ok(LinkWindowRequest::fixture((
+                WindowTarget::with_window(source.clone(), 0),
+                WindowTarget::with_window(source.clone(), 1),
+            )))
             .await;
-        assert!(matches!(linked, Response::LinkWindow(_)), "{linked:?}");
     }
     seed_peer_duplicate_flags(&handler, &peer).await;
 
-    let response = handler
-        .handle(Request::MoveWindow(MoveWindowRequest {
-            source: Some(WindowTarget::with_window(source, 0)),
-            target: MoveWindowTarget::Window(WindowTarget::with_window(owner, 0)),
-            renumber: false,
-            kill_destination: false,
-            detached: true,
-            after: false,
+    handler
+        .handle_ok(MoveWindowRequest {
             before: true,
-        }))
+            ..Fixture::fixture((
+                WindowTarget::with_window(source, 0),
+                WindowTarget::with_window(owner, 0),
+            ))
+        })
         .await;
-    assert!(matches!(response, Response::MoveWindow(_)), "{response:?}");
 
     assert_peer_duplicate_flags_shifted(&handler, &peer).await;
 }

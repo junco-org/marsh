@@ -4,16 +4,16 @@ use crate::outer_terminal::OuterTerminalContext;
 use crate::pane_io::AttachControl;
 use rmux_core::LifecycleEvent;
 use rmux_proto::{
-    DeleteBufferRequest, ErrorResponse, ListBuffersRequest, LoadBufferRequest, NewSessionRequest,
-    OptionName, PaneTarget, PasteBufferRequest, Request, RespawnPaneRequest, Response, RmuxError,
-    ScopeSelector, SetBufferRequest, SetOptionMode, SetOptionRequest, ShowBufferRequest,
-    SwapPaneRequest, TerminalSize,
+    DeleteBufferRequest, ErrorResponse, ListBuffersRequest, LoadBufferRequest, OptionName,
+    PaneTarget, PasteBufferRequest, Request, RespawnPaneRequest, Response, RmuxError,
+    ScopeSelector, SetBufferRequest, ShowBufferRequest, SwapPaneRequest,
 };
 use std::fs;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Barrier;
 
+use crate::test_fixtures::{unique_temp_path, Fixture};
 use crate::test_names::session_name;
 
 fn set_buffer_request(name: Option<&str>, content: &[u8]) -> SetBufferRequest {
@@ -50,48 +50,6 @@ fn paste_buffer_request(
         linefeed: false,
         raw: false,
         bracketed: false,
-    }
-}
-
-async fn create_session(handler: &RequestHandler, name: &str) {
-    let session_name = session_name(name);
-    let response = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name: session_name.clone(),
-            detached: true,
-            size: Some(TerminalSize { cols: 80, rows: 24 }),
-            environment: None,
-        }))
-        .await;
-
-    assert!(matches!(response, Response::NewSession(_)));
-    handler
-        .wait_for_pane_startup_to_finish_for_test(&PaneTarget::new(session_name, 0))
-        .await;
-}
-
-async fn wait_for_dead_pane(
-    handler: &RequestHandler,
-    session_name: &rmux_proto::SessionName,
-    window_index: u32,
-    pane_index: u32,
-) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        let exited = {
-            let state = handler.state.lock().await;
-            state
-                .pane_shell_if_alive(session_name, window_index, pane_index)
-                .is_err()
-        };
-        if exited {
-            return;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "timed out waiting for pane {session_name}:{window_index}.{pane_index} to exit"
-        );
-        tokio::time::sleep(Duration::from_millis(25)).await;
     }
 }
 
@@ -152,16 +110,9 @@ async fn assert_no_clipboard_write(
 async fn set_buffer_creates_unnamed_buffer() {
     let handler = RequestHandler::new();
 
-    let response = handler
-        .handle(Request::SetBuffer(Box::new(set_buffer_request(
-            None, b"hello",
-        ))))
-        .await;
+    let response = handler.handle_ok(set_buffer_request(None, b"hello")).await;
 
-    match response {
-        Response::SetBuffer(r) => assert_eq!(r.buffer_name, "buffer0"),
-        other => panic!("unexpected response: {other:?}"),
-    }
+    assert_eq!(response.buffer_name, "buffer0");
 }
 
 #[tokio::test]
@@ -169,28 +120,18 @@ async fn set_buffer_creates_named_buffer() {
     let handler = RequestHandler::new();
 
     let response = handler
-        .handle(Request::SetBuffer(Box::new(set_buffer_request(
-            Some("my-buf"),
-            b"data",
-        ))))
+        .handle_ok(SetBufferRequest::fixture(("my-buf", b"data")))
         .await;
 
-    match response {
-        Response::SetBuffer(r) => assert_eq!(r.buffer_name, "my-buf"),
-        other => panic!("unexpected response: {other:?}"),
-    }
+    assert_eq!(response.buffer_name, "my-buf");
 }
 
 #[tokio::test]
 async fn concurrent_named_buffer_appends_preserve_both_writes() {
     let handler = Arc::new(RequestHandler::new());
-    let response = handler
-        .handle(Request::SetBuffer(Box::new(set_buffer_request(
-            Some("append-race"),
-            b"base",
-        ))))
+    handler
+        .handle_ok(SetBufferRequest::fixture(("append-race", b"base")))
         .await;
-    assert!(matches!(response, Response::SetBuffer(_)));
 
     let state_guard = handler.state.lock().await;
     let start = Arc::new(Barrier::new(3));
@@ -251,15 +192,10 @@ async fn set_buffer_skips_existing_named_buffer_pattern_for_unnamed() {
         .await;
 
     let response = handler
-        .handle(Request::SetBuffer(Box::new(set_buffer_request(
-            None, b"unnamed",
-        ))))
+        .handle_ok(set_buffer_request(None, b"unnamed"))
         .await;
 
-    match response {
-        Response::SetBuffer(r) => assert_eq!(r.buffer_name, "buffer1"),
-        other => panic!("unexpected response: {other:?}"),
-    }
+    assert_eq!(response.buffer_name, "buffer1");
 
     let show_named = handler
         .handle(Request::ShowBuffer(ShowBufferRequest {
@@ -301,30 +237,19 @@ async fn set_buffer_accepts_colon_in_name() {
     let handler = RequestHandler::new();
 
     let response = handler
-        .handle(Request::SetBuffer(Box::new(set_buffer_request(
-            Some("a:b"),
-            b"data",
-        ))))
+        .handle_ok(SetBufferRequest::fixture(("a:b", b"data")))
         .await;
 
-    match response {
-        Response::SetBuffer(response) => assert_eq!(response.buffer_name, "a:b"),
-        other => panic!("unexpected response: {other:?}"),
-    }
+    assert_eq!(response.buffer_name, "a:b");
 }
 
 #[tokio::test]
 async fn set_buffer_empty_content_does_not_create_buffer() {
     let handler = RequestHandler::new();
 
-    let response = handler
-        .handle(Request::SetBuffer(Box::new(set_buffer_request(None, b""))))
-        .await;
+    let response = handler.handle_ok(set_buffer_request(None, b"")).await;
 
-    match response {
-        Response::SetBuffer(response) => assert!(response.buffer_name.is_empty()),
-        other => panic!("unexpected response: {other:?}"),
-    }
+    assert!(response.buffer_name.is_empty());
 
     let show = handler
         .handle(Request::ShowBuffer(ShowBufferRequest { name: None }))
@@ -387,14 +312,9 @@ async fn delete_buffer_removes_stack_head() {
         .handle(Request::SetBuffer(Box::new(set_buffer_request(None, b"b"))))
         .await;
 
-    let response = handler
-        .handle(Request::DeleteBuffer(DeleteBufferRequest { name: None }))
-        .await;
+    let response = handler.handle_ok(DeleteBufferRequest { name: None }).await;
 
-    match response {
-        Response::DeleteBuffer(r) => assert_eq!(r.buffer_name, "buffer1"),
-        other => panic!("unexpected response: {other:?}"),
-    }
+    assert_eq!(response.buffer_name, "buffer1");
 }
 
 #[tokio::test]
@@ -471,7 +391,7 @@ async fn list_buffers_empty_returns_empty_output() {
 #[tokio::test]
 async fn paste_buffer_writes_to_pty() {
     let handler = RequestHandler::new();
-    create_session(&handler, "alpha").await;
+    handler.create_started_session("alpha").await;
 
     handler
         .handle(Request::SetBuffer(Box::new(set_buffer_request(
@@ -514,8 +434,8 @@ async fn assert_paste_buffer_rejects_same_slot_replacement(original_bracketed_mo
     };
     let original = session_name(original_name);
     let replacement = session_name(replacement_name);
-    create_session(handler.as_ref(), original_name).await;
-    create_session(handler.as_ref(), replacement_name).await;
+    handler.create_started_session(original_name).await;
+    handler.create_started_session(replacement_name).await;
 
     handler
         .handle(Request::SetBuffer(Box::new(set_buffer_request(
@@ -586,16 +506,12 @@ async fn assert_paste_buffer_rejects_same_slot_replacement(original_bracketed_mo
         .await
         .expect("paste-buffer should pause after capturing pane identity");
 
-    let swapped = handler
-        .handle(Request::SwapPane(SwapPaneRequest {
-            source: original_target.clone(),
-            target: replacement_target.clone(),
-            direction: None,
-            detached: true,
-            preserve_zoom: false,
-        }))
+    handler
+        .handle_ok(SwapPaneRequest::fixture((
+            &original_target,
+            &replacement_target,
+        )))
         .await;
-    assert!(matches!(swapped, Response::SwapPane(_)), "{swapped:?}");
     pause.release();
 
     let response = paste.await.expect("paste-buffer task should join");
@@ -638,7 +554,7 @@ async fn paste_buffer_plain_mode_snapshot_rejects_same_slot_replacement() {
 #[tokio::test]
 async fn paste_buffer_with_delete_removes_buffer_after_write() {
     let handler = RequestHandler::new();
-    create_session(&handler, "alpha").await;
+    handler.create_started_session("alpha").await;
 
     handler
         .handle(Request::SetBuffer(Box::new(set_buffer_request(
@@ -667,7 +583,7 @@ async fn paste_buffer_with_delete_removes_buffer_after_write() {
 #[tokio::test]
 async fn paste_buffer_with_delete_keeps_newer_named_replacements() {
     let handler = Arc::new(RequestHandler::new());
-    create_session(handler.as_ref(), "alpha").await;
+    handler.create_started_session("alpha").await;
 
     handler
         .handle(Request::SetBuffer(Box::new(set_buffer_request(
@@ -731,7 +647,7 @@ async fn paste_buffer_with_delete_keeps_newer_named_replacements() {
 #[tokio::test]
 async fn cancelling_paste_delete_caller_after_write_still_deletes_and_emits() {
     let handler = Arc::new(RequestHandler::new());
-    create_session(handler.as_ref(), "paste-delete-durable").await;
+    handler.create_started_session("paste-delete-durable").await;
     handler
         .handle(Request::SetBuffer(Box::new(set_buffer_request(
             Some("durable"),
@@ -816,7 +732,7 @@ async fn paste_buffer_nonexistent_session_returns_error() {
 #[tokio::test]
 async fn paste_buffer_empty_store_is_successful_noop() {
     let handler = RequestHandler::new();
-    create_session(&handler, "alpha").await;
+    handler.create_started_session("alpha").await;
 
     let response = handler
         .handle(Request::PasteBuffer(Box::new(paste_buffer_request(
@@ -852,14 +768,10 @@ async fn paste_buffer_empty_store_is_successful_noop() {
 #[tokio::test]
 async fn ordered_paste_reports_stale_identity_without_wire_sentinel() {
     let handler = RequestHandler::new();
-    create_session(&handler, "ordered-paste-stale").await;
-    let set = handler
-        .handle(Request::SetBuffer(Box::new(set_buffer_request(
-            Some("shared"),
-            b"old",
-        ))))
+    handler.create_started_session("ordered-paste-stale").await;
+    handler
+        .handle_ok(SetBufferRequest::fixture(("shared", b"old")))
         .await;
-    assert!(matches!(set, Response::SetBuffer(_)), "{set:?}");
     let captured_order = handler
         .state
         .lock()
@@ -869,22 +781,14 @@ async fn ordered_paste_reports_stale_identity_without_wire_sentinel() {
         .expect("captured buffer exists")
         .2;
 
-    let deleted = handler
-        .handle(Request::DeleteBuffer(DeleteBufferRequest {
+    handler
+        .handle_ok(DeleteBufferRequest {
             name: Some("shared".to_owned()),
-        }))
+        })
         .await;
-    assert!(matches!(deleted, Response::DeleteBuffer(_)), "{deleted:?}");
-    let replacement = handler
-        .handle(Request::SetBuffer(Box::new(set_buffer_request(
-            Some("shared"),
-            b"replacement",
-        ))))
+    handler
+        .handle_ok(SetBufferRequest::fixture(("shared", b"replacement")))
         .await;
-    assert!(
-        matches!(replacement, Response::SetBuffer(_)),
-        "{replacement:?}"
-    );
 
     let result = handler
         .handle_paste_buffer_for_order(
@@ -944,7 +848,7 @@ async fn implicit_show_buffer_ignores_newer_named_buffers() {
 #[tokio::test]
 async fn implicit_paste_buffer_ignores_newer_named_buffers() {
     let handler = RequestHandler::new();
-    create_session(&handler, "alpha").await;
+    handler.create_started_session("alpha").await;
 
     handler
         .handle(Request::SetBuffer(Box::new(set_buffer_request(
@@ -975,7 +879,7 @@ async fn implicit_paste_buffer_ignores_newer_named_buffers() {
 #[tokio::test]
 async fn paste_buffer_nonexistent_pane_returns_error() {
     let handler = RequestHandler::new();
-    create_session(&handler, "alpha").await;
+    handler.create_started_session("alpha").await;
 
     handler
         .handle(Request::SetBuffer(Box::new(set_buffer_request(
@@ -1006,33 +910,23 @@ async fn paste_buffer_dead_remain_on_exit_pane_returns_clean_error() {
     let handler = RequestHandler::new();
     let alpha_name = "alpha-dead-paste";
     let alpha = session_name(alpha_name);
-    create_session(&handler, alpha_name).await;
+    handler.create_started_session(alpha_name).await;
 
-    assert!(matches!(
-        handler
-            .handle(Request::SetOption(SetOptionRequest {
-                scope: ScopeSelector::Pane(PaneTarget::with_window(alpha.clone(), 0, 0)),
-                option: OptionName::RemainOnExit,
-                value: "on".to_owned(),
-                mode: SetOptionMode::Replace,
-            }))
-            .await,
-        Response::SetOption(_)
-    ));
-    assert!(matches!(
-        handler
-            .handle(Request::RespawnPane(Box::new(RespawnPaneRequest {
-                target: PaneTarget::with_window(alpha.clone(), 0, 0),
-                kill: true,
-                start_directory: None,
-                environment: None,
-                command: Some(vec!["exit 0".to_owned()]),
-                process_command: None,
-            })))
-            .await,
-        Response::RespawnPane(_)
-    ));
-    wait_for_dead_pane(&handler, &alpha, 0, 0).await;
+    let pane = PaneTarget::with_window(alpha.clone(), 0, 0);
+    handler
+        .set_option(
+            ScopeSelector::Pane(pane.clone()),
+            OptionName::RemainOnExit,
+            "on",
+        )
+        .await;
+    handler
+        .handle_ok(RespawnPaneRequest {
+            command: Some(vec!["exit 0".to_owned()]),
+            ..Fixture::fixture(&pane)
+        })
+        .await;
+    handler.wait_for_pane_exit_for_test(&pane).await;
 
     handler
         .handle(Request::SetBuffer(Box::new(set_buffer_request(
@@ -1061,7 +955,7 @@ async fn paste_buffer_dead_remain_on_exit_pane_returns_clean_error() {
 #[tokio::test]
 async fn paste_buffer_with_delete_nonexistent_pane_preserves_buffer() {
     let handler = RequestHandler::new();
-    create_session(&handler, "alpha").await;
+    handler.create_started_session("alpha").await;
 
     handler
         .handle(Request::SetBuffer(Box::new(set_buffer_request(
@@ -1105,15 +999,12 @@ async fn delete_buffer_by_explicit_name_works() {
         .await;
 
     let response = handler
-        .handle(Request::DeleteBuffer(DeleteBufferRequest {
+        .handle_ok(DeleteBufferRequest {
             name: Some("target".to_owned()),
-        }))
+        })
         .await;
 
-    match response {
-        Response::DeleteBuffer(r) => assert_eq!(r.buffer_name, "target"),
-        other => panic!("unexpected response: {other:?}"),
-    }
+    assert_eq!(response.buffer_name, "target");
 
     // other buffer should still exist
     let show = handler
@@ -1129,15 +1020,9 @@ async fn set_buffer_empty_content_is_not_listed() {
     let handler = RequestHandler::new();
 
     let set = handler
-        .handle(Request::SetBuffer(Box::new(set_buffer_request(
-            Some("empty"),
-            b"",
-        ))))
+        .handle_ok(SetBufferRequest::fixture(("empty", b"")))
         .await;
-    match set {
-        Response::SetBuffer(response) => assert!(response.buffer_name.is_empty()),
-        other => panic!("unexpected response: {other:?}"),
-    }
+    assert!(set.buffer_name.is_empty());
 
     let show = handler
         .handle(Request::ShowBuffer(ShowBufferRequest {
@@ -1158,7 +1043,7 @@ async fn set_buffer_empty_content_is_not_listed() {
 async fn set_buffer_clipboard_write_uses_attached_terminal_features() {
     let handler = RequestHandler::new();
     let session = session_name("alpha");
-    create_session(&handler, "alpha").await;
+    handler.create_started_session("alpha").await;
 
     let (control_tx, mut control_rx) = tokio::sync::mpsc::unbounded_channel();
     handler
@@ -1186,17 +1071,11 @@ async fn set_buffer_clipboard_write_uses_attached_terminal_features() {
 async fn set_buffer_clipboard_write_flag_overrides_set_clipboard_off() {
     let handler = RequestHandler::new();
     let session = session_name("alpha");
-    create_session(&handler, "alpha").await;
+    handler.create_started_session("alpha").await;
 
-    let set_option = handler
-        .handle(Request::SetOption(SetOptionRequest {
-            scope: ScopeSelector::Global,
-            option: OptionName::SetClipboard,
-            value: "off".to_owned(),
-            mode: SetOptionMode::Replace,
-        }))
+    handler
+        .set_option(ScopeSelector::Global, OptionName::SetClipboard, "off")
         .await;
-    assert!(matches!(set_option, Response::SetOption(_)));
 
     let (control_tx, mut control_rx) = tokio::sync::mpsc::unbounded_channel();
     handler
@@ -1224,19 +1103,11 @@ async fn set_buffer_clipboard_write_flag_overrides_set_clipboard_off() {
 async fn clipboard_writes_require_explicit_buffer_command_flag() {
     let handler = RequestHandler::new();
     let session = session_name("alpha");
-    create_session(&handler, "alpha").await;
+    handler.create_started_session("alpha").await;
 
-    assert!(matches!(
-        handler
-            .handle(Request::SetOption(SetOptionRequest {
-                scope: ScopeSelector::Global,
-                option: OptionName::SetClipboard,
-                value: "external".to_owned(),
-                mode: SetOptionMode::Replace,
-            }))
-            .await,
-        Response::SetOption(_)
-    ));
+    handler
+        .set_option(ScopeSelector::Global, OptionName::SetClipboard, "external")
+        .await;
 
     let (control_tx, mut control_rx) = tokio::sync::mpsc::unbounded_channel();
     handler
@@ -1262,14 +1133,7 @@ async fn clipboard_writes_require_explicit_buffer_command_flag() {
     )
     .await;
 
-    let temp_path = std::env::temp_dir().join(format!(
-        "rmux-load-buffer-no-clipboard-{}-{}.txt",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("time after epoch")
-            .as_nanos()
-    ));
+    let temp_path = unique_temp_path("load-buffer-no-clipboard").with_extension("txt");
     fs::write(&temp_path, b"loaded private").expect("write test buffer");
     let response = handler
         .dispatch(
@@ -1293,7 +1157,7 @@ async fn clipboard_writes_require_explicit_buffer_command_flag() {
 async fn set_buffer_clipboard_write_is_suppressed_without_unique_attached_client() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    create_session(&handler, "alpha").await;
+    handler.create_started_session("alpha").await;
 
     let (first_tx, mut first_rx) = tokio::sync::mpsc::unbounded_channel();
     handler
@@ -1329,7 +1193,7 @@ async fn set_buffer_clipboard_write_is_suppressed_without_unique_attached_client
 async fn set_buffer_target_client_writes_only_to_the_selected_client() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    create_session(&handler, "alpha").await;
+    handler.create_started_session("alpha").await;
 
     let terminal = OuterTerminalContext::from_pairs(&[("TERM", "xterm-256color")]);
     let (first_tx, mut first_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1361,7 +1225,7 @@ async fn set_buffer_target_client_writes_only_to_the_selected_client() {
 async fn load_buffer_target_client_writes_only_to_the_selected_client() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    create_session(&handler, "alpha").await;
+    handler.create_started_session("alpha").await;
 
     let terminal = OuterTerminalContext::from_pairs(&[("TERM", "xterm-256color")]);
     let (first_tx, mut first_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1373,14 +1237,7 @@ async fn load_buffer_target_client_writes_only_to_the_selected_client() {
         .register_attach_with_terminal_context(202, alpha, second_tx, terminal)
         .await;
 
-    let temp_path = std::env::temp_dir().join(format!(
-        "rmux-load-buffer-target-client-{}-{}.txt",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("time after epoch")
-            .as_nanos()
-    ));
+    let temp_path = unique_temp_path("load-buffer-target-client").with_extension("txt");
     fs::write(&temp_path, b"loaded selected").expect("write test buffer");
     let mut request = load_buffer_request(temp_path.to_str().expect("utf8 temp path"));
     request.set_clipboard = true;
@@ -1428,17 +1285,11 @@ async fn missing_buffer_target_client_is_a_successful_clipboard_noop() {
 async fn load_buffer_clipboard_write_flag_overrides_set_clipboard_off() {
     let handler = RequestHandler::new();
     let session = session_name("alpha");
-    create_session(&handler, "alpha").await;
+    handler.create_started_session("alpha").await;
 
-    let set_option = handler
-        .handle(Request::SetOption(SetOptionRequest {
-            scope: ScopeSelector::Global,
-            option: OptionName::SetClipboard,
-            value: "off".to_owned(),
-            mode: SetOptionMode::Replace,
-        }))
+    handler
+        .set_option(ScopeSelector::Global, OptionName::SetClipboard, "off")
         .await;
-    assert!(matches!(set_option, Response::SetOption(_)));
 
     let (control_tx, mut control_rx) = tokio::sync::mpsc::unbounded_channel();
     handler
@@ -1450,14 +1301,7 @@ async fn load_buffer_clipboard_write_flag_overrides_set_clipboard_off() {
         )
         .await;
 
-    let temp_path = std::env::temp_dir().join(format!(
-        "rmux-load-buffer-{}-{}.txt",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("time after epoch")
-            .as_nanos()
-    ));
+    let temp_path = unique_temp_path("load-buffer").with_extension("txt");
     fs::write(&temp_path, b"loaded clipboard").expect("write test buffer");
 
     let mut request = load_buffer_request(temp_path.to_str().expect("utf8 temp path"));

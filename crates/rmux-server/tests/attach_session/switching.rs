@@ -1,27 +1,17 @@
 use std::error::Error;
 
 use rmux_proto::{
-    encode_attach_message, AttachMessage, AttachSessionRequest, KillSessionRequest,
-    NewSessionRequest, OptionName, PaneTarget, Request, Response, ScopeSelector, SelectPaneRequest,
-    SendKeysRequest, SetOptionMode, SetOptionRequest, SplitWindowRequest, SplitWindowTarget,
-    SwitchClientRequest, TerminalSize, WindowTarget,
+    AttachSessionRequest, OptionName, PaneTarget, Request, Response, ScopeSelector,
+    SelectPaneRequest, SendKeysRequest, SetOptionRequest, SplitDirection, SplitWindowRequest,
+    SwitchClientRequest, WindowTarget,
 };
-use tokio::io::AsyncWriteExt;
 use tokio::time::timeout;
 
-use crate::common::{session_name, start_server, ClientConnection, TestHarness, PTY_TEST_LOCK};
-use crate::support::{read_attach_until_contains, STEP_TIMEOUT};
-
-async fn send_attach_command(
-    stream: &mut tokio::net::UnixStream,
-    command: &str,
-) -> Result<(), Box<dyn Error>> {
-    let mut bytes = command.as_bytes().to_vec();
-    bytes.push(b'\r');
-    let frame = encode_attach_message(&AttachMessage::Data(bytes))?;
-    stream.write_all(&frame).await?;
-    Ok(())
-}
+use crate::common::{
+    create_session, kill_session, read_attach_until_contains, send_ok, send_request, session_name,
+    start_server, ClientConnection, Fixture, TestHarness, PTY_TEST_LOCK,
+};
+use crate::support::{send_attach_command, STEP_TIMEOUT};
 
 #[tokio::test(flavor = "multi_thread")]
 async fn switch_client_reroutes_attach_input_and_output() -> Result<(), Box<dyn Error>> {
@@ -30,29 +20,8 @@ async fn switch_client_reroutes_attach_input_and_output() -> Result<(), Box<dyn 
     let socket_path = harness.socket_path().to_path_buf();
     let handle = start_server(&harness).await?;
 
-    let created_alpha = crate::common::send_request(
-        &socket_path,
-        &Request::NewSession(NewSessionRequest {
-            session_name: session_name("alpha"),
-            detached: true,
-            size: Some(TerminalSize { cols: 80, rows: 24 }),
-            environment: None,
-        }),
-    )
-    .await?;
-    assert!(matches!(created_alpha, Response::NewSession(_)));
-
-    let created_beta = crate::common::send_request(
-        &socket_path,
-        &Request::NewSession(NewSessionRequest {
-            session_name: session_name("beta"),
-            detached: true,
-            size: Some(TerminalSize { cols: 80, rows: 24 }),
-            environment: None,
-        }),
-    )
-    .await?;
-    assert!(matches!(created_beta, Response::NewSession(_)));
+    create_session(&socket_path, "alpha").await?;
+    create_session(&socket_path, "beta").await?;
 
     let (_, mut attach_stream) = ClientConnection::connect(&socket_path)
         .await?
@@ -61,20 +30,19 @@ async fn switch_client_reroutes_attach_input_and_output() -> Result<(), Box<dyn 
         })
         .await?;
 
-    let alpha_output = crate::common::send_request(
+    send_ok(
         &socket_path,
-        &Request::SendKeys(SendKeysRequest {
-            target: PaneTarget::new(session_name("alpha"), 0),
-            keys: vec!["printf alpha-output".to_owned(), "Enter".to_owned()],
-        }),
+        SendKeysRequest::fixture((
+            PaneTarget::new(session_name("alpha"), 0),
+            ["printf alpha-output", "Enter"],
+        )),
     )
     .await?;
-    assert!(matches!(alpha_output, Response::SendKeys(_)));
     let alpha_output =
         read_attach_until_contains(&mut attach_stream, "alpha-output", STEP_TIMEOUT).await?;
     assert!(alpha_output.contains("alpha-output"));
 
-    let switched = crate::common::send_request(
+    let switched = send_request(
         &socket_path,
         &Request::SwitchClient(SwitchClientRequest {
             target: session_name("beta"),
@@ -93,35 +61,21 @@ async fn switch_client_reroutes_attach_input_and_output() -> Result<(), Box<dyn 
         read_attach_until_contains(&mut attach_stream, "beta-input", STEP_TIMEOUT).await?;
     assert!(beta_input.contains("beta-input"));
 
-    let beta_output = crate::common::send_request(
+    send_ok(
         &socket_path,
-        &Request::SendKeys(SendKeysRequest {
-            target: PaneTarget::new(session_name("beta"), 0),
-            keys: vec!["printf beta-output".to_owned(), "Enter".to_owned()],
-        }),
+        SendKeysRequest::fixture((
+            PaneTarget::new(session_name("beta"), 0),
+            ["printf beta-output", "Enter"],
+        )),
     )
     .await?;
-    assert!(matches!(beta_output, Response::SendKeys(_)));
     let beta_output =
         read_attach_until_contains(&mut attach_stream, "beta-output", STEP_TIMEOUT).await?;
     assert!(beta_output.contains("beta-output"));
 
     drop(attach_stream);
-    for target in [session_name("alpha"), session_name("beta")] {
-        let removed = crate::common::send_request(
-            &socket_path,
-            &Request::KillSession(KillSessionRequest {
-                target,
-                kill_all_except_target: false,
-                clear_alerts: false,
-                kill_group: false,
-            }),
-        )
-        .await?;
-        assert_eq!(
-            removed,
-            Response::KillSession(rmux_proto::KillSessionResponse { existed: true })
-        );
+    for target in ["alpha", "beta"] {
+        kill_session(&socket_path, target).await?;
     }
     timeout(STEP_TIMEOUT, handle.shutdown()).await??;
     Ok(())
@@ -137,66 +91,29 @@ async fn switch_client_to_multi_pane_session_emits_border_frame_before_forwardin
     let alpha = session_name("alpha");
     let beta = session_name("beta");
 
-    let created_alpha = crate::common::send_request(
+    create_session(&socket_path, &alpha).await?;
+    create_session(&socket_path, &beta).await?;
+    send_ok(
         &socket_path,
-        &Request::NewSession(NewSessionRequest {
-            session_name: alpha.clone(),
-            detached: true,
-            size: Some(TerminalSize { cols: 80, rows: 24 }),
-            environment: None,
-        }),
+        SplitWindowRequest {
+            direction: SplitDirection::Horizontal,
+            ..Fixture::fixture(&beta)
+        },
     )
     .await?;
-    assert!(matches!(created_alpha, Response::NewSession(_)));
-
-    let created_beta = crate::common::send_request(
+    send_ok(
         &socket_path,
-        &Request::NewSession(NewSessionRequest {
-            session_name: beta.clone(),
-            detached: true,
-            size: Some(TerminalSize { cols: 80, rows: 24 }),
-            environment: None,
-        }),
+        SplitWindowRequest {
+            direction: SplitDirection::Horizontal,
+            ..Fixture::fixture(PaneTarget::new(beta.clone(), 1))
+        },
     )
     .await?;
-    assert!(matches!(created_beta, Response::NewSession(_)));
-
-    let first_split = crate::common::send_request(
+    send_ok(
         &socket_path,
-        &Request::SplitWindow(SplitWindowRequest {
-            target: SplitWindowTarget::Session(beta.clone()),
-            direction: rmux_proto::SplitDirection::Horizontal,
-            before: false,
-            environment: None,
-        }),
+        SelectPaneRequest::fixture(PaneTarget::new(beta.clone(), 2)),
     )
     .await?;
-    assert!(matches!(first_split, Response::SplitWindow(_)));
-
-    let second_split = crate::common::send_request(
-        &socket_path,
-        &Request::SplitWindow(SplitWindowRequest {
-            target: SplitWindowTarget::Pane(PaneTarget::new(beta.clone(), 1)),
-            direction: rmux_proto::SplitDirection::Horizontal,
-            before: false,
-            environment: None,
-        }),
-    )
-    .await?;
-    assert!(matches!(second_split, Response::SplitWindow(_)));
-
-    let selected = crate::common::send_request(
-        &socket_path,
-        &Request::SelectPane(Box::new(SelectPaneRequest {
-            target: PaneTarget::new(beta.clone(), 2),
-            title: None,
-            style: None,
-            input_disabled: None,
-            preserve_zoom: false,
-        })),
-    )
-    .await?;
-    assert!(matches!(selected, Response::SelectPane(_)));
 
     for (scope, option, value) in [
         (
@@ -215,17 +132,11 @@ async fn switch_client_to_multi_pane_session_emits_border_frame_before_forwardin
             "off",
         ),
     ] {
-        let response = crate::common::send_request(
+        send_ok(
             &socket_path,
-            &Request::SetOption(SetOptionRequest {
-                scope,
-                option,
-                value: value.to_owned(),
-                mode: SetOptionMode::Replace,
-            }),
+            SetOptionRequest::fixture((scope, option, value)),
         )
         .await?;
-        assert!(matches!(response, Response::SetOption(_)));
     }
 
     let (_, mut attach_stream) = ClientConnection::connect(&socket_path)
@@ -234,7 +145,7 @@ async fn switch_client_to_multi_pane_session_emits_border_frame_before_forwardin
         .await?;
     read_attach_until_contains(&mut attach_stream, "[alpha]", STEP_TIMEOUT).await?;
 
-    let switched = crate::common::send_request(
+    let switched = send_request(
         &socket_path,
         &Request::SwitchClient(SwitchClientRequest {
             target: beta.clone(),
@@ -259,35 +170,21 @@ async fn switch_client_to_multi_pane_session_emits_border_frame_before_forwardin
         read_attach_until_contains(&mut attach_stream, "beta-input", STEP_TIMEOUT).await?;
     assert!(beta_input.contains("beta-input"));
 
-    let beta_output = crate::common::send_request(
+    send_ok(
         &socket_path,
-        &Request::SendKeys(SendKeysRequest {
-            target: PaneTarget::new(beta.clone(), 2),
-            keys: vec!["printf beta-output".to_owned(), "Enter".to_owned()],
-        }),
+        SendKeysRequest::fixture((
+            PaneTarget::new(beta.clone(), 2),
+            ["printf beta-output", "Enter"],
+        )),
     )
     .await?;
-    assert!(matches!(beta_output, Response::SendKeys(_)));
     let beta_output =
         read_attach_until_contains(&mut attach_stream, "beta-output", STEP_TIMEOUT).await?;
     assert!(beta_output.contains("beta-output"));
 
     drop(attach_stream);
-    for target in [session_name("alpha"), session_name("beta")] {
-        let removed = crate::common::send_request(
-            &socket_path,
-            &Request::KillSession(KillSessionRequest {
-                target,
-                kill_all_except_target: false,
-                clear_alerts: false,
-                kill_group: false,
-            }),
-        )
-        .await?;
-        assert_eq!(
-            removed,
-            Response::KillSession(rmux_proto::KillSessionResponse { existed: true })
-        );
+    for target in ["alpha", "beta"] {
+        kill_session(&socket_path, target).await?;
     }
     timeout(STEP_TIMEOUT, handle.shutdown()).await??;
     Ok(())
@@ -301,17 +198,7 @@ async fn switch_client_to_missing_session_keeps_the_current_attach_stream(
     let socket_path = harness.socket_path().to_path_buf();
     let handle = start_server(&harness).await?;
 
-    let created = crate::common::send_request(
-        &socket_path,
-        &Request::NewSession(NewSessionRequest {
-            session_name: session_name("alpha"),
-            detached: true,
-            size: Some(TerminalSize { cols: 80, rows: 24 }),
-            environment: None,
-        }),
-    )
-    .await?;
-    assert!(matches!(created, Response::NewSession(_)));
+    create_session(&socket_path, "alpha").await?;
 
     let (_, mut attach_stream) = ClientConnection::connect(&socket_path)
         .await?
@@ -320,7 +207,7 @@ async fn switch_client_to_missing_session_keeps_the_current_attach_stream(
         })
         .await?;
 
-    let switched = crate::common::send_request(
+    let switched = send_request(
         &socket_path,
         &Request::SwitchClient(SwitchClientRequest {
             target: session_name("missing"),
@@ -339,34 +226,20 @@ async fn switch_client_to_missing_session_keeps_the_current_attach_stream(
         read_attach_until_contains(&mut attach_stream, "still-alpha", STEP_TIMEOUT).await?;
     assert!(still_alpha.contains("still-alpha"));
 
-    let still_output = crate::common::send_request(
+    send_ok(
         &socket_path,
-        &Request::SendKeys(SendKeysRequest {
-            target: PaneTarget::new(session_name("alpha"), 0),
-            keys: vec!["printf still-output".to_owned(), "Enter".to_owned()],
-        }),
+        SendKeysRequest::fixture((
+            PaneTarget::new(session_name("alpha"), 0),
+            ["printf still-output", "Enter"],
+        )),
     )
     .await?;
-    assert!(matches!(still_output, Response::SendKeys(_)));
     let still_output =
         read_attach_until_contains(&mut attach_stream, "still-output", STEP_TIMEOUT).await?;
     assert!(still_output.contains("still-output"));
 
     drop(attach_stream);
-    let removed = crate::common::send_request(
-        &socket_path,
-        &Request::KillSession(KillSessionRequest {
-            target: session_name("alpha"),
-            kill_all_except_target: false,
-            clear_alerts: false,
-            kill_group: false,
-        }),
-    )
-    .await?;
-    assert_eq!(
-        removed,
-        Response::KillSession(rmux_proto::KillSessionResponse { existed: true })
-    );
+    kill_session(&socket_path, "alpha").await?;
     timeout(STEP_TIMEOUT, handle.shutdown()).await??;
     Ok(())
 }

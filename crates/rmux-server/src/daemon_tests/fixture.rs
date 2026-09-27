@@ -40,7 +40,7 @@ pub(super) async fn daemon(config: DaemonConfig) -> (RmuxFrontend, TempDir) {
     let filesystem = Arc::new(marsh_btrfs::fake::CopyTree::new());
     filesystem.register(&seed);
 
-    let frontend = RmuxFrontend::open_with(
+    let frontend = crate::test_support::open_frontend(
         config,
         &seed,
         brush_core::env::ShellEnvironment::new(),

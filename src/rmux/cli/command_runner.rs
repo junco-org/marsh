@@ -1,5 +1,4 @@
 use std::cell::RefCell;
-use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 
 use rmux_client::{ClientError, Connection, connect};
@@ -10,9 +9,10 @@ use rmux_proto::{
     encode_internal_runtime_command_arguments,
 };
 
-use crate::cli_response::{expect_command_output, expect_command_success, response_name};
+use crate::cli_response::{expect_command_output, expect_command_success};
 
 use super::ExitFailure;
+use super::aux_command::write_stdout;
 
 thread_local! {
     /// Per-thread reusable connection for a batch of CLI commands over one socket.
@@ -380,17 +380,14 @@ fn inherited_pane_id(socket_path: &Path) -> Option<String> {
 
 /// Whether the inherited `RMUX` environment variable names the socket being addressed.
 fn rmux_env_socket_matches(socket_path: &Path) -> bool {
-    let Some(inherited_socket) = std::env::var("RMUX")
+    std::env::var("RMUX")
         .ok()
         .and_then(|value| rmux_socket_path_from_env(&value))
-    else {
-        return false;
-    };
-    rmux_os::path::socket_paths_match(&inherited_socket, socket_path)
+        .is_some_and(|inherited| rmux_os::path::socket_paths_match(&inherited, socket_path))
 }
 
 /// Extracts the socket path from an `RMUX` environment value of the form `path,...`.
-fn rmux_socket_path_from_env(value: &str) -> Option<PathBuf> {
+pub(super) fn rmux_socket_path_from_env(value: &str) -> Option<PathBuf> {
     let path = value.split_once(',').map_or(value, |(path, _)| path);
     (!path.is_empty()).then(|| PathBuf::from(path))
 }
@@ -400,6 +397,11 @@ fn normalize_queued_direct_error(command_name: &str, error: ExitFailure) -> Exit
     if command_name == "source-file" {
         return error;
     }
+    strip_source_file_location(error)
+}
+
+/// Drops a leading `-:<line>: ` stdin source-file location from `error`'s message.
+pub(super) fn strip_source_file_location(error: ExitFailure) -> ExitFailure {
     let Some(message) = strip_source_file_stdin_line_prefix(error.message()) else {
         return error;
     };
@@ -413,17 +415,6 @@ fn strip_source_file_stdin_line_prefix(message: &str) -> Option<&str> {
     line.bytes()
         .all(|byte| byte.is_ascii_digit())
         .then_some(message)
-}
-
-/// Builds the protocol error reported when the server answers with the wrong response kind.
-pub(super) fn unexpected_response(command_name: &str, response: &Response) -> ExitFailure {
-    ExitFailure::new(
-        1,
-        format!(
-            "protocol error: unexpected '{}' response for {command_name}",
-            response_name(response)
-        ),
-    )
 }
 
 /// Checks a successful response, prints any command output, and yields exit code `0`.
@@ -441,26 +432,17 @@ pub(super) fn finish_command_success(
 
 /// Writes captured stdout to the process stdout, treating a broken pipe as success.
 pub(super) fn write_command_output(output: &CommandOutput) -> Result<(), ExitFailure> {
-    match std::io::stdout().write_all(output.stdout()) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == ErrorKind::BrokenPipe => Ok(()),
-        Err(error) => Err(ExitFailure::new(
-            1,
-            format!("failed to write command output: {error}"),
-        )),
-    }
+    write_stdout(output.stdout(), "command").map(drop)
 }
 
 /// Prints `lines` as newline-terminated output, emitting nothing when the list is empty.
 pub(super) fn write_lines_output(lines: &[String]) -> Result<i32, ExitFailure> {
-    if lines.is_empty() {
-        write_command_output(&CommandOutput::from_stdout(Vec::new()))?;
+    let text = if lines.is_empty() {
+        String::new()
     } else {
-        write_command_output(&CommandOutput::from_stdout(
-            format!("{}\n", lines.join("\n")).into_bytes(),
-        ))?;
-    }
-    Ok(0)
+        format!("{}\n", lines.join("\n"))
+    };
+    write_stdout(text.as_bytes(), "command")
 }
 
 #[cfg(test)]
@@ -469,7 +451,10 @@ mod tests {
     use rmux_client::ClientError;
     use rmux_proto::{ErrorResponse, Response, RmuxError};
 
-    use super::{capture_target_action_needs_legacy_retry, target_action_needs_legacy_retry};
+    use super::{
+        capture_target_action_needs_legacy_retry, strip_source_file_stdin_line_prefix,
+        target_action_needs_legacy_retry,
+    };
 
     #[test]
     fn target_action_retry_is_limited_to_protocol_decode_failures() {
@@ -492,5 +477,17 @@ mod tests {
                 },
             },
         ))));
+    }
+
+    #[test]
+    fn alias_fallback_errors_strip_synthetic_source_file_prefix() {
+        assert_eq!(
+            strip_source_file_stdin_line_prefix("-:1: unknown command: nope"),
+            Some("unknown command: nope")
+        );
+        assert_eq!(
+            strip_source_file_stdin_line_prefix("unknown command: nope"),
+            None
+        );
     }
 }

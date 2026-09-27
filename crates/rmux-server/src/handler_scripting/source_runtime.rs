@@ -790,6 +790,7 @@ impl RequestHandler {
                 command.quiet,
                 command.stdin.as_deref(),
                 command.read_policy(),
+                None,
             );
         }
 
@@ -1343,6 +1344,7 @@ fn read_bootstrap_source_path(
         command.quiet,
         command.stdin.as_deref(),
         command.read_policy(),
+        None,
     )
 }
 

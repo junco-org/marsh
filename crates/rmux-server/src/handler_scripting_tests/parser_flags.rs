@@ -1,8 +1,6 @@
 use super::*;
 
-use crate::handler::scripting_support::parse_request_from_parts;
-use rmux_core::{OptionStore, SessionStore};
-use rmux_proto::RmuxError;
+use rmux_proto::{RenameWindowRequest, SendKeysExtRequest};
 
 const UNKNOWN_FLAG_COMMANDS: [(&str, &str); 13] = [
     ("set-buffer", "set-buffer -x payload"),
@@ -23,59 +21,7 @@ const UNKNOWN_FLAG_COMMANDS: [(&str, &str); 13] = [
     ("select-layout", "select-layout -x"),
 ];
 
-const DAEMON_TEST_STACK_SIZE: usize = 8 * 1024 * 1024;
 const NEW_UNKNOWN_FLAG_COMMAND_START: usize = 6;
-
-fn run_on_daemon_test_stack<F, Fut>(test: F)
-where
-    F: FnOnce() -> Fut + Send + 'static,
-    Fut: std::future::Future<Output = ()> + 'static,
-{
-    let worker = std::thread::Builder::new()
-        .name("parser-flags-test".to_owned())
-        .stack_size(DAEMON_TEST_STACK_SIZE)
-        .spawn(|| {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("parser-flags test runtime should build");
-            runtime.block_on(test());
-        })
-        .expect("parser-flags test worker should spawn");
-    if let Err(panic) = worker.join() {
-        std::panic::resume_unwind(panic);
-    }
-}
-
-fn parse_server_request(
-    command: &str,
-    arguments: &[&str],
-    sessions: &SessionStore,
-    find_context: &TargetFindContext,
-) -> Result<Request, RmuxError> {
-    parse_request_from_parts(
-        command.to_owned(),
-        arguments
-            .iter()
-            .map(|argument| (*argument).to_owned())
-            .collect(),
-        None,
-        sessions,
-        &OptionStore::default(),
-        find_context,
-    )
-}
-
-fn parser_fixture() -> (SessionStore, TargetFindContext) {
-    let alpha = session_name("alpha");
-    let mut sessions = SessionStore::new();
-    sessions
-        .create_session(alpha.clone(), TerminalSize { cols: 80, rows: 24 })
-        .expect("parser fixture session");
-    let find_context =
-        TargetFindContext::from_target(Target::Pane(PaneTarget::with_window(alpha, 0, 0)));
-    (sessions, find_context)
-}
 
 #[test]
 fn server_tail_parsers_reject_unknown_flags_before_positionals() {
@@ -201,14 +147,13 @@ fn server_tail_parsers_preserve_explicit_dash_prefixed_positionals() {
 }
 
 async fn create_stable_session(handler: &RequestHandler, name: &SessionName) -> u32 {
-    create_background_identity_session(handler, name.clone()).await;
-    let rename = handler
-        .handle(Request::RenameWindow(rmux_proto::RenameWindowRequest {
+    handler.create_session(name).await;
+    handler
+        .handle_ok(RenameWindowRequest {
             target: WindowTarget::with_window(name.clone(), 0),
             name: "stable-window".to_owned(),
-        }))
+        })
         .await;
-    assert!(matches!(rename, Response::RenameWindow(_)), "{rename:?}");
 
     let state = handler.state.lock().await;
     let pane_id = state
@@ -256,11 +201,7 @@ async fn assert_stable_session(handler: &RequestHandler, name: &SessionName, pan
 }
 
 async fn assert_named_buffer_absent(handler: &RequestHandler, name: &str) {
-    let response = handler
-        .handle(Request::ShowBuffer(ShowBufferRequest {
-            name: Some(name.to_owned()),
-        }))
-        .await;
+    let response = handler.handle(show_buffer_request(name)).await;
     assert!(
         matches!(response, Response::Error(_)),
         "buffer {name:?} proves a rejected command tail still executed: {response:?}"
@@ -284,8 +225,9 @@ async fn assert_control_mode_case(index: usize, command: &str, invalid: &str) {
     let alpha = session_name("control-parser-flags");
     let pane_id = create_stable_session(&handler, &alpha).await;
     let requester_pid = 63_000 + index as u32;
-    let (_control_id, _control_events) =
-        register_control_for_session(&handler, requester_pid, alpha.clone()).await;
+    let (_control_id, _control_events) = handler
+        .register_control_for_test(requester_pid, Some(&alpha))
+        .await;
     let canary = format!("control-unknown-{index}");
     let commands = handler
         .parse_control_commands(&format!("{invalid} ; set-buffer -b {canary} must-not-run"))
@@ -431,23 +373,12 @@ async fn assert_bind_key_case(index: usize, command: &str, invalid: &str) {
         .expect("binding installs before it is triggered");
 
     let requester_pid = std::process::id();
-    let (attach_tx, _attach_rx) = tokio::sync::mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha.clone(), attach_tx)
-        .await;
+    let _attach_rx = handler.attach_client(requester_pid, &alpha).await;
     let response = handler
-        .handle(Request::SendKeysExt(rmux_proto::SendKeysExtRequest {
-            target: Some(PaneTarget::with_window(alpha.clone(), 0, 0)),
-            keys: vec![key],
-            expand_formats: false,
-            hex: false,
-            literal: false,
-            dispatch_key_table: true,
-            copy_mode_command: false,
-            forward_mouse_event: false,
-            reset_terminal: false,
-            repeat_count: None,
-        }))
+        .handle(
+            SendKeysExtRequest::fixture((PaneTarget::with_window(alpha.clone(), 0, 0), [key]))
+                .into_request(),
+        )
         .await;
     let Response::Error(error) = response else {
         panic!("triggered binding must reject the unknown nested flag: {response:?}");

@@ -13,13 +13,8 @@
 //! principal. Its writes are staged. Its attempt is recorded. Its result becomes visible only when
 //! the gate approves the boundary.
 //!
-//! # Registered uniformly, before attachment
-//!
-//! This builtin is in the one profile `ShellIo::new` freezes, which every shell of this daemon's
-//! mux is built from — panes, popups and helpers alike — and it is registered
-//! *before* `Shell::attach`. Attaching installs one process-wide instrumented builtin table, so a
-//! late registration would run uninstrumented and a partial one would break the table for every
-//! other shell.
+//! Registration is local to each shell. Brush's generic observer scopes the real builtin body
+//! and every tracked worker, independently of other live muxes.
 //!
 //! # What it is not
 //!
@@ -32,11 +27,9 @@
 
 use std::path::{Path, PathBuf};
 
-use brush_core::builtins::Registration;
-use brush_core::commands::{CommandArg, ExecutionContext};
+use brush_core::commands::ExecutionContext;
 use brush_core::results::ExecutionResult;
-use marsh_core::shellmux::{current_command_context, CommandContext};
-use marsh_core::MarshShellExtensions;
+use marsh_core::builtins::{current_context, Command, CommandContext, Registration};
 
 /// The name this builtin is registered under.
 ///
@@ -44,43 +37,29 @@ use marsh_core::MarshShellExtensions;
 /// or a script should call.
 pub(crate) const RMUX_IO_BUILTIN: &str = "__rmux_io";
 
-/// The registration installed into every shell of this daemon's mux.
-pub(crate) fn registration() -> Registration<MarshShellExtensions> {
-    Registration {
-        execute_func: execute,
-        content_func: content,
-        disabled: false,
-        special_builtin: false,
-        declaration_builtin: false,
+/// The opaque registration installed into every shell of this daemon's mux.
+pub(crate) fn registration() -> Registration {
+    marsh_core::builtins::builtin::<RmuxIoBuiltin>()
+}
+
+#[derive(clap::Parser)]
+struct RmuxIoBuiltin {
+    #[clap(allow_hyphen_values = true, num_args = 0..)]
+    words: Vec<String>,
+}
+impl Command for RmuxIoBuiltin {
+    type Error = brush_core::Error;
+    fn new<I: IntoIterator<Item = String>>(args: I) -> Result<Self, clap::Error> {
+        Ok(Self {
+            words: args.into_iter().collect(),
+        })
     }
-}
-
-/// Help content. Deliberately terse: this is not a user-facing command.
-fn content(
-    _name: &str,
-    _content_type: brush_core::builtins::ContentType,
-    _options: &brush_core::builtins::ContentOptions,
-) -> Result<String, brush_core::Error> {
-    Ok(String::from(
-        "__rmux_io: private rmux daemon file helper; not for interactive use\n",
-    ))
-}
-
-/// Runs one subcommand.
-fn execute(
-    context: ExecutionContext<'_, MarshShellExtensions>,
-    args: Vec<CommandArg>,
-) -> brush_core::builtins::BoxFuture<'_, Result<ExecutionResult, brush_core::Error>> {
-    Box::pin(async move {
-        let words: Vec<String> = args
-            .into_iter()
-            .map(|argument| match argument {
-                CommandArg::String(value) => value,
-                CommandArg::Assignment(assignment) => assignment.to_string(),
-            })
-            .collect();
-        Ok(dispatch(&context, &words).await)
-    })
+    async fn execute<SE: brush_core::ShellExtensions>(
+        &self,
+        context: ExecutionContext<'_, SE>,
+    ) -> Result<ExecutionResult, Self::Error> {
+        Ok(dispatch(&context, &self.words).await)
+    }
 }
 
 /// Dispatches to a subcommand, refusing outright without a managed command context.
@@ -94,10 +73,10 @@ fn execute(
 /// rather than counted: an invocation that already arrives without it — anything that strips
 /// argument zero the way `exec` does for an external program — still finds its subcommand.
 async fn dispatch(
-    context: &ExecutionContext<'_, MarshShellExtensions>,
+    context: &ExecutionContext<'_, impl brush_core::ShellExtensions>,
     words: &[String],
 ) -> ExecutionResult {
-    let Some(managed) = current_command_context() else {
+    let Some(managed) = current_context() else {
         let _ = writeln!(
             context.stderr(),
             "{RMUX_IO_BUILTIN}: refusing to run outside a managed command"
@@ -117,7 +96,7 @@ async fn dispatch(
     match subcommand.as_str() {
         "read" => read(context, &managed, rest).await,
         "write" => write(context, &managed, rest).await,
-        "source" => source(context, rest).await,
+        "source" => source(context, &managed, rest).await,
         "presets" => presets(context, &managed, rest).await,
         other => {
             let _ = writeln!(
@@ -144,28 +123,9 @@ fn operands<'a>(words: &'a [String], flags: &mut Vec<&'a str>) -> &'a [String] {
     &[]
 }
 
-/// Rebases `path` so a write lands in the helper's own snapshot rather than the live seed.
-///
-/// Three cases, in this order:
-///
-/// * already inside this command's snapshot — used as is;
-/// * inside the seed — the seed prefix is replaced by the snapshot root, so the write is staged;
-/// * anywhere else — left alone. An absolute path outside the seed is an ordinary OS effect this
-///   engine observes but does not confine, and pretending otherwise would be a false promise.
-fn rebase(managed: &CommandContext, path: &Path) -> PathBuf {
-    let Some(root) = managed.snapshot_root() else {
-        return path.to_path_buf();
-    };
-    if path.starts_with(root) {
-        return path.to_path_buf();
-    }
-    path.strip_prefix(managed.seed())
-        .map_or_else(|_| path.to_path_buf(), |relative| root.join(relative))
-}
-
 /// `read -- PATH`: the file's raw bytes on standard output.
 async fn read(
-    context: &ExecutionContext<'_, MarshShellExtensions>,
+    context: &ExecutionContext<'_, impl brush_core::ShellExtensions>,
     managed: &CommandContext,
     words: &[String],
 ) -> ExecutionResult {
@@ -175,11 +135,9 @@ async fn read(
         let _ = writeln!(context.stderr(), "{RMUX_IO_BUILTIN} read: missing path");
         return ExecutionResult::new(2);
     };
-    // A read is rebased too: a helper reading back what an earlier helper staged must see the
-    // staged copy, not the seed's older one.
-    let path = rebase(managed, Path::new(path));
+    let path = PathBuf::from(path);
 
-    match crate::buffer_file_io::read(path).await {
+    match crate::buffer_file_io::read(path, Some(managed)).await {
         Ok(bytes) => {
             let mut out = context.stdout();
             if out.write_all(&bytes).is_err() {
@@ -197,7 +155,7 @@ async fn read(
 
 /// `write [--append] [--mkdirs] -- PATH`: raw standard input into a staged file.
 async fn write(
-    context: &ExecutionContext<'_, MarshShellExtensions>,
+    context: &ExecutionContext<'_, impl brush_core::ShellExtensions>,
     managed: &CommandContext,
     words: &[String],
 ) -> ExecutionResult {
@@ -209,7 +167,7 @@ async fn write(
         let _ = writeln!(context.stderr(), "{RMUX_IO_BUILTIN} write: missing path");
         return ExecutionResult::new(2);
     };
-    let path = rebase(managed, Path::new(path));
+    let path = PathBuf::from(path);
 
     // Standard input here is the job's real pipe, and the only writer is the caller that started
     // this helper. The read therefore blocks until *that caller* sends end of file — so doing it
@@ -253,9 +211,10 @@ async fn write(
     if mkdirs {
         if let Some(parent) = path.parent() {
             let parent = parent.to_path_buf();
+            let worker_context = managed.clone();
             // Through the context's tracked worker, so the core joins it before any boundary: a
             // directory created after a discard would be a change nobody staged.
-            match managed.spawn_blocking(move || std::fs::create_dir_all(parent)) {
+            match managed.spawn_blocking(move || worker_context.create_dir_all(&parent)) {
                 Ok(receiver) => {
                     if let Ok(Err(error)) = receiver.await {
                         let _ = writeln!(context.stderr(), "{RMUX_IO_BUILTIN} write: {error}");
@@ -270,7 +229,7 @@ async fn write(
         }
     }
 
-    match crate::buffer_file_io::write(path, content, append).await {
+    match crate::buffer_file_io::write(path, content, append, Some(managed)).await {
         Ok(()) => ExecutionResult::success(),
         Err(error) => {
             let _ = writeln!(context.stderr(), "{RMUX_IO_BUILTIN} write: {error}");
@@ -290,27 +249,10 @@ async fn write(
 /// `b`, and the caller needs the reader's own error value, not a re-wrapped copy of its text. The
 /// exit status is reserved for this helper failing to do its job at all.
 ///
-/// # Paths are not rebased, and why the three subcommands differ
-///
-/// [`write`] rebases because it stages: the plan's rebase rule exists so a managed write never
-/// touches the live seed and becomes visible only at an approved boundary. [`read`] rebases to
-/// stay consistent with it — a helper reading back what an earlier helper in the same command
-/// staged has to see the staged copy. Neither of them reports a path to anyone.
-///
-/// This one does, so its patterns and its `--cwd` arrive untouched. A source read's resolved
-/// paths are *results*: they become `#{current_file}`, they are the location in every parse
-/// diagnostic a user reads, and they are the directory a nested `source-file` resolves its own
-/// relative paths against. A snapshot copy's name is none of those things — it is not a path the
-/// user can act on, and it is not a path the caller can resolve against once the boundary has
-/// closed. Rebasing `--cwd` would also silently move where a relative pattern resolves, which is
-/// exactly the caller-cwd semantics this helper exists to preserve.
-///
-/// This is a deliberate narrowing of the plan's rebase sentence, which is about writes ("never
-/// write the live seed directly"). Nothing is lost by it: a read cannot miss a staged
-/// configuration file, because an earlier helper's write is visible here only once it has been
-/// published into the seed, and a write that was not published must not be visible at all.
+/// Logical file paths and nested-source diagnostics are preserved while I/O targets the work view.
 async fn source(
-    context: &ExecutionContext<'_, MarshShellExtensions>,
+    context: &ExecutionContext<'_, impl brush_core::ShellExtensions>,
+    managed: &CommandContext,
     words: &[String],
 ) -> ExecutionResult {
     let mut flags = Vec::new();
@@ -334,6 +276,7 @@ async fn source(
                 cwd.as_deref(),
                 quiet,
                 strict,
+                Some(managed),
             )
         })
         .collect();
@@ -356,7 +299,7 @@ async fn source(
 
 /// `presets -- DIR…`: the configured tunnel preset names, one per line.
 async fn presets(
-    context: &ExecutionContext<'_, MarshShellExtensions>,
+    context: &ExecutionContext<'_, impl brush_core::ShellExtensions>,
     managed: &CommandContext,
     words: &[String],
 ) -> ExecutionResult {
@@ -364,8 +307,8 @@ async fn presets(
     let directories = operands(words, &mut flags);
     let mut names: Vec<String> = Vec::new();
     for directory in directories {
-        let path = rebase(managed, Path::new(directory));
-        let Ok(entries) = std::fs::read_dir(&path) else {
+        let path = Path::new(directory);
+        let Ok(entries) = managed.read_dir(path) else {
             continue;
         };
         for entry in entries.flatten() {

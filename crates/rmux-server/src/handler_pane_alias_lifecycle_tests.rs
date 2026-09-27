@@ -1,122 +1,35 @@
 use super::RequestHandler;
 use rmux_core::PaneId;
 use rmux_proto::{
-    ErrorResponse, KillPaneRequest, KillSessionRequest, LinkWindowRequest, NewSessionExtRequest,
-    NewSessionRequest, NewWindowRequest, PaneKillRequest, PaneOptionGetRequest,
-    PaneOptionSetRequest, PaneRespawnRequest, PaneStateClosedReason, PaneStateCursorRequest,
-    PaneStateEventDto, PaneStateSnapshot, PaneStateSubscriptionId, PaneTarget, PaneTargetRef,
-    Request, RespawnPaneRequest, RespawnWindowRequest, Response, RmuxError, SessionName,
-    SetOptionMode, SplitDirection, SplitWindowRequest, SplitWindowTarget,
-    SubscribePaneStateRequest, TerminalSize, UnlinkWindowRequest, WindowTarget,
+    ErrorResponse, KillPaneRequest, KillSessionRequest, LinkWindowRequest, NewWindowRequest,
+    PaneKillRequest, PaneOptionGetRequest, PaneOptionSetRequest, PaneRespawnRequest,
+    PaneStateClosedReason, PaneStateEventDto, PaneStateSnapshot, PaneStateSubscriptionId,
+    PaneTarget, PaneTargetRef, Request, RespawnPaneRequest, RespawnWindowRequest, Response,
+    RmuxError, SetOptionMode, SplitWindowRequest, SubscribePaneStateRequest, UnlinkWindowRequest,
+    WindowTarget,
 };
 
-use crate::test_names::session_name;
-
-async fn create_session(handler: &RequestHandler, value: &str) -> SessionName {
-    let session = session_name(value);
-    let response = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name: session.clone(),
-            detached: true,
-            size: Some(TerminalSize { cols: 80, rows: 24 }),
-            environment: None,
-        }))
-        .await;
-    assert!(matches!(response, Response::NewSession(_)), "{response:?}");
-    session
-}
-
-async fn create_grouped_session(
-    handler: &RequestHandler,
-    value: &str,
-    group_target: &SessionName,
-) -> SessionName {
-    let session = session_name(value);
-    let response = handler
-        .handle(Request::NewSessionExt(Box::new(NewSessionExtRequest {
-            session_name: Some(session.clone()),
-            working_directory: None,
-            detached: true,
-            size: Some(TerminalSize { cols: 80, rows: 24 }),
-            environment: None,
-            group_target: Some(group_target.clone()),
-            attach_if_exists: false,
-            detach_other_clients: false,
-            kill_other_clients: false,
-            flags: None,
-            window_name: None,
-            print_session_info: false,
-            print_format: None,
-            command: None,
-            process_command: None,
-            client_environment: None,
-            skip_environment_update: false,
-        })))
-        .await;
-    assert!(matches!(response, Response::NewSession(_)), "{response:?}");
-    session
-}
-
-async fn create_window(handler: &RequestHandler, session: &SessionName, index: u32) {
-    let response = handler
-        .handle(Request::NewWindow(Box::new(NewWindowRequest {
-            target: session.clone(),
-            name: None,
-            detached: true,
-            environment: None,
-            command: None,
-            start_directory: None,
-            target_window_index: Some(index),
-            insert_at_target: false,
-            process_command: None,
-        })))
-        .await;
-    assert!(matches!(response, Response::NewWindow(_)), "{response:?}");
-}
+use crate::test_fixtures::{Fixture, Grouped};
 
 async fn subscribe(
     handler: &RequestHandler,
     connection_id: u64,
     target: PaneTarget,
 ) -> (PaneStateSubscriptionId, PaneId, PaneStateSnapshot) {
-    match handler
-        .handle_subscribe_pane_state(
+    let response = handler
+        .subscribe_ok(
             connection_id,
             SubscribePaneStateRequest {
-                target: PaneTargetRef::slot(target),
-                include_title: false,
                 include_options: true,
-                include_foreground: false,
+                ..Fixture::fixture(target)
             },
         )
-        .await
-    {
-        Response::SubscribePaneState(response) => (
-            response.subscription_id,
-            response.pane_id,
-            response.snapshot,
-        ),
-        response => panic!("subscribe-pane-state failed: {response:?}"),
-    }
-}
-
-async fn read_cursor(
-    handler: &RequestHandler,
-    connection_id: u64,
-    subscription_id: PaneStateSubscriptionId,
-    after_revision: u64,
-) -> Response {
-    handler
-        .handle_pane_state_cursor(
-            connection_id,
-            PaneStateCursorRequest {
-                subscription_id,
-                after_revision,
-                wait: false,
-                max_events: Some(16),
-            },
-        )
-        .await
+        .await;
+    (
+        response.subscription_id,
+        response.pane_id,
+        response.snapshot,
+    )
 }
 
 async fn set_option(
@@ -194,19 +107,17 @@ fn assert_no_events(response: Response) {
 #[tokio::test]
 async fn linked_pane_aliases_share_option_get_snapshot_and_events() {
     let handler = RequestHandler::new();
-    let alpha = create_session(&handler, "alias-link-alpha").await;
-    let beta = create_session(&handler, "alias-link-beta").await;
-    let linked = handler
-        .handle(Request::LinkWindow(LinkWindowRequest {
-            source: WindowTarget::with_window(alpha.clone(), 0),
-            target: WindowTarget::with_window(beta.clone(), 0),
-            after: false,
-            before: false,
+    let alpha = handler.create_session("alias-link-alpha").await;
+    let beta = handler.create_session("alias-link-beta").await;
+    handler
+        .handle_ok(LinkWindowRequest {
             kill_destination: true,
-            detached: true,
-        }))
+            ..Fixture::fixture((
+                WindowTarget::with_window(alpha.clone(), 0),
+                WindowTarget::with_window(beta.clone(), 0),
+            ))
+        })
         .await;
-    assert!(matches!(linked, Response::LinkWindow(_)), "{linked:?}");
     let alpha_target = PaneTarget::with_window(alpha.clone(), 0, 0);
     let beta_target = PaneTarget::with_window(beta.clone(), 0, 0);
     let (alpha_subscription, pane_id, alpha_snapshot) =
@@ -233,13 +144,17 @@ async fn linked_pane_aliases_share_option_get_snapshot_and_events() {
         Some("shared".to_owned())
     );
     assert_option_event(
-        read_cursor(&handler, 1101, alpha_subscription, alpha_snapshot.revision).await,
+        handler
+            .read_pane_state_cursor_for_test(1101, alpha_subscription, alpha_snapshot.revision)
+            .await,
         pane_id,
         "@alias.link",
         "shared",
     );
     assert_option_event(
-        read_cursor(&handler, 1102, beta_subscription, beta_snapshot.revision).await,
+        handler
+            .read_pane_state_cursor_for_test(1102, beta_subscription, beta_snapshot.revision)
+            .await,
         pane_id,
         "@alias.link",
         "shared",
@@ -254,7 +169,7 @@ async fn linked_pane_aliases_share_option_get_snapshot_and_events() {
 #[tokio::test]
 async fn grouped_pane_aliases_copy_existing_options_and_share_later_mutations() {
     let handler = RequestHandler::new();
-    let alpha = create_session(&handler, "alias-group-alpha").await;
+    let alpha = handler.create_session("alias-group-alpha").await;
     let alpha_target = PaneTarget::with_window(alpha.clone(), 0, 0);
     let set = set_option(
         &handler,
@@ -264,7 +179,9 @@ async fn grouped_pane_aliases_copy_existing_options_and_share_later_mutations() 
     )
     .await;
     assert!(matches!(set, Response::PaneOptionSet(_)), "{set:?}");
-    let beta = create_grouped_session(&handler, "alias-group-beta", &alpha).await;
+    let beta = handler
+        .create_session(Grouped("alias-group-beta", &alpha))
+        .await;
     let beta_target = PaneTarget::with_window(beta.clone(), 0, 0);
     assert_eq!(
         get_option(
@@ -310,13 +227,17 @@ async fn grouped_pane_aliases_copy_existing_options_and_share_later_mutations() 
         Some("shared".to_owned())
     );
     assert_option_event(
-        read_cursor(&handler, 1111, alpha_subscription, alpha_snapshot.revision).await,
+        handler
+            .read_pane_state_cursor_for_test(1111, alpha_subscription, alpha_snapshot.revision)
+            .await,
         pane_id,
         "@alias.after-group",
         "shared",
     );
     assert_option_event(
-        read_cursor(&handler, 1112, beta_subscription, beta_snapshot.revision).await,
+        handler
+            .read_pane_state_cursor_for_test(1112, beta_subscription, beta_snapshot.revision)
+            .await,
         pane_id,
         "@alias.after-group",
         "shared",
@@ -326,8 +247,10 @@ async fn grouped_pane_aliases_copy_existing_options_and_share_later_mutations() 
 #[tokio::test]
 async fn killing_group_session_alias_keeps_runtime_and_emits_no_false_closed() {
     let handler = RequestHandler::new();
-    let alpha = create_session(&handler, "kill-alias-alpha").await;
-    let beta = create_grouped_session(&handler, "kill-alias-beta", &alpha).await;
+    let alpha = handler.create_session("kill-alias-alpha").await;
+    let beta = handler
+        .create_session(Grouped("kill-alias-beta", &alpha))
+        .await;
     let alpha_target = PaneTarget::with_window(alpha.clone(), 0, 0);
     let beta_target = PaneTarget::with_window(beta.clone(), 0, 0);
     let (alpha_subscription, pane_id, alpha_snapshot) =
@@ -336,15 +259,7 @@ async fn killing_group_session_alias_keeps_runtime_and_emits_no_false_closed() {
         subscribe(&handler, 1122, beta_target).await;
     assert_eq!(beta_pane_id, pane_id);
 
-    let killed = handler
-        .handle(Request::KillSession(KillSessionRequest {
-            target: beta,
-            kill_all_except_target: false,
-            clear_alerts: false,
-            kill_group: false,
-        }))
-        .await;
-    assert!(matches!(killed, Response::KillSession(_)), "{killed:?}");
+    handler.handle_ok(KillSessionRequest::fixture(beta)).await;
     {
         let state = handler.state.lock().await;
         assert!(state.sessions.contains_session(&alpha));
@@ -353,16 +268,24 @@ async fn killing_group_session_alias_keeps_runtime_and_emits_no_false_closed() {
             .expect("surviving group alias retains runtime");
     }
     assert_no_events(
-        read_cursor(&handler, 1121, alpha_subscription, alpha_snapshot.revision).await,
+        handler
+            .read_pane_state_cursor_for_test(1121, alpha_subscription, alpha_snapshot.revision)
+            .await,
     );
-    assert_no_events(read_cursor(&handler, 1122, beta_subscription, beta_snapshot.revision).await);
+    assert_no_events(
+        handler
+            .read_pane_state_cursor_for_test(1122, beta_subscription, beta_snapshot.revision)
+            .await,
+    );
 }
 
 #[tokio::test]
 async fn deleting_last_pane_or_link_alias_preserves_the_shared_runtime() {
     let handler = RequestHandler::new();
-    let alpha = create_session(&handler, "delete-alias-alpha").await;
-    let beta = create_grouped_session(&handler, "delete-alias-beta", &alpha).await;
+    let alpha = handler.create_session("delete-alias-alpha").await;
+    let beta = handler
+        .create_session(Grouped("delete-alias-beta", &alpha))
+        .await;
     let target = PaneTarget::with_window(alpha.clone(), 0, 0);
     let (subscription, pane_id, snapshot) = subscribe(&handler, 1131, target).await;
     let killed = handler
@@ -378,59 +301,59 @@ async fn deleting_last_pane_or_link_alias_preserves_the_shared_runtime() {
             .ensure_panes_exist(&alpha, &[pane_id])
             .expect("last-pane deletion through peer keeps owner runtime");
     }
-    assert_no_events(read_cursor(&handler, 1131, subscription, snapshot.revision).await);
+    assert_no_events(
+        handler
+            .read_pane_state_cursor_for_test(1131, subscription, snapshot.revision)
+            .await,
+    );
 
-    let link_owner = create_session(&handler, "delete-link-owner").await;
-    let link_peer = create_session(&handler, "delete-link-peer").await;
-    create_window(&handler, &link_peer, 1).await;
-    let linked = handler
-        .handle(Request::LinkWindow(LinkWindowRequest {
-            source: WindowTarget::with_window(link_owner.clone(), 0),
-            target: WindowTarget::with_window(link_peer.clone(), 0),
-            after: false,
-            before: false,
-            kill_destination: true,
-            detached: true,
-        }))
+    let link_owner = handler.create_session("delete-link-owner").await;
+    let link_peer = handler.create_session("delete-link-peer").await;
+    handler
+        .create_window(NewWindowRequest {
+            target_window_index: Some(1),
+            ..Fixture::fixture(&link_peer)
+        })
         .await;
-    assert!(matches!(linked, Response::LinkWindow(_)), "{linked:?}");
+    handler
+        .handle_ok(LinkWindowRequest {
+            kill_destination: true,
+            ..Fixture::fixture((
+                WindowTarget::with_window(link_owner.clone(), 0),
+                WindowTarget::with_window(link_peer.clone(), 0),
+            ))
+        })
+        .await;
     let link_target = PaneTarget::with_window(link_owner.clone(), 0, 0);
     let (link_subscription, link_pane_id, link_snapshot) =
         subscribe(&handler, 1132, link_target).await;
-    let unlinked = handler
-        .handle(Request::UnlinkWindow(UnlinkWindowRequest {
+    handler
+        .handle_ok(UnlinkWindowRequest {
             target: WindowTarget::with_window(link_peer, 0),
             kill_if_last: false,
-        }))
+        })
         .await;
-    assert!(
-        matches!(unlinked, Response::UnlinkWindow(_)),
-        "{unlinked:?}"
-    );
     {
         let state = handler.state.lock().await;
         state
             .ensure_panes_exist(&link_owner, &[link_pane_id])
             .expect("unlinking one alias keeps linked runtime");
     }
-    assert_no_events(read_cursor(&handler, 1132, link_subscription, link_snapshot.revision).await);
+    assert_no_events(
+        handler
+            .read_pane_state_cursor_for_test(1132, link_subscription, link_snapshot.revision)
+            .await,
+    );
 }
 
 #[tokio::test]
 async fn grouped_peer_kill_pane_resize_rollback_restores_owner_runtime() {
     let handler = RequestHandler::new();
-    let owner = create_session(&handler, "kill-rollback-owner").await;
-    let split = handler
-        .handle(Request::SplitWindow(SplitWindowRequest {
-            target: SplitWindowTarget::Session(owner.clone()),
-            direction: SplitDirection::Vertical,
-            before: false,
-            environment: None,
-        }))
+    let owner = handler.create_session("kill-rollback-owner").await;
+    handler.handle_ok(SplitWindowRequest::fixture(&owner)).await;
+    let peer = handler
+        .create_session(Grouped("kill-rollback-peer", &owner))
         .await;
-    assert!(matches!(split, Response::SplitWindow(_)), "{split:?}");
-    let peer = create_grouped_session(&handler, "kill-rollback-peer", &owner).await;
-    handler.wait_for_initial_panes_for_test().await;
 
     let (pane_id, pane_instance) = {
         let mut state = handler.state.lock().await;
@@ -502,53 +425,36 @@ async fn grouped_peer_kill_pane_resize_rollback_restores_owner_runtime() {
 #[tokio::test]
 async fn successful_respawn_pane_and_window_close_the_old_lifetime() {
     let handler = RequestHandler::new();
-    let session = create_session(&handler, "respawn-old-lifetime").await;
+    let session = handler.create_session("respawn-old-lifetime").await;
     let target = PaneTarget::with_window(session.clone(), 0, 0);
     let (pane_subscription, pane_id, pane_snapshot) =
         subscribe(&handler, 1141, target.clone()).await;
-    let respawned = handler
-        .handle(Request::RespawnPane(Box::new(RespawnPaneRequest {
-            target: target.clone(),
-            kill: true,
-            start_directory: None,
-            environment: None,
-            command: None,
-            process_command: None,
-        })))
+    handler
+        .handle_ok(RespawnPaneRequest::fixture(&target))
         .await;
-    assert!(
-        matches!(respawned, Response::RespawnPane(_)),
-        "{respawned:?}"
-    );
     let _ = closed_revision(
-        read_cursor(&handler, 1141, pane_subscription, pane_snapshot.revision).await,
+        handler
+            .read_pane_state_cursor_for_test(1141, pane_subscription, pane_snapshot.revision)
+            .await,
         pane_id,
     );
 
     let (window_subscription, window_pane_id, window_snapshot) =
         subscribe(&handler, 1142, target).await;
     assert_eq!(window_pane_id, pane_id);
-    let respawned = handler
-        .handle(Request::RespawnWindow(Box::new(RespawnWindowRequest {
+    handler
+        .handle_ok(RespawnWindowRequest {
             target: WindowTarget::with_window(session, 0),
             kill: true,
             environment: None,
             command: None,
             start_directory: None,
-        })))
+        })
         .await;
-    assert!(
-        matches!(respawned, Response::RespawnWindow(_)),
-        "{respawned:?}"
-    );
     let _ = closed_revision(
-        read_cursor(
-            &handler,
-            1142,
-            window_subscription,
-            window_snapshot.revision,
-        )
-        .await,
+        handler
+            .read_pane_state_cursor_for_test(1142, window_subscription, window_snapshot.revision)
+            .await,
         pane_id,
     );
 }
@@ -556,7 +462,7 @@ async fn successful_respawn_pane_and_window_close_the_old_lifetime() {
 #[tokio::test]
 async fn pane_respawn_keep_alive_rolls_back_on_error_and_journals_on_success() {
     let handler = RequestHandler::new();
-    let session = create_session(&handler, "pane-respawn-keep-alive").await;
+    let session = handler.create_session("pane-respawn-keep-alive").await;
     let target = PaneTarget::with_window(session.clone(), 0, 0);
     let (old_subscription, pane_id, old_snapshot) = subscribe(&handler, 1151, target.clone()).await;
 
@@ -581,7 +487,11 @@ async fn pane_respawn_keep_alive_rolls_back_on_error_and_journals_on_success() {
         .await,
         None
     );
-    assert_no_events(read_cursor(&handler, 1151, old_subscription, old_snapshot.revision).await);
+    assert_no_events(
+        handler
+            .read_pane_state_cursor_for_test(1151, old_subscription, old_snapshot.revision)
+            .await,
+    );
 
     let succeeded = handler
         .handle(Request::PaneRespawn(Box::new(PaneRespawnRequest {
@@ -599,7 +509,9 @@ async fn pane_respawn_keep_alive_rolls_back_on_error_and_journals_on_success() {
         "{succeeded:?}"
     );
     let close_revision = closed_revision(
-        read_cursor(&handler, 1151, old_subscription, old_snapshot.revision).await,
+        handler
+            .read_pane_state_cursor_for_test(1151, old_subscription, old_snapshot.revision)
+            .await,
         pane_id,
     );
 
@@ -607,7 +519,9 @@ async fn pane_respawn_keep_alive_rolls_back_on_error_and_journals_on_success() {
     assert_eq!(new_pane_id, pane_id);
     assert!(snapshot_has(&new_snapshot, "remain-on-exit", "on"));
     assert_option_event(
-        read_cursor(&handler, 1152, new_subscription, close_revision).await,
+        handler
+            .read_pane_state_cursor_for_test(1152, new_subscription, close_revision)
+            .await,
         pane_id,
         "remain-on-exit",
         "on",

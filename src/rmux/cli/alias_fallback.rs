@@ -17,8 +17,10 @@ use crate::runtime_command_expansion::{
     RuntimeCommandExpansionError, expand_runtime_command_segment,
 };
 
-use super::ExitFailure;
-use super::command_runner::run_queued_server_command_with_connection;
+use super::command_runner::{
+    run_queued_server_command_with_connection, strip_source_file_location,
+};
+use super::{ExitFailure, command_index};
 
 /// Outcome of resolving an argv command queue against a running server.
 pub(super) enum RuntimeCommandResolution {
@@ -69,7 +71,7 @@ fn run_raw_command_through_server(
         .collect::<Vec<_>>()
         .join(" ");
     run_queued_server_command_with_connection(connection, socket_path, "source-file", queue_command)
-        .map_err(normalize_alias_fallback_error)
+        .map_err(strip_source_file_location)
 }
 
 /// Reports whether the server has a `command-alias` entry matching `command_name`.
@@ -376,44 +378,14 @@ fn alias_lookup_command_name(group: &[String]) -> Option<&str> {
         .map(String::as_str)
 }
 
-/// Strips the server's `source-file` stdin line prefix from a dispatch error message.
-fn normalize_alias_fallback_error(error: ExitFailure) -> ExitFailure {
-    let Some(message) = strip_source_file_stdin_line_prefix(error.message()) else {
-        return error;
-    };
-    ExitFailure::new(error.exit_code(), message.to_owned())
-}
-
-/// Returns the message following a `-:<line>: ` prefix, if the prefix is present.
-fn strip_source_file_stdin_line_prefix(message: &str) -> Option<&str> {
-    let rest = message.strip_prefix("-:")?;
-    let (line, message) = rest.split_once(": ")?;
-    line.bytes()
-        .all(|byte| byte.is_ascii_digit())
-        .then_some(message)
-}
-
 /// Returns the command words that follow the top-level flags, or `None` on non-UTF-8 argv.
 fn command_arguments(args: &[OsString]) -> Option<Vec<String>> {
-    let mut index = 1;
-    while index < args.len() {
-        let argument = args[index].to_str()?;
-        if argument == "--" {
-            return args_to_strings(&args[index + 1..]);
-        }
-        if !argument.starts_with('-') || argument == "-" {
-            return args_to_strings(&args[index..]);
-        }
-
-        match argument {
-            "-c" | "-f" | "-L" | "-S" | "-T" => index += 1,
-            value if value.starts_with("-L") && value.len() > 2 => {}
-            value if value.starts_with("-S") && value.len() > 2 => {}
-            _ => {}
-        }
-        index += 1;
-    }
-    Some(Vec::new())
+    let arguments = args.get(1..).unwrap_or(&[]);
+    args_to_strings(
+        arguments
+            .get(command_index(arguments, |_, _| {})?..)
+            .unwrap_or(&[]),
+    )
 }
 
 /// Converts `OsString` arguments into `String` values, returning `None` on non-UTF-8 input.
@@ -454,13 +426,8 @@ fn tmux_quote_value(argument: &str) -> String {
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 mod tests {
-    use std::ffi::OsStr;
-
     use super::*;
-
-    fn args(values: &[&str]) -> Vec<OsString> {
-        values.iter().map(OsStr::new).map(OsString::from).collect()
-    }
+    use crate::cli::aux_command::args;
 
     #[test]
     fn command_arguments_skip_top_level_socket_options() {
@@ -708,17 +675,5 @@ mod tests {
             &[vec!["list-sess".to_owned()]],
             &aliases,
         ));
-    }
-
-    #[test]
-    fn alias_fallback_errors_strip_synthetic_source_file_prefix() {
-        assert_eq!(
-            strip_source_file_stdin_line_prefix("-:1: unknown command: nope"),
-            Some("unknown command: nope")
-        );
-        assert_eq!(
-            strip_source_file_stdin_line_prefix("unknown command: nope"),
-            None
-        );
     }
 }

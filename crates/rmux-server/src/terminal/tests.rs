@@ -1,6 +1,7 @@
 use super::environment_from_os_pairs;
 use super::{parse_environment_assignments, validate_process_command, TerminalProfile};
-use rmux_core::{EnvironmentStore, OptionStore};
+use crate::test_fixtures::{option_store, unique_temp_path};
+use rmux_core::{EnvironmentStore, OptionStore, PaneId};
 use rmux_proto::{OptionName, ProcessCommand, ScopeSelector, SessionName, SetOptionMode};
 use std::collections::HashMap;
 use std::error::Error;
@@ -8,9 +9,103 @@ use std::ffi::OsString;
 use std::fs;
 use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
 
-static UNIQUE_ID: AtomicUsize = AtomicUsize::new(0);
+const DEFAULT_SHELL: &str = "/bin/sh";
+/// `default-shell` set globally to [`DEFAULT_SHELL`].
+const SHELL_OPTION: (ScopeSelector, OptionName, &str, SetOptionMode) = (
+    ScopeSelector::Global,
+    OptionName::DefaultShell,
+    DEFAULT_SHELL,
+    SetOptionMode::Replace,
+);
+/// `default-terminal` set globally to `tmux-256color`.
+const DEFAULT_TERMINAL: (ScopeSelector, OptionName, &str, SetOptionMode) = (
+    ScopeSelector::Global,
+    OptionName::DefaultTerminal,
+    "tmux-256color",
+    SetOptionMode::Replace,
+);
+
+/// The session every profile is spawned for.
+fn alpha() -> SessionName {
+    SessionName::new("alpha").expect("valid session name")
+}
+
+/// The arguments of one [`TerminalProfile::for_session`] call for session [`alpha`], without a
+/// base environment. The default is session 7 on `/tmp/rmux.sock` with terminal defaults, only
+/// `default-shell` set, and no spawn environment, overrides, pane or requested directory.
+struct SessionSpawn<'a> {
+    environment: EnvironmentStore,
+    options: OptionStore,
+    session_id: u32,
+    socket_path: PathBuf,
+    spawn_environment: Option<&'a HashMap<String, String>>,
+    include_terminal_defaults: bool,
+    overrides: Option<&'a [String]>,
+    pane_id: Option<PaneId>,
+    requested_cwd: Option<&'a Path>,
+}
+
+impl Default for SessionSpawn<'_> {
+    fn default() -> Self {
+        Self {
+            environment: EnvironmentStore::new(),
+            options: option_store([SHELL_OPTION]),
+            session_id: 7,
+            socket_path: PathBuf::from("/tmp/rmux.sock"),
+            spawn_environment: None,
+            include_terminal_defaults: true,
+            overrides: None,
+            pane_id: None,
+            requested_cwd: None,
+        }
+    }
+}
+
+impl SessionSpawn<'_> {
+    fn profile(&self) -> TerminalProfile {
+        TerminalProfile::for_session(
+            &self.environment,
+            &self.options,
+            &alpha(),
+            self.session_id,
+            &self.socket_path,
+            None,
+            self.spawn_environment,
+            self.include_terminal_defaults,
+            self.overrides,
+            self.pane_id,
+            self.requested_cwd,
+        )
+        .expect("profile")
+    }
+}
+
+/// A `run-shell` profile over empty stores, for `target`'s session name and id when given.
+fn run_shell_profile(
+    target: Option<(&SessionName, u32)>,
+    socket_path: &Path,
+    requested_cwd: &Path,
+) -> TerminalProfile {
+    TerminalProfile::for_run_shell(
+        &EnvironmentStore::new(),
+        &OptionStore::new(),
+        target.map(|(session_name, _)| session_name),
+        target.map(|(_, session_id)| session_id),
+        socket_path,
+        None,
+        false,
+        None,
+        Some(requested_cwd),
+    )
+    .expect("run-shell profile")
+}
+
+/// Asserts `profile` exports `expected` as both `RMUX` and `TMUX`.
+fn assert_mux_env(profile: &TerminalProfile, expected: &str) {
+    assert_eq!(profile.environment_value("RMUX"), Some(expected));
+    assert_eq!(profile.environment_value("TMUX"), Some(expected));
+}
 
 #[test]
 fn base_environment_snapshot_skips_non_utf8_pairs() {
@@ -32,41 +127,16 @@ fn base_environment_snapshot_skips_non_utf8_pairs() {
 
 #[test]
 fn terminal_profile_sets_rmux_term_shell_and_pane_context() {
-    let environment = EnvironmentStore::new();
-    let mut options = OptionStore::new();
-    let session_name = SessionName::new("alpha").expect("valid session name");
-
-    options
-        .set(
-            ScopeSelector::Global,
-            OptionName::DefaultTerminal,
-            "tmux-256color".to_owned(),
-            SetOptionMode::Replace,
-        )
-        .expect("default-terminal succeeds");
-    options
-        .set(
-            ScopeSelector::Global,
-            OptionName::DefaultShell,
-            default_shell_string(),
-            SetOptionMode::Replace,
-        )
-        .expect("default-shell succeeds");
-
-    let profile = TerminalProfile::for_session(
-        &environment,
-        &options,
-        &session_name,
-        7,
-        temp_socket_path().as_path(),
-        None,
-        None,
-        true,
-        Some(&["FOO=bar".to_owned()]),
-        Some(rmux_core::PaneId::new(3)),
-        Some(std::env::temp_dir().as_path()),
-    )
-    .expect("profile");
+    let socket_path = temp_socket_path();
+    let profile = SessionSpawn {
+        options: option_store([DEFAULT_TERMINAL, SHELL_OPTION]),
+        socket_path: socket_path.clone(),
+        overrides: Some(&["FOO=bar".to_owned()]),
+        pane_id: Some(PaneId::new(3)),
+        requested_cwd: Some(std::env::temp_dir().as_path()),
+        ..SessionSpawn::default()
+    }
+    .profile();
     assert_eq!(profile.environment_value("TERM"), Some("tmux-256color"));
     assert_eq!(profile.environment_value("TERM_PROGRAM"), Some("rmux"));
     assert_eq!(
@@ -78,24 +148,12 @@ fn terminal_profile_sets_rmux_term_shell_and_pane_context() {
         profile.environment_value("COLORTERM"),
         ambient_colorterm.as_deref()
     );
-    let socket_path = temp_socket_path();
-    let expected_rmux = expected_mux_env(&socket_path, 7);
-    assert_eq!(
-        profile.environment_value("RMUX"),
-        Some(expected_rmux.as_str())
-    );
-    assert_eq!(
-        profile.environment_value("TMUX"),
-        Some(expected_rmux.as_str())
-    );
+    assert_mux_env(&profile, &expected_mux_env(&socket_path, 7));
     assert_eq!(profile.environment_value("RMUX_PANE"), Some("%3"));
     assert_eq!(profile.environment_value("TMUX_PANE"), Some("%3"));
     assert_eq!(profile.environment_value("FOO"), Some("bar"));
     let expected_cwd = std::env::temp_dir();
-    assert_eq!(
-        profile.environment_value("SHELL"),
-        Some(default_shell_string().as_str())
-    );
+    assert_eq!(profile.environment_value("SHELL"), Some(DEFAULT_SHELL));
     assert_eq!(
         profile.environment_value("PWD"),
         Some(expected_cwd.to_string_lossy().as_ref())
@@ -105,37 +163,18 @@ fn terminal_profile_sets_rmux_term_shell_and_pane_context() {
 
 #[test]
 fn terminal_profile_applies_spawn_environment_before_explicit_overrides() {
-    let environment = EnvironmentStore::new();
-    let mut options = OptionStore::new();
-    let session_name = SessionName::new("alpha").expect("valid session name");
     let spawn_environment = HashMap::from([
         ("PATH".to_owned(), "/client/bin:/usr/bin".to_owned()),
         ("RMUX_CLIENT_ONLY".to_owned(), "present".to_owned()),
     ]);
 
-    options
-        .set(
-            ScopeSelector::Global,
-            OptionName::DefaultShell,
-            default_shell_string(),
-            SetOptionMode::Replace,
-        )
-        .expect("default-shell succeeds");
-
-    let profile = TerminalProfile::for_session(
-        &environment,
-        &options,
-        &session_name,
-        7,
-        temp_socket_path().as_path(),
-        None,
-        Some(&spawn_environment),
-        true,
-        Some(&["RMUX_CLIENT_ONLY=override".to_owned()]),
-        None,
-        None,
-    )
-    .expect("profile");
+    let profile = SessionSpawn {
+        socket_path: temp_socket_path(),
+        spawn_environment: Some(&spawn_environment),
+        overrides: Some(&["RMUX_CLIENT_ONLY=override".to_owned()]),
+        ..SessionSpawn::default()
+    }
+    .profile();
 
     assert_eq!(
         profile.environment_value("PATH"),
@@ -149,9 +188,6 @@ fn terminal_profile_applies_spawn_environment_before_explicit_overrides() {
 
 #[test]
 fn terminal_profile_uses_client_shell_when_default_shell_is_unset() {
-    let environment = EnvironmentStore::new();
-    let options = OptionStore::new();
-    let session_name = SessionName::new("alpha").expect("valid session name");
     let client_shell = std::env::current_exe().expect("test executable path");
     let client_shell_value = client_shell
         .to_str()
@@ -162,20 +198,13 @@ fn terminal_profile_uses_client_shell_when_default_shell_is_unset() {
         ("PATH".to_owned(), "/usr/bin:/bin".to_owned()),
     ]);
 
-    let profile = TerminalProfile::for_session(
-        &environment,
-        &options,
-        &session_name,
-        7,
-        temp_socket_path().as_path(),
-        None,
-        Some(&spawn_environment),
-        true,
-        None,
-        None,
-        None,
-    )
-    .expect("profile");
+    let profile = SessionSpawn {
+        options: OptionStore::new(),
+        socket_path: temp_socket_path(),
+        spawn_environment: Some(&spawn_environment),
+        ..SessionSpawn::default()
+    }
+    .profile();
 
     assert_eq!(profile.shell(), client_shell);
     assert_eq!(
@@ -187,42 +216,24 @@ fn terminal_profile_uses_client_shell_when_default_shell_is_unset() {
 #[test]
 fn terminal_profile_honors_explicit_color_environment_overrides() {
     let mut environment = EnvironmentStore::new();
-    let mut options = OptionStore::new();
-    let session_name = SessionName::new("alpha").expect("valid session name");
+    for (name, value) in [("NO_COLOR", "1"), ("COLORTERM", "truecolor")] {
+        environment.set(
+            ScopeSelector::Session(alpha()),
+            name.to_owned(),
+            value.to_owned(),
+        );
+    }
 
-    environment.set(
-        ScopeSelector::Session(session_name.clone()),
-        "NO_COLOR".to_owned(),
-        "1".to_owned(),
-    );
-    environment.set(
-        ScopeSelector::Session(session_name.clone()),
-        "COLORTERM".to_owned(),
-        "truecolor".to_owned(),
-    );
-    options
-        .set(
-            ScopeSelector::Global,
-            OptionName::DefaultTerminal,
-            "tmux-256color".to_owned(),
-            SetOptionMode::Replace,
-        )
-        .expect("default-terminal succeeds");
-
-    let profile = TerminalProfile::for_session(
-        &environment,
-        &options,
-        &session_name,
-        7,
-        temp_socket_path().as_path(),
-        None,
-        None,
-        true,
-        Some(&["NODE_DISABLE_COLORS=1".to_owned(), "CLICOLOR=0".to_owned()]),
-        Some(rmux_core::PaneId::new(3)),
-        Some(std::env::temp_dir().as_path()),
-    )
-    .expect("profile");
+    let profile = SessionSpawn {
+        environment,
+        options: option_store([DEFAULT_TERMINAL]),
+        socket_path: temp_socket_path(),
+        overrides: Some(&["NODE_DISABLE_COLORS=1".to_owned(), "CLICOLOR=0".to_owned()]),
+        pane_id: Some(PaneId::new(3)),
+        requested_cwd: Some(std::env::temp_dir().as_path()),
+        ..SessionSpawn::default()
+    }
+    .profile();
 
     assert_eq!(profile.environment_value("NO_COLOR"), Some("1"));
     assert_eq!(profile.environment_value("COLORTERM"), Some("truecolor"));
@@ -233,53 +244,26 @@ fn terminal_profile_honors_explicit_color_environment_overrides() {
 #[test]
 fn terminal_profile_applies_default_terminal_before_per_command_term_override() {
     let mut environment = EnvironmentStore::new();
-    let mut options = OptionStore::new();
-    let session_name = SessionName::new("alpha").expect("valid session name");
-
     environment.set(
-        ScopeSelector::Session(session_name.clone()),
+        ScopeSelector::Session(alpha()),
         "TERM".to_owned(),
         "screen-256color".to_owned(),
     );
-    options
-        .set(
-            ScopeSelector::Global,
-            OptionName::DefaultTerminal,
-            "tmux-256color".to_owned(),
-            SetOptionMode::Replace,
-        )
-        .expect("default-terminal succeeds");
+    let spawn = SessionSpawn {
+        environment,
+        options: option_store([DEFAULT_TERMINAL]),
+        session_id: 2,
+        ..SessionSpawn::default()
+    };
 
-    let profile = TerminalProfile::for_session(
-        &environment,
-        &options,
-        &session_name,
-        2,
-        Path::new("/tmp/rmux.sock"),
-        None,
-        None,
-        true,
-        None,
-        None,
-        None,
-    )
-    .expect("profile");
+    let profile = spawn.profile();
     assert_eq!(profile.environment_value("TERM"), Some("tmux-256color"));
 
-    let override_profile = TerminalProfile::for_session(
-        &environment,
-        &options,
-        &session_name,
-        2,
-        Path::new("/tmp/rmux.sock"),
-        None,
-        None,
-        true,
-        Some(&["TERM=screen-256color".to_owned()]),
-        None,
-        None,
-    )
-    .expect("override profile");
+    let override_profile = SessionSpawn {
+        overrides: Some(&["TERM=screen-256color".to_owned()]),
+        ..spawn
+    }
+    .profile();
     assert_eq!(
         override_profile.environment_value("TERM"),
         Some("screen-256color")
@@ -288,86 +272,25 @@ fn terminal_profile_applies_default_terminal_before_per_command_term_override() 
 
 #[test]
 fn run_shell_profile_exports_tmux_env_for_plugin_children() {
-    let environment = EnvironmentStore::new();
-    let options = OptionStore::new();
     let socket_path = temp_socket_path();
+    let temp_dir = std::env::temp_dir();
 
-    let detached_profile = TerminalProfile::for_run_shell(
-        &environment,
-        &options,
-        None,
-        None,
-        socket_path.as_path(),
-        None,
-        false,
-        None,
-        Some(std::env::temp_dir().as_path()),
-    )
-    .expect("detached run-shell profile");
-    let expected_detached = expected_mux_env(&socket_path, 0);
-    assert_eq!(
-        detached_profile.environment_value("RMUX"),
-        Some(expected_detached.as_str())
-    );
-    assert_eq!(
-        detached_profile.environment_value("TMUX"),
-        Some(expected_detached.as_str())
-    );
+    let detached_profile = run_shell_profile(None, &socket_path, &temp_dir);
+    assert_mux_env(&detached_profile, &expected_mux_env(&socket_path, 0));
 
-    let session_name = SessionName::new("alpha").expect("valid session name");
-    let targeted_profile = TerminalProfile::for_run_shell(
-        &environment,
-        &options,
-        Some(&session_name),
-        Some(7),
-        socket_path.as_path(),
-        None,
-        false,
-        None,
-        Some(std::env::temp_dir().as_path()),
-    )
-    .expect("targeted run-shell profile");
-    let expected_targeted = expected_mux_env(&socket_path, 7);
-    assert_eq!(
-        targeted_profile.environment_value("RMUX"),
-        Some(expected_targeted.as_str())
-    );
-    assert_eq!(
-        targeted_profile.environment_value("TMUX"),
-        Some(expected_targeted.as_str())
-    );
+    let targeted_profile = run_shell_profile(Some((&alpha(), 7)), &socket_path, &temp_dir);
+    assert_mux_env(&targeted_profile, &expected_mux_env(&socket_path, 7));
 }
 
 #[test]
 fn run_shell_profile_exports_absolute_mux_env_for_relative_socket() -> Result<(), Box<dyn Error>> {
-    let environment = EnvironmentStore::new();
-    let options = OptionStore::new();
     let socket_path = PathBuf::from("relative-rmux.sock");
-    let run_cwd = unique_output_path("run-shell-relative-socket-cwd");
+    let run_cwd = unique_temp_path("server-terminal-run-shell-relative-socket-cwd");
     fs::create_dir_all(&run_cwd)?;
 
-    let profile = TerminalProfile::for_run_shell(
-        &environment,
-        &options,
-        None,
-        None,
-        socket_path.as_path(),
-        None,
-        false,
-        None,
-        Some(run_cwd.as_path()),
-    )
-    .expect("run-shell profile");
-    let expected_rmux = expected_mux_env(socket_path.as_path(), 0);
+    let profile = run_shell_profile(None, &socket_path, &run_cwd);
 
-    assert_eq!(
-        profile.environment_value("RMUX"),
-        Some(expected_rmux.as_str())
-    );
-    assert_eq!(
-        profile.environment_value("TMUX"),
-        Some(expected_rmux.as_str())
-    );
+    assert_mux_env(&profile, &expected_mux_env(&socket_path, 0));
     assert_eq!(profile.cwd(), run_cwd.as_path());
 
     Ok(())
@@ -375,72 +298,26 @@ fn run_shell_profile_exports_absolute_mux_env_for_relative_socket() -> Result<()
 
 #[test]
 fn terminal_profile_prefers_rmux_term_program_for_default_window_name() {
-    let environment = EnvironmentStore::new();
-    let mut options = OptionStore::new();
-    let session_name = SessionName::new("alpha").expect("valid session name");
-
-    options
-        .set(
-            ScopeSelector::Global,
-            OptionName::DefaultShell,
-            default_shell_string(),
-            SetOptionMode::Replace,
-        )
-        .expect("default-shell succeeds");
-
-    let profile = TerminalProfile::for_session(
-        &environment,
-        &options,
-        &session_name,
-        7,
-        Path::new("/tmp/rmux.sock"),
-        None,
-        None,
-        true,
-        None,
-        None,
-        None,
-    )
-    .expect("profile");
+    let profile = SessionSpawn::default().profile();
 
     assert_eq!(profile.default_window_name().as_deref(), Some("rmux"));
 }
 
 #[test]
 fn terminal_profile_initial_pane_title_uses_host_short() {
-    let environment = EnvironmentStore::new();
-    let mut options = OptionStore::new();
-    let session_name = SessionName::new("alpha").expect("valid session name");
     let home = std::env::current_dir().expect("current dir");
     let home_text = home.to_string_lossy().into_owned();
 
-    options
-        .set(
-            ScopeSelector::Global,
-            OptionName::DefaultShell,
-            default_shell_string(),
-            SetOptionMode::Replace,
-        )
-        .expect("default-shell succeeds");
-
-    let profile = TerminalProfile::for_session(
-        &environment,
-        &options,
-        &session_name,
-        7,
-        Path::new("/tmp/rmux.sock"),
-        None,
-        None,
-        true,
-        Some(&[
+    let profile = SessionSpawn {
+        overrides: Some(&[
             "USER=alice".to_owned(),
             format!("HOME={home_text}"),
             "PWD=/ignored".to_owned(),
         ]),
-        None,
-        Some(&home),
-    )
-    .expect("profile");
+        requested_cwd: Some(&home),
+        ..SessionSpawn::default()
+    }
+    .profile();
 
     let title = profile.initial_pane_title().expect("initial title");
     let host = crate::host_name::local_hostname().expect("host name");
@@ -449,33 +326,11 @@ fn terminal_profile_initial_pane_title_uses_host_short() {
 
 #[test]
 fn terminal_profile_falls_back_to_shell_name_without_term_program() {
-    let environment = EnvironmentStore::new();
-    let mut options = OptionStore::new();
-    let session_name = SessionName::new("alpha").expect("valid session name");
-
-    options
-        .set(
-            ScopeSelector::Global,
-            OptionName::DefaultShell,
-            default_shell_string(),
-            SetOptionMode::Replace,
-        )
-        .expect("default-shell succeeds");
-
-    let profile = TerminalProfile::for_session(
-        &environment,
-        &options,
-        &session_name,
-        7,
-        Path::new("/tmp/rmux.sock"),
-        None,
-        None,
-        false,
-        None,
-        None,
-        None,
-    )
-    .expect("profile");
+    let profile = SessionSpawn {
+        include_terminal_defaults: false,
+        ..SessionSpawn::default()
+    }
+    .profile();
 
     let shell_name = default_shell_name();
     assert_eq!(profile.default_window_name().as_deref(), Some(&*shell_name));
@@ -483,33 +338,11 @@ fn terminal_profile_falls_back_to_shell_name_without_term_program() {
 
 #[test]
 fn terminal_profile_ignores_non_rmux_term_program_for_default_window_name() {
-    let environment = EnvironmentStore::new();
-    let mut options = OptionStore::new();
-    let session_name = SessionName::new("alpha").expect("valid session name");
-
-    options
-        .set(
-            ScopeSelector::Global,
-            OptionName::DefaultShell,
-            default_shell_string(),
-            SetOptionMode::Replace,
-        )
-        .expect("default-shell succeeds");
-
-    let profile = TerminalProfile::for_session(
-        &environment,
-        &options,
-        &session_name,
-        7,
-        Path::new("/tmp/rmux.sock"),
-        None,
-        None,
-        true,
-        Some(&["TERM_PROGRAM=tmux".to_owned()]),
-        None,
-        None,
-    )
-    .expect("profile");
+    let profile = SessionSpawn {
+        overrides: Some(&["TERM_PROGRAM=tmux".to_owned()]),
+        ..SessionSpawn::default()
+    }
+    .profile();
 
     let shell_name = default_shell_name();
     assert_eq!(profile.default_window_name().as_deref(), Some(&*shell_name));
@@ -517,70 +350,34 @@ fn terminal_profile_ignores_non_rmux_term_program_for_default_window_name() {
 
 #[test]
 fn terminal_profile_runtime_window_name_tracks_spawned_command_shape() {
-    let environment = EnvironmentStore::new();
-    let mut options = OptionStore::new();
-    let session_name = SessionName::new("alpha").expect("valid session name");
-
-    options
-        .set(
-            ScopeSelector::Global,
-            OptionName::DefaultShell,
-            default_shell_string(),
-            SetOptionMode::Replace,
-        )
-        .expect("default-shell succeeds");
-
-    let profile = TerminalProfile::for_session(
-        &environment,
-        &options,
-        &session_name,
-        7,
-        Path::new("/tmp/rmux.sock"),
-        None,
-        None,
-        true,
-        None,
-        None,
-        None,
-    )
-    .expect("profile");
+    let profile = SessionSpawn::default().profile();
 
     let shell_name = default_shell_name();
-    assert_eq!(
-        profile.runtime_window_name(None).as_deref(),
-        Some(&*shell_name)
-    );
-    assert_eq!(
-        profile
-            .runtime_window_name(Some(&rmux_proto::ProcessCommand::Shell(
-                "printf hi".to_owned(),
-            )))
-            .as_deref(),
-        Some("printf")
-    );
-    assert_eq!(
-        profile
-            .runtime_window_name(Some(&rmux_proto::ProcessCommand::Shell(
-                "exit 0".to_owned()
-            )))
-            .as_deref(),
-        Some("exit")
-    );
-    assert_eq!(
-        profile
-            .runtime_window_name(Some(&rmux_proto::ProcessCommand::Argv(vec![
+    for (command, expected) in [
+        (None, shell_name.as_str()),
+        (
+            Some(ProcessCommand::Shell("printf hi".to_owned())),
+            "printf",
+        ),
+        (Some(ProcessCommand::Shell("exit 0".to_owned())), "exit"),
+        (
+            Some(ProcessCommand::Argv(vec![
                 "/usr/bin/top".to_owned(),
                 "-H".to_owned(),
-            ])))
-            .as_deref(),
-        Some("top")
-    );
+            ])),
+            "top",
+        ),
+    ] {
+        assert_eq!(
+            profile.runtime_window_name(command.as_ref()).as_deref(),
+            Some(expected),
+            "{command:?}"
+        );
+    }
     assert_eq!(profile.automatic_window_name(None).as_deref(), Some("rmux"));
     assert_eq!(
         profile
-            .automatic_window_name(Some(&rmux_proto::ProcessCommand::Shell(
-                "sleep 30".to_owned(),
-            )))
+            .automatic_window_name(Some(&ProcessCommand::Shell("sleep 30".to_owned())))
             .as_deref(),
         Some("sleep")
     );
@@ -619,46 +416,33 @@ fn empty_shell_process_command_is_allowed_for_empty_tmux_panes() {
         .expect("empty shell command creates a tmux-style empty pane");
 }
 
+/// The shell resolved for session [`alpha`] whose `default-shell` is `default_shell`, with
+/// `SHELL=/bin/sh` in the spawn environment.
+fn resolved_shell(default_shell: &str) -> PathBuf {
+    let session_name = alpha();
+    let environment = HashMap::from([("SHELL".to_owned(), "/bin/sh".to_owned())]);
+    let options = option_store([(
+        ScopeSelector::Session(session_name.clone()),
+        OptionName::DefaultShell,
+        default_shell,
+        SetOptionMode::Replace,
+    )]);
+
+    super::resolve_shell_path(&options, Some(&session_name), &environment)
+}
+
 #[test]
 fn resolve_shell_path_prefers_explicit_default_shell_option_before_shell_env_fallback() {
-    let mut options = OptionStore::new();
-    let session_name = SessionName::new("alpha").expect("valid session name");
-    let environment = HashMap::from([("SHELL".to_owned(), "/bin/sh".to_owned())]);
-    options
-        .set(
-            ScopeSelector::Session(session_name.clone()),
-            OptionName::DefaultShell,
-            "/bin/bash".to_owned(),
-            SetOptionMode::Replace,
-        )
-        .expect("default-shell succeeds");
-
-    let resolved = super::resolve_shell_path(&options, Some(&session_name), &environment);
-
     assert_eq!(
-        resolved,
+        resolved_shell("/bin/bash"),
         super::shell_resolver::normalize_shell_path(PathBuf::from("/bin/bash"))
     );
 }
 
 #[test]
 fn resolve_shell_path_uses_shell_env_when_default_shell_is_explicitly_empty() {
-    let mut options = OptionStore::new();
-    let session_name = SessionName::new("alpha").expect("valid session name");
-    let environment = HashMap::from([("SHELL".to_owned(), "/bin/sh".to_owned())]);
-    options
-        .set(
-            ScopeSelector::Session(session_name.clone()),
-            OptionName::DefaultShell,
-            String::new(),
-            SetOptionMode::Replace,
-        )
-        .expect("default-shell accepts an empty override");
-
-    let resolved = super::resolve_shell_path(&options, Some(&session_name), &environment);
-
     assert_eq!(
-        resolved,
+        resolved_shell(""),
         super::shell_resolver::normalize_shell_path(PathBuf::from("/bin/sh"))
     );
 }
@@ -673,16 +457,6 @@ fn parse_environment_assignments_rejects_missing_equals() {
             "environment assignment must be NAME=VALUE: INVALID".to_owned()
         )
     );
-}
-
-fn unique_output_path(label: &str) -> PathBuf {
-    let unique_id = UNIQUE_ID.fetch_add(1, Ordering::Relaxed);
-    let path = std::env::temp_dir().join(format!(
-        "rmux-server-terminal-{label}-{}-{unique_id}.txt",
-        std::process::id()
-    ));
-    let _ = fs::remove_file(&path);
-    path
 }
 
 fn temp_socket_path() -> PathBuf {
@@ -710,13 +484,8 @@ fn expected_mux_env(socket_path: &Path, index: u32) -> String {
     format!("{},{},{}", socket_path.display(), std::process::id(), index)
 }
 
-fn default_shell_string() -> String {
-    "/bin/sh".to_owned()
-}
-
 fn default_shell_name() -> String {
-    let shell = default_shell_string();
-    Path::new(&shell)
+    Path::new(DEFAULT_SHELL)
         .file_name()
         .and_then(|name| name.to_str())
         .map(|name| name.trim_start_matches('-').to_owned())
@@ -724,16 +493,7 @@ fn default_shell_name() -> String {
         .expect("test default shell has a file name")
 }
 
-/// A directory inside one job's snapshot opens the next shell on the seed it came from.
-///
-/// A pane's shell starts at its job's snapshot, so any rmux command issued *from* a pane that
-/// names its own working directory — `new-session -c $PWD`, the tmux shim's `new-session`, a
-/// popup inheriting the pane's cwd — hands the daemon a path spelled `<snap>/<uid>/<rest>`.
-///
-/// The regression this pins is the one a per-shell seed makes possible: a job's snapshot is
-/// itself a subvolume, so discovering a seed from that path would make the snapshot a seed of its
-/// own — a second lease, a second history, and publications into a tree that is about to be
-/// reclaimed. The mapped job must land on the *original* seed and publish there.
+/// A job's public logical cwd opens another shell on the same source and directory.
 #[test]
 fn a_snapshot_directory_opens_a_shell_on_its_original_seed() {
     let scratch = tempfile::tempdir().expect("scratch directory");
@@ -748,7 +508,7 @@ fn a_snapshot_directory_opens_a_shell_on_its_original_seed() {
         .enable_all()
         .build()
         .expect("a runtime for the engine");
-    let (pane_seed, mapped_seed, opened) = runtime.block_on(async {
+    let (pane_seed, mapped_seed) = runtime.block_on(async {
         // The receiver is held until teardown rather than drained: the command below produces no
         // output, so nothing is waiting on an output receipt, but dropping the queue's consumer
         // end early would be a different engine from the one production builds.
@@ -756,9 +516,9 @@ fn a_snapshot_directory_opens_a_shell_on_its_original_seed() {
             &seed,
             brush_core::env::ShellEnvironment::new(),
             marsh_core::shellmux::TerminalGeometry { rows: 24, cols: 80 },
-            filesystem,
             tokio::runtime::Handle::current(),
             root.join("rmux.sock"),
+            |profile, frontend| marsh_core::test_support::mux(profile, frontend, filesystem),
         )
         .expect("open the test engine");
         // A real job, so the snapshot the daemon has to recognize is one it actually took.
@@ -770,21 +530,17 @@ fn a_snapshot_directory_opens_a_shell_on_its_original_seed() {
             )
             .await
             .expect("open a shell");
-        let inside_snapshot = io
+        let logical_directory = io
             .jobs()
             .into_iter()
             .find(|view| view.id == *pane.id())
             .map(|view| view.working_directory)
-            .expect("the shell's own working directory");
-        assert!(
-            !inside_snapshot.starts_with(&seed),
-            "the pane's shell stands in its snapshot, not in the seed: {}",
-            inside_snapshot.display()
-        );
+            .expect("logical working directory");
+        assert_eq!(logical_directory, seed.join("src"));
 
         let mapped = io
             .open_shell(
-                &inside_snapshot,
+                &logical_directory,
                 Some(marsh_core::shellmux::ShellId::from("mapped")),
                 marsh_core::shellmux::SpawnOptions::default(),
             )
@@ -798,20 +554,9 @@ fn a_snapshot_directory_opens_a_shell_on_its_original_seed() {
             )
             .await
             .expect("the mapped shell publishes into the original seed");
-        assert!(
-            matches!(
-                completion.outcome.as_ref(),
-                Ok(marsh_core::Outcome::Published { .. })
-            ),
-            "the mapped shell publishes into the original seed: {:?}",
-            completion.outcome
-        );
+        assert!(completion.is_published(), "{:?}", completion);
 
-        let answer = (
-            pane.sandbox().seed.clone(),
-            mapped.sandbox().seed.clone(),
-            io.seeds(),
-        );
+        let answer = (pane.sandbox().seed.clone(), mapped.sandbox().seed.clone());
         io.shutdown().await.expect("shut the engine down");
         answer
     });
@@ -820,11 +565,6 @@ fn a_snapshot_directory_opens_a_shell_on_its_original_seed() {
     assert_eq!(
         mapped_seed, seed,
         "a path inside a job's snapshot names the seed that snapshot was taken from"
-    );
-    assert_eq!(
-        opened.iter().map(|info| &info.seed).collect::<Vec<_>>(),
-        vec![&seed],
-        "no second seed was opened over the snapshot"
     );
     assert_eq!(
         fs::read(seed.join("src/mapped.txt")).expect("the published file"),

@@ -2,18 +2,10 @@ use super::*;
 
 async fn selection_hook_fixture(label: &str) -> (RequestHandler, SessionName) {
     let handler = RequestHandler::new();
-    let session = session_name(label);
-    create_session(&handler, session.as_str()).await;
-    let split = handler
-        .handle(Request::SplitWindow(SplitWindowRequest {
-            target: SplitWindowTarget::Session(session.clone()),
-            direction: SplitDirection::Vertical,
-            before: false,
-            environment: None,
-        }))
+    let session = create_session(&handler, label).await;
+    handler
+        .handle_ok(SplitWindowRequest::fixture(&session))
         .await;
-    assert!(matches!(split, Response::SplitWindow(_)), "{split:?}");
-    handler.wait_for_initial_panes_for_test().await;
     handler
         .state
         .lock()
@@ -27,19 +19,12 @@ async fn selection_hook_fixture(label: &str) -> (RequestHandler, SessionName) {
 }
 
 async fn install_after_select_probe(handler: &RequestHandler, buffer_name: &str) {
-    let response = handler
-        .handle(Request::SetHookMutation(SetHookMutationRequest {
-            scope: ScopeSelector::Global,
-            hook: HookName::AfterSelectPane,
-            command: Some(format!("set-buffer -b {buffer_name} fired")),
-            lifecycle: HookLifecycle::Persistent,
-            append: false,
-            unset: false,
-            run_immediately: false,
-            index: None,
-        }))
+    handler
+        .set_global_hook(
+            HookName::AfterSelectPane,
+            &format!("set-buffer -b {buffer_name} fired"),
+        )
         .await;
-    assert!(matches!(response, Response::SetHook(_)), "{response:?}");
     let state = handler.state.lock().await;
     assert!(
         state.buffers.show(Some(buffer_name)).is_err(),
@@ -72,16 +57,11 @@ async fn direct_select_hook_requires_an_active_pane_change() {
     let (handler, session) = selection_hook_fixture("hook-direct-change").await;
     install_after_select_probe(&handler, "hook-direct-change").await;
 
-    let response = handler
-        .handle(Request::SelectPane(Box::new(SelectPaneRequest {
-            target: PaneTarget::with_window(session, 0, 1),
-            title: None,
-            style: None,
-            input_disabled: None,
-            preserve_zoom: false,
-        })))
+    handler
+        .handle_ok(SelectPaneRequest::fixture(PaneTarget::with_window(
+            session, 0, 1,
+        )))
         .await;
-    assert!(matches!(response, Response::SelectPane(_)), "{response:?}");
     assert_probe(&handler, "hook-direct-change", true).await;
 }
 
@@ -111,16 +91,13 @@ async fn direct_select_noop_title_and_input_mutations_do_not_run_hook() {
             "fixture active pane changed before {label}"
         );
 
-        let response = handler
-            .handle(Request::SelectPane(Box::new(SelectPaneRequest {
-                target: PaneTarget::with_window(session, 0, target_pane),
+        handler
+            .handle_ok(SelectPaneRequest {
                 title,
-                style: None,
                 input_disabled,
-                preserve_zoom: false,
-            })))
+                ..Fixture::fixture(PaneTarget::with_window(session, 0, target_pane))
+            })
             .await;
-        assert!(matches!(response, Response::SelectPane(_)), "{response:?}");
         assert_probe(&handler, &buffer_name, false).await;
     }
 }

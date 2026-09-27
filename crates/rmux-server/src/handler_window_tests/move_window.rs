@@ -1,21 +1,5 @@
 use super::*;
 
-async fn set_session_monitor_silence(
-    handler: &RequestHandler,
-    session_name: SessionName,
-    seconds: &str,
-) {
-    let response = handler
-        .handle(Request::SetOption(SetOptionRequest {
-            scope: ScopeSelector::Session(session_name),
-            option: OptionName::MonitorSilence,
-            value: seconds.to_owned(),
-            mode: SetOptionMode::Replace,
-        }))
-        .await;
-    assert!(matches!(response, Response::SetOption(_)), "{response:?}");
-}
-
 async fn expect_attach_exited(
     control_rx: &mut mpsc::UnboundedReceiver<AttachControl>,
     context: &str,
@@ -35,29 +19,18 @@ async fn expect_attach_exited(
 #[tokio::test]
 async fn move_window_last_source_session_exits_attached_client() {
     let handler = RequestHandler::new();
-    let source = session_name("move-attached-source");
-    let destination = session_name("move-attached-destination");
-    create_session(&handler, source.as_str()).await;
-    create_session(&handler, destination.as_str()).await;
+    let source = create_session(&handler, "move-attached-source").await;
+    let destination = create_session(&handler, "move-attached-destination").await;
     let attach_pid = 81_001;
-    let (control_tx, mut control_rx) = mpsc::unbounded_channel();
-    handler
-        .register_attach(attach_pid, source.clone(), control_tx)
-        .await;
+    let mut control_rx = handler.attach_client(attach_pid, &source).await;
     drain_attach_controls(&mut control_rx).await;
 
-    let response = handler
-        .handle(Request::MoveWindow(MoveWindowRequest {
-            source: Some(WindowTarget::with_window(source.clone(), 0)),
-            target: MoveWindowTarget::Window(WindowTarget::with_window(destination, 1)),
-            renumber: false,
-            kill_destination: false,
-            detached: true,
-            after: false,
-            before: false,
-        }))
+    handler
+        .handle_ok(MoveWindowRequest::fixture((
+            WindowTarget::with_window(source.clone(), 0),
+            WindowTarget::with_window(destination, 1),
+        )))
         .await;
-    assert!(matches!(response, Response::MoveWindow(_)), "{response:?}");
     assert!(handler
         .state
         .lock()
@@ -81,35 +54,21 @@ async fn move_window_last_source_session_exits_attached_client() {
 #[tokio::test]
 async fn move_window_session_target_exits_source_and_refreshes_destination_attaches() {
     let handler = RequestHandler::new();
-    let source = session_name("move-session-target-attached-source");
-    let destination = session_name("move-session-target-attached-destination");
-    create_session(&handler, source.as_str()).await;
-    create_session(&handler, destination.as_str()).await;
+    let source = create_session(&handler, "move-session-target-attached-source").await;
+    let destination = create_session(&handler, "move-session-target-attached-destination").await;
     let source_pid = 81_031;
     let destination_pid = 81_032;
-    let (source_tx, mut source_rx) = mpsc::unbounded_channel();
-    let (destination_tx, mut destination_rx) = mpsc::unbounded_channel();
-    handler
-        .register_attach(source_pid, source.clone(), source_tx)
-        .await;
-    handler
-        .register_attach(destination_pid, destination.clone(), destination_tx)
-        .await;
+    let mut source_rx = handler.attach_client(source_pid, &source).await;
+    let mut destination_rx = handler.attach_client(destination_pid, &destination).await;
     drain_attach_controls(&mut source_rx).await;
     drain_attach_controls(&mut destination_rx).await;
 
-    let response = handler
-        .handle(Request::MoveWindow(MoveWindowRequest {
-            source: Some(WindowTarget::with_window(source.clone(), 0)),
-            target: MoveWindowTarget::Session(destination.clone()),
-            renumber: false,
-            kill_destination: false,
-            detached: true,
-            after: false,
-            before: false,
-        }))
+    handler
+        .handle_ok(MoveWindowRequest::fixture((
+            WindowTarget::with_window(source.clone(), 0),
+            &destination,
+        )))
         .await;
-    assert!(matches!(response, Response::MoveWindow(_)), "{response:?}");
 
     expect_attach_exited(&mut source_rx, "removed source with session-only target").await;
     let destination_refresh = timeout(Duration::from_secs(2), destination_rx.recv())
@@ -137,37 +96,22 @@ async fn move_window_session_target_exits_source_and_refreshes_destination_attac
 #[tokio::test]
 async fn move_window_last_source_group_exits_all_attached_clients() {
     let handler = RequestHandler::new();
-    let owner = session_name("move-attached-group-owner");
-    let peer = session_name("move-attached-group-peer");
-    let destination = session_name("move-attached-group-destination");
-    create_session(&handler, owner.as_str()).await;
-    create_grouped_session(&handler, peer.as_str(), &owner).await;
-    create_session(&handler, destination.as_str()).await;
+    let owner = create_session(&handler, "move-attached-group-owner").await;
+    let peer = create_grouped_session(&handler, "move-attached-group-peer", &owner).await;
+    let destination = create_session(&handler, "move-attached-group-destination").await;
     let owner_pid = 81_011;
     let peer_pid = 81_012;
-    let (owner_tx, mut owner_rx) = mpsc::unbounded_channel();
-    let (peer_tx, mut peer_rx) = mpsc::unbounded_channel();
-    handler
-        .register_attach(owner_pid, owner.clone(), owner_tx)
-        .await;
-    handler
-        .register_attach(peer_pid, peer.clone(), peer_tx)
-        .await;
+    let mut owner_rx = handler.attach_client(owner_pid, &owner).await;
+    let mut peer_rx = handler.attach_client(peer_pid, &peer).await;
     drain_attach_controls(&mut owner_rx).await;
     drain_attach_controls(&mut peer_rx).await;
 
-    let response = handler
-        .handle(Request::MoveWindow(MoveWindowRequest {
-            source: Some(WindowTarget::with_window(peer.clone(), 0)),
-            target: MoveWindowTarget::Window(WindowTarget::with_window(destination, 1)),
-            renumber: false,
-            kill_destination: false,
-            detached: true,
-            after: false,
-            before: false,
-        }))
+    handler
+        .handle_ok(MoveWindowRequest::fixture((
+            WindowTarget::with_window(peer.clone(), 0),
+            WindowTarget::with_window(destination, 1),
+        )))
         .await;
-    assert!(matches!(response, Response::MoveWindow(_)), "{response:?}");
     {
         let state = handler.state.lock().await;
         assert!(state.sessions.session(&owner).is_none());
@@ -184,30 +128,19 @@ async fn move_window_last_source_group_exits_all_attached_clients() {
 #[tokio::test]
 async fn move_window_source_session_with_remaining_window_keeps_attached_client() {
     let handler = RequestHandler::new();
-    let source = session_name("move-attached-surviving-source");
-    let destination = session_name("move-attached-surviving-destination");
-    create_session(&handler, source.as_str()).await;
+    let source = create_session(&handler, "move-attached-surviving-source").await;
     insert_window(&handler, &source, 1).await;
-    create_session(&handler, destination.as_str()).await;
+    let destination = create_session(&handler, "move-attached-surviving-destination").await;
     let attach_pid = 81_021;
-    let (control_tx, mut control_rx) = mpsc::unbounded_channel();
-    handler
-        .register_attach(attach_pid, source.clone(), control_tx)
-        .await;
+    let mut control_rx = handler.attach_client(attach_pid, &source).await;
     drain_attach_controls(&mut control_rx).await;
 
-    let response = handler
-        .handle(Request::MoveWindow(MoveWindowRequest {
-            source: Some(WindowTarget::with_window(source.clone(), 1)),
-            target: MoveWindowTarget::Window(WindowTarget::with_window(destination, 1)),
-            renumber: false,
-            kill_destination: false,
-            detached: true,
-            after: false,
-            before: false,
-        }))
+    handler
+        .handle_ok(MoveWindowRequest::fixture((
+            WindowTarget::with_window(source.clone(), 1),
+            WindowTarget::with_window(destination, 1),
+        )))
         .await;
-    assert!(matches!(response, Response::MoveWindow(_)), "{response:?}");
 
     let refresh = timeout(Duration::from_secs(2), control_rx.recv())
         .await
@@ -237,11 +170,9 @@ async fn move_window_source_session_with_remaining_window_keeps_attached_client(
 #[tokio::test]
 async fn move_window_preserves_unrelated_and_grouped_peer_silence_deadlines() {
     let handler = RequestHandler::new();
-    let alpha = session_name("move-silence-alpha");
-    let beta = session_name("move-silence-beta");
-    create_session(&handler, alpha.as_str()).await;
+    let alpha = create_session(&handler, "move-silence-alpha").await;
     insert_window(&handler, &alpha, 1).await;
-    create_grouped_session(&handler, beta.as_str(), &alpha).await;
+    let beta = create_grouped_session(&handler, "move-silence-beta", &alpha).await;
     enable_global_monitor_silence(&handler).await;
 
     let unrelated = WindowTarget::with_window(alpha.clone(), 0);
@@ -256,18 +187,12 @@ async fn move_window_preserves_unrelated_and_grouped_peer_silence_deadlines() {
         .silence_timer_identity_for_test(&peer_source)
         .expect("grouped peer timer has stable identity");
 
-    let response = handler
-        .handle(Request::MoveWindow(MoveWindowRequest {
-            source: Some(WindowTarget::with_window(alpha.clone(), 1)),
-            target: MoveWindowTarget::Window(WindowTarget::with_window(alpha.clone(), 3)),
-            renumber: false,
-            kill_destination: false,
-            detached: true,
-            after: false,
-            before: false,
-        }))
+    handler
+        .handle_ok(MoveWindowRequest::fixture((
+            WindowTarget::with_window(alpha.clone(), 1),
+            WindowTarget::with_window(alpha.clone(), 3),
+        )))
         .await;
-    assert!(matches!(response, Response::MoveWindow(_)), "{response:?}");
 
     assert_eq!(
         handler.silence_timer_snapshot_for_test(&unrelated),
@@ -297,19 +222,8 @@ async fn move_window_preserves_unrelated_and_grouped_peer_silence_deadlines() {
 #[tokio::test]
 async fn move_window_preserves_distinct_duplicate_alias_silence_deadlines() {
     let handler = RequestHandler::new();
-    let alpha = session_name("move-duplicate-silence");
-    create_session(&handler, alpha.as_str()).await;
-    let linked = handler
-        .handle(Request::LinkWindow(LinkWindowRequest {
-            source: WindowTarget::with_window(alpha.clone(), 0),
-            target: WindowTarget::with_window(alpha.clone(), 2),
-            after: false,
-            before: false,
-            kill_destination: false,
-            detached: true,
-        }))
-        .await;
-    assert!(matches!(linked, Response::LinkWindow(_)), "{linked:?}");
+    let alpha = create_session(&handler, "move-duplicate-silence").await;
+    link_duplicate_window(&handler, &alpha, 0, 2).await;
     enable_global_monitor_silence(&handler).await;
 
     let source = WindowTarget::with_window(alpha.clone(), 0);
@@ -326,18 +240,9 @@ async fn move_window_preserves_distinct_duplicate_alias_silence_deadlines() {
         .silence_timer_snapshot_for_test(&sibling)
         .expect("sibling alias timer is armed");
 
-    let response = handler
-        .handle(Request::MoveWindow(MoveWindowRequest {
-            source: Some(source.clone()),
-            target: MoveWindowTarget::Window(destination.clone()),
-            renumber: false,
-            kill_destination: false,
-            detached: true,
-            after: false,
-            before: false,
-        }))
+    handler
+        .handle_ok(MoveWindowRequest::fixture((&source, &destination)))
         .await;
-    assert!(matches!(response, Response::MoveWindow(_)), "{response:?}");
 
     assert_eq!(handler.silence_timer_snapshot_for_test(&source), None);
     assert_eq!(
@@ -355,19 +260,8 @@ async fn move_window_preserves_distinct_duplicate_alias_silence_deadlines() {
 #[tokio::test]
 async fn move_window_kill_duplicate_alias_preserves_source_silence_deadline() {
     let handler = RequestHandler::new();
-    let alpha = session_name("move-kill-duplicate-silence");
-    create_session(&handler, alpha.as_str()).await;
-    let linked = handler
-        .handle(Request::LinkWindow(LinkWindowRequest {
-            source: WindowTarget::with_window(alpha.clone(), 0),
-            target: WindowTarget::with_window(alpha.clone(), 2),
-            after: false,
-            before: false,
-            kill_destination: false,
-            detached: true,
-        }))
-        .await;
-    assert!(matches!(linked, Response::LinkWindow(_)), "{linked:?}");
+    let alpha = create_session(&handler, "move-kill-duplicate-silence").await;
+    link_duplicate_window(&handler, &alpha, 0, 2).await;
     enable_global_monitor_silence(&handler).await;
 
     let source = WindowTarget::with_window(alpha.clone(), 0);
@@ -385,18 +279,12 @@ async fn move_window_kill_duplicate_alias_preserves_source_silence_deadline() {
         .silence_timer_snapshot_for_test(&destination)
         .expect("destination alias timer is armed");
 
-    let response = handler
-        .handle(Request::MoveWindow(MoveWindowRequest {
-            source: Some(source.clone()),
-            target: MoveWindowTarget::Window(destination.clone()),
-            renumber: false,
+    handler
+        .handle_ok(MoveWindowRequest {
             kill_destination: true,
-            detached: true,
-            after: false,
-            before: false,
-        }))
+            ..Fixture::fixture((&source, &destination))
+        })
         .await;
-    assert!(matches!(response, Response::MoveWindow(_)), "{response:?}");
 
     assert_eq!(handler.silence_timer_snapshot_for_test(&source), None);
     let destination_after = handler
@@ -410,11 +298,9 @@ async fn move_window_kill_duplicate_alias_preserves_source_silence_deadline() {
 #[tokio::test]
 async fn move_window_kill_duplicate_alias_moves_group_peer_alerts_by_occurrence() {
     let handler = RequestHandler::new();
-    let owner = session_name("move-alert-duplicate-owner");
-    let peer = session_name("move-alert-duplicate-peer");
-    create_session(&handler, owner.as_str()).await;
+    let owner = create_session(&handler, "move-alert-duplicate-owner").await;
     link_duplicate_window(&handler, &owner, 0, 2).await;
-    create_grouped_session(&handler, peer.as_str(), &owner).await;
+    let peer = create_grouped_session(&handler, "move-alert-duplicate-peer", &owner).await;
     {
         let mut state = handler.state.lock().await;
         let peer_session = state
@@ -425,18 +311,15 @@ async fn move_window_kill_duplicate_alias_moves_group_peer_alerts_by_occurrence(
         assert!(peer_session.add_winlink_alert_flags(2, rmux_core::WINLINK_ACTIVITY));
     }
 
-    let response = handler
-        .handle(Request::MoveWindow(MoveWindowRequest {
-            source: Some(WindowTarget::with_window(owner.clone(), 0)),
-            target: MoveWindowTarget::Window(WindowTarget::with_window(owner, 2)),
-            renumber: false,
+    handler
+        .handle_ok(MoveWindowRequest {
             kill_destination: true,
-            detached: true,
-            after: false,
-            before: false,
-        }))
+            ..Fixture::fixture((
+                WindowTarget::with_window(owner.clone(), 0),
+                WindowTarget::with_window(owner, 2),
+            ))
+        })
         .await;
-    assert!(matches!(response, Response::MoveWindow(_)), "{response:?}");
 
     let state = handler.state.lock().await;
     let peer_session = state.sessions.session(&peer).expect("group peer survives");
@@ -451,23 +334,15 @@ async fn move_window_kill_duplicate_alias_moves_group_peer_alerts_by_occurrence(
 #[tokio::test]
 async fn move_window_reindex_remaps_group_peer_duplicate_alias_alerts_by_occurrence() {
     let handler = RequestHandler::new();
-    let owner = session_name("reindex-alert-duplicate-owner");
-    let peer = session_name("reindex-alert-duplicate-peer");
-    create_session(&handler, owner.as_str()).await;
-    let moved = handler
-        .handle(Request::MoveWindow(MoveWindowRequest {
-            source: Some(WindowTarget::with_window(owner.clone(), 0)),
-            target: MoveWindowTarget::Window(WindowTarget::with_window(owner.clone(), 1)),
-            renumber: false,
-            kill_destination: false,
-            detached: true,
-            after: false,
-            before: false,
-        }))
+    let owner = create_session(&handler, "reindex-alert-duplicate-owner").await;
+    handler
+        .handle_ok(MoveWindowRequest::fixture((
+            WindowTarget::with_window(owner.clone(), 0),
+            WindowTarget::with_window(owner.clone(), 1),
+        )))
         .await;
-    assert!(matches!(moved, Response::MoveWindow(_)), "{moved:?}");
     link_duplicate_window(&handler, &owner, 1, 2).await;
-    create_grouped_session(&handler, peer.as_str(), &owner).await;
+    let peer = create_grouped_session(&handler, "reindex-alert-duplicate-peer", &owner).await;
     {
         let mut state = handler.state.lock().await;
         let peer_session = state
@@ -478,18 +353,13 @@ async fn move_window_reindex_remaps_group_peer_duplicate_alias_alerts_by_occurre
         assert!(peer_session.add_winlink_alert_flags(2, rmux_core::WINLINK_BELL));
     }
 
-    let response = handler
-        .handle(Request::MoveWindow(MoveWindowRequest {
+    handler
+        .handle_ok(MoveWindowRequest {
             source: None,
-            target: MoveWindowTarget::Session(owner),
             renumber: true,
-            kill_destination: false,
-            detached: true,
-            after: false,
-            before: false,
-        }))
+            ..Fixture::fixture((WindowTarget::with_window(owner.clone(), 0), owner))
+        })
         .await;
-    assert!(matches!(response, Response::MoveWindow(_)), "{response:?}");
 
     let state = handler.state.lock().await;
     let peer_session = state.sessions.session(&peer).expect("group peer survives");
@@ -504,11 +374,9 @@ async fn move_window_reindex_remaps_group_peer_duplicate_alias_alerts_by_occurre
 #[tokio::test]
 async fn move_window_relative_remaps_group_peer_duplicate_alias_alerts_by_occurrence() {
     let handler = RequestHandler::new();
-    let owner = session_name("relative-alert-duplicate-owner");
-    let peer = session_name("relative-alert-duplicate-peer");
-    create_session(&handler, owner.as_str()).await;
+    let owner = create_session(&handler, "relative-alert-duplicate-owner").await;
     link_duplicate_window(&handler, &owner, 0, 1).await;
-    create_grouped_session(&handler, peer.as_str(), &owner).await;
+    let peer = create_grouped_session(&handler, "relative-alert-duplicate-peer", &owner).await;
     {
         let mut state = handler.state.lock().await;
         let peer_session = state
@@ -525,18 +393,15 @@ async fn move_window_relative_remaps_group_peer_duplicate_alias_alerts_by_occurr
         assert!(peer_session.add_winlink_alert_flags(1, rmux_core::WINLINK_BELL));
     }
 
-    let response = handler
-        .handle(Request::MoveWindow(MoveWindowRequest {
-            source: Some(WindowTarget::with_window(owner.clone(), 1)),
-            target: MoveWindowTarget::Window(WindowTarget::with_window(owner, 0)),
-            renumber: false,
-            kill_destination: false,
-            detached: true,
-            after: false,
+    handler
+        .handle_ok(MoveWindowRequest {
             before: true,
-        }))
+            ..Fixture::fixture((
+                WindowTarget::with_window(owner.clone(), 1),
+                WindowTarget::with_window(owner, 0),
+            ))
+        })
         .await;
-    assert!(matches!(response, Response::MoveWindow(_)), "{response:?}");
 
     let state = handler.state.lock().await;
     let peer_session = state.sessions.session(&peer).expect("group peer survives");
@@ -552,21 +417,10 @@ async fn move_window_relative_remaps_group_peer_duplicate_alias_alerts_by_occurr
 #[tokio::test]
 async fn move_window_kill_duplicate_alias_emits_only_source_unlinked() {
     let handler = RequestHandler::new();
-    let alpha = session_name("move-kill-duplicate-lifecycle");
-    create_session(&handler, alpha.as_str()).await;
+    let alpha = create_session(&handler, "move-kill-duplicate-lifecycle").await;
     let source = WindowTarget::with_window(alpha.clone(), 0);
     let destination = WindowTarget::with_window(alpha.clone(), 2);
-    let linked = handler
-        .handle(Request::LinkWindow(LinkWindowRequest {
-            source: source.clone(),
-            target: destination.clone(),
-            after: false,
-            before: false,
-            kill_destination: false,
-            detached: true,
-        }))
-        .await;
-    assert!(matches!(linked, Response::LinkWindow(_)), "{linked:?}");
+    link_duplicate_window(&handler, &alpha, 0, 2).await;
     let original_window_id = {
         let state = handler.state.lock().await;
         let source_window_id = state
@@ -588,18 +442,12 @@ async fn move_window_kill_duplicate_alias_emits_only_source_unlinked() {
     };
     let mut events = handler.subscribe_lifecycle_events();
 
-    let response = handler
-        .handle(Request::MoveWindow(MoveWindowRequest {
-            source: Some(source.clone()),
-            target: MoveWindowTarget::Window(destination.clone()),
-            renumber: false,
+    handler
+        .handle_ok(MoveWindowRequest {
             kill_destination: true,
-            detached: true,
-            after: false,
-            before: false,
-        }))
+            ..Fixture::fixture((&source, &destination))
+        })
         .await;
-    assert!(matches!(response, Response::MoveWindow(_)), "{response:?}");
 
     let state = handler.state.lock().await;
     let session = state.sessions.session(&alpha).expect("session survives");
@@ -633,10 +481,8 @@ async fn move_window_kill_duplicate_alias_emits_only_source_unlinked() {
 #[tokio::test]
 async fn move_window_across_sessions_preserves_silence_deadline_and_identity() {
     let handler = RequestHandler::new();
-    let alpha = session_name("move-cross-silence-alpha");
-    let beta = session_name("move-cross-silence-beta");
-    create_session(&handler, alpha.as_str()).await;
-    create_session(&handler, beta.as_str()).await;
+    let alpha = create_session(&handler, "move-cross-silence-alpha").await;
+    let beta = create_session(&handler, "move-cross-silence-beta").await;
     insert_window(&handler, &alpha, 1).await;
     enable_global_monitor_silence(&handler).await;
 
@@ -650,27 +496,11 @@ async fn move_window_across_sessions_preserves_silence_deadline_and_identity() {
     let source_identity = handler
         .silence_timer_identity_for_test(&source)
         .expect("cross-session source identity exists");
-    let destination_session_id = {
-        let state = handler.state.lock().await;
-        state
-            .sessions
-            .session(&beta)
-            .expect("destination session exists")
-            .id()
-    };
+    let destination_session_id = handler.session_id_for_test(&beta).await;
 
-    let response = handler
-        .handle(Request::MoveWindow(MoveWindowRequest {
-            source: Some(source.clone()),
-            target: MoveWindowTarget::Window(destination.clone()),
-            renumber: false,
-            kill_destination: false,
-            detached: true,
-            after: false,
-            before: false,
-        }))
+    handler
+        .handle_ok(MoveWindowRequest::fixture((&source, &destination)))
         .await;
-    assert!(matches!(response, Response::MoveWindow(_)), "{response:?}");
 
     assert_eq!(handler.silence_timer_snapshot_for_test(&source), None);
     let destination_after = handler
@@ -688,8 +518,7 @@ async fn move_window_across_sessions_preserves_silence_deadline_and_identity() {
 #[tokio::test]
 async fn move_window_does_not_rearm_expired_unrelated_silence_timer() {
     let handler = RequestHandler::new();
-    let alpha = session_name("move-expired-silence");
-    create_session(&handler, alpha.as_str()).await;
+    let alpha = create_session(&handler, "move-expired-silence").await;
     insert_window(&handler, &alpha, 1).await;
     enable_global_monitor_silence(&handler).await;
 
@@ -714,18 +543,9 @@ async fn move_window_does_not_rearm_expired_unrelated_silence_timer() {
         .await;
     assert_eq!(handler.silence_timer_snapshot_for_test(&expired), None);
 
-    let response = handler
-        .handle(Request::MoveWindow(MoveWindowRequest {
-            source: Some(source.clone()),
-            target: MoveWindowTarget::Window(destination.clone()),
-            renumber: false,
-            kill_destination: false,
-            detached: true,
-            after: false,
-            before: false,
-        }))
+    handler
+        .handle_ok(MoveWindowRequest::fixture((&source, &destination)))
         .await;
-    assert!(matches!(response, Response::MoveWindow(_)), "{response:?}");
 
     assert_eq!(
         handler.silence_timer_snapshot_for_test(&expired),
@@ -742,12 +562,16 @@ async fn move_window_does_not_rearm_expired_unrelated_silence_timer() {
 #[tokio::test]
 async fn move_window_across_sessions_arms_timer_when_monitor_silence_becomes_nonzero() {
     let handler = RequestHandler::new();
-    let alpha = session_name("move-cross-monitor-zero");
-    let beta = session_name("move-cross-monitor-sixty");
-    create_session(&handler, alpha.as_str()).await;
-    create_session(&handler, beta.as_str()).await;
+    let alpha = create_session(&handler, "move-cross-monitor-zero").await;
+    let beta = create_session(&handler, "move-cross-monitor-sixty").await;
     insert_window(&handler, &alpha, 1).await;
-    set_session_monitor_silence(&handler, beta.clone(), "60").await;
+    handler
+        .set_option(
+            ScopeSelector::Session(beta.clone()),
+            OptionName::MonitorSilence,
+            "60",
+        )
+        .await;
 
     let source = WindowTarget::with_window(alpha.clone(), 1);
     let destination = WindowTarget::with_window(beta.clone(), 1);
@@ -757,18 +581,9 @@ async fn move_window_across_sessions_arms_timer_when_monitor_silence_becomes_non
         .silence_timer_snapshot_for_test(&unrelated_destination)
         .expect("existing destination timer is armed");
 
-    let response = handler
-        .handle(Request::MoveWindow(MoveWindowRequest {
-            source: Some(source.clone()),
-            target: MoveWindowTarget::Window(destination.clone()),
-            renumber: false,
-            kill_destination: false,
-            detached: true,
-            after: false,
-            before: false,
-        }))
+    handler
+        .handle_ok(MoveWindowRequest::fixture((&source, &destination)))
         .await;
-    assert!(matches!(response, Response::MoveWindow(_)), "{response:?}");
 
     assert_eq!(handler.silence_timer_snapshot_for_test(&source), None);
     assert!(
@@ -787,10 +602,8 @@ async fn move_window_across_sessions_arms_timer_when_monitor_silence_becomes_non
 async fn assert_cross_session_move_preserves_expired_silence_alert(kill_destination: bool) {
     let label = if kill_destination { "kill" } else { "empty" };
     let handler = RequestHandler::new();
-    let alpha = session_name(&format!("move-alert-{label}-alpha"));
-    let beta = session_name(&format!("move-alert-{label}-beta"));
-    create_session(&handler, alpha.as_str()).await;
-    create_session(&handler, beta.as_str()).await;
+    let alpha = create_session(&handler, format!("move-alert-{label}-alpha")).await;
+    let beta = create_session(&handler, format!("move-alert-{label}-beta")).await;
     insert_window(&handler, &alpha, 1).await;
     enable_global_monitor_silence(&handler).await;
 
@@ -832,18 +645,12 @@ async fn assert_cross_session_move_preserves_expired_silence_alert(kill_destinat
         );
     }
 
-    let response = handler
-        .handle(Request::MoveWindow(MoveWindowRequest {
-            source: Some(source.clone()),
-            target: MoveWindowTarget::Window(destination.clone()),
-            renumber: false,
+    handler
+        .handle_ok(MoveWindowRequest {
             kill_destination,
-            detached: true,
-            after: false,
-            before: false,
-        }))
+            ..Fixture::fixture((&source, &destination))
+        })
         .await;
-    assert!(matches!(response, Response::MoveWindow(_)), "{response:?}");
 
     {
         let state = handler.state.lock().await;
@@ -890,10 +697,8 @@ async fn move_window_across_sessions_preserves_expired_silence_alert_for_empty_a
 #[tokio::test]
 async fn move_window_across_sessions_migrates_the_terminal_ownership_map() {
     let handler = RequestHandler::new();
-    let alpha = session_name("alpha");
-    let beta = session_name("beta");
-    create_session(&handler, "alpha").await;
-    create_session(&handler, "beta").await;
+    let alpha = create_session(&handler, "alpha").await;
+    let beta = create_session(&handler, "beta").await;
     insert_window(&handler, &alpha, 1).await;
 
     let moved_pane_id = {
@@ -909,24 +714,17 @@ async fn move_window_across_sessions_migrates_the_terminal_ownership_map() {
             .id()
     };
 
-    let response = handler
-        .handle(Request::MoveWindow(MoveWindowRequest {
-            source: Some(WindowTarget::with_window(alpha.clone(), 1)),
-            target: MoveWindowTarget::Window(WindowTarget::with_window(beta.clone(), 4)),
-            renumber: false,
-            kill_destination: false,
-            detached: true,
-            after: false,
-            before: false,
-        }))
-        .await;
-
     assert_eq!(
-        response,
-        Response::MoveWindow(rmux_proto::MoveWindowResponse {
+        handler
+            .handle_ok(MoveWindowRequest::fixture((
+                WindowTarget::with_window(alpha.clone(), 1),
+                WindowTarget::with_window(beta.clone(), 4),
+            )))
+            .await,
+        rmux_proto::MoveWindowResponse {
             session_name: beta.clone(),
             target: Some(WindowTarget::with_window(beta.clone(), 4)),
-        })
+        }
     );
 
     let state = handler.state.lock().await;
@@ -959,40 +757,27 @@ async fn move_window_across_sessions_migrates_the_terminal_ownership_map() {
 #[tokio::test]
 async fn move_window_within_session_moves_linked_slot_metadata() {
     let handler = RequestHandler::new();
-    let alpha = session_name("alpha");
-    let beta = session_name("beta");
-    create_session(&handler, "alpha").await;
-    create_session(&handler, "beta").await;
+    let alpha = create_session(&handler, "alpha").await;
+    let beta = create_session(&handler, "beta").await;
 
-    let link = handler
-        .handle(Request::LinkWindow(LinkWindowRequest {
-            source: WindowTarget::with_window(alpha.clone(), 0),
-            target: WindowTarget::with_window(beta.clone(), 1),
-            after: false,
-            before: false,
-            kill_destination: false,
-            detached: true,
-        }))
+    handler
+        .handle_ok(LinkWindowRequest::fixture((
+            WindowTarget::with_window(alpha.clone(), 0),
+            WindowTarget::with_window(beta.clone(), 1),
+        )))
         .await;
-    assert!(matches!(link, Response::LinkWindow(_)));
 
-    let response = handler
-        .handle(Request::MoveWindow(MoveWindowRequest {
-            source: Some(WindowTarget::with_window(alpha.clone(), 0)),
-            target: MoveWindowTarget::Window(WindowTarget::with_window(alpha.clone(), 2)),
-            renumber: false,
-            kill_destination: false,
-            detached: true,
-            after: false,
-            before: false,
-        }))
-        .await;
     assert_eq!(
-        response,
-        Response::MoveWindow(rmux_proto::MoveWindowResponse {
+        handler
+            .handle_ok(MoveWindowRequest::fixture((
+                WindowTarget::with_window(alpha.clone(), 0),
+                WindowTarget::with_window(alpha.clone(), 2),
+            )))
+            .await,
+        rmux_proto::MoveWindowResponse {
             session_name: alpha.clone(),
             target: Some(WindowTarget::with_window(alpha.clone(), 2)),
-        })
+        }
     );
 
     {
@@ -1006,13 +791,12 @@ async fn move_window_within_session_moves_linked_slot_metadata() {
         );
     }
 
-    let rename = handler
-        .handle(Request::RenameWindow(RenameWindowRequest {
+    handler
+        .handle_ok(RenameWindowRequest {
             target: WindowTarget::with_window(beta.clone(), 1),
             name: "logs".to_owned(),
-        }))
+        })
         .await;
-    assert!(matches!(rename, Response::RenameWindow(_)));
 
     let state = handler.state.lock().await;
     assert_eq!(
@@ -1036,12 +820,9 @@ async fn move_window_within_session_moves_linked_slot_metadata() {
 #[tokio::test]
 async fn move_window_from_group_peer_moves_runtime_state_and_removes_empty_group() {
     let handler = RequestHandler::new();
-    let alpha = session_name("alpha");
-    let beta = session_name("beta");
-    let gamma = session_name("gamma");
-    create_session(&handler, "alpha").await;
-    create_grouped_session(&handler, "beta", &alpha).await;
-    create_session(&handler, "gamma").await;
+    let alpha = create_session(&handler, "alpha").await;
+    let beta = create_grouped_session(&handler, "beta", &alpha).await;
+    let gamma = create_session(&handler, "gamma").await;
 
     let moved_pane_id = {
         let state = handler.state.lock().await;
@@ -1054,23 +835,17 @@ async fn move_window_from_group_peer_moves_runtime_state_and_removes_empty_group
             .expect("grouped pane should exist")
     };
 
-    let response = handler
-        .handle(Request::MoveWindow(MoveWindowRequest {
-            source: Some(WindowTarget::with_window(beta.clone(), 0)),
-            target: MoveWindowTarget::Window(WindowTarget::with_window(gamma.clone(), 1)),
-            renumber: false,
-            kill_destination: false,
-            detached: true,
-            after: false,
-            before: false,
-        }))
-        .await;
     assert_eq!(
-        response,
-        Response::MoveWindow(rmux_proto::MoveWindowResponse {
+        handler
+            .handle_ok(MoveWindowRequest::fixture((
+                WindowTarget::with_window(beta.clone(), 0),
+                WindowTarget::with_window(gamma.clone(), 1),
+            )))
+            .await,
+        rmux_proto::MoveWindowResponse {
             session_name: gamma.clone(),
             target: Some(WindowTarget::with_window(gamma.clone(), 1)),
-        })
+        }
     );
 
     let state = handler.state.lock().await;
@@ -1093,10 +868,8 @@ async fn move_window_from_group_peer_moves_runtime_state_and_removes_empty_group
 #[tokio::test]
 async fn move_window_rejects_cross_session_move_within_same_session_group() {
     let handler = RequestHandler::new();
-    let alpha = session_name("alpha");
-    let beta = session_name("beta");
-    create_session(&handler, "alpha").await;
-    create_grouped_session(&handler, "beta", &alpha).await;
+    let alpha = create_session(&handler, "alpha").await;
+    let beta = create_grouped_session(&handler, "beta", &alpha).await;
 
     let shared_pane_id = {
         let state = handler.state.lock().await;
@@ -1110,15 +883,10 @@ async fn move_window_rejects_cross_session_move_within_same_session_group() {
     };
 
     let response = handler
-        .handle(Request::MoveWindow(MoveWindowRequest {
-            source: Some(WindowTarget::with_window(beta.clone(), 0)),
-            target: MoveWindowTarget::Window(WindowTarget::with_window(alpha.clone(), 5)),
-            renumber: false,
-            kill_destination: false,
-            detached: true,
-            after: false,
-            before: false,
-        }))
+        .handle(Request::MoveWindow(MoveWindowRequest::fixture((
+            WindowTarget::with_window(beta.clone(), 0),
+            WindowTarget::with_window(alpha.clone(), 5),
+        ))))
         .await;
 
     assert!(
@@ -1150,20 +918,16 @@ async fn move_window_rejects_cross_session_move_within_same_session_group() {
 #[tokio::test]
 async fn move_window_relative_rejects_cross_session_move_within_same_session_group() {
     let handler = RequestHandler::new();
-    let alpha = session_name("alpha");
-    let beta = session_name("beta");
-    create_session(&handler, "alpha").await;
-    create_grouped_session(&handler, "beta", &alpha).await;
+    let alpha = create_session(&handler, "alpha").await;
+    let beta = create_grouped_session(&handler, "beta", &alpha).await;
 
     let response = handler
         .handle(Request::MoveWindow(MoveWindowRequest {
-            source: Some(WindowTarget::with_window(beta.clone(), 0)),
-            target: MoveWindowTarget::Window(WindowTarget::with_window(alpha.clone(), 0)),
-            renumber: false,
-            kill_destination: false,
-            detached: true,
             after: true,
-            before: false,
+            ..Fixture::fixture((
+                WindowTarget::with_window(beta.clone(), 0),
+                WindowTarget::with_window(alpha.clone(), 0),
+            ))
         }))
         .await;
 
@@ -1188,14 +952,10 @@ async fn move_window_relative_rejects_cross_session_move_within_same_session_gro
 #[tokio::test]
 async fn move_window_from_group_peer_linked_source_removes_empty_group() {
     let handler = RequestHandler::new();
-    let alpha = session_name("alpha");
-    let beta = session_name("beta");
-    let gamma = session_name("gamma");
-    let delta = session_name("delta");
-    create_session(&handler, "alpha").await;
-    create_grouped_session(&handler, "beta", &alpha).await;
-    create_session(&handler, "gamma").await;
-    create_session(&handler, "delta").await;
+    let alpha = create_session(&handler, "alpha").await;
+    let beta = create_grouped_session(&handler, "beta", &alpha).await;
+    let gamma = create_session(&handler, "gamma").await;
+    let delta = create_session(&handler, "delta").await;
 
     let linked_pane_id = {
         let state = handler.state.lock().await;
@@ -1208,35 +968,24 @@ async fn move_window_from_group_peer_linked_source_removes_empty_group() {
             .expect("grouped linked pane should exist")
     };
 
-    let link = handler
-        .handle(Request::LinkWindow(LinkWindowRequest {
-            source: WindowTarget::with_window(alpha.clone(), 0),
-            target: WindowTarget::with_window(gamma.clone(), 1),
-            after: false,
-            before: false,
-            kill_destination: false,
-            detached: true,
-        }))
+    handler
+        .handle_ok(LinkWindowRequest::fixture((
+            WindowTarget::with_window(alpha.clone(), 0),
+            WindowTarget::with_window(gamma.clone(), 1),
+        )))
         .await;
-    assert!(matches!(link, Response::LinkWindow(_)));
 
-    let response = handler
-        .handle(Request::MoveWindow(MoveWindowRequest {
-            source: Some(WindowTarget::with_window(beta.clone(), 0)),
-            target: MoveWindowTarget::Window(WindowTarget::with_window(delta.clone(), 1)),
-            renumber: false,
-            kill_destination: false,
-            detached: true,
-            after: false,
-            before: false,
-        }))
-        .await;
     assert_eq!(
-        response,
-        Response::MoveWindow(rmux_proto::MoveWindowResponse {
+        handler
+            .handle_ok(MoveWindowRequest::fixture((
+                WindowTarget::with_window(beta.clone(), 0),
+                WindowTarget::with_window(delta.clone(), 1),
+            )))
+            .await,
+        rmux_proto::MoveWindowResponse {
             session_name: delta.clone(),
             target: Some(WindowTarget::with_window(delta.clone(), 1)),
-        })
+        }
     );
 
     let state = handler.state.lock().await;
@@ -1273,12 +1022,9 @@ async fn move_window_from_group_peer_linked_source_removes_empty_group() {
 #[tokio::test]
 async fn move_window_kill_destination_preserves_surviving_linked_window_runtime() {
     let handler = RequestHandler::new();
-    let alpha = session_name("alpha");
-    let gamma = session_name("gamma");
-    let delta = session_name("delta");
-    create_session(&handler, "alpha").await;
-    create_session(&handler, "gamma").await;
-    create_session(&handler, "delta").await;
+    let alpha = create_session(&handler, "alpha").await;
+    let gamma = create_session(&handler, "gamma").await;
+    let delta = create_session(&handler, "delta").await;
 
     let (source_pane_id, linked_pane_id) = {
         let state = handler.state.lock().await;
@@ -1300,35 +1046,27 @@ async fn move_window_kill_destination_preserves_surviving_linked_window_runtime(
         )
     };
 
-    let link = handler
-        .handle(Request::LinkWindow(LinkWindowRequest {
-            source: WindowTarget::with_window(gamma.clone(), 0),
-            target: WindowTarget::with_window(delta.clone(), 1),
-            after: false,
-            before: false,
-            kill_destination: false,
-            detached: true,
-        }))
+    handler
+        .handle_ok(LinkWindowRequest::fixture((
+            WindowTarget::with_window(gamma.clone(), 0),
+            WindowTarget::with_window(delta.clone(), 1),
+        )))
         .await;
-    assert!(matches!(link, Response::LinkWindow(_)));
 
-    let response = handler
-        .handle(Request::MoveWindow(MoveWindowRequest {
-            source: Some(WindowTarget::with_window(alpha.clone(), 0)),
-            target: MoveWindowTarget::Window(WindowTarget::with_window(gamma.clone(), 0)),
-            renumber: false,
-            kill_destination: true,
-            detached: true,
-            after: false,
-            before: false,
-        }))
-        .await;
     assert_eq!(
-        response,
-        Response::MoveWindow(rmux_proto::MoveWindowResponse {
+        handler
+            .handle_ok(MoveWindowRequest {
+                kill_destination: true,
+                ..Fixture::fixture((
+                    WindowTarget::with_window(alpha.clone(), 0),
+                    WindowTarget::with_window(gamma.clone(), 0),
+                ))
+            })
+            .await,
+        rmux_proto::MoveWindowResponse {
             session_name: gamma.clone(),
             target: Some(WindowTarget::with_window(gamma.clone(), 0)),
-        })
+        }
     );
 
     let state = handler.state.lock().await;
@@ -1364,10 +1102,8 @@ async fn move_window_kill_destination_preserves_surviving_linked_window_runtime(
 #[tokio::test]
 async fn move_window_within_session_kill_destination_preserves_surviving_linked_runtime() {
     let handler = RequestHandler::new();
-    let alpha = session_name("alpha");
-    let beta = session_name("beta");
-    create_session(&handler, "alpha").await;
-    create_session(&handler, "beta").await;
+    let alpha = create_session(&handler, "alpha").await;
+    let beta = create_session(&handler, "beta").await;
     insert_window(&handler, &alpha, 2).await;
 
     let (source_pane_id, linked_pane_id) = {
@@ -1390,35 +1126,27 @@ async fn move_window_within_session_kill_destination_preserves_surviving_linked_
         )
     };
 
-    let link = handler
-        .handle(Request::LinkWindow(LinkWindowRequest {
-            source: WindowTarget::with_window(alpha.clone(), 0),
-            target: WindowTarget::with_window(beta.clone(), 1),
-            after: false,
-            before: false,
-            kill_destination: false,
-            detached: true,
-        }))
+    handler
+        .handle_ok(LinkWindowRequest::fixture((
+            WindowTarget::with_window(alpha.clone(), 0),
+            WindowTarget::with_window(beta.clone(), 1),
+        )))
         .await;
-    assert!(matches!(link, Response::LinkWindow(_)));
 
-    let response = handler
-        .handle(Request::MoveWindow(MoveWindowRequest {
-            source: Some(WindowTarget::with_window(alpha.clone(), 2)),
-            target: MoveWindowTarget::Window(WindowTarget::with_window(alpha.clone(), 0)),
-            renumber: false,
-            kill_destination: true,
-            detached: true,
-            after: false,
-            before: false,
-        }))
-        .await;
     assert_eq!(
-        response,
-        Response::MoveWindow(rmux_proto::MoveWindowResponse {
+        handler
+            .handle_ok(MoveWindowRequest {
+                kill_destination: true,
+                ..Fixture::fixture((
+                    WindowTarget::with_window(alpha.clone(), 2),
+                    WindowTarget::with_window(alpha.clone(), 0),
+                ))
+            })
+            .await,
+        rmux_proto::MoveWindowResponse {
             session_name: alpha.clone(),
             target: Some(WindowTarget::with_window(alpha.clone(), 0)),
-        })
+        }
     );
 
     let state = handler.state.lock().await;
@@ -1453,8 +1181,7 @@ async fn move_window_within_session_kill_destination_preserves_surviving_linked_
 #[tokio::test]
 async fn move_window_within_session_restores_the_killed_destination_when_resize_fails() {
     let handler = RequestHandler::new();
-    let alpha = session_name("alpha");
-    create_session(&handler, "alpha").await;
+    let alpha = create_session(&handler, "alpha").await;
     insert_window(&handler, &alpha, 1).await;
 
     let (source_pane_id, destination_pane_id, stable_source, stable_destination) = {
@@ -1495,13 +1222,11 @@ async fn move_window_within_session_restores_the_killed_destination_when_resize_
 
     let response = handler
         .handle(Request::MoveWindow(MoveWindowRequest {
-            source: Some(WindowTarget::with_window(alpha.clone(), 0)),
-            target: MoveWindowTarget::Window(WindowTarget::with_window(alpha.clone(), 1)),
-            renumber: false,
             kill_destination: true,
-            detached: true,
-            after: false,
-            before: false,
+            ..Fixture::fixture((
+                WindowTarget::with_window(alpha.clone(), 0),
+                WindowTarget::with_window(alpha.clone(), 1),
+            ))
         }))
         .await;
 
@@ -1541,29 +1266,22 @@ async fn move_window_within_session_restores_the_killed_destination_when_resize_
 #[tokio::test]
 async fn move_window_reindex_compacts_sparse_window_indices() {
     let handler = RequestHandler::new();
-    let alpha = session_name("alpha");
-    create_session(&handler, "alpha").await;
+    let alpha = create_session(&handler, "alpha").await;
     insert_window(&handler, &alpha, 3).await;
     insert_window(&handler, &alpha, 7).await;
 
-    let response = handler
-        .handle(Request::MoveWindow(MoveWindowRequest {
-            source: None,
-            target: MoveWindowTarget::Session(alpha.clone()),
-            renumber: true,
-            kill_destination: false,
-            detached: true,
-            after: false,
-            before: false,
-        }))
-        .await;
-
     assert_eq!(
-        response,
-        Response::MoveWindow(rmux_proto::MoveWindowResponse {
+        handler
+            .handle_ok(MoveWindowRequest {
+                source: None,
+                renumber: true,
+                ..Fixture::fixture((WindowTarget::with_window(alpha.clone(), 0), &alpha))
+            })
+            .await,
+        rmux_proto::MoveWindowResponse {
             session_name: alpha.clone(),
             target: None,
-        })
+        }
     );
 
     let state = handler.state.lock().await;
@@ -1577,31 +1295,22 @@ async fn move_window_reindex_compacts_sparse_window_indices() {
 #[tokio::test]
 async fn move_window_reindex_with_source_ignores_source_and_renumbers_target_session() {
     let handler = RequestHandler::new();
-    let alpha = session_name("alpha");
-    let beta = session_name("beta");
-    create_session(&handler, "alpha").await;
-    create_session(&handler, "beta").await;
+    let alpha = create_session(&handler, "alpha").await;
+    let beta = create_session(&handler, "beta").await;
     insert_window(&handler, &alpha, 3).await;
     insert_window(&handler, &beta, 4).await;
 
-    let response = handler
-        .handle(Request::MoveWindow(MoveWindowRequest {
-            source: Some(WindowTarget::with_window(alpha.clone(), 3)),
-            target: MoveWindowTarget::Session(beta.clone()),
-            renumber: true,
-            kill_destination: false,
-            detached: true,
-            after: false,
-            before: false,
-        }))
-        .await;
-
     assert_eq!(
-        response,
-        Response::MoveWindow(rmux_proto::MoveWindowResponse {
+        handler
+            .handle_ok(MoveWindowRequest {
+                renumber: true,
+                ..Fixture::fixture((WindowTarget::with_window(alpha.clone(), 3), &beta))
+            })
+            .await,
+        rmux_proto::MoveWindowResponse {
             session_name: beta.clone(),
             target: None,
-        })
+        }
     );
 
     let state = handler.state.lock().await;
@@ -1617,30 +1326,22 @@ async fn move_window_reindex_with_source_ignores_source_and_renumbers_target_ses
 #[tokio::test]
 async fn move_window_reindex_ignores_source_in_target_without_window_lifecycle_events() {
     let handler = RequestHandler::new();
-    let alpha = session_name("reindex-source-in-target");
-    create_session(&handler, alpha.as_str()).await;
+    let alpha = create_session(&handler, "reindex-source-in-target").await;
     insert_window(&handler, &alpha, 3).await;
     insert_window(&handler, &alpha, 7).await;
     let mut events = handler.subscribe_lifecycle_events();
 
-    let response = handler
-        .handle(Request::MoveWindow(MoveWindowRequest {
-            source: Some(WindowTarget::with_window(alpha.clone(), 7)),
-            target: MoveWindowTarget::Session(alpha.clone()),
-            renumber: true,
-            kill_destination: false,
-            detached: true,
-            after: false,
-            before: false,
-        }))
-        .await;
-
     assert_eq!(
-        response,
-        Response::MoveWindow(rmux_proto::MoveWindowResponse {
+        handler
+            .handle_ok(MoveWindowRequest {
+                renumber: true,
+                ..Fixture::fixture((WindowTarget::with_window(alpha.clone(), 7), &alpha))
+            })
+            .await,
+        rmux_proto::MoveWindowResponse {
             session_name: alpha.clone(),
             target: None,
-        })
+        }
     );
     let state = handler.state.lock().await;
     assert_eq!(
@@ -1671,29 +1372,25 @@ async fn move_window_reindex_ignores_source_in_target_without_window_lifecycle_e
 #[tokio::test]
 async fn move_window_reindex_with_window_target_renumbers_target_session() {
     let handler = RequestHandler::new();
-    let alpha = session_name("alpha");
-    create_session(&handler, "alpha").await;
+    let alpha = create_session(&handler, "alpha").await;
     insert_window(&handler, &alpha, 5).await;
     insert_window(&handler, &alpha, 9).await;
 
-    let response = handler
-        .handle(Request::MoveWindow(MoveWindowRequest {
-            source: None,
-            target: MoveWindowTarget::Window(WindowTarget::with_window(alpha.clone(), 9)),
-            renumber: true,
-            kill_destination: false,
-            detached: true,
-            after: false,
-            before: false,
-        }))
-        .await;
-
     assert_eq!(
-        response,
-        Response::MoveWindow(rmux_proto::MoveWindowResponse {
+        handler
+            .handle_ok(MoveWindowRequest {
+                source: None,
+                renumber: true,
+                ..Fixture::fixture((
+                    WindowTarget::with_window(alpha.clone(), 0),
+                    WindowTarget::with_window(alpha.clone(), 9),
+                ))
+            })
+            .await,
+        rmux_proto::MoveWindowResponse {
             session_name: alpha.clone(),
             target: None,
-        })
+        }
     );
 
     let state = handler.state.lock().await;
@@ -1707,32 +1404,26 @@ async fn move_window_reindex_with_window_target_renumbers_target_session() {
 #[tokio::test]
 async fn move_window_reindex_with_source_and_window_target_ignores_source() {
     let handler = RequestHandler::new();
-    let alpha = session_name("alpha");
-    let beta = session_name("beta");
-    create_session(&handler, "alpha").await;
-    create_session(&handler, "beta").await;
+    let alpha = create_session(&handler, "alpha").await;
+    let beta = create_session(&handler, "beta").await;
     insert_window(&handler, &alpha, 2).await;
     insert_window(&handler, &alpha, 5).await;
     insert_window(&handler, &beta, 4).await;
 
-    let response = handler
-        .handle(Request::MoveWindow(MoveWindowRequest {
-            source: Some(WindowTarget::with_window(alpha.clone(), 5)),
-            target: MoveWindowTarget::Window(WindowTarget::with_window(beta.clone(), 4)),
-            renumber: true,
-            kill_destination: false,
-            detached: true,
-            after: false,
-            before: false,
-        }))
-        .await;
-
     assert_eq!(
-        response,
-        Response::MoveWindow(rmux_proto::MoveWindowResponse {
+        handler
+            .handle_ok(MoveWindowRequest {
+                renumber: true,
+                ..Fixture::fixture((
+                    WindowTarget::with_window(alpha.clone(), 5),
+                    WindowTarget::with_window(beta.clone(), 4),
+                ))
+            })
+            .await,
+        rmux_proto::MoveWindowResponse {
             session_name: beta.clone(),
             target: None,
-        })
+        }
     );
 
     let state = handler.state.lock().await;
@@ -1751,8 +1442,7 @@ async fn move_window_reindex_with_source_and_window_target_ignores_source() {
 #[tokio::test]
 async fn move_window_after_source_already_after_target_matches_tmux_gap_shape() {
     let handler = RequestHandler::new();
-    let alpha = session_name("alpha");
-    create_session(&handler, "alpha").await;
+    let alpha = create_session(&handler, "alpha").await;
     insert_window(&handler, &alpha, 1).await;
     insert_window(&handler, &alpha, 2).await;
 
@@ -1769,24 +1459,21 @@ async fn move_window_after_source_already_after_target_matches_tmux_gap_shape() 
         )
     };
 
-    let response = handler
-        .handle(Request::MoveWindow(MoveWindowRequest {
-            source: Some(WindowTarget::with_window(alpha.clone(), 1)),
-            target: MoveWindowTarget::Window(WindowTarget::with_window(alpha.clone(), 0)),
-            renumber: false,
-            kill_destination: false,
-            detached: false,
-            after: true,
-            before: false,
-        }))
-        .await;
-
     assert_eq!(
-        response,
-        Response::MoveWindow(rmux_proto::MoveWindowResponse {
+        handler
+            .handle_ok(MoveWindowRequest {
+                detached: false,
+                after: true,
+                ..Fixture::fixture((
+                    WindowTarget::with_window(alpha.clone(), 1),
+                    WindowTarget::with_window(alpha.clone(), 0),
+                ))
+            })
+            .await,
+        rmux_proto::MoveWindowResponse {
             session_name: alpha.clone(),
             target: Some(WindowTarget::with_window(alpha.clone(), 1)),
-        })
+        }
     );
 
     let state = handler.state.lock().await;
@@ -1803,8 +1490,7 @@ async fn move_window_after_source_already_after_target_matches_tmux_gap_shape() 
 #[tokio::test]
 async fn move_window_before_source_is_target_matches_tmux_gap_shape() {
     let handler = RequestHandler::new();
-    let alpha = session_name("alpha");
-    create_session(&handler, "alpha").await;
+    let alpha = create_session(&handler, "alpha").await;
     insert_window(&handler, &alpha, 1).await;
     insert_window(&handler, &alpha, 2).await;
 
@@ -1824,24 +1510,21 @@ async fn move_window_before_source_is_target_matches_tmux_gap_shape() {
         )
     };
 
-    let response = handler
-        .handle(Request::MoveWindow(MoveWindowRequest {
-            source: Some(WindowTarget::with_window(alpha.clone(), 0)),
-            target: MoveWindowTarget::Window(WindowTarget::with_window(alpha.clone(), 0)),
-            renumber: false,
-            kill_destination: false,
-            detached: false,
-            after: false,
-            before: true,
-        }))
-        .await;
-
     assert_eq!(
-        response,
-        Response::MoveWindow(rmux_proto::MoveWindowResponse {
+        handler
+            .handle_ok(MoveWindowRequest {
+                detached: false,
+                before: true,
+                ..Fixture::fixture((
+                    WindowTarget::with_window(alpha.clone(), 0),
+                    WindowTarget::with_window(alpha.clone(), 0),
+                ))
+            })
+            .await,
+        rmux_proto::MoveWindowResponse {
             session_name: alpha.clone(),
             target: Some(WindowTarget::with_window(alpha.clone(), 0)),
-        })
+        }
     );
 
     let state = handler.state.lock().await;
@@ -1859,39 +1542,30 @@ async fn move_window_before_source_is_target_matches_tmux_gap_shape() {
 #[tokio::test]
 async fn move_window_reindex_starts_at_base_index() {
     let handler = RequestHandler::new();
-    let alpha = session_name("alpha");
-    create_session(&handler, "alpha").await;
+    let alpha = create_session(&handler, "alpha").await;
     insert_window(&handler, &alpha, 3).await;
     insert_window(&handler, &alpha, 7).await;
 
-    let set_base_index = handler
-        .handle(Request::SetOption(SetOptionRequest {
-            scope: ScopeSelector::Session(alpha.clone()),
-            option: OptionName::BaseIndex,
-            value: "2".to_owned(),
-            mode: SetOptionMode::Replace,
-        }))
-        .await;
-    assert!(matches!(set_base_index, Response::SetOption(_)));
-
-    let response = handler
-        .handle(Request::MoveWindow(MoveWindowRequest {
-            source: None,
-            target: MoveWindowTarget::Session(alpha.clone()),
-            renumber: true,
-            kill_destination: false,
-            detached: true,
-            after: false,
-            before: false,
-        }))
+    handler
+        .set_option(
+            ScopeSelector::Session(alpha.clone()),
+            OptionName::BaseIndex,
+            "2",
+        )
         .await;
 
     assert_eq!(
-        response,
-        Response::MoveWindow(rmux_proto::MoveWindowResponse {
+        handler
+            .handle_ok(MoveWindowRequest {
+                source: None,
+                renumber: true,
+                ..Fixture::fixture((WindowTarget::with_window(alpha.clone(), 0), &alpha))
+            })
+            .await,
+        rmux_proto::MoveWindowResponse {
             session_name: alpha.clone(),
             target: None,
-        })
+        }
     );
 
     let state = handler.state.lock().await;
@@ -1905,46 +1579,32 @@ async fn move_window_reindex_starts_at_base_index() {
 #[tokio::test]
 async fn move_window_reindex_remaps_window_metadata() {
     let handler = RequestHandler::new();
-    let alpha = session_name("alpha");
-    create_session(&handler, "alpha").await;
+    let alpha = create_session(&handler, "alpha").await;
     insert_window(&handler, &alpha, 2).await;
     insert_window(&handler, &alpha, 3).await;
 
-    assert!(matches!(
-        handler
-            .handle(Request::SetOption(SetOptionRequest {
-                scope: ScopeSelector::Window(WindowTarget::with_window(alpha.clone(), 3)),
-                option: OptionName::WindowStyle,
-                value: "fg=colour3".to_owned(),
-                mode: SetOptionMode::Replace,
-            }))
-            .await,
-        Response::SetOption(_)
-    ));
-    assert!(matches!(
-        handler
-            .handle(Request::SetHook(rmux_proto::SetHookRequest {
-                scope: ScopeSelector::Window(WindowTarget::with_window(alpha.clone(), 3)),
-                hook: HookName::WindowLayoutChanged,
-                command: "display-message remapped".to_owned(),
-                lifecycle: HookLifecycle::Persistent,
-            }))
-            .await,
-        Response::SetHook(_)
-    ));
-
-    let response = handler
-        .handle(Request::MoveWindow(MoveWindowRequest {
-            source: None,
-            target: MoveWindowTarget::Session(alpha.clone()),
-            renumber: true,
-            kill_destination: false,
-            detached: true,
-            after: false,
-            before: false,
-        }))
+    handler
+        .set_option(
+            ScopeSelector::Window(WindowTarget::with_window(alpha.clone(), 3)),
+            OptionName::WindowStyle,
+            "fg=colour3",
+        )
         .await;
-    assert!(matches!(response, Response::MoveWindow(_)));
+    handler
+        .handle_ok(rmux_proto::SetHookRequest::fixture((
+            ScopeSelector::Window(WindowTarget::with_window(alpha.clone(), 3)),
+            HookName::WindowLayoutChanged,
+            "display-message remapped",
+        )))
+        .await;
+
+    handler
+        .handle_ok(MoveWindowRequest {
+            source: None,
+            renumber: true,
+            ..Fixture::fixture((WindowTarget::with_window(alpha.clone(), 0), &alpha))
+        })
+        .await;
 
     let state = handler.state.lock().await;
     assert_eq!(
@@ -1965,10 +1625,8 @@ async fn move_window_reindex_remaps_window_metadata() {
 #[tokio::test]
 async fn move_window_across_sessions_restores_terminal_ownership_when_resize_fails() {
     let handler = RequestHandler::new();
-    let alpha = session_name("alpha");
-    let beta = session_name("beta");
-    create_session(&handler, "alpha").await;
-    create_session(&handler, "beta").await;
+    let alpha = create_session(&handler, "alpha").await;
+    let beta = create_session(&handler, "beta").await;
     insert_window(&handler, &alpha, 1).await;
     insert_window(&handler, &beta, 4).await;
 
@@ -2011,13 +1669,11 @@ async fn move_window_across_sessions_restores_terminal_ownership_when_resize_fai
 
     let response = handler
         .handle(Request::MoveWindow(MoveWindowRequest {
-            source: Some(WindowTarget::with_window(alpha.clone(), 1)),
-            target: MoveWindowTarget::Window(WindowTarget::with_window(beta.clone(), 4)),
-            renumber: false,
             kill_destination: true,
-            detached: true,
-            after: false,
-            before: false,
+            ..Fixture::fixture((
+                WindowTarget::with_window(alpha.clone(), 1),
+                WindowTarget::with_window(beta.clone(), 4),
+            ))
         }))
         .await;
 

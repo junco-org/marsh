@@ -3,7 +3,8 @@ use std::path::PathBuf;
 use clap::{ArgAction, ArgGroup, Args};
 use rmux_proto::RotateWindowDirection;
 
-use super::{QueuedCommand, TargetSpec, parse_command_args, parse_target_spec};
+use super::validate::{Validate, too_many_arguments_error, unknown_flag_error};
+use super::{TargetSpec, parse_command_args, parse_target_spec};
 
 /// Parses `rename-window` arguments, rejecting anything but exactly one new name.
 pub(super) fn parse_rename_window_args(
@@ -12,28 +13,9 @@ pub(super) fn parse_rename_window_args(
     parse_command_args::<RawRenameWindowArgs>("rename-window", arguments)?.validate()
 }
 
-/// Parses `select-window` arguments and rejects the unsupported `-Z` flag.
-pub(super) fn parse_select_window_args(
-    arguments: Vec<String>,
-) -> Result<SelectWindowArgs, clap::Error> {
-    parse_command_args::<SelectWindowArgs>("select-window", arguments)?.validate()
-}
-
-/// Parses `swap-window` arguments and rejects the unsupported `-a` flag.
-pub(super) fn parse_swap_window_args(
-    arguments: Vec<String>,
-) -> Result<SwapWindowArgs, clap::Error> {
-    parse_command_args::<SwapWindowArgs>("swap-window", arguments)?.validate()
-}
-
 /// Arguments of `new-window`: placement, naming, environment and the command to run.
 #[derive(Debug, Clone, Args)]
-#[command(group(
-    ArgGroup::new("placement")
-        .required(false)
-        .multiple(false)
-        .args(["after", "before"])
-))]
+#[command(group(ArgGroup::new("placement").args(["after", "before"])))]
 pub(crate) struct NewWindowArgs {
     #[arg(short = 'a', action = ArgAction::SetTrue)]
     pub(crate) after: bool,
@@ -63,13 +45,6 @@ pub(crate) struct NewWindowArgs {
     pub(crate) queue_command: String,
 }
 
-impl QueuedCommand for NewWindowArgs {
-    /// Records the original `new-window` line so the dispatcher can queue it.
-    fn set_queue_command(&mut self, queue_command: String) {
-        self.queue_command = queue_command;
-    }
-}
-
 /// Arguments of `kill-window`, including `-a` to kill every other window instead.
 #[derive(Debug, Clone, Args)]
 pub(crate) struct KillWindowArgs {
@@ -88,12 +63,7 @@ pub(crate) struct WindowTargetArgs {
 
 /// Arguments of `select-window`: relative navigation flags plus an explicit target.
 #[derive(Debug, Clone, Args)]
-#[command(group(
-    ArgGroup::new("navigation")
-        .required(false)
-        .multiple(false)
-        .args(["last", "next", "previous"])
-))]
+#[command(group(ArgGroup::new("navigation").args(["last", "next", "previous"])))]
 pub(crate) struct SelectWindowArgs {
     #[arg(short = 'l', action = ArgAction::SetTrue, group = "navigation")]
     pub(crate) last: bool,
@@ -109,11 +79,11 @@ pub(crate) struct SelectWindowArgs {
     pub(crate) target: Option<TargetSpec>,
 }
 
-impl SelectWindowArgs {
+impl Validate for SelectWindowArgs {
     /// Rejects `select-window -Z`, which `rmux` does not implement.
-    fn validate(self) -> Result<Self, clap::Error> {
+    fn validate(self, command_name: &'static str) -> Result<Self, clap::Error> {
         if self.reject_zoom {
-            return Err(tmux_unknown_flag_error("select-window", "-Z"));
+            return Err(unknown_flag_error(command_name, "-Z"));
         }
         Ok(self)
     }
@@ -149,20 +119,9 @@ impl RawRenameWindowArgs {
                 clap::error::ErrorKind::TooFewValues,
                 "command rename-window: too few arguments (need at least 1)",
             )),
-            _ => Err(clap::Error::raw(
-                clap::error::ErrorKind::TooManyValues,
-                "command rename-window: too many arguments (need at most 1)",
-            )),
+            _ => Err(too_many_arguments_error("rename-window", 1)),
         }
     }
-}
-
-/// Builds the tmux-style `unknown flag` parse error for an accepted-but-unsupported flag.
-fn tmux_unknown_flag_error(command_name: &str, flag: &str) -> clap::Error {
-    clap::Error::raw(
-        clap::error::ErrorKind::UnknownArgument,
-        format!("command {command_name}: unknown flag {flag}"),
-    )
 }
 
 /// Arguments of `list-windows`: scope, formatting, filtering and sort order.
@@ -186,12 +145,7 @@ pub(crate) struct ListWindowsArgs {
 
 /// Arguments of `move-window`: source, destination and placement or reindex behavior.
 #[derive(Debug, Clone, Args)]
-#[command(group(
-    ArgGroup::new("position")
-        .required(false)
-        .multiple(false)
-        .args(["after", "before"])
-))]
+#[command(group(ArgGroup::new("position").args(["after", "before"])))]
 pub(crate) struct MoveWindowArgs {
     #[arg(short = 'a', action = ArgAction::SetTrue, group = "position")]
     pub(crate) after: bool,
@@ -222,11 +176,11 @@ pub(crate) struct SwapWindowArgs {
     pub(crate) target: Option<TargetSpec>,
 }
 
-impl SwapWindowArgs {
+impl Validate for SwapWindowArgs {
     /// Rejects `swap-window -a`, which `rmux` does not implement.
-    fn validate(self) -> Result<Self, clap::Error> {
+    fn validate(self, command_name: &'static str) -> Result<Self, clap::Error> {
         if self.reject_after {
-            return Err(tmux_unknown_flag_error("swap-window", "-a"));
+            return Err(unknown_flag_error(command_name, "-a"));
         }
         Ok(self)
     }
@@ -234,12 +188,7 @@ impl SwapWindowArgs {
 
 /// Arguments of `link-window`: source, destination and placement or kill behavior.
 #[derive(Debug, Clone, Args)]
-#[command(group(
-    ArgGroup::new("position")
-        .required(false)
-        .multiple(false)
-        .args(["after", "before"])
-))]
+#[command(group(ArgGroup::new("position").args(["after", "before"])))]
 pub(crate) struct LinkWindowArgs {
     #[arg(short = 'a', action = ArgAction::SetTrue, group = "position")]
     pub(crate) after: bool,
@@ -266,12 +215,7 @@ pub(crate) struct UnlinkWindowArgs {
 
 /// Arguments of `rotate-window`: rotation direction, zoom restore and target.
 #[derive(Debug, Clone, Args)]
-#[command(group(
-    ArgGroup::new("direction")
-        .required(false)
-        .multiple(false)
-        .args(["down", "up"])
-))]
+#[command(group(ArgGroup::new("direction").args(["down", "up"])))]
 pub(crate) struct RotateWindowArgs {
     #[arg(short = 'D', action = ArgAction::SetTrue, group = "direction")]
     pub(crate) down: bool,
@@ -296,12 +240,7 @@ impl RotateWindowArgs {
 
 /// Arguments of `resize-window`: directional or absolute sizing and the adjustment step.
 #[derive(Debug, Clone, Args)]
-#[command(group(
-    ArgGroup::new("balanced")
-        .required(false)
-        .multiple(false)
-        .args(["expand", "shrink"])
-))]
+#[command(group(ArgGroup::new("balanced").args(["expand", "shrink"])))]
 pub(crate) struct ResizeWindowArgs {
     #[arg(short = 'A', action = ArgAction::SetTrue, group = "balanced")]
     pub(crate) expand: bool,
@@ -361,11 +300,4 @@ pub(crate) struct FindWindowArgs {
     pub(crate) match_string: String,
     #[arg(skip = String::new())]
     pub(crate) queue_command: String,
-}
-
-impl QueuedCommand for FindWindowArgs {
-    /// Records the original `find-window` line so the dispatcher can queue it.
-    fn set_queue_command(&mut self, queue_command: String) {
-        self.queue_command = queue_command;
-    }
 }

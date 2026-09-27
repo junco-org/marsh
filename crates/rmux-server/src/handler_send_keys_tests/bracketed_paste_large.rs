@@ -12,10 +12,7 @@ async fn live_attach_large_bracketed_paste_survives_irregular_chunks() {
 
     create_quiet_input_session(&handler, &alpha).await;
 
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
 
     let input = large_bracketed_paste_bytes();
     let expected = bracketed_paste_body(&input);
@@ -57,10 +54,7 @@ async fn live_attach_one_mebibyte_bracketed_paste_has_bounded_work() {
     let requester_pid = std::process::id();
 
     create_quiet_input_session(&handler, &alpha).await;
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
 
     let body = vec![b'p'; ONE_MEBIBYTE];
     let mut input = Vec::with_capacity(body.len() + 12);
@@ -92,16 +86,8 @@ async fn live_attach_over_limit_bracketed_mode_uses_bounded_envelopes_product_di
     let requester_pid = std::process::id();
 
     create_quiet_input_session(&handler, &alpha).await;
-    {
-        let mut state = handler.state.lock().await;
-        state
-            .append_bytes_to_pane_transcript_for_test(&alpha, 0, 0, b"\x1b[?2004h")
-            .expect("pane enables bracketed paste mode");
-    }
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
+    append_pane_output(&handler, &alpha, b"\x1b[?2004h").await;
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
 
     let body = vec![b'p'; DEFAULT_MAX_FRAME_LENGTH + 64];
     let first_body_len = DEFAULT_MAX_FRAME_LENGTH - b"\x1b[200~".len() + 1;
@@ -139,10 +125,6 @@ async fn live_attach_over_limit_bracketed_mode_uses_bounded_envelopes_product_di
 
     capture.finish(&handler, &alpha).await;
     capture.assert_contents(&handler, &expected).await;
-}
-
-fn bracketed_paste_body(bytes: &[u8]) -> &[u8] {
-    &bytes[b"\x1b[200~".len()..bytes.len() - b"\x1b[201~".len()]
 }
 
 fn large_bracketed_paste_bytes() -> Vec<u8> {

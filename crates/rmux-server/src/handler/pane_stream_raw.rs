@@ -1,6 +1,7 @@
 use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::time::Instant;
 
+use marsh_lib::InitializationRoute;
 use rmux_core::events::{OutputCursorItem, DEFAULT_SUBSCRIPTION_BATCH_EVENTS};
 use rmux_proto::{
     ErrorResponse, PaneRawBytes, PaneRawRebaseReason, PaneStreamCursorRequest, PaneStreamEndReason,
@@ -10,9 +11,7 @@ use rmux_proto::{
 
 use crate::pane_io::{PaneBoundary, PaneObservationItem, PaneOutputReceiver};
 
-use super::super::subscription_support::{
-    cursor_event_limit, OutputSubscriptionState, RawInitializationRoute,
-};
+use super::super::subscription_support::{cursor_event_limit, OutputSubscriptionState};
 use super::protocol::detached_response_size;
 use super::types::RawPaneStream;
 use super::{
@@ -107,7 +106,8 @@ impl Drop for RawInitializationGuard {
         subscriptions
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .finish_raw_initialization(self.token);
+            .raw_initializations
+            .finish(self.token);
     }
 }
 
@@ -117,12 +117,12 @@ impl RequestHandler {
         connection_id: u64,
         subscription_id: rmux_proto::PaneOutputSubscriptionId,
         mut source: PaneStreamSource,
-        mut route: RawInitializationRoute,
+        mut route: InitializationRoute<Arc<CachedRawRebase>>,
         include_snapshot: bool,
     ) -> RawInitializationOutcome {
         loop {
             match route {
-                RawInitializationRoute::Ready(cached) => {
+                InitializationRoute::Ready(cached) => {
                     if let Some(receiver) = source.output.subscribe_at_boundary(cached.boundary) {
                         let rebase = Self::initial_rebase_from_cache(&cached, include_snapshot);
                         return RawInitializationOutcome::Complete(self.finish_raw_subscription(
@@ -155,13 +155,13 @@ impl RequestHandler {
                     subscriptions.discard_raw_rebase_if_current(&source.key, &cached);
                     route = subscriptions.raw_initialization_route(&source.key, include_snapshot);
                 }
-                RawInitializationRoute::Initialize { token } => {
+                InitializationRoute::Initialize { token } => {
                     return RawInitializationOutcome::Capture {
                         source,
                         guard: RawInitializationGuard::new(&self.subscriptions, token),
                     };
                 }
-                RawInitializationRoute::Wait(mut completion) => {
+                InitializationRoute::Wait(mut completion) => {
                     let _ = completion.changed().await;
                     let mut subscriptions = self
                         .subscriptions

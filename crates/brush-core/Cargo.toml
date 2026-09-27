@@ -1,7 +1,8 @@
 # Vendored from https://github.com/reubeno/brush brush-core 0.5.0 (crates.io), plus the
-# ExternalCommandSpawner seam of https://github.com/reubeno/brush/pull/1382. Redirected onto
-# crates.io's brush-core by the root [patch.crates-io]; delete this crate once the seam ships
-# in a released brush-core.
+# ExternalCommandSpawner seam of https://github.com/reubeno/brush/pull/1382 and a generic
+# ExecutionObserver seam (extensions.rs) that brackets builtins, the shell's code-running entry
+# points and every task it schedules. Redirected onto crates.io's brush-core by the root
+# [patch.crates-io]; delete this crate once both seams ship in a released brush-core.
 [package]
 name = "brush-core"
 description = "Reusable core of a POSIX/bash shell (used by brush-shell)"

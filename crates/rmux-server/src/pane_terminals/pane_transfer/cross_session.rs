@@ -4,6 +4,7 @@ use rmux_proto::{
     SessionName, SwapPaneResponse, WindowTarget,
 };
 
+use super::super::window_indices::window_ids_by_index;
 use super::super::{session_not_found, HandlerState};
 use super::window_metadata::PaneTransferWindowMetadata;
 use super::{join_pane_internal_direction, pane_id_for_target, pane_index_for_id};
@@ -14,7 +15,7 @@ use transaction::{
     cross_session_rollback_error, inserted_window_index_map, pane_option_snapshots_for_transfer,
     resize_two_sessions, restore_pane_options_after_transfer, rollback_cross_session_move,
     rollback_cross_session_swap, sync_pane_lifecycle_for_sessions,
-    synchronize_cross_session_transfer_families, window_ids_by_index, CrossSessionTransferSnapshot,
+    synchronize_cross_session_transfer_families, CrossSessionTransferSnapshot,
 };
 
 impl HandlerState {
@@ -367,7 +368,11 @@ impl HandlerState {
             (destination_session_name.clone(), destination_slot_before),
         ];
         let pane_option_snapshots = pane_option_snapshots_for_transfer(self, &slots_before)?;
-        let destination_window_ids_before = window_ids_by_index(self, &destination_session_name)?;
+        let destination_window_ids_before = window_ids_by_index(
+            self.sessions
+                .session(&destination_session_name)
+                .ok_or_else(|| session_not_found(&destination_session_name))?,
+        );
         let destination_group_members = self
             .sessions
             .session_group_members(&destination_session_name);

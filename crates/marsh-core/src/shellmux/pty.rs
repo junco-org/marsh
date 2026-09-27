@@ -16,6 +16,7 @@
 use std::os::fd::{AsFd as _, AsRawFd as _, BorrowedFd, FromRawFd as _, OwnedFd};
 
 use brush_core::openfiles::OpenFile;
+use nix::errno::Errno;
 
 /// Guard that disables the terminal's suspend character and restores it on drop.
 ///
@@ -142,28 +143,14 @@ pub fn open_pty(rows: u16, cols: u16) -> std::io::Result<(OwnedFd, OwnedFd)> {
     // `PtyMaster` already owns its descriptor, and so does the `OwnedFd` it converts into, so
     // every early return below still closes the master.
     let master = OwnedFd::from(master);
-
-    let request = libc::TIOCGPTPEER;
-    let flags = libc::O_RDWR | libc::O_CLOEXEC | libc::O_NOCTTY;
-    // SAFETY:
-    // This is calling a libc function on a live, unlocked pseudoterminal master. `TIOCGPTPEER`
-    // takes its argument by value, so no pointer is handed to the kernel.
-    let slave = unsafe { libc::ioctl(master.as_raw_fd(), request, flags) };
-    if slave < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-
-    // SAFETY:
-    // `slave` is a fresh descriptor the kernel just returned and nothing else owns it yet.
-    let slave = unsafe { OwnedFd::from_raw_fd(slave) };
-
+    let slave = open_peer(master.as_fd(), 0)?;
     resize_pty(slave.as_fd(), rows, cols)?;
     replace_suspend_char::<std::io::Error>(slave.as_fd(), nix::sys::termios::_POSIX_VDISABLE)?;
 
     Ok((master, slave))
 }
 
-/// Opens an independent file description on the slave side of `master`.
+/// Opens an independent file description on the slave side of `master`, with `extra` status flags.
 ///
 /// The descriptor a job's shell holds is not shareable for this: it is the shell's standard
 /// input, its flags are the shell's, and making it non-blocking would make the shell's own reads
@@ -171,7 +158,7 @@ pub fn open_pty(rows: u16, cols: u16) -> std::io::Result<(OwnedFd, OwnedFd)> {
 /// terminal, so the flags set here are this descriptor's alone — which is why an idle prompt may
 /// poll it without changing anything the shell or a launched program sees.
 ///
-/// `O_NONBLOCK` is therefore safe here and would not be on a `dup`. `O_CLOEXEC` is applied
+/// `O_NONBLOCK` is therefore safe in `extra` and would not be on a `dup`. `O_CLOEXEC` is applied
 /// atomically for the reason [`open_pty`] documents, and `O_NOCTTY` keeps this process from
 /// acquiring the terminal.
 ///
@@ -179,16 +166,12 @@ pub fn open_pty(rows: u16, cols: u16) -> std::io::Result<(OwnedFd, OwnedFd)> {
 ///
 /// Fails when the kernel refuses `TIOCGPTPEER`, which is what a master whose terminal is already
 /// gone reports.
-pub(crate) fn open_peer(master: BorrowedFd<'_>) -> std::io::Result<OwnedFd> {
-    let request = libc::TIOCGPTPEER;
-    let flags = libc::O_RDWR | libc::O_CLOEXEC | libc::O_NOCTTY | libc::O_NONBLOCK;
+pub(crate) fn open_peer(master: BorrowedFd<'_>, extra: libc::c_int) -> std::io::Result<OwnedFd> {
+    let flags = libc::O_RDWR | libc::O_CLOEXEC | libc::O_NOCTTY | extra;
     // SAFETY:
-    // This is calling a libc function on a live pseudoterminal master kept alive by the borrow.
-    // `TIOCGPTPEER` takes its argument by value, so no pointer is handed to the kernel.
-    let peer = unsafe { libc::ioctl(master.as_raw_fd(), request, flags) };
-    if peer < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
+    // This is calling a libc function on a live, unlocked pseudoterminal master kept alive by the
+    // borrow. `TIOCGPTPEER` takes its argument by value, so no pointer is handed to the kernel.
+    let peer = Errno::result(unsafe { libc::ioctl(master.as_raw_fd(), libc::TIOCGPTPEER, flags) })?;
     // SAFETY:
     // `peer` is a fresh descriptor the kernel just returned and nothing else owns it yet.
     Ok(unsafe { OwnedFd::from_raw_fd(peer) })
@@ -215,16 +198,10 @@ pub fn resize_pty(fd: BorrowedFd<'_>, rows: u16, cols: u16) -> std::io::Result<(
         ws_xpixel: 0,
         ws_ypixel: 0,
     };
-
-    let request = libc::TIOCSWINSZ;
     // SAFETY:
     // This is calling a libc function with a descriptor kept alive by the borrow and a pointer to
     // a live `winsize`, which is exactly what `TIOCSWINSZ` reads.
-    let result = unsafe { libc::ioctl(fd.as_raw_fd(), request, &raw const size) };
-    if result < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-
+    Errno::result(unsafe { libc::ioctl(fd.as_raw_fd(), libc::TIOCSWINSZ, &raw const size) })?;
     Ok(())
 }
 
@@ -247,16 +224,10 @@ pub fn terminal_size(fd: BorrowedFd<'_>) -> std::io::Result<(u16, u16)> {
         ws_xpixel: 0,
         ws_ypixel: 0,
     };
-
-    let request = libc::TIOCGWINSZ;
     // SAFETY:
     // This is calling a libc function with a descriptor kept alive by the borrow and a pointer to
     // a live `winsize`, which is exactly what `TIOCGWINSZ` fills in.
-    let result = unsafe { libc::ioctl(fd.as_raw_fd(), request, &raw mut size) };
-    if result < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-
+    Errno::result(unsafe { libc::ioctl(fd.as_raw_fd(), libc::TIOCGWINSZ, &raw mut size) })?;
     Ok((size.ws_row, size.ws_col))
 }
 
@@ -266,7 +237,13 @@ pub fn terminal_size(fd: BorrowedFd<'_>) -> std::io::Result<(u16, u16)> {
 )]
 #[cfg(test)]
 mod tests {
+    use nix::sys::termios::{_POSIX_VDISABLE, LocalFlags, SetArg, tcgetattr, tcsetattr};
+
     use super::*;
+    use crate::shellmux::testing::is_nonblocking;
+
+    /// Where the suspend character sits among a terminal's control characters.
+    const VSUSP: usize = nix::sys::termios::SpecialCharacterIndices::VSUSP as usize;
 
     /// The suspend character is the only thing the guard owns. Restoring a whole snapshot instead
     /// would silently revert whatever the session changed while the guard was alive — which is
@@ -277,45 +254,37 @@ mod tests {
         // The master is retained for the whole test: closing it would hang up the slave.
         let _master = pty.master;
         let terminal: OpenFile = std::fs::File::from(pty.slave).into();
-        let index = nix::sys::termios::SpecialCharacterIndices::VSUSP as usize;
+        let attributes = |what: &str| {
+            tcgetattr(terminal.try_borrow_as_fd().expect("borrow the terminal")).expect(what)
+        };
 
-        let borrowed = terminal.try_borrow_as_fd().expect("borrow the terminal");
-        let original =
-            nix::sys::termios::tcgetattr(borrowed).expect("read the original attributes");
-        let suspend_char = original.control_chars[index];
-        let echo_before = original
-            .local_flags
-            .contains(nix::sys::termios::LocalFlags::ECHO);
+        let original = attributes("read the original attributes");
+        let echo_before = original.local_flags.contains(LocalFlags::ECHO);
 
         let guard = SuspendKeyGuard::new(terminal.clone()).expect("disable the suspend character");
-        let borrowed = terminal.try_borrow_as_fd().expect("borrow the terminal");
-        let disabled = nix::sys::termios::tcgetattr(borrowed).expect("read the guarded attributes");
+        let mut toggled = attributes("read the guarded attributes");
         assert_eq!(
-            disabled.control_chars[index],
-            nix::sys::termios::_POSIX_VDISABLE,
+            toggled.control_chars[VSUSP], _POSIX_VDISABLE,
             "the guard disables the suspend character while it lives"
         );
 
         // An unrelated mode change, made while the guard is alive, that the guard must not undo.
-        let mut toggled = disabled;
-        toggled
-            .local_flags
-            .set(nix::sys::termios::LocalFlags::ECHO, !echo_before);
-        nix::sys::termios::tcsetattr(borrowed, nix::sys::termios::SetArg::TCSANOW, &toggled)
-            .expect("toggle ECHO");
+        toggled.local_flags.set(LocalFlags::ECHO, !echo_before);
+        tcsetattr(
+            terminal.try_borrow_as_fd().expect("borrow the terminal"),
+            SetArg::TCSANOW,
+            &toggled,
+        )
+        .expect("toggle ECHO");
         drop(guard);
 
-        let borrowed = terminal.try_borrow_as_fd().expect("borrow the terminal");
-        let restored =
-            nix::sys::termios::tcgetattr(borrowed).expect("read the restored attributes");
+        let restored = attributes("read the restored attributes");
         assert_eq!(
-            restored.control_chars[index], suspend_char,
+            restored.control_chars[VSUSP], original.control_chars[VSUSP],
             "the suspend character comes back"
         );
         assert_eq!(
-            restored
-                .local_flags
-                .contains(nix::sys::termios::LocalFlags::ECHO),
+            restored.local_flags.contains(LocalFlags::ECHO),
             !echo_before,
             "and the unrelated change made meanwhile survives"
         );
@@ -329,55 +298,36 @@ mod tests {
     fn a_new_pty_reports_the_size_it_was_opened_with() {
         let (master, slave) = open_pty(24, 80).expect("open a private pty");
 
+        let sizes = || {
+            (
+                terminal_size(master.as_fd()).expect("measure the master"),
+                terminal_size(slave.as_fd()).expect("measure the slave"),
+            )
+        };
         assert_eq!(
-            terminal_size(master.as_fd()).expect("measure the master"),
-            (24, 80),
-            "the master reports the size the pair was opened with"
+            sizes(),
+            ((24, 80), (24, 80)),
+            "both halves report the size the pair was opened with"
         );
-        assert_eq!(
-            terminal_size(slave.as_fd()).expect("measure the slave"),
-            (24, 80),
-            "and so does the slave the child would be given"
-        );
-
         resize_pty(master.as_fd(), 30, 100).expect("resize through the master");
         assert_eq!(
-            terminal_size(master.as_fd()).expect("re-measure the master"),
-            (30, 100),
-            "a resize is retained"
-        );
-        assert_eq!(
-            terminal_size(slave.as_fd()).expect("re-measure the slave"),
-            (30, 100),
-            "and the two descriptors share one window size"
+            sizes(),
+            ((30, 100), (30, 100)),
+            "a resize is retained, and the two descriptors share one window size"
         );
 
-        let attributes =
-            nix::sys::termios::tcgetattr(slave.as_fd()).expect("read the slave attributes");
-        let index = nix::sys::termios::SpecialCharacterIndices::VSUSP as usize;
+        let attributes = tcgetattr(slave.as_fd()).expect("read the slave attributes");
         assert_eq!(
-            attributes.control_chars[index],
-            nix::sys::termios::_POSIX_VDISABLE,
+            attributes.control_chars[VSUSP], _POSIX_VDISABLE,
             "Ctrl-Z never becomes a SIGTSTP on a freshly opened job terminal"
         );
 
-        // SAFETY:
-        // This is calling a libc function to read the status flags of a live descriptor.
-        let master_flags = unsafe { libc::fcntl(master.as_raw_fd(), libc::F_GETFL) };
-        assert!(master_flags >= 0, "read the master status flags");
-        assert_ne!(
-            master_flags & libc::O_NONBLOCK,
-            0,
+        assert!(
+            is_nonblocking(&master),
             "the master is non-blocking, so an async reactor can poll it"
         );
-
-        // SAFETY:
-        // This is calling a libc function to read the status flags of a live descriptor.
-        let slave_flags = unsafe { libc::fcntl(slave.as_raw_fd(), libc::F_GETFL) };
-        assert!(slave_flags >= 0, "read the slave status flags");
-        assert_eq!(
-            slave_flags & libc::O_NONBLOCK,
-            0,
+        assert!(
+            !is_nonblocking(&slave),
             "the slave stays blocking, so a child's output is not lost to EAGAIN"
         );
     }

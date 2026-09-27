@@ -4,36 +4,15 @@ use clap::{ArgAction, ArgGroup, Args};
 use rmux_core::tmux_precedence;
 use rmux_proto::{SelectPaneDirection, SplitDirection};
 
+use super::validate::{Validate, missing_value_error, selected_count, unknown_flag_error};
 use super::{TargetSpec, parse_command_args, parse_target_spec};
 
 /// Validates and parses `split-window` arguments from the tmux command line.
 pub(super) fn parse_split_window_args(
     arguments: Vec<String>,
 ) -> Result<SplitWindowArgs, clap::Error> {
-    validate_required_size_argument("split-window", &arguments)?;
+    validate_required_size_argument(&arguments)?;
     parse_command_args::<SplitWindowArgs>("split-window", arguments)
-}
-
-/// Parses `join-pane`/`move-pane` arguments under `command_name`.
-pub(super) fn parse_join_pane_args(
-    command_name: &'static str,
-    arguments: Vec<String>,
-) -> Result<JoinPaneArgs, clap::Error> {
-    parse_command_args::<JoinPaneArgs>(command_name, arguments)
-}
-
-/// Parses `select-pane` arguments and rejects conflicting flag combinations.
-pub(super) fn parse_select_pane_args(
-    arguments: Vec<String>,
-) -> Result<SelectPaneArgs, clap::Error> {
-    parse_command_args::<SelectPaneArgs>("select-pane", arguments)?.validate()
-}
-
-/// Parses `select-layout` arguments.
-pub(super) fn parse_select_layout_args(
-    arguments: Vec<String>,
-) -> Result<SelectLayoutArgs, clap::Error> {
-    parse_command_args::<SelectLayoutArgs>("select-layout", arguments)
 }
 
 /// Normalizes tmux `resize-pane` syntax quirks, then parses the arguments.
@@ -51,56 +30,27 @@ pub(super) fn parse_resize_pane_args(
 }
 
 /// Rejects a trailing `-l` that has no size value attached.
-fn validate_required_size_argument(
-    command_name: &'static str,
-    arguments: &[String],
-) -> Result<(), clap::Error> {
+fn validate_required_size_argument(arguments: &[String]) -> Result<(), clap::Error> {
     let mut index = 0;
-    while index < arguments.len() {
-        let argument = &arguments[index];
-        if argument == "--" {
+    while let Some(argument) = arguments.get(index) {
+        if argument == "--" || !argument.starts_with('-') {
             break;
         }
-        if argument == "-l" {
-            if arguments.get(index + 1).is_none() {
-                return Err(clap::Error::raw(
-                    clap::error::ErrorKind::ValueValidation,
-                    format!("command {command_name}: -l expects an argument"),
-                ));
-            }
-            index += 2;
-            continue;
+        if argument == "-l" && index + 1 == arguments.len() {
+            return Err(missing_value_error("split-window", "-l"));
         }
-        if split_window_option_takes_value(argument) {
-            index += 2;
-            continue;
-        }
-        if !argument.starts_with('-') {
-            break;
-        }
-        index += 1;
+        let takes_value = matches!(argument.as_str(), "-c" | "-e" | "-F" | "-l" | "-p" | "-t");
+        index += if takes_value { 2 } else { 1 };
     }
     Ok(())
 }
 
-/// Reports whether a `split-window` short flag consumes the following argument.
-fn split_window_option_takes_value(argument: &str) -> bool {
-    matches!(argument, "-c" | "-e" | "-F" | "-p" | "-t")
-}
-
-/// Rejects `-x` or `-y` that appear without their size value.
+/// Rejects a trailing `-x` or `-y` that has no size value after it.
 fn validate_required_absolute_resize_arguments(arguments: &[String]) -> Result<(), clap::Error> {
-    for (index, argument) in arguments.iter().enumerate() {
-        let missing =
-            matches!(argument.as_str(), "-x" | "-y") && arguments.get(index + 1).is_none();
-        if missing {
-            return Err(clap::Error::raw(
-                clap::error::ErrorKind::ValueValidation,
-                format!("command resize-pane: {argument} expects an argument"),
-            ));
-        }
+    match arguments.last().map(String::as_str) {
+        Some(flag @ ("-x" | "-y")) => Err(missing_value_error("resize-pane", flag)),
+        _ => Ok(()),
     }
-    Ok(())
 }
 
 /// An absolute `resize-pane` size given either in cells or as a percentage.
@@ -190,26 +140,15 @@ fn validate_resize_pane_tmux_direction_delta_syntax(
                 .get(index + 1)
                 .filter(|next| !next.starts_with('-'))
             {
-                match parse_resize_pane_delta(next) {
-                    Ok(_) => {}
-                    Err(message) if message.starts_with("adjustment too large") => {
-                        return Err(clap::Error::raw(
-                            clap::error::ErrorKind::ValueValidation,
-                            "adjustment too large",
-                        ));
-                    }
-                    Err(message) if message.starts_with("adjustment too small") => {
-                        return Err(clap::Error::raw(
-                            clap::error::ErrorKind::ValueValidation,
-                            "adjustment too small",
-                        ));
-                    }
-                    Err(_) => {
-                        return Err(clap::Error::raw(
-                            clap::error::ErrorKind::ValueValidation,
-                            "adjustment invalid",
-                        ));
-                    }
+                if let Err(message) = parse_resize_pane_delta(next) {
+                    let message = ["adjustment too large", "adjustment too small"]
+                        .into_iter()
+                        .find(|prefix| message.starts_with(prefix))
+                        .unwrap_or("adjustment invalid");
+                    return Err(clap::Error::raw(
+                        clap::error::ErrorKind::ValueValidation,
+                        message,
+                    ));
                 }
             }
             if arguments
@@ -228,10 +167,7 @@ fn validate_resize_pane_tmux_direction_delta_syntax(
                 format!("unexpected argument '{argument}'"),
             ));
         } else if let Some(flag) = attached_resize_pane_direction_flag(argument) {
-            return Err(clap::Error::raw(
-                clap::error::ErrorKind::UnknownArgument,
-                format!("command resize-pane: unknown flag -{flag}"),
-            ));
+            return Err(unknown_flag_error("resize-pane", &format!("-{flag}")));
         }
     }
 
@@ -251,47 +187,22 @@ fn attached_resize_pane_direction_flag(argument: &str) -> Option<char> {
     None
 }
 
-/// Which `resize-pane` dimension an absolute size applies to.
-#[derive(Clone, Copy)]
-enum ResizePaneAxis {
-    Width,
-    Height,
-}
-
-impl ResizePaneAxis {
-    /// The human-readable dimension name used in error messages.
-    const fn label(self) -> &'static str {
-        match self {
-            Self::Width => "width",
-            Self::Height => "height",
-        }
-    }
-}
-
 /// Validates every `-x` and `-y` value, whether separate or attached to the flag.
 fn validate_resize_pane_absolute_size_values(arguments: &[String]) -> Result<(), clap::Error> {
     let mut index = 0;
-    while index < arguments.len() {
-        match arguments[index].as_str() {
-            "-x" => {
-                if let Some(value) = arguments.get(index + 1) {
-                    validate_resize_pane_absolute_size_value(ResizePaneAxis::Width, value)?;
-                }
-                index += 2;
-            }
-            "-y" => {
-                if let Some(value) = arguments.get(index + 1) {
-                    validate_resize_pane_absolute_size_value(ResizePaneAxis::Height, value)?;
-                }
-                index += 2;
-            }
-            argument => {
-                if let Some(value) = short_flag_attached_value(argument, "-x") {
-                    validate_resize_pane_absolute_size_value(ResizePaneAxis::Width, value)?;
-                } else if let Some(value) = short_flag_attached_value(argument, "-y") {
-                    validate_resize_pane_absolute_size_value(ResizePaneAxis::Height, value)?;
+    while let Some(argument) = arguments.get(index) {
+        index += 1;
+        for (flag, dimension) in [("-x", "width"), ("-y", "height")] {
+            if argument == flag {
+                if let Some(value) = arguments.get(index) {
+                    validate_resize_pane_absolute_size_value(dimension, value)?;
                 }
                 index += 1;
+                break;
+            }
+            if let Some(value) = short_flag_attached_value(argument, flag) {
+                validate_resize_pane_absolute_size_value(dimension, value)?;
+                break;
             }
         }
     }
@@ -307,32 +218,23 @@ fn short_flag_attached_value<'a>(argument: &'a str, flag: &str) -> Option<&'a st
     Some(value.strip_prefix('=').unwrap_or(value))
 }
 
-/// Rejects an absolute size that is unparsable, negative or beyond `i32::MAX`.
+/// Rejects a `dimension` size that is unparsable, negative or beyond `i32::MAX`.
 fn validate_resize_pane_absolute_size_value(
-    axis: ResizePaneAxis,
+    dimension: &str,
     value: &str,
 ) -> Result<(), clap::Error> {
     let value = value.strip_suffix('%').unwrap_or(value);
     let value = value.strip_prefix('+').unwrap_or(value);
-    let parsed = value.parse::<i64>().map_err(|_| {
-        clap::Error::raw(
-            clap::error::ErrorKind::ValueValidation,
-            format!("{} invalid", axis.label()),
-        )
-    })?;
-    if parsed < 0 {
-        return Err(clap::Error::raw(
-            clap::error::ErrorKind::ValueValidation,
-            format!("{} too small", axis.label()),
-        ));
-    }
-    if parsed > i64::from(i32::MAX) {
-        return Err(clap::Error::raw(
-            clap::error::ErrorKind::ValueValidation,
-            format!("{} too large", axis.label()),
-        ));
-    }
-    Ok(())
+    let problem = match value.parse::<i64>() {
+        Err(_) => "invalid",
+        Ok(parsed) if parsed < 0 => "too small",
+        Ok(parsed) if parsed > i64::from(i32::MAX) => "too large",
+        Ok(_) => return Ok(()),
+    };
+    Err(clap::Error::raw(
+        clap::error::ErrorKind::ValueValidation,
+        format!("{dimension} {problem}"),
+    ))
 }
 
 /// Moves a trailing standalone delta next to its direction flag for `clap`.
@@ -460,12 +362,10 @@ fn resize_pane_has_standalone_trailing_delta_from(
 
 /// Parsed `split-window` command line.
 #[derive(Debug, Clone, Args)]
-#[command(disable_help_flag = true, group(
-    ArgGroup::new("direction")
-        .required(false)
-        .multiple(false)
-        .args(["horizontal", "vertical"])
-    ))]
+#[command(
+    disable_help_flag = true,
+    group(ArgGroup::new("direction").args(["horizontal", "vertical"]))
+)]
 pub(crate) struct SplitWindowArgs {
     #[arg(short = 'b', action = ArgAction::SetTrue)]
     pub(crate) before: bool,
@@ -503,12 +403,7 @@ pub(crate) struct SplitWindowArgs {
 
 /// Parsed `swap-pane` command line.
 #[derive(Debug, Clone, Args)]
-#[command(group(
-    ArgGroup::new("relative")
-        .required(false)
-        .multiple(false)
-        .args(["down", "up"])
-))]
+#[command(group(ArgGroup::new("relative").args(["down", "up"])))]
 pub(crate) struct SwapPaneArgs {
     #[arg(short = 'd', action = ArgAction::SetTrue)]
     pub(crate) detached: bool,
@@ -526,12 +421,10 @@ pub(crate) struct SwapPaneArgs {
 
 /// Parsed `join-pane` command line.
 #[derive(Debug, Clone, Args)]
-#[command(disable_help_flag = true, group(
-    ArgGroup::new("direction")
-        .required(false)
-        .multiple(false)
-        .args(["horizontal", "vertical"])
-))]
+#[command(
+    disable_help_flag = true,
+    group(ArgGroup::new("direction").args(["horizontal", "vertical"]))
+)]
 pub(crate) struct JoinPaneArgs {
     #[arg(short = 'b', action = ArgAction::SetTrue)]
     pub(crate) before: bool,
@@ -555,12 +448,7 @@ pub(crate) struct JoinPaneArgs {
 
 /// Parsed `break-pane` command line.
 #[derive(Debug, Clone, Args)]
-#[command(group(
-    ArgGroup::new("placement")
-        .required(false)
-        .multiple(false)
-        .args(["after", "before"])
-))]
+#[command(group(ArgGroup::new("placement").args(["after", "before"])))]
 pub(crate) struct BreakPaneArgs {
     #[arg(short = 'a', action = ArgAction::SetTrue)]
     pub(crate) after: bool,
@@ -693,17 +581,13 @@ pub(crate) struct ResizePaneArgs {
 impl ResizePaneArgs {
     /// Rejects more than one relative adjustment unless `-Z` or `-T` is present.
     fn validate(self) -> Result<Self, clap::Error> {
-        let relative_count = [
+        let relative_count = selected_count([
             self.down.is_some(),
             self.up.is_some(),
             self.left.is_some(),
             self.right.is_some(),
-        ]
-        .into_iter()
-        .filter(|present| *present)
-        .count();
-        let invalid = !self.zoom && !self.trim_below && relative_count > 1;
-        if invalid {
+        ]);
+        if !self.zoom && !self.trim_below && relative_count > 1 {
             return Err(clap::Error::raw(
                 clap::error::ErrorKind::ArgumentConflict,
                 "resize-pane accepts only one relative adjustment",
@@ -724,22 +608,11 @@ pub(crate) struct PaneTargetArgs {
 
 /// Parsed `select-pane` command line.
 #[derive(Debug, Clone, Args)]
-#[command(group(
-    ArgGroup::new("marking")
-        .required(false)
-        .multiple(false)
-        .args(["mark", "clear_marked"])
-), group(
-    ArgGroup::new("direction")
-        .required(false)
-        .multiple(false)
-        .args(["up", "down", "left", "right"])
-), group(
-    ArgGroup::new("input")
-        .required(false)
-        .multiple(false)
-        .args(["disable_input", "enable_input"])
-))]
+#[command(
+    group(ArgGroup::new("marking").args(["mark", "clear_marked"])),
+    group(ArgGroup::new("direction").args(["up", "down", "left", "right"])),
+    group(ArgGroup::new("input").args(["disable_input", "enable_input"]))
+)]
 pub(crate) struct SelectPaneArgs {
     #[arg(short = 'm', action = ArgAction::SetTrue, group = "marking")]
     pub(crate) mark: bool,
@@ -878,9 +751,9 @@ impl JoinPaneArgs {
     }
 }
 
-impl SelectPaneArgs {
+impl Validate for SelectPaneArgs {
     /// Rejects direction, `-P`, `-l` and marking flags used together.
-    fn validate(self) -> Result<Self, clap::Error> {
+    fn validate(self, _: &'static str) -> Result<Self, clap::Error> {
         if self.direction().is_some() && (self.mark || self.clear_marked || self.title.is_some()) {
             return Err(clap::Error::raw(
                 clap::error::ErrorKind::ArgumentConflict,
@@ -901,10 +774,11 @@ impl SelectPaneArgs {
                 "select-pane -l cannot be combined with -U, -D, -L, -R, -m, or -M",
             ));
         }
-
         Ok(self)
     }
+}
 
+impl SelectPaneArgs {
     /// The navigation direction requested, or `None` when no direction flag is set.
     pub(crate) const fn direction(&self) -> Option<SelectPaneDirection> {
         if self.up {

@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use crate::arithmetic::{self, ExpandAndEvaluate};
 use crate::commands::{self, CommandArg};
 use crate::env::{EnvironmentLookup, EnvironmentScope, valid_variable_name};
+use crate::extensions::ExecutionObserver as _;
 use crate::openfiles::{OpenFile, OpenFiles};
 use crate::results::{
     ExecutionExitCode, ExecutionResult, ExecutionSpawnResult, ExecutionWaitResult,
@@ -248,7 +249,7 @@ impl Execute for ast::CompoundList {
             let run_async = matches!(sep, ast::SeparatorOperator::Async);
 
             if run_async {
-                let job = spawn_async_ao_list_in_task(ao_list, shell, params);
+                let job = spawn_async_ao_list_in_task(ao_list, shell, params)?;
                 let job_formatted = job.to_pid_style_string();
 
                 if shell.options().interactive && !shell.is_subshell() {
@@ -276,7 +277,7 @@ fn spawn_async_ao_list_in_task<'a, SE: extensions::ShellExtensions>(
     ao_list: &ast::AndOrList,
     shell: &'a mut Shell<SE>,
     params: &ExecutionParameters,
-) -> &'a jobs::Job {
+) -> Result<&'a jobs::Job, error::Error> {
     // Clone the inputs.
     let mut cloned_shell = shell.clone();
     let mut cloned_params = params.clone();
@@ -290,17 +291,19 @@ fn spawn_async_ao_list_in_task<'a, SE: extensions::ShellExtensions>(
         cloned_params.set_fd(openfiles::OpenFiles::STDIN_FD, null);
     }
 
-    let join_handle = tokio::spawn(async move {
+    // The list runs as a task scheduled by the observer; a refusal fails the list rather than
+    // running it unobserved.
+    let join_handle = shell.execution_observer().spawn_task(async move {
         cloned_ao_list
             .execute(&mut cloned_shell, &cloned_params)
             .await
-    });
+    })?;
 
-    shell.jobs_mut().add_as_current(jobs::Job::new(
+    Ok(shell.jobs_mut().add_as_current(jobs::Job::new(
         [jobs::JobTask::Internal(join_handle)],
         ao_list.to_string(),
         jobs::JobState::Running,
-    ))
+    )))
 }
 
 #[async_trait::async_trait]
@@ -760,7 +763,9 @@ impl Execute for ast::CoprocessCommand {
             .set_fd(OpenFiles::STDOUT_FD, stdout_writer.into());
 
         let body = self.body.clone();
-        let join_handle = tokio::spawn(async move {
+        // The coprocess runs as a task scheduled by the observer; a refusal fails the command
+        // rather than running it unobserved.
+        let spawned = shell.execution_observer().spawn_task(async move {
             let pipeline_context = PipelineExecutionContext {
                 shell: commands::ShellForCommand::ParentShell(&mut child_shell),
                 process_group_id: None,
@@ -773,6 +778,15 @@ impl Execute for ast::CoprocessCommand {
                 ExecutionWaitResult::Stopped(_) => Ok(ExecutionResult::stopped()),
             }
         });
+        let join_handle = match spawned {
+            Ok(join_handle) => join_handle,
+            Err(err) => {
+                // Nothing will ever use the descriptors allocated for the refused coprocess.
+                shell.open_files_mut().remove_fd(stdout_fd);
+                shell.open_files_mut().remove_fd(stdin_fd);
+                return Err(err);
+            }
+        };
 
         let job = shell.jobs_mut().add_as_current(jobs::Job::new(
             [jobs::JobTask::Internal(join_handle)],
@@ -1939,17 +1953,6 @@ fn setup_process_substitution(
         }
     };
 
-    // Asynchronously spawn off the subshell; we intentionally don't block on its
-    // completion.
-    let subshell_cmd = subshell_cmd.to_owned();
-    tokio::spawn(async move {
-        // Intentionally ignore the result of the subshell command.
-        let _ = subshell_cmd
-            .list
-            .execute(&mut subshell, &child_params)
-            .await;
-    });
-
     // Starting at 63 (a.k.a. 64-1)--and decrementing--look for an
     // available fd.
     let mut candidate_fd_num = 63;
@@ -1959,6 +1962,20 @@ fn setup_process_substitution(
             return error::unimp("no available file descriptors");
         }
     }
+
+    // Asynchronously spawn off the subshell as a task scheduled by the observer; we
+    // intentionally don't block on its completion, so its handle is dropped once the observer
+    // has admitted it. A refusal fails the expansion rather than running the subshell
+    // unobserved.
+    let subshell_cmd = subshell_cmd.to_owned();
+    let subshell_task = shell.execution_observer().spawn_task(async move {
+        // Intentionally ignore the result of the subshell command.
+        let _ = subshell_cmd
+            .list
+            .execute(&mut subshell, &child_params)
+            .await;
+    })?;
+    drop(subshell_task);
 
     Ok((candidate_fd_num, target_file))
 }

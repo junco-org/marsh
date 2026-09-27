@@ -2,50 +2,24 @@ use super::*;
 
 async fn handler_with_split_session(name: &str) -> (RequestHandler, SessionName) {
     let handler = RequestHandler::new();
-    let session = session_name(name);
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: session.clone(),
-                detached: true,
-                size: Some(TerminalSize { cols: 80, rows: 24 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
-    assert!(matches!(
-        handler
-            .handle(Request::SplitWindow(SplitWindowRequest {
-                target: SplitWindowTarget::Pane(PaneTarget::with_window(session.clone(), 0, 0)),
-                direction: SplitDirection::Vertical,
-                before: false,
-                environment: None,
-            }))
-            .await,
-        Response::SplitWindow(_)
-    ));
+    let session = handler.create_session(name).await;
+    handler
+        .handle_ok(SplitWindowRequest::fixture(PaneTarget::with_window(
+            session.clone(),
+            0,
+            0,
+        )))
+        .await;
     (handler, session)
 }
 
-async fn execute(handler: &RequestHandler, command: &str) {
-    let parsed = CommandParser::new().parse(command).expect("command parses");
-    handler
-        .execute_parsed_commands_for_test(std::process::id(), parsed)
-        .await
-        .unwrap_or_else(|error| panic!("{command} should execute: {error}"));
-}
-
 async fn zoom_pane(handler: &RequestHandler, session: &SessionName, pane_index: u32) {
-    assert!(matches!(
-        handler
-            .handle(Request::ResizePane(rmux_proto::ResizePaneRequest {
-                target: PaneTarget::with_window(session.clone(), 0, pane_index),
-                adjustment: rmux_proto::ResizePaneAdjustment::Zoom,
-            }))
-            .await,
-        Response::ResizePane(_)
-    ));
+    handler
+        .handle_ok(rmux_proto::ResizePaneRequest {
+            target: PaneTarget::with_window(session.clone(), 0, pane_index),
+            adjustment: rmux_proto::ResizePaneAdjustment::Zoom,
+        })
+        .await;
 }
 
 async fn assert_zoomed_active(handler: &RequestHandler, session: &SessionName, pane_index: u32) {

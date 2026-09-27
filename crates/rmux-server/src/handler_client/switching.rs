@@ -1920,10 +1920,10 @@ mod tests {
             ),
             "{response:?}"
         );
-        assert!(matches!(
-            control_rx.try_recv(),
-            Err(mpsc::error::TryRecvError::Empty)
-        ));
+        assert_client_was_not_moved(
+            &mut control_rx,
+            "a switch rejected for a reused window index must not move the client",
+        );
         {
             let state = handler.state.lock().await;
             assert_eq!(
@@ -2068,10 +2068,15 @@ mod tests {
             ),
             "{response:?}"
         );
-        assert!(matches!(
-            control_rx.try_recv(),
-            Err(mpsc::error::TryRecvError::Empty)
-        ));
+        loop {
+            match control_rx.try_recv() {
+                Ok(ControlServerEvent::Refresh | ControlServerEvent::Notification(_)) => {}
+                Err(mpsc::error::TryRecvError::Empty) => break,
+                unexpected => panic!(
+                    "a stale control target must not switch or disconnect the client: {unexpected:?}"
+                ),
+            }
+        }
         let state = handler.state.lock().await;
         assert_eq!(
             state.environment.session_value(&beta, "DISPLAY"),

@@ -1,20 +1,10 @@
 use super::*;
-use rmux_proto::{
-    BindKeyRequest, HookLifecycle, ListKeysRequest, SetBufferRequest, SetHookMutationRequest,
-};
+use rmux_proto::{BindKeyRequest, ListKeysRequest};
 
 async fn set_command_alias(handler: &RequestHandler, alias: &str) {
-    assert!(matches!(
-        handler
-            .handle(Request::SetOption(SetOptionRequest {
-                scope: ScopeSelector::Global,
-                option: OptionName::CommandAlias,
-                value: alias.to_owned(),
-                mode: SetOptionMode::Replace,
-            }))
-            .await,
-        Response::SetOption(_)
-    ));
+    handler
+        .set_option(ScopeSelector::Global, OptionName::CommandAlias, alias)
+        .await;
 }
 
 #[tokio::test]
@@ -71,9 +61,7 @@ async fn runtime_command_alias_option_drives_source_file_parser() {
 
     assert_eq!(
         handler
-            .handle(Request::ShowBuffer(ShowBufferRequest {
-                name: Some("aliased".to_owned()),
-            }))
+            .handle(show_buffer_request("aliased"))
             .await
             .command_output()
             .expect("aliased buffer output")
@@ -88,16 +76,13 @@ async fn internal_canonical_execution_does_not_expand_aliases_again() {
     set_command_alias(&handler, "if-shell=display-message -p second").await;
 
     let response = handler
-        .handle(Request::SourceFile(Box::new(SourceFileRequest {
-            paths: vec![INTERNAL_CANONICAL_COMMAND_EXECUTION_PATH.to_owned()],
-            quiet: false,
-            parse_only: false,
-            verbose: false,
-            expand_paths: false,
-            target: None,
-            caller_cwd: None,
-            stdin: Some("if-shell -F 1 \"display-message -p first\"".to_owned()),
-        })))
+        .handle(
+            SourceFileRequest {
+                stdin: Some("if-shell -F 1 \"display-message -p first\"".to_owned()),
+                ..Fixture::fixture([INTERNAL_CANONICAL_COMMAND_EXECUTION_PATH])
+            }
+            .into_request(),
+        )
         .await;
 
     assert_eq!(
@@ -113,29 +98,17 @@ async fn internal_canonical_execution_does_not_expand_aliases_again() {
 async fn internal_canonical_execution_accepts_explicit_target_context() {
     let handler = RequestHandler::new();
     let alpha = session_name("canonical-target");
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: alpha.clone(),
-                detached: true,
-                size: Some(TerminalSize { cols: 80, rows: 24 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
+    handler.create_session(&alpha).await;
 
     let response = handler
-        .handle(Request::SourceFile(Box::new(SourceFileRequest {
-            paths: vec![INTERNAL_CANONICAL_COMMAND_EXECUTION_PATH.to_owned()],
-            quiet: false,
-            parse_only: false,
-            verbose: false,
-            expand_paths: false,
-            target: Some(PaneTarget::with_window(alpha, 0, 0)),
-            caller_cwd: None,
-            stdin: Some("display-message -p '#{session_name}:#{window_index}'".to_owned()),
-        })))
+        .handle(
+            SourceFileRequest {
+                target: Some(PaneTarget::with_window(alpha, 0, 0)),
+                stdin: Some("display-message -p '#{session_name}:#{window_index}'".to_owned()),
+                ..Fixture::fixture([INTERNAL_CANONICAL_COMMAND_EXECUTION_PATH])
+            }
+            .into_request(),
+        )
         .await;
 
     assert_eq!(
@@ -153,16 +126,13 @@ async fn internal_canonical_execution_keeps_deferred_branch_aliases_dynamic() {
     set_command_alias(&handler, "inner=display-message -p nested").await;
 
     let response = handler
-        .handle(Request::SourceFile(Box::new(SourceFileRequest {
-            paths: vec![INTERNAL_CANONICAL_COMMAND_EXECUTION_PATH.to_owned()],
-            quiet: false,
-            parse_only: false,
-            verbose: false,
-            expand_paths: false,
-            target: None,
-            caller_cwd: None,
-            stdin: Some("if-shell -F 1 inner".to_owned()),
-        })))
+        .handle(
+            SourceFileRequest {
+                stdin: Some("if-shell -F 1 inner".to_owned()),
+                ..Fixture::fixture([INTERNAL_CANONICAL_COMMAND_EXECUTION_PATH])
+            }
+            .into_request(),
+        )
         .await;
 
     assert_eq!(
@@ -178,19 +148,13 @@ async fn internal_canonical_execution_keeps_deferred_branch_aliases_dynamic() {
 async fn internal_canonical_execution_rejects_malformed_shapes() {
     let handler = RequestHandler::new();
     let response = handler
-        .handle(Request::SourceFile(Box::new(SourceFileRequest {
-            paths: vec![
-                INTERNAL_CANONICAL_COMMAND_EXECUTION_PATH.to_owned(),
-                "-".to_owned(),
-            ],
-            quiet: false,
-            parse_only: false,
-            verbose: false,
-            expand_paths: false,
-            target: None,
-            caller_cwd: None,
-            stdin: Some("display-message -p no".to_owned()),
-        })))
+        .handle(
+            SourceFileRequest {
+                stdin: Some("display-message -p no".to_owned()),
+                ..Fixture::fixture([INTERNAL_CANONICAL_COMMAND_EXECUTION_PATH, "-"])
+            }
+            .into_request(),
+        )
         .await;
 
     let Response::Error(error) = response else {
@@ -207,37 +171,14 @@ async fn runtime_command_alias_option_drives_hook_registration_parser() {
     let handler = RequestHandler::new();
     set_command_alias(&handler, "sbuf=set-buffer -b aliased").await;
 
-    let response = handler
-        .handle(Request::SetHookMutation(SetHookMutationRequest {
-            scope: ScopeSelector::Global,
-            hook: HookName::AfterSetBuffer,
-            command: Some("sbuf from-hook".to_owned()),
-            lifecycle: HookLifecycle::Persistent,
-            append: false,
-            unset: false,
-            run_immediately: false,
-            index: None,
-        }))
+    handler
+        .set_global_hook(HookName::AfterSetBuffer, "sbuf from-hook")
         .await;
-    assert!(matches!(response, Response::SetHook(_)), "{response:?}");
+    handler
+        .handle_ok(SetBufferRequest::fixture(("origin", b"origin")))
+        .await;
 
-    let response = handler
-        .handle(Request::SetBuffer(Box::new(SetBufferRequest {
-            name: Some("origin".to_owned()),
-            content: b"origin".to_vec(),
-            append: false,
-            new_name: None,
-            set_clipboard: false,
-            target_client: None,
-        })))
-        .await;
-    assert!(matches!(response, Response::SetBuffer(_)), "{response:?}");
-
-    let output = handler
-        .handle(Request::ShowBuffer(ShowBufferRequest {
-            name: Some("aliased".to_owned()),
-        }))
-        .await;
+    let output = handler.handle(show_buffer_request("aliased")).await;
     assert_eq!(
         output
             .command_output()
@@ -261,22 +202,10 @@ async fn runtime_command_alias_option_drives_hook_registration_parser() {
             .await,
         Response::SourceFile(rmux_proto::SourceFileResponse::no_output())
     );
-    let response = handler
-        .handle(Request::SetBuffer(Box::new(SetBufferRequest {
-            name: Some("source-origin".to_owned()),
-            content: b"origin".to_vec(),
-            append: false,
-            new_name: None,
-            set_clipboard: false,
-            target_client: None,
-        })))
+    handler
+        .handle_ok(SetBufferRequest::fixture(("source-origin", b"origin")))
         .await;
-    assert!(matches!(response, Response::SetBuffer(_)), "{response:?}");
-    let output = handler
-        .handle(Request::ShowBuffer(ShowBufferRequest {
-            name: Some("aliased".to_owned()),
-        }))
-        .await;
+    let output = handler.handle(show_buffer_request("aliased")).await;
     assert_eq!(
         output
             .command_output()
@@ -318,16 +247,9 @@ async fn runtime_command_alias_option_drives_binding_payload_parsers() {
         ),
         ("F11", vec!["sbuf from-protocol-string".to_owned()]),
     ] {
-        let response = handler
-            .handle(Request::BindKey(Box::new(BindKeyRequest {
-                table_name: "root".to_owned(),
-                key: key.to_owned(),
-                note: None,
-                repeat: false,
-                command: Some(command),
-            })))
+        handler
+            .handle_ok(BindKeyRequest::fixture(("root", key, command)))
             .await;
-        assert!(matches!(response, Response::BindKey(_)), "{response:?}");
     }
 
     let parsed = handler

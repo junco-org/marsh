@@ -259,12 +259,12 @@ fn report_verdict(provider: &str, verdict: &ProviderVerdict) {
     match verdict {
         Ok(completion) if completion.is_published() => debug!(
             provider,
-            exit_code = ?completion.exit_code,
+            exit_code = ?completion.exit_code(),
             "web-share tunnel provider ended"
         ),
         Ok(completion) => warn!(
             provider,
-            exit_code = ?completion.exit_code,
+            exit_code = ?completion.exit_code(),
             "web-share tunnel provider ended without approval:\n{}",
             managed_workload::completion_report(completion).trim_end()
         ),
@@ -281,7 +281,7 @@ fn report_verdict(provider: &str, verdict: &ProviderVerdict) {
 /// one where they disagree: a provider that exited zero and had its work refused did not fail to
 /// run, it failed to be approved, and only one of those is worth reinstalling a program over.
 fn ended_detail(completion: &CommandCompletion) -> String {
-    let status = completion.exit_code.map_or_else(
+    let status = completion.exit_code().map_or_else(
         || "ended without an exit status".to_owned(),
         |code| format!("exited with status {code}"),
     );

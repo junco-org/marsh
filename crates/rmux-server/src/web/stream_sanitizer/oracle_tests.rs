@@ -5,20 +5,10 @@ use rmux_core::{GridRenderOptions, ScreenCaptureRange, TerminalScreen};
 use rmux_proto::TerminalSize;
 use serde_json::{json, Value};
 
+use super::tests::{sanitize, sanitize_for_role, ROLES};
 use super::*;
 
 type OracleCase = (&'static str, &'static [u8], &'static [u8]);
-
-fn sanitize(input: &[u8]) -> Vec<u8> {
-    sanitize_for_role(WebShareConnectRole::Operator, input)
-}
-
-fn sanitize_for_role(role: WebShareConnectRole, input: &[u8]) -> Vec<u8> {
-    let mut sanitizer = WebTerminalSanitizer::for_role(role);
-    let mut output = Vec::new();
-    sanitizer.push(input, &mut output);
-    output
-}
 
 fn rmux_printable(input: &[u8]) -> Vec<u8> {
     let mut terminal = TerminalScreen::new(TerminalSize { cols: 120, rows: 1 }, 0);
@@ -92,11 +82,41 @@ fn assert_xterm_vectors(vectors: Vec<Value>) {
     );
 }
 
+/// A pinned-xterm vector named `name`: a 120-column, `rows`-row viewer fed `keyframe` must
+/// render the same screen as one fed `initial`.
+fn xterm_vector(name: &str, rows: u16, initial: &[u8], keyframe: &[u8]) -> Value {
+    json!({
+        "name": name,
+        "cols": 120,
+        "rows": rows,
+        "scrollback": 0,
+        "initial": initial,
+        "keyframe": keyframe,
+        "tail": []
+    })
+}
+
+/// One two-row [`xterm_vector`] per role, named `{name}-{role:?}`, whose keyframe is `input`
+/// sanitized for that role.
+fn role_vectors(name: &str, input: &[u8], expected: &[u8]) -> Vec<Value> {
+    ROLES
+        .into_iter()
+        .map(|role| {
+            xterm_vector(
+                &format!("{name}-{role:?}"),
+                2,
+                expected,
+                &sanitize_for_role(role, &[input]),
+            )
+        })
+        .collect()
+}
+
 #[test]
 fn sanitized_bytes_match_rmux_printable_text() {
     for (name, input, expected) in oracle_cases() {
         assert_eq!(rmux_printable(input), expected, "RMUX owner: {name}");
-        assert_eq!(sanitize(input), expected, "sanitized bytes: {name}");
+        assert_eq!(sanitize(&[input]), expected, "sanitized bytes: {name}");
     }
 }
 
@@ -107,15 +127,7 @@ fn sanitized_bytes_match_pinned_xterm_viewer() {
         .into_iter()
         .map(|(name, input, expected)| {
             assert_eq!(rmux_printable(input), expected, "RMUX owner: {name}");
-            json!({
-                "name": name,
-                "cols": 120,
-                "rows": 8,
-                "scrollback": 0,
-                "initial": expected,
-                "keyframe": sanitize(input),
-                "tail": []
-            })
+            xterm_vector(name, 8, expected, &sanitize(&[input]))
         })
         .collect::<Vec<_>>();
     assert_xterm_vectors(vectors);
@@ -142,23 +154,6 @@ fn rejected_osc_8_closes_prior_hyperlink_in_pinned_xterm() {
         "END",
     )
     .as_bytes();
-    let mut vectors = [
-        WebShareConnectRole::Operator,
-        WebShareConnectRole::Spectator,
-    ]
-    .into_iter()
-    .map(|role| {
-        json!({
-            "name": format!("rejected-osc-8-closes-prior-link-{role:?}"),
-            "cols": 120,
-            "rows": 2,
-            "scrollback": 0,
-            "initial": expected,
-            "keyframe": sanitize_for_role(role, input),
-            "tail": []
-        })
-    })
-    .collect::<Vec<_>>();
 
     let blocked_clipboard = concat!(
         "\u{1b}]8;;https://old.example\u{1b}\\",
@@ -176,24 +171,6 @@ fn rejected_osc_8_closes_prior_hyperlink_in_pinned_xterm() {
         "END",
     )
     .as_bytes();
-    vectors.extend(
-        [
-            WebShareConnectRole::Operator,
-            WebShareConnectRole::Spectator,
-        ]
-        .into_iter()
-        .map(|role| {
-            json!({
-                "name": format!("blocked-non-hyperlink-osc-keeps-prior-link-{role:?}"),
-                "cols": 120,
-                "rows": 2,
-                "scrollback": 0,
-                "initial": blocked_clipboard_expected,
-                "keyframe": sanitize_for_role(role, blocked_clipboard),
-                "tail": []
-            })
-        }),
-    );
 
     let spectator_metadata = concat!(
         "\u{1b}]8;;https://old.example\u{1b}\\",
@@ -204,15 +181,6 @@ fn rejected_osc_8_closes_prior_hyperlink_in_pinned_xterm() {
         "END",
     )
     .as_bytes();
-    vectors.push(json!({
-        "name": "spectator-metadata-removal-keeps-prior-link",
-        "cols": 120,
-        "rows": 2,
-        "scrollback": 0,
-        "initial": blocked_clipboard_expected,
-        "keyframe": sanitize_for_role(WebShareConnectRole::Spectator, spectator_metadata),
-        "tail": []
-    }));
 
     let rejected_then_allowed = concat!(
         "\u{1b}]8;;https://old.example\u{1b}\\",
@@ -234,24 +202,6 @@ fn rejected_osc_8_closes_prior_hyperlink_in_pinned_xterm() {
         "END",
     )
     .as_bytes();
-    vectors.extend(
-        [
-            WebShareConnectRole::Operator,
-            WebShareConnectRole::Spectator,
-        ]
-        .into_iter()
-        .map(|role| {
-            json!({
-                "name": format!("allowed-link-reopens-after-rejected-link-{role:?}"),
-                "cols": 120,
-                "rows": 2,
-                "scrollback": 0,
-                "initial": rejected_then_allowed_expected,
-                "keyframe": sanitize_for_role(role, rejected_then_allowed),
-                "tail": []
-            })
-        }),
-    );
 
     let cancelled = concat!(
         "\u{1b}]8;;https://old.example\u{1b}\\",
@@ -262,24 +212,32 @@ fn rejected_osc_8_closes_prior_hyperlink_in_pinned_xterm() {
         "END",
     )
     .as_bytes();
-    vectors.extend(
-        [
-            WebShareConnectRole::Operator,
-            WebShareConnectRole::Spectator,
-        ]
-        .into_iter()
-        .map(|role| {
-            json!({
-                "name": format!("cancelled-hyperlink-keeps-prior-link-{role:?}"),
-                "cols": 120,
-                "rows": 2,
-                "scrollback": 0,
-                "initial": blocked_clipboard_expected,
-                "keyframe": sanitize_for_role(role, cancelled),
-                "tail": []
-            })
-        }),
-    );
 
-    assert_xterm_vectors(vectors);
+    assert_xterm_vectors(
+        [
+            role_vectors("rejected-osc-8-closes-prior-link", input, expected),
+            role_vectors(
+                "blocked-non-hyperlink-osc-keeps-prior-link",
+                blocked_clipboard,
+                blocked_clipboard_expected,
+            ),
+            vec![xterm_vector(
+                "spectator-metadata-removal-keeps-prior-link",
+                2,
+                blocked_clipboard_expected,
+                &sanitize_for_role(WebShareConnectRole::Spectator, &[spectator_metadata]),
+            )],
+            role_vectors(
+                "allowed-link-reopens-after-rejected-link",
+                rejected_then_allowed,
+                rejected_then_allowed_expected,
+            ),
+            role_vectors(
+                "cancelled-hyperlink-keeps-prior-link",
+                cancelled,
+                blocked_clipboard_expected,
+            ),
+        ]
+        .concat(),
+    );
 }

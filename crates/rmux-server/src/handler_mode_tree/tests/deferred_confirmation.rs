@@ -2,7 +2,6 @@ use super::*;
 
 use super::super::mode_tree_model::{ModeTreeActionIdentity, ModeTreeDeferredAction};
 use super::super::mode_tree_order::session_item_id;
-use crate::pane_io::AttachControl;
 
 struct DeferredTreeFixture {
     handler: RequestHandler,
@@ -14,56 +13,17 @@ struct DeferredTreeFixture {
     second_id: rmux_proto::SessionId,
 }
 
-async fn create_session(
-    handler: &RequestHandler,
-    name: &str,
-) -> (SessionName, rmux_proto::SessionId) {
-    let session_name = SessionName::new(name).expect("valid session name");
-    let response = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name: session_name.clone(),
-            detached: true,
-            size: Some(TerminalSize { cols: 80, rows: 24 }),
-            environment: None,
-        }))
-        .await;
-    assert!(matches!(response, Response::NewSession(_)), "{response:?}");
-    let session_id = handler
-        .state
-        .lock()
-        .await
-        .sessions
-        .session(&session_name)
-        .expect("created session exists")
-        .id();
-    (session_name, session_id)
-}
-
 async fn deferred_tree_fixture(label: &str, pid_offset: u32) -> DeferredTreeFixture {
     let handler = RequestHandler::new();
-    let (host_name, _) = create_session(&handler, &format!("{label}-host")).await;
-    let (first_name, first_id) = create_session(&handler, &format!("{label}-first")).await;
-    let (second_name, second_id) = create_session(&handler, &format!("{label}-second")).await;
+    let host_name = handler.create_session(format!("{label}-host")).await;
+    let first_name = handler.create_session(format!("{label}-first")).await;
+    let first_id = handler.session_id_for_test(&first_name).await;
+    let second_name = handler.create_session(format!("{label}-second")).await;
+    let second_id = handler.session_id_for_test(&second_name).await;
 
     let attach_pid = std::process::id().saturating_add(pid_offset);
-    let (control_tx, control_rx) = mpsc::unbounded_channel();
-    handler
-        .register_attach(attach_pid, host_name, control_tx)
-        .await;
-    let parsed = CommandParser::new()
-        .parse_arguments(["choose-tree", "-s"])
-        .expect("choose-tree parses");
-    let command = RequestHandler::parse_mode_tree_queue_command(parsed.commands()[0].clone())
-        .expect("mode-tree command parses")
-        .expect("mode-tree command recognized");
-    handler
-        .execute_queued_mode_tree(
-            attach_pid,
-            command,
-            &QueueExecutionContext::without_caller_cwd(),
-        )
-        .await
-        .expect("choose-tree opens");
+    let control_rx = handler.attach_client(attach_pid, host_name).await;
+    open_mode_tree(&handler, attach_pid, &["choose-tree", "-s"]).await;
 
     DeferredTreeFixture {
         handler,
@@ -81,15 +41,10 @@ async fn set_current_selection(
     attach_pid: u32,
     session_id: rmux_proto::SessionId,
 ) {
-    handler
-        .active_attach
-        .lock()
-        .await
-        .by_pid
-        .get_mut(&attach_pid)
-        .and_then(|active| active.mode_tree.as_mut())
-        .expect("choose-tree remains active")
-        .selected_id = Some(session_item_id(session_id));
+    with_mode_tree(handler, attach_pid, |mode| {
+        mode.selected_id = Some(session_item_id(session_id));
+    })
+    .await;
 }
 
 async fn set_tagged_selection(
@@ -97,37 +52,11 @@ async fn set_tagged_selection(
     attach_pid: u32,
     session_id: rmux_proto::SessionId,
 ) {
-    let mut active_attach = handler.active_attach.lock().await;
-    let mode = active_attach
-        .by_pid
-        .get_mut(&attach_pid)
-        .and_then(|active| active.mode_tree.as_mut())
-        .expect("choose-tree remains active");
-    mode.tagged.clear();
-    mode.tagged.insert(session_item_id(session_id));
-}
-
-async fn confirm_prompt_and_wait_for_action(
-    handler: &RequestHandler,
-    attach_pid: u32,
-    control_rx: &mut mpsc::UnboundedReceiver<AttachControl>,
-) {
-    while control_rx.try_recv().is_ok() {}
-    handler
-        .handle_attached_live_input_for_test(attach_pid, b"y")
-        .await
-        .expect("confirmation input succeeds");
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        loop {
-            match control_rx.recv().await {
-                Some(AttachControl::Overlay(_)) => break,
-                Some(_) => {}
-                None => panic!("attach control channel closed before action refresh"),
-            }
-        }
+    with_mode_tree(handler, attach_pid, |mode| {
+        mode.tagged.clear();
+        mode.tagged.insert(session_item_id(session_id));
     })
-    .await
-    .expect("captured tree action refreshes the overlay");
+    .await;
 }
 
 async fn assert_only_first_was_killed(fixture: &DeferredTreeFixture) {
@@ -215,18 +144,13 @@ struct DeferredPaneFixture {
 
 async fn deferred_pane_fixture(label: &str, pid_offset: u32) -> DeferredPaneFixture {
     let handler = RequestHandler::new();
-    let (session_name, _) = create_session(&handler, label).await;
-    assert!(matches!(
-        handler
-            .handle(Request::SplitWindow(SplitWindowRequest {
-                target: SplitWindowTarget::Session(session_name.clone()),
-                direction: SplitDirection::Horizontal,
-                before: false,
-                environment: None,
-            }))
-            .await,
-        Response::SplitWindow(_)
-    ));
+    let session_name = handler.create_session(label).await;
+    handler
+        .handle_ok(SplitWindowRequest {
+            direction: SplitDirection::Horizontal,
+            ..Fixture::fixture(&session_name)
+        })
+        .await;
     let (host_pane_id, target, target_pane_id) = {
         let state = handler.state.lock().await;
         let window = state
@@ -248,24 +172,8 @@ async fn deferred_pane_fixture(label: &str, pid_offset: u32) -> DeferredPaneFixt
     };
 
     let attach_pid = std::process::id().saturating_add(pid_offset);
-    let (control_tx, control_rx) = mpsc::unbounded_channel();
-    handler
-        .register_attach(attach_pid, session_name, control_tx)
-        .await;
-    let parsed = CommandParser::new()
-        .parse_arguments(["choose-tree"])
-        .expect("choose-tree parses");
-    let command = RequestHandler::parse_mode_tree_queue_command(parsed.commands()[0].clone())
-        .expect("mode-tree command parses")
-        .expect("mode-tree command recognized");
-    handler
-        .execute_queued_mode_tree(
-            attach_pid,
-            command,
-            &QueueExecutionContext::without_caller_cwd(),
-        )
-        .await
-        .expect("choose-tree opens");
+    let control_rx = handler.attach_client(attach_pid, session_name).await;
+    open_mode_tree(&handler, attach_pid, &["choose-tree"]).await;
     let action_identity = handler
         .current_mode_tree_action_identity(attach_pid)
         .await
@@ -292,15 +200,7 @@ async fn deferred_pane_fixture(label: &str, pid_offset: u32) -> DeferredPaneFixt
             .expect("non-host pane action exists")
     };
     assert_ne!(host_pane_id, target_pane_id);
-    handler
-        .active_attach
-        .lock()
-        .await
-        .by_pid
-        .get_mut(&attach_pid)
-        .and_then(|active| active.mode_tree.as_mut())
-        .expect("mode-tree remains active")
-        .auto_accept = true;
+    with_mode_tree(&handler, attach_pid, |mode| mode.auto_accept = true).await;
 
     DeferredPaneFixture {
         handler,
@@ -347,20 +247,10 @@ async fn confirmed_pane_kill_rejects_a_respawned_output_generation() {
         .await
         .expect("confirmed kill reaches deferred commit");
 
-    let response = fixture
+    fixture
         .handler
-        .handle(Request::RespawnPane(Box::new(
-            rmux_proto::RespawnPaneRequest {
-                target: fixture.target.clone(),
-                kill: true,
-                start_directory: None,
-                environment: None,
-                command: None,
-                process_command: None,
-            },
-        )))
+        .handle_ok(rmux_proto::RespawnPaneRequest::fixture(&fixture.target))
         .await;
-    assert!(matches!(response, Response::RespawnPane(_)), "{response:?}");
     pause.release.notify_one();
 
     assert!(

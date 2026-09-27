@@ -38,12 +38,6 @@ use rmux_server::{ConfigFileSelection as ServerConfigFileSelection, DaemonConfig
 
 /// Process entrypoint: sets up the locale, dispatches, and exits with the chosen status.
 fn main() {
-    if let Some(exit_code) =
-        rmux_server::run_internal_fifo_reader_helper(std::env::args_os().skip(1))
-    {
-        std::process::exit(exit_code);
-    }
-
     match process_locale::initialize_process_locale()
         .map_err(|error| cli::ExitFailure::new(1, error))
         .and_then(|()| try_main(env::args_os()))

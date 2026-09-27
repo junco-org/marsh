@@ -3,6 +3,7 @@ use std::fs::{self, File};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
+use marsh_core::builtins::CommandContext;
 use rmux_core::command_parser::{CommandParseError, ParsedCommands};
 use rmux_proto::{PaneTarget, RmuxError, SourceFileRequest};
 
@@ -254,7 +255,7 @@ pub(super) fn source_inputs_for_path(
     stdin: Option<&str>,
     read_policy: SourceReadPolicy,
 ) -> Result<Vec<SourceInput>, RmuxError> {
-    let read = source_inputs_for_path_with_diagnostics(path, cwd, quiet, stdin, read_policy)?;
+    let read = source_inputs_for_path_with_diagnostics(path, cwd, quiet, stdin, read_policy, None)?;
     if let Some(error) = read.error {
         return Err(error);
     }
@@ -267,6 +268,7 @@ pub(super) fn source_inputs_for_path_with_diagnostics(
     quiet: bool,
     stdin: Option<&str>,
     read_policy: SourceReadPolicy,
+    context: Option<&CommandContext>,
 ) -> Result<SourcePathRead, RmuxError> {
     if is_unix_null_config_path(path) {
         return Ok(SourcePathRead {
@@ -299,9 +301,18 @@ pub(super) fn source_inputs_for_path_with_diagnostics(
     }
     let pattern = glob_pattern_for_source_path(path, cwd);
     let has_glob_metachars = source_path_has_glob_metachars(path);
-    let entries = glob::glob(&pattern).map_err(|error| {
-        RmuxError::Server(format!("invalid source-file glob '{path}': {error}"))
-    })?;
+    let entries = match context {
+        Some(context) => either::Either::Left(context.glob(path, cwd).map_err(|error| {
+            RmuxError::Server(format!("invalid source-file glob '{path}': {error}"))
+        })?),
+        None => either::Either::Right(
+            glob::glob(&pattern)
+                .map_err(|error| {
+                    RmuxError::Server(format!("invalid source-file glob '{path}': {error}"))
+                })?
+                .map(|entry| entry.map_err(io::Error::other)),
+        ),
+    };
 
     let mut inputs = Vec::new();
     let mut errors = Vec::new();
@@ -316,7 +327,7 @@ pub(super) fn source_inputs_for_path_with_diagnostics(
                 "source-file glob '{path}' matched too many files (maximum {MAX_SOURCE_MATCHED_FILES})"
             )));
         }
-        match read_source_entry(&entry, read_policy) {
+        match read_source_entry(&entry, read_policy, context) {
             Ok(contents) => {
                 aggregate_bytes = reserve_source_contents(aggregate_bytes, contents.len(), path)?;
                 inputs.push(SourceInput {
@@ -390,18 +401,23 @@ fn source_entry_read_error(entry: &Path, error: &io::Error) -> RmuxError {
     ))
 }
 
-fn read_source_entry(entry: &Path, read_policy: SourceReadPolicy) -> io::Result<String> {
+fn read_source_entry(
+    entry: &Path,
+    read_policy: SourceReadPolicy,
+    context: Option<&CommandContext>,
+) -> io::Result<String> {
     match read_policy {
-        SourceReadPolicy::Strict => read_limited_source_entry(entry),
-        SourceReadPolicy::BestEffort => read_tmux_compat_source_entry(entry),
+        SourceReadPolicy::Strict => read_limited_source_entry(entry, context),
+        SourceReadPolicy::BestEffort => read_tmux_compat_source_entry(entry, context),
     }
 }
 
-fn read_limited_source_entry(entry: &Path) -> io::Result<String> {
-    let metadata = fs::metadata(entry)?;
+fn read_limited_source_entry(entry: &Path, context: Option<&CommandContext>) -> io::Result<String> {
+    let metadata =
+        context.map_or_else(|| fs::metadata(entry), |context| context.metadata(entry))?;
     validate_strict_source_metadata(&metadata)?;
 
-    let file = open_strict_source_entry(entry)?;
+    let file = open_strict_source_entry(entry, context)?;
     let metadata = file.metadata()?;
     validate_strict_source_metadata(&metadata)?;
     let mut contents = Vec::new();
@@ -432,23 +448,28 @@ fn validate_strict_source_metadata(metadata: &fs::Metadata) -> io::Result<()> {
     Ok(())
 }
 
-fn open_strict_source_entry(entry: &Path) -> io::Result<File> {
-    use rustix::fs::{open, Mode, OFlags};
-
-    let fd = open(
-        entry,
-        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NONBLOCK,
-        Mode::empty(),
+fn open_strict_source_entry(entry: &Path, context: Option<&CommandContext>) -> io::Result<File> {
+    use rustix::fs::OFlags;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut options = fs::OpenOptions::new();
+    options.read(true).custom_flags(
+        i32::try_from((OFlags::CLOEXEC | OFlags::NONBLOCK).bits()).map_err(io::Error::other)?,
+    );
+    context.map_or_else(
+        || options.open(entry),
+        |context| context.open(entry, &options),
     )
-    .map_err(io::Error::from)?;
-    Ok(File::from(fd))
 }
 
-fn read_tmux_compat_source_entry(entry: &Path) -> io::Result<String> {
-    let preopen_metadata = fs::metadata(entry)?;
+fn read_tmux_compat_source_entry(
+    entry: &Path,
+    context: Option<&CommandContext>,
+) -> io::Result<String> {
+    let preopen_metadata =
+        context.map_or_else(|| fs::metadata(entry), |context| context.metadata(entry))?;
     validate_tmux_compat_regular_metadata(&preopen_metadata)?;
 
-    let file = open_tmux_compat_regular_file(entry)?;
+    let file = open_strict_source_entry(entry, context)?;
     let metadata = file.metadata()?;
     validate_tmux_compat_regular_metadata(&metadata)?;
 
@@ -472,18 +493,6 @@ fn validate_tmux_compat_regular_metadata(metadata: &fs::Metadata) -> io::Result<
         return Err(oversized_source_config_error());
     }
     Ok(())
-}
-
-fn open_tmux_compat_regular_file(entry: &Path) -> io::Result<File> {
-    use rustix::fs::{open, Mode, OFlags};
-
-    let fd = open(
-        entry,
-        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NONBLOCK,
-        Mode::empty(),
-    )
-    .map_err(io::Error::from)?;
-    Ok(File::from(fd))
 }
 
 fn oversized_source_config_error() -> io::Error {
@@ -723,6 +732,7 @@ mod tests {
             false,
             None,
             SourceReadPolicy::Strict,
+            None,
         )
         .expect("strict glob source should keep readable matches");
         let _ = std::fs::remove_file(&first);
@@ -992,13 +1002,14 @@ pub(crate) fn managed_source_read(
     cwd: Option<&Path>,
     quiet: bool,
     strict: bool,
+    context: Option<&CommandContext>,
 ) -> ManagedSourceFile {
     let policy = if strict {
         SourceReadPolicy::Strict
     } else {
         SourceReadPolicy::BestEffort
     };
-    match source_inputs_for_path_with_diagnostics(path, cwd, quiet, None, policy) {
+    match source_inputs_for_path_with_diagnostics(path, cwd, quiet, None, policy, context) {
         Ok(read) => ManagedSourceFile::Read(read),
         Err(error) => ManagedSourceFile::Failed(error),
     }

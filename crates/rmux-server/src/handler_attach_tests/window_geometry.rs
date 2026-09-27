@@ -1,7 +1,7 @@
 use super::*;
 
-use crate::control::{ControlModeUpgrade, ControlServerEvent, CONTROL_SERVER_EVENT_CAPACITY};
-use rmux_proto::{BreakPaneRequest, ControlMode, ResizeWindowAdjustment, ResizeWindowRequest};
+use crate::control::ControlServerEvent;
+use rmux_proto::{BreakPaneRequest, ResizeWindowAdjustment, ResizeWindowRequest};
 
 const EXTERNAL_SIZE: TerminalSize = TerminalSize {
     cols: 101,
@@ -35,53 +35,27 @@ async fn attached_status_split_and_last_detach_keep_terminal_and_content_geometr
         STATUS_ON_CONTENT_SIZE,
     )
     .await;
+    let pane_0 = PaneTarget::with_window(session_name.clone(), 0, 0);
+    let pane_1 = PaneTarget::with_window(session_name.clone(), 0, 1);
     assert_eq!(
-        pane_terminal_size(&handler, &session_name, 0, 0).await,
+        handler.pane_terminal_size_for_test(&pane_0).await,
         STATUS_ON_CONTENT_SIZE
     );
 
-    assert!(matches!(
-        handler
-            .handle(Request::SplitWindow(SplitWindowRequest {
-                target: SplitWindowTarget::Session(session_name.clone()),
-                direction: rmux_proto::SplitDirection::Vertical,
-                before: false,
-                environment: None,
-            }))
-            .await,
-        Response::SplitWindow(_)
-    ));
+    handler
+        .handle_ok(SplitWindowRequest::fixture(&session_name))
+        .await;
     assert_pane_rows(&handler, &session_name, 0, &[20, 19]).await;
-    assert_eq!(
-        pane_terminal_size(&handler, &session_name, 0, 0).await.rows,
-        20
-    );
-    assert_eq!(
-        pane_terminal_size(&handler, &session_name, 0, 1).await.rows,
-        19
-    );
+    assert_eq!(handler.pane_terminal_size_for_test(&pane_0).await.rows, 20);
+    assert_eq!(handler.pane_terminal_size_for_test(&pane_1).await.rows, 19);
 
     let control_pid = 91_802;
-    let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(CONTROL_SERVER_EVENT_CAPACITY);
-    let control_id = handler
-        .register_control_with_closing(
-            control_pid,
-            ControlModeUpgrade {
-                initial_command_count: 0,
-                mode: ControlMode::Plain,
-                terminal_context: OuterTerminalContext::default(),
-            },
-            event_tx,
-            Arc::new(AtomicBool::new(false)),
-        )
+    let (control_id, mut event_rx) = handler
+        .register_control_for_test(control_pid, Some(&session_name))
         .await;
-    handler
-        .set_control_session(control_pid, Some(session_name.clone()))
-        .await
-        .expect("control client selects geometry session");
     drain_control_events(&mut event_rx).await;
 
-    set_status(&handler, &session_name, "3").await;
+    handler.set_session_status(&session_name, "3").await;
     let notifications = drain_control_events(&mut event_rx).await;
     let layout_changes = notifications
         .iter()
@@ -106,23 +80,17 @@ async fn attached_status_split_and_last_detach_keep_terminal_and_content_geometr
     )
     .await;
     assert_pane_rows(&handler, &session_name, 0, &[19, 18]).await;
-    assert_eq!(
-        pane_terminal_size(&handler, &session_name, 0, 0).await.rows,
-        19
-    );
-    assert_eq!(
-        pane_terminal_size(&handler, &session_name, 0, 1).await.rows,
-        18
-    );
+    assert_eq!(handler.pane_terminal_size_for_test(&pane_0).await.rows, 19);
+    assert_eq!(handler.pane_terminal_size_for_test(&pane_1).await.rows, 18);
 
     handler.finish_control(control_pid, control_id).await;
     let attach_identity = handler.active_attach_identity_for_test(attach_pid).await;
     handler
         .finish_attach(attach_pid, attach_identity.attach_id())
         .await;
-    set_status(&handler, &session_name, "on").await;
+    handler.set_session_status(&session_name, "on").await;
     assert_window_size(&handler, &session_name, 0, STATUS_THREE_CONTENT_SIZE).await;
-    set_status(&handler, &session_name, "off").await;
+    handler.set_session_status(&session_name, "off").await;
     assert_window_size(&handler, &session_name, 0, STATUS_THREE_CONTENT_SIZE).await;
     assert_pane_rows(&handler, &session_name, 0, &[19, 18]).await;
 }
@@ -137,10 +105,16 @@ async fn attached_new_break_resize_and_formats_use_content_geometry() {
         .handle_attached_resize(attach_pid, EXTERNAL_SIZE)
         .await
         .expect("101x41 attached resize succeeds");
-    set_status(&handler, &session_name, "3").await;
+    handler.set_session_status(&session_name, "3").await;
 
-    let active_window = new_window(&handler, &session_name, false).await;
-    let detached_window = new_window(&handler, &session_name, true).await;
+    let active_window = handler
+        .create_window(NewWindowRequest {
+            detached: false,
+            ..Fixture::fixture(&session_name)
+        })
+        .await
+        .window_index();
+    let detached_window = handler.create_window(&session_name).await.window_index();
     assert_eq!(active_window, 1);
     assert_eq!(detached_window, 2);
     for window_index in 0..=2 {
@@ -151,8 +125,9 @@ async fn attached_new_break_resize_and_formats_use_content_geometry() {
             STATUS_THREE_CONTENT_SIZE,
         )
         .await;
+        let pane = PaneTarget::with_window(session_name.clone(), window_index, 0);
         assert_eq!(
-            pane_terminal_size(&handler, &session_name, window_index, 0).await,
+            handler.pane_terminal_size_for_test(&pane).await,
             STATUS_THREE_CONTENT_SIZE
         );
     }
@@ -168,38 +143,17 @@ async fn attached_new_break_resize_and_formats_use_content_geometry() {
         EXTERNAL_SIZE
     );
 
-    assert!(matches!(
-        handler
-            .handle(Request::SplitWindow(SplitWindowRequest {
-                target: SplitWindowTarget::Pane(PaneTarget::with_window(
-                    session_name.clone(),
-                    active_window,
-                    0,
-                )),
-                direction: rmux_proto::SplitDirection::Vertical,
-                before: false,
-                environment: None,
-            }))
-            .await,
-        Response::SplitWindow(_)
-    ));
-    assert_pane_rows(&handler, &session_name, active_window, &[19, 18]).await;
-    let response = handler
-        .handle(Request::BreakPane(Box::new(BreakPaneRequest {
-            source: PaneTarget::with_window(session_name.clone(), active_window, 1),
-            target: None,
-            name: None,
-            detached: true,
-            after: false,
-            before: false,
-            print_target: false,
-            format: None,
-        })))
+    let active_pane = PaneTarget::with_window(session_name.clone(), active_window, 0);
+    handler
+        .handle_ok(SplitWindowRequest::fixture(&active_pane))
         .await;
-    let Response::BreakPane(response) = response else {
-        panic!("break-pane succeeds: {response:?}");
-    };
-    let broken_window = response.target.window_index();
+    assert_pane_rows(&handler, &session_name, active_window, &[19, 18]).await;
+    let broken_pane = PaneTarget::with_window(session_name.clone(), active_window, 1);
+    let broken_window = handler
+        .handle_ok(BreakPaneRequest::fixture(broken_pane))
+        .await
+        .target
+        .window_index();
     assert_eq!(broken_window, 3);
     for window_index in [active_window, broken_window] {
         assert_window_size(
@@ -209,14 +163,15 @@ async fn attached_new_break_resize_and_formats_use_content_geometry() {
             STATUS_THREE_CONTENT_SIZE,
         )
         .await;
+        let pane = PaneTarget::with_window(session_name.clone(), window_index, 0);
         assert_eq!(
-            pane_terminal_size(&handler, &session_name, window_index, 0).await,
+            handler.pane_terminal_size_for_test(&pane).await,
             STATUS_THREE_CONTENT_SIZE
         );
     }
 
     let list_windows = handler
-        .handle(Request::ListWindows(Box::new(ListWindowsRequest {
+        .handle_ok(ListWindowsRequest {
             target: session_name.clone(),
             format: Some(
                 "#{window_index}:#{window_width}x#{window_height}:#{pane_height}".to_owned(),
@@ -224,28 +179,22 @@ async fn attached_new_break_resize_and_formats_use_content_geometry() {
             filter: None,
             sort_order: None,
             reversed: false,
-        })))
+        })
         .await;
-    let Response::ListWindows(list_windows) = list_windows else {
-        panic!("list-windows succeeds: {list_windows:?}");
-    };
     assert_eq!(
         list_windows.output.stdout(),
         b"0:101x38:38\n1:101x38:38\n2:101x38:38\n3:101x38:38\n"
     );
     let list_inactive_pane = handler
-        .handle(Request::ListPanes(Box::new(ListPanesRequest {
+        .handle_ok(ListPanesRequest {
             target: session_name.clone(),
             format: Some("#{pane_width}x#{pane_height}".to_owned()),
             filter: None,
             sort_order: None,
             reversed: false,
             target_window_index: Some(detached_window),
-        })))
+        })
         .await;
-    let Response::ListPanes(list_inactive_pane) = list_inactive_pane else {
-        panic!("list-panes succeeds: {list_inactive_pane:?}");
-    };
     assert_eq!(list_inactive_pane.output.stdout(), b"101x38\n");
 
     resize_window(
@@ -339,7 +288,7 @@ async fn attached_new_break_resize_and_formats_use_content_geometry() {
         ),
         Some("manual")
     );
-    set_status(&handler, &session_name, "on").await;
+    handler.set_session_status(&session_name, "on").await;
     assert_window_size(
         &handler,
         &session_name,
@@ -347,7 +296,7 @@ async fn attached_new_break_resize_and_formats_use_content_geometry() {
         TerminalSize { cols: 90, rows: 30 },
     )
     .await;
-    set_status(&handler, &session_name, "off").await;
+    handler.set_session_status(&session_name, "off").await;
     assert_window_size(
         &handler,
         &session_name,
@@ -355,40 +304,6 @@ async fn attached_new_break_resize_and_formats_use_content_geometry() {
         TerminalSize { cols: 90, rows: 30 },
     )
     .await;
-}
-
-async fn set_status(handler: &RequestHandler, session_name: &SessionName, value: &str) {
-    assert!(matches!(
-        handler
-            .handle(Request::SetOption(SetOptionRequest {
-                scope: ScopeSelector::Session(session_name.clone()),
-                option: OptionName::Status,
-                value: value.to_owned(),
-                mode: SetOptionMode::Replace,
-            }))
-            .await,
-        Response::SetOption(_)
-    ));
-}
-
-async fn new_window(handler: &RequestHandler, session_name: &SessionName, detached: bool) -> u32 {
-    let response = handler
-        .handle(Request::NewWindow(Box::new(NewWindowRequest {
-            target: session_name.clone(),
-            name: None,
-            detached,
-            environment: None,
-            command: None,
-            process_command: None,
-            start_directory: None,
-            target_window_index: None,
-            insert_at_target: false,
-        })))
-        .await;
-    let Response::NewWindow(response) = response else {
-        panic!("new-window succeeds: {response:?}");
-    };
-    response.target.window_index()
 }
 
 async fn resize_window(
@@ -399,17 +314,14 @@ async fn resize_window(
     height: Option<u16>,
     adjustment: Option<ResizeWindowAdjustment>,
 ) {
-    assert!(matches!(
-        handler
-            .handle(Request::ResizeWindow(ResizeWindowRequest {
-                target: WindowTarget::with_window(session_name.clone(), window_index),
-                width,
-                height,
-                adjustment,
-            }))
-            .await,
-        Response::ResizeWindow(_)
-    ));
+    handler
+        .handle_ok(ResizeWindowRequest {
+            target: WindowTarget::with_window(session_name.clone(), window_index),
+            width,
+            height,
+            adjustment,
+        })
+        .await;
 }
 
 async fn assert_session_geometry(

@@ -1,16 +1,14 @@
-use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
 use std::time::Duration;
 
 use rmux_core::LifecycleEvent;
 use rmux_proto::{
-    ControlMode, PaneKillRequest, PaneResizeRequest, PaneTargetRef, Request, ResizePaneAdjustment,
-    Response, SessionName, TerminalSize,
+    PaneKillRequest, PaneResizeRequest, PaneTargetRef, Request, ResizePaneAdjustment, Response,
+    SessionName, TerminalSize,
 };
 use tokio::sync::{mpsc, oneshot};
 
 use super::RequestHandler;
-use crate::control::{ControlModeUpgrade, ControlServerEvent, CONTROL_SERVER_EVENT_CAPACITY};
+use crate::control::ControlServerEvent;
 
 #[path = "handler_layout_notification_tests/linked_transfer_aliases.rs"]
 mod linked_transfer_aliases;
@@ -108,7 +106,10 @@ async fn layout_command_sites_keep_one_canonical_notification_per_mutation_produ
         if let Some(command) = case.warmup {
             run_detached_command(&handler, &render_command(command, &session)).await;
         }
-        let (control_pid, mut notifications) = register_control_client(&handler, &session).await;
+        let control_pid = std::process::id();
+        let (_, mut notifications) = handler
+            .register_control_for_test(control_pid, Some(&session))
+            .await;
         let _ = settle_control_notifications(&mut notifications).await;
 
         run_control_command(
@@ -143,7 +144,10 @@ async fn custom_layout_resize_has_one_layout_notification_not_two() {
     };
     run_detached_command(&handler, &format!("resize-window -t {session} -x 80 -y 24")).await;
 
-    let (control_pid, mut notifications) = register_control_client(&handler, &session).await;
+    let control_pid = std::process::id();
+    let (_, mut notifications) = handler
+        .register_control_for_test(control_pid, Some(&session))
+        .await;
     let _ = settle_control_notifications(&mut notifications).await;
     let mut lifecycle_events = handler.subscribe_lifecycle_events();
     run_control_command(
@@ -242,8 +246,10 @@ async fn join_and_move_reflow_minimum_target_and_publish_resize_product_divergen
                 )
                 .await;
 
-                let (control_pid, mut notifications) =
-                    register_control_client(&handler, &target).await;
+                let control_pid = std::process::id();
+                let (_, mut notifications) = handler
+                    .register_control_for_test(control_pid, Some(&target))
+                    .await;
                 let _ = settle_control_notifications(&mut notifications).await;
                 run_detached_command(&handler, "set-buffer -b transfer-events ''").await;
                 let mut lifecycle_events = handler.subscribe_lifecycle_events();
@@ -331,7 +337,10 @@ async fn layout_no_ops_are_silent_on_cli_and_stable_id_paths() {
     let handler = RequestHandler::new();
     let session = SessionName::new("layout-notify-no-op").expect("test session name");
     create_session(&handler, &session).await;
-    let (control_pid, mut notifications) = register_control_client(&handler, &session).await;
+    let control_pid = std::process::id();
+    let (_, mut notifications) = handler
+        .register_control_for_test(control_pid, Some(&session))
+        .await;
     let _ = settle_control_notifications(&mut notifications).await;
 
     for command in [
@@ -404,7 +413,9 @@ async fn stable_id_resize_and_kill_keep_required_layout_notifications() {
             window.pane(1).expect("second test pane").id(),
         )
     };
-    let (_control_pid, mut notifications) = register_control_client(&handler, &session).await;
+    let (_, mut notifications) = handler
+        .register_control_for_test(std::process::id(), Some(&session))
+        .await;
     let _ = settle_control_notifications(&mut notifications).await;
 
     let response = handler
@@ -452,31 +463,6 @@ async fn run_control_command(handler: &RequestHandler, control_pid: u32, command
         "failed to execute {command:?}: {:?}",
         result.error
     );
-}
-
-async fn register_control_client(
-    handler: &RequestHandler,
-    session: &SessionName,
-) -> (u32, mpsc::Receiver<ControlServerEvent>) {
-    let control_pid = std::process::id();
-    let (event_tx, event_rx) = mpsc::channel(CONTROL_SERVER_EVENT_CAPACITY);
-    handler
-        .register_control_with_closing(
-            control_pid,
-            ControlModeUpgrade {
-                initial_command_count: 0,
-                mode: ControlMode::Plain,
-                terminal_context: crate::outer_terminal::OuterTerminalContext::default(),
-            },
-            event_tx,
-            Arc::new(AtomicBool::new(false)),
-        )
-        .await;
-    handler
-        .set_control_session(control_pid, Some(session.clone()))
-        .await
-        .expect("set test control session");
-    (control_pid, event_rx)
 }
 
 async fn layout_change_count(notifications: &mut mpsc::Receiver<ControlServerEvent>) -> usize {

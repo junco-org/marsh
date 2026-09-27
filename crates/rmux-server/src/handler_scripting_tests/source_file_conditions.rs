@@ -27,11 +27,7 @@ async fn source_file_lookup_parse_errors_skip_bad_file_and_continue_other_paths(
     for name in ["before-error", "after-error"] {
         assert!(
             matches!(
-                handler
-                    .handle(Request::ShowBuffer(ShowBufferRequest {
-                        name: Some(name.to_owned()),
-                    }))
-                    .await,
+                handler.handle(show_buffer_request(name)).await,
                 Response::Error(_)
             ),
             "{name} should not run when the source file has a lookup parse error"
@@ -39,9 +35,7 @@ async fn source_file_lookup_parse_errors_skip_bad_file_and_continue_other_paths(
     }
     assert_eq!(
         handler
-            .handle(Request::ShowBuffer(ShowBufferRequest {
-                name: Some("parsed-after".to_owned()),
-            }))
+            .handle(show_buffer_request("parsed-after"))
             .await
             .command_output()
             .expect("good source path should still run")
@@ -85,22 +79,14 @@ async fn source_file_lookup_error_inside_block_stops_file_without_brace_noise() 
     );
     assert!(
         matches!(
-            handler
-                .handle(Request::ShowBuffer(ShowBufferRequest {
-                    name: Some("inside-block".to_owned()),
-                }))
-                .await,
+            handler.handle(show_buffer_request("inside-block")).await,
             Response::Error(_)
         ),
         "the corrupt block should be skipped instead of partially executed"
     );
     assert!(
         matches!(
-            handler
-                .handle(Request::ShowBuffer(ShowBufferRequest {
-                    name: Some("after-block".to_owned()),
-                }))
-                .await,
+            handler.handle(show_buffer_request("after-block")).await,
             Response::Error(_)
         ),
         "commands after the first lookup parse error should not run"
@@ -134,20 +120,14 @@ async fn nested_source_file_lookup_parse_error_skips_child_but_outer_continues()
     );
     assert!(
         matches!(
-            handler
-                .handle(Request::ShowBuffer(ShowBufferRequest {
-                    name: Some("nested-after".to_owned()),
-                }))
-                .await,
+            handler.handle(show_buffer_request("nested-after")).await,
             Response::Error(_)
         ),
         "nested command after lookup parse error should not run"
     );
     assert_eq!(
         handler
-            .handle(Request::ShowBuffer(ShowBufferRequest {
-                name: Some("outer-after".to_owned()),
-            }))
+            .handle(show_buffer_request("outer-after"))
             .await
             .command_output()
             .expect("outer command after nested parse error should run")
@@ -185,19 +165,13 @@ async fn nested_source_file_skips_child_after_command_syntax_error() {
     );
     for name in ["child-before", "child-after"] {
         assert!(matches!(
-            handler
-                .handle(Request::ShowBuffer(ShowBufferRequest {
-                    name: Some(name.to_owned()),
-                }))
-                .await,
+            handler.handle(show_buffer_request(name)).await,
             Response::Error(_)
         ));
     }
     assert_eq!(
         handler
-            .handle(Request::ShowBuffer(ShowBufferRequest {
-                name: Some("outer-after".to_owned()),
-            }))
+            .handle(show_buffer_request("outer-after"))
             .await
             .command_output()
             .expect("outer command after nested syntax error should run")
@@ -225,9 +199,7 @@ async fn source_file_continuation_inside_single_quoted_string() {
     // before quote processing. So single-quoted strings DO get continuation joining.
     assert_eq!(
         handler
-            .handle(Request::ShowBuffer(ShowBufferRequest {
-                name: Some("sq".to_owned()),
-            }))
+            .handle(show_buffer_request("sq"))
             .await
             .command_output()
             .expect("sq buffer output")
@@ -258,9 +230,7 @@ async fn source_file_nested_if_elif_else_endif_branches() {
     );
     assert_eq!(
         handler
-            .handle(Request::ShowBuffer(ShowBufferRequest {
-                name: Some("branch".to_owned()),
-            }))
+            .handle(show_buffer_request("branch"))
             .await
             .command_output()
             .expect("branch buffer output")
@@ -289,9 +259,7 @@ async fn source_file_if_with_format_expression_condition() {
     );
     assert_eq!(
         handler
-            .handle(Request::ShowBuffer(ShowBufferRequest {
-                name: Some("fmt-cond".to_owned()),
-            }))
+            .handle(show_buffer_request("fmt-cond"))
             .await
             .command_output()
             .expect("fmt-cond buffer output")
@@ -307,16 +275,13 @@ async fn source_file_stdin_dash_without_stdin_returns_error() {
     fs::create_dir_all(&root).expect("create temp root");
 
     let response = handler
-        .handle(Request::SourceFile(Box::new(SourceFileRequest {
-            paths: vec!["-".to_owned()],
-            quiet: false,
-            parse_only: false,
-            verbose: false,
-            expand_paths: false,
-            target: None,
-            caller_cwd: Some(root),
-            stdin: None,
-        })))
+        .handle(
+            SourceFileRequest {
+                caller_cwd: Some(root),
+                ..Fixture::fixture(vec!["-".to_owned()])
+            }
+            .into_request(),
+        )
         .await;
 
     let Response::SourceFile(response) = response else {
@@ -338,29 +303,18 @@ async fn source_file_ignores_server_scope_for_non_server_options_like_tmux() {
     let root = temp_root("set-option-server-scope");
     fs::create_dir_all(&root).expect("create temp root");
     let alpha = session_name("alpha");
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: alpha.clone(),
-                detached: true,
-                size: Some(TerminalSize { cols: 80, rows: 24 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
+    handler.create_session(&alpha).await;
 
     let response = handler
-        .handle(Request::SourceFile(Box::new(SourceFileRequest {
-            paths: vec!["-".to_owned()],
-            quiet: false,
-            parse_only: false,
-            verbose: false,
-            expand_paths: false,
-            target: Some(PaneTarget::with_window(alpha, 0, 0)),
-            caller_cwd: Some(root),
-            stdin: Some("set-option -s status off\n".to_owned()),
-        })))
+        .handle(
+            SourceFileRequest {
+                target: Some(PaneTarget::with_window(alpha, 0, 0)),
+                caller_cwd: Some(root),
+                stdin: Some("set-option -s status off\n".to_owned()),
+                ..Fixture::fixture(vec!["-".to_owned()])
+            }
+            .into_request(),
+        )
         .await;
 
     assert_eq!(
@@ -389,29 +343,15 @@ async fn source_file_routes_window_show_commands_and_global_show_scope_compatibi
     let root = temp_root("show-options-compat");
     fs::create_dir_all(&root).expect("create temp root");
     let alpha = session_name("alpha");
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: alpha.clone(),
-                detached: true,
-                size: Some(TerminalSize { cols: 80, rows: 24 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
+    handler.create_session(&alpha).await;
 
     let response = handler
-        .handle(Request::SourceFile(Box::new(SourceFileRequest {
-            paths: vec!["-".to_owned()],
-            quiet: false,
-            parse_only: false,
-            verbose: false,
-            expand_paths: false,
-            target: Some(PaneTarget::with_window(alpha, 0, 0)),
-            caller_cwd: Some(root),
-            stdin: Some(
-                "set-option -s message-limit 77\n\
+        .handle(
+            SourceFileRequest {
+                target: Some(PaneTarget::with_window(alpha, 0, 0)),
+                caller_cwd: Some(root),
+                stdin: Some(
+                    "set-option -s message-limit 77\n\
 set -gq status off\n\
 set -gw pane-border-style fg=colour3\n\
 set-window-option -g pane-active-border-style fg=colour5\n\
@@ -422,9 +362,12 @@ show-options -gqv status\n\
 show-window-options -g -t alpha -v pane-border-style\n\
 show-window-options -g -v pane-active-border-style\n\
 show-window-options -g -v copy-mode-selection-style\n"
-                    .to_owned(),
-            ),
-        })))
+                        .to_owned(),
+                ),
+                ..Fixture::fixture(vec!["-".to_owned()])
+            }
+            .into_request(),
+        )
         .await;
 
     assert_eq!(
@@ -442,35 +385,24 @@ async fn source_file_show_options_quiet_suppresses_missing_options_with_current_
     let root = temp_root("show-options-quiet-missing");
     fs::create_dir_all(&root).expect("create temp root");
     let alpha = session_name("alpha");
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: alpha.clone(),
-                detached: true,
-                size: Some(TerminalSize { cols: 80, rows: 24 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
+    handler.create_session(&alpha).await;
 
     let response = handler
-        .handle(Request::SourceFile(Box::new(SourceFileRequest {
-            paths: vec!["-".to_owned()],
-            quiet: false,
-            parse_only: false,
-            verbose: false,
-            expand_paths: false,
-            target: Some(PaneTarget::with_window(alpha, 0, 0)),
-            caller_cwd: Some(root),
-            stdin: Some(
-                "show-options -q @missing\n\
+        .handle(
+            SourceFileRequest {
+                target: Some(PaneTarget::with_window(alpha, 0, 0)),
+                caller_cwd: Some(root),
+                stdin: Some(
+                    "show-options -q @missing\n\
 show-options -wq @missing\n\
 show-options -pq @missing\n\
 show-options -gq nonexistent\n"
-                    .to_owned(),
-            ),
-        })))
+                        .to_owned(),
+                ),
+                ..Fixture::fixture(vec!["-".to_owned()])
+            }
+            .into_request(),
+        )
         .await;
 
     assert_eq!(
@@ -485,33 +417,21 @@ async fn source_file_set_option_p_preserves_explicit_pane_target() {
     let root = temp_root("set-option-pane-target");
     fs::create_dir_all(&root).expect("create temp root");
     let alpha = session_name("alpha");
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: alpha.clone(),
-                detached: true,
-                size: Some(TerminalSize { cols: 80, rows: 24 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
+    handler.create_session(&alpha).await;
 
     let response = handler
-        .handle(Request::SourceFile(Box::new(SourceFileRequest {
-            paths: vec!["-".to_owned()],
-            quiet: false,
-            parse_only: false,
-            verbose: false,
-            expand_paths: false,
-            target: None,
-            caller_cwd: Some(root),
-            stdin: Some(
-                "set-option -p -t alpha:0.0 pane-border-style fg=blue\n\
+        .handle(
+            SourceFileRequest {
+                caller_cwd: Some(root),
+                stdin: Some(
+                    "set-option -p -t alpha:0.0 pane-border-style fg=blue\n\
 show-options -pqv -t alpha:0.0 pane-border-style\n"
-                    .to_owned(),
-            ),
-        })))
+                        .to_owned(),
+                ),
+                ..Fixture::fixture(vec!["-".to_owned()])
+            }
+            .into_request(),
+        )
         .await;
 
     assert_eq!(
@@ -529,33 +449,22 @@ async fn source_file_set_option_format_expands_value_before_storage() {
     let root = temp_root("set-option-format");
     fs::create_dir_all(&root).expect("create temp root");
     let alpha = session_name("alpha");
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: alpha.clone(),
-                detached: true,
-                size: Some(TerminalSize { cols: 80, rows: 24 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
+    handler.create_session(&alpha).await;
 
     let response = handler
-        .handle(Request::SourceFile(Box::new(SourceFileRequest {
-            paths: vec!["-".to_owned()],
-            quiet: false,
-            parse_only: false,
-            verbose: false,
-            expand_paths: false,
-            target: Some(PaneTarget::with_window(alpha, 0, 0)),
-            caller_cwd: Some(root),
-            stdin: Some(
-                "set-option -gF @probe '#{session_name}-#{window_index}'\n\
+        .handle(
+            SourceFileRequest {
+                target: Some(PaneTarget::with_window(alpha, 0, 0)),
+                caller_cwd: Some(root),
+                stdin: Some(
+                    "set-option -gF @probe '#{session_name}-#{window_index}'\n\
 show-options -gqv @probe\n"
-                    .to_owned(),
-            ),
-        })))
+                        .to_owned(),
+                ),
+                ..Fixture::fixture(vec!["-".to_owned()])
+            }
+            .into_request(),
+        )
         .await;
 
     assert_eq!(
@@ -574,33 +483,22 @@ async fn source_file_set_option_format_expands_socket_path() {
     let root = temp_root("set-option-socket-path");
     fs::create_dir_all(&root).expect("create temp root");
     let alpha = session_name("alpha");
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: alpha.clone(),
-                detached: true,
-                size: Some(TerminalSize { cols: 80, rows: 24 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
+    handler.create_session(&alpha).await;
 
     let response = handler
-        .handle(Request::SourceFile(Box::new(SourceFileRequest {
-            paths: vec!["-".to_owned()],
-            quiet: false,
-            parse_only: false,
-            verbose: false,
-            expand_paths: false,
-            target: Some(PaneTarget::with_window(alpha, 0, 0)),
-            caller_cwd: Some(root),
-            stdin: Some(
-                "set-option -gF @probe '#{socket_path}'\n\
+        .handle(
+            SourceFileRequest {
+                target: Some(PaneTarget::with_window(alpha, 0, 0)),
+                caller_cwd: Some(root),
+                stdin: Some(
+                    "set-option -gF @probe '#{socket_path}'\n\
 show-options -gqv @probe\n"
-                    .to_owned(),
-            ),
-        })))
+                        .to_owned(),
+                ),
+                ..Fixture::fixture(vec!["-".to_owned()])
+            }
+            .into_request(),
+        )
         .await;
 
     assert_eq!(
@@ -619,21 +517,19 @@ async fn source_file_set_option_format_sees_earlier_global_user_option_without_t
     fs::create_dir_all(&root).expect("create temp root");
 
     let response = handler
-        .handle(Request::SourceFile(Box::new(SourceFileRequest {
-            paths: vec!["-".to_owned()],
-            quiet: false,
-            parse_only: false,
-            verbose: false,
-            expand_paths: false,
-            target: None,
-            caller_cwd: Some(root),
-            stdin: Some(
-                "set-option -g @fmt '#{session_name}'\n\
+        .handle(
+            SourceFileRequest {
+                caller_cwd: Some(root),
+                stdin: Some(
+                    "set-option -g @fmt '#{session_name}'\n\
 set-option -gF @expanded '#{@fmt}'\n\
 show-options -gqv @expanded\n"
-                    .to_owned(),
-            ),
-        })))
+                        .to_owned(),
+                ),
+                ..Fixture::fixture(vec!["-".to_owned()])
+            }
+            .into_request(),
+        )
         .await;
 
     assert_eq!(
@@ -652,21 +548,19 @@ async fn source_file_accepts_oh_my_tmux_extended_keys_format_value() {
     fs::create_dir_all(&root).expect("create temp root");
 
     let response = handler
-        .handle(Request::SourceFile(Box::new(SourceFileRequest {
-            paths: vec!["-".to_owned()],
-            quiet: false,
-            parse_only: false,
-            verbose: false,
-            expand_paths: false,
-            target: None,
-            caller_cwd: Some(root),
-            stdin: Some(
-                "set-environment -g TERM_PROGRAM iTerm\n\
+        .handle(
+            SourceFileRequest {
+                caller_cwd: Some(root),
+                stdin: Some(
+                    "set-environment -g TERM_PROGRAM iTerm\n\
 set -g extended-keys #{?#{||:#{m/ri:mintty|iTerm,#{TERM_PROGRAM}},#{!=:#{XTERM_VERSION},}},on,off}\n\
 show-options -gqv extended-keys\n"
-                    .to_owned(),
-            ),
-        })))
+                        .to_owned(),
+                ),
+                ..Fixture::fixture(vec!["-".to_owned()])
+            }
+            .into_request(),
+        )
         .await;
 
     assert_eq!(
@@ -685,16 +579,16 @@ async fn source_file_preserves_option_like_set_option_values_after_the_option_na
     fs::create_dir_all(&root).expect("create temp root");
 
     let response = handler
-        .handle(Request::SourceFile(Box::new(SourceFileRequest {
-            paths: vec!["-".to_owned()],
-            quiet: false,
-            parse_only: false,
-            verbose: false,
-            expand_paths: false,
-            target: None,
-            caller_cwd: Some(root),
-            stdin: Some("set-option -g @compact -tfoo\nshow-options -gqv @compact\n".to_owned()),
-        })))
+        .handle(
+            SourceFileRequest {
+                caller_cwd: Some(root),
+                stdin: Some(
+                    "set-option -g @compact -tfoo\nshow-options -gqv @compact\n".to_owned(),
+                ),
+                ..Fixture::fixture(vec!["-".to_owned()])
+            }
+            .into_request(),
+        )
         .await;
 
     assert_eq!(
@@ -713,16 +607,14 @@ async fn source_file_without_target_routes_append_to_default_global_scope() {
     fs::create_dir_all(&root).expect("create temp root");
 
     let response = handler
-        .handle(Request::SourceFile(Box::new(SourceFileRequest {
-            paths: vec!["-".to_owned()],
-            quiet: false,
-            parse_only: false,
-            verbose: false,
-            expand_paths: false,
-            target: None,
-            caller_cwd: Some(root),
-            stdin: Some("set-option -ag status-left append\n".to_owned()),
-        })))
+        .handle(
+            SourceFileRequest {
+                caller_cwd: Some(root),
+                stdin: Some("set-option -ag status-left append\n".to_owned()),
+                ..Fixture::fixture(vec!["-".to_owned()])
+            }
+            .into_request(),
+        )
         .await;
 
     assert!(
@@ -741,27 +633,10 @@ async fn source_file_without_target_uses_preferred_session_for_parse_time_format
     let handler = RequestHandler::new();
     let root = temp_root("source-file-implicit-target");
     fs::create_dir_all(&root).expect("create temp root");
-    let alpha = session_name("alpha");
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: alpha,
-                detached: true,
-                size: Some(TerminalSize { cols: 80, rows: 24 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
+    handler.create_session("alpha").await;
 
-    let response = handler
-        .handle(Request::SourceFile(Box::new(SourceFileRequest {
-            paths: vec!["-".to_owned()],
-            quiet: false,
-            parse_only: false,
-            verbose: false,
-            expand_paths: false,
-            target: None,
+    handler
+        .handle_ok(SourceFileRequest {
             caller_cwd: Some(root),
             stdin: Some(
                 "%if #{==:#{session_name},alpha}\n\
@@ -772,10 +647,10 @@ set-buffer -b implicit no\n\
 if-shell -F '#{==:#{window_index},0}' 'set-buffer -b implicit-if yes' 'set-buffer -b implicit-if no'\n"
                     .to_owned(),
             ),
-        })))
+            ..Fixture::fixture(vec!["-".to_owned()])
+        })
         .await;
 
-    assert!(matches!(response, Response::SourceFile(_)));
     let state = handler.state.lock().await;
     let (_, content) = state
         .buffers
@@ -811,9 +686,7 @@ async fn source_file_comment_after_command_is_ignored() {
     );
     assert_eq!(
         handler
-            .handle(Request::ShowBuffer(ShowBufferRequest {
-                name: Some("commented".to_owned()),
-            }))
+            .handle(show_buffer_request("commented"))
             .await
             .command_output()
             .expect("commented buffer output")
@@ -839,9 +712,7 @@ async fn source_file_glob_expands_matching_files() {
     );
     assert_eq!(
         handler
-            .handle(Request::ShowBuffer(ShowBufferRequest {
-                name: Some("glob-a".to_owned()),
-            }))
+            .handle(show_buffer_request("glob-a"))
             .await
             .command_output()
             .expect("glob-a buffer output")
@@ -850,9 +721,7 @@ async fn source_file_glob_expands_matching_files() {
     );
     assert_eq!(
         handler
-            .handle(Request::ShowBuffer(ShowBufferRequest {
-                name: Some("glob-b".to_owned()),
-            }))
+            .handle(show_buffer_request("glob-b"))
             .await
             .command_output()
             .expect("glob-b buffer output")
@@ -868,22 +737,20 @@ async fn source_file_sets_user_and_known_non_resize_options_through_named_guard(
     fs::create_dir_all(&root).expect("create temp root");
 
     let response = handler
-        .handle(Request::SourceFile(Box::new(SourceFileRequest {
-            paths: vec!["-".to_owned()],
-            quiet: false,
-            parse_only: false,
-            verbose: false,
-            expand_paths: false,
-            target: None,
-            caller_cwd: Some(root),
-            stdin: Some(
-                "set-option -g @capture-guard first\n\
+        .handle(
+            SourceFileRequest {
+                caller_cwd: Some(root),
+                stdin: Some(
+                    "set-option -g @capture-guard first\n\
 set-option -g status-left second\n\
 show-options -gqv @capture-guard\n\
 show-options -gqv status-left\n"
-                    .to_owned(),
-            ),
-        })))
+                        .to_owned(),
+                ),
+                ..Fixture::fixture(vec!["-".to_owned()])
+            }
+            .into_request(),
+        )
         .await;
 
     assert_eq!(

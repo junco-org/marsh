@@ -1,28 +1,6 @@
 use std::time::Instant;
 
 use super::*;
-use crate::handler::attach_support::ActiveAttachIdentity;
-
-async fn current_identity(handler: &RequestHandler, attach_pid: u32) -> ActiveAttachIdentity {
-    handler
-        .active_attach
-        .lock()
-        .await
-        .by_pid
-        .get(&attach_pid)
-        .expect("attached client remains registered")
-        .identity(attach_pid)
-}
-
-async fn table_references(handler: &RequestHandler, table_name: &str) -> Option<usize> {
-    handler
-        .state
-        .lock()
-        .await
-        .key_bindings
-        .table(table_name)
-        .map(|table| table.references())
-}
 
 #[tokio::test]
 async fn prefix_timer_follows_stable_session_identity_across_rename() {
@@ -31,7 +9,7 @@ async fn prefix_timer_follows_stable_session_identity_across_rename() {
     let renamed = session_name("key-timer-rename-current");
     let attach_pid = u32::MAX - 811;
     let _control_rx = create_attached_session(&handler, attach_pid, &original).await;
-    let identity = current_identity(&handler, attach_pid).await;
+    let identity = handler.active_attach_identity_for_test(attach_pid).await;
     let key_table_set_at = Instant::now();
     handler
         .set_attached_key_table_for_client_session_identity(
@@ -66,16 +44,12 @@ async fn prefix_timer_follows_stable_session_identity_across_rename() {
         .await
         .expect("timer reaches expiry boundary before rename");
 
-    let response = handler
-        .handle(Request::RenameSession(RenameSessionRequest {
+    handler
+        .handle_ok(RenameSessionRequest {
             target: original,
             new_name: renamed.clone(),
-        }))
+        })
         .await;
-    assert!(
-        matches!(response, Response::RenameSession(_)),
-        "{response:?}"
-    );
 
     expiry_pause.release.notify_one();
     tokio::time::timeout(ATTACH_LIFECYCLE_TIMEOUT, timer)
@@ -103,7 +77,7 @@ async fn non_live_dispatch_rejects_same_pid_same_generation_replacement() {
     let session = session_name("non-live-dispatch-attach-aba");
     let attach_pid = std::process::id();
     let _original_rx = create_attached_session(&handler, attach_pid, &session).await;
-    let original_identity = current_identity(&handler, attach_pid).await;
+    let original_identity = handler.active_attach_identity_for_test(attach_pid).await;
     assert_eq!(
         handler
             .active_attach
@@ -118,32 +92,19 @@ async fn non_live_dispatch_rejects_same_pid_same_generation_replacement() {
 
     let dispatch_pause = handler.install_attached_key_dispatch_commit_pause(attach_pid);
     let dispatch_handler = handler.clone();
-    let dispatch_session = session.clone();
+    let dispatch_request =
+        rmux_proto::SendKeysExtRequest::fixture((PaneTarget::new(session.clone(), 0), ["C-b"]));
     let dispatch = tokio::spawn(async move {
         dispatch_handler
-            .handle(Request::SendKeysExt(rmux_proto::SendKeysExtRequest {
-                target: Some(PaneTarget::new(dispatch_session, 0)),
-                keys: vec!["C-b".to_owned()],
-                expand_formats: false,
-                hex: false,
-                literal: false,
-                dispatch_key_table: true,
-                copy_mode_command: false,
-                forward_mouse_event: false,
-                reset_terminal: false,
-                repeat_count: None,
-            }))
+            .handle(Request::SendKeysExt(dispatch_request))
             .await
     });
     tokio::time::timeout(ATTACH_LIFECYCLE_TIMEOUT, dispatch_pause.reached.notified())
         .await
         .expect("non-live dispatch pauses after generation-zero lookup");
 
-    let (replacement_tx, _replacement_rx) = mpsc::unbounded_channel();
-    handler
-        .register_attach(attach_pid, session, replacement_tx)
-        .await;
-    let replacement_identity = current_identity(&handler, attach_pid).await;
+    let _replacement_rx = handler.attach_client(attach_pid, session).await;
+    let replacement_identity = handler.active_attach_identity_for_test(attach_pid).await;
     assert_ne!(replacement_identity, original_identity);
     assert_eq!(
         handler
@@ -186,17 +147,15 @@ async fn switch_table_apply_rejects_attach_rehomed_after_session_resolution() {
     let attach_pid = std::process::id();
     let _beta_rx = create_attached_session(&handler, u32::MAX - 812, &beta).await;
     let _alpha_rx = create_attached_session(&handler, attach_pid, &alpha).await;
-    let alpha_identity = current_identity(&handler, attach_pid).await;
+    let alpha_identity = handler.active_attach_identity_for_test(attach_pid).await;
 
-    let response = handler
-        .handle(Request::SetOption(SetOptionRequest {
-            scope: ScopeSelector::Session(alpha.clone()),
-            option: OptionName::DetachOnDestroy,
-            value: "off".to_owned(),
-            mode: SetOptionMode::Replace,
-        }))
+    handler
+        .set_option(
+            ScopeSelector::Session(alpha.clone()),
+            OptionName::DetachOnDestroy,
+            "off",
+        )
         .await;
-    assert!(matches!(response, Response::SetOption(_)), "{response:?}");
     handler
         .set_attached_key_table_for_client_session_identity(
             alpha_identity,
@@ -228,15 +187,7 @@ async fn switch_table_apply_rejects_attach_rehomed_after_session_resolution() {
         .await
         .expect("switch-client -T pauses after resolving alpha identity");
 
-    let response = handler
-        .handle(Request::KillSession(KillSessionRequest {
-            target: alpha,
-            kill_all_except_target: false,
-            clear_alerts: false,
-            kill_group: false,
-        }))
-        .await;
-    assert!(matches!(response, Response::KillSession(_)), "{response:?}");
+    handler.handle_ok(KillSessionRequest::fixture(alpha)).await;
     {
         let active_attach = handler.active_attach.lock().await;
         let rehomed = active_attach

@@ -6,22 +6,12 @@ async fn attached_mode_tree_acceptance_uses_mode_before_prefix_or_pty() {
     let requester_pid = std::process::id();
     let alpha = session_name("alpha");
     let _control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
-    assert!(matches!(
-        handler
-            .handle(Request::NewWindow(Box::new(NewWindowRequest {
-                target: alpha.clone(),
-                name: Some("w1".to_owned()),
-                detached: true,
-                start_directory: None,
-                environment: None,
-                command: None,
-                process_command: None,
-                target_window_index: None,
-                insert_at_target: false,
-            })))
-            .await,
-        Response::NewWindow(_)
-    ));
+    handler
+        .create_window(NewWindowRequest {
+            name: Some("w1".to_owned()),
+            ..Fixture::fixture(&alpha)
+        })
+        .await;
 
     let commands = handler
         .parse_control_commands("choose-tree -Zw")
@@ -69,22 +59,12 @@ async fn attached_compact_prefix_wq_uses_choose_tree_before_the_following_key() 
     let requester_pid = std::process::id();
     let alpha = session_name("alpha");
     let _control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
-    assert!(matches!(
-        handler
-            .handle(Request::NewWindow(Box::new(NewWindowRequest {
-                target: alpha.clone(),
-                name: Some("w1".to_owned()),
-                detached: true,
-                start_directory: None,
-                environment: None,
-                command: None,
-                process_command: None,
-                target_window_index: None,
-                insert_at_target: false,
-            })))
-            .await,
-        Response::NewWindow(_)
-    ));
+    handler
+        .create_window(NewWindowRequest {
+            name: Some("w1".to_owned()),
+            ..Fixture::fixture(&alpha)
+        })
+        .await;
 
     handler
         .handle_attached_live_input_for_test(requester_pid, b"\x02wq")

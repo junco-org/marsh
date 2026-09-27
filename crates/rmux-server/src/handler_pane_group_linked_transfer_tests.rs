@@ -4,12 +4,13 @@ use super::pane_group_transfer_tests::{
 };
 use super::RequestHandler;
 use rmux_proto::{
-    BreakPaneRequest, CapturePaneRequest, HookLifecycle, HookName, JoinPaneRequest,
-    KillPaneRequest, LinkWindowRequest, MovePaneRequest, NewWindowRequest, OptionScopeSelector,
-    PaneTarget, Request, Response, ScopeSelector, SelectWindowRequest, SendKeysRequest,
-    SetHookRequest, SetOptionByNameRequest, SetOptionMode, SplitDirection, SplitWindowRequest,
-    SplitWindowTarget, SwapPaneRequest, TerminalPixels, WindowTarget,
+    BreakPaneRequest, CapturePaneRequest, HookName, JoinPaneRequest, KillPaneRequest,
+    LinkWindowRequest, MovePaneRequest, NewWindowRequest, OptionScopeSelector, PaneTarget, Request,
+    Response, ScopeSelector, SelectWindowRequest, SendKeysRequest, SetHookRequest, SplitDirection,
+    SplitWindowRequest, SwapPaneRequest, TerminalPixels, WindowTarget,
 };
+
+use crate::test_fixtures::Fixture;
 
 async fn create_group_with_linked_runtime_window(
     handler: &RequestHandler,
@@ -24,20 +25,14 @@ async fn create_group_with_linked_runtime_window(
     let linked_owner = create_session(handler, &format!("{label}-linked")).await;
     split_session(handler, &linked_owner).await;
 
-    let response = handler
-        .handle(Request::LinkWindow(LinkWindowRequest {
-            source: WindowTarget::with_window(linked_owner.clone(), 0),
-            target: WindowTarget::with_window(owner.clone(), 1),
-            after: false,
-            before: false,
-            kill_destination: false,
-            detached: true,
-        }))
+    handler
+        .handle_ok(LinkWindowRequest::fixture((
+            WindowTarget::with_window(linked_owner.clone(), 0),
+            WindowTarget::with_window(owner.clone(), 1),
+        )))
         .await;
-    assert!(matches!(response, Response::LinkWindow(_)), "{response:?}");
 
     let peer = create_grouped_session(handler, &format!("{label}-peer"), &owner).await;
-    handler.wait_for_initial_panes_for_test().await;
     (owner, peer, linked_owner)
 }
 
@@ -53,20 +48,14 @@ async fn create_group_with_duplicate_two_pane_linked_window(
     let linked_owner = create_session(handler, &format!("{label}-linked")).await;
     split_session(handler, &linked_owner).await;
     for target_window_index in [1, 2] {
-        let response = handler
-            .handle(Request::LinkWindow(LinkWindowRequest {
-                source: WindowTarget::with_window(linked_owner.clone(), 0),
-                target: WindowTarget::with_window(owner.clone(), target_window_index),
-                after: false,
-                before: false,
-                kill_destination: false,
-                detached: true,
-            }))
+        handler
+            .handle_ok(LinkWindowRequest::fixture((
+                WindowTarget::with_window(linked_owner.clone(), 0),
+                WindowTarget::with_window(owner.clone(), target_window_index),
+            )))
             .await;
-        assert!(matches!(response, Response::LinkWindow(_)), "{response:?}");
     }
     let peer = create_grouped_session(handler, &format!("{label}-peer"), &owner).await;
-    handler.wait_for_initial_panes_for_test().await;
     (owner, peer, linked_owner)
 }
 
@@ -82,20 +71,14 @@ async fn create_group_with_single_pane_linked_window(
     split_session(handler, &owner).await;
     let linked_owner = create_session(handler, &format!("{label}-linked")).await;
 
-    let response = handler
-        .handle(Request::LinkWindow(LinkWindowRequest {
-            source: WindowTarget::with_window(linked_owner.clone(), 0),
-            target: WindowTarget::with_window(owner.clone(), 1),
-            after: false,
-            before: false,
-            kill_destination: false,
-            detached: true,
-        }))
+    handler
+        .handle_ok(LinkWindowRequest::fixture((
+            WindowTarget::with_window(linked_owner.clone(), 0),
+            WindowTarget::with_window(owner.clone(), 1),
+        )))
         .await;
-    assert!(matches!(response, Response::LinkWindow(_)), "{response:?}");
 
     let peer = create_grouped_session(handler, &format!("{label}-peer"), &owner).await;
-    handler.wait_for_initial_panes_for_test().await;
     (owner, peer, linked_owner)
 }
 
@@ -111,19 +94,16 @@ async fn create_fully_linked_single_window_group(
     let destination = create_session(handler, &format!("{label}-destination")).await;
     let owner = create_session(handler, &format!("{label}-owner")).await;
     let linked_owner = create_session(handler, &format!("{label}-linked")).await;
-    let response = handler
-        .handle(Request::LinkWindow(LinkWindowRequest {
-            source: WindowTarget::with_window(linked_owner.clone(), 0),
-            target: WindowTarget::with_window(owner.clone(), 0),
-            after: false,
-            before: false,
+    handler
+        .handle_ok(LinkWindowRequest {
             kill_destination: true,
-            detached: true,
-        }))
+            ..Fixture::fixture((
+                WindowTarget::with_window(linked_owner.clone(), 0),
+                WindowTarget::with_window(owner.clone(), 0),
+            ))
+        })
         .await;
-    assert!(matches!(response, Response::LinkWindow(_)), "{response:?}");
     let peer = create_grouped_session(handler, &format!("{label}-peer"), &owner).await;
-    handler.wait_for_initial_panes_for_test().await;
     (destination, owner, peer, linked_owner)
 }
 
@@ -149,33 +129,12 @@ async fn assert_destroyed_group_runtime_names_are_reusable(
     }
 
     let recreated = create_session(handler, recreated_name.as_str()).await;
-    handler.wait_for_initial_panes_for_test().await;
     let state = handler.state.lock().await;
     assert!(state.contains_session_terminals(&recreated));
     assert_eq!(state.attached_terminal_pixels_for_test(&recreated), None);
     state
         .pane_profile_in_window(&recreated, 0, 0)
         .expect("recreated group peer receives a fresh runtime");
-}
-
-async fn link_external_window(
-    handler: &RequestHandler,
-    external: &rmux_proto::SessionName,
-    owner: &rmux_proto::SessionName,
-    owner_window_index: u32,
-    kill_destination: bool,
-) {
-    let response = handler
-        .handle(Request::LinkWindow(LinkWindowRequest {
-            source: WindowTarget::with_window(external.clone(), 0),
-            target: WindowTarget::with_window(owner.clone(), owner_window_index),
-            after: false,
-            before: false,
-            kill_destination,
-            detached: true,
-        }))
-        .await;
-    assert!(matches!(response, Response::LinkWindow(_)), "{response:?}");
 }
 
 async fn create_group_with_individually_linked_windows(
@@ -192,11 +151,18 @@ async fn create_group_with_individually_linked_windows(
     let mut externals = Vec::with_capacity(window_count);
     for window_index in 0..window_count as u32 {
         let external = create_session(handler, &format!("{label}-external-{window_index}")).await;
-        link_external_window(handler, &external, &owner, window_index, window_index == 0).await;
+        handler
+            .handle_ok(LinkWindowRequest {
+                kill_destination: window_index == 0,
+                ..Fixture::fixture((
+                    WindowTarget::with_window(external.clone(), 0),
+                    WindowTarget::with_window(owner.clone(), window_index),
+                ))
+            })
+            .await;
         externals.push(external);
     }
     let peer = create_grouped_session(handler, &format!("{label}-peer"), &owner).await;
-    handler.wait_for_initial_panes_for_test().await;
     (owner, peer, externals)
 }
 
@@ -211,23 +177,15 @@ async fn create_group_with_duplicate_linked_winlinks(
 ) {
     let (owner, peer, linked_owner) =
         create_group_with_single_pane_linked_window(handler, label).await;
-    let base_window_id = {
-        let state = handler.state.lock().await;
-        window_id(&state, &owner, 0)
-    };
-    let response = handler
-        .handle(Request::BreakPane(Box::new(BreakPaneRequest {
-            source: PaneTarget::with_window(linked_owner, 0, 0),
-            target: Some(WindowTarget::with_window(owner.clone(), 2)),
-            name: None,
-            detached: true,
-            after: false,
-            before: false,
-            print_target: false,
-            format: None,
-        })))
+    let base_window_id = handler
+        .window_id_for_test(&WindowTarget::with_window(owner.clone(), 0))
         .await;
-    assert!(matches!(response, Response::BreakPane(_)), "{response:?}");
+    handler
+        .handle_ok(BreakPaneRequest::fixture((
+            PaneTarget::with_window(linked_owner, 0, 0),
+            WindowTarget::with_window(owner.clone(), 2),
+        )))
+        .await;
     let linked_window_id = {
         let state = handler.state.lock().await;
         let linked_window_id = window_id(&state, &owner, 1);
@@ -240,23 +198,9 @@ async fn create_group_with_duplicate_linked_winlinks(
 }
 
 async fn set_window_marker(handler: &RequestHandler, target: WindowTarget, value: &str) {
-    let response = handler
-        .handle(Request::SetOptionByName(Box::new(SetOptionByNameRequest {
-            scope: OptionScopeSelector::Window(target),
-            name: "@break-slot".to_owned(),
-            value: Some(value.to_owned()),
-            mode: SetOptionMode::Replace,
-            only_if_unset: false,
-            unset: false,
-            unset_pane_overrides: false,
-            format: false,
-            format_target: None,
-        })))
+    handler
+        .set_option_by_name(OptionScopeSelector::Window(target), "@break-slot", value)
         .await;
-    assert!(
-        matches!(response, Response::SetOptionByName(_)),
-        "{response:?}"
-    );
 }
 
 fn window_id(
@@ -313,39 +257,11 @@ async fn select_window(
     session_name: &rmux_proto::SessionName,
     window_index: u32,
 ) {
-    let response = handler
-        .handle(Request::SelectWindow(SelectWindowRequest {
+    handler
+        .handle_ok(SelectWindowRequest {
             target: WindowTarget::with_window(session_name.clone(), window_index),
-        }))
+        })
         .await;
-    assert!(
-        matches!(response, Response::SelectWindow(_)),
-        "{response:?}"
-    );
-}
-
-fn capture_request(target: PaneTarget) -> CapturePaneRequest {
-    CapturePaneRequest {
-        target,
-        start: None,
-        end: None,
-        print: true,
-        buffer_name: None,
-        alternate: false,
-        escape_ansi: false,
-        escape_sequences: false,
-        include_format: false,
-        hyperlinks: false,
-        line_numbers: false,
-        join_wrapped: false,
-        use_mode_screen: false,
-        preserve_trailing_spaces: false,
-        do_not_trim_spaces: false,
-        pending_input: false,
-        quiet: false,
-        start_is_absolute: false,
-        end_is_absolute: false,
-    }
 }
 
 async fn assert_linked_source_was_removed_and_moved_pane_is_live(
@@ -397,7 +313,7 @@ async fn assert_linked_source_was_removed_and_moved_pane_is_live(
         .await;
     assert!(matches!(stale_send, Response::Error(_)), "{stale_send:?}");
     let stale_capture = handler
-        .handle(Request::CapturePane(Box::new(capture_request(
+        .handle(Request::CapturePane(Box::new(CapturePaneRequest::fixture(
             stale_target,
         ))))
         .await;
@@ -406,22 +322,15 @@ async fn assert_linked_source_was_removed_and_moved_pane_is_live(
         "{stale_capture:?}"
     );
 
-    let live_send = handler
-        .handle(Request::SendKeys(SendKeysRequest {
+    handler
+        .handle_ok(SendKeysRequest {
             target: moved_target.clone(),
             keys: vec!["x".to_owned()],
-        }))
+        })
         .await;
-    assert!(matches!(live_send, Response::SendKeys(_)), "{live_send:?}");
-    let live_capture = handler
-        .handle(Request::CapturePane(Box::new(capture_request(
-            moved_target,
-        ))))
+    handler
+        .handle_ok(CapturePaneRequest::fixture(moved_target))
         .await;
-    assert!(
-        matches!(live_capture, Response::CapturePane(_)),
-        "{live_capture:?}"
-    );
 }
 
 #[tokio::test]
@@ -440,31 +349,21 @@ async fn join_last_linked_pane_through_group_alias_removes_stale_family_and_keep
         "tracked",
     )
     .await;
-    let hook = handler
-        .handle(Request::SetHook(SetHookRequest {
-            scope: ScopeSelector::Session(linked_owner.clone()),
-            hook: HookName::SessionClosed,
-            command: "display-message -p linked-closed".to_owned(),
-            lifecycle: HookLifecycle::Persistent,
-        }))
+    handler
+        .handle_ok(SetHookRequest::fixture((
+            ScopeSelector::Session(linked_owner.clone()),
+            HookName::SessionClosed,
+            "display-message -p linked-closed",
+        )))
         .await;
-    assert!(matches!(hook, Response::SetHook(_)), "{hook:?}");
     let mut lifecycle_events = handler.subscribe_lifecycle_events();
 
     let response = handler
-        .handle(Request::JoinPane(JoinPaneRequest {
-            source: PaneTarget::with_window(peer.clone(), 1, 0),
-            target: PaneTarget::with_window(owner.clone(), 0, 0),
-            direction: SplitDirection::Vertical,
-            detached: true,
-            before: false,
-            full_size: false,
-            size: None,
-        }))
+        .handle_ok(JoinPaneRequest::fixture((
+            PaneTarget::with_window(peer.clone(), 1, 0),
+            PaneTarget::with_window(owner.clone(), 0, 0),
+        )))
         .await;
-    let Response::JoinPane(response) = response else {
-        panic!("expected last linked pane join success, got {response:?}");
-    };
 
     assert_linked_source_was_removed_and_moved_pane_is_live(
         &handler,
@@ -522,19 +421,11 @@ async fn join_last_linked_pane_into_linked_target_synchronizes_destination_famil
     .await;
 
     let response = handler
-        .handle(Request::JoinPane(JoinPaneRequest {
-            source: source_target,
-            target: PaneTarget::with_window(destination_owner.clone(), 1, 0),
-            direction: SplitDirection::Vertical,
-            detached: true,
-            before: false,
-            full_size: false,
-            size: None,
-        }))
+        .handle_ok(JoinPaneRequest::fixture((
+            source_target,
+            PaneTarget::with_window(destination_owner.clone(), 1, 0),
+        )))
         .await;
-    let Response::JoinPane(response) = response else {
-        panic!("expected linked-last join into linked target success, got {response:?}");
-    };
 
     let state = handler.state.lock().await;
     assert!(state.sessions.session(&source_linked).is_none());
@@ -583,10 +474,9 @@ async fn break_last_linked_pane_before_linked_target_remaps_destination_family()
             .await;
     let (destination_owner, destination_peer, destination_linked) =
         create_group_with_linked_runtime_window(&handler, "last-linked-break-before-target").await;
-    let old_destination_window_id = {
-        let state = handler.state.lock().await;
-        window_id(&state, &destination_owner, 1)
-    };
+    let old_destination_window_id = handler
+        .window_id_for_test(&WindowTarget::with_window(destination_owner.clone(), 1))
+        .await;
     for target in [
         WindowTarget::with_window(destination_owner.clone(), 1),
         WindowTarget::with_window(destination_peer.clone(), 1),
@@ -607,20 +497,14 @@ async fn break_last_linked_pane_before_linked_target_remaps_destination_family()
     .await;
 
     let response = handler
-        .handle(Request::BreakPane(Box::new(BreakPaneRequest {
-            source: source_target,
-            target: Some(WindowTarget::with_window(destination_owner.clone(), 1)),
-            name: None,
-            detached: true,
-            after: false,
+        .handle_ok(BreakPaneRequest {
             before: true,
-            print_target: false,
-            format: None,
-        })))
+            ..Fixture::fixture((
+                source_target,
+                WindowTarget::with_window(destination_owner.clone(), 1),
+            ))
+        })
         .await;
-    let Response::BreakPane(response) = response else {
-        panic!("expected linked-last break-before success, got {response:?}");
-    };
     assert_eq!(
         response.target,
         PaneTarget::with_window(destination_owner.clone(), 1, 0)
@@ -680,19 +564,11 @@ async fn move_last_linked_pane_through_group_alias_removes_stale_family_and_keep
     .await;
 
     let response = handler
-        .handle(Request::MovePane(MovePaneRequest {
-            source: PaneTarget::with_window(peer.clone(), 1, 0),
-            target: PaneTarget::with_window(owner.clone(), 0, 0),
-            direction: SplitDirection::Vertical,
-            detached: true,
-            before: false,
-            full_size: false,
-            size: None,
-        }))
+        .handle_ok(MovePaneRequest::fixture((
+            PaneTarget::with_window(peer.clone(), 1, 0),
+            PaneTarget::with_window(owner.clone(), 0, 0),
+        )))
         .await;
-    let Response::MovePane(response) = response else {
-        panic!("expected last linked pane move success, got {response:?}");
-    };
 
     assert_linked_source_was_removed_and_moved_pane_is_live(
         &handler,
@@ -719,18 +595,12 @@ async fn join_last_linked_pane_cleans_every_destroyed_group_runtime_before_name_
         state.set_attached_terminal_pixels(&peer, Some(TerminalPixels::new(111, 222)));
     }
 
-    let response = handler
-        .handle(Request::JoinPane(JoinPaneRequest {
-            source: PaneTarget::with_window(peer.clone(), 0, 0),
-            target: PaneTarget::with_window(destination, 0, 0),
-            direction: SplitDirection::Vertical,
-            detached: true,
-            before: false,
-            full_size: false,
-            size: None,
-        }))
+    handler
+        .handle_ok(JoinPaneRequest::fixture((
+            PaneTarget::with_window(peer.clone(), 0, 0),
+            PaneTarget::with_window(destination, 0, 0),
+        )))
         .await;
-    assert!(matches!(response, Response::JoinPane(_)), "{response:?}");
 
     assert_destroyed_group_runtime_names_are_reusable(
         &handler,
@@ -750,18 +620,12 @@ async fn move_last_linked_pane_cleans_every_destroyed_group_runtime_before_name_
         state.set_attached_terminal_pixels(&peer, Some(TerminalPixels::new(333, 444)));
     }
 
-    let response = handler
-        .handle(Request::MovePane(MovePaneRequest {
-            source: PaneTarget::with_window(peer.clone(), 0, 0),
-            target: PaneTarget::with_window(destination, 0, 0),
-            direction: SplitDirection::Vertical,
-            detached: true,
-            before: false,
-            full_size: false,
-            size: None,
-        }))
+    handler
+        .handle_ok(MovePaneRequest::fixture((
+            PaneTarget::with_window(peer.clone(), 0, 0),
+            PaneTarget::with_window(destination, 0, 0),
+        )))
         .await;
-    assert!(matches!(response, Response::MovePane(_)), "{response:?}");
 
     assert_destroyed_group_runtime_names_are_reusable(
         &handler,
@@ -776,7 +640,6 @@ async fn runtime_owner_transfer_preserves_existing_next_owner_pixel_geometry() {
     let handler = RequestHandler::new();
     let owner = create_session(&handler, "pixel-owner").await;
     let peer = create_grouped_session(&handler, "pixel-peer", &owner).await;
-    handler.wait_for_initial_panes_for_test().await;
     let owner_pixels = TerminalPixels::new(100, 200);
     let peer_pixels = TerminalPixels::new(300, 400);
 
@@ -813,7 +676,6 @@ async fn runtime_owner_transfer_does_not_inherit_pixels_into_unattached_next_own
     let handler = RequestHandler::new();
     let owner = create_session(&handler, "pixel-unattached-owner").await;
     let peer = create_grouped_session(&handler, "pixel-unattached-peer", &owner).await;
-    handler.wait_for_initial_panes_for_test().await;
 
     let mut state = handler.state.lock().await;
     state.set_attached_terminal_pixels(&owner, Some(TerminalPixels::new(500, 600)));
@@ -878,20 +740,14 @@ async fn break_before_remaps_every_grouped_link_slot_by_window_identity() {
     };
 
     let response = handler
-        .handle(Request::BreakPane(Box::new(BreakPaneRequest {
-            source: PaneTarget::with_window(owner.clone(), 1, 0),
-            target: Some(WindowTarget::with_window(owner.clone(), 0)),
-            name: None,
-            detached: true,
-            after: false,
+        .handle_ok(BreakPaneRequest {
             before: true,
-            print_target: false,
-            format: None,
-        })))
+            ..Fixture::fixture((
+                PaneTarget::with_window(owner.clone(), 1, 0),
+                WindowTarget::with_window(owner.clone(), 0),
+            ))
+        })
         .await;
-    let Response::BreakPane(response) = response else {
-        panic!("expected break-pane -b success, got {response:?}");
-    };
     assert_eq!(
         response.target,
         PaneTarget::with_window(owner.clone(), 0, 0)
@@ -974,20 +830,14 @@ async fn break_after_remaps_shifted_sentinel_and_source_link_slots_by_window_ide
     };
 
     let response = handler
-        .handle(Request::BreakPane(Box::new(BreakPaneRequest {
-            source: PaneTarget::with_window(owner.clone(), 0, 0),
-            target: Some(WindowTarget::with_window(owner.clone(), 1)),
-            name: None,
-            detached: true,
+        .handle_ok(BreakPaneRequest {
             after: true,
-            before: false,
-            print_target: false,
-            format: None,
-        })))
+            ..Fixture::fixture((
+                PaneTarget::with_window(owner.clone(), 0, 0),
+                WindowTarget::with_window(owner.clone(), 1),
+            ))
+        })
         .await;
-    let Response::BreakPane(response) = response else {
-        panic!("expected break-pane -a success, got {response:?}");
-    };
     assert_eq!(
         response.target,
         PaneTarget::with_window(owner.clone(), 2, 0)
@@ -1083,20 +933,14 @@ async fn break_before_remaps_the_selected_occurrence_of_duplicate_linked_winlink
     select_window(&handler, &peer, 2).await;
 
     let response = handler
-        .handle(Request::BreakPane(Box::new(BreakPaneRequest {
-            source: PaneTarget::with_window(owner.clone(), 2, 0),
-            target: Some(WindowTarget::with_window(owner.clone(), 0)),
-            name: None,
-            detached: true,
-            after: false,
+        .handle_ok(BreakPaneRequest {
             before: true,
-            print_target: false,
-            format: None,
-        })))
+            ..Fixture::fixture((
+                PaneTarget::with_window(owner.clone(), 2, 0),
+                WindowTarget::with_window(owner.clone(), 0),
+            ))
+        })
         .await;
-    let Response::BreakPane(response) = response else {
-        panic!("expected duplicate winlink break-pane -b success, got {response:?}");
-    };
     assert_eq!(
         response.target,
         PaneTarget::with_window(owner.clone(), 0, 0)
@@ -1161,19 +1005,11 @@ async fn join_last_linked_pane_from_real_session_removes_all_old_aliases() {
     .await;
 
     let response = handler
-        .handle(Request::JoinPane(JoinPaneRequest {
-            source: PaneTarget::with_window(linked_owner.clone(), 0, 0),
-            target: PaneTarget::with_window(owner.clone(), 0, 0),
-            direction: SplitDirection::Vertical,
-            detached: true,
-            before: false,
-            full_size: false,
-            size: None,
-        }))
+        .handle_ok(JoinPaneRequest::fixture((
+            PaneTarget::with_window(linked_owner.clone(), 0, 0),
+            PaneTarget::with_window(owner.clone(), 0, 0),
+        )))
         .await;
-    let Response::JoinPane(response) = response else {
-        panic!("expected real linked source join success, got {response:?}");
-    };
     let moved_target = response.target.clone();
 
     assert_linked_source_was_removed_and_moved_pane_is_live(
@@ -1209,20 +1045,11 @@ async fn break_last_linked_pane_from_real_session_matches_tmux_success() {
     .await;
 
     let response = handler
-        .handle(Request::BreakPane(Box::new(BreakPaneRequest {
-            source: PaneTarget::with_window(linked_owner.clone(), 0, 0),
-            target: Some(WindowTarget::with_window(owner.clone(), 2)),
-            name: None,
-            detached: true,
-            after: false,
-            before: false,
-            print_target: false,
-            format: None,
-        })))
+        .handle_ok(BreakPaneRequest::fixture((
+            PaneTarget::with_window(linked_owner.clone(), 0, 0),
+            WindowTarget::with_window(owner.clone(), 2),
+        )))
         .await;
-    let Response::BreakPane(response) = response else {
-        panic!("expected real linked source break success, got {response:?}");
-    };
     let moved_target = response.target.clone();
 
     {
@@ -1299,20 +1126,11 @@ async fn break_last_linked_pane_within_group_owner_matches_tmux_slot_move() {
     .await;
 
     let response = handler
-        .handle(Request::BreakPane(Box::new(BreakPaneRequest {
-            source: PaneTarget::with_window(owner.clone(), 1, 0),
-            target: Some(WindowTarget::with_window(owner.clone(), 2)),
-            name: None,
-            detached: true,
-            after: false,
-            before: false,
-            print_target: false,
-            format: None,
-        })))
+        .handle_ok(BreakPaneRequest::fixture((
+            PaneTarget::with_window(owner.clone(), 1, 0),
+            WindowTarget::with_window(owner.clone(), 2),
+        )))
         .await;
-    let Response::BreakPane(response) = response else {
-        panic!("expected same-session linked break success, got {response:?}");
-    };
     assert_eq!(
         response.target,
         PaneTarget::with_window(owner.clone(), 2, 0)
@@ -1379,21 +1197,13 @@ async fn break_last_linked_pane_preserves_other_source_session_windows_and_runti
     let handler = RequestHandler::new();
     let (owner, peer, linked_owner) =
         create_group_with_single_pane_linked_window(&handler, "surviving-linked-break").await;
-    let created = handler
-        .handle(Request::NewWindow(Box::new(NewWindowRequest {
-            target: linked_owner.clone(),
+    handler
+        .create_window(NewWindowRequest {
             name: Some("survivor".to_owned()),
-            detached: true,
-            environment: None,
-            command: None,
-            start_directory: None,
             target_window_index: Some(1),
-            insert_at_target: false,
-            process_command: None,
-        })))
+            ..Fixture::fixture(&linked_owner)
+        })
         .await;
-    assert!(matches!(created, Response::NewWindow(_)), "{created:?}");
-    handler.wait_for_initial_panes_for_test().await;
     let (moved_pane_id, surviving_pane_id) = {
         let state = handler.state.lock().await;
         (
@@ -1402,19 +1212,12 @@ async fn break_last_linked_pane_preserves_other_source_session_windows_and_runti
         )
     };
 
-    let response = handler
-        .handle(Request::BreakPane(Box::new(BreakPaneRequest {
-            source: PaneTarget::with_window(linked_owner.clone(), 0, 0),
-            target: Some(WindowTarget::with_window(owner.clone(), 2)),
-            name: None,
-            detached: true,
-            after: false,
-            before: false,
-            print_target: false,
-            format: None,
-        })))
+    handler
+        .handle_ok(BreakPaneRequest::fixture((
+            PaneTarget::with_window(linked_owner.clone(), 0, 0),
+            WindowTarget::with_window(owner.clone(), 2),
+        )))
         .await;
-    assert!(matches!(response, Response::BreakPane(_)), "{response:?}");
 
     let state = handler.state.lock().await;
     let linked_session = state
@@ -1442,7 +1245,6 @@ async fn cross_session_swap_synchronizes_the_entire_linked_window_family() {
     let (owner, peer, linked_owner) =
         create_group_with_linked_runtime_window(&handler, "cross-linked-swap").await;
     let gamma = create_session(&handler, "cross-linked-swap-gamma").await;
-    handler.wait_for_initial_panes_for_test().await;
     let source_pane_id = {
         let state = handler.state.lock().await;
         pane_id(&state, &owner, 1, 1)
@@ -1466,16 +1268,12 @@ async fn cross_session_swap_synchronizes_the_entire_linked_window_family() {
     )
     .await;
 
-    let response = handler
-        .handle(Request::SwapPane(SwapPaneRequest {
-            source: PaneTarget::with_window(owner.clone(), 1, 1),
-            target: PaneTarget::with_window(gamma.clone(), 0, 0),
-            direction: None,
-            detached: true,
-            preserve_zoom: false,
-        }))
+    handler
+        .handle_ok(SwapPaneRequest::fixture((
+            PaneTarget::with_window(owner.clone(), 1, 1),
+            PaneTarget::with_window(gamma.clone(), 0, 0),
+        )))
         .await;
-    assert!(matches!(response, Response::SwapPane(_)), "{response:?}");
 
     let state = handler.state.lock().await;
     assert_linked_window_models_and_runtimes_match(&state, &owner, &peer, &linked_owner);
@@ -1525,16 +1323,12 @@ async fn swap_between_two_aliases_of_the_same_linked_window_uses_shared_identity
         )
     };
 
-    let response = handler
-        .handle(Request::SwapPane(SwapPaneRequest {
-            source: PaneTarget::with_window(owner.clone(), 1, 0),
-            target: PaneTarget::with_window(linked_owner.clone(), 0, 1),
-            direction: None,
-            detached: true,
-            preserve_zoom: false,
-        }))
+    handler
+        .handle_ok(SwapPaneRequest::fixture((
+            PaneTarget::with_window(owner.clone(), 1, 0),
+            PaneTarget::with_window(linked_owner.clone(), 0, 1),
+        )))
         .await;
-    assert!(matches!(response, Response::SwapPane(_)), "{response:?}");
 
     let state = handler.state.lock().await;
     for (session_name, window_index) in [(&owner, 1), (&peer, 1), (&linked_owner, 0)] {
@@ -1561,18 +1355,15 @@ async fn join_between_two_aliases_of_the_same_linked_window_uses_shared_identity
         pane_ids(&state, &owner, 1)
     };
 
-    let response = handler
-        .handle(Request::JoinPane(JoinPaneRequest {
-            source: PaneTarget::with_window(owner.clone(), 1, 1),
-            target: PaneTarget::with_window(linked_owner.clone(), 0, 0),
+    handler
+        .handle_ok(JoinPaneRequest {
             direction: SplitDirection::Horizontal,
-            detached: true,
-            before: false,
-            full_size: false,
-            size: None,
-        }))
+            ..Fixture::fixture((
+                PaneTarget::with_window(owner.clone(), 1, 1),
+                PaneTarget::with_window(linked_owner.clone(), 0, 0),
+            ))
+        })
         .await;
-    assert!(matches!(response, Response::JoinPane(_)), "{response:?}");
 
     let state = handler.state.lock().await;
     for (session_name, window_index) in [(&owner, 1), (&peer, 1), (&linked_owner, 0)] {
@@ -1595,18 +1386,15 @@ async fn move_between_two_aliases_of_the_same_linked_window_uses_shared_identity
         pane_ids(&state, &owner, 1)
     };
 
-    let response = handler
-        .handle(Request::MovePane(MovePaneRequest {
-            source: PaneTarget::with_window(owner.clone(), 1, 1),
-            target: PaneTarget::with_window(linked_owner.clone(), 0, 0),
+    handler
+        .handle_ok(MovePaneRequest {
             direction: SplitDirection::Horizontal,
-            detached: true,
-            before: false,
-            full_size: false,
-            size: None,
-        }))
+            ..Fixture::fixture((
+                PaneTarget::with_window(owner.clone(), 1, 1),
+                PaneTarget::with_window(linked_owner.clone(), 0, 0),
+            ))
+        })
         .await;
-    assert!(matches!(response, Response::MovePane(_)), "{response:?}");
 
     let state = handler.state.lock().await;
     for (session_name, window_index) in [(&owner, 1), (&peer, 1), (&linked_owner, 0)] {
@@ -1625,7 +1413,6 @@ async fn cross_session_linked_swap_resize_failure_restores_the_full_transaction(
     let (owner, peer, linked_owner) =
         create_group_with_linked_runtime_window(&handler, "cross-linked-rollback").await;
     let gamma = create_session(&handler, "cross-linked-rollback-gamma").await;
-    handler.wait_for_initial_panes_for_test().await;
     let source_target = PaneTarget::with_window(owner.clone(), 1, 1);
     let target_target = PaneTarget::with_window(gamma.clone(), 0, 0);
     set_pane_option(
@@ -1679,13 +1466,10 @@ async fn cross_session_linked_swap_resize_failure_restores_the_full_transaction(
     };
 
     let response = handler
-        .handle(Request::SwapPane(SwapPaneRequest {
-            source: source_target.clone(),
-            target: target_target.clone(),
-            direction: None,
-            detached: true,
-            preserve_zoom: false,
-        }))
+        .handle(Request::SwapPane(SwapPaneRequest::fixture((
+            source_target.clone(),
+            target_target.clone(),
+        ))))
         .await;
     assert!(
         matches!(&response, Response::Error(error) if error.error.to_string().contains("injected pane terminal resize failure")),
@@ -1729,26 +1513,17 @@ async fn cross_session_join_into_linked_target_synchronizes_every_alias() {
         create_group_with_linked_runtime_window(&handler, "cross-linked-join").await;
     let gamma = create_session(&handler, "cross-linked-join-gamma").await;
     split_session(&handler, &gamma).await;
-    handler.wait_for_initial_panes_for_test().await;
     let moved_pane_id = {
         let state = handler.state.lock().await;
         pane_id(&state, &gamma, 0, 1)
     };
 
     let response = handler
-        .handle(Request::JoinPane(JoinPaneRequest {
-            source: PaneTarget::with_window(gamma.clone(), 0, 1),
-            target: PaneTarget::with_window(owner.clone(), 1, 0),
-            direction: SplitDirection::Vertical,
-            detached: true,
-            before: false,
-            full_size: false,
-            size: None,
-        }))
+        .handle_ok(JoinPaneRequest::fixture((
+            PaneTarget::with_window(gamma.clone(), 0, 1),
+            PaneTarget::with_window(owner.clone(), 1, 0),
+        )))
         .await;
-    let Response::JoinPane(response) = response else {
-        panic!("expected join into linked target success, got {response:?}");
-    };
 
     let state = handler.state.lock().await;
     assert_linked_window_models_and_runtimes_match(&state, &owner, &peer, &linked_owner);
@@ -1770,7 +1545,6 @@ async fn cross_session_move_out_of_linked_source_synchronizes_every_alias() {
     let (owner, peer, linked_owner) =
         create_group_with_linked_runtime_window(&handler, "cross-linked-move").await;
     let gamma = create_session(&handler, "cross-linked-move-gamma").await;
-    handler.wait_for_initial_panes_for_test().await;
     let moved_pane_id = {
         let mut state = handler.state.lock().await;
         let moved_pane_id = pane_id(&state, &owner, 1, 1);
@@ -1781,19 +1555,11 @@ async fn cross_session_move_out_of_linked_source_synchronizes_every_alias() {
     };
 
     let response = handler
-        .handle(Request::MovePane(MovePaneRequest {
-            source: PaneTarget::with_window(owner.clone(), 1, 1),
-            target: PaneTarget::with_window(gamma.clone(), 0, 0),
-            direction: SplitDirection::Vertical,
-            detached: true,
-            before: false,
-            full_size: false,
-            size: None,
-        }))
+        .handle_ok(MovePaneRequest::fixture((
+            PaneTarget::with_window(owner.clone(), 1, 1),
+            PaneTarget::with_window(gamma.clone(), 0, 0),
+        )))
         .await;
-    let Response::MovePane(response) = response else {
-        panic!("expected move out of linked source success, got {response:?}");
-    };
 
     let state = handler.state.lock().await;
     assert_linked_window_models_and_runtimes_match(&state, &owner, &peer, &linked_owner);
@@ -1819,7 +1585,6 @@ async fn cross_session_move_clears_options_from_every_duplicate_source_winlink()
     )
     .await;
     let gamma = create_session(&handler, "cross-move-duplicate-options-gamma").await;
-    handler.wait_for_initial_panes_for_test().await;
     let moved_source = PaneTarget::with_window(owner.clone(), 1, 0);
     let moved_pane_id = {
         let state = handler.state.lock().await;
@@ -1838,19 +1603,11 @@ async fn cross_session_move_clears_options_from_every_duplicate_source_winlink()
     .await;
 
     let response = handler
-        .handle(Request::MovePane(MovePaneRequest {
-            source: moved_source,
-            target: PaneTarget::with_window(gamma, 0, 0),
-            direction: SplitDirection::Vertical,
-            detached: true,
-            before: false,
-            full_size: false,
-            size: None,
-        }))
+        .handle_ok(MovePaneRequest::fixture((
+            moved_source,
+            PaneTarget::with_window(gamma, 0, 0),
+        )))
         .await;
-    let Response::MovePane(response) = response else {
-        panic!("expected duplicate-winlink move success, got {response:?}");
-    };
 
     let state = handler.state.lock().await;
     for (session_name, window_index) in [
@@ -1908,13 +1665,12 @@ async fn kill_pane_rekeys_options_across_every_duplicate_linked_winlink() {
     )
     .await;
 
-    let response = handler
-        .handle(Request::KillPane(KillPaneRequest {
+    handler
+        .handle_ok(KillPaneRequest {
             target: PaneTarget::with_window(owner.clone(), 1, 0),
             kill_all_except: false,
-        }))
+        })
         .await;
-    assert!(matches!(response, Response::KillPane(_)), "{response:?}");
 
     let state = handler.state.lock().await;
     for (session_name, window_index) in [
@@ -1972,19 +1728,11 @@ async fn grouped_move_rekeys_options_across_every_duplicate_linked_winlink() {
     .await;
 
     let response = handler
-        .handle(Request::MovePane(MovePaneRequest {
-            source: PaneTarget::with_window(owner.clone(), 1, 0),
-            target: PaneTarget::with_window(peer.clone(), 0, 0),
-            direction: SplitDirection::Vertical,
-            detached: true,
-            before: false,
-            full_size: false,
-            size: None,
-        }))
+        .handle_ok(MovePaneRequest::fixture((
+            PaneTarget::with_window(owner.clone(), 1, 0),
+            PaneTarget::with_window(peer.clone(), 0, 0),
+        )))
         .await;
-    let Response::MovePane(response) = response else {
-        panic!("expected grouped duplicate move success, got {response:?}");
-    };
 
     let state = handler.state.lock().await;
     for (session_name, window_index) in [
@@ -2030,19 +1778,11 @@ async fn grouped_move_last_pane_removes_every_duplicate_linked_occurrence() {
     set_pane_option(&handler, source.clone(), "@grouped-last-duplicate", "moved").await;
 
     let response = handler
-        .handle(Request::MovePane(MovePaneRequest {
+        .handle_ok(MovePaneRequest::fixture((
             source,
-            target: PaneTarget::with_window(peer.clone(), 0, 0),
-            direction: SplitDirection::Vertical,
-            detached: true,
-            before: false,
-            full_size: false,
-            size: None,
-        }))
+            PaneTarget::with_window(peer.clone(), 0, 0),
+        )))
         .await;
-    let Response::MovePane(response) = response else {
-        panic!("expected grouped last duplicate move success, got {response:?}");
-    };
 
     let state = handler.state.lock().await;
     for group_member in [&owner, &peer] {
@@ -2096,15 +1836,12 @@ async fn split_before_linked_pane_keeps_option_on_stable_pane_identity() {
     )
     .await;
 
-    let response = handler
-        .handle(Request::SplitWindow(SplitWindowRequest {
-            target: SplitWindowTarget::Pane(old_target),
-            direction: SplitDirection::Vertical,
+    handler
+        .handle_ok(SplitWindowRequest {
             before: true,
-            environment: None,
-        }))
+            ..Fixture::fixture(old_target)
+        })
         .await;
-    assert!(matches!(response, Response::SplitWindow(_)), "{response:?}");
 
     let state = handler.state.lock().await;
     for (session_name, window_index) in [(&owner, 1), (&peer, 1), (&linked_owner, 0)] {
@@ -2145,27 +1882,17 @@ async fn cross_session_break_out_of_linked_source_synchronizes_every_alias() {
     let (owner, peer, linked_owner) =
         create_group_with_linked_runtime_window(&handler, "cross-linked-break").await;
     let gamma = create_session(&handler, "cross-linked-break-gamma").await;
-    handler.wait_for_initial_panes_for_test().await;
     let moved_pane_id = {
         let state = handler.state.lock().await;
         pane_id(&state, &owner, 1, 1)
     };
 
     let response = handler
-        .handle(Request::BreakPane(Box::new(BreakPaneRequest {
-            source: PaneTarget::with_window(owner.clone(), 1, 1),
-            target: Some(WindowTarget::with_window(gamma.clone(), 1)),
-            name: None,
-            detached: true,
-            after: false,
-            before: false,
-            print_target: false,
-            format: None,
-        })))
+        .handle_ok(BreakPaneRequest::fixture((
+            PaneTarget::with_window(owner.clone(), 1, 1),
+            WindowTarget::with_window(gamma.clone(), 1),
+        )))
         .await;
-    let Response::BreakPane(response) = response else {
-        panic!("expected break out of linked source success, got {response:?}");
-    };
 
     let state = handler.state.lock().await;
     assert_linked_window_models_and_runtimes_match(&state, &owner, &peer, &linked_owner);
@@ -2182,7 +1909,6 @@ async fn cross_session_break_before_remaps_duplicate_destination_winlinks() {
             .await;
     let source = create_session(&handler, "cross-break-before-duplicates-source").await;
     split_session(&handler, &source).await;
-    handler.wait_for_initial_panes_for_test().await;
     set_window_marker(
         &handler,
         WindowTarget::with_window(owner.clone(), 0),
@@ -2232,20 +1958,14 @@ async fn cross_session_break_before_remaps_duplicate_destination_winlinks() {
     .await;
 
     let response = handler
-        .handle(Request::BreakPane(Box::new(BreakPaneRequest {
-            source: PaneTarget::with_window(source, 0, 1),
-            target: Some(WindowTarget::with_window(owner.clone(), 1)),
-            name: None,
-            detached: true,
-            after: false,
+        .handle_ok(BreakPaneRequest {
             before: true,
-            print_target: false,
-            format: None,
-        })))
+            ..Fixture::fixture((
+                PaneTarget::with_window(source, 0, 1),
+                WindowTarget::with_window(owner.clone(), 1),
+            ))
+        })
         .await;
-    let Response::BreakPane(response) = response else {
-        panic!("expected cross-session break-before success, got {response:?}");
-    };
     assert_eq!(
         response.target,
         PaneTarget::with_window(owner.clone(), 1, 0)
@@ -2308,16 +2028,12 @@ async fn swap_between_group_aliases_moves_terminals_across_linked_runtime_owners
     )
     .await;
 
-    let response = handler
-        .handle(Request::SwapPane(SwapPaneRequest {
-            source: PaneTarget::with_window(owner.clone(), 0, 0),
-            target: PaneTarget::with_window(peer.clone(), 1, 0),
-            direction: None,
-            detached: true,
-            preserve_zoom: false,
-        }))
+    handler
+        .handle_ok(SwapPaneRequest::fixture((
+            PaneTarget::with_window(owner.clone(), 0, 0),
+            PaneTarget::with_window(peer.clone(), 1, 0),
+        )))
         .await;
-    assert!(matches!(response, Response::SwapPane(_)), "{response:?}");
 
     let state = handler.state.lock().await;
     assert_eq!(pane_id(&state, &owner, 0, 0), target_pane_id);
@@ -2365,19 +2081,11 @@ async fn join_between_group_aliases_moves_terminal_into_linked_runtime_owner() {
     };
 
     let response = handler
-        .handle(Request::JoinPane(JoinPaneRequest {
-            source: PaneTarget::with_window(owner.clone(), 0, 1),
-            target: PaneTarget::with_window(peer.clone(), 1, 0),
-            direction: SplitDirection::Vertical,
-            detached: true,
-            before: false,
-            full_size: false,
-            size: None,
-        }))
+        .handle_ok(JoinPaneRequest::fixture((
+            PaneTarget::with_window(owner.clone(), 0, 1),
+            PaneTarget::with_window(peer.clone(), 1, 0),
+        )))
         .await;
-    let Response::JoinPane(response) = response else {
-        panic!("expected linked-runtime join success, got {response:?}");
-    };
 
     let state = handler.state.lock().await;
     assert!(pane_ids(&state, &owner, 0)
@@ -2422,14 +2130,11 @@ async fn break_last_linked_pane_between_group_aliases_matches_tmux_group_rejecti
     for detached in [true, false] {
         let response = handler
             .handle(Request::BreakPane(Box::new(BreakPaneRequest {
-                source: PaneTarget::with_window(peer.clone(), 1, 0),
-                target: Some(WindowTarget::with_window(owner.clone(), 2)),
-                name: None,
                 detached,
-                after: false,
-                before: false,
-                print_target: false,
-                format: None,
+                ..Fixture::fixture((
+                    PaneTarget::with_window(peer.clone(), 1, 0),
+                    WindowTarget::with_window(owner.clone(), 2),
+                ))
             })))
             .await;
         assert!(
@@ -2480,20 +2185,14 @@ async fn break_between_group_aliases_moves_terminal_out_of_linked_runtime_owner(
     .await;
 
     let response = handler
-        .handle(Request::BreakPane(Box::new(BreakPaneRequest {
-            source: PaneTarget::with_window(peer.clone(), 1, 1),
-            target: Some(WindowTarget::with_window(owner.clone(), 2)),
-            name: None,
+        .handle_ok(BreakPaneRequest {
             detached: false,
-            after: false,
-            before: false,
-            print_target: false,
-            format: None,
-        })))
+            ..Fixture::fixture((
+                PaneTarget::with_window(peer.clone(), 1, 1),
+                WindowTarget::with_window(owner.clone(), 2),
+            ))
+        })
         .await;
-    let Response::BreakPane(response) = response else {
-        panic!("expected linked-runtime break success, got {response:?}");
-    };
     assert_eq!(
         response.target,
         PaneTarget::with_window(owner.clone(), 2, 0)

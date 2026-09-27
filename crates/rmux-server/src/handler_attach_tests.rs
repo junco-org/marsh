@@ -1,4 +1,4 @@
-use super::attach_support::AttachRegistration;
+use super::attach_support::{AttachRegistration, ClientFlags};
 use super::RequestHandler;
 use crate::input_keys::{MouseForwardEvent, MAX_SGR_MOUSE_FRAME_BYTES};
 use crate::mouse::{AttachedMouseEvent, MouseLocation};
@@ -18,12 +18,11 @@ use rmux_proto::{
     ResolveTargetRequest, ResolveTargetType, Response, RmuxError, ScopeSelector,
     SelectLayoutRequest, SelectLayoutTarget, SelectPaneRequest, SelectWindowRequest,
     SendKeysRequest, SessionName, SetOptionMode, SetOptionRequest, SplitWindowRequest,
-    SplitWindowTarget, SwitchClientRequest, Target, TerminalSize, WindowTarget,
-    CAPABILITY_ATTACH_RENDER,
+    SwitchClientRequest, Target, TerminalSize, WindowTarget, CAPABILITY_ATTACH_RENDER,
 };
 use rmux_pty::{ChildCommand, TerminalSize as PtyTerminalSize};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -32,14 +31,11 @@ use tokio::time::sleep;
 
 const ATTACH_LIFECYCLE_TIMEOUT: Duration = Duration::from_secs(5);
 
+use crate::test_fixtures::{Fixture, Grouped, Quiet, DEFAULT_SHELL_WINDOW_NAME};
 use crate::test_names::session_name;
 
-fn default_shell_window_name() -> String {
-    "bash".to_owned()
-}
-
 fn default_shell_pane_status() -> String {
-    format!("{}|0|\n", default_shell_window_name())
+    format!("{DEFAULT_SHELL_WINDOW_NAME}|0|\n")
 }
 
 fn take_render_frame(control: AttachControl) -> String {
@@ -158,26 +154,11 @@ async fn create_attached_session(
     requester_pid: u32,
     session: &SessionName,
 ) -> mpsc::UnboundedReceiver<AttachControl> {
-    {
-        set_unix_test_shell(handler, session).await;
-
-        assert!(matches!(
-            handler
-                .handle(Request::NewSession(NewSessionRequest {
-                    session_name: session.clone(),
-                    detached: true,
-                    size: Some(TerminalSize { cols: 80, rows: 24 }),
-                    environment: None,
-                }))
-                .await,
-            Response::NewSession(_)
-        ));
-    }
-    let (control_tx, control_rx) = mpsc::unbounded_channel();
     handler
-        .register_attach(requester_pid, session.clone(), control_tx)
+        .store_option_for_test(ScopeSelector::Global, OptionName::DefaultShell, "/bin/bash")
         .await;
-    control_rx
+    handler.create_session(session).await;
+    handler.attach_client(requester_pid, session).await
 }
 
 /// Creates the same attached session as [`create_attached_session`], with the
@@ -192,62 +173,32 @@ async fn create_attached_session_in_utf8_locale(
     requester_pid: u32,
     session: &SessionName,
 ) -> mpsc::UnboundedReceiver<AttachControl> {
-    set_unix_test_shell(handler, session).await;
-
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: session.clone(),
-                detached: true,
-                size: Some(TerminalSize { cols: 80, rows: 24 }),
-                environment: utf8_locale::fixture_environment(),
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
-    let (control_tx, control_rx) = mpsc::unbounded_channel();
     handler
-        .register_attach(requester_pid, session.clone(), control_tx)
+        .store_option_for_test(ScopeSelector::Global, OptionName::DefaultShell, "/bin/bash")
         .await;
-    control_rx
+    handler
+        .create_session(NewSessionRequest {
+            environment: utf8_locale::fixture_environment(),
+            ..Fixture::fixture(session)
+        })
+        .await;
+    handler.attach_client(requester_pid, session).await
 }
 
 #[tokio::test]
 async fn web_render_refreshes_are_marked_pending_before_building_switches() {
     let handler = RequestHandler::new();
-    let session = session_name("web-refresh-coalesce");
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: session.clone(),
-                detached: true,
-                size: Some(TerminalSize { cols: 80, rows: 24 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
+    let session = handler.create_session("web-refresh-coalesce").await;
 
     let (control_tx, mut control_rx) = mpsc::unbounded_channel();
-    let uid = current_owner_uid();
     handler
         .register_attach_with_access(
             77,
             session.clone(),
             None,
             AttachRegistration {
-                control_tx,
-                control_backlog: Arc::new(AtomicUsize::new(0)),
-                closing: Arc::new(AtomicBool::new(false)),
-                persistent_overlay_epoch: Arc::new(AtomicU64::new(0)),
-                terminal_context: OuterTerminalContext::default(),
-                client_title: None,
-                flags: super::attach_support::ClientFlags::default(),
                 render_stream: true,
-                uid,
-                user: rmux_os::identity::UserIdentity::Uid(uid),
-                can_write: true,
-                client_size: Some(TerminalSize { cols: 80, rows: 24 }),
+                ..Fixture::fixture((control_tx, current_owner_uid()))
             },
         )
         .await
@@ -266,43 +217,22 @@ async fn web_render_refreshes_are_marked_pending_before_building_switches() {
 #[tokio::test]
 async fn refresh_attached_session_removes_clients_over_backlog_limit() {
     let handler = RequestHandler::new();
-    let session = session_name("refresh-backlog");
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: session.clone(),
-                detached: true,
-                size: Some(TerminalSize { cols: 80, rows: 24 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
+    let session = handler.create_session("refresh-backlog").await;
 
     let (control_tx, mut control_rx) = mpsc::unbounded_channel();
     let control_backlog = Arc::new(AtomicUsize::new(
         super::attach_support::ATTACH_CONTROL_BACKLOG_LIMIT,
     ));
     let closing = Arc::new(AtomicBool::new(false));
-    let uid = current_owner_uid();
     handler
         .register_attach_with_access(
             77,
             session.clone(),
             None,
             AttachRegistration {
-                control_tx,
                 control_backlog: control_backlog.clone(),
                 closing: closing.clone(),
-                persistent_overlay_epoch: Arc::new(AtomicU64::new(0)),
-                terminal_context: OuterTerminalContext::default(),
-                client_title: None,
-                flags: super::attach_support::ClientFlags::default(),
-                render_stream: false,
-                uid,
-                user: rmux_os::identity::UserIdentity::Uid(uid),
-                can_write: true,
-                client_size: Some(TerminalSize { cols: 80, rows: 24 }),
+                ..Fixture::fixture((control_tx, current_owner_uid()))
             },
         )
         .await
@@ -326,7 +256,12 @@ async fn create_line_exiting_attached_session(
     session: &SessionName,
 ) -> mpsc::UnboundedReceiver<AttachControl> {
     let marker = format!("RMUX_LINE_EXIT_READY_{}", std::process::id());
-    create_session_with_command(handler, session, line_exiting_command(&marker)).await;
+    handler
+        .create_session(NewSessionExtRequest {
+            command: Some(line_exiting_command(&marker)),
+            ..Fixture::fixture(session)
+        })
+        .await;
     let target = PaneTarget::new(session.clone(), 0);
     wait_for_capture_containing(
         handler,
@@ -335,26 +270,10 @@ async fn create_line_exiting_attached_session(
         "the attached-exit fixture should reach its input loop",
     )
     .await;
-    replace_transcript_contents(handler, &target, TerminalSize { cols: 80, rows: 24 }, b"").await;
-
-    let (control_tx, control_rx) = mpsc::unbounded_channel();
     handler
-        .register_attach(requester_pid, session.clone(), control_tx)
+        .replace_transcript_for_test(&target, TerminalSize { cols: 80, rows: 24 }, b"")
         .await;
-    control_rx
-}
-
-async fn set_unix_test_shell(handler: &RequestHandler, _session: &SessionName) {
-    let mut state = handler.state.lock().await;
-    state
-        .options
-        .set(
-            ScopeSelector::Global,
-            OptionName::DefaultShell,
-            "/bin/bash".to_owned(),
-            SetOptionMode::Replace,
-        )
-        .expect("test default-shell is valid");
+    handler.attach_client(requester_pid, session).await
 }
 
 async fn create_quiet_attached_session(
@@ -362,48 +281,8 @@ async fn create_quiet_attached_session(
     requester_pid: u32,
     session: &SessionName,
 ) -> mpsc::UnboundedReceiver<AttachControl> {
-    create_quiet_session(handler, session).await;
-    let (control_tx, control_rx) = mpsc::unbounded_channel();
-    handler
-        .register_attach(requester_pid, session.clone(), control_tx)
-        .await;
-    control_rx
-}
-
-async fn create_quiet_session(handler: &RequestHandler, session: &SessionName) {
-    create_session_with_command(handler, session, quiet_attached_command()).await;
-}
-
-async fn create_session_with_command(
-    handler: &RequestHandler,
-    session: &SessionName,
-    command: Vec<String>,
-) {
-    let response = handler
-        .handle(Request::NewSessionExt(Box::new(NewSessionExtRequest {
-            session_name: Some(session.clone()),
-            working_directory: None,
-            detached: true,
-            size: Some(TerminalSize { cols: 80, rows: 24 }),
-            environment: None,
-            group_target: None,
-            attach_if_exists: false,
-            detach_other_clients: false,
-            kill_other_clients: false,
-            flags: None,
-            window_name: None,
-            print_session_info: false,
-            print_format: None,
-            command: Some(command),
-            process_command: None,
-            client_environment: None,
-            skip_environment_update: false,
-        })))
-        .await;
-    assert!(
-        matches!(response, Response::NewSession(_)),
-        "quiet test session should be created, got {response:?}"
-    );
+    handler.create_session(Quiet(session)).await;
+    handler.attach_client(requester_pid, session).await
 }
 
 fn line_exiting_command(marker: &str) -> Vec<String> {
@@ -430,55 +309,30 @@ fn quiet_ready_command(marker: &str) -> Vec<String> {
     ]
 }
 
-fn quiet_attached_command() -> Vec<String> {
-    ["/bin/sh", "-c", "sleep 60"]
-        .into_iter()
-        .map(str::to_owned)
-        .collect()
-}
-
 async fn active_panes(handler: &RequestHandler, session: &SessionName) -> String {
     let response = handler
-        .handle(Request::ListPanes(Box::new(ListPanesRequest {
+        .handle_ok(ListPanesRequest {
             target: session.clone(),
             format: Some("#{pane_index}:#{pane_active}".to_owned()),
             filter: None,
             sort_order: None,
             reversed: false,
             target_window_index: None,
-        })))
+        })
         .await;
-    let Response::ListPanes(response) = response else {
-        panic!("expected list-panes response, got {response:?}");
-    };
     String::from_utf8(response.output.stdout().to_vec()).expect("list-panes stdout is utf-8")
-}
-
-async fn pane_terminal_size(
-    handler: &RequestHandler,
-    session_name: &SessionName,
-    window_index: u32,
-    pane_index: u32,
-) -> TerminalSize {
-    let state = handler.state.lock().await;
-    state
-        .pane_terminal_size(session_name, window_index, pane_index)
-        .expect("pane terminal size available")
 }
 
 async fn active_windows(handler: &RequestHandler, session: &SessionName) -> String {
     let response = handler
-        .handle(Request::ListWindows(Box::new(ListWindowsRequest {
+        .handle_ok(ListWindowsRequest {
             target: session.clone(),
             format: Some("#{window_index}:#{window_active}".to_owned()),
             filter: None,
             sort_order: None,
             reversed: false,
-        })))
+        })
         .await;
-    let Response::ListWindows(response) = response else {
-        panic!("expected list-windows response, got {response:?}");
-    };
     String::from_utf8(response.output.stdout().to_vec()).expect("list-windows stdout is utf-8")
 }
 
@@ -506,7 +360,7 @@ async fn select_layout(handler: &RequestHandler, session: &SessionName, layout: 
 
 async fn pane_mode_status(handler: &RequestHandler, session: &SessionName) -> String {
     let response = handler
-        .handle(Request::ListPanes(Box::new(ListPanesRequest {
+        .handle_ok(ListPanesRequest {
             target: session.clone(),
             format: Some(
                 "#{pane_in_mode}:#{pane_mode}:#{search_present}:#{selection_present}".to_owned(),
@@ -515,11 +369,8 @@ async fn pane_mode_status(handler: &RequestHandler, session: &SessionName) -> St
             sort_order: None,
             reversed: false,
             target_window_index: None,
-        })))
+        })
         .await;
-    let Response::ListPanes(response) = response else {
-        panic!("expected list-panes response, got {response:?}");
-    };
     String::from_utf8(response.output.stdout().to_vec()).expect("list-panes stdout is utf-8")
 }
 
@@ -528,21 +379,8 @@ async fn display_target_format(
     target: PaneTarget,
     format: &str,
 ) -> String {
-    let response = handler
-        .handle(Request::DisplayMessage(rmux_proto::DisplayMessageRequest {
-            target: Some(rmux_proto::Target::Pane(target)),
-            print: true,
-            message: Some(format.to_owned()),
-            empty_target_context: false,
-        }))
-        .await;
-    let Response::DisplayMessage(response) = response else {
-        panic!("expected display-message response");
-    };
-    let output = response
-        .command_output()
-        .expect("display-message -p returns output");
-    String::from_utf8(output.stdout().to_vec()).expect("display-message stdout is utf-8")
+    String::from_utf8(handler.display_print(target, format).await)
+        .expect("display-message stdout is utf-8")
 }
 
 fn drain_attach_controls(control_rx: &mut mpsc::UnboundedReceiver<AttachControl>) {
@@ -572,33 +410,9 @@ async fn recv_overlay_frame(
 }
 
 async fn capture_pane_print(handler: &RequestHandler, target: PaneTarget) -> String {
-    let response = handler
-        .handle(Request::CapturePane(Box::new(CapturePaneRequest {
-            target,
-            start: None,
-            end: None,
-            print: true,
-            buffer_name: None,
-            alternate: false,
-            escape_ansi: false,
-            escape_sequences: false,
-            include_format: false,
-            hyperlinks: false,
-            line_numbers: false,
-            join_wrapped: false,
-            use_mode_screen: false,
-            preserve_trailing_spaces: false,
-            do_not_trim_spaces: false,
-            pending_input: false,
-            quiet: false,
-            start_is_absolute: false,
-            end_is_absolute: false,
-        })))
-        .await;
-    let Response::CapturePane(response) = response else {
-        panic!("expected capture-pane response, got {response:?}");
-    };
-    let output = response
+    let output = handler
+        .handle_ok(CapturePaneRequest::fixture(target))
+        .await
         .output
         .expect("capture-pane -p should return command output");
     String::from_utf8(output.stdout().to_vec()).expect("capture-pane stdout is utf-8")
@@ -626,25 +440,14 @@ async fn wait_for_capture_containing(
 }
 
 async fn prepare_attached_shell_prompt(handler: &RequestHandler, target: &PaneTarget) {
-    let [set_prompt, clear_screen] = attached_shell_prompt_commands();
-    assert!(matches!(
+    for command in attached_shell_prompt_commands() {
         handler
-            .handle(Request::SendKeys(SendKeysRequest {
+            .handle_ok(SendKeysRequest {
                 target: target.clone(),
-                keys: vec![set_prompt, "Enter".to_owned()],
-            }))
-            .await,
-        Response::SendKeys(_)
-    ));
-    assert!(matches!(
-        handler
-            .handle(Request::SendKeys(SendKeysRequest {
-                target: target.clone(),
-                keys: vec![clear_screen, "Enter".to_owned()],
-            }))
-            .await,
-        Response::SendKeys(_)
-    ));
+                keys: vec![command, "Enter".to_owned()],
+            })
+            .await;
+    }
     wait_for_capture_containing(
         handler,
         target.clone(),
@@ -660,31 +463,6 @@ fn attached_shell_prompt_commands() -> [String; 2] {
 
 fn attached_shell_prompt_ready_needle() -> &'static str {
     "PROMPT>"
-}
-
-async fn wait_for_dead_pane(
-    handler: &RequestHandler,
-    session_name: &SessionName,
-    window_index: u32,
-    pane_index: u32,
-) {
-    let deadline = tokio::time::Instant::now() + ATTACH_LIFECYCLE_TIMEOUT;
-    loop {
-        let exited = {
-            let state = handler.state.lock().await;
-            state
-                .pane_shell_if_alive(session_name, window_index, pane_index)
-                .is_err()
-        };
-        if exited {
-            return;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "timed out waiting for pane {session_name}:{window_index}.{pane_index} to exit"
-        );
-        sleep(Duration::from_millis(25)).await;
-    }
 }
 
 async fn wait_for_session_removed(handler: &RequestHandler, session_name: &SessionName) {
@@ -705,32 +483,112 @@ async fn wait_for_session_removed(handler: &RequestHandler, session_name: &Sessi
     }
 }
 
-use super::input_capture::RawPaneInputProbe;
-
-async fn replace_transcript_contents(
+/// Registers `requester_pid` on `session` as a writable client that declared `size`, then
+/// reports that size, as a sized attach publishes itself.
+async fn register_sized_attach(
     handler: &RequestHandler,
-    target: &PaneTarget,
+    requester_pid: u32,
+    session: &SessionName,
     size: TerminalSize,
-    content: &[u8],
-) {
-    let transcript = {
-        let state = handler.state.lock().await;
-        state
-            .transcript_handle(target)
-            .expect("session transcript must exist")
-    };
-    let history_limit = transcript
-        .lock()
-        .expect("pane transcript mutex must not be poisoned")
-        .history_limit();
-    let mut screen = Screen::new(size, history_limit);
-    let mut parser = InputParser::new();
-    parser.parse(content, &mut screen);
-    transcript
-        .lock()
-        .expect("pane transcript mutex must not be poisoned")
-        .set_screen_for_test(screen);
+) -> (u64, mpsc::UnboundedReceiver<AttachControl>) {
+    register_sized_attach_with_flags(
+        handler,
+        requester_pid,
+        session,
+        size,
+        ClientFlags::default(),
+    )
+    .await
 }
+
+async fn register_sized_attach_with_flags(
+    handler: &RequestHandler,
+    requester_pid: u32,
+    session: &SessionName,
+    size: TerminalSize,
+    flags: ClientFlags,
+) -> (u64, mpsc::UnboundedReceiver<AttachControl>) {
+    let (control_tx, control_rx) = mpsc::unbounded_channel();
+    let attach_id = handler
+        .register_attach_with_access(
+            requester_pid,
+            session.clone(),
+            None,
+            AttachRegistration {
+                flags,
+                client_size: Some(size),
+                ..Fixture::fixture((control_tx, current_owner_uid()))
+            },
+        )
+        .await
+        .expect("attach registration succeeds");
+    handler
+        .handle_attached_resize(requester_pid, size)
+        .await
+        .expect("initial attached client size is accepted");
+    (attach_id, control_rx)
+}
+
+/// A writable `attach-session -t session` that declares `client_size`, every other option off.
+fn attach_session_ext2(
+    session: &SessionName,
+    client_size: TerminalSize,
+) -> AttachSessionExt2Request {
+    AttachSessionExt2Request {
+        target: Some(session.clone()),
+        target_spec: Some(session.to_string()),
+        detach_other_clients: false,
+        kill_other_clients: false,
+        read_only: false,
+        skip_environment_update: false,
+        flags: None,
+        working_directory: None,
+        client_terminal: rmux_proto::ClientTerminalContext::default(),
+        client_size: Some(client_size),
+    }
+}
+
+/// [`attach_session_ext2`] as the request to dispatch.
+fn attach_session_request(session: &SessionName, client_size: TerminalSize) -> Request {
+    Request::AttachSessionExt2(Box::new(attach_session_ext2(session, client_size)))
+}
+
+async fn set_vi_mode_keys(handler: &RequestHandler, session: &SessionName) {
+    handler
+        .set_option(
+            ScopeSelector::Window(WindowTarget::with_window(session.clone(), 0)),
+            OptionName::ModeKeys,
+            "vi",
+        )
+        .await;
+}
+
+async fn table_references(handler: &RequestHandler, table_name: &str) -> Option<usize> {
+    handler
+        .state
+        .lock()
+        .await
+        .key_bindings
+        .table(table_name)
+        .map(|table| table.references())
+}
+
+/// Reads one session's current position in the recency order.
+async fn session_recency(
+    handler: &RequestHandler,
+    session: &SessionName,
+) -> rmux_core::SessionRecency {
+    handler
+        .state
+        .lock()
+        .await
+        .sessions
+        .session(session)
+        .expect("session exists")
+        .recency()
+}
+
+use super::input_capture::RawPaneInputProbe;
 
 #[path = "handler_attach_tests/utf8_locale.rs"]
 mod utf8_locale;

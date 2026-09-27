@@ -2,49 +2,14 @@ use std::time::Duration;
 
 use rmux_core::LifecycleEvent;
 use rmux_proto::{
-    HookLifecycle, HookName, NewSessionRequest, Request, Response, ScopeSelector, SessionName,
-    SetHookMutationRequest, ShowBufferRequest, TerminalSize, WaitForMode, WaitForRequest,
+    HookLifecycle, HookName, Request, ScopeSelector, SessionName, SetHookMutationRequest,
+    ShowBufferRequest, WaitForMode, WaitForRequest,
 };
 use tokio::sync::oneshot;
 
 use super::*;
 
-use crate::test_names::session_name;
-
-async fn create_session(handler: &RequestHandler, name: &str) -> SessionName {
-    let session = session_name(name);
-    let response = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name: session.clone(),
-            detached: true,
-            size: Some(TerminalSize { cols: 80, rows: 24 }),
-            environment: None,
-        }))
-        .await;
-    assert!(matches!(response, Response::NewSession(_)), "{response:?}");
-    session
-}
-
-async fn set_focus_hook(
-    handler: &RequestHandler,
-    command: &str,
-    lifecycle: HookLifecycle,
-    append: bool,
-) {
-    let response = handler
-        .handle(Request::SetHookMutation(SetHookMutationRequest {
-            scope: ScopeSelector::Global,
-            hook: HookName::ClientFocusIn,
-            command: Some(command.to_owned()),
-            lifecycle,
-            append,
-            unset: false,
-            run_immediately: false,
-            index: None,
-        }))
-        .await;
-    assert!(matches!(response, Response::SetHook(_)), "{response:?}");
-}
+use crate::test_fixtures::Fixture;
 
 fn spawn_lifecycle_consumer(handler: &RequestHandler) -> (oneshot::Sender<()>, JoinHandle<()>) {
     let events = handler
@@ -82,16 +47,6 @@ async fn wait_for_hook_block(handler: &RequestHandler, channel: &str) {
     .expect("hook reaches its deterministic wait-for seam");
 }
 
-async fn signal_wait_for(handler: &RequestHandler, channel: &str) {
-    let response = handler
-        .handle(Request::WaitFor(WaitForRequest {
-            channel: channel.to_owned(),
-            mode: WaitForMode::Signal,
-        }))
-        .await;
-    assert!(matches!(response, Response::WaitFor(_)), "{response:?}");
-}
-
 async fn seal_final_lifecycle_boundaries(handler: &RequestHandler) {
     handler.close_and_drain_lifecycle_producers().await;
     handler.close_and_drain_post_commit_operations().await;
@@ -101,14 +56,13 @@ async fn seal_final_lifecycle_boundaries(handler: &RequestHandler) {
 #[tokio::test]
 async fn full_outbox_and_stuck_hook_are_forced_at_the_shared_deadline() {
     let handler = RequestHandler::with_lifecycle_dispatch_capacity_for_test(1);
-    let session = create_session(&handler, "shutdown-full-outbox").await;
-    set_focus_hook(
-        &handler,
-        "wait-for shutdown-full-outbox-hook",
-        HookLifecycle::Persistent,
-        false,
-    )
-    .await;
+    let session = handler.create_session("shutdown-full-outbox").await;
+    handler
+        .set_global_hook(
+            HookName::ClientFocusIn,
+            "wait-for shutdown-full-outbox-hook",
+        )
+        .await;
     let (hook_shutdown, mut hook_task) = spawn_lifecycle_consumer(&handler);
 
     emit_focus(&handler, &session, "accepted").await;
@@ -184,27 +138,38 @@ async fn full_outbox_and_stuck_hook_are_forced_at_the_shared_deadline() {
 #[tokio::test]
 async fn normal_shutdown_drains_already_accepted_and_queued_hooks() {
     let handler = RequestHandler::with_lifecycle_dispatch_capacity_for_test(1);
-    let session = create_session(&handler, "shutdown-normal-outbox").await;
-    set_focus_hook(
-        &handler,
-        "wait-for shutdown-normal-outbox-hook",
-        HookLifecycle::OneShot,
-        false,
-    )
-    .await;
-    set_focus_hook(
-        &handler,
-        "set-buffer -b shutdown-normal-outbox drained",
-        HookLifecycle::Persistent,
-        true,
-    )
-    .await;
+    let session = handler.create_session("shutdown-normal-outbox").await;
+    for (command, lifecycle, append) in [
+        (
+            "wait-for shutdown-normal-outbox-hook",
+            HookLifecycle::OneShot,
+            false,
+        ),
+        (
+            "set-buffer -b shutdown-normal-outbox drained",
+            HookLifecycle::Persistent,
+            true,
+        ),
+    ] {
+        handler
+            .handle_ok(SetHookMutationRequest {
+                lifecycle,
+                append,
+                ..Fixture::fixture((ScopeSelector::Global, HookName::ClientFocusIn, command))
+            })
+            .await;
+    }
     let (hook_shutdown, mut hook_task) = spawn_lifecycle_consumer(&handler);
 
     emit_focus(&handler, &session, "accepted").await;
     wait_for_hook_block(&handler, "shutdown-normal-outbox-hook").await;
     emit_focus(&handler, &session, "queued").await;
-    signal_wait_for(&handler, "shutdown-normal-outbox-hook").await;
+    handler
+        .handle_ok(WaitForRequest::fixture((
+            "shutdown-normal-outbox-hook",
+            WaitForMode::Signal,
+        )))
+        .await;
 
     let deadline = Instant::now() + Duration::from_secs(2);
     let outcome =

@@ -1,82 +1,19 @@
 use super::*;
-use crate::input_keys::MouseForwardEvent;
-use crate::mouse::{AttachedMouseEvent, MouseLocation};
-use rmux_core::{input::InputParser, PaneId, Screen};
-use tokio::sync::mpsc;
-
-fn quiet_command() -> Vec<String> {
-    vec!["/bin/sh".to_owned(), "-c".to_owned(), "sleep 60".to_owned()]
-}
 
 fn failing_pipe_command() -> &'static str {
     "exit 7"
 }
 
 async fn fixture(name: &str) -> (RequestHandler, SessionName, PaneTarget) {
-    let handler = RequestHandler::new();
-    let session = session_name(name);
-    let target = PaneTarget::with_window(session.clone(), 0, 0);
-    let response = handler
-        .handle(Request::NewSessionExt(Box::new(NewSessionExtRequest {
-            session_name: Some(session.clone()),
-            working_directory: None,
-            detached: true,
-            size: Some(TerminalSize { cols: 20, rows: 6 }),
-            environment: None,
-            group_target: None,
-            attach_if_exists: false,
-            detach_other_clients: false,
-            kill_other_clients: false,
-            flags: None,
-            window_name: None,
-            print_session_info: false,
-            print_format: None,
-            command: Some(quiet_command()),
-            process_command: None,
-            client_environment: None,
-            skip_environment_update: false,
-        })))
-        .await;
-    assert!(matches!(response, Response::NewSession(_)), "{response:?}");
+    let (handler, session, target) = mouse_fixture(name).await;
     handler
-        .wait_for_pane_startup_to_finish_for_test(&target)
+        .set_option(
+            ScopeSelector::Global,
+            OptionName::CopyModeLineNumbers,
+            "absolute",
+        )
         .await;
-    assert!(matches!(
-        handler
-            .handle(Request::SetOption(SetOptionRequest {
-                scope: ScopeSelector::Global,
-                option: OptionName::CopyModeLineNumbers,
-                value: "absolute".to_owned(),
-                mode: SetOptionMode::Replace,
-            }))
-            .await,
-        Response::SetOption(_)
-    ));
     (handler, session, target)
-}
-
-fn mouse_event(target: &PaneTarget) -> AttachedMouseEvent {
-    AttachedMouseEvent {
-        raw: MouseForwardEvent {
-            b: 0,
-            lb: 0,
-            x: 1,
-            y: 1,
-            lx: 1,
-            ly: 1,
-            sgr_b: 0,
-            sgr_type: 'M',
-            ignore: false,
-        },
-        session_id: 1,
-        window_id: Some(1),
-        pane_id: Some(PaneId::new(0)),
-        pane_target: Some(target.clone()),
-        location: MouseLocation::Pane,
-        status_at: None,
-        status_lines: 0,
-        ignore: false,
-    }
 }
 
 async fn execute_with_mouse_event(
@@ -150,50 +87,11 @@ async fn prepare_copy_mode_fixture(
     handler: &RequestHandler,
     session: &SessionName,
     target: &PaneTarget,
-) -> mpsc::UnboundedReceiver<crate::pane_io::AttachControl> {
-    let transcript = {
-        let state = handler.state.lock().await;
-        state.transcript_handle(target).expect("pane transcript")
-    };
-    let history_limit = transcript
-        .lock()
-        .expect("pane transcript mutex")
-        .history_limit();
-    let mut screen = Screen::new(TerminalSize { cols: 20, rows: 6 }, history_limit);
-    let mut parser = InputParser::new();
-    parser.parse(
-        b"zero one two three\r\nalpha beta gamma\r\nomega sigma tau\r\n",
-        &mut screen,
-    );
-    transcript
-        .lock()
-        .expect("pane transcript mutex")
-        .set_screen_for_test(screen);
-
-    let (control_tx, control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(std::process::id(), session.clone(), control_tx)
-        .await;
-    execute_without_mouse(
-        handler,
-        &format!(
-            "copy-mode -t {target}; send-keys -Xt {target} history-top; \
-             send-keys -Xt {target} start-of-line; send-keys -N6 -Xt {target} cursor-right"
-        ),
-    )
-    .await;
+) -> mpsc::UnboundedReceiver<AttachControl> {
+    seed_copy_mode_screen(handler, target).await;
+    let control_rx = handler.attach_client(std::process::id(), session).await;
+    execute_without_mouse(handler, &copy_cursor_command(target)).await;
     control_rx
-}
-
-async fn selection_coordinates(
-    handler: &RequestHandler,
-    session: &SessionName,
-) -> Option<(u32, usize)> {
-    let state = handler.state.lock().await;
-    state
-        .pane_copy_mode_summary(session, PaneId::new(0))
-        .and_then(|summary| summary.selection_start)
-        .map(|position| (position.x, position.y))
 }
 
 async fn cursor_coordinates(
@@ -271,36 +169,26 @@ async fn assert_mouse_target_queue_case(
     expected_pane: u32,
 ) -> rmux_proto::CommandOutput {
     let (handler, session, current_target) = fixture(name).await;
-    let split = handler
-        .handle(Request::SplitWindow(SplitWindowRequest {
-            target: SplitWindowTarget::Pane(current_target.clone()),
+    handler
+        .handle_ok(SplitWindowRequest {
             direction: SplitDirection::Horizontal,
-            before: false,
-            environment: None,
-        }))
+            ..Fixture::fixture(&current_target)
+        })
         .await;
-    assert!(matches!(split, Response::SplitWindow(_)), "{split:?}");
     let mouse_target = PaneTarget::with_window(session.clone(), 0, 1);
     handler
         .wait_for_pane_startup_to_finish_for_test(&mouse_target)
         .await;
-    let selected = handler
-        .handle(Request::SelectPane(Box::new(SelectPaneRequest {
-            target: current_target.clone(),
-            title: None,
-            style: None,
-            input_disabled: None,
-            preserve_zoom: false,
-        })))
+    handler
+        .handle_ok(SelectPaneRequest::fixture(&current_target))
         .await;
-    assert!(matches!(selected, Response::SelectPane(_)), "{selected:?}");
 
     let root = sourced.then(|| temp_root(name));
     let queued_command = match root.as_ref() {
         Some(root) => {
             let path = root.join("mouse-target.conf");
             write_config(&path, &format!("{command}\n"));
-            format!("source-file {}", shell_quote(&path))
+            format!("source-file {}", sh_quote_path(&path))
         }
         None => command.to_owned(),
     };
@@ -348,7 +236,7 @@ async fn mouse_origin_survives_direct_source_and_foreground_command_queues() {
     execute_with_mouse(
         &handler,
         &target,
-        &format!("source-file {}", shell_quote(&path)),
+        &format!("source-file {}", sh_quote_path(&path)),
     )
     .await;
     wait_for_line_number_state(&handler, &session, PaneId::new(0), false).await;
@@ -412,7 +300,7 @@ async fn mouse_origin_reaches_copy_commands_through_foreground_queues() {
     execute_with_mouse(
         &handler,
         &target,
-        &format!("source-file {}", shell_quote(&path)),
+        &format!("source-file {}", sh_quote_path(&path)),
     )
     .await;
     assert_eq!(
@@ -591,39 +479,17 @@ async fn foreground_display_panes_action_preserves_its_mouse_origin() {
 async fn display_panes_rekeys_mouse_origin_outside_the_target_client_session() {
     let (handler, alpha, alpha_target) = fixture("mouse-display-panes-origin-alpha").await;
     let beta = session_name("mouse-display-panes-client-beta");
-    let beta_target = PaneTarget::with_window(beta.clone(), 0, 0);
-    let response = handler
-        .handle(Request::NewSessionExt(Box::new(NewSessionExtRequest {
-            session_name: Some(beta.clone()),
-            working_directory: None,
-            detached: true,
-            size: Some(TerminalSize { cols: 20, rows: 6 }),
-            environment: None,
-            group_target: None,
-            attach_if_exists: false,
-            detach_other_clients: false,
-            kill_other_clients: false,
-            flags: None,
-            window_name: None,
-            print_session_info: false,
-            print_format: None,
-            command: Some(quiet_command()),
-            process_command: None,
-            client_environment: None,
-            skip_environment_update: false,
-        })))
-        .await;
-    assert!(matches!(response, Response::NewSession(_)), "{response:?}");
     handler
-        .wait_for_pane_startup_to_finish_for_test(&beta_target)
+        .create_started_session(NewSessionExtRequest {
+            size: Some(TerminalSize { cols: 20, rows: 6 }),
+            command: Some(quiet_command()),
+            ..Fixture::fixture(&beta)
+        })
         .await;
 
     let _alpha_control_rx = prepare_copy_mode_fixture(&handler, &alpha, &alpha_target).await;
     let requester_pid = std::process::id();
-    let (beta_control_tx, _beta_control_rx) = mpsc::unbounded_channel();
-    handler
-        .register_attach(requester_pid, beta.clone(), beta_control_tx)
-        .await;
+    let _beta_control_rx = handler.attach_client(requester_pid, &beta).await;
 
     let execution_handler = handler.clone();
     let execution_target = alpha_target.clone();
@@ -641,16 +507,12 @@ async fn display_panes_rekeys_mouse_origin_outside_the_target_client_session() {
     wait_for_display_panes_state(&handler).await;
 
     let renamed_alpha = session_name("mouse-display-panes-origin-renamed");
-    let response = handler
-        .handle(Request::RenameSession(rmux_proto::RenameSessionRequest {
+    handler
+        .handle_ok(rmux_proto::RenameSessionRequest {
             target: alpha,
             new_name: renamed_alpha.clone(),
-        }))
+        })
         .await;
-    assert!(
-        matches!(response, Response::RenameSession(_)),
-        "{response:?}"
-    );
     {
         let active_attach = handler.active_attach.lock().await;
         let active = &active_attach.by_pid[&requester_pid];
@@ -847,12 +709,7 @@ async fn nonzero_copy_pipe_exit_is_startup_success_and_finalizes_mouse_refresh()
         "the cancel transition must emit pane-mode-changed after the pipe starts"
     );
     let refresh_count = std::iter::from_fn(|| control_rx.try_recv().ok())
-        .filter(|control| {
-            matches!(
-                control,
-                crate::pane_io::AttachControl::Refresh | crate::pane_io::AttachControl::Switch(_)
-            )
-        })
+        .filter(|control| matches!(control, AttachControl::Refresh | AttachControl::Switch(_)))
         .count();
     assert!(
         refresh_count >= 1,

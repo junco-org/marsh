@@ -10,7 +10,7 @@
 
 use std::io::Write;
 
-use crate::shellmux::{JobView, Sandbox, ShellId, ShellMux};
+use crate::shellmux::{Sandbox, ShellId, ShellMux};
 
 /// Signals a frontend must not receive.
 ///
@@ -36,38 +36,26 @@ pub fn ignore_terminal_job_signals() {
 /// `current` is the caller's selection, marked with `*`. The collection has none of its own:
 /// which shell a display is looking at is the front-end's state, and a table rendered for one
 /// front-end must not mark another's choice.
+///
+/// An idle row prints only two states, because a line is `running` from the moment it starts
+/// until its verdict has been delivered: the conclusion is part of [`crate::Shell::run`], not a
+/// phase after it. `starting` is a state of its own: the job's terminal and shell are being built,
+/// which is neither idle nor a command anyone can signal yet.
 pub fn print_jobs(mux: &ShellMux, current: Option<&ShellId>, out: &mut dyn Write) {
     for job in mux.jobs() {
         let marker = if current == Some(&job.id) { "*" } else { "" };
         let dir = dir_label(&job.sandbox);
-        let (state, cmd) = job.running.as_ref().map_or_else(
-            || (idle_state(&job), ""),
-            |running| ("running", running.cmd.as_str()),
+        let idle = if job.starting { "starting" } else { "idle" };
+        let (state, cmd) = job
+            .running
+            .as_ref()
+            .map_or((idle, ""), |running| ("running", running.cmd.as_str()));
+        let row = format!(
+            "{}{marker} {dir} {} {state} {cmd}",
+            job.id.reference(),
+            job.sandbox.uid
         );
-        let _ = writeln!(
-            out,
-            "{}",
-            format!(
-                "{}{marker} {dir} {} {state} {cmd}",
-                job.id.reference(),
-                job.sandbox.uid
-            )
-            .trim_end()
-        );
-    }
-}
-
-/// The word an idle row prints: what it is doing when it is running nothing.
-///
-/// Only two states, because a line is `running` from the moment it starts until its verdict has
-/// been delivered: the conclusion is part of [`crate::Shell::run`], not a phase after it.
-const fn idle_state(job: &JobView) -> &'static str {
-    if job.starting {
-        // `starting` is a state of its own: the job's terminal and shell are being built, which is
-        // neither idle nor a command anyone can signal yet.
-        "starting"
-    } else {
-        "idle"
+        let _ = writeln!(out, "{}", row.trim_end());
     }
 }
 

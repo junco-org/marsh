@@ -8,62 +8,101 @@ use rmux_core::{
     KEYC_META, KEYC_SHIFT,
 };
 
+const MODIFIED_CURSOR_CASES: [(&str, &[u8]); 8] = [
+    ("C-Up", b"\x1b[1;5A"),
+    ("C-Down", b"\x1b[1;5B"),
+    ("C-Right", b"\x1b[1;5C"),
+    ("C-Left", b"\x1b[1;5D"),
+    ("S-Up", b"\x1b[1;2A"),
+    ("M-Up", b"\x1b[1;3A"),
+    ("C-Home", b"\x1b[1;5H"),
+    ("C-End", b"\x1b[1;5F"),
+];
+
 fn parse_key(name: &str) -> KeyCode {
     key_string_lookup_string(name).expect("key name parses")
 }
 
+/// Encodes the named key with the xterm extended-key format.
+fn encode_named(pane_mode: u32, name: &str) -> Option<Vec<u8>> {
+    encode_key(pane_mode, ExtendedKeyFormat::Xterm, parse_key(name))
+}
+
+fn matched(size: usize, key: KeyCode) -> ExtendedKeyDecode {
+    ExtendedKeyDecode::Matched { size, key }
+}
+
+/// Encodes `name` in extended mode 2, checks the bytes, then decodes them back to the key plus
+/// `decoded_modifiers`.
+fn assert_extended_round_trip(
+    format: ExtendedKeyFormat,
+    name: &str,
+    expected: &[u8],
+    backspace: Option<u8>,
+    decoded_modifiers: KeyCode,
+) {
+    let key = parse_key(name);
+    let encoded = encode_key(mode::MODE_KEYS_EXTENDED_2, format, key).expect("encode");
+    assert_eq!(encoded, expected);
+    assert_eq!(
+        decode_extended_key(&encoded, backspace),
+        matched(encoded.len(), key | decoded_modifiers)
+    );
+}
+
+fn forward_event(
+    b: u16,
+    lb: u16,
+    (x, y): (u16, u16),
+    (lx, ly): (u16, u16),
+    sgr_b: u16,
+    sgr_type: char,
+) -> MouseForwardEvent {
+    MouseForwardEvent {
+        b,
+        lb,
+        x,
+        y,
+        lx,
+        ly,
+        sgr_b,
+        sgr_type,
+        ignore: false,
+    }
+}
+
 #[test]
 fn extended_key_round_trips_xterm_ascii_ctrl_meta() {
-    let key = parse_key("M-C-a");
-    let encoded = encode_key(mode::MODE_KEYS_EXTENDED_2, ExtendedKeyFormat::Xterm, key)
-        .expect("extended key encodes");
-    assert_eq!(encoded, b"\x1b[27;7;97~");
-    assert_eq!(
-        decode_extended_key(&encoded, Some(0x7f)),
-        ExtendedKeyDecode::Matched {
-            size: encoded.len(),
-            key: key | KEYC_IMPLIED_META,
-        }
+    assert_extended_round_trip(
+        ExtendedKeyFormat::Xterm,
+        "M-C-a",
+        b"\x1b[27;7;97~",
+        Some(0x7f),
+        KEYC_IMPLIED_META,
     );
 }
 
 #[test]
 fn extended_key_round_trips_csi_u_unicode() {
-    let key = parse_key("C-\u{03c0}");
-    let encoded =
-        encode_key(mode::MODE_KEYS_EXTENDED_2, ExtendedKeyFormat::CsiU, key).expect("encode");
-    assert_eq!(encoded, "\x1b[960;5u".as_bytes());
-    assert_eq!(
-        decode_extended_key(&encoded, None),
-        ExtendedKeyDecode::Matched {
-            size: encoded.len(),
-            key,
-        }
+    assert_extended_round_trip(
+        ExtendedKeyFormat::CsiU,
+        "C-\u{03c0}",
+        "\x1b[960;5u".as_bytes(),
+        None,
+        0,
     );
 }
 
 #[test]
 fn extended_key_round_trips_csi_u_shift_enter() {
-    let key = parse_key("S-Enter");
-    let encoded =
-        encode_key(mode::MODE_KEYS_EXTENDED_2, ExtendedKeyFormat::CsiU, key).expect("encode");
-    assert_eq!(encoded, b"\x1b[13;2u");
-    assert_eq!(
-        decode_extended_key(&encoded, None),
-        ExtendedKeyDecode::Matched {
-            size: encoded.len(),
-            key,
-        }
-    );
+    assert_extended_round_trip(ExtendedKeyFormat::CsiU, "S-Enter", b"\x1b[13;2u", None, 0);
 }
 
 #[test]
 fn kitty_keyboard_mode_forces_csi_u_format() {
-    let key = parse_key("S-Enter");
-    let encoded = encode_key(
+    let encoded = encode_named(
         mode::MODE_KEYS_EXTENDED_2 | mode::MODE_KEYS_KITTY,
-        ExtendedKeyFormat::Xterm,
-        key,
+        "S-Enter",
     )
     .expect("encode");
     assert_eq!(encoded, b"\x1b[13;2u");
@@ -73,66 +112,52 @@ fn kitty_keyboard_mode_forces_csi_u_format() {
 fn extended_key_shift_only_printables_strip_shift() {
     assert_eq!(
         decode_extended_key(b"\x1b[65;2u", None),
-        ExtendedKeyDecode::Matched {
-            size: 7,
-            key: KeyCode::from(b'A'),
-        }
+        matched(7, KeyCode::from(b'A'))
     );
 }
 
 #[test]
 fn extended_key_shift_tab_becomes_backtab() {
-    let btab = parse_key("BTab");
     assert_eq!(
         decode_extended_key(b"\x1b[9;2u", None),
-        ExtendedKeyDecode::Matched { size: 6, key: btab }
+        matched(6, parse_key("BTab"))
     );
 }
 
 #[test]
 fn standard_mode_meta_printable_falls_back_to_escape_prefix() {
-    let encoded = encode_key(0, ExtendedKeyFormat::Xterm, parse_key("M-a")).expect("encode");
-    assert_eq!(encoded, b"\x1ba");
+    assert_eq!(encode_named(0, "M-a").expect("encode"), b"\x1ba");
 }
 
 #[test]
 fn standard_mode_shift_enter_maps_to_line_feed() {
-    let encoded = encode_key(0, ExtendedKeyFormat::Xterm, parse_key("S-Enter")).expect("encode");
-    assert_eq!(encoded, b"\n");
+    assert_eq!(encode_named(0, "S-Enter").expect("encode"), b"\n");
 }
 
 #[test]
 fn mode1_prefers_vt10x_for_compatible_ctrl_keys() {
-    let encoded = encode_key(
-        mode::MODE_KEYS_EXTENDED,
-        ExtendedKeyFormat::Xterm,
-        parse_key("C-@"),
-    )
-    .expect("encode");
-    assert_eq!(encoded, [0x00]);
+    assert_eq!(
+        encode_named(mode::MODE_KEYS_EXTENDED, "C-@").expect("encode"),
+        [0x00]
+    );
 }
 
 #[test]
 fn standard_mode_control_space_encodes_nul() {
-    let encoded = encode_key(0, ExtendedKeyFormat::Xterm, parse_key("C-Space")).expect("encode");
-    assert_eq!(encoded, [0x00]);
-
-    let meta = encode_key(0, ExtendedKeyFormat::Xterm, parse_key("M-C-Space")).expect("encode");
-    assert_eq!(meta, [0x1b, 0x00]);
+    assert_eq!(encode_named(0, "C-Space").expect("encode"), [0x00]);
+    assert_eq!(encode_named(0, "M-C-Space").expect("encode"), [0x1b, 0x00]);
 }
 
 #[test]
 fn standard_mode_control_question_encodes_delete() {
-    let encoded = encode_key(0, ExtendedKeyFormat::Xterm, parse_key("C-?")).expect("encode");
-    assert_eq!(encoded, [0x7f]);
+    assert_eq!(encode_named(0, "C-?").expect("encode"), [0x7f]);
 }
 
 #[test]
 fn standard_mode_tmux_noop_control_digits_encode_empty() {
     for key in ["C-3", "C-4", "C-5", "C-7", "C-8"] {
-        let encoded = encode_key(0, ExtendedKeyFormat::Xterm, parse_key(key)).expect("encode");
         assert_eq!(
-            encoded,
+            encode_named(0, key).expect("encode"),
             Vec::<u8>::new(),
             "{key} should be a successful no-op"
         );
@@ -141,41 +166,18 @@ fn standard_mode_tmux_noop_control_digits_encode_empty() {
 
 #[test]
 fn mouse_decode_supports_standard_and_sgr_sequences() {
-    let old = decode_mouse(b"\x1b[M !!", None);
     assert_eq!(
-        old,
+        decode_mouse(b"\x1b[M !!", None),
         MouseDecode::Matched {
             size: 6,
-            event: MouseForwardEvent {
-                b: 0,
-                lb: 0,
-                x: 0,
-                y: 0,
-                lx: 0,
-                ly: 0,
-                sgr_b: 0,
-                sgr_type: ' ',
-                ignore: false,
-            }
+            event: forward_event(0, 0, (0, 0), (0, 0), 0, ' '),
         }
     );
-
-    let sgr = decode_mouse(b"\x1b[<35;12;7M", None);
     assert_eq!(
-        sgr,
+        decode_mouse(b"\x1b[<35;12;7M", None),
         MouseDecode::Matched {
             size: 11,
-            event: MouseForwardEvent {
-                b: 35,
-                lb: 0,
-                x: 11,
-                y: 6,
-                lx: 0,
-                ly: 0,
-                sgr_b: 35,
-                sgr_type: 'M',
-                ignore: false,
-            }
+            event: forward_event(35, 0, (11, 6), (0, 0), 35, 'M'),
         }
     );
 }
@@ -223,17 +225,7 @@ fn mouse_output_encodes_all_three_formats() {
 
 #[test]
 fn mouse_output_respects_motion_and_release_filters() {
-    let drag = MouseForwardEvent {
-        b: 32,
-        lb: 0,
-        x: 5,
-        y: 6,
-        lx: 4,
-        ly: 5,
-        sgr_b: 32,
-        sgr_type: ' ',
-        ignore: false,
-    };
+    let drag = forward_event(32, 0, (5, 6), (4, 5), 32, ' ');
     assert!(
         encode_mouse_event(mode::MODE_MOUSE_STANDARD, &drag, 5, 6).is_none(),
         "drag events need motion mode"
@@ -243,17 +235,7 @@ fn mouse_output_respects_motion_and_release_filters() {
         "button mode accepts drag motion"
     );
 
-    let release = MouseForwardEvent {
-        b: 35,
-        lb: 35,
-        x: 5,
-        y: 6,
-        lx: 5,
-        ly: 6,
-        sgr_b: 35,
-        sgr_type: 'm',
-        ignore: false,
-    };
+    let release = forward_event(35, 35, (5, 6), (5, 6), 35, 'm');
     assert!(
         encode_mouse_event(
             mode::MODE_MOUSE_STANDARD | mode::MODE_MOUSE_SGR,
@@ -291,13 +273,12 @@ fn utf8_mouse_output_rejects_out_of_range_button_values() {
 
 #[test]
 fn modifier_bits_are_preserved_by_extended_decode() {
-    let decoded = decode_extended_key(b"\x1b[97;8u", None);
     assert_eq!(
-        decoded,
-        ExtendedKeyDecode::Matched {
-            size: 7,
-            key: KeyCode::from(b'a') | KEYC_SHIFT | KEYC_CTRL | KEYC_META | KEYC_IMPLIED_META,
-        }
+        decode_extended_key(b"\x1b[97;8u", None),
+        matched(
+            7,
+            KeyCode::from(b'a') | KEYC_SHIFT | KEYC_CTRL | KEYC_META | KEYC_IMPLIED_META,
+        )
     );
 }
 
@@ -312,30 +293,26 @@ fn extended_key_decode_rejects_invalid_prefix_for_xterm_format() {
 
 #[test]
 fn extended_key_decode_rejects_extra_semicolons() {
-    assert_eq!(
-        decode_extended_key(b"\x1b[27;2;65;99~", None),
-        ExtendedKeyDecode::Invalid
-    );
-    assert_eq!(
-        decode_extended_key(b"\x1b[65;2;3u", None),
-        ExtendedKeyDecode::Invalid
-    );
+    for sequence in [b"\x1b[27;2;65;99~".as_slice(), b"\x1b[65;2;3u".as_slice()] {
+        assert_eq!(
+            decode_extended_key(sequence, None),
+            ExtendedKeyDecode::Invalid
+        );
+    }
 }
 
 #[test]
 fn extended_key_decode_partial_returns_for_incomplete_input() {
-    assert_eq!(
-        decode_extended_key(b"\x1b", None),
-        ExtendedKeyDecode::Partial
-    );
-    assert_eq!(
-        decode_extended_key(b"\x1b[", None),
-        ExtendedKeyDecode::Partial
-    );
-    assert_eq!(
-        decode_extended_key(b"\x1b[27;2;65", None),
-        ExtendedKeyDecode::Partial
-    );
+    for sequence in [
+        b"\x1b".as_slice(),
+        b"\x1b[".as_slice(),
+        b"\x1b[27;2;65".as_slice(),
+    ] {
+        assert_eq!(
+            decode_extended_key(sequence, None),
+            ExtendedKeyDecode::Partial
+        );
+    }
 }
 
 #[test]
@@ -346,26 +323,18 @@ fn extended_key_decode_rejects_non_esc_start() {
 #[test]
 fn extended_key_decode_modifiers_zero_means_no_modifiers() {
     // modifiers=0 is unusual but valid - no modifier bits set
-    let decoded = decode_extended_key(b"\x1b[65;0u", None);
     assert_eq!(
-        decoded,
-        ExtendedKeyDecode::Matched {
-            size: 7,
-            key: KeyCode::from(b'A'),
-        }
+        decode_extended_key(b"\x1b[65;0u", None),
+        matched(7, KeyCode::from(b'A'))
     );
 }
 
 #[test]
 fn extended_key_decode_modifiers_one_means_no_modifiers() {
     // modifiers=1 means modifiers-1=0, so no modifier bits
-    let decoded = decode_extended_key(b"\x1b[65;1u", None);
     assert_eq!(
-        decoded,
-        ExtendedKeyDecode::Matched {
-            size: 7,
-            key: KeyCode::from(b'A'),
-        }
+        decode_extended_key(b"\x1b[65;1u", None),
+        matched(7, KeyCode::from(b'A'))
     );
 }
 
@@ -383,41 +352,24 @@ fn extended_key_backspace_option_maps_to_bspace() {
 
 #[test]
 fn extended_key_decode_supports_modified_cursor_sequences() {
-    for (sequence, expected) in [
-        (b"\x1b[1;5A".as_slice(), parse_key("Up") | KEYC_CTRL),
-        (b"\x1b[1;5B".as_slice(), parse_key("Down") | KEYC_CTRL),
-        (b"\x1b[1;5C".as_slice(), parse_key("Right") | KEYC_CTRL),
-        (b"\x1b[1;5D".as_slice(), parse_key("Left") | KEYC_CTRL),
+    for (sequence, name) in [
+        (b"\x1b[1;5A".as_slice(), "Up"),
+        (b"\x1b[1;5B".as_slice(), "Down"),
+        (b"\x1b[1;5C".as_slice(), "Right"),
+        (b"\x1b[1;5D".as_slice(), "Left"),
     ] {
         assert_eq!(
             decode_extended_key(sequence, None),
-            ExtendedKeyDecode::Matched {
-                size: sequence.len(),
-                key: expected,
-            }
+            matched(sequence.len(), parse_key(name) | KEYC_CTRL)
         );
     }
 }
 
 #[test]
 fn extended_key_encode_uses_xterm_modified_cursor_sequences() {
-    for (name, expected) in [
-        ("C-Up", b"\x1b[1;5A".as_slice()),
-        ("C-Down", b"\x1b[1;5B".as_slice()),
-        ("C-Right", b"\x1b[1;5C".as_slice()),
-        ("C-Left", b"\x1b[1;5D".as_slice()),
-        ("S-Up", b"\x1b[1;2A".as_slice()),
-        ("M-Up", b"\x1b[1;3A".as_slice()),
-        ("C-Home", b"\x1b[1;5H".as_slice()),
-        ("C-End", b"\x1b[1;5F".as_slice()),
-    ] {
+    for (name, expected) in MODIFIED_CURSOR_CASES {
         assert_eq!(
-            encode_key(
-                mode::MODE_KEYS_EXTENDED_2,
-                ExtendedKeyFormat::Xterm,
-                parse_key(name),
-            )
-            .as_deref(),
+            encode_named(mode::MODE_KEYS_EXTENDED_2, name).as_deref(),
             Some(expected),
             "{name} should use xterm modified cursor encoding"
         );
@@ -426,18 +378,9 @@ fn extended_key_encode_uses_xterm_modified_cursor_sequences() {
 
 #[test]
 fn standard_key_encode_uses_xterm_modified_cursor_sequences() {
-    for (name, expected) in [
-        ("C-Up", b"\x1b[1;5A".as_slice()),
-        ("C-Down", b"\x1b[1;5B".as_slice()),
-        ("C-Right", b"\x1b[1;5C".as_slice()),
-        ("C-Left", b"\x1b[1;5D".as_slice()),
-        ("S-Up", b"\x1b[1;2A".as_slice()),
-        ("M-Up", b"\x1b[1;3A".as_slice()),
-        ("C-Home", b"\x1b[1;5H".as_slice()),
-        ("C-End", b"\x1b[1;5F".as_slice()),
-    ] {
+    for (name, expected) in MODIFIED_CURSOR_CASES {
         assert_eq!(
-            encode_key(0, ExtendedKeyFormat::Xterm, parse_key(name)).as_deref(),
+            encode_named(0, name).as_deref(),
             Some(expected),
             "{name} should use xterm modified cursor encoding"
         );
@@ -447,7 +390,7 @@ fn standard_key_encode_uses_xterm_modified_cursor_sequences() {
 #[test]
 fn meta_backspace_encodes_escape_del() {
     assert_eq!(
-        encode_key(0, ExtendedKeyFormat::Xterm, parse_key("M-BSpace")).as_deref(),
+        encode_named(0, "M-BSpace").as_deref(),
         Some(b"\x1b\x7f".as_slice())
     );
 }
@@ -498,14 +441,12 @@ fn mouse_decode_sgr_rejects_invalid_or_missing_decimal_fields() {
 
 #[test]
 fn mouse_decode_sgr_rejects_zero_coordinates() {
-    assert_eq!(
-        decode_mouse(b"\x1b[<0;0;1M", None),
-        MouseDecode::Discard { size: 9 }
-    );
-    assert_eq!(
-        decode_mouse(b"\x1b[<0;1;0M", None),
-        MouseDecode::Discard { size: 9 }
-    );
+    for sequence in [b"\x1b[<0;0;1M".as_slice(), b"\x1b[<0;1;0M".as_slice()] {
+        assert_eq!(
+            decode_mouse(sequence, None),
+            MouseDecode::Discard { size: 9 }
+        );
+    }
 }
 
 #[test]
@@ -519,17 +460,7 @@ fn mouse_decode_legacy_discards_underflow() {
 
 #[test]
 fn mouse_decode_preserves_last_event_positions() {
-    let last = MouseForwardEvent {
-        b: 0,
-        lb: 0,
-        x: 10,
-        y: 20,
-        lx: 5,
-        ly: 15,
-        sgr_b: 0,
-        sgr_type: ' ',
-        ignore: false,
-    };
+    let last = forward_event(0, 0, (10, 20), (5, 15), 0, ' ');
     let result = decode_mouse(b"\x1b[<0;5;8M", Some(last));
     if let MouseDecode::Matched { event, .. } = result {
         assert_eq!(event.lx, 10, "lx from previous event's x");
@@ -543,15 +474,8 @@ fn mouse_decode_preserves_last_event_positions() {
 #[test]
 fn mouse_output_ignores_ignored_events() {
     let event = MouseForwardEvent {
-        b: 0,
-        lb: 0,
-        x: 0,
-        y: 0,
-        lx: 0,
-        ly: 0,
-        sgr_b: 0,
-        sgr_type: ' ',
         ignore: true,
+        ..forward_event(0, 0, (0, 0), (0, 0), 0, ' ')
     };
     assert!(encode_mouse_event(mode::MODE_MOUSE_STANDARD, &event, 0, 0).is_none());
 }
@@ -651,17 +575,8 @@ fn mouse_decode_consumes_a_fixed_prefix_of_attacker_sized_decimal_input() {
 
 #[test]
 fn sgr_mouse_release_falls_through_to_legacy_when_no_sgr_type() {
-    let event = MouseForwardEvent {
-        b: 3, // release
-        lb: 0,
-        x: 0,
-        y: 0,
-        lx: 0,
-        ly: 0,
-        sgr_b: 0,
-        sgr_type: ' ', // non-SGR source
-        ignore: false,
-    };
+    // Release (b = 3) from a non-SGR source (sgr_type = ' ').
+    let event = forward_event(3, 0, (0, 0), (0, 0), 0, ' ');
     // SGR mode is set but event is from non-SGR terminal
     let result = encode_mouse_event(
         mode::MODE_MOUSE_STANDARD | mode::MODE_MOUSE_SGR,
@@ -694,16 +609,12 @@ fn non_sgr_source_with_sgr_mode_falls_through_to_legacy() {
 
 #[test]
 fn encode_key_backtab_without_extended_mode_produces_escape_sequence() {
-    let btab = parse_key("BTab");
-    let encoded = encode_key(0, ExtendedKeyFormat::Xterm, btab).expect("backtab");
-    assert_eq!(encoded, b"\x1b[Z");
+    assert_eq!(encode_named(0, "BTab").expect("backtab"), b"\x1b[Z");
 }
 
 #[test]
 fn encode_key_backtab_in_extended_mode_produces_shift_tab() {
-    let btab = parse_key("BTab");
-    let encoded =
-        encode_key(mode::MODE_KEYS_EXTENDED_2, ExtendedKeyFormat::Xterm, btab).expect("encode");
+    let encoded = encode_named(mode::MODE_KEYS_EXTENDED_2, "BTab").expect("encode");
     // Should encode as Shift-Tab: \x1b[27;2;9~
     assert_eq!(encoded, b"\x1b[27;2;9~");
 }
@@ -719,13 +630,9 @@ fn trivial_keys_bypass_extended_encoding() {
 
 #[test]
 fn vt10x_arrow_keys_match_tmux_standard_and_cursor_modes() {
-    let up = parse_key("Up");
+    assert_eq!(encode_named(0, "Up").expect("standard up"), b"\x1b[A");
     assert_eq!(
-        encode_key(0, ExtendedKeyFormat::Xterm, up).expect("standard up"),
-        b"\x1b[A"
-    );
-    assert_eq!(
-        encode_key(mode::MODE_KCURSOR, ExtendedKeyFormat::Xterm, up).expect("cursor mode up"),
+        encode_named(mode::MODE_KCURSOR, "Up").expect("cursor mode up"),
         b"\x1bOA"
     );
 }
@@ -758,18 +665,13 @@ fn extended_modes_do_not_drop_plain_navigation_keys() {
 
 #[test]
 fn vt10x_navigation_keys_match_tmux_standard_sequences() {
-    assert_eq!(
-        encode_key(0, ExtendedKeyFormat::Xterm, parse_key("Home")).expect("home"),
-        b"\x1b[1~"
-    );
-    assert_eq!(
-        encode_key(0, ExtendedKeyFormat::Xterm, parse_key("DC")).expect("delete"),
-        b"\x1b[3~"
-    );
-    assert_eq!(
-        encode_key(0, ExtendedKeyFormat::Xterm, parse_key("PageUp")).expect("page up"),
-        b"\x1b[5~"
-    );
+    for (name, expected, label) in [
+        ("Home", b"\x1b[1~", "home"),
+        ("DC", b"\x1b[3~", "delete"),
+        ("PageUp", b"\x1b[5~", "page up"),
+    ] {
+        assert_eq!(encode_named(0, name).expect(label), expected);
+    }
 }
 
 #[test]
@@ -780,10 +682,7 @@ fn golden_standard_key_trace_for_navigation_and_modifiers() {
     ];
     let encoded = keys
         .into_iter()
-        .flat_map(|key| {
-            encode_key(0, ExtendedKeyFormat::Xterm, parse_key(key))
-                .unwrap_or_else(|| panic!("{key} must encode"))
-        })
+        .flat_map(|key| encode_named(0, key).unwrap_or_else(|| panic!("{key} must encode")))
         .collect::<Vec<_>>();
 
     assert_eq!(

@@ -1,55 +1,66 @@
 # rmux-marsh
 
-A tmux-style terminal multiplexer whose panes are not host processes. Every pane, popup and
-workload helper is a job on one shell multiplexer over one btrfs subvolume — the *seed*. A pane
-runs an embedded [brush](https://github.com/reubeno/brush) interpreter; each submitted line is
-staged in that job's own snapshot; and its effects reach the seed only once
-[junco-policy](https://github.com/junco-org/junco-policy) has granted every capability the line
-amounts to. A refused line leaves the seed untouched while the pane stays open, which is why a
-process exit status and an approval are two separate results here.
+A tmux-style terminal multiplexer with persistent, in-process
+[Brush](https://github.com/reubeno/brush) shells. Each shell owns four private stages:
 
-Two ways in, and they are the same system: the `rmux` command, and `marsh::rmux::RmuxFrontend` in
-a Rust program.
+```text
+immutable command baseline → observed execution → capability authorization → durable WAL merge
+```
 
-## Running rmux-marsh
+Shells over the same canonical source share one authority. A command executes once: conflicting
+newer data returns `Stale`, never an automatic replay. Supported changes reach the source only
+when the complete [junco-policy](https://github.com/junco-org/junco-policy) batch is granted.
 
-### What the build and the seed need
+The interfaces are `marsh::Shell`, the `rmux` executable, and `marsh::rmux::RmuxFrontend`.
+None requires a caller to allocate snapshots, manage a validator, replay a log or finalize a line.
+This controls publication, **not OS confinement**. Terminal output, network effects, external
+FIFO/device operations and writes outside the private work view are not rolled back.
 
-* Linux. btrfs subvolume ioctls exist nowhere else.
-* The Rust toolchain named by `rust-version` in the root manifest — currently **1.95** — or newer.
-* A C build toolchain, **Clang/libclang**, and **libbtrfsutil** where the linker can find it.
-  A Rust toolchain alone is not enough: `marsh-btrfs` pins `btrfsutil` 0.2.0, whose
-  `btrfsutil-sys` 1.3.0 build script generates bindings with bindgen from its bundled header and
-  links against `btrfsutil`. On Debian/Ubuntu that is `clang libclang-dev libbtrfsutil-dev`; on
-  Fedora, `clang-devel libbtrfsutil-devel`.
-* **Git** and **btrfs-progs** for the setup commands below.
-* **`strace`**, and permission for the daemon to trace itself. Which files a line touched is
-  observed through one tracer attached to the host, and a host that cannot attach one fails
-  closed rather than publishing work it never saw. Under `kernel.yama.ptrace_scope=1` — the
-  common default — nothing has to be configured: the daemon names its own tracer through
-  `PR_SET_PTRACER`. Under `ptrace_scope=2` or `3`, or inside a sandbox that forbids `ptrace`
-  outright, marsh will not start a shell. The tracer's output is spooled through private,
-  already-unlinked files in `/tmp`, which must support `fallocate` hole punching (tmpfs, ext4,
-  xfs and btrfs do); the kernel must be Linux 5.3 or newer, for pidfds.
-* A writable **btrfs mount carrying `user_subvol_rm_allowed`**, so an unprivileged user can
-  reclaim job snapshots. Check it with `findmnt -T <path> -o FSTYPE,OPTIONS`.
+## Build and distribution
 
-The seed must be a **dedicated subvolume**, not the mount's root subvolume: state lives beside it,
-at `<seed-parent>/.marsh/<seed-name>/`, so the parent directory has to be writable and the seed has
-to have a parent at all. A seed that is its own mount root is refused rather than putting state at
-the filesystem root.
+Requirements:
 
-Seed discovery starts at the **daemon process's own working directory** and walks up to the first
-enclosing subvolume. That is true of `rmux -D` and of the hidden auto-start entrypoint alike, which
-is why every command below runs the daemon from inside the seed. The `--config-cwd` option is about
-resolving relative paths in configuration files and has nothing to do with it.
+* Linux 5.3+ with procfs, usable `ptrace`/`PTRACE_GET_SYSCALL_INFO`, and pidfds.
+* Rust 1.95 or newer, as specified by the root manifest.
+* A C toolchain, Clang/libclang and libbtrfsutil. Debian/Ubuntu packages:
+  `clang libclang-dev libbtrfsutil-dev`; Fedora: `clang-devel libbtrfsutil-devel`.
+* Git and btrfs-progs for the setup commands below.
+* A writable btrfs mount with `user_subvol_rm_allowed` for production source snapshots.
+  Inspect it with `findmnt -T <path> -o FSTYPE,OPTIONS`.
 
-### Setting up and starting a daemon
-
-From the checkout root, using a fresh disposable example root:
+Build or install **both** package binaries:
 
 ```sh
-cargo build --release -p marsh --bin rmux
+cargo build --release -p marsh --bins
+# Alternatively:
+cargo install --path . --bins
+```
+
+`marsh-trace` is the package-owned companion to `rmux` and embedded library applications. It
+imports unmodified crates.io `lurk-cli = "=0.3.14"`; lurk is neither vendored nor patched. No
+installed `strace` or `lurk` executable is used. Bundle `marsh-trace` beside the application's
+executable. Cargo test/example executables also locate the sibling in their parent output
+directory. There is no PATH search or caller-selected tracing backend.
+
+Marsh's observation wrapper reuses lurk's public syscall types, argument tables and filters.
+It supplies the stopped-task callbacks, all-thread attachment and filesystem identities absent
+from the released tracer API. Its records contain an upstream `SyscallInfo` plus raw path bytes,
+descriptor identities and entry order; no renderer output is reparsed. The host grants its exact
+helper child `PR_SET_PTRACER` permission. The service's monitor thread creates and reaps the helper,
+so Linux's thread-bound parent-death signal cannot tie it to a short-lived caller runtime.
+Records use a bounded Unix socket queue; pinned process identities travel as pidfds. Kernel/LSM
+refusal, incompatible helpers, queue overflow and lost observation fail closed. No trace spool,
+sysctl changes or fallback tracer is involved.
+
+## Start a disposable daemon
+
+A source must be a dedicated subvolume, not its mount's root. Its parent must be writable because
+private state lives at `<source-parent>/.marsh/<source-name>/`.
+
+From the checkout root:
+
+```sh
+cargo build --release -p marsh --bins
 RMUX="$PWD/target/release/rmux"
 WORK="$(mktemp -d "$HOME/rmux-marsh.XXXXXX")"
 btrfs subvolume create "$WORK/seed"
@@ -60,114 +71,144 @@ cd "$WORK/seed"
 "$RMUX" -D -f /dev/null -S "$WORK/rmux.sock"
 ```
 
-`$HOME` must be on the suitable btrfs mount for this to work as written; if it is not, put `WORK`
-somewhere that is. If Cargo writes to a custom target directory, set `RMUX` to that directory's
-`release/rmux` instead.
+Use a suitable btrfs mount instead of `$HOME` if necessary. `-f /dev/null` isolates this example
+from your rmux configuration. Keep the socket outside the source.
 
-The example initializes Git **before** the managed shell starts only to give it a first commit.
-The managed `git` builtin runs the system `git` — any subcommand, `init` and `clone` included —
-through the shell's recorded spawner, inside the pane's snapshot: host Git configuration is
-ignored, nothing outside the snapshot is written, and what each invocation did to each path is
-requested from the policy before the line is published.
-`-f /dev/null` isolates the example from your own rmux configuration. The socket is deliberately
-outside the seed, so it is never part of what a workload could publish.
-
-### Using it
-
-In another terminal, with the same absolute `RMUX` and `WORK` values:
+From another terminal, with the same absolute `RMUX` and `WORK`:
 
 ```sh
 "$RMUX" -N -S "$WORK/rmux.sock" new-session -s demo
 ```
 
-`-N` means connect-only: this client talks to the daemon that is already running and never starts
-one of its own.
-
-Now **inside the new pane** — these are not host-shell commands, they are lines submitted to the
-managed shell:
+Inside the pane:
 
 ```sh
 printf hello > greeting.txt
 git add -- greeting.txt
 ```
 
-`Ctrl-b d` detaches. From the host shell again:
+`Ctrl-b d` detaches. Host commands can reattach or stop this disposable daemon:
 
 ```sh
 "$RMUX" -N -S "$WORK/rmux.sock" attach-session -t demo
 "$RMUX" -N -S "$WORK/rmux.sock" kill-server
 ```
 
-As an alternative to the foreground daemon, and only once any previous daemon over this seed has
-stopped, running this from inside the seed starts a daemon automatically and attaches to it:
+`-N` is connect-only. Without it, a client may start a daemon when its endpoint is absent.
+A daemon's initial directory is a request default, not a source lease: each shell discovers its
+source from its own logical working directory. One daemon can therefore serve independent sources.
+Within a process, canonical aliases share authority; another process is excluded by the source lease.
 
-```sh
-"$RMUX" -f /dev/null -S "$WORK/rmux.sock" new-session -s demo
+## Ordinary Shell API
+
+```rust,no_run
+use marsh::{Shell, ShellError, ShellErrorKind};
+
+async fn example(source: &std::path::Path) -> Result<(), ShellError> {
+    let a = Shell::new(source).await?;
+    let b = Shell::new(source).await?;
+    a.run("export KEPT=value; printf first > owned").await?;
+    assert!(a.env_var("KEPT").await.is_some());
+
+    let error = b.run("printf blind > owned").await.err().expect("denied");
+    assert!(matches!(error.kind(), ShellErrorKind::Denied { .. }));
+    assert_eq!(u8::from(error.execution_result().unwrap().exit_code), 0);
+
+    a.close(false).await?;
+    b.close(false).await?;
+    Ok(())
+}
 ```
 
-One daemon leases one seed exclusively. A second daemon over the same seed is refused, whichever
-way it was started.
+`Shell::builder()` configures ordinary cwd, environment, variables, fds, builtin registrations,
+options, arguments, rc/profile loading and interactive behavior. Startup scripts explicitly
+requested by the caller go through the same boundary. Defaults inherit the environment and skip
+rc/profile files.
 
-### What is on disk, and what "published" means
+`run`, `run_string`, `run_script`, `source_script` and `invoke_function` retain shell variables,
+functions and cwd. State queries return owned ordinary Brush values; `env_var` avoids copying the
+whole environment. Working directories and builtin file operations use logical source paths.
 
-State lives beside the seed:
+`Ok(ExecutionResult)` means supported effects were accepted, including a genuine nonzero exit.
+`ShellError::kind()` distinguishes `Busy`, `Closed`, `Denied`, `Stale`, `Interrupted`, `Unsupported`
+and `Infrastructure`. `execution_result()` preserves any native status/control flow obtained before
+a later failure; underlying causes remain available through `Error::source()`.
 
-| Path | What it is |
+Only one command is admitted at a time. Dropping its caller's future does not drop the boundary or
+detach producers. `close(false)` waits for accepted work; `close(true)` requests cancellation and
+joins/kills owned producers before discard. Natural `exit` closes the shell even if finalization
+subsequently fails. Closed handles keep observations and identity, not the live interpreter or source
+lease. `run_interactively(UIOptions)` owns prompts, line editing, completion, history and EXIT work;
+the blocking editor requires a multi-thread runtime. Noninteractive methods also support a
+current-thread runtime.
+
+`Shell::principal()` returns junco-policy's `Principal`, used unchanged for live authorization,
+durable grants and retained-handle identity. Display names never select ownership. There is no
+separate Marsh principal type, compatibility namespace or caller-supplied principal.
+
+### Native builtins
+
+Use `marsh::builtins::{builtin, simple_builtin, decl_builtin, raw_arg_builtin}` with Brush's existing
+command traits. Registrations are opaque and local to each shell; no global hook installer replaces
+another mux's implementation.
+
+`marsh::builtins::current_context()` provides logical `working_dir`, `open`, `metadata`,
+`create_dir_all`, `read_dir` and `glob`, plus cancellation and tracked `spawn_blocking`. Retained
+contexts/iterators refuse I/O after their run ends. Trusted native plugins must register spawned work
+through this context; arbitrary unregistered Rust threads are not a safe extension mechanism.
+
+## Publication and recovery
+
+* A fresh immutable baseline is captured per command. The candidate diff is baseline→work, not
+  work→a source that another shell may already have changed. Unexplained changes are refused.
+* Actual reads acquire Read claims. A blind competing edit can be denied while an explicit read
+  followed by an edit is permitted. Write intent still requires Edit when final bytes are unchanged;
+  grant-only transactions are durable.
+* Exact paths, lookup dependencies, directory membership and recursive replacements participate in
+  freshness. Disjoint changes can both publish. A stale command's output, stdin and variables have
+  already happened once; the line is not reoffered or reexecuted.
+* Persistent descriptors survive unchanged work generations. Access through a descriptor or mapping
+  from a necessarily retired generation fails rather than silently rebinding paths or offsets.
+* Managed Git preserves causal Stage/Commit/Checkout semantics. Direct/descendant Git and repository
+  metadata mutations outside a successful managed invocation are refused. `git add` releases an
+  unstaged stake; a reused display name never inherits an older shell instance's authority.
+* Directories, including empty directories and modes, have explicit operations. FIFO/socket/device
+  publication, unsupported metadata effects and unrepresentable hard-link mutations are refused
+  before intent. Directory removal is nonrecursive and replay never follows symlink ancestors.
+* Quiescent work is frozen as readonly redo before intent. The WAL durably records the complete
+  counted intent and grants, applies descriptor-relative operations with namespace fsyncs, and ends
+  with durable `END`. Any possibly written intent failure blocks the source until reopen recovery.
+  After `END`, cleanup failure cannot relabel committed bytes as unpublished.
+* A complete WAL record that cannot be decoded — malformed JSON, an obsolete or incompatible
+  record schema, or missing/obsolete ownership metadata — resets startup: the whole log, including
+  valid prefixes, suffixes and pending intent, is atomically replaced by an empty durable log and
+  nothing is replayed. Source bytes stay as they are; the discarded grants are gone. Failing to
+  replace the log refuses startup with it unchanged. Records that decode but carry impossible
+  framing, paths or sources still refuse startup unchanged. Only a genuinely torn final append is
+  truncated. Recovery checks source kind, digest and mode before copying; an absent source is
+  accepted only if the target proves the operation already applied.
+* Reopen reconciles externally deleted source paths without forgetting other paths' grants. A
+  deletion recorded by the WAL is not treated as an external disappearance. Missing/obsolete
+  ownership metadata and old uncounted or untyped WAL records are never interpreted as empty
+  ownership or silently migrated; they reset the log as above.
+
+Private operator layout:
+
+| Path below `.marsh/<source-name>/` | Contents |
 | --- | --- |
-| `<seed-parent>/.marsh/<seed-name>/snap/` | one btrfs snapshot per live job |
-| `<seed-parent>/.marsh/<seed-name>/meta/wal.jsonl` | the write-ahead log every publication goes through |
-| `<seed-parent>/.marsh/<seed-name>/meta/runs/<uid>/` | one job's spawn, builtin and file-access record streams |
+| `snap/` | work views and retained per-command readonly baseline/redo subvolumes |
+| `meta/wal.jsonl` | filesystem intent and durable grants |
+| `meta/runs/<principal>/trace.log` | append-only JSON observations: upstream syscall info plus captured filesystem metadata |
 
-Each submitted shell line is staged in its job's snapshot. After the line ends, its filesystem
-effects are diffed against the seed, its `git` requests are translated into capability events, and
-the policy either grants **all** of them — the transaction is logged and applied to the seed — or
-refuses, in which case the snapshot is retaken from the seed and the line's changes are gone.
+Each command appends its owned observations once. Transaction staging is owned by its validated
+WAL frame, not inferred from user filename suffixes. A legitimate filename ending `.tmp-wal`
+is ordinary source content.
 
-Which files a line actually read and wrote is observed rather than guessed at: a `strace` attached
-to the host reports every path-taking syscall of every shell and every process they start, and each
-job's share is written to `meta/runs/<uid>/trace.log` beside its other record streams. Tracing is
-required — a host that may not `ptrace` itself fails with the prerequisite rather than publishing
-unobserved work.
+## RmuxFrontend library integration
 
-That is what makes two panes over one seed independent rather than merely serialized:
-
-* A line that **read** a file another pane publishes while it is still running is unwound and
-  evaluated again against the new bytes. Its abandoned attempt requests nothing, and its own
-  output, stdin consumption and writes outside the snapshot may repeat — a replay is the same
-  line run again, not a rollback.
-* A line that **wrote** a file another pane owns unstaged is refused, because running it a second
-  time would be refused for the same reason. That is an ownership decision, and the capability
-  policy is what makes it.
-* Lines that touch disjoint files never wait for each other, whatever order they publish in.
-
-This staging is *not* Git's index. `git add -- path` is a runtime **Stage** request: it releases
-that path's unstaged ownership so another principal may edit it. `printf hello > greeting.txt`
-above is an **Edit** that publishes and leaves `greeting.txt` owned by that pane's snapshot until
-it is staged.
-
-Two consequences worth planning for:
-
-* A refused line leaves the seed unchanged **even when its process exited zero**. The exit status
-  is the program's; the approval is the gate's.
-* Published grants are durable and belong to the snapshot that earned them, never to a reusable
-  job name. A path left unstaged when the daemon stops stays owned by a principal that no longer
-  exists, and restarting does not hand the next holder that stake. Stage what you want released
-  before shutting down. A library caller that controls a stable agent identity may instead open
-  its shell with `SpawnOptions { durable: true, .. }`, whose grants that same name resumes after a
-  reopen; rmux panes never do.
-
-## Using `RmuxFrontend` as a library
-
-### The consuming project
-
-`marsh` is not published, so a consumer depends on a checkout by path. A minimal `Cargo.toml`:
+A downstream Cargo workspace patches the vendored dependencies at its own root:
 
 ```toml
-[package]
-name = "rmux-frontend-example"
-version = "0.1.0"
-edition = "2024"
-
 [dependencies]
 marsh = { path = "/absolute/path/to/marsh", default-features = false }
 tokio = { version = "1.52.3", features = ["macros", "rt-multi-thread", "time"] }
@@ -177,347 +218,58 @@ brush-core = { path = "/absolute/path/to/marsh/crates/brush-core" }
 rmux-server = { path = "/absolute/path/to/marsh/crates/rmux-server" }
 ```
 
-Adjust both paths to your checkout. The `[patch.crates-io]` section must live in the **consuming
-workspace's own root manifest**: Cargo ignores `[patch]` sections in dependency manifests, so
-without it `marsh`'s `rmux-server = "=0.10.0"` and `brush-core = "0.5.0"` would resolve to
-crates.io copies that do not carry the local server or the `ExternalCommandSpawner` seam. See the
-Cargo Book on
-[working with an unpublished minor version](https://doc.rust-lang.org/cargo/reference/overriding-dependencies.html#working-with-an-unpublished-minor-version).
-The patched versions are the in-tree ones: `brush-core` 0.5.0 and `rmux-server` 0.10.0, matching
-what crates.io currently publishes for `brush-core`, so no version selection has to change.
+Cargo ignores patches in dependency manifests. Only Brush 0.5.0 and rmux-server 0.10.0 need the
+local patches above; lurk-cli 0.3.14 comes directly from crates.io. Bundle the built `marsh-trace`
+alongside the consuming executable.
 
-No direct dependency on `brush-core`, `rmux-core`, `rmux-proto`, `rmux-sdk` or `marsh-core` is
-needed. Every argument and result type the interface mentions is re-exported from
-`marsh::rmux::types`.
-
-### The program
-
-This is [`examples/rmux_api.rs`](examples/rmux_api.rs) verbatim; drop it into `src/main.rs`.
-
-```rust
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
-
-use marsh::rmux::types::{
-    Action, protocol, CommandOptions, DaemonConfig, Outcome, ProcessCommand, ShellEnvironment,
-    ShellId, SpawnOptions, TerminalGeometry,
-};
-use marsh::rmux::{
-    CollectOptions, ExecutionSpec, IoError, IoPhase, OutputLimit, OverflowPolicy, RmuxFrontend,
-};
-use marsh::PolicyValidator;
-
-#[tokio::main(flavor = "multi_thread")]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Every wait in this program is bounded by the same window: a hang is a failure, not a slow
-    // success, and an unbounded await would turn one into the other.
-    let limit = Duration::from_secs(30);
-
-    let mut arguments = std::env::args_os().skip(1);
-    let (seed, socket) = match (arguments.next(), arguments.next(), arguments.next()) {
-        (Some(seed), Some(socket), None) => {
-            (std::path::PathBuf::from(seed), std::path::PathBuf::from(socket))
-        }
-        _ => return Err("usage: rmux_api <seed> <socket>".into()),
-    };
-
-    // The caller's own validator. This is marsh's junco-policy adapter and its committed history,
-    // not something the frontend chooses: passing it in is what makes step 5 below able to check
-    // that the daemon really judged against *this* history.
-    let validator = Arc::new(Mutex::new(PolicyValidator::new()));
-
-    // ---- Phase one: a live daemon over a fresh seed. -----------------------------------------
-    let frontend = RmuxFrontend::open(
-        DaemonConfig::new(socket.clone()),
-        &seed,
-        Arc::clone(&validator),
-        ShellEnvironment::default(),
-        TerminalGeometry { rows: 24, cols: 80 },
-    )
-    .await?;
-
-    // Kept alive across the shutdown below, which is the point of step 7.
-    let retained = frontend.io();
-    let mut writer = None;
-    let mut other = None;
-
-    let phase = async {
-        // The canonical seed, as the daemon resolved it. A relative or symlinked argument names
-        // the same subvolume; this is the spelling every path check below is made against.
-        let canonical = frontend
-            .executor_info()
-            .seed
-            .ok_or("the frontend leases no seed")?;
-
-        let writer_job = frontend
-            .spawn("", Some(ShellId::from("writer")), None, SpawnOptions::default())
-            .await?;
-        let other_job = frontend
-            .spawn("", Some(ShellId::from("other")), None, SpawnOptions::default())
-            .await?;
-        writer = Some(writer_job.clone());
-        other = Some(other_job.clone());
-
-        // 3. One line, two files. A zero exit is not an approval, so both are required.
-        let command = frontend
-            .start_in(
-                &writer_job,
-                "printf owner > owned; printf staged > released",
-                CommandOptions::default(),
-            )
-            .await?;
-        let published = tokio::time::timeout(limit, command.wait()).await??;
-        assert_eq!(published.exit_code, Some(0), "the process said zero");
-        assert!(published.is_published(), "and the gate agreed");
-        assert_eq!(std::fs::read(canonical.join("owned"))?, b"owner");
-        assert_eq!(std::fs::read(canonical.join("released"))?, b"staged");
-
-        // 4. A second principal overwrites the first's file. The process succeeds; the
-        //    publication does not, and the seed keeps the original bytes.
-        let command = frontend
-            .start_in(&other_job, "printf intruder > owned", CommandOptions::default())
-            .await?;
-        let denied = tokio::time::timeout(limit, command.wait()).await??;
-        assert_eq!(denied.exit_code, Some(0), "the process still said zero");
-        assert!(
-            matches!(denied.outcome.as_ref(), Ok(Outcome::Denied { .. })),
-            "a zero exit is not an approval"
-        );
-        assert_eq!(std::fs::read(canonical.join("owned"))?, b"owner");
-
-        // 5. `git add` is a runtime Stage request, not repository bookkeeping: it releases
-        //    `released`'s unstaged ownership. `owned` is deliberately left owned, which is what
-        //    step 8 restarts into. The supplied validator must have seen the grant — a
-        //    constructor that ignored it would still publish, and this is what catches that.
-        let command = frontend
-            .start_in(&writer_job, "git add -- released", CommandOptions::default())
-            .await?;
-        let staged = tokio::time::timeout(limit, command.wait()).await??;
-        assert_eq!(staged.exit_code, Some(0));
-        assert!(staged.is_published());
-        assert!(
-            validator
-                .lock()
-                .expect("the caller's validator")
-                .history()
-                .iter()
-                .any(|event| event.action == Action::Stage),
-            "the daemon judged against the validator this caller supplied"
-        );
-
-        // 6. A pipe execution: two real streams, byte-exact, never merged.
-        let execution = frontend
-            .execute(ExecutionSpec {
-                directory: String::new(),
-                id: None,
-                process: ProcessCommand::Shell("printf stdout; printf stderr >&2".to_owned()),
-                environment: None,
-            })
-            .await?;
-        let captured = tokio::time::timeout(
-            limit,
-            execution.collect(CollectOptions {
-                limit: OutputLimit::Bytes(65_536),
-                overflow: OverflowPolicy::Error,
-            }),
-        )
-        .await??;
-        assert_eq!(captured.stdout, b"stdout", "stdout is its own stream");
-        assert_eq!(captured.stderr, b"stderr", "and stderr is never merged into it");
-        assert_eq!(captured.completion.exit_code, Some(0));
-        assert!(captured.completion.is_published());
-
-        Ok::<std::path::PathBuf, Box<dyn std::error::Error>>(canonical)
-    }
-    .await;
-
-    // Teardown happens whatever the phase made of itself: an explicit shutdown ends the listener
-    // and releases the seed however many handles are still held.
-    let released = tokio::time::timeout(limit, frontend.shutdown()).await;
-    let canonical = match (phase, released) {
-        (Ok(canonical), Ok(Ok(()))) => canonical,
-        (Ok(_), Ok(Err(error))) => return Err(error.into()),
-        (Ok(_), Err(elapsed)) => return Err(elapsed.into()),
-        (Err(error), Ok(Ok(()))) => return Err(error),
-        (Err(error), teardown) => {
-            eprintln!("rmux_api: shutdown also failed: {teardown:?}");
-            return Err(error);
-        }
-    };
-
-    // 7. The daemon is gone, and the handles that outlived it hold nothing.
-    assert!(!socket.exists(), "an explicit shutdown removes the socket");
-    assert_eq!(retained.snapshot().phase, IoPhase::Closed);
-    assert!(
-        matches!(
-            retained.spawn("", None, None, SpawnOptions::default()).await,
-            Err(IoError::Closed)
-        ),
-        "a retained handle refuses work rather than reaching a released engine"
-    );
-
-    // 8. Reopen the same seed on the same socket, with an empty validator that knows nothing.
-    let state = canonical
-        .parent()
-        .ok_or("the seed has no parent")?
-        .join(".marsh")
-        .join(canonical.file_name().ok_or("the seed has no name")?);
-    let wal = state.join("meta").join("wal.jsonl");
-    let before = std::fs::read(&wal)?;
-
-    let reopened = RmuxFrontend::open(
-        DaemonConfig::new(socket.clone()),
-        &seed,
-        Arc::new(Mutex::new(PolicyValidator::new())),
-        ShellEnvironment::default(),
-        TerminalGeometry { rows: 24, cols: 80 },
-    )
-    .await?;
-
-    let phase = async {
-        // Read before a single line is admitted: recovery installs the seed's durable history
-        // during construction, so this is the seed's property and not this process's.
-        assert!(
-            reopened
-                .history()
-                .iter()
-                .any(|event| event.action == Action::Stage),
-            "reopening adopts the grants the previous run published"
-        );
-
-        // The same *name*, a different snapshot uid. Rights belong to the uid, so this job
-        // inherits nothing from the `writer` that earned them.
-        let job = reopened
-            .spawn("", Some(ShellId::from("writer")), None, SpawnOptions::default())
-            .await?;
-        let command = reopened
-            .start_in(&job, "printf intruder > owned", CommandOptions::default())
-            .await?;
-        let denied = tokio::time::timeout(limit, command.wait()).await??;
-        assert_eq!(denied.exit_code, Some(0));
-        assert!(
-            matches!(denied.outcome.as_ref(), Ok(Outcome::Denied { .. })),
-            "an unstaged path stays owned by a principal that no longer exists"
-        );
-        assert_eq!(std::fs::read(canonical.join("owned"))?, b"owner");
-        assert_eq!(
-            std::fs::read(&wal)?,
-            before,
-            "a replay and a refusal write nothing to the log"
-        );
-
-        // 9. `released` was staged before the restart, and the release survived it: this is the
-        //    other half of durability, and the reason recovery is not "fail closed for every
-        //    path".
-        let command = reopened
-            .start_in(&job, "printf after-reopen > released", CommandOptions::default())
-            .await?;
-        let republished = tokio::time::timeout(limit, command.wait()).await??;
-        assert_eq!(republished.exit_code, Some(0));
-        assert!(republished.is_published());
-        assert_eq!(std::fs::read(canonical.join("released"))?, b"after-reopen");
-
-        // 10. The full wire vocabulary, over the socket this frontend bound. Protocol I/O after
-        //     the connect is blocking, so it belongs on a blocking worker.
-        let connection = reopened.open_protocol().await?;
-        let response = tokio::time::timeout(
-            limit,
-            tokio::task::spawn_blocking(move || {
-                let mut connection = connection;
-                connection.roundtrip(&protocol::Request::KillServer(protocol::KillServerRequest))
-            }),
-        )
-        .await???;
-        assert!(matches!(response, protocol::Response::KillServer(_)));
-        Ok::<(), Box<dyn std::error::Error>>(())
-    }
-    .await;
-
-    // A successful `kill-server` has already ended the listener, so `wait` is the ending that
-    // belongs to it; anything else still needs an explicit stop.
-    match phase {
-        Ok(()) => tokio::time::timeout(limit, reopened.wait()).await??,
-        Err(error) => {
-            if let Err(teardown) = tokio::time::timeout(limit, reopened.shutdown()).await {
-                eprintln!("rmux_api: shutdown also failed: {teardown}");
-            }
-            return Err(error);
-        }
-    }
-
-    assert!(!socket.exists(), "a killed server removes its socket too");
-    assert_eq!(
-        std::fs::read_dir(state.join("snap"))?.count(),
-        0,
-        "every successful run's snapshot is reclaimed"
-    );
-
-    // Still in scope, and still holding nothing: two whole daemons have come and gone underneath
-    // these values.
-    drop((retained, writer, other));
-
-    println!("rmux_api: staging, policy, and durable reopen verified.");
-    Ok(())
-}
-```
-
-Run it from the consumer project, after the CLI daemon from the first section has stopped:
-
-```sh
-cargo run -- "$WORK/seed" "$WORK/rmux.sock"
-```
-
-Or, in the checkout:
+[`examples/rmux_api.rs`](examples/rmux_api.rs) uses only the ordinary public interface. On a fresh
+Git-initialized source and unused socket:
 
 ```sh
 cargo run -p marsh --example rmux_api -- "$WORK/seed" "$WORK/rmux.sock"
 ```
 
-Both consume the Git-initialized seed the first section prepared. The example's `owned` and
-`released` must not already carry ownership from an earlier run, so use a **fresh seed** for each
-run — repeat the `btrfs subvolume create` / `git init` / empty-commit sequence.
+`RmuxFrontend::open` binds the daemon; `io()` returns a cloneable native-client lease. `shutdown(self)`
+closes its listener and shells even when handles remain; `wait(self)` waits for an external/idle stop.
+`CommandCompletion.result` is the one `Arc<Result<ExecutionResult, ShellError>>`; `exit_code()` derives
+the native status. `RunError::Execution` carries that full completion. No facade exposes a validator,
+seed-history query, snapshot parent or recovery flag.
 
-### The interface, and the lifecycle
+Pipe executions preserve independent stdout/stderr bytes and real stdin EOF. Terminal jobs retain
+idle PTY leases, geometry and byte pumps. `observe()` reports an atomic snapshot plus ordered events;
+falling behind is explicit. SDK and protocol connections address this same daemon.
 
-**The validator is the caller's.** `Arc<Mutex<marsh::PolicyValidator>>` is marsh's existing
-junco-policy `GitPolicy` adapter together with its committed history — not an internally chosen
-global and not a new policy abstraction. A raw junco `GitPolicy` borrows a non-`Sync` arena, so
-this adapter is the cross-thread contract. Use a fresh validator per independently governed seed;
-reopening with an empty one still adopts that seed's durable grants before a single command is
-accepted, which is exactly what step 8 above observes.
+## Verification
 
-**Construction.** `RmuxFrontend::open` opens and replays the seed and binds one engine and one
-server. `open_with` is the same thing over an explicitly supplied `Subvolumes` backend, which only
-a test fixture normally needs. Normal consumers never construct an executor, a multiplexer, a
-shell profile, a callback queue or an observation task.
+The `marsh-core` library suite includes the real readonly-redo/recovery regression by default. It
+requires a writable btrfs `$HOME` mounted with `user_subvol_rm_allowed`; missing prerequisites fail
+the test instead of skipping it.
 
-**Ownership.** `RmuxFrontend` is the unique owner: of the seed's exclusive lease, of the
-multiplexer, and of the listener task. Its operations are `ShellIo`'s, reached through `Deref`, so
-`frontend.spawn(...)`, `frontend.execute(...)` and `frontend.observe()` are all direct calls.
-`io()` explicitly returns a **cloneable native-client lease** for concurrent code — a task, a
-thread, a struct field — and those handles neither create a second service nor own the server
-task. Use `io()` rather than treating the owner as cloneable; it is deliberately neither `Clone`
-nor `DerefMut`. `shutdown(self)` ends the listener and releases the seed however many handles are
-still held; `wait(self)` drops the owner's lease and joins a server that something else stopped or
-that went idle; owner `Drop` requests shutdown but cannot await it.
+```sh
+cargo build -p marsh --bins
+cargo test -p marsh-instrument
+cargo test -p marsh-btrfs -p marsh-wal
+cargo test -p brush-core --test external_command_spawner_tests
+cargo test -p marsh-core --lib
+cargo test -p rmux-server --lib pane_repl::
+cargo test -p marsh --test shell --test shellmux --test builtins --test git_shell --test rmux --test rmux_cli
+env -u RMUX -u TMUX cargo run -p marsh --example rmux_smoke
+```
 
-**Results.** `spawn` returns a job handle. `start_in` *returning* is admission, not completion:
-inspect `CommandHandle::wait()` and its typed `Outcome`, not only `exit_code`. `execute` opens a
-pipe job — separate byte-exact stdout and stderr, and a real end-of-file on input — while terminal
-jobs have one merged stream instead. `observe` gives an atomic snapshot plus an event
-subscription, where falling behind is an explicit error rather than silent loss. SDK handles and
-`open_protocol` reach the same bound socket; protocol I/O after the connect is blocking and belongs
-on a blocking worker, as the example shows.
+The smoke first execs itself with `--native-trace-only` and a temporary PATH containing only Git,
+before the parent attaches any tracer. It checks normal Shell sharing/recovery, Read enforcement,
+explicit read+edit and zero-op grant durability. The parent then exercises the real rmux executable,
+independent sources (the sibling seed's pane starting over an incompatible WAL, which it resets),
+native file I/O, stale-without-replay and natural pane exit.
 
-**Durability.** Rights belong to snapshot uids, never to reused job names. An unstaged path stays
-owned after the job that wrote it has vanished, and restarting does not reset that. Stage the work
-you want released before closing its owner. Discarding cancels unpublished work; it does not undo
-a grant already published into the seed. The example leaves `owned` unstaged on purpose, to show
-the refusal after a restart, and stages `released`, to show that the release survives one too.
+`marsh-core/testing` and `rmux-server/testing` provide explicit CopyTree/configured-builder
+factories for deterministic tests. No production constructor accepts a backend. The smoke reports
+whether it used real btrfs or CopyTree; only real btrfs proves readonly subvolume ioctls.
 
-**What this is not.** It is a publication and policy boundary, not OS confinement. Network effects
-and writes to absolute paths outside the seed are neither transactional nor sandboxed by this
-interface.
+The private publication regression captures explicitly Internal-scoped calls through the
+test-only `marsh-instrument/testing` feature. It correlates the completed WAL frame with
+native intent sync, staged-payload fsync, namespace fsync and END sync in that order. This is
+syscall-ordering evidence, not a power-cut/storage-fault proof.
 
 ## License
 

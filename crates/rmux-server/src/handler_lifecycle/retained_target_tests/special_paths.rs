@@ -1,11 +1,11 @@
-use std::path::PathBuf;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use super::*;
 use crate::handler::scripting_support::install_queue_exact_target_capture_pause;
+use crate::test_fixtures::{unique_temp_path, wait_until};
 
 async fn session_with_spare_window(handler: &RequestHandler, name: &str) -> SessionName {
-    let session_name = create_handler_session(handler, name).await;
+    let session_name = handler.create_session(name).await;
     handler
         .state
         .lock()
@@ -139,12 +139,9 @@ async fn source_file_rejects_retired_and_replaced_lifecycle_targets() {
 async fn source_file_missing_explicit_target_cuts_the_outer_lifecycle_lease() {
     let handler = RequestHandler::new();
     let alpha = session_with_spare_window(&handler, "special-source-missing-alpha").await;
-    let beta = create_handler_session(&handler, "special-source-missing-beta").await;
+    let beta = handler.create_session("special-source-missing-beta").await;
     let requester_pid = std::process::id();
-    let (control_tx, _control_rx) = tokio::sync::mpsc::unbounded_channel();
-    handler
-        .register_attach(requester_pid, beta.clone(), control_tx)
-        .await;
+    let _control_rx = handler.attach_client(requester_pid, &beta).await;
     let (current_target, lease) = retained_alert_binding(&handler, &alpha).await;
     let path = unique_temp_path("source-missing-target.conf");
     std::fs::write(&path, "rename-window fallback-beta\n").expect("write source fixture");
@@ -223,7 +220,7 @@ async fn run_shell_command_modes_reject_retired_and_replaced_lifecycle_targets()
 async fn explicit_if_shell_target_cuts_the_lifecycle_lease_and_pins_beta() {
     let handler = RequestHandler::new();
     let alpha = session_with_spare_window(&handler, "special-explicit-alpha").await;
-    let beta = create_handler_session(&handler, "special-explicit-beta").await;
+    let beta = handler.create_session("special-explicit-beta").await;
     let (current_target, lease) = retained_alert_binding(&handler, &alpha).await;
     retire_window_zero(&handler, &alpha, false).await;
 
@@ -252,7 +249,7 @@ async fn explicit_if_shell_target_cuts_the_lifecycle_lease_and_pins_beta() {
 async fn explicit_if_shell_target_rejects_same_name_slot_replacement() {
     let handler = RequestHandler::new();
     let alpha = session_with_spare_window(&handler, "special-explicit-aba-alpha").await;
-    let beta = create_handler_session(&handler, "special-explicit-aba-beta").await;
+    let beta = handler.create_session("special-explicit-aba-beta").await;
     let (current_target, lease) = retained_alert_binding(&handler, &alpha).await;
     let pause = install_queue_exact_target_capture_pause(&handler, "if-shell");
     let queued_handler = handler.clone();
@@ -320,8 +317,9 @@ async fn special_mutations_reject_a_respawned_pane_with_the_same_pane_id() {
     ];
     for (command_name, command, buffer) in cases {
         let handler = RequestHandler::new();
-        let session_name =
-            create_handler_session(&handler, &format!("{command_name}-respawn")).await;
+        let session_name = handler
+            .create_session(format!("{command_name}-respawn"))
+            .await;
         let (current_target, lease) = retained_alert_binding(&handler, &session_name).await;
         let pause = install_queue_exact_target_capture_pause(&handler, command_name);
         let queued_handler = handler.clone();
@@ -336,17 +334,12 @@ async fn special_mutations_reject_a_respawned_pane_with_the_same_pane_id() {
                 .await
         });
         pause.wait_until_reached().await;
-        let response = handler
-            .handle(Request::RespawnPane(Box::new(RespawnPaneRequest {
-                target: PaneTarget::with_window(session_name.clone(), 0, 0),
-                kill: true,
-                start_directory: None,
-                environment: None,
+        handler
+            .handle_ok(RespawnPaneRequest {
                 command: Some(vec![crate::test_shell::stdin_discard_command()]),
-                process_command: None,
-            })))
+                ..Fixture::fixture(PaneTarget::with_window(session_name.clone(), 0, 0))
+            })
             .await;
-        assert!(matches!(response, Response::RespawnPane(_)), "{response:?}");
         pause.release.notify_one();
         let error = queued
             .await
@@ -389,26 +382,14 @@ async fn admitted_background_shell_finishes_after_its_lifecycle_target_retires()
     let _ = std::fs::remove_file(finished);
 }
 
-fn unique_temp_path(label: &str) -> PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .expect("system clock after epoch")
-        .as_nanos();
-    std::env::temp_dir().join(format!("rmux-{label}-{}-{nanos}", std::process::id()))
-}
-
 async fn wait_for_file(path: &std::path::Path) {
-    tokio::time::timeout(background_shell_marker_timeout(), async {
-        while !path.exists() {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
+    wait_until(
+        Duration::from_secs(10),
+        Duration::from_millis(10),
+        async || path.exists().then_some(()).ok_or(()),
+    )
     .await
     .unwrap_or_else(|_| panic!("background shell did not write marker {}", path.display()));
-}
-
-fn background_shell_marker_timeout() -> Duration {
-    Duration::from_secs(10)
 }
 
 fn delayed_file_command(started: &std::path::Path, finished: &std::path::Path) -> String {

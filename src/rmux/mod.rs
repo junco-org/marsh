@@ -24,7 +24,7 @@
 //! | Default directory, per-seed policy history | [`ShellIo::default_dir`], [`ShellIo::history`] |
 //! | Jobs, one job, current selection | [`ShellIo::snapshot`], [`ShellIo::jobs`], [`ShellIo::job`], [`ShellIo::current_job`], [`ShellIo::shell`] |
 //! | Create a shell and keep it | [`ShellIo::open_shell`], [`ShellIo::keep`] |
-//! | Run a line, and the finish callback | [`ShellHandle::run_command`], [`ShellIo::on_finish`] |
+//! | Run a line and await its verdict | [`ShellHandle::run_command`], [`CommandHandle::wait`](types::CommandHandle::wait) |
 //! | Selection, graceful and forced stop | [`ShellIo::switch`], [`ShellIo::stop`], [`ShellHandle::wait_closed`] |
 //! | Raw input and resize | [`ShellIo::write_input`], [`ShellIo::resize`], [`ShellIo::resize_all`] |
 //! | Frontend output, lifecycle and errors | [`ShellIo::observe`], [`ShellIo::output`], typed completion and closure watches |
@@ -57,15 +57,14 @@
 //!
 //! Ownership of a path is **durable**, and that has a consequence worth planning for. Each
 //! transaction's granted capabilities are recorded in the write-ahead log together with the
-//! snapshot id that earned them, and reopening the seed reinstalls that history before any shell
-//! runs a line, so [`ShellIo::history`] describes the seed rather than this process and a
-//! restart hands nobody a clean slate. Owners are identified by snapshot id and never by job
-//! name, because a pane index is reused and a restarted daemon renumbers from one — naming them
-//! by name would let the next holder inherit the last holder's stake.
+//! Junco principal that earned them. Reopening the seed reinstalls that same ownership before
+//! any shell runs a line, so a restart hands nobody a clean slate. Principals are independent
+//! of display names, which may be reused when a pane closes or the daemon restarts. Reusing a
+//! name never lets the new shell inherit the last holder's stake.
 //!
 //! The consequence: a path left **unstaged** when the host shuts down stays owned by a principal
 //! that no longer exists. The policy admits only that owner for staging, checkout or stash, so
-//! after the restart no one can edit it — the denial names a snapshot id with no job behind it.
+//! after the restart no one can edit it — the denial names the same principal with no live shell.
 //! Staging a path before shutdown releases it. An application that opens jobs which leave work
 //! unstaged should therefore treat "stage or discard before shutdown" as part of its teardown,
 //! not as housekeeping it can skip.
@@ -116,9 +115,6 @@ pub mod types {
     /// One retained chunk, or the explicit gap that says an observer fell behind.
     pub use rmux_core::events::{OutputCursorItem, OutputEvent};
 
-    /// The snapshot backend an explicit
-    /// [`RmuxFrontend::open_with`](super::RmuxFrontend::open_with) is handed.
-    pub use rmux_server::Subvolumes;
     /// The daemon's listening configuration and its startup config-file policy, for
     /// [`RmuxFrontend::open`](super::RmuxFrontend::open).
     pub use rmux_server::{ConfigFileSelection, ConfigLoadOptions, DaemonConfig};
@@ -144,26 +140,19 @@ pub mod types {
         EnsureSessionPolicy, PaneRespawnOptions, ProcessSpec, SplitDirection, TerminalSizeSpec,
     };
 
-    /// What a policy decision is *about*, for a caller reading
-    /// [`ShellIo::history`](super::ShellIo::history).
-    pub use marsh_core::policy::{Action, Event, Principal, Resource};
-    /// What the gate produced, and the shell-layer failure underneath a
-    /// [`MuxError::Marsh`].
+    /// Ordinary shell construction, execution values and typed diagnostics.
     pub use marsh_core::{
-        Denial, GrantedAction, GrantedCapability, MarshError, Publication,
+        Denial, ExecutionParameters, ExecutionResult, OpenFile, ProfileLoadBehavior,
+        RcLoadBehavior, Shell, ShellBuilder, ShellError, ShellErrorKind, ShellFd, ShellVariable,
+        SourceInfo, UIOptions,
     };
 
-    /// The core vocabulary a shell, a command and its verdict are spelled in.
-    ///
-    /// [`RunError`] and [`PolicyError`] are here so a native caller can name what a line failed
-    /// with — a refused admission, a policy denial carrying the completion it refused, an
-    /// unpublished conclusion, a lost answer — without taking a dependency on the core crate.
+    /// Ordinary signals for running shell work.
+    pub use marsh_core::Signal;
+    /// Job names, receipts and terminal configuration; no storage or policy handles.
     pub use marsh_core::shellmux::{
         CommandCompletion, CommandHandle, CommandId, CommandOptions, IdleTerminal, JobDir, JobEnd,
-        JobIo, JobView, MuxError, MuxSnapshot, OnFinish, OutputChannel, PolicyError, RunError,
-        RunningView, Sandbox, SeedInfo, ShellId, SnapshotUid, SpawnOptions, TerminalGeometry,
-        WaitError,
+        JobIo, JobView, MuxError, MuxSnapshot, OutputChannel, Principal, RunError, RunningView,
+        Sandbox, ShellId, SpawnOptions, TerminalGeometry, WaitError,
     };
-    /// What the gate made of a line, and the signals a running command can be sent.
-    pub use marsh_core::{Outcome, Signal};
 }

@@ -1,6 +1,7 @@
 use clap::{ArgAction, Args};
 
 use super::automation::{DURATION_HELP, SendKeysWaitMode, parse_duration};
+use super::validate::{Validate, reject_empty, selected_count, value_error};
 use super::{TargetSpec, parse_target_spec};
 
 /// Parsed arguments of `send-keys`, including the rmux-specific `--wait` synchronization flags.
@@ -55,46 +56,40 @@ impl SendKeysArgs {
             || self.wait_next_text.is_some()
             || self.wait_pane_exit
     }
+}
 
+impl Validate for SendKeysArgs {
     /// Rejects conflicting, empty, or unsupported combinations of the `--wait` family of flags.
-    pub(crate) fn validate(self) -> Result<Self, clap::Error> {
-        let waits = [
+    fn validate(self, command_name: &'static str) -> Result<Self, clap::Error> {
+        let waits = selected_count([
             self.wait.is_some(),
             self.wait_text.is_some(),
             self.wait_visible_text.is_some(),
             self.wait_next_text.is_some(),
             self.wait_pane_exit,
-        ]
-        .into_iter()
-        .filter(|selected| *selected)
-        .count();
-        let has_wait = waits > 0;
+        ]);
         if waits > 1 {
             return Err(value_error(
-                "send-keys",
+                command_name,
                 "only one --wait condition may be selected",
             ));
         }
-        if self.timeout.is_some() && !has_wait {
+        if self.timeout.is_some() && waits == 0 {
             return Err(value_error(
-                "send-keys",
+                command_name,
                 "--timeout is valid only with a --wait condition",
             ));
         }
-        reject_empty("send-keys", "--wait-text", self.wait_text.as_deref())?;
-        reject_empty(
-            "send-keys",
-            "--wait-visible-text",
-            self.wait_visible_text.as_deref(),
-        )?;
-        reject_empty(
-            "send-keys",
-            "--wait-next-text",
-            self.wait_next_text.as_deref(),
-        )?;
+        for (flag, value) in [
+            ("--wait-text", &self.wait_text),
+            ("--wait-visible-text", &self.wait_visible_text),
+            ("--wait-next-text", &self.wait_next_text),
+        ] {
+            reject_empty(command_name, flag, value.as_deref())?;
+        }
         if self.stable_for.is_some() && self.wait != Some(SendKeysWaitMode::Quiet) {
             return Err(value_error(
-                "send-keys",
+                command_name,
                 "--stable-for is valid only with --wait quiet",
             ));
         }
@@ -157,13 +152,6 @@ pub(crate) struct ListKeysArgs {
     pub(crate) key: Option<String>,
 }
 
-impl ListKeysArgs {
-    /// Accepts the parsed arguments unchanged; `list-keys` has no cross-flag constraints.
-    pub(crate) const fn validate(self) -> Self {
-        self
-    }
-}
-
 /// Parsed arguments of `send-prefix`, sending the primary or secondary prefix key to a pane.
 #[derive(Debug, Clone, Args)]
 pub(crate) struct SendPrefixArgs {
@@ -176,26 +164,23 @@ pub(crate) struct SendPrefixArgs {
 impl BindKeyArgs {
     /// The key table to bind into: the explicit `-T` name, else `root` with `-n`, else `prefix`.
     pub(crate) fn table_name(&self) -> String {
-        if let Some(table_name) = &self.table_name {
-            table_name.clone()
-        } else if self.root_table {
-            "root".to_owned()
-        } else {
-            "prefix".to_owned()
-        }
+        key_table_name(self.table_name.as_deref(), self.root_table)
     }
 }
 
 impl UnbindKeyArgs {
     /// The key table to unbind from: the explicit `-T` name, else `root` with `-n`, else `prefix`.
     pub(crate) fn table_name(&self) -> String {
-        if let Some(table_name) = &self.table_name {
-            table_name.clone()
-        } else if self.root_table {
-            "root".to_owned()
-        } else {
-            "prefix".to_owned()
-        }
+        key_table_name(self.table_name.as_deref(), self.root_table)
+    }
+}
+
+/// The key table a binding command acts on: `table_name`, else `root` or `prefix` per `-n`.
+fn key_table_name(table_name: Option<&str>, root_table: bool) -> String {
+    match table_name {
+        Some(table_name) => table_name.to_owned(),
+        None if root_table => "root".to_owned(),
+        None => "prefix".to_owned(),
     }
 }
 
@@ -205,23 +190,4 @@ fn parse_send_keys_wait_mode(value: &str) -> Result<SendKeysWaitMode, String> {
         "quiet" => Ok(SendKeysWaitMode::Quiet),
         _ => Err("supported wait modes: quiet".to_owned()),
     }
-}
-
-/// Fails when a present flag value is the empty string.
-fn reject_empty(command_name: &str, flag: &str, value: Option<&str>) -> Result<(), clap::Error> {
-    if value.is_some_and(str::is_empty) {
-        return Err(value_error(
-            command_name,
-            format!("{flag} must not be empty"),
-        ));
-    }
-    Ok(())
-}
-
-/// Builds a clap value-validation error prefixed with the offending command name.
-fn value_error(command_name: &str, message: impl std::fmt::Display) -> clap::Error {
-    clap::Error::raw(
-        clap::error::ErrorKind::ValueValidation,
-        format!("command {command_name}: {message}"),
-    )
 }

@@ -1,53 +1,13 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
-
-use rmux_proto::{ControlMode, SwapWindowRequest};
 
 use super::*;
-use crate::control::{ControlModeUpgrade, ControlServerEvent, CONTROL_SERVER_EVENT_CAPACITY};
-
-#[derive(Clone, Copy)]
-struct IntraSessionCase {
-    name: &'static str,
-    windows: u32,
-    active: u32,
-    source: u32,
-    target: u32,
-    detached: bool,
-    expected_identity_slot: u32,
-}
+use crate::control::ControlServerEvent;
 
 #[derive(Debug)]
 struct StableSessionSelection {
     session_name: SessionName,
     session_id: String,
     window_id: String,
-}
-
-async fn register_swap_control(
-    handler: &RequestHandler,
-    requester_pid: u32,
-    session: &SessionName,
-) -> (u64, mpsc::Receiver<ControlServerEvent>) {
-    let (event_tx, event_rx) = mpsc::channel(CONTROL_SERVER_EVENT_CAPACITY);
-    let control_id = handler
-        .register_control_with_closing(
-            requester_pid,
-            ControlModeUpgrade {
-                initial_command_count: 0,
-                mode: ControlMode::Plain,
-                terminal_context: crate::outer_terminal::OuterTerminalContext::default(),
-            },
-            event_tx,
-            Arc::new(AtomicBool::new(false)),
-        )
-        .await;
-    handler
-        .set_control_session(requester_pid, Some(session.clone()))
-        .await
-        .expect("control attaches to swap test session");
-    (control_id, event_rx)
 }
 
 async fn run_swap_control(
@@ -80,8 +40,7 @@ fn swap_notifications(rx: &mut mpsc::Receiver<ControlServerEvent>) -> Vec<String
 }
 
 async fn create_indexed_windows(handler: &RequestHandler, name: &str, windows: u32) -> SessionName {
-    create_session(handler, name).await;
-    let session_name = session_name(name);
+    let session_name = create_session(handler, name).await;
     for window_index in 1..windows {
         insert_window(handler, &session_name, window_index).await;
     }
@@ -128,21 +87,19 @@ async fn active_window_id(handler: &RequestHandler, session_name: &SessionName) 
         .to_string()
 }
 
+/// Each session's stable id mapped to its active window's stable id.
+fn selection_model(selections: &[StableSessionSelection]) -> HashMap<String, String> {
+    selections
+        .iter()
+        .map(|selection| (selection.session_id.clone(), selection.window_id.clone()))
+        .collect()
+}
+
 async fn active_window_model(
     handler: &RequestHandler,
     session_names: &[SessionName],
 ) -> HashMap<String, String> {
-    let state = handler.state.lock().await;
-    session_names
-        .iter()
-        .map(|session_name| {
-            let session = state
-                .sessions
-                .session(session_name)
-                .expect("model session exists");
-            (session.id().to_string(), session.window().id().to_string())
-        })
-        .collect()
+    selection_model(&stable_selection_snapshot(handler, session_names).await)
 }
 
 async fn stable_selection_snapshot(
@@ -217,124 +174,46 @@ async fn swap_window_intra_session_publishes_only_real_identity_changes() {
     // tmux 3.7b was measured before this assertion. RMUX intentionally
     // normalizes the oracle's redundant and missing notifications to exactly
     // one event per real stable-identity transition.
-    let cases = [
-        IntraSessionCase {
-            name: "inactive-d",
-            windows: 3,
-            active: 2,
-            source: 0,
-            target: 1,
-            detached: true,
-            expected_identity_slot: 0,
-        },
-        IntraSessionCase {
-            name: "inactive-default",
-            windows: 3,
-            active: 2,
-            source: 0,
-            target: 1,
-            detached: false,
-            expected_identity_slot: 2,
-        },
-        IntraSessionCase {
-            name: "inverse-d",
-            windows: 3,
-            active: 2,
-            source: 1,
-            target: 0,
-            detached: true,
-            expected_identity_slot: 1,
-        },
-        IntraSessionCase {
-            name: "same-target-d",
-            windows: 3,
-            active: 2,
-            source: 0,
-            target: 0,
-            detached: true,
-            expected_identity_slot: 2,
-        },
-        IntraSessionCase {
-            name: "source-active-d",
-            windows: 3,
-            active: 0,
-            source: 0,
-            target: 1,
-            detached: true,
-            expected_identity_slot: 0,
-        },
-        IntraSessionCase {
-            name: "target-active-d",
-            windows: 3,
-            active: 1,
-            source: 0,
-            target: 1,
-            detached: true,
-            expected_identity_slot: 0,
-        },
-        IntraSessionCase {
-            name: "source-active-default",
-            windows: 3,
-            active: 0,
-            source: 0,
-            target: 1,
-            detached: false,
-            expected_identity_slot: 1,
-        },
-        IntraSessionCase {
-            name: "target-active-default",
-            windows: 3,
-            active: 1,
-            source: 0,
-            target: 1,
-            detached: false,
-            expected_identity_slot: 0,
-        },
-        IntraSessionCase {
-            name: "two-source-active-d",
-            windows: 2,
-            active: 0,
-            source: 0,
-            target: 1,
-            detached: true,
-            expected_identity_slot: 0,
-        },
-        IntraSessionCase {
-            name: "two-target-active-d",
-            windows: 2,
-            active: 1,
-            source: 0,
-            target: 1,
-            detached: true,
-            expected_identity_slot: 0,
-        },
+    // (name, windows, active, source, target, detached, expected identity slot)
+    let cases: [(&str, u32, u32, u32, u32, bool, u32); 10] = [
+        ("inactive-d", 3, 2, 0, 1, true, 0),
+        ("inactive-default", 3, 2, 0, 1, false, 2),
+        ("inverse-d", 3, 2, 1, 0, true, 1),
+        ("same-target-d", 3, 2, 0, 0, true, 2),
+        ("source-active-d", 3, 0, 0, 1, true, 0),
+        ("target-active-d", 3, 1, 0, 1, true, 0),
+        ("source-active-default", 3, 0, 0, 1, false, 1),
+        ("target-active-default", 3, 1, 0, 1, false, 0),
+        ("two-source-active-d", 2, 0, 0, 1, true, 0),
+        ("two-target-active-d", 2, 1, 0, 1, true, 0),
     ];
 
     for (offset, case) in cases.into_iter().enumerate() {
+        let (name, windows, active, source, target, detached, expected_identity_slot) = case;
         let handler = RequestHandler::new();
-        let session_name = create_indexed_windows(&handler, case.name, case.windows).await;
-        select_window(&handler, &session_name, case.active).await;
+        let session_name = create_indexed_windows(&handler, name, windows).await;
+        select_window(&handler, &session_name, active).await;
         let (session_id, initial_ids) = session_window_ids(&handler, &session_name).await;
         let before = active_window_id(&handler, &session_name).await;
         let expected_after = initial_ids
-            .get(&case.expected_identity_slot)
+            .get(&expected_identity_slot)
             .expect("expected identity slot exists")
             .clone();
-        let (_control_id, mut rx) =
-            register_swap_control(&handler, 32_000 + offset as u32, &session_name).await;
+        let (_control_id, mut rx) = handler
+            .register_control_for_test(32_000 + offset as u32, Some(&session_name))
+            .await;
         let _ = swap_notifications(&mut rx);
 
         let response = handler
             .handle(Request::SwapWindow(SwapWindowRequest {
-                source: WindowTarget::with_window(session_name.clone(), case.source),
-                target: WindowTarget::with_window(session_name.clone(), case.target),
-                detached: case.detached,
+                source: WindowTarget::with_window(session_name.clone(), source),
+                target: WindowTarget::with_window(session_name.clone(), target),
+                detached,
             }))
             .await;
         assert!(
             matches!(response, Response::SwapWindow(_)),
-            "{}: {response:?}",
-            case.name
+            "{name}: {response:?}"
         );
 
         let notifications = swap_notifications(&mut rx);
@@ -347,14 +226,12 @@ async fn swap_window_intra_session_publishes_only_real_identity_changes() {
         };
         assert_eq!(
             notifications, expected_notifications,
-            "{} must publish exactly its real identity transition",
-            case.name
+            "{name} must publish exactly its real identity transition"
         );
         assert_eq!(
             active_window_id(&handler, &session_name).await,
             expected_after,
-            "{} active identity",
-            case.name
+            "{name} active identity"
         );
     }
 }
@@ -366,7 +243,9 @@ async fn swap_window_repetition_keeps_snapshot_event_model_exact_without_rescan(
     select_window(&handler, &alpha, 2).await;
     let (session_id, initial_ids) = session_window_ids(&handler, &alpha).await;
     let requester_pid = 32_100;
-    let (control_id, mut rx) = register_swap_control(&handler, requester_pid, &alpha).await;
+    let (control_id, mut rx) = handler
+        .register_control_for_test(requester_pid, Some(&alpha))
+        .await;
     let _ = swap_notifications(&mut rx);
     let mut model = active_window_model(&handler, std::slice::from_ref(&alpha)).await;
 
@@ -411,19 +290,20 @@ async fn cross_session_swap_orders_each_real_transition_target_then_source() {
     select_window(&handler, &beta, 1).await;
     let (alpha_id, alpha_windows) = session_window_ids(&handler, &alpha).await;
     let (beta_id, beta_windows) = session_window_ids(&handler, &beta).await;
-    let (_control_id, mut rx) = register_swap_control(&handler, 32_200, &alpha).await;
+    let (_control_id, mut rx) = handler
+        .register_control_for_test(32_200, Some(&alpha))
+        .await;
     let _ = swap_notifications(&mut rx);
     let sessions = [alpha.clone(), beta.clone()];
     let mut model = active_window_model(&handler, &sessions).await;
 
-    let response = handler
-        .handle(Request::SwapWindow(SwapWindowRequest {
+    handler
+        .handle_ok(SwapWindowRequest {
             source: WindowTarget::with_window(alpha.clone(), 0),
             target: WindowTarget::with_window(beta.clone(), 0),
             detached: true,
-        }))
+        })
         .await;
-    assert!(matches!(response, Response::SwapWindow(_)), "{response:?}");
 
     let source_window_id = alpha_windows.get(&0).expect("source identity");
     let target_window_id = beta_windows.get(&0).expect("target identity");
@@ -444,8 +324,7 @@ async fn cross_session_swap_orders_each_real_transition_target_then_source() {
 async fn cross_session_swap_orders_complete_grouped_families_from_stable_snapshots() {
     let handler = RequestHandler::new();
     let alpha = create_indexed_windows(&handler, "family-alpha", 3).await;
-    let gamma = session_name("family-gamma");
-    create_grouped_session(&handler, gamma.as_str(), &alpha).await;
+    let gamma = create_grouped_session(&handler, "family-gamma", &alpha).await;
     let beta = create_indexed_windows(&handler, "family-beta", 3).await;
     let unchanged = create_indexed_windows(&handler, "family-unchanged", 1).await;
     for session_name in [&alpha, &gamma, &beta, &unchanged] {
@@ -463,7 +342,9 @@ async fn cross_session_swap_orders_complete_grouped_families_from_stable_snapsho
         unchanged.clone(),
     ];
     let requester_pid = 32_250;
-    let (control_id, mut rx) = register_swap_control(&handler, requester_pid, &alpha).await;
+    let (control_id, mut rx) = handler
+        .register_control_for_test(requester_pid, Some(&alpha))
+        .await;
     let _ = swap_notifications(&mut rx);
 
     let family_orders = [
@@ -501,15 +382,9 @@ async fn cross_session_swap_orders_complete_grouped_families_from_stable_snapsho
             operation + 1
         );
 
-        let mut model = before
-            .iter()
-            .map(|selection| (selection.session_id.clone(), selection.window_id.clone()))
-            .collect::<HashMap<_, _>>();
+        let mut model = selection_model(&before);
         apply_session_window_events(&mut model, &notifications);
-        let final_snapshot = after
-            .iter()
-            .map(|selection| (selection.session_id.clone(), selection.window_id.clone()))
-            .collect::<HashMap<_, _>>();
+        let final_snapshot = selection_model(&after);
         assert_eq!(
             model,
             final_snapshot,
@@ -523,24 +398,24 @@ async fn cross_session_swap_orders_complete_grouped_families_from_stable_snapsho
 async fn grouped_and_linked_peers_do_not_receive_identity_stable_noise() {
     let handler = RequestHandler::new();
     let owner = create_indexed_windows(&handler, "group-owner", 3).await;
-    let peer = session_name("group-peer");
-    create_grouped_session(&handler, peer.as_str(), &owner).await;
+    let peer = create_grouped_session(&handler, "group-peer", &owner).await;
     select_window(&handler, &owner, 2).await;
     select_window(&handler, &peer, 2).await;
     let (owner_id, owner_windows) = session_window_ids(&handler, &owner).await;
     let (_peer_id, peer_windows) = session_window_ids(&handler, &peer).await;
     let peer_before = peer_windows.get(&2).expect("peer active identity").clone();
-    let (_control_id, mut rx) = register_swap_control(&handler, 32_300, &owner).await;
+    let (_control_id, mut rx) = handler
+        .register_control_for_test(32_300, Some(&owner))
+        .await;
     let _ = swap_notifications(&mut rx);
 
-    let response = handler
-        .handle(Request::SwapWindow(SwapWindowRequest {
+    handler
+        .handle_ok(SwapWindowRequest {
             source: WindowTarget::with_window(owner.clone(), 0),
             target: WindowTarget::with_window(owner.clone(), 1),
             detached: true,
-        }))
+        })
         .await;
-    assert!(matches!(response, Response::SwapWindow(_)), "{response:?}");
     assert_eq!(
         swap_notifications(&mut rx),
         vec![format!(
@@ -553,32 +428,28 @@ async fn grouped_and_linked_peers_do_not_receive_identity_stable_noise() {
     let handler = RequestHandler::new();
     let owner = create_indexed_windows(&handler, "link-owner", 3).await;
     let peer = create_indexed_windows(&handler, "link-peer", 1).await;
-    let response = handler
-        .handle(Request::LinkWindow(LinkWindowRequest {
-            source: WindowTarget::with_window(owner.clone(), 0),
-            target: WindowTarget::with_window(peer.clone(), 1),
-            after: false,
-            before: false,
-            kill_destination: false,
-            detached: true,
-        }))
+    handler
+        .handle_ok(LinkWindowRequest::fixture((
+            WindowTarget::with_window(owner.clone(), 0),
+            WindowTarget::with_window(peer.clone(), 1),
+        )))
         .await;
-    assert!(matches!(response, Response::LinkWindow(_)), "{response:?}");
     select_window(&handler, &owner, 2).await;
     select_window(&handler, &peer, 1).await;
     let (owner_id, owner_windows) = session_window_ids(&handler, &owner).await;
     let peer_before = active_window_id(&handler, &peer).await;
-    let (_control_id, mut rx) = register_swap_control(&handler, 32_301, &owner).await;
+    let (_control_id, mut rx) = handler
+        .register_control_for_test(32_301, Some(&owner))
+        .await;
     let _ = swap_notifications(&mut rx);
 
-    let response = handler
-        .handle(Request::SwapWindow(SwapWindowRequest {
+    handler
+        .handle_ok(SwapWindowRequest {
             source: WindowTarget::with_window(owner.clone(), 0),
             target: WindowTarget::with_window(owner.clone(), 1),
             detached: true,
-        }))
+        })
         .await;
-    assert!(matches!(response, Response::SwapWindow(_)), "{response:?}");
     assert_eq!(
         swap_notifications(&mut rx),
         vec![format!(

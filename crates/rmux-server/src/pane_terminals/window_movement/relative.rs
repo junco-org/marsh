@@ -2,13 +2,13 @@ use std::collections::BTreeMap;
 
 use rmux_core::Session;
 use rmux_proto::{
-    MoveWindowRequest, MoveWindowResponse, MoveWindowTarget, RmuxError, SessionName, WindowTarget,
+    MoveWindowRequest, MoveWindowResponse, MoveWindowTarget, RmuxError, WindowTarget,
 };
 
 use super::{
     ensure_session_panes_exist, link_window_destination_index, session_not_found, HandlerState,
 };
-use crate::pane_terminals::session_mutation::WindowMutationMetadataSnapshot;
+use crate::pane_terminals::session_mutation::SessionCheckpoint;
 
 impl HandlerState {
     pub(super) fn move_window_relative(
@@ -73,16 +73,19 @@ impl HandlerState {
             .session(&target_session_name)
             .cloned()
             .ok_or_else(|| session_not_found(&target_session_name))?;
-        let rollback_state = MoveWindowRelativeCrossSessionRollbackState {
-            source_session: previous_source_session.clone(),
-            target_session: previous_target_session.clone(),
-            metadata: WindowMutationMetadataSnapshot::capture(self),
-        };
+        let checkpoint = SessionCheckpoint::capture(
+            self,
+            [
+                (&source_session_name, previous_source_session),
+                (&target_session_name, previous_target_session),
+            ],
+        );
+        let [(_, previous_source_session), (_, previous_target_session)] = checkpoint.sessions();
 
-        ensure_session_panes_exist(self, &source_session_name, &previous_source_session)?;
-        ensure_session_panes_exist(self, &target_session_name, &previous_target_session)?;
+        ensure_session_panes_exist(self, &source_session_name, previous_source_session)?;
+        ensure_session_panes_exist(self, &target_session_name, previous_target_session)?;
         let destination_index = link_window_destination_index(
-            &previous_target_session,
+            previous_target_session,
             target.window_index(),
             after,
             before,
@@ -99,11 +102,7 @@ impl HandlerState {
         if let Err(error) =
             self.remap_session_group_window_metadata(&target_session_name, &index_map)
         {
-            self.restore_move_window_relative_cross_session_state(
-                &source_session_name,
-                &target_session_name,
-                rollback_state,
-            )?;
+            checkpoint.restore(self)?;
             return Err(error);
         }
 
@@ -117,11 +116,7 @@ impl HandlerState {
         ) {
             Ok(response) => Ok(response),
             Err(error) => {
-                self.restore_move_window_relative_cross_session_state(
-                    &source_session_name,
-                    &target_session_name,
-                    rollback_state,
-                )?;
+                checkpoint.restore(self)?;
                 Err(error)
             }
         }
@@ -141,14 +136,12 @@ impl HandlerState {
             .session(&session_name)
             .cloned()
             .ok_or_else(|| session_not_found(&session_name))?;
-        let rollback_state = MoveWindowRelativeRollbackState {
-            session: previous_session.clone(),
-            metadata: WindowMutationMetadataSnapshot::capture(self),
-        };
+        let checkpoint = SessionCheckpoint::capture(self, [(&session_name, previous_session)]);
+        let [(_, previous_session)] = checkpoint.sessions();
 
-        ensure_session_panes_exist(self, &session_name, &previous_session)?;
+        ensure_session_panes_exist(self, &session_name, previous_session)?;
         let destination_index =
-            link_window_destination_index(&previous_session, target.window_index(), after, before)?;
+            link_window_destination_index(previous_session, target.window_index(), after, before)?;
 
         let (index_map, adjusted_source_index) = {
             let session = self
@@ -165,14 +158,14 @@ impl HandlerState {
 
         let remap_result = self.remap_session_group_window_metadata(&session_name, &index_map);
         if let Err(error) = remap_result {
-            self.restore_move_window_relative_state(&session_name, rollback_state)?;
+            checkpoint.restore(self)?;
             return Err(error);
         }
 
         let adjusted_source =
             WindowTarget::with_window(session_name.clone(), adjusted_source_index);
         let winlink_alert_map = relative_move_winlink_alert_map(
-            &previous_session,
+            previous_session,
             &index_map,
             adjusted_source_index,
             destination_index,
@@ -185,33 +178,11 @@ impl HandlerState {
             &winlink_alert_map,
         );
         if let Err(error) = response {
-            self.restore_move_window_relative_state(&session_name, rollback_state)?;
+            checkpoint.restore(self)?;
             return Err(error);
         }
 
         response
-    }
-
-    fn restore_move_window_relative_cross_session_state(
-        &mut self,
-        source_session_name: &SessionName,
-        target_session_name: &SessionName,
-        rollback_state: MoveWindowRelativeCrossSessionRollbackState,
-    ) -> Result<(), RmuxError> {
-        self.replace_session(source_session_name, rollback_state.source_session)?;
-        self.replace_session(target_session_name, rollback_state.target_session)?;
-        rollback_state.metadata.restore(self);
-        Ok(())
-    }
-
-    fn restore_move_window_relative_state(
-        &mut self,
-        session_name: &SessionName,
-        rollback_state: MoveWindowRelativeRollbackState,
-    ) -> Result<(), RmuxError> {
-        self.replace_session(session_name, rollback_state.session)?;
-        rollback_state.metadata.restore(self);
-        Ok(())
     }
 }
 
@@ -237,15 +208,4 @@ fn relative_move_winlink_alert_map(
             (previous_index, final_index)
         })
         .collect()
-}
-
-struct MoveWindowRelativeRollbackState {
-    session: Session,
-    metadata: WindowMutationMetadataSnapshot,
-}
-
-struct MoveWindowRelativeCrossSessionRollbackState {
-    source_session: Session,
-    target_session: Session,
-    metadata: WindowMutationMetadataSnapshot,
 }

@@ -1,12 +1,13 @@
 use rmux_core::{input::InputParser, PaneId, Screen};
 use rmux_proto::{
     PaneOutputSubscriptionId, PaneStreamEndReason, PaneStreamEvent, PaneStreamMode, PaneTarget,
-    PaneTargetRef, ResizeWindowRequest, Response, RmuxError, SubscribePaneStreamRequest,
-    TerminalSize, UnsubscribePaneStreamRequest, WindowTarget, DEFAULT_MAX_DETACHED_FRAME_LENGTH,
+    ResizeWindowRequest, Response, RmuxError, SubscribePaneStreamRequest, TerminalSize,
+    UnsubscribePaneStreamRequest, WindowTarget, DEFAULT_MAX_DETACHED_FRAME_LENGTH,
 };
 
 use crate::pane_recovery::{PaneProjectionSeed, MAX_RECOVERY_STRING_BYTES};
 use crate::pane_transcript::SharedPaneTranscript;
+use crate::test_fixtures::Fixture;
 
 use super::CONNECTION_ID;
 
@@ -97,18 +98,14 @@ pub(super) async fn resize_window(
     cols: u16,
     rows: u16,
 ) {
-    let response = handler
-        .handle(rmux_proto::Request::ResizeWindow(ResizeWindowRequest {
+    handler
+        .handle_ok(ResizeWindowRequest {
             target: WindowTarget::with_window(target.session_name().clone(), target.window_index()),
             width: Some(cols),
             height: Some(rows),
             adjustment: None,
-        }))
+        })
         .await;
-    assert!(
-        matches!(response, Response::ResizeWindow(_)),
-        "window resize failed: {response:?}"
-    );
 }
 
 pub(super) fn materialize_frame(
@@ -140,11 +137,7 @@ pub(super) async fn subscribe_mode_response(
     handler
         .handle_subscribe_pane_stream(
             connection_id,
-            SubscribePaneStreamRequest {
-                target: PaneTargetRef::slot(target.clone()),
-                mode,
-                include_snapshot: false,
-            },
+            SubscribePaneStreamRequest::fixture((target, mode)),
         )
         .await
 }

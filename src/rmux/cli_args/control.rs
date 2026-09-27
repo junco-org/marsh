@@ -2,6 +2,8 @@ use std::ffi::OsString;
 
 use rmux_core::command_parser::CommandArgument;
 
+use super::validate::invalid_utf8_error;
+
 /// Renders control-mode startup arguments, defaulting to `new-session` when none were given.
 pub(super) fn initial_control_command_lines(
     arguments: &[OsString],
@@ -19,7 +21,7 @@ fn render_control_command_lines(arguments: &[OsString]) -> Result<Vec<String>, c
     let mut current = Vec::new();
 
     for argument in arguments {
-        let value = argument.to_str().ok_or_else(invalid_utf8)?;
+        let value = argument.to_str().ok_or_else(invalid_utf8_error)?;
         let (value, ends_command) = split_command_terminator(value);
         if !ends_command || !value.is_empty() {
             current.push(value);
@@ -60,14 +62,6 @@ fn render_command(arguments: &[String]) -> String {
         .join(" ")
 }
 
-/// The clap error reported when a command argument is not valid UTF-8.
-fn invalid_utf8() -> clap::Error {
-    clap::Error::raw(
-        clap::error::ErrorKind::InvalidUtf8,
-        "invalid UTF-8 in command argument",
-    )
-}
-
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 mod tests {
@@ -97,32 +91,26 @@ mod tests {
 
         let lines = render_control_command_lines(&arguments).expect("control lines");
         assert_eq!(lines.len(), 2);
-        assert!(lines[0].starts_with("first-alias "));
-        assert!(lines[1].starts_with("second-alias "));
-        let first = CommandParser::new()
-            .with_command_aliases([
-                "first-alias=display-message".to_owned(),
-                "second-alias=display-message".to_owned(),
-            ])
-            .parse_one_group(&lines[0])
-            .expect("first control line reparses");
-        assert_eq!(first.commands()[0].name(), "display-message");
-        assert_eq!(
-            first.commands()[0].arguments()[0].as_string(),
-            Some("space ; dollar $HOME slash\\ quote' double\"")
-        );
-        let second = CommandParser::new()
-            .with_command_aliases([
-                "first-alias=display-message".to_owned(),
-                "second-alias=display-message".to_owned(),
-            ])
-            .parse_one_group(&lines[1])
-            .expect("second control line reparses");
-        assert_eq!(second.commands()[0].name(), "display-message");
-        assert_eq!(
-            second.commands()[0].arguments()[0].as_string(),
-            Some("semi;")
-        );
+        let parser = CommandParser::new().with_command_aliases([
+            "first-alias=display-message".to_owned(),
+            "second-alias=display-message".to_owned(),
+        ]);
+        for (line, alias, literal) in [
+            (
+                &lines[0],
+                "first-alias ",
+                "space ; dollar $HOME slash\\ quote' double\"",
+            ),
+            (&lines[1], "second-alias ", "semi;"),
+        ] {
+            assert!(line.starts_with(alias), "{line}");
+            let parsed = parser.parse_one_group(line).expect("control line reparses");
+            assert_eq!(parsed.commands()[0].name(), "display-message");
+            assert_eq!(
+                parsed.commands()[0].arguments()[0].as_string(),
+                Some(literal)
+            );
+        }
     }
 
     #[test]

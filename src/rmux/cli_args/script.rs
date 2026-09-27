@@ -3,7 +3,8 @@ use std::path::PathBuf;
 use clap::{ArgAction, ArgGroup, Args};
 use rmux_proto::WaitForMode;
 
-use super::{QueuedCommand, TargetSpec, parse_command_args, parse_target_spec};
+use super::validate::unknown_flag_error;
+use super::{TargetSpec, parse_command_args, parse_target_spec};
 
 /// Parses `source-file` arguments, rejecting flags `clap` would otherwise absorb as file paths.
 pub(super) fn parse_source_file_args(
@@ -30,7 +31,7 @@ fn validate_source_file_options(arguments: &[String]) -> Result<(), clap::Error>
         if let Some(long) = argument.strip_prefix("--") {
             let name = long.split_once('=').map_or(long, |(name, _)| name);
             if name != "help" {
-                return Err(source_file_unknown_flag(&format!("--{name}")));
+                return Err(unknown_flag_error("source-file", &format!("--{name}")));
             }
             continue;
         }
@@ -47,19 +48,11 @@ fn validate_source_file_options(arguments: &[String]) -> Result<(), clap::Error>
                     expect_target = chars.peek().is_none();
                     break;
                 }
-                _ => return Err(source_file_unknown_flag(&format!("-{flag}"))),
+                _ => return Err(unknown_flag_error("source-file", &format!("-{flag}"))),
             }
         }
     }
     Ok(())
-}
-
-/// Builds the `source-file` unknown-flag error carrying the offending flag text.
-fn source_file_unknown_flag(flag: &str) -> clap::Error {
-    clap::Error::raw(
-        clap::error::ErrorKind::UnknownArgument,
-        format!("command source-file: unknown flag {flag}"),
-    )
 }
 
 /// Arguments for `run-shell`, which runs a shell command and reports its output to the client.
@@ -117,21 +110,9 @@ pub(crate) struct IfShellArgs {
     pub(crate) queue_command: String,
 }
 
-impl QueuedCommand for IfShellArgs {
-    /// Records the original `if-shell` text so the server can re-parse it after the condition.
-    fn set_queue_command(&mut self, queue_command: String) {
-        self.queue_command = queue_command;
-    }
-}
-
 /// Arguments for `wait-for`, which signals, locks or waits on a named synchronisation channel.
 #[derive(Debug, Clone, Args)]
-#[command(group(
-    ArgGroup::new("mode")
-        .required(false)
-        .multiple(false)
-        .args(["signal", "lock", "unlock"])
-))]
+#[command(group(ArgGroup::new("mode").args(["signal", "lock", "unlock"])))]
 pub(crate) struct WaitForArgs {
     #[arg(short = 'S', action = ArgAction::SetTrue, group = "mode")]
     pub(crate) signal: bool,

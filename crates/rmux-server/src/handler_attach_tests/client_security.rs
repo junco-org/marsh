@@ -5,29 +5,13 @@ async fn lock_client_with_empty_lock_command_is_noop() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
 
-    let created = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name: alpha.clone(),
-            detached: true,
-            size: Some(TerminalSize { cols: 80, rows: 24 }),
-            environment: None,
-        }))
-        .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    handler.create_session(&alpha).await;
 
     handler
-        .handle(Request::SetOption(SetOptionRequest {
-            scope: ScopeSelector::Global,
-            option: OptionName::LockCommand,
-            value: String::new(),
-            mode: SetOptionMode::Replace,
-        }))
+        .set_option(ScopeSelector::Global, OptionName::LockCommand, "")
         .await;
 
-    let (control_tx, mut control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(std::process::id(), alpha, control_tx)
-        .await;
+    let mut control_rx = handler.attach_client(std::process::id(), alpha).await;
 
     let response = handler
         .handle(Request::LockClient(rmux_proto::LockClientRequest {
@@ -47,15 +31,7 @@ async fn lock_client_with_invalid_target_returns_error() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
 
-    let created = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name: alpha,
-            detached: true,
-            size: Some(TerminalSize { cols: 80, rows: 24 }),
-            environment: None,
-        }))
-        .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    handler.create_session(alpha).await;
 
     let response = handler
         .handle(Request::LockClient(rmux_proto::LockClientRequest {
@@ -83,23 +59,10 @@ async fn lock_client_accepts_tty_path_targets() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
 
-    let created = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name: alpha.clone(),
-            detached: true,
-            size: Some(TerminalSize { cols: 80, rows: 24 }),
-            environment: None,
-        }))
-        .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    handler.create_session(&alpha).await;
 
     handler
-        .handle(Request::SetOption(SetOptionRequest {
-            scope: ScopeSelector::Global,
-            option: OptionName::LockCommand,
-            value: String::new(),
-            mode: SetOptionMode::Replace,
-        }))
+        .set_option(ScopeSelector::Global, OptionName::LockCommand, "")
         .await;
 
     let mut child = spawn_tty_child().expect("spawn tty child");
@@ -111,8 +74,7 @@ async fn lock_client_accepts_tty_path_targets() {
         .display()
         .to_string();
 
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler.register_attach(child.id(), alpha, control_tx).await;
+    let _control_rx = handler.attach_client(child.id(), alpha).await;
 
     let response = handler
         .handle(Request::LockClient(rmux_proto::LockClientRequest {
@@ -141,25 +103,13 @@ async fn lock_client_accepts_tty_path_targets() {
 async fn overlay_commands_resolve_names_published_by_list_clients() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: alpha.clone(),
-                detached: true,
-                size: Some(TerminalSize { cols: 80, rows: 24 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
+    handler.create_session(&alpha).await;
 
     let mut child = spawn_tty_child().expect("spawn tty child");
-    let (control_tx, mut control_rx) = mpsc::unbounded_channel();
-    handler.register_attach(child.id(), alpha, control_tx).await;
+    let mut control_rx = handler.attach_client(child.id(), alpha).await;
     let other_pid = child.id().saturating_add(10_000);
-    let (other_tx, _other_rx) = mpsc::unbounded_channel();
-    handler
-        .register_attach(other_pid, session_name("alpha"), other_tx)
+    let _other_rx = handler
+        .attach_client(other_pid, session_name("alpha"))
         .await;
     let published_name = handler
         .list_clients_snapshot()
@@ -262,25 +212,13 @@ fn terminate_child(child: &mut TtyChild) {
 
 #[tokio::test]
 async fn detach_client_all_other_detaches_only_non_requester_clients() {
-    use rmux_proto::request::DetachClientExtRequest;
-
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
 
-    let created = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name: alpha.clone(),
-            detached: true,
-            size: Some(TerminalSize { cols: 80, rows: 24 }),
-            environment: None,
-        }))
-        .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    handler.create_session(&alpha).await;
 
-    let (first_tx, mut first_rx) = mpsc::unbounded_channel();
-    let (second_tx, mut second_rx) = mpsc::unbounded_channel();
-    let _first_attach = handler.register_attach(101, alpha.clone(), first_tx).await;
-    let _second_attach = handler.register_attach(202, alpha, second_tx).await;
+    let mut first_rx = handler.attach_client(101, &alpha).await;
+    let mut second_rx = handler.attach_client(202, alpha).await;
 
     let response = handler
         .dispatch(
@@ -314,20 +252,9 @@ async fn suspend_client_marks_client_as_suspended() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
 
-    let created = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name: alpha.clone(),
-            detached: true,
-            size: Some(TerminalSize { cols: 80, rows: 24 }),
-            environment: None,
-        }))
-        .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    handler.create_session(&alpha).await;
 
-    let (control_tx, mut control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(std::process::id(), alpha, control_tx)
-        .await;
+    let mut control_rx = handler.attach_client(std::process::id(), alpha).await;
 
     let response = handler
         .dispatch(
@@ -356,8 +283,6 @@ async fn suspend_client_marks_client_as_suspended() {
 
 #[tokio::test]
 async fn client_flags_apply_named_supports_negate_prefix() {
-    use super::super::attach_support::ClientFlags;
-
     let mut flags = ClientFlags::default();
     flags.apply_named("read-only").expect("apply read-only");
     assert!(flags.contains(ClientFlags::READONLY));
@@ -386,40 +311,16 @@ async fn refresh_client_flags_merge_incrementally() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
 
-    let created = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name: alpha.clone(),
-            detached: true,
-            size: Some(TerminalSize { cols: 80, rows: 24 }),
-            environment: None,
-        }))
-        .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    handler.create_session(&alpha).await;
 
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(std::process::id(), alpha, control_tx)
-        .await;
+    let _control_rx = handler.attach_client(std::process::id(), alpha).await;
 
     let response = handler
         .dispatch(
             std::process::id(),
             Request::RefreshClient(Box::new(RefreshClientRequest {
-                target_client: None,
-                adjustment: None,
-                clear_pan: false,
-                pan_left: false,
-                pan_right: false,
-                pan_up: false,
-                pan_down: false,
-                status_only: false,
-                clipboard_query: false,
                 flags: Some("active-pane".to_owned()),
-                flags_alias: None,
-                subscriptions: vec![],
-                subscriptions_format: vec![],
-                control_size: None,
-                colour_report: None,
+                ..Fixture::fixture(None)
             })),
         )
         .await
@@ -433,9 +334,7 @@ async fn refresh_client_flags_merge_incrementally() {
             .get(&std::process::id())
             .expect("attached client must exist");
         assert!(
-            active
-                .flags
-                .contains(super::super::attach_support::ClientFlags::ACTIVEPANE),
+            active.flags.contains(ClientFlags::ACTIVEPANE),
             "active-pane flag must be set after refresh-client -f"
         );
     }
@@ -444,21 +343,8 @@ async fn refresh_client_flags_merge_incrementally() {
         .dispatch(
             std::process::id(),
             Request::RefreshClient(Box::new(RefreshClientRequest {
-                target_client: None,
-                adjustment: None,
-                clear_pan: false,
-                pan_left: false,
-                pan_right: false,
-                pan_up: false,
-                pan_down: false,
-                status_only: false,
-                clipboard_query: false,
                 flags: Some("no-detach-on-destroy".to_owned()),
-                flags_alias: None,
-                subscriptions: vec![],
-                subscriptions_format: vec![],
-                control_size: None,
-                colour_report: None,
+                ..Fixture::fixture(None)
             })),
         )
         .await
@@ -472,15 +358,11 @@ async fn refresh_client_flags_merge_incrementally() {
             .get(&std::process::id())
             .expect("attached client must exist");
         assert!(
-            active
-                .flags
-                .contains(super::super::attach_support::ClientFlags::ACTIVEPANE),
+            active.flags.contains(ClientFlags::ACTIVEPANE),
             "active-pane flag must still be set after second refresh-client -f"
         );
         assert!(
-            active
-                .flags
-                .contains(super::super::attach_support::ClientFlags::NO_DETACH_ON_DESTROY),
+            active.flags.contains(ClientFlags::NO_DETACH_ON_DESTROY),
             "no-detach-on-destroy flag must be set after second refresh-client -f"
         );
     }
@@ -493,37 +375,13 @@ async fn refresh_client_reserved_wire_fields_from_old_clients_are_rejected() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
 
-    let created = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name: alpha.clone(),
-            detached: true,
-            size: Some(TerminalSize { cols: 80, rows: 24 }),
-            environment: None,
-        }))
-        .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    handler.create_session(&alpha).await;
 
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(std::process::id(), alpha, control_tx)
-        .await;
+    let _control_rx = handler.attach_client(std::process::id(), alpha).await;
 
     let base_request = || RefreshClientRequest {
-        target_client: None,
-        adjustment: None,
-        clear_pan: false,
-        pan_left: false,
-        pan_right: false,
-        pan_up: false,
-        pan_down: false,
-        status_only: false,
-        clipboard_query: false,
-        flags: None,
-        flags_alias: None,
-        subscriptions: Vec::new(),
-        subscriptions_format: Vec::new(),
         control_size: Some("80x24".to_owned()),
-        colour_report: None,
+        ..Fixture::fixture(None)
     };
 
     let mut clear_pan = base_request();

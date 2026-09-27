@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use rmux_client::{ConnectResult, connect_or_absent};
+use rmux_client::{ConnectResult, Connection, connect_or_absent};
 use rmux_core::{
     KEYC_NONE, KEYC_UNKNOWN, KeyBindingDisplay, KeyBindingSortOrder, KeyBindingStore,
     LIST_KEYS_TEMPLATE,
@@ -8,13 +8,13 @@ use rmux_core::{
     key_code_lookup_bits, key_string_lookup_string,
 };
 use rmux_proto::{
-    BindKeyRequest, CommandOutput, ListKeysRequest, SendKeysExt2Request, SendKeysExtRequest,
-    UnbindKeyRequest,
+    BindKeyRequest, CommandOutput, ListKeysRequest, PaneTarget, Response, SendKeysExt2Request,
+    SendKeysExtRequest, UnbindKeyRequest,
 };
 
+use super::target_resolution::{resolve_optional_pane_target, run_targeted};
 use super::{
-    ExitFailure, expect_command_output, resolve_pane_target_spec, run_command,
-    run_command_resolved, write_command_output,
+    ExitFailure, expect_command_output, run_command, run_command_resolved, write_command_output,
 };
 use crate::cli_args::{BindKeyArgs, ListKeysArgs, SendKeysArgs, SendPrefixArgs, UnbindKeyArgs};
 
@@ -30,53 +30,56 @@ pub(super) fn run_send_keys(args: SendKeysArgs, socket_path: &Path) -> Result<i3
         return super::automation::run_send_keys_with_wait(args, socket_path);
     }
 
-    if send_keys_uses_legacy_path(&args)
-        && let Some(target) = args.target.clone()
-    {
-        return run_command_resolved(socket_path, "send-keys", move |connection| {
-            let target = resolve_pane_target_spec(connection, &target)?;
-            connection
-                .send_keys(target, args.keys)
-                .map_err(ExitFailure::from)
-        });
+    if send_keys_uses_legacy_path(&args) {
+        return run_targeted(
+            socket_path,
+            "send-keys",
+            args.target.as_ref(),
+            |connection, target| connection.send_keys(target, args.keys),
+        );
     }
 
     run_command_resolved(socket_path, "send-keys", move |connection| {
-        let target = args
-            .target
-            .as_ref()
-            .map(|target| resolve_pane_target_spec(connection, target))
-            .transpose()?;
-        let response = if let Some(target_client) = args.client_target {
-            connection.send_keys_extended_target_client(SendKeysExt2Request {
-                target,
-                keys: args.keys,
-                expand_formats: args.expand_formats,
-                hex: args.hex,
-                literal: args.literal,
-                dispatch_key_table: args.key_table,
-                copy_mode_command: args.copy_mode,
-                forward_mouse_event: args.mouse,
-                reset_terminal: args.reset_terminal,
-                repeat_count: args.repeat_count,
-                target_client: Some(target_client),
-            })
-        } else {
-            connection.send_keys_extended(SendKeysExtRequest {
-                target,
-                keys: args.keys,
-                expand_formats: args.expand_formats,
-                hex: args.hex,
-                literal: args.literal,
-                dispatch_key_table: args.key_table,
-                copy_mode_command: args.copy_mode,
-                forward_mouse_event: args.mouse,
-                reset_terminal: args.reset_terminal,
-                repeat_count: args.repeat_count,
-            })
-        };
-        response.map_err(ExitFailure::from)
+        let target = resolve_optional_pane_target(connection, args.target.as_ref())?;
+        send_keys_extended(connection, args, target)
     })
+}
+
+/// Sends the keys through the extended request, using the target-client variant when set.
+pub(super) fn send_keys_extended(
+    connection: &mut Connection,
+    args: SendKeysArgs,
+    target: Option<PaneTarget>,
+) -> Result<Response, ExitFailure> {
+    let response = if let Some(target_client) = args.client_target {
+        connection.send_keys_extended_target_client(SendKeysExt2Request {
+            target,
+            keys: args.keys,
+            expand_formats: args.expand_formats,
+            hex: args.hex,
+            literal: args.literal,
+            dispatch_key_table: args.key_table,
+            copy_mode_command: args.copy_mode,
+            forward_mouse_event: args.mouse,
+            reset_terminal: args.reset_terminal,
+            repeat_count: args.repeat_count,
+            target_client: Some(target_client),
+        })
+    } else {
+        connection.send_keys_extended(SendKeysExtRequest {
+            target,
+            keys: args.keys,
+            expand_formats: args.expand_formats,
+            hex: args.hex,
+            literal: args.literal,
+            dispatch_key_table: args.key_table,
+            copy_mode_command: args.copy_mode,
+            forward_mouse_event: args.mouse,
+            reset_terminal: args.reset_terminal,
+            repeat_count: args.repeat_count,
+        })
+    };
+    response.map_err(ExitFailure::from)
 }
 
 /// True when a targeted `send-keys` carries no extended flag and can use the plain request.
@@ -397,17 +400,13 @@ fn note_prefix(
 
 /// Runs `send-prefix`, optionally targeting a pane and sending the secondary prefix.
 pub(super) fn run_send_prefix(
-    args: SendPrefixArgs,
+    args: &SendPrefixArgs,
     socket_path: &Path,
 ) -> Result<i32, ExitFailure> {
-    run_command_resolved(socket_path, "send-prefix", move |connection| {
-        let target = args
-            .target
-            .as_ref()
-            .map(|target| resolve_pane_target_spec(connection, target))
-            .transpose()?;
-        connection
-            .send_prefix(target, args.secondary)
-            .map_err(ExitFailure::from)
-    })
+    run_targeted(
+        socket_path,
+        "send-prefix",
+        args.target.as_ref(),
+        |connection, target| connection.send_prefix(target, args.secondary),
+    )
 }

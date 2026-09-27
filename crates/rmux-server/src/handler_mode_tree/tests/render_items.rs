@@ -44,14 +44,6 @@ fn choose_tree_uses_window_local_visible_pane_indices_in_rows_and_previews() {
     );
 
     let item = ModeTreeItem {
-        id: "window".to_owned(),
-        parent: None,
-        children: Vec::new(),
-        depth: 1,
-        line: String::new(),
-        search_text: String::new(),
-        preview: Vec::new(),
-        no_tag: false,
         action: ModeTreeAction::TreeTarget {
             session_name,
             session_id: session.id(),
@@ -62,6 +54,7 @@ fn choose_tree_uses_window_local_visible_pane_indices_in_rows_and_previews() {
             pane_id: None,
             pane_output_generation: None,
         },
+        ..tree_item("window", None, &[], 1)
     };
     let preview = mode_tree_preview_lines(&state, &mode, &item, 60, 7, &Utf8Config::default());
     assert!(
@@ -82,52 +75,16 @@ fn render_visible_item_hides_single_pane_branch_marker_in_window_tree() {
     mode.key_format.clear();
     mode.tree_depth = TreeDepth::Window;
     let item = ModeTreeItem {
-        id: "window".to_owned(),
-        parent: Some("session".to_owned()),
-        children: vec!["pane".to_owned()],
-        depth: 1,
         line: "1: shell".to_owned(),
-        search_text: String::new(),
-        preview: Vec::new(),
-        no_tag: false,
-        action: ModeTreeAction::None,
+        ..tree_item("window", Some("session"), &["pane"], 1)
     };
     let build = ModeTreeBuild {
-        items: BTreeMap::from([
-            (
-                "session".to_owned(),
-                ModeTreeItem {
-                    id: "session".to_owned(),
-                    parent: None,
-                    children: vec!["window".to_owned()],
-                    depth: 0,
-                    line: String::new(),
-                    search_text: String::new(),
-                    preview: Vec::new(),
-                    no_tag: false,
-                    action: ModeTreeAction::None,
-                },
-            ),
-            (item.id.clone(), item.clone()),
-            (
-                "pane".to_owned(),
-                ModeTreeItem {
-                    id: "pane".to_owned(),
-                    parent: Some("window".to_owned()),
-                    children: Vec::new(),
-                    depth: 2,
-                    line: String::new(),
-                    search_text: String::new(),
-                    preview: Vec::new(),
-                    no_tag: false,
-                    action: ModeTreeAction::None,
-                },
-            ),
-        ]),
-        roots: vec!["session".to_owned()],
-        order: vec!["session".to_owned(), "window".to_owned(), "pane".to_owned()],
         visible: vec!["session".to_owned(), "window".to_owned()],
-        no_matches: false,
+        ..tree_build(vec![
+            tree_item("session", None, &["window"], 0),
+            item.clone(),
+            tree_item("pane", Some("window"), &[], 2),
+        ])
     };
 
     let rendered = render_visible_item(&state, &mode, &build, &item, 1, 0, &utf8);
@@ -143,39 +100,13 @@ fn render_visible_item_keeps_branch_marker_for_multi_pane_window_tree_item() {
     mode.key_format.clear();
     mode.tree_depth = TreeDepth::Window;
     let item = ModeTreeItem {
-        id: "window".to_owned(),
-        parent: Some("session".to_owned()),
-        children: vec!["pane0".to_owned(), "pane1".to_owned()],
-        depth: 1,
         line: "0: shell*".to_owned(),
-        search_text: String::new(),
-        preview: Vec::new(),
-        no_tag: false,
-        action: ModeTreeAction::None,
+        ..tree_item("window", Some("session"), &["pane0", "pane1"], 1)
     };
-    let build = ModeTreeBuild {
-        items: BTreeMap::from([
-            (
-                "session".to_owned(),
-                ModeTreeItem {
-                    id: "session".to_owned(),
-                    parent: None,
-                    children: vec!["window".to_owned()],
-                    depth: 0,
-                    line: String::new(),
-                    search_text: String::new(),
-                    preview: Vec::new(),
-                    no_tag: false,
-                    action: ModeTreeAction::None,
-                },
-            ),
-            (item.id.clone(), item.clone()),
-        ]),
-        roots: vec!["session".to_owned()],
-        order: vec!["session".to_owned(), "window".to_owned()],
-        visible: vec!["session".to_owned(), "window".to_owned()],
-        no_matches: false,
-    };
+    let build = tree_build(vec![
+        tree_item("session", None, &["window"], 0),
+        item.clone(),
+    ]);
 
     let rendered = render_visible_item(&state, &mode, &build, &item, 1, 0, &utf8);
 
@@ -190,93 +121,19 @@ fn render_visible_item_omits_extra_leaf_padding_for_flat_pane_lists() {
     mode.key_format.clear();
     mode.tree_depth = TreeDepth::Pane;
     let item = ModeTreeItem {
-        id: "pane0".to_owned(),
-        parent: Some("window".to_owned()),
-        children: Vec::new(),
-        depth: 2,
         line: "0: bash".to_owned(),
-        search_text: String::new(),
-        preview: Vec::new(),
-        no_tag: false,
-        action: ModeTreeAction::None,
+        ..tree_item("pane0", Some("window"), &[], 2)
     };
-    let build = ModeTreeBuild {
-        items: BTreeMap::from([
-            (
-                "session0".to_owned(),
-                ModeTreeItem {
-                    id: "session0".to_owned(),
-                    parent: None,
-                    children: vec!["window".to_owned()],
-                    depth: 0,
-                    line: String::new(),
-                    search_text: String::new(),
-                    preview: Vec::new(),
-                    no_tag: false,
-                    action: ModeTreeAction::None,
-                },
-            ),
-            (
-                "session1".to_owned(),
-                ModeTreeItem {
-                    id: "session1".to_owned(),
-                    parent: None,
-                    children: Vec::new(),
-                    depth: 0,
-                    line: String::new(),
-                    search_text: String::new(),
-                    preview: Vec::new(),
-                    no_tag: false,
-                    action: ModeTreeAction::None,
-                },
-            ),
-            (
-                "window".to_owned(),
-                ModeTreeItem {
-                    id: "window".to_owned(),
-                    parent: Some("session0".to_owned()),
-                    children: vec!["pane0".to_owned(), "pane1".to_owned()],
-                    depth: 1,
-                    line: String::new(),
-                    search_text: String::new(),
-                    preview: Vec::new(),
-                    no_tag: false,
-                    action: ModeTreeAction::None,
-                },
-            ),
-            (item.id.clone(), item.clone()),
-            (
-                "pane1".to_owned(),
-                ModeTreeItem {
-                    id: "pane1".to_owned(),
-                    parent: Some("window".to_owned()),
-                    children: Vec::new(),
-                    depth: 2,
-                    line: "1: bash".to_owned(),
-                    search_text: String::new(),
-                    preview: Vec::new(),
-                    no_tag: false,
-                    action: ModeTreeAction::None,
-                },
-            ),
-        ]),
-        roots: vec!["session0".to_owned(), "session1".to_owned()],
-        order: vec![
-            "session0".to_owned(),
-            "window".to_owned(),
-            "pane0".to_owned(),
-            "pane1".to_owned(),
-            "session1".to_owned(),
-        ],
-        visible: vec![
-            "session0".to_owned(),
-            "window".to_owned(),
-            "pane0".to_owned(),
-            "pane1".to_owned(),
-            "session1".to_owned(),
-        ],
-        no_matches: false,
-    };
+    let build = tree_build(vec![
+        tree_item("session0", None, &["window"], 0),
+        tree_item("window", Some("session0"), &["pane0", "pane1"], 1),
+        item.clone(),
+        ModeTreeItem {
+            line: "1: bash".to_owned(),
+            ..tree_item("pane1", Some("window"), &[], 2)
+        },
+        tree_item("session1", None, &[], 0),
+    ]);
 
     let rendered = render_visible_item(&state, &mode, &build, &item, 2, 0, &utf8);
 

@@ -60,8 +60,23 @@ pub trait Subvolumes: Send + Sync {
     /// Fails with [`Error::Snapshot`] when `src` is not a subvolume or the ioctl is refused.
     fn snapshot(&self, src: &Path, dest: &Path) -> Result<(), Error>;
 
-    /// Deletes the subvolume at `path`, leaking it with a warning if every mechanism fails.
-    fn delete_subvolume(&self, path: &Path);
+    /// Snapshots the subvolume rooted at `src` to `dest`, read-only, and waits until the
+    /// snapshot is on disk.
+    ///
+    /// # Errors
+    ///
+    /// Fails with [`Error::Snapshot`] when `src` is not a subvolume, the ioctl is refused or the
+    /// filesystem cannot be synced.
+    fn snapshot_readonly(&self, src: &Path, dest: &Path) -> Result<(), Error>;
+
+    /// Deletes the subvolume at `path` — clearing its read-only flag first when it has one — or
+    /// reports why no mechanism could. An absent path is already deleted.
+    ///
+    /// # Errors
+    ///
+    /// Fails with [`Error::Snapshot`] when every mechanism failed; the subvolume is then still
+    /// there, and still the caller's.
+    fn delete_subvolume(&self, path: &Path) -> Result<(), Error>;
 }
 
 /// [`Subvolumes`] over libbtrfsutil, `statfs(2)` and `/proc/mounts`.
@@ -95,8 +110,12 @@ impl Subvolumes for LibBtrfs {
         snapshot(src, dest)
     }
 
-    fn delete_subvolume(&self, path: &Path) {
-        delete_subvolume(path);
+    fn snapshot_readonly(&self, src: &Path, dest: &Path) -> Result<(), Error> {
+        snapshot_readonly(src, dest)
+    }
+
+    fn delete_subvolume(&self, path: &Path) -> Result<(), Error> {
+        delete_subvolume(path)
     }
 }
 
@@ -147,14 +166,26 @@ fn containing_mount(mounts: impl Iterator<Item = MountInfo>, path: &Path) -> Opt
     best.map(|(_, mount)| mount)
 }
 
-/// Every mount `/proc/mounts` describes, skipping lines that cannot be parsed.
+/// The mount `/proc/mounts` says contains `path`, skipping lines that cannot be parsed.
 ///
 /// `/proc/mounts` rather than `/proc/self/mountinfo` because its single options field merges the
 /// per-mount and super options that mountinfo splits apart, and `user_subvol_rm_allowed` lives only
 /// in the super half. Unparsable lines are skipped rather than fatal: one exotic mount elsewhere on
 /// the machine must not stop a session from starting.
-fn mounts() -> Result<impl Iterator<Item = MountInfo>, Error> {
-    Ok(MountIter::new().map_err(Error::Io)?.filter_map(Result::ok))
+fn mount_of(path: &Path) -> Result<Option<MountInfo>, Error> {
+    Ok(containing_mount(
+        MountIter::new()?.filter_map(Result::ok),
+        path,
+    ))
+}
+
+/// Whether `mount` carries `user_subvol_rm_allowed` — as a whole entry, not a substring, so a
+/// hypothetical `nouser_subvol_rm_allowed` does not pass.
+fn allows_user_subvol_rm(mount: &MountInfo) -> bool {
+    mount
+        .options
+        .iter()
+        .any(|option| option == "user_subvol_rm_allowed")
 }
 
 /// Fails unless `path`'s mount carries `user_subvol_rm_allowed`.
@@ -167,14 +198,7 @@ fn mounts() -> Result<impl Iterator<Item = MountInfo>, Error> {
 /// Fails with [`Error::NotUserSubvolRmAllowed`] when the option is absent, and with [`Error::Io`]
 /// when `/proc/mounts` cannot be read.
 pub fn assert_user_subvol_rm_allowed(path: &Path) -> Result<(), Error> {
-    let allowed = containing_mount(mounts()?, path).is_some_and(|mount| {
-        // Whole entries, not substrings: a hypothetical `nouser_subvol_rm_allowed` must not pass.
-        mount
-            .options
-            .iter()
-            .any(|option| option == "user_subvol_rm_allowed")
-    });
-    if allowed {
+    if mount_of(path)?.as_ref().is_some_and(allows_user_subvol_rm) {
         Ok(())
     } else {
         Err(Error::NotUserSubvolRmAllowed(path.to_path_buf()))
@@ -200,7 +224,7 @@ pub fn is_subvolume(path: &Path) -> bool {
 ///
 /// Fails with [`Error::Io`] when `/proc/mounts` cannot be read.
 pub fn is_mount_root(path: &Path) -> Result<bool, Error> {
-    Ok(containing_mount(mounts()?, path).is_some_and(|mount| mount.dest == path))
+    Ok(mount_of(path)?.is_some_and(|mount| mount.dest == path))
 }
 
 /// Snapshots the subvolume rooted at `src` to `dest`.
@@ -213,11 +237,32 @@ pub fn is_mount_root(path: &Path) -> Result<bool, Error> {
 /// Fails with [`Error::Snapshot`] when `src` cannot be opened as a subvolume or the snapshot ioctl
 /// is refused.
 pub fn snapshot(src: &Path, dest: &Path) -> Result<(), Error> {
-    let subvol = Subvolume::get(src)
-        .map_err(|error| Error::Snapshot(format!("open {}: {error}", src.display())))?;
-    subvol
-        .snapshot(dest, None::<SnapshotFlags>, None::<QgroupInherit>)
-        .map(|_| ())
+    create_snapshot(src, dest, None)
+}
+
+/// Snapshots the subvolume rooted at `src` to `dest`, read-only, and syncs the filesystem.
+///
+/// A read-only snapshot is a frozen copy: nothing — not a command, not a stray descriptor opened
+/// before it was taken — can change what it holds, so content verified against it stays verified.
+/// The snapshot ioctl already waits for its own transaction; the sync after it makes the snapshot
+/// durable before a caller logs anything that depends on it.
+///
+/// # Errors
+///
+/// Fails with [`Error::Snapshot`] when `src` cannot be opened as a subvolume, the snapshot ioctl
+/// is refused, or the sync fails.
+pub fn snapshot_readonly(src: &Path, dest: &Path) -> Result<(), Error> {
+    create_snapshot(src, dest, Some(SnapshotFlags::READ_ONLY))?;
+    btrfsutil::sync::sync(dest)
+        .map_err(|error| Error::Snapshot(format!("sync {}: {error}", dest.display())))
+}
+
+/// Snapshots the subvolume rooted at `src` to `dest` with `flags`.
+fn create_snapshot(src: &Path, dest: &Path, flags: Option<SnapshotFlags>) -> Result<(), Error> {
+    Subvolume::get(src)
+        .map_err(|error| Error::Snapshot(format!("open {}: {error}", src.display())))?
+        .snapshot(dest, flags, None::<QgroupInherit>)
+        .map(drop)
         .map_err(|error| {
             Error::Snapshot(format!(
                 "snapshot {} -> {}: {error}",
@@ -229,24 +274,28 @@ pub fn snapshot(src: &Path, dest: &Path) -> Result<(), Error> {
 
 /// Deletes the subvolume at `path`, falling back through progressively more privileged mechanisms.
 ///
-/// The unprivileged delete ioctl is the normal path; the fallbacks cover a mount whose options
-/// changed under a running session. The chain is: delete ioctl, then `remove_dir_all` (kernels ≥
-/// 4.18 let the owner rmdir an *empty* subvolume, and removing the contents empties it), then
-/// `sudo -n btrfs subvolume delete`. If every branch fails the snapshot is leaked with a warning:
-/// a leaked snapshot costs disk space, never correctness, so it must not fail a merge that already
-/// committed.
-pub fn delete_subvolume(path: &Path) {
-    if !path.exists() {
-        return;
+/// The unprivileged delete ioctl is the normal path. It refuses a read-only subvolume — deleting
+/// one needs write access to its root — so a read-only flag is cleared first, which the owner of
+/// the subvolume may do. The fallbacks cover a mount whose options changed under a running
+/// session: `remove_dir_all` (kernels ≥ 4.18 let the owner rmdir an *empty* subvolume, and
+/// removing the contents empties it), then `sudo -n btrfs subvolume delete`.
+///
+/// When every branch fails the subvolume is still there and the failure is returned, naming
+/// each: a snapshot that was not reclaimed is a resource its caller still holds, and only the
+/// caller knows whether that fails what it was doing.
+///
+/// # Errors
+///
+/// Fails with [`Error::Snapshot`] when no mechanism deleted `path`.
+pub fn delete_subvolume(path: &Path) -> Result<(), Error> {
+    if existing(path)?.is_none() {
+        return Ok(());
     }
-    let ioctl_error =
-        match Subvolume::get(path).and_then(|subvol| subvol.delete(None::<DeleteFlags>)) {
-            Ok(()) => return,
-            Err(error) => error.to_string(),
-        };
-    let rmdir_error = match std::fs::remove_dir_all(path) {
-        Ok(()) => return,
-        Err(error) => error.to_string(),
+    let Err(ioctl_error) = delete_ioctl(path) else {
+        return Ok(());
+    };
+    let Err(rmdir_error) = std::fs::remove_dir_all(path) else {
+        return Ok(());
     };
     let sudo_error = match std::process::Command::new("sudo")
         .args(["-n", "btrfs", "subvolume", "delete"])
@@ -255,14 +304,41 @@ pub fn delete_subvolume(path: &Path) {
         .stderr(std::process::Stdio::null())
         .status()
     {
-        Ok(status) if status.success() => return,
+        Ok(status) if status.success() => return Ok(()),
         Ok(status) => format!("exit {status}"),
         Err(error) => error.to_string(),
     };
-    eprintln!(
-        "marsh-btrfs: leaking snapshot {} (ioctl: {ioctl_error}; rmdir: {rmdir_error}; sudo: {sudo_error})",
+    Err(Error::Snapshot(format!(
+        "delete {} (ioctl: {ioctl_error}; rmdir: {rmdir_error}; sudo: {sudo_error})",
         path.display()
-    );
+    )))
+}
+
+/// `path`'s own metadata, or `None` when nothing is there — which, for every [`Subvolumes`], is
+/// a subvolume already deleted.
+///
+/// # Errors
+///
+/// Fails with [`Error::Io`] when `path` cannot be stat'ed for any other reason.
+pub(crate) fn existing(path: &Path) -> Result<Option<std::fs::Metadata>, Error> {
+    match path.symlink_metadata() {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(Error::Io(error)),
+    }
+}
+
+/// Deletes the subvolume at `path` through the delete ioctl, clearing its read-only flag first.
+fn delete_ioctl(path: &Path) -> Result<(), String> {
+    let subvolume = Subvolume::get(path).map_err(|error| error.to_string())?;
+    if subvolume.is_ro().map_err(|error| error.to_string())? {
+        subvolume
+            .set_ro(false)
+            .map_err(|error| format!("clear read-only: {error}"))?;
+    }
+    subvolume
+        .delete(None::<DeleteFlags>)
+        .map_err(|error| error.to_string())
 }
 
 #[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
@@ -337,8 +413,28 @@ mod tests {
             "the refused ioctl names both ends: got {error:?}"
         );
 
-        fs.delete_subvolume(&snap);
-        fs.delete_subvolume(&subvol);
+        // A read-only snapshot is frozen: writing into it is refused by the filesystem, and it
+        // is reclaimable only by clearing the flag first — which deletion does by itself.
+        let frozen = root.join("frozen");
+        fs.snapshot_readonly(&snap, &frozen)
+            .expect("read-only snapshot");
+        assert!(fs.is_subvolume(&frozen));
+        assert_eq!(
+            std::fs::read(frozen.join("a.txt")).expect("read the frozen copy"),
+            b"work\n"
+        );
+        let refused = std::fs::write(frozen.join("a.txt"), b"changed\n")
+            .expect_err("a read-only snapshot refuses writes");
+        assert_eq!(refused.raw_os_error(), Some(libc::EROFS), "got {refused:?}");
+        let refused =
+            std::fs::write(frozen.join("new.txt"), b"new\n").expect_err("and refuses new entries");
+        assert_eq!(refused.raw_os_error(), Some(libc::EROFS), "got {refused:?}");
+
+        fs.delete_subvolume(&frozen)
+            .expect("a read-only snapshot is reclaimed");
+        fs.delete_subvolume(&snap).expect("delete the snapshot");
+        fs.delete_subvolume(&subvol).expect("delete the seed");
+        assert!(!frozen.exists(), "read-only snapshot removed");
         assert!(!snap.exists(), "snapshot removed");
         assert!(!subvol.exists(), "seed removed");
 
@@ -349,26 +445,17 @@ mod tests {
     /// prefix; an exact-match lookup would find nothing for a seed inside `/home`.
     #[test]
     fn the_containing_mount_is_the_longest_matching_one() {
-        let fixture = concat!(
+        let table = concat!(
             "/dev/sda1 / ext4 rw,relatime 0 0\n",
             "/dev/loop3 /home btrfs rw,noatime,user_subvol_rm_allowed,subvol=/@home 0 0\n",
         );
-        let mounts = |text: &'static str| {
-            proc_mounts::MountIter::new_from_reader(std::io::BufReader::new(text.as_bytes()))
-                .filter_map(Result::ok)
-        };
 
-        let found = containing_mount(mounts(fixture), Path::new("/home/someone/work"))
+        let found = containing_mount(fixture(table), Path::new("/home/someone/work"))
             .expect("a seed inside /home is covered by the /home mount");
         assert_eq!(found.dest, Path::new("/home"));
-        assert!(
-            found
-                .options
-                .iter()
-                .any(|option| option == "user_subvol_rm_allowed")
-        );
+        assert!(allows_user_subvol_rm(&found));
 
-        let sibling = containing_mount(mounts(fixture), Path::new("/homer"))
+        let sibling = containing_mount(fixture(table), Path::new("/homer"))
             .expect("falls back to the root mount");
         assert_eq!(
             sibling.dest,
@@ -377,7 +464,7 @@ mod tests {
         );
     }
 
-    /// Parses a `/proc/mounts` fixture the way [`mounts`] parses the real file.
+    /// Parses a `/proc/mounts` fixture the way [`mount_of`] parses the real file.
     fn fixture(text: &'static str) -> impl Iterator<Item = MountInfo> {
         proc_mounts::MountIter::new_from_reader(std::io::BufReader::new(text.as_bytes()))
             .filter_map(Result::ok)
@@ -395,10 +482,7 @@ mod tests {
             .expect("both mounts cover /home/u");
         assert_eq!(found.source, Path::new("/dev/over"));
         assert!(
-            found
-                .options
-                .iter()
-                .any(|option| option == "user_subvol_rm_allowed"),
+            allows_user_subvol_rm(&found),
             "the shadowing mount's options are the ones that apply"
         );
     }
@@ -420,24 +504,15 @@ mod tests {
 
         let with_nul = PathBuf::from(OsString::from_vec(b"/tmp/interior\0nul".to_vec()));
         let error = assert_btrfs(&with_nul).expect_err("an unrepresentable path");
-        assert!(
-            matches!(&error, Error::NotBtrfs(path) if *path == with_nul),
-            "got {error:?}"
-        );
+        assert_error!(error, Error::NotBtrfs(path) if *path == with_nul);
 
         let missing = Path::new("/nonexistent-marsh-btrfs-probe/deeper");
         let error = assert_btrfs(missing).expect_err("an absent path");
-        assert!(
-            matches!(&error, Error::Io(io) if io.kind() == std::io::ErrorKind::NotFound),
-            "got {error:?}"
-        );
+        assert_error!(error, Error::Io(io) if io.kind() == std::io::ErrorKind::NotFound);
 
         let procfs = Path::new("/proc");
         let error = assert_btrfs(procfs).expect_err("procfs is a filesystem, just not btrfs");
-        assert!(
-            matches!(&error, Error::NotBtrfs(path) if path == procfs),
-            "got {error:?}"
-        );
+        assert_error!(error, Error::NotBtrfs(path) if path == procfs);
     }
 
     /// Only a subvolume *root* answers true; a plain directory and a path that is not there at all
@@ -459,7 +534,7 @@ mod tests {
     fn deleting_an_absent_path_does_nothing() {
         let scratch = tempfile::tempdir().expect("scratch directory");
         let absent = scratch.path().join("absent");
-        delete_subvolume(&absent);
+        delete_subvolume(&absent).expect("an absent path is already deleted");
         assert!(!absent.exists());
     }
 
@@ -472,24 +547,27 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("nested directory");
         std::fs::write(dir.join("a.txt"), b"x").expect("a file inside");
 
-        LibBtrfs.delete_subvolume(&scratch.path().join("tree"));
+        LibBtrfs
+            .delete_subvolume(&scratch.path().join("tree"))
+            .expect("the fallback deletes it");
         assert!(!scratch.path().join("tree").exists());
     }
 
-    /// When every mechanism refuses, the path is left where it is and a warning is printed: a
-    /// snapshot that cannot be reclaimed costs disk space, and failing here would fail a merge
-    /// that has already committed.
+    /// When every mechanism refuses, the path is left where it is and the failure is reported,
+    /// naming each mechanism: an unreclaimed snapshot is still its caller's resource, never a
+    /// silent success.
     #[test]
-    fn a_path_no_mechanism_can_delete_is_leaked_rather_than_failing() {
+    fn a_path_no_mechanism_can_delete_is_reported() {
         let scratch = tempfile::tempdir().expect("scratch directory");
         // A regular file: the delete ioctl refuses it, `remove_dir_all` refuses it, and `btrfs
         // subvolume delete` refuses it — the only input that reaches the end of the chain.
         let file = scratch.path().join("regular");
         std::fs::write(&file, b"x").expect("a regular file");
 
-        delete_subvolume(&file);
-
-        assert!(file.exists(), "the path is leaked, not removed");
+        let error = delete_subvolume(&file).expect_err("nothing could delete it");
+        assert_error!(error, Error::Snapshot(message)
+            if ["ioctl:", "rmdir:", "sudo:"].iter().all(|mechanism| message.contains(mechanism)));
+        assert!(file.exists(), "the path is still there");
     }
 
     /// [`LibBtrfs`] is delegation, so each method answers exactly what the free function of the
@@ -519,17 +597,17 @@ mod tests {
         let error = LibBtrfs
             .snapshot(&plain, &scratch.path().join("copy"))
             .expect_err("a plain directory is not a subvolume");
-        assert!(
-            matches!(&error, Error::Snapshot(message) if message.contains("open")),
-            "got {error:?}"
-        );
+        assert_error!(error, Error::Snapshot(message) if message.contains("open"));
+
+        let error = LibBtrfs
+            .snapshot_readonly(&plain, &scratch.path().join("frozen"))
+            .expect_err("a plain directory is not a subvolume");
+        assert_error!(error, Error::Snapshot(message) if message.contains("open"));
+        assert!(!scratch.path().join("frozen").exists());
 
         let error = LibBtrfs
             .create_subvolume(&scratch.path().join("absent-parent/sub"))
             .expect_err("a subvolume needs an existing parent");
-        assert!(
-            matches!(&error, Error::Snapshot(message) if message.contains("create")),
-            "got {error:?}"
-        );
+        assert_error!(error, Error::Snapshot(message) if message.contains("create"));
     }
 }

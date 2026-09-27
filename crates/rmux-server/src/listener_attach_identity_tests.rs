@@ -13,7 +13,7 @@ use rmux_os::identity::UserIdentity;
 use rmux_proto::request::AttachSessionExt3Request;
 use rmux_proto::{
     ClientTerminalContext, ListClientsRequest, ListWindowsRequest, OptionName, ScopeSelector,
-    SetOptionMode, SetOptionRequest, TerminalSize,
+    TerminalSize,
 };
 
 use super::connection_test_support::{
@@ -85,15 +85,9 @@ fn attach_request(session: &rmux_proto::SessionName, client_size: Option<Termina
 }
 
 async fn set_global(handler: &Arc<RequestHandler>, option: OptionName, value: &str) {
-    let response = handler
-        .handle(Request::SetOption(SetOptionRequest {
-            scope: ScopeSelector::Global,
-            option,
-            value: value.to_owned(),
-            mode: SetOptionMode::Replace,
-        }))
+    handler
+        .set_option(ScopeSelector::Global, option, value)
         .await;
-    assert!(matches!(response, Response::SetOption(_)), "set {option:?}");
 }
 
 /// The same bindings, resolved through the independent `list-clients` path.

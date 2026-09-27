@@ -5,47 +5,18 @@ const ORACLE_OLD_BUFFER_BYTES: &[u8] = b"OLD";
 const ORACLE_SINGLE_CELL_BYTES: &[u8] = b"a";
 const ORACLE_MULTILINE_BYTES: &[u8] = b"alpha beta gamma\nsecond";
 
-async fn set_vi_mode_keys(handler: &RequestHandler, session: &SessionName) {
-    assert!(matches!(
-        handler
-            .handle(Request::SetOption(SetOptionRequest {
-                scope: ScopeSelector::Window(WindowTarget::with_window(session.clone(), 0)),
-                option: OptionName::ModeKeys,
-                value: "vi".to_owned(),
-                mode: SetOptionMode::Replace,
-            }))
-            .await,
-        Response::SetOption(_)
-    ));
-}
-
 async fn enter_copy_mode_with_selection_seed(
     handler: &RequestHandler,
     target: &PaneTarget,
 ) -> String {
-    replace_transcript_contents(
-        handler,
-        target,
-        TerminalSize { cols: 80, rows: 24 },
-        b"alpha beta gamma\r\nsecond beta line\r\nthird alpha marker\r\nfourth delta marker\r\nfifth beta tail\r\n\x1b[1;1H",
-    )
-    .await;
-    assert!(matches!(
-        handler
-            .handle(Request::CopyMode(CopyModeRequest {
-                target: Some(target.clone()),
-                page_down: false,
-                exit_on_scroll: false,
-                hide_position: false,
-                mouse_drag_start: false,
-                cancel_mode: false,
-                scrollbar_scroll: false,
-                source: None,
-                page_up: false,
-            }))
-            .await,
-        Response::CopyMode(_)
-    ));
+    handler
+        .replace_transcript_for_test(
+            target,
+            TerminalSize { cols: 80, rows: 24 },
+            b"alpha beta gamma\r\nsecond beta line\r\nthird alpha marker\r\nfourth delta marker\r\nfifth beta tail\r\n\x1b[1;1H",
+        )
+        .await;
+    handler.handle_ok(CopyModeRequest::fixture(target)).await;
     copy_selection_status(handler, target.clone()).await
 }
 
@@ -91,19 +62,12 @@ async fn show_top_buffer_bytes(handler: &RequestHandler) -> Vec<u8> {
 }
 
 async fn set_top_buffer_bytes(handler: &RequestHandler, bytes: &[u8]) {
-    assert!(matches!(
-        handler
-            .handle(Request::SetBuffer(Box::new(rmux_proto::SetBufferRequest {
-                name: None,
-                content: bytes.to_vec(),
-                append: false,
-                new_name: None,
-                set_clipboard: false,
-                target_client: None,
-            })))
-            .await,
-        Response::SetBuffer(_)
-    ));
+    handler
+        .handle_ok(rmux_proto::SetBufferRequest {
+            name: None,
+            ..Fixture::fixture(("", bytes))
+        })
+        .await;
 }
 
 async fn enter_vi_selection_yank_fixture(

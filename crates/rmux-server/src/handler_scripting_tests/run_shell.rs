@@ -1,7 +1,7 @@
 use super::*;
 use crate::handler::with_expected_attach_and_session_identity;
-use crate::pane_io::AttachControl;
-use rmux_proto::{ErrorResponse, RmuxError};
+use rmux_proto::ErrorResponse;
+
 #[tokio::test]
 async fn run_shell_foreground_returns_stdout_like_tmux() {
     let handler = RequestHandler::new();
@@ -42,21 +42,17 @@ async fn run_shell_stderr_output_flag_merges_stdout_and_stderr_like_tmux() {
     let handler = RequestHandler::new();
 
     let response = handler
-        .handle(Request::RunShell(Box::new(RunShellRequest {
-            command: format!(
-                "{}; {}",
-                shell_print_command("out"),
-                shell_stderr_command("err")
-            ),
-            arguments: Vec::new(),
-            background: false,
-            as_commands: false,
-            show_stderr: true,
-            delay_seconds: None,
-            start_directory: None,
-            target: None,
-            source_depth: None,
-        })))
+        .handle(
+            RunShellRequest {
+                show_stderr: true,
+                ..Fixture::fixture(format!(
+                    "{}; {}",
+                    shell_print_command("out"),
+                    shell_stderr_command("err")
+                ))
+            }
+            .into_request(),
+        )
         .await;
 
     let output = response
@@ -82,34 +78,23 @@ async fn run_shell_uses_bin_sh_instead_of_default_shell_like_tmux() {
         &fake_shell,
         &format!(
             "#!/bin/sh\nprintf used > {}\nexit 42\n",
-            shell_quote(&marker_path)
+            sh_quote_path(&marker_path)
         ),
     );
 
-    assert!(matches!(
-        handler
-            .handle(Request::SetOption(SetOptionRequest {
-                scope: ScopeSelector::Global,
-                option: OptionName::DefaultShell,
-                value: fake_shell.to_string_lossy().into_owned(),
-                mode: SetOptionMode::Replace,
-            }))
-            .await,
-        Response::SetOption(_)
-    ));
+    handler
+        .set_option(
+            ScopeSelector::Global,
+            OptionName::DefaultShell,
+            &fake_shell.to_string_lossy(),
+        )
+        .await;
 
     let response = handler
-        .handle(Request::RunShell(Box::new(RunShellRequest {
-            command: format!("printf ok > {}", shell_quote(&output_path)),
-            arguments: Vec::new(),
-            background: false,
-            as_commands: false,
-            show_stderr: false,
-            delay_seconds: None,
-            start_directory: None,
-            target: None,
-            source_depth: None,
-        })))
+        .handle(run_shell(
+            &format!("printf ok > {}", sh_quote_path(&output_path)),
+            false,
+        ))
         .await;
 
     assert_eq!(
@@ -142,17 +127,14 @@ async fn background_run_shell_is_tracked_as_detached_request_until_finished() {
     let handler = RequestHandler::new();
 
     let response = handler
-        .handle(Request::RunShell(Box::new(RunShellRequest {
-            command: String::new(),
-            arguments: Vec::new(),
-            background: true,
-            as_commands: false,
-            show_stderr: false,
-            delay_seconds: Some(RunShellDelaySeconds(0.2)),
-            start_directory: None,
-            target: None,
-            source_depth: None,
-        })))
+        .handle(
+            RunShellRequest {
+                background: true,
+                delay_seconds: Some(RunShellDelaySeconds(0.2)),
+                ..Fixture::fixture("")
+            }
+            .into_request(),
+        )
         .await;
 
     assert_eq!(response, Response::RunShell(RunShellResponse::background()));
@@ -188,10 +170,11 @@ async fn background_run_shell_commands_reject_a_reused_control_registration() {
     let original = session_name("run-shell-control-original");
     let replacement = session_name("run-shell-control-replacement");
     let wait_channel = "run-shell-control-registration-reuse";
-    create_background_identity_session(&handler, original.clone()).await;
-    create_background_identity_session(&handler, replacement.clone()).await;
-    let (original_control_id, original_events) =
-        register_control_for_session(&handler, requester_pid, original.clone()).await;
+    handler.create_session(&original).await;
+    handler.create_session(&replacement).await;
+    let (original_control_id, original_events) = handler
+        .register_control_for_test(requester_pid, Some(&original))
+        .await;
 
     let commands = CommandParser::new()
         .parse(&format!(
@@ -205,8 +188,9 @@ async fn background_run_shell_commands_reject_a_reused_control_registration() {
     assert!(result.error.is_none(), "{result:?}");
     wait_for_background_waiter(&handler, wait_channel).await;
 
-    let (_replacement_control_id, replacement_events) =
-        register_control_for_session(&handler, requester_pid, replacement.clone()).await;
+    let (_replacement_control_id, replacement_events) = handler
+        .register_control_for_test(requester_pid, Some(&replacement))
+        .await;
     release_background_waiter(&handler, wait_channel).await;
 
     assert_sessions_survive_background_control_reuse(&handler, &original, &replacement).await;
@@ -220,12 +204,9 @@ async fn background_run_shell_commands_reject_a_reused_attach_registration() {
     let original = session_name("run-shell-attach-original");
     let replacement = session_name("run-shell-attach-replacement");
     let wait_channel = "run-shell-attach-registration-reuse";
-    create_background_identity_session(&handler, original.clone()).await;
-    create_background_identity_session(&handler, replacement.clone()).await;
-    let (original_control_tx, _original_control_rx) = tokio::sync::mpsc::unbounded_channel();
-    handler
-        .register_attach(requester_pid, original.clone(), original_control_tx)
-        .await;
+    handler.create_session(&original).await;
+    handler.create_session(&replacement).await;
+    let _original_control_rx = handler.attach_client(requester_pid, &original).await;
     let original_identity = handler.active_attach_identity_for_test(requester_pid).await;
 
     let commands = CommandParser::new()
@@ -244,11 +225,7 @@ async fn background_run_shell_commands_reject_a_reused_attach_registration() {
     assert!(output.stdout().is_empty());
     wait_for_background_waiter(&handler, wait_channel).await;
 
-    let (replacement_control_tx, mut replacement_control_rx) =
-        tokio::sync::mpsc::unbounded_channel();
-    handler
-        .register_attach(requester_pid, replacement.clone(), replacement_control_tx)
-        .await;
+    let mut replacement_control_rx = handler.attach_client(requester_pid, &replacement).await;
     let replacement_identity = handler.active_attach_identity_for_test(requester_pid).await;
     while replacement_control_rx.try_recv().is_ok() {}
 
@@ -280,12 +257,9 @@ async fn background_run_shell_commands_survive_a_same_registration_session_switc
     let beta = session_name("run-shell-attach-switch-beta");
     let wait_channel = "run-shell-attach-session-switch";
     let followed_window_name = "run-shell-followed-attached-session";
-    create_background_identity_session(&handler, alpha.clone()).await;
-    create_background_identity_session(&handler, beta.clone()).await;
-    let (control_tx, _control_rx) = tokio::sync::mpsc::unbounded_channel();
-    handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
+    handler.create_session(&alpha).await;
+    handler.create_session(&beta).await;
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
     let identity = handler.active_attach_identity_for_test(requester_pid).await;
 
     let commands = CommandParser::new()
@@ -345,12 +319,9 @@ async fn background_run_shell_expands_implicit_formats_after_attached_switch() {
     let requester_pid = 424_306;
     let alpha = session_name("run-shell-format-switch-alpha");
     let beta = session_name("run-shell-format-switch-beta");
-    create_background_identity_session(&handler, alpha.clone()).await;
-    create_background_identity_session(&handler, beta.clone()).await;
-    let (control_tx, _control_rx) = tokio::sync::mpsc::unbounded_channel();
-    handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
+    handler.create_session(&alpha).await;
+    handler.create_session(&beta).await;
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
     let identity = handler.active_attach_identity_for_test(requester_pid).await;
 
     let commands = CommandParser::new()
@@ -381,23 +352,19 @@ async fn background_run_shell_builds_environment_for_followed_attached_session()
     let requester_pid = 424_311;
     let alpha = session_name("run-shell-environment-switch-alpha");
     let beta = session_name("run-shell-environment-switch-beta");
-    create_background_identity_session(&handler, alpha.clone()).await;
-    create_background_identity_session(&handler, beta.clone()).await;
+    handler.create_session(&alpha).await;
+    handler.create_session(&beta).await;
     for (session, value) in [(&alpha, "alpha"), (&beta, "beta")] {
-        let response = handler
-            .handle(Request::SetEnvironment(Box::new(SetEnvironmentRequest {
+        handler
+            .handle_ok(SetEnvironmentRequest {
                 scope: ScopeSelector::Session(session.clone()),
                 name: "RMUX_BG_TARGET".to_owned(),
                 value: value.to_owned(),
                 mode: None,
                 hidden: false,
                 format: false,
-            })))
+            })
             .await;
-        assert!(
-            matches!(response, Response::SetEnvironment(_)),
-            "{response:?}"
-        );
     }
 
     // Two different places on purpose: the job's start directory is NAMED, so it must live in
@@ -409,28 +376,21 @@ async fn background_run_shell_builds_environment_for_followed_attached_session()
     let output_path = root.join("target.txt");
     let shell_command = format!(
         "printf '%s' \"$RMUX_BG_TARGET\" > {}",
-        shell_quote(&output_path)
+        sh_quote_path(&output_path)
     );
 
-    let (control_tx, _control_rx) = tokio::sync::mpsc::unbounded_channel();
-    handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
     let identity = handler.active_attach_identity_for_test(requester_pid).await;
     with_expected_attach_and_session_identity(identity, alpha, identity.session_id(), async {
         let response = handler
             .handle_run_shell(
                 requester_pid,
                 RunShellRequest {
-                    command: shell_command,
-                    arguments: Vec::new(),
                     background: true,
-                    as_commands: false,
                     show_stderr: true,
                     delay_seconds: Some(RunShellDelaySeconds(0.05)),
                     start_directory: Some(cwd.path().to_path_buf()),
-                    target: None,
-                    source_depth: None,
+                    ..Fixture::fixture(shell_command)
                 },
             )
             .await;
@@ -459,13 +419,10 @@ async fn explicit_background_run_shell_target_survives_attached_switch() {
     let beta = session_name("run-shell-explicit-switch-beta");
     let gamma = session_name("run-shell-explicit-switch-gamma");
     let expected_window_name = "run-shell-explicit-target";
-    create_background_identity_session(&handler, alpha.clone()).await;
-    create_background_identity_session(&handler, beta.clone()).await;
-    create_background_identity_session(&handler, gamma.clone()).await;
-    let (control_tx, _control_rx) = tokio::sync::mpsc::unbounded_channel();
-    handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
+    handler.create_session(&alpha).await;
+    handler.create_session(&beta).await;
+    handler.create_session(&gamma).await;
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
     let identity = handler.active_attach_identity_for_test(requester_pid).await;
 
     let commands = CommandParser::new()
@@ -501,8 +458,8 @@ async fn explicit_background_shell_target_survives_origin_attach_detach() {
     let requester_pid = 424_312;
     let origin = session_name("run-shell-explicit-detach-origin");
     let target = session_name("run-shell-explicit-detach-target");
-    create_background_identity_session(&handler, origin.clone()).await;
-    create_background_identity_session(&handler, target.clone()).await;
+    handler.create_session(&origin).await;
+    handler.create_session(&target).await;
 
     // Two different places on purpose: the job's start directory NAMES the seed it publishes
     // into, so it must live in this handler's, while the probe it writes is an absolute host
@@ -511,10 +468,7 @@ async fn explicit_background_shell_target_survives_origin_attach_detach() {
     let root = temp_root("run-shell-explicit-detach");
     std::fs::create_dir_all(&root).expect("explicit detach output root");
     let output_path = root.join("completed.txt");
-    let (control_tx, _control_rx) = tokio::sync::mpsc::unbounded_channel();
-    handler
-        .register_attach(requester_pid, origin.clone(), control_tx)
-        .await;
+    let _control_rx = handler.attach_client(requester_pid, &origin).await;
     let identity = handler.active_attach_identity_for_test(requester_pid).await;
 
     let response = with_expected_attach_and_session_identity(
@@ -524,15 +478,12 @@ async fn explicit_background_shell_target_survives_origin_attach_detach() {
         handler.handle_run_shell(
             requester_pid,
             RunShellRequest {
-                command: write_text_command(&output_path, "ok"),
-                arguments: Vec::new(),
                 background: true,
-                as_commands: false,
                 show_stderr: true,
                 delay_seconds: Some(RunShellDelaySeconds(0.05)),
                 start_directory: Some(cwd.path().to_path_buf()),
                 target: Some(PaneTarget::with_window(target, 0, 0)),
-                source_depth: None,
+                ..Fixture::fixture(write_text_command(&output_path, "ok"))
             },
         ),
     )
@@ -556,19 +507,16 @@ async fn explicit_background_shell_target_survives_same_pid_attach_replacement()
     let origin = session_name("run-shell-explicit-reuse-origin");
     let replacement = session_name("run-shell-explicit-reuse-replacement");
     let target = session_name("run-shell-explicit-reuse-target");
-    create_background_identity_session(&handler, origin.clone()).await;
-    create_background_identity_session(&handler, replacement.clone()).await;
-    create_background_identity_session(&handler, target.clone()).await;
+    handler.create_session(&origin).await;
+    handler.create_session(&replacement).await;
+    handler.create_session(&target).await;
 
     // Start directory in the seed, probe on the host: see the detach case above.
     let cwd = seed_scratch_dir(&handler, "run-shell-explicit-reuse");
     let root = temp_root("run-shell-explicit-reuse");
     std::fs::create_dir_all(&root).expect("explicit reuse output root");
     let output_path = root.join("completed.txt");
-    let (origin_control_tx, _origin_control_rx) = tokio::sync::mpsc::unbounded_channel();
-    handler
-        .register_attach(requester_pid, origin.clone(), origin_control_tx)
-        .await;
+    let _origin_control_rx = handler.attach_client(requester_pid, &origin).await;
     let origin_identity = handler.active_attach_identity_for_test(requester_pid).await;
 
     let response = with_expected_attach_and_session_identity(
@@ -578,26 +526,19 @@ async fn explicit_background_shell_target_survives_same_pid_attach_replacement()
         handler.handle_run_shell(
             requester_pid,
             RunShellRequest {
-                command: write_text_command(&output_path, "ok"),
-                arguments: Vec::new(),
                 background: true,
-                as_commands: false,
                 show_stderr: true,
                 delay_seconds: Some(RunShellDelaySeconds(0.05)),
                 start_directory: Some(cwd.path().to_path_buf()),
                 target: Some(PaneTarget::with_window(target, 0, 0)),
-                source_depth: None,
+                ..Fixture::fixture(write_text_command(&output_path, "ok"))
             },
         ),
     )
     .await;
     assert_eq!(response, Response::RunShell(RunShellResponse::background()));
 
-    let (replacement_control_tx, mut replacement_control_rx) =
-        tokio::sync::mpsc::unbounded_channel();
-    handler
-        .register_attach(requester_pid, replacement.clone(), replacement_control_tx)
-        .await;
+    let mut replacement_control_rx = handler.attach_client(requester_pid, &replacement).await;
     let replacement_identity = handler.active_attach_identity_for_test(requester_pid).await;
     assert_ne!(
         replacement_identity.attach_id(),
@@ -625,7 +566,7 @@ async fn explicit_background_shell_target_survives_same_pid_attach_replacement()
 #[tokio::test]
 async fn background_run_shell_commands_still_emit_after_hooks_outside_hook_context() {
     let handler = RequestHandler::new();
-    create_named_session(&handler, "run-shell-after-hooks").await;
+    handler.create_session("run-shell-after-hooks").await;
     execute_test_command(
         &handler,
         "set-hook -g after-new-window 'set-buffer -b after-run-shell yes'",
@@ -647,11 +588,7 @@ async fn queued_run_shell_command_mode_ignores_positional_arguments_like_tmux() 
     )
     .await;
 
-    let response = handler
-        .handle(Request::ShowBuffer(ShowBufferRequest {
-            name: Some("positional".to_owned()),
-        }))
-        .await;
+    let response = handler.handle(show_buffer_request("positional")).await;
     assert_eq!(
         response
             .command_output()
@@ -759,18 +696,16 @@ async fn run_nested_commands(
     delay_seconds: Option<RunShellDelaySeconds>,
 ) -> Response {
     tokio::time::timeout(
-        std::time::Duration::from_secs(30),
-        handler.handle(Request::RunShell(Box::new(RunShellRequest {
-            command,
-            arguments: Vec::new(),
-            background,
-            as_commands: true,
-            show_stderr: false,
-            delay_seconds,
-            start_directory: None,
-            target: None,
-            source_depth: None,
-        }))),
+        Duration::from_secs(30),
+        handler.handle(
+            RunShellRequest {
+                background,
+                as_commands: true,
+                delay_seconds,
+                ..Fixture::fixture(command)
+            }
+            .into_request(),
+        ),
     )
     .await
     .expect("nested run-shell command completes within its liveness budget")
@@ -788,18 +723,13 @@ async fn seed_nested_run_shell_chain(
         } else {
             format!("run-shell -C '#{{@{prefix}-{}}}'", depth - 1)
         };
+        let name = format!("@{prefix}-{depth}");
         let response = handler
-            .handle_set_option_by_name(rmux_proto::SetOptionByNameRequest {
-                scope: OptionScopeSelector::SessionGlobal,
-                name: format!("@{prefix}-{depth}"),
-                value: Some(value),
-                mode: SetOptionMode::Replace,
-                only_if_unset: false,
-                unset: false,
-                unset_pane_overrides: false,
-                format: false,
-                format_target: None,
-            })
+            .handle_set_option_by_name(rmux_proto::SetOptionByNameRequest::fixture((
+                OptionScopeSelector::SessionGlobal,
+                name.as_str(),
+                value.as_str(),
+            )))
             .await;
         assert!(
             matches!(response, Response::SetOptionByName(_)),
@@ -821,20 +751,16 @@ async fn assert_named_buffer(handler: &RequestHandler, name: &str, expected: Opt
 #[tokio::test]
 async fn run_shell_command_mode_attach_session_requires_terminal_like_tmux() {
     let handler = RequestHandler::new();
-    create_named_session(&handler, "run-shell-attach-target").await;
+    handler.create_session("run-shell-attach-target").await;
 
     let response = handler
-        .handle(Request::RunShell(Box::new(RunShellRequest {
-            command: "attach-session -t run-shell-attach-target".to_owned(),
-            arguments: Vec::new(),
-            background: false,
-            as_commands: true,
-            show_stderr: false,
-            delay_seconds: None,
-            start_directory: None,
-            target: None,
-            source_depth: None,
-        })))
+        .handle(
+            RunShellRequest {
+                as_commands: true,
+                ..Fixture::fixture("attach-session -t run-shell-attach-target")
+            }
+            .into_request(),
+        )
         .await;
 
     assert!(matches!(
@@ -851,24 +777,20 @@ async fn run_shell_command_mode_rejects_nested_and_implicit_attach_like_tmux() {
     // "open terminal failed: not a terminal" for attach-session nested in a
     // brace body and for a non-detached new-session (and creates nothing).
     let handler = RequestHandler::new();
-    create_named_session(&handler, "run-shell-nested-attach").await;
+    handler.create_session("run-shell-nested-attach").await;
 
     for command in [
         "if-shell -F 1 { attach-session -t run-shell-nested-attach }",
         "new-session",
     ] {
         let response = handler
-            .handle(Request::RunShell(Box::new(RunShellRequest {
-                command: command.to_owned(),
-                arguments: Vec::new(),
-                background: false,
-                as_commands: true,
-                show_stderr: false,
-                delay_seconds: None,
-                start_directory: None,
-                target: None,
-                source_depth: None,
-            })))
+            .handle(
+                RunShellRequest {
+                    as_commands: true,
+                    ..Fixture::fixture(command)
+                }
+                .into_request(),
+            )
             .await;
 
         assert!(
@@ -883,17 +805,13 @@ async fn run_shell_command_mode_rejects_nested_and_implicit_attach_like_tmux() {
     }
 
     let detached = handler
-        .handle(Request::RunShell(Box::new(RunShellRequest {
-            command: "new-session -d -s run-shell-detached-ok".to_owned(),
-            arguments: Vec::new(),
-            background: false,
-            as_commands: true,
-            show_stderr: false,
-            delay_seconds: None,
-            start_directory: None,
-            target: None,
-            source_depth: None,
-        })))
+        .handle(
+            RunShellRequest {
+                as_commands: true,
+                ..Fixture::fixture("new-session -d -s run-shell-detached-ok")
+            }
+            .into_request(),
+        )
         .await;
     assert!(
         !matches!(detached, Response::Error(_)),
@@ -915,17 +833,13 @@ async fn run_shell_missing_explicit_target_is_nonfatal() {
     let handler = RequestHandler::new();
 
     let response = handler
-        .handle(Request::RunShell(Box::new(RunShellRequest {
-            command: shell_success_command(),
-            arguments: Vec::new(),
-            background: false,
-            as_commands: false,
-            show_stderr: false,
-            delay_seconds: None,
-            start_directory: None,
-            target: Some(PaneTarget::new(session_name("missing"), 0)),
-            source_depth: None,
-        })))
+        .handle(
+            RunShellRequest {
+                target: Some(PaneTarget::new(session_name("missing"), 0)),
+                ..Fixture::fixture(shell_success_command())
+            }
+            .into_request(),
+        )
         .await;
 
     assert_eq!(
@@ -937,7 +851,7 @@ async fn run_shell_missing_explicit_target_is_nonfatal() {
 #[tokio::test]
 async fn background_if_shell_still_emits_after_hooks_outside_hook_context() {
     let handler = RequestHandler::new();
-    create_named_session(&handler, "if-shell-after-hooks").await;
+    handler.create_session("if-shell-after-hooks").await;
     execute_test_command(
         &handler,
         "set-hook -g after-new-window 'set-buffer -b after-if-shell yes'",
@@ -968,7 +882,7 @@ async fn queued_background_if_shell_preserves_hook_formats_after_hook_scope_exit
         ))
         .expect("background queued if-shell command parses");
 
-    let output = crate::hook_runtime::with_hook_execution(
+    let output = with_hook_execution(
         crate::hook_runtime::HookExecutionContext::command(HookName::AfterNewWindow),
         vec![("hook_pane".to_owned(), "%1".to_owned())],
         async {
@@ -992,22 +906,19 @@ async fn background_run_shell_preserves_hook_formats_after_hook_scope_exits() {
     let output_path = root.join("hook-pane.txt");
     let command = write_literal_format_command(&output_path, "#{hook_pane}");
 
-    let response = crate::hook_runtime::with_hook_execution(
+    let response = with_hook_execution(
         crate::hook_runtime::HookExecutionContext::command(HookName::AfterNewWindow),
         vec![("hook_pane".to_owned(), "%1".to_owned())],
         async {
             handler
-                .handle(Request::RunShell(Box::new(RunShellRequest {
-                    command,
-                    arguments: Vec::new(),
-                    background: true,
-                    as_commands: false,
-                    show_stderr: true,
-                    delay_seconds: None,
-                    start_directory: None,
-                    target: None,
-                    source_depth: None,
-                })))
+                .handle(
+                    RunShellRequest {
+                        background: true,
+                        show_stderr: true,
+                        ..Fixture::fixture(command)
+                    }
+                    .into_request(),
+                )
                 .await
         },
     )
@@ -1029,17 +940,13 @@ async fn run_shell_expands_socket_path_without_target() {
     let command = write_text_command(&output_path, "#{socket_path}");
 
     let response = handler
-        .handle(Request::RunShell(Box::new(RunShellRequest {
-            command,
-            arguments: Vec::new(),
-            background: false,
-            as_commands: false,
-            show_stderr: true,
-            delay_seconds: None,
-            start_directory: None,
-            target: None,
-            source_depth: None,
-        })))
+        .handle(
+            RunShellRequest {
+                show_stderr: true,
+                ..Fixture::fixture(command)
+            }
+            .into_request(),
+        )
         .await;
 
     assert_eq!(
@@ -1052,20 +959,6 @@ async fn run_shell_expands_socket_path_without_target() {
     );
 }
 
-async fn create_named_session(handler: &RequestHandler, name: &str) {
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: session_name(name),
-                detached: true,
-                size: Some(TerminalSize { cols: 80, rows: 24 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
-}
-
 async fn execute_test_command(handler: &RequestHandler, command: &str) {
     let parsed = CommandParser::new()
         .parse(command)
@@ -1076,7 +969,7 @@ async fn execute_test_command(handler: &RequestHandler, command: &str) {
         .unwrap_or_else(|error| panic!("{command:?} should execute: {error}"));
 }
 
-async fn wait_for_file_text(path: &std::path::Path, expected: &str) {
+async fn wait_for_file_text(path: &Path, expected: &str) {
     let mut last_observed = None;
     let result = tokio::time::timeout(background_shell_test_timeout(), async {
         loop {
@@ -1086,7 +979,7 @@ async fn wait_for_file_text(path: &std::path::Path, expected: &str) {
                 }
                 last_observed = Some(text);
             }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await;
@@ -1095,16 +988,16 @@ async fn wait_for_file_text(path: &std::path::Path, expected: &str) {
     }
 }
 
-fn write_literal_format_command(path: &std::path::Path, text: &str) -> String {
+fn write_literal_format_command(path: &Path, text: &str) -> String {
     format!(
         "printf '%s' {} > {}",
         command_quote(text),
-        shell_quote(path)
+        sh_quote_path(path)
     )
 }
 
-fn write_text_command(path: &std::path::Path, text: &str) -> String {
-    format!("printf {} > {}", command_quote(text), shell_quote(path))
+fn write_text_command(path: &Path, text: &str) -> String {
+    format!("printf {} > {}", command_quote(text), sh_quote_path(path))
 }
 
 #[tokio::test]
@@ -1134,17 +1027,13 @@ async fn run_shell_rejects_invalid_delay_without_closing_connection() {
 
     for delay in [-1.0, f64::NAN, f64::INFINITY] {
         let response = handler
-            .handle(Request::RunShell(Box::new(RunShellRequest {
-                command: shell_success_command(),
-                arguments: Vec::new(),
-                background: false,
-                as_commands: false,
-                show_stderr: false,
-                delay_seconds: Some(RunShellDelaySeconds(delay)),
-                start_directory: None,
-                target: None,
-                source_depth: None,
-            })))
+            .handle(
+                RunShellRequest {
+                    delay_seconds: Some(RunShellDelaySeconds(delay)),
+                    ..Fixture::fixture(shell_success_command())
+                }
+                .into_request(),
+            )
             .await;
 
         assert!(
@@ -1160,17 +1049,14 @@ async fn run_shell_background_rejects_invalid_delay_before_reporting_success() {
 
     for delay in [-1.0, f64::NAN, f64::INFINITY] {
         let response = handler
-            .handle(Request::RunShell(Box::new(RunShellRequest {
-                command: shell_success_command(),
-                arguments: Vec::new(),
-                background: true,
-                as_commands: false,
-                show_stderr: false,
-                delay_seconds: Some(RunShellDelaySeconds(delay)),
-                start_directory: None,
-                target: None,
-                source_depth: None,
-            })))
+            .handle(
+                RunShellRequest {
+                    background: true,
+                    delay_seconds: Some(RunShellDelaySeconds(delay)),
+                    ..Fixture::fixture(shell_success_command())
+                }
+                .into_request(),
+            )
             .await;
 
         assert!(
@@ -1203,7 +1089,7 @@ async fn queue_parsed_run_shell_rejects_invalid_delay() {
 fn parsed_run_shell_accepts_tmux_clustered_no_value_flags() {
     let handler = RequestHandler::new();
     let state = handler.state.blocking_lock();
-    let parsed = crate::handler::scripting_support::parse_request_from_parts(
+    let parsed = parse_request_from_parts(
         "run-shell".to_owned(),
         vec!["-bC".to_owned(), "set-option -g @compact yes".to_owned()],
         None,
@@ -1226,7 +1112,7 @@ fn parsed_run_shell_accepts_tmux_clustered_no_value_flags() {
 fn parsed_send_keys_accepts_tmux_clustered_no_value_flags() {
     let handler = RequestHandler::new();
     let state = handler.state.blocking_lock();
-    let parsed = crate::handler::scripting_support::parse_request_from_parts(
+    let parsed = parse_request_from_parts(
         "send-keys".to_owned(),
         vec!["-lR".to_owned(), "ABC".to_owned()],
         None,
@@ -1255,7 +1141,7 @@ async fn parsed_new_session_start_directory_sets_session_cwd() {
     let parsed = CommandParser::new()
         .parse(&format!(
             "new-session -d -s alpha -c {}",
-            shell_quote(&root)
+            sh_quote_path(&root)
         ))
         .expect("new-session -c parses");
 
@@ -1276,7 +1162,7 @@ async fn parsed_new_session_start_directory_sets_session_cwd() {
 fn parsed_new_session_accepts_tmux_shell_command_after_double_dash() {
     let handler = RequestHandler::new();
     let state = handler.state.blocking_lock();
-    let parsed = crate::handler::scripting_support::parse_request_from_parts(
+    let parsed = parse_request_from_parts(
         "new-session".to_owned(),
         vec![
             "-d".to_owned(),
@@ -1296,23 +1182,9 @@ fn parsed_new_session_accepts_tmux_shell_command_after_double_dash() {
     assert_eq!(
         parsed,
         Request::NewSessionExt(Box::new(NewSessionExtRequest {
-            session_name: Some(session_name("alpha")),
-            working_directory: None,
-            detached: true,
             size: None,
-            environment: None,
-            group_target: None,
-            attach_if_exists: false,
-            detach_other_clients: false,
-            kill_other_clients: false,
-            flags: None,
-            window_name: None,
-            print_session_info: false,
-            print_format: None,
             command: Some(vec!["sleep".to_owned(), "30".to_owned()]),
-            process_command: None,
-            client_environment: None,
-            skip_environment_update: false,
+            ..Fixture::fixture(session_name("alpha"))
         }))
     );
 }
@@ -1321,7 +1193,7 @@ fn parsed_new_session_accepts_tmux_shell_command_after_double_dash() {
 fn parsed_new_session_accepts_skip_environment_update() {
     let handler = RequestHandler::new();
     let state = handler.state.blocking_lock();
-    let parsed = crate::handler::scripting_support::parse_request_from_parts(
+    let parsed = parse_request_from_parts(
         "new-session".to_owned(),
         vec![
             "-E".to_owned(),
@@ -1349,7 +1221,7 @@ fn parsed_new_session_accepts_skip_environment_update() {
 fn parsed_new_session_accepts_compact_bare_and_value_flags() {
     let handler = RequestHandler::new();
     let state = handler.state.blocking_lock();
-    let parsed = crate::handler::scripting_support::parse_request_from_parts(
+    let parsed = parse_request_from_parts(
         "new-session".to_owned(),
         vec![
             "-dEPsalpha".to_owned(),

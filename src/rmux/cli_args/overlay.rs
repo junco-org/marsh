@@ -1,7 +1,5 @@
 use clap::{ArgAction, Args};
 
-use super::QueuedCommand;
-
 /// Arguments for `display-menu` / alias `menu`.
 #[derive(Debug, Clone, Args)]
 pub(crate) struct DisplayMenuArgs {
@@ -78,18 +76,4 @@ pub(crate) struct DisplayPopupArgs {
     pub(crate) shell_command: Vec<String>,
     #[arg(skip = String::new())]
     pub(crate) queue_command: String,
-}
-
-impl QueuedCommand for DisplayMenuArgs {
-    /// Records the queued command text that `display-menu` was parsed from.
-    fn set_queue_command(&mut self, queue_command: String) {
-        self.queue_command = queue_command;
-    }
-}
-
-impl QueuedCommand for DisplayPopupArgs {
-    /// Records the queued command text that `display-popup` was parsed from.
-    fn set_queue_command(&mut self, queue_command: String) {
-        self.queue_command = queue_command;
-    }
 }

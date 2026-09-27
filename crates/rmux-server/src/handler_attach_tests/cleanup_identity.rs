@@ -6,14 +6,7 @@ async fn stale_cleanup_identity_preserves_reregistered_same_pid_and_session() {
     let session = session_name("attach-cleanup-aba");
     let attach_pid = 94_201;
     let mut original_rx = create_attached_session(&handler, attach_pid, &session).await;
-    let stale_identity = {
-        let active_attach = handler.active_attach.lock().await;
-        active_attach
-            .by_pid
-            .get(&attach_pid)
-            .expect("original attach exists")
-            .identity(attach_pid)
-    };
+    let stale_identity = handler.active_attach_identity_for_test(attach_pid).await;
 
     let (replacement_tx, mut replacement_rx) = mpsc::unbounded_channel();
     let replacement_id = handler

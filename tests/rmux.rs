@@ -20,121 +20,65 @@
 //! instrumentation is process-global and because the shells a test opens take their seeds' leases
 //! — a host on its own leases nothing.
 
+mod common;
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use brush_core::env::ShellEnvironment;
-use marsh::policy::{Action, Resource};
+use common::rmux::{Host, admit, frontend, pipes, saw};
+use common::{TIMEOUT, denied, run};
 use marsh::rmux::{
-    CollectOptions, ExecutionSpec, IoError, OutputLimit, OverflowPolicy, RmuxFrontend, ShellIo,
+    CapturedOutput, CollectOptions, Execution, IoError, IoEvent, IoResult, OutputLimit,
+    OverflowPolicy, ShellHandle, ShellIo,
 };
 use marsh::shellmux::{
-    CommandOptions, JobIo, MuxError, OutputChannel, ShellId, SpawnOptions, TerminalGeometry,
+    CommandOptions, JobEnd, MuxError, OutputChannel, ShellId, SpawnOptions, TerminalGeometry,
 };
-use marsh::{MarshError, Outcome};
-use marsh_btrfs::fake::CopyTree;
-use rmux_server::DaemonConfig;
+use marsh_btrfs::Subvolumes;
+use rmux_proto::ProcessCommand;
 use serial_test::serial;
-use tempfile::TempDir;
 
-/// How long a wait may take before a test declares the claim it is waiting for unmet.
-const TIMEOUT: Duration = Duration::from_secs(30);
-
-/// Two sibling seeds, the fake btrfs both are registered with, and a bound host over them.
-///
-/// The second seed is registered but never opened by the fixture itself: a host leases nothing
-/// until a shell asks for a directory, so the tests that are about leases open their own shells
-/// and can prove one host serves both trees.
-struct Host {
-    /// The running daemon.
-    rmux: Option<RmuxFrontend>,
-    /// The facade every test drives.
-    io: ShellIo,
-    /// The first seed's root, and the host's default directory.
-    seed: PathBuf,
-    /// A second registered seed beside the first.
-    other: PathBuf,
-    /// The filesystem both seeds live on, so a competing host sees the same trees.
-    fs: Arc<CopyTree>,
-    /// Kept alive: dropping it deletes the trees the host is publishing into.
-    _scratch: TempDir,
+/// Admits `cmd` as a shell workload.
+async fn execute(io: &ShellIo, cmd: &str) -> Execution {
+    admit(io, ProcessCommand::Shell(cmd.to_owned()))
+        .await
+        .expect("admit the workload")
 }
 
-impl Host {
-    /// Builds a seed with `files` in it, a registered sibling seed beside it, and binds a host
-    /// whose default directory is the first.
-    async fn new(files: &[(&str, &str)]) -> Self {
-        let scratch = tempfile::tempdir().expect("a scratch directory");
-        let seed = scratch.path().join("seed");
-        std::fs::create_dir_all(&seed).expect("create the seed root");
-        for (path, contents) in files {
-            let path = seed.join(path);
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent).expect("create a seed directory");
-            }
-            std::fs::write(path, contents).expect("seed a file");
-        }
-        // A sibling rather than a child: a nested tree would be reachable by walking up out of
-        // the first seed, and the two would not be independent publication roots.
-        let other = scratch.path().join("other");
-        std::fs::create_dir_all(&other).expect("create the second seed root");
-
-        let fs = Arc::new(CopyTree::new());
-        fs.register(&seed);
-        fs.register(&other);
-
-        // A socket under the scratch root, so two tests never contend for one path.
-        let socket = scratch.path().join("rmux.sock");
-        let rmux = RmuxFrontend::open_with(
-            DaemonConfig::new(socket),
-            &seed,
-            ShellEnvironment::new(),
-            TerminalGeometry { rows: 24, cols: 80 },
-            Arc::clone(&fs) as Arc<dyn marsh_btrfs::Subvolumes>,
-        )
+/// Collects `execution` under `options`, within [`TIMEOUT`].
+async fn collect(execution: Execution, options: CollectOptions) -> IoResult<CapturedOutput> {
+    tokio::time::timeout(TIMEOUT, execution.collect(options))
         .await
-        .expect("open an rmux frontend");
-
-        let io = rmux.io();
-        Self {
-            rmux: Some(rmux),
-            io,
-            seed,
-            other,
-            fs,
-            _scratch: scratch,
-        }
-    }
-
-    /// A path inside the seed.
-    fn seed(&self, path: &str) -> PathBuf {
-        self.seed.join(path)
-    }
-
-    /// Stops the daemon and waits for every snapshot to be reclaimed.
-    async fn shutdown(mut self) {
-        if let Some(rmux) = self.rmux.take() {
-            rmux.shutdown().await.expect("shut the host down");
-        }
-    }
+        .expect("the collection settles")
 }
 
-/// Runs one workload to completion and returns everything it produced.
-async fn run(io: &ShellIo, cmd: &str) -> marsh::rmux::CapturedOutput {
-    let execution = io
-        .execute(ExecutionSpec {
-            initial_dir: PathBuf::new(),
-            id: None,
-            process: rmux_proto::ProcessCommand::Shell(cmd.to_string()),
-            environment: None,
-        })
+/// Collects `printf abc; printf XYZ >&2` under a four-byte allowance both streams draw on.
+async fn four_bytes(host: &Host, overflow: OverflowPolicy) -> IoResult<CapturedOutput> {
+    let execution = execute(&host.io, "printf abc; printf XYZ >&2").await;
+    collect(
+        execution,
+        CollectOptions {
+            limit: OutputLimit::Bytes(4),
+            overflow,
+        },
+    )
+    .await
+}
+
+/// Opens a job in the host's default directory, failing the test with `what`.
+async fn open(io: &ShellIo, id: Option<&str>, options: SpawnOptions, what: &str) -> ShellHandle {
+    io.open_shell(Path::new(""), id.map(ShellId::from), options)
         .await
-        .expect("admit the workload");
-    tokio::time::timeout(TIMEOUT, execution.collect(CollectOptions::default()))
+        .expect(what)
+}
+
+/// Waits, within [`TIMEOUT`], for `job` to close.
+async fn closed(job: &ShellHandle) -> Arc<JobEnd> {
+    tokio::time::timeout(TIMEOUT, job.wait_closed())
         .await
-        .expect("the workload finishes")
-        .expect("the workload collects")
+        .expect("the job closes")
+        .expect("the closure resolves")
 }
 
 /// Opens a job whose shell starts in `initial_dir`, publishes `line` through it, and returns it.
@@ -143,12 +87,7 @@ async fn run(io: &ShellIo, cmd: &str) -> marsh::rmux::CapturedOutput {
 /// holds anything: the lease, the recovered log and the validator all arrive with the first shell
 /// that names a directory on that seed. Publishing a line as well is what puts a committed event
 /// into the seed's history, so a frozen copy of it afterwards is a copy of something.
-async fn publish_in(
-    io: &ShellIo,
-    initial_dir: &Path,
-    id: &str,
-    line: &str,
-) -> marsh::rmux::ShellHandle {
+async fn publish_in(io: &ShellIo, initial_dir: &Path, id: &str, line: &str) -> ShellHandle {
     let job = io
         .open_shell(
             initial_dir,
@@ -157,32 +96,12 @@ async fn publish_in(
         )
         .await
         .expect("open a job on the named directory's seed");
-    let completion =
-        tokio::time::timeout(TIMEOUT, job.run_command(line, CommandOptions::default()))
-            .await
-            .expect("the line finishes")
-            .expect("the verdict resolves");
+    let completion = run(&job, line).await;
     assert!(
         completion.is_published(),
-        "the line publishes into its own seed: {:?}",
-        completion.outcome
+        "the line publishes into its own seed: {completion:?}"
     );
     job
-}
-
-/// Whether `error` is the btrfs lease refusal for `seed`, carried whole through the facade.
-///
-/// Matched structurally rather than by message: "another owner holds this seed" has to stay
-/// distinguishable from "that directory is not a subvolume" and from a generic I/O failure.
-fn is_session_busy(error: &IoError, seed: &Path) -> bool {
-    matches!(
-        error,
-        IoError::Mux(mux) if matches!(
-            &**mux,
-            MuxError::Marsh(MarshError::Btrfs(marsh_btrfs::Error::SessionBusy(held)))
-                if held == seed
-        )
-    )
 }
 
 /// The canonical key a seed's metadata and history are filed under.
@@ -198,7 +117,7 @@ fn canonical(seed: &Path) -> PathBuf {
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
 async fn a_workloads_two_streams_stay_separate_and_byte_exact() {
-    let host = Host::new(&[]).await;
+    let host = Host::new().await;
 
     let captured = run(&host.io, "printf 'out-no-newline'; printf 'err\\n' >&2").await;
 
@@ -208,7 +127,7 @@ async fn a_workloads_two_streams_stay_separate_and_byte_exact() {
     );
     assert_eq!(captured.stderr, b"err\n");
     assert!(!captured.truncated);
-    assert_eq!(captured.completion.exit_code, Some(0));
+    assert_eq!(captured.completion.exit_code(), Some(0));
 
     host.shutdown().await;
 }
@@ -221,15 +140,15 @@ async fn a_workloads_two_streams_stay_separate_and_byte_exact() {
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
 async fn an_exit_code_and_an_approval_are_different_answers() {
-    let host = Host::new(&[]).await;
+    let host = Host::new().await;
 
     let captured = run(&host.io, "printf hello > greeting").await;
 
-    assert_eq!(captured.completion.exit_code, Some(0));
+    assert_eq!(captured.completion.exit_code(), Some(0));
     assert!(
         captured.completion.is_published(),
         "a write that was granted reaches the seed: {:?}",
-        captured.completion.outcome
+        captured.completion
     );
     assert_eq!(
         std::fs::read_to_string(host.seed("greeting")).expect("the published file"),
@@ -239,15 +158,8 @@ async fn an_exit_code_and_an_approval_are_different_answers() {
 
     // And the negative: a command that exits zero having staged nothing publishes nothing.
     let nothing = run(&host.io, "true").await;
-    assert_eq!(nothing.completion.exit_code, Some(0));
-    assert!(
-        matches!(
-            nothing.completion.outcome.as_ref(),
-            Ok(Outcome::Published { .. })
-        ),
-        "an empty boundary is still a boundary: {:?}",
-        nothing.completion.outcome
-    );
+    assert_eq!(nothing.completion.exit_code(), Some(0));
+    assert!(nothing.completion.is_published());
 
     host.shutdown().await;
 }
@@ -260,11 +172,11 @@ async fn an_exit_code_and_an_approval_are_different_answers() {
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
 async fn a_failing_program_is_a_completion_not_an_error() {
-    let host = Host::new(&[]).await;
+    let host = Host::new().await;
 
     let captured = run(&host.io, "exit 3").await;
 
-    assert_eq!(captured.completion.exit_code, Some(3));
+    assert_eq!(captured.completion.exit_code(), Some(3));
     assert!(captured.stdout.is_empty());
 
     host.shutdown().await;
@@ -278,18 +190,9 @@ async fn a_failing_program_is_a_completion_not_an_error() {
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
 async fn closing_a_pipe_jobs_input_is_a_real_end_of_file() {
-    let host = Host::new(&[]).await;
+    let host = Host::new().await;
 
-    let execution = host
-        .io
-        .execute(ExecutionSpec {
-            initial_dir: PathBuf::new(),
-            id: None,
-            process: rmux_proto::ProcessCommand::Shell("cat".to_string()),
-            environment: None,
-        })
-        .await
-        .expect("admit the workload");
+    let execution = execute(&host.io, "cat").await;
 
     execution
         .input()
@@ -298,13 +201,12 @@ async fn closing_a_pipe_jobs_input_is_a_real_end_of_file() {
         .expect("the input accepts the write");
 
     // `collect` closes stdin before draining, which is the only reason `cat` ever exits.
-    let captured = tokio::time::timeout(TIMEOUT, execution.collect(CollectOptions::default()))
+    let captured = collect(execution, CollectOptions::default())
         .await
-        .expect("cat sees end of file and exits")
         .expect("the workload collects");
 
     assert_eq!(captured.stdout, b"piped\n");
-    assert_eq!(captured.completion.exit_code, Some(0));
+    assert_eq!(captured.completion.exit_code(), Some(0));
 
     host.shutdown().await;
 }
@@ -317,27 +219,22 @@ async fn closing_a_pipe_jobs_input_is_a_real_end_of_file() {
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
 async fn an_argv_workloads_arguments_are_not_reinterpreted() {
-    let host = Host::new(&[]).await;
+    let host = Host::new().await;
 
-    let execution = host
-        .io
-        .execute(ExecutionSpec {
-            initial_dir: PathBuf::new(),
-            id: None,
-            process: rmux_proto::ProcessCommand::Argv(vec![
-                "printf".to_string(),
-                "[%s]".to_string(),
-                String::new(),
-                "two words".to_string(),
-                "*".to_string(),
-            ]),
-            environment: None,
-        })
+    let execution = admit(
+        &host.io,
+        ProcessCommand::Argv(vec![
+            "printf".to_string(),
+            "[%s]".to_string(),
+            String::new(),
+            "two words".to_string(),
+            "*".to_string(),
+        ]),
+    )
+    .await
+    .expect("admit the workload");
+    let captured = collect(execution, CollectOptions::default())
         .await
-        .expect("admit the workload");
-    let captured = tokio::time::timeout(TIMEOUT, execution.collect(CollectOptions::default()))
-        .await
-        .expect("the workload finishes")
         .expect("the workload collects");
 
     assert_eq!(
@@ -361,28 +258,9 @@ async fn an_argv_workloads_arguments_are_not_reinterpreted() {
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
 async fn a_bounded_collection_refuses_to_return_a_silent_prefix() {
-    let host = Host::new(&[]).await;
+    let host = Host::new().await;
 
-    let execution = host
-        .io
-        .execute(ExecutionSpec {
-            initial_dir: PathBuf::new(),
-            id: None,
-            process: rmux_proto::ProcessCommand::Shell("printf abc; printf XYZ >&2".to_string()),
-            environment: None,
-        })
-        .await
-        .expect("admit the workload");
-
-    let outcome = tokio::time::timeout(
-        TIMEOUT,
-        execution.collect(CollectOptions {
-            limit: OutputLimit::Bytes(4),
-            overflow: OverflowPolicy::Error,
-        }),
-    )
-    .await
-    .expect("the collection settles");
+    let outcome = four_bytes(&host, OverflowPolicy::Error).await;
 
     assert!(
         matches!(outcome, Err(IoError::OutputLimit { limit: 4 })),
@@ -401,29 +279,11 @@ async fn a_bounded_collection_refuses_to_return_a_silent_prefix() {
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
 async fn a_truncating_collection_marks_what_it_kept() {
-    let host = Host::new(&[]).await;
+    let host = Host::new().await;
 
-    let execution = host
-        .io
-        .execute(ExecutionSpec {
-            initial_dir: PathBuf::new(),
-            id: None,
-            process: rmux_proto::ProcessCommand::Shell("printf abc; printf XYZ >&2".to_string()),
-            environment: None,
-        })
+    let captured = four_bytes(&host, OverflowPolicy::Truncate)
         .await
-        .expect("admit the workload");
-
-    let captured = tokio::time::timeout(
-        TIMEOUT,
-        execution.collect(CollectOptions {
-            limit: OutputLimit::Bytes(4),
-            overflow: OverflowPolicy::Truncate,
-        }),
-    )
-    .await
-    .expect("the collection settles")
-    .expect("a truncating collection still succeeds");
+        .expect("a truncating collection still succeeds");
 
     assert!(
         captured.truncated,
@@ -445,7 +305,7 @@ async fn a_truncating_collection_marks_what_it_kept() {
         String::from_utf8_lossy(&captured.stderr)
     );
     assert_eq!(
-        captured.completion.exit_code,
+        captured.completion.exit_code(),
         Some(0),
         "the verdict is still awaited and still real"
     );
@@ -465,40 +325,15 @@ async fn a_truncating_collection_marks_what_it_kept() {
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
 async fn a_stale_handle_cannot_reach_its_own_replacement() {
-    let host = Host::new(&[]).await;
+    let host = Host::new().await;
 
-    let first = host
-        .io
-        .open_shell(
-            Path::new(""),
-            Some(ShellId::from("worker")),
-            SpawnOptions {
-                io: JobIo::Pipes,
-                ..SpawnOptions::default()
-            },
-        )
-        .await
-        .expect("open the first job");
+    let first = open(&host.io, Some("worker"), pipes(), "open the first job").await;
     let first_uid = first.sandbox().uid.clone();
 
     host.io.stop(&first, true).await.expect("force the job");
-    tokio::time::timeout(TIMEOUT, first.wait_closed())
-        .await
-        .expect("the job closes")
-        .expect("the closure resolves");
+    closed(&first).await;
 
-    let second = host
-        .io
-        .open_shell(
-            Path::new(""),
-            Some(ShellId::from("worker")),
-            SpawnOptions {
-                io: JobIo::Pipes,
-                ..SpawnOptions::default()
-            },
-        )
-        .await
-        .expect("reuse the name");
+    let second = open(&host.io, Some("worker"), pipes(), "reuse the name").await;
     assert_ne!(
         second.sandbox().uid,
         first_uid,
@@ -526,21 +361,10 @@ async fn a_stale_handle_cannot_reach_its_own_replacement() {
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
 async fn a_foreign_handle_is_refused() {
-    let first = Host::new(&[]).await;
-    let second = Host::new(&[]).await;
+    let first = Host::new().await;
+    let second = Host::new().await;
 
-    let job = first
-        .io
-        .open_shell(
-            Path::new(""),
-            None,
-            SpawnOptions {
-                io: JobIo::Pipes,
-                ..SpawnOptions::default()
-            },
-        )
-        .await
-        .expect("open a job on the first host");
+    let job = open(&first.io, None, pipes(), "open a job on the first host").await;
 
     let refused = second.io.write_input(&job, b"x").await;
     assert!(
@@ -561,44 +385,29 @@ async fn a_foreign_handle_is_refused() {
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
 async fn an_observation_never_falls_between_its_snapshot_and_its_stream() {
-    let host = Host::new(&[]).await;
+    let host = Host::new().await;
 
-    let observation = host.io.observe();
+    let mut observation = host.io.observe();
     let before = observation.snapshot.state.jobs.len();
 
-    let job = host
-        .io
-        .open_shell(
-            Path::new(""),
-            Some(ShellId::from("watched")),
-            SpawnOptions {
-                io: JobIo::Pipes,
-                ..SpawnOptions::default()
-            },
-        )
-        .await
-        .expect("open a job after subscribing");
+    let job = open(
+        &host.io,
+        Some("watched"),
+        pipes(),
+        "open a job after subscribing",
+    )
+    .await;
 
     // Everything from `next_event_sequence` onwards is on the stream. The job is not in the
     // snapshot, so it must be in the events.
-    let mut events = observation.events;
-    let mut saw_opened = false;
-    let deadline = tokio::time::Instant::now() + TIMEOUT;
-    while tokio::time::Instant::now() < deadline {
-        let Ok(Ok(Some(envelope))) =
-            tokio::time::timeout(Duration::from_secs(5), events.recv()).await
-        else {
-            break;
-        };
+    let saw_opened = saw(&mut observation.events, |envelope| {
         assert!(
             envelope.sequence >= observation.snapshot.next_event_sequence,
             "the stream resumes exactly where the snapshot stopped"
         );
-        if matches!(envelope.event, marsh::rmux::IoEvent::Opened { .. }) {
-            saw_opened = true;
-            break;
-        }
-    }
+        matches!(envelope.event, IoEvent::Opened { .. })
+    })
+    .await;
     assert!(
         saw_opened,
         "a job opened after the snapshot must appear on the stream"
@@ -622,20 +431,9 @@ async fn an_observation_never_falls_between_its_snapshot_and_its_stream() {
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
 async fn the_four_boundaries_are_separate_and_ordered() {
-    let host = Host::new(&[]).await;
+    let host = Host::new().await;
 
-    let execution = host
-        .io
-        .execute(ExecutionSpec {
-            initial_dir: PathBuf::new(),
-            id: None,
-            process: rmux_proto::ProcessCommand::Shell("printf done".to_string()),
-            environment: None,
-        })
-        .await
-        .expect("admit the workload");
-
-    let parts = execution.into_parts();
+    let parts = execute(&host.io, "printf done").await.into_parts();
     let shell = parts.shell.clone();
     let command = parts.command.clone();
     let mut stdout = parts.stdout;
@@ -655,13 +453,10 @@ async fn the_four_boundaries_are_separate_and_ordered() {
         .await
         .expect("the command finishes")
         .expect("the verdict resolves");
-    assert_eq!(completion.exit_code, Some(0));
+    assert_eq!(completion.exit_code(), Some(0));
 
     // 3. the job closes, which is a later boundary than the verdict.
-    let end = tokio::time::timeout(TIMEOUT, shell.wait_closed())
-        .await
-        .expect("the job closes")
-        .expect("the closure resolves");
+    let end = closed(&shell).await;
     assert_eq!(end.shell.uid, completion.shell.uid);
     assert_eq!(
         end.completion.as_ref().map(|last| last.id),
@@ -677,13 +472,15 @@ async fn the_four_boundaries_are_separate_and_ordered() {
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
 async fn a_jobs_stream_shape_is_fixed_when_it_is_admitted() {
-    let host = Host::new(&[]).await;
+    let host = Host::new().await;
 
-    let terminal = host
-        .io
-        .open_shell(Path::new(""), None, SpawnOptions::default())
-        .await
-        .expect("open a terminal job");
+    let terminal = open(
+        &host.io,
+        None,
+        SpawnOptions::default(),
+        "open a terminal job",
+    )
+    .await;
     assert_eq!(terminal.output_channels(), &[OutputChannel::Terminal]);
     assert!(
         matches!(
@@ -693,18 +490,7 @@ async fn a_jobs_stream_shape_is_fixed_when_it_is_admitted() {
         "a pseudoterminal has no half-close, and Ctrl-D is a keystroke rather than an end of file"
     );
 
-    let piped = host
-        .io
-        .open_shell(
-            Path::new(""),
-            None,
-            SpawnOptions {
-                io: JobIo::Pipes,
-                ..SpawnOptions::default()
-            },
-        )
-        .await
-        .expect("open a pipe job");
+    let piped = open(&host.io, None, pipes(), "open a pipe job").await;
     assert_eq!(
         piped.output_channels(),
         &[OutputChannel::Stdout, OutputChannel::Stderr]
@@ -732,20 +518,15 @@ async fn a_jobs_stream_shape_is_fixed_when_it_is_admitted() {
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
 async fn a_scheduled_command_is_accepted_before_it_produces_anything() {
-    let host = Host::new(&[]).await;
+    let host = Host::new().await;
 
-    let job = host
-        .io
-        .open_shell(
-            Path::new(""),
-            Some(ShellId::from("scheduled")),
-            SpawnOptions {
-                io: JobIo::Pipes,
-                ..SpawnOptions::default()
-            },
-        )
-        .await
-        .expect("open a job with nothing running in it");
+    let job = open(
+        &host.io,
+        Some("scheduled"),
+        pipes(),
+        "open a job with nothing running in it",
+    )
+    .await;
 
     let idle = host.io.job(job.id()).expect("the new job is visible");
     assert!(
@@ -755,7 +536,7 @@ async fn a_scheduled_command_is_accepted_before_it_produces_anything() {
 
     // Subscribed before the line is scheduled, so the order of its observations is read off the
     // stream rather than reconstructed from it afterwards.
-    let observation = host.io.observe();
+    let mut observation = host.io.observe();
 
     // `cat` cannot write a byte or exit until its input ends, and its input is not ended below
     // until the receipt is already in hand: this cannot pass by the run simply being over.
@@ -808,35 +589,19 @@ async fn a_scheduled_command_is_accepted_before_it_produces_anything() {
         .expect("the runner task finished")
         .expect("the line publishes");
     assert_eq!(completion.id, command.id(), "one line, one identity");
-    assert_eq!(completion.exit_code, Some(0));
+    assert_eq!(completion.exit_code(), Some(0));
 
     // The stream says the same thing in order: neither a byte the command produced nor its
     // verdict comes before its acceptance.
-    let mut events = observation.events;
-    let mut accepted_first = false;
-    let deadline = tokio::time::Instant::now() + TIMEOUT;
-    while tokio::time::Instant::now() < deadline {
-        let Ok(Ok(Some(envelope))) =
-            tokio::time::timeout(Duration::from_secs(5), events.recv()).await
-        else {
-            break;
-        };
-        match &envelope.event {
-            marsh::rmux::IoEvent::CommandAccepted { command: handle }
-                if handle.id() == command.id() =>
-            {
-                accepted_first = true;
-                break;
-            }
-            marsh::rmux::IoEvent::Output { .. } | marsh::rmux::IoEvent::Finished { .. } => {
-                panic!(
-                    "a command's bytes and its verdict both come after its acceptance: {:?}",
-                    envelope.event
-                )
-            }
-            _ => {}
-        }
-    }
+    let accepted_first = saw(&mut observation.events, |envelope| match &envelope.event {
+        IoEvent::CommandAccepted { command: handle } => handle.id() == command.id(),
+        IoEvent::Output { .. } | IoEvent::Finished { .. } => panic!(
+            "a command's bytes and its verdict both come after its acceptance: {:?}",
+            envelope.event
+        ),
+        _ => false,
+    })
+    .await;
     assert!(
         accepted_first,
         "an admitted line announces itself on the stream"
@@ -845,80 +610,17 @@ async fn a_scheduled_command_is_accepted_before_it_produces_anything() {
     host.shutdown().await;
 }
 
-/// After shutdown the facade is still readable, still refuses work, and still knows **every** seed
-/// it served.
-///
-/// A caller holding a clone must not get a panic or a lie: read-only metadata is answered from the
-/// frozen copy, live state is empty, and every admission fails with [`IoError::Closed`]. One host
-/// serves as many seeds as its shells name, so freezing one of them — the first, the last, or the
-/// daemon's default directory — would silently lose the others' committed histories, which is the
-/// only record a later caller has of what was granted.
+/// Closed handles refuse new work; committed ownership survives automatic reopen on every source.
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
 async fn a_closed_facade_answers_rather_than_pretending() {
-    let host = Host::new(&[]).await;
+    let mut host = Host::new().await;
     let io = host.io.clone();
-    let first = canonical(&host.seed);
-    let second = canonical(&host.other);
-
-    // Nothing is leased and nothing is knowable until a shell asks for a directory.
-    assert!(
-        io.seeds().is_empty(),
-        "a host that has opened no shell has opened no seed"
-    );
-    assert_eq!(io.history(&first), None);
-
     let a = publish_in(&io, &host.seed, "a", "printf a > from-a").await;
     let b = publish_in(&io, &host.other, "b", "printf b > from-b").await;
-    assert_eq!(a.sandbox().seed, first, "the first job publishes into A");
-    assert_eq!(b.sandbox().seed, second, "the second job publishes into B");
-
-    // `seeds()` enumerates in canonical-path order, which is what a caller can rely on rather
-    // than the order the shells happened to open in.
-    let live: Vec<PathBuf> = io.seeds().iter().map(|info| info.seed.clone()).collect();
-    let mut both = vec![first.clone(), second.clone()];
-    both.sort();
-    assert_eq!(live, both, "one host, both seeds");
-
-    host.shutdown().await;
-
-    let frozen: Vec<PathBuf> = io.seeds().iter().map(|info| info.seed.clone()).collect();
-    assert_eq!(
-        frozen, live,
-        "which seeds were served is still a legitimate question once the leases are gone"
-    );
-    assert!(
-        io.seeds().iter().all(|info| !info.recovery_required
-            && info.snapshot_parent.starts_with(
-                info.seed
-                    .parent()
-                    .expect("a seed has a parent to put its state beside")
-            )),
-        "each frozen record keeps its own state parent: {:?}",
-        io.seeds()
-    );
-
-    // The committed histories survive whole, and each seed keeps only its own principal's events.
-    let edit_of = |seed: &Path, principal: &str, file: &str| {
-        io.history(seed)
-            .unwrap_or_else(|| panic!("{} was opened", seed.display()))
-            .iter()
-            .any(|event| {
-                event.action == Action::Edit
-                    && event.principal.as_str() == principal
-                    && event.resource == Resource::from(vec![file])
-            })
-    };
-    assert!(edit_of(&first, "a", "from-a"), "A's grant is frozen");
-    assert!(edit_of(&second, "b", "from-b"), "B's grant is frozen");
-    assert!(!edit_of(&first, "b", "from-b"), "B's grant is not in A");
-    assert!(!edit_of(&second, "a", "from-a"), "A's grant is not in B");
-    assert_eq!(
-        io.history(Path::new("/nowhere")),
-        None,
-        "a seed this host never opened is still unknown afterwards"
-    );
-
+    assert_eq!(a.sandbox().seed, canonical(&host.seed));
+    assert_eq!(b.sandbox().seed, canonical(&host.other));
+    host.rmux.take().unwrap().shutdown().await.unwrap();
     assert!(io.jobs().is_empty());
     assert!(matches!(
         io.open_shell(Path::new(""), None, SpawnOptions::default())
@@ -929,6 +631,15 @@ async fn a_closed_facade_answers_rather_than_pretending() {
         io.shell(&ShellId::from("anything")),
         Err(IoError::Closed)
     ));
+    for (source, name) in [(&host.seed, "from-a"), (&host.other, "from-b")] {
+        let shell = marsh_core::test_support::shell_builder(host.fs.clone())
+            .working_dir(source.clone())
+            .build()
+            .await
+            .unwrap();
+        denied(&shell, &format!("printf blind > {name}")).await;
+        shell.close(false).await.unwrap();
+    }
 }
 
 /// One job submitting several lines keeps one principal and one snapshot across all of them.
@@ -938,29 +649,22 @@ async fn a_closed_facade_answers_rather_than_pretending() {
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
 async fn a_job_outlives_the_commands_run_in_it() {
-    let host = Host::new(&[]).await;
+    let host = Host::new().await;
 
-    let job = host
-        .io
-        .open_shell(
-            Path::new(""),
-            Some(ShellId::from("acc")),
-            SpawnOptions::default(),
-        )
-        .await
-        .expect("open a terminal job");
+    let job = open(
+        &host.io,
+        Some("acc"),
+        SpawnOptions::default(),
+        "open a terminal job",
+    )
+    .await;
     let uid = job.sandbox().uid.clone();
 
     for line in ["printf one >> log", "printf two >> log"] {
-        let completion =
-            tokio::time::timeout(TIMEOUT, job.run_command(line, CommandOptions::default()))
-                .await
-                .expect("the line finishes")
-                .expect("the verdict resolves");
+        let completion = run(&job, line).await;
         assert!(
             completion.is_published(),
-            "each line is published on its own: {:?}",
-            completion.outcome
+            "each line is published on its own: {completion:?}"
         );
         assert_eq!(completion.shell.uid, uid, "the sandbox did not change");
     }
@@ -982,20 +686,18 @@ async fn a_job_outlives_the_commands_run_in_it() {
 /// both seeds is what makes a per-seed leak visible — releasing only the default directory's seed
 /// would pass a single-seed check and strand every other one for the life of the process.
 async fn reopen_and_publish_on_both(
-    fs: Arc<dyn marsh_btrfs::Subvolumes>,
-    socket: PathBuf,
+    fs: Arc<dyn Subvolumes>,
+    socket: &Path,
     first: &Path,
     second: &Path,
 ) {
-    let reopened = RmuxFrontend::open_with(
-        DaemonConfig::new(socket),
+    let reopened = frontend(
+        socket,
         first,
-        ShellEnvironment::new(),
-        TerminalGeometry { rows: 24, cols: 80 },
         fs,
+        "a host binds its socket whatever the seeds are doing",
     )
-    .await
-    .expect("a host binds its socket whatever the seeds are doing");
+    .await;
     let io = reopened.io();
 
     publish_in(&io, first, "reopened-a", "printf again-a > reopened").await;
@@ -1032,39 +734,28 @@ async fn reopen_and_publish_on_both(
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
 async fn stopping_the_daemon_releases_the_seed_even_with_a_clone_outstanding() {
-    let host = Host::new(&[]).await;
-    let seed = host.seed.clone();
-    let other = host.other.clone();
-    let first = canonical(&seed);
-    let second = canonical(&other);
-    let scratch_root = seed
-        .parent()
-        .expect("the seed sits in a scratch root")
-        .to_path_buf();
-    let fs = Arc::clone(&host.fs) as Arc<dyn marsh_btrfs::Subvolumes>;
+    let host = Host::new().await;
     let retained = host.io.clone();
 
     // Nothing is held until a shell asks. These two are what put both seeds under lease.
-    publish_in(&host.io, &seed, "a", "printf a > held-a").await;
-    publish_in(&host.io, &other, "b", "printf b > held-b").await;
+    publish_in(&host.io, &host.seed, "a", "printf a > held-a").await;
+    publish_in(&host.io, &host.other, "b", "printf b > held-b").await;
 
     // A competing host over the same trees, on a socket of its own: a refusal on the bound socket
     // would prove nothing about a seed. Construction succeeds — a listener's lifetime no longer
     // depends on any seed's — and the refusal lands on the shell that actually wants the lease.
-    let competing = RmuxFrontend::open_with(
-        DaemonConfig::new(scratch_root.join("competing.sock")),
-        &seed,
-        ShellEnvironment::new(),
-        TerminalGeometry { rows: 24, cols: 80 },
-        Arc::clone(&fs),
+    let competing = frontend(
+        &host.scratch.path().join("competing.sock"),
+        &host.seed,
+        Arc::clone(&host.fs),
+        "a second host binds its own socket while another host holds the seeds",
     )
-    .await
-    .expect("a second host binds its own socket while another host holds the seeds");
-    for (directory, canonical_seed, name) in [
-        (&seed, &first, "intruder-a"),
-        (&other, &second, "intruder-b"),
+    .await;
+    for (directory, file, name) in [
+        (&host.seed, "held-a", "shared-a"),
+        (&host.other, "held-b", "shared-b"),
     ] {
-        let refusal = competing
+        let shared = competing
             .io()
             .open_shell(
                 directory,
@@ -1072,17 +763,9 @@ async fn stopping_the_daemon_releases_the_seed_even_with_a_clone_outstanding() {
                 SpawnOptions::default(),
             )
             .await
-            .expect_err("the running host holds that seed's exclusive lease");
-        assert!(
-            is_session_busy(&refusal, canonical_seed),
-            "{} is busy, not broken: {refusal:?}",
-            canonical_seed.display()
-        );
+            .expect("same-process frontends share the canonical source authority");
+        denied(&shared, &format!("printf blind > {file}")).await;
     }
-    assert!(
-        competing.io().jobs().is_empty() && competing.io().seeds().is_empty(),
-        "a refused spawn admits no job and opens no seed"
-    );
     competing
         .shutdown()
         .await
@@ -1095,7 +778,10 @@ async fn stopping_the_daemon_releases_the_seed_even_with_a_clone_outstanding() {
     let Host {
         rmux,
         io,
-        _scratch: scratch,
+        seed,
+        other,
+        fs,
+        scratch,
         ..
     } = host;
     drop(io);
@@ -1105,18 +791,6 @@ async fn stopping_the_daemon_releases_the_seed_even_with_a_clone_outstanding() {
         .expect("shut the host down");
 
     // The clone is still alive and still answers — and no longer holds anything.
-    let frozen: Vec<PathBuf> = retained
-        .seeds()
-        .iter()
-        .map(|info| info.seed.clone())
-        .collect();
-    let mut both = vec![first.clone(), second.clone()];
-    both.sort();
-    assert_eq!(
-        frozen, both,
-        "a closed handle still answers which seeds were served"
-    );
-    assert!(retained.history(&first).is_some() && retained.history(&second).is_some());
     assert!(retained.jobs().is_empty());
     assert!(matches!(
         retained
@@ -1125,7 +799,7 @@ async fn stopping_the_daemon_releases_the_seed_even_with_a_clone_outstanding() {
         Err(IoError::Closed)
     ));
 
-    reopen_and_publish_on_both(fs, scratch_root.join("reopened.sock"), &seed, &other).await;
+    reopen_and_publish_on_both(fs, &scratch.path().join("reopened.sock"), &seed, &other).await;
     // Still in scope for the whole run, and still harmless: a retained handle never pinned a
     // seed, before or after the reopen.
     drop(retained);
@@ -1142,25 +816,19 @@ async fn stopping_the_daemon_releases_the_seed_even_with_a_clone_outstanding() {
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
 async fn an_external_stop_releases_the_seed_too() {
-    let host = Host::new(&[]).await;
-    let seed = host.seed.clone();
-    let other = host.other.clone();
-    let first = canonical(&seed);
-    let second = canonical(&other);
-    let scratch_root = seed
-        .parent()
-        .expect("the seed sits in a scratch root")
-        .to_path_buf();
-    let fs = Arc::clone(&host.fs) as Arc<dyn marsh_btrfs::Subvolumes>;
+    let host = Host::new().await;
     let retained = host.io.clone();
 
     // Two shells on two seeds: two leases, taken by the shells rather than by the host.
-    publish_in(&host.io, &seed, "a", "printf a > held-a").await;
-    publish_in(&host.io, &other, "b", "printf b > held-b").await;
+    publish_in(&host.io, &host.seed, "a", "printf a > held-a").await;
+    publish_in(&host.io, &host.other, "b", "printf b > held-b").await;
 
     let Host {
         rmux,
-        _scratch: scratch,
+        seed,
+        other,
+        fs,
+        scratch,
         ..
     } = host;
     let rmux = rmux.expect("the host is running");
@@ -1204,21 +872,9 @@ async fn an_external_stop_releases_the_seed_too() {
         "an externally stopped daemon removes its socket"
     );
 
-    let mut both = vec![first.clone(), second.clone()];
-    both.sort();
-    let frozen: Vec<PathBuf> = retained
-        .seeds()
-        .iter()
-        .map(|info| info.seed.clone())
-        .collect();
-    assert_eq!(
-        frozen, both,
-        "an externally stopped daemon still leaves its clone the record of both seeds"
-    );
-    assert!(retained.history(&first).is_some() && retained.history(&second).is_some());
     assert!(retained.jobs().is_empty());
 
-    reopen_and_publish_on_both(fs, scratch_root.join("reopened.sock"), &seed, &other).await;
+    reopen_and_publish_on_both(fs, &scratch.path().join("reopened.sock"), &seed, &other).await;
     drop(retained);
     drop(scratch);
 }
@@ -1232,18 +888,10 @@ async fn an_external_stop_releases_the_seed_too() {
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
 async fn an_uncomposable_workload_leaves_no_job_behind() {
-    let host = Host::new(&[]).await;
+    let host = Host::new().await;
     let before = host.io.jobs().len();
 
-    let refused = host
-        .io
-        .execute(ExecutionSpec {
-            initial_dir: PathBuf::new(),
-            id: None,
-            process: rmux_proto::ProcessCommand::Argv(Vec::new()),
-            environment: None,
-        })
-        .await;
+    let refused = admit(&host.io, ProcessCommand::Argv(Vec::new())).await;
 
     assert!(refused.is_err(), "an empty argv names no program");
     assert_eq!(
@@ -1263,21 +911,10 @@ async fn an_uncomposable_workload_leaves_no_job_behind() {
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
 async fn observing_a_stream_checks_the_host_before_the_channel() {
-    let first = Host::new(&[]).await;
-    let second = Host::new(&[]).await;
+    let first = Host::new().await;
+    let second = Host::new().await;
 
-    let job = first
-        .io
-        .open_shell(
-            Path::new(""),
-            None,
-            SpawnOptions {
-                io: JobIo::Pipes,
-                ..SpawnOptions::default()
-            },
-        )
-        .await
-        .expect("open a job on the first host");
+    let job = open(&first.io, None, pipes(), "open a job on the first host").await;
 
     assert!(
         matches!(
@@ -1315,31 +952,18 @@ async fn observing_a_stream_checks_the_host_before_the_channel() {
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
 async fn observing_a_closed_job_ends_rather_than_waits() {
-    let host = Host::new(&[]).await;
+    let host = Host::new().await;
 
-    let execution = host
-        .io
-        .execute(ExecutionSpec {
-            initial_dir: PathBuf::new(),
-            id: None,
-            process: rmux_proto::ProcessCommand::Shell("printf gone".to_string()),
-            environment: None,
-        })
-        .await
-        .expect("admit the workload");
+    let execution = execute(&host.io, "printf gone").await;
     let shell = execution.shell().clone();
 
-    let captured = tokio::time::timeout(TIMEOUT, execution.collect(CollectOptions::default()))
+    let captured = collect(execution, CollectOptions::default())
         .await
-        .expect("the workload finishes")
         .expect("the workload collects");
     assert_eq!(captured.stdout, b"gone");
 
     // The job is gone; the host is not.
-    tokio::time::timeout(TIMEOUT, shell.wait_closed())
-        .await
-        .expect("the job closes")
-        .expect("the closure resolves");
+    closed(&shell).await;
 
     let mut stream = host
         .io

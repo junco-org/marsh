@@ -1,30 +1,27 @@
 use super::*;
 use crate::handler::scripting_support::install_queue_exact_target_capture_pause;
-use crate::pane_io::AttachControl;
+use crate::test_fixtures::Grouped;
 
-// Source-file queues can nest command dispatch and attached rendering in one poll.
-// Mirror the daemon worker budget without depending on the test harness thread stack.
-const DAEMON_TEST_STACK_SIZE: usize = 8 * 1024 * 1024;
+/// `show-environment -g name` (`-h` when `hidden`).
+fn show_env_request(name: &str, hidden: bool) -> Request {
+    Request::ShowEnvironment(ShowEnvironmentRequest {
+        scope: ScopeSelector::Global,
+        name: Some(name.to_owned()),
+        hidden,
+        shell_format: false,
+    })
+}
 
-fn run_on_daemon_test_stack<F, Fut>(test: F)
-where
-    F: FnOnce() -> Fut + Send + 'static,
-    Fut: std::future::Future<Output = ()> + 'static,
-{
-    let worker = std::thread::Builder::new()
-        .name("source-file-test".to_owned())
-        .stack_size(DAEMON_TEST_STACK_SIZE)
-        .spawn(|| {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("source-file test runtime should build");
-            runtime.block_on(test());
-        })
-        .expect("source-file test worker should spawn");
-    if let Err(panic) = worker.join() {
-        std::panic::resume_unwind(panic);
-    }
+/// `show-options -v` of option `name` in `scope` (`-q` when `quiet`).
+fn show_option_request(scope: OptionScopeSelector, name: &str, quiet: bool) -> Request {
+    Request::ShowOptions(ShowOptionsRequest {
+        scope,
+        name: Some(name.to_owned()),
+        value_only: true,
+        include_inherited: false,
+        quiet,
+        include_hooks: false,
+    })
 }
 
 #[tokio::test]
@@ -46,9 +43,7 @@ async fn compact_short_options_execute_from_source_file() {
     assert!(matches!(response, Response::SourceFile(_)), "{response:?}");
     assert_eq!(
         handler
-            .handle(Request::ShowBuffer(ShowBufferRequest {
-                name: Some("compact-source".to_owned()),
-            }))
+            .handle(show_buffer_request("compact-source"))
             .await
             .command_output()
             .expect("source command after compact flags should execute")
@@ -62,28 +57,13 @@ async fn compact_short_options_execute_from_source_file() {
 async fn compact_hidden_select_pane_style_executes_from_source_file() {
     let handler = RequestHandler::new();
     let alpha = session_name("source-compact-select-style");
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: alpha.clone(),
-                detached: true,
-                size: Some(TerminalSize { cols: 80, rows: 24 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
-    assert!(matches!(
-        handler
-            .handle(Request::SplitWindow(SplitWindowRequest {
-                target: SplitWindowTarget::Pane(PaneTarget::with_window(alpha.clone(), 0, 0)),
-                direction: SplitDirection::Horizontal,
-                before: false,
-                environment: None,
-            }))
-            .await,
-        Response::SplitWindow(_)
-    ));
+    handler.create_session(&alpha).await;
+    handler
+        .handle_ok(SplitWindowRequest {
+            direction: SplitDirection::Horizontal,
+            ..Fixture::fixture(PaneTarget::with_window(alpha.clone(), 0, 0))
+        })
+        .await;
 
     let root = temp_root("compact-hidden-select-style");
     write_config(
@@ -182,19 +162,8 @@ fn source_file_preserves_target_client_and_show_hooks_flags() {
 async fn source_file_preserves_target_client_and_show_hooks_flags_body() {
     let handler = RequestHandler::new();
     let alpha = session_name("source-target-client");
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: alpha.clone(),
-                detached: true,
-                size: Some(TerminalSize { cols: 80, rows: 24 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
-    let (control_tx, mut control_rx) = tokio::sync::mpsc::unbounded_channel();
-    handler.register_attach(202, alpha, control_tx).await;
+    handler.create_session(&alpha).await;
+    let mut control_rx = handler.attach_client(202, alpha).await;
     while control_rx.try_recv().is_ok() {}
 
     let root = temp_root("target-client-flags");
@@ -222,7 +191,7 @@ async fn source_file_preserves_target_client_and_show_hooks_flags_body() {
     // render refresh that causes rides the same channel — in front of the overlay, because
     // `load-buffer` above reads its file in a managed job and takes real time. Position is not
     // the contract; delivery is.
-    let delivered = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    let delivered = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             match control_rx.recv().await {
                 Some(AttachControl::Overlay(_)) => return true,
@@ -244,9 +213,7 @@ async fn source_file_preserves_target_client_and_show_hooks_flags_body() {
     ] {
         assert_eq!(
             handler
-                .handle(Request::ShowBuffer(ShowBufferRequest {
-                    name: Some(name.to_owned()),
-                }))
+                .handle(show_buffer_request(name))
                 .await
                 .command_output()
                 .expect("source-created buffer")
@@ -261,25 +228,12 @@ async fn source_file_target_client_follows_the_same_registration_after_switch() 
     let handler = RequestHandler::new();
     let before_switch = session_name("source-display-client-before-switch");
     let after_switch = session_name("source-display-client-after-switch");
-    for name in [before_switch.clone(), after_switch.clone()] {
-        assert!(matches!(
-            handler
-                .handle(Request::NewSession(NewSessionRequest {
-                    session_name: name,
-                    detached: true,
-                    size: Some(TerminalSize { cols: 80, rows: 24 }),
-                    environment: None,
-                }))
-                .await,
-            Response::NewSession(_)
-        ));
+    for name in [&before_switch, &after_switch] {
+        handler.create_session(name).await;
     }
 
     let attach_pid = 91_943;
-    let (control_tx, mut control_rx) = tokio::sync::mpsc::unbounded_channel();
-    handler
-        .register_attach(attach_pid, before_switch, control_tx)
-        .await;
+    let mut control_rx = handler.attach_client(attach_pid, before_switch).await;
     while control_rx.try_recv().is_ok() {}
 
     let root = temp_root("target-client-switch");
@@ -337,7 +291,7 @@ async fn source_file_background_run_shell_preserves_its_implicit_target() {
     let alpha = session_name("source-background-target-alpha");
     let beta = session_name("source-background-target-beta");
     let expected_window_name = "source-background-fixed-target";
-    create_background_identity_session(&handler, alpha.clone()).await;
+    handler.create_session(&alpha).await;
 
     // The sourced file's directory NAMES the seed the queued `run-shell` publishes into, so it
     // has to live in this handler's. A host temp path is outside every seed and the source fails
@@ -366,7 +320,7 @@ async fn source_file_background_run_shell_preserves_its_implicit_target() {
         String::from_utf8_lossy(&sourced.stderr)
     );
 
-    create_background_identity_session(&handler, beta.clone()).await;
+    handler.create_session(&beta).await;
 
     wait_for_active_window_name(&handler, &alpha, expected_window_name).await;
     let state = handler.state.lock().await;
@@ -514,7 +468,7 @@ async fn source_file_rejects_unknown_options_before_command_tails() {
         );
 
         let response = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
+            Duration::from_secs(5),
             handler.handle(source_file_request(
                 vec!["main.conf".to_owned()],
                 Some(root.clone()),
@@ -533,11 +487,7 @@ async fn source_file_rejects_unknown_options_before_command_tails() {
         );
         assert!(
             matches!(
-                handler
-                    .handle(Request::ShowBuffer(ShowBufferRequest {
-                        name: Some(canary),
-                    }))
-                    .await,
+                handler.handle(show_buffer_request(&canary)).await,
                 Response::Error(_)
             ),
             "source-file executed commands after {label}'s validation error"
@@ -556,12 +506,13 @@ async fn source_file_uses_shared_parser_for_conditions_comments_and_continuation
         "# ignored comment\n%if #{current_file}\nset-buffer -b chosen yes\\\n-suffix\n%else\nset-buffer -b chosen no\n%endif\n",
     );
 
-    let mut request = match source_file_request(vec!["main.conf".to_owned()], Some(root.clone())) {
-        Request::SourceFile(request) => request,
-        _ => unreachable!("source file request"),
-    };
-    request.verbose = true;
-    let response = handler.handle(Request::SourceFile(request)).await;
+    let request = SourceFileRequest {
+        verbose: true,
+        caller_cwd: Some(root.clone()),
+        ..Fixture::fixture(["main.conf"])
+    }
+    .into_request();
+    let response = handler.handle(request).await;
 
     let output = response
         .command_output()
@@ -575,9 +526,7 @@ async fn source_file_uses_shared_parser_for_conditions_comments_and_continuation
     );
     assert_eq!(
         handler
-            .handle(Request::ShowBuffer(ShowBufferRequest {
-                name: Some("chosen".to_owned()),
-            }))
+            .handle(show_buffer_request("chosen"))
             .await
             .command_output()
             .expect("chosen buffer output")
@@ -606,9 +555,7 @@ async fn source_file_handles_crlf_backslash_continuations() {
     );
     assert_eq!(
         handler
-            .handle(Request::ShowBuffer(ShowBufferRequest {
-                name: Some("crlf".to_owned()),
-            }))
+            .handle(show_buffer_request("crlf"))
             .await
             .command_output()
             .expect("crlf buffer output")
@@ -624,14 +571,15 @@ async fn source_file_parse_only_verbose_uses_tmux37_end_lines_for_multiline_stri
     let config = root.join("main.conf");
     write_config(&config, "display-message -p \"a\nb\"\nset -g @after yes\n");
 
-    let mut request = match source_file_request(vec!["main.conf".to_owned()], Some(root)) {
-        Request::SourceFile(request) => request,
-        _ => unreachable!("source file request"),
-    };
-    request.parse_only = true;
-    request.verbose = true;
+    let request = SourceFileRequest {
+        parse_only: true,
+        verbose: true,
+        caller_cwd: Some(root),
+        ..Fixture::fixture(["main.conf"])
+    }
+    .into_request();
 
-    let Response::SourceFile(response) = handler.handle(Request::SourceFile(request)).await else {
+    let Response::SourceFile(response) = handler.handle(request).await else {
         panic!("expected source-file -n -v to return verbose output");
     };
     let stdout = response
@@ -657,13 +605,14 @@ async fn source_file_parse_only_validation_errors_use_multiline_command_end_line
         "new-window -Q \"x\ny\"\nset -g @after yes\n",
     );
 
-    let mut request = match source_file_request(vec!["main.conf".to_owned()], Some(root)) {
-        Request::SourceFile(request) => request,
-        _ => unreachable!("source file request"),
-    };
-    request.parse_only = true;
+    let request = SourceFileRequest {
+        parse_only: true,
+        caller_cwd: Some(root),
+        ..Fixture::fixture(["main.conf"])
+    }
+    .into_request();
 
-    let Response::Error(error) = handler.handle(Request::SourceFile(request)).await else {
+    let Response::Error(error) = handler.handle(request).await else {
         panic!("expected source-file -n to reject invalid flag");
     };
     assert!(
@@ -700,11 +649,7 @@ async fn source_file_unquoted_percent_word_is_fatal_syntax_error() {
         error
     );
     assert!(matches!(
-        handler
-            .handle(Request::ShowBuffer(ShowBufferRequest {
-                name: Some("after".to_owned()),
-            }))
-            .await,
+        handler.handle(show_buffer_request("after")).await,
         Response::Error(_)
     ));
 }
@@ -736,11 +681,7 @@ async fn source_file_utf8_bom_is_not_stripped_like_tmux() {
         error
     );
     assert!(matches!(
-        handler
-            .handle(Request::ShowBuffer(ShowBufferRequest {
-                name: Some("after".to_owned()),
-            }))
-            .await,
+        handler.handle(show_buffer_request("after")).await,
         Response::Error(_)
     ));
 }
@@ -775,11 +716,7 @@ async fn source_file_reversed_bom_is_not_a_read_error_or_valid_command() {
         "source-file should parse lossy text like tmux, got {message}"
     );
     assert!(matches!(
-        handler
-            .handle(Request::ShowBuffer(ShowBufferRequest {
-                name: Some("after".to_owned()),
-            }))
-            .await,
+        handler.handle(show_buffer_request("after")).await,
         Response::Error(_)
     ));
 }
@@ -794,13 +731,14 @@ async fn source_file_execute_verbose_reports_lookup_prefix_without_running_bad_f
         "set-buffer -b before yes\nbogus\nset-buffer -b after yes\n",
     );
 
-    let mut request = match source_file_request(vec!["main.conf".to_owned()], Some(root)) {
-        Request::SourceFile(request) => request,
-        _ => unreachable!("source file request"),
-    };
-    request.verbose = true;
+    let request = SourceFileRequest {
+        verbose: true,
+        caller_cwd: Some(root),
+        ..Fixture::fixture(["main.conf"])
+    }
+    .into_request();
 
-    let Response::SourceFile(response) = handler.handle(Request::SourceFile(request)).await else {
+    let Response::SourceFile(response) = handler.handle(request).await else {
         panic!("source-file -v should return verbose output plus parse error");
     };
     assert_eq!(response.exit_status(), Some(1));
@@ -820,11 +758,7 @@ async fn source_file_execute_verbose_reports_lookup_prefix_without_running_bad_f
     for name in ["before", "after"] {
         assert!(
             matches!(
-                handler
-                    .handle(Request::ShowBuffer(ShowBufferRequest {
-                        name: Some(name.to_owned()),
-                    }))
-                    .await,
+                handler.handle(show_buffer_request(name)).await,
                 Response::Error(_)
             ),
             "{name} should not run from a file with a lookup parse error"
@@ -839,13 +773,14 @@ async fn source_file_verbose_execution_errors_go_to_stderr() {
     let config = root.join("main.conf");
     write_config(&config, "set-option -g xyzzy on\n");
 
-    let mut request = match source_file_request(vec!["main.conf".to_owned()], Some(root)) {
-        Request::SourceFile(request) => request,
-        _ => unreachable!("source file request"),
-    };
-    request.verbose = true;
+    let request = SourceFileRequest {
+        verbose: true,
+        caller_cwd: Some(root),
+        ..Fixture::fixture(["main.conf"])
+    }
+    .into_request();
 
-    let Response::SourceFile(response) = handler.handle(Request::SourceFile(request)).await else {
+    let Response::SourceFile(response) = handler.handle(request).await else {
         panic!("source-file -v should return verbose output plus execution stderr");
     };
     assert_eq!(response.exit_status(), Some(1));
@@ -902,13 +837,14 @@ async fn source_file_parse_only_reports_parse_without_executing() {
     let config = root.join("main.conf");
     write_config(&config, "set-buffer -b parsed value\n");
 
-    let mut request = match source_file_request(vec!["main.conf".to_owned()], Some(root)) {
-        Request::SourceFile(request) => request,
-        _ => unreachable!("source file request"),
-    };
-    request.parse_only = true;
-    request.verbose = true;
-    let response = handler.handle(Request::SourceFile(request)).await;
+    let request = SourceFileRequest {
+        parse_only: true,
+        verbose: true,
+        caller_cwd: Some(root),
+        ..Fixture::fixture(["main.conf"])
+    }
+    .into_request();
+    let response = handler.handle(request).await;
 
     assert!(std::str::from_utf8(
         response
@@ -919,11 +855,7 @@ async fn source_file_parse_only_reports_parse_without_executing() {
     .expect("verbose output is UTF-8")
     .contains("set-buffer -b parsed value"));
     assert!(matches!(
-        handler
-            .handle(Request::ShowBuffer(ShowBufferRequest {
-                name: Some("parsed".to_owned()),
-            }))
-            .await,
+        handler.handle(show_buffer_request("parsed")).await,
         Response::Error(_)
     ));
 }
@@ -932,13 +864,8 @@ async fn source_file_parse_only_reports_parse_without_executing() {
 async fn internal_runtime_expansion_skips_source_only_flag_validation_without_executing() {
     let handler = RequestHandler::new();
     let request = SourceFileRequest {
-        paths: vec![INTERNAL_RUNTIME_COMMAND_EXPANSION_PATH.to_owned()],
-        quiet: false,
         parse_only: true,
         verbose: true,
-        expand_paths: false,
-        target: None,
-        caller_cwd: None,
         stdin: Some(
             encode_internal_runtime_command_arguments(&[
                 "set-environment".to_owned(),
@@ -948,11 +875,10 @@ async fn internal_runtime_expansion_skips_source_only_flag_validation_without_ex
             ])
             .expect("runtime argv serializes"),
         ),
+        ..Fixture::fixture([INTERNAL_RUNTIME_COMMAND_EXPANSION_PATH])
     };
 
-    let Response::SourceFile(response) =
-        handler.handle(Request::SourceFile(Box::new(request))).await
-    else {
+    let Response::SourceFile(response) = handler.handle(request.into_request()).await else {
         panic!("internal runtime expansion should return canonical output");
     };
     assert_eq!(response.exit_status(), None);
@@ -964,14 +890,7 @@ async fn internal_runtime_expansion_skips_source_only_flag_validation_without_ex
         b"set-environment -gh SECRET value"
     );
     assert!(matches!(
-        handler
-            .handle(Request::ShowEnvironment(ShowEnvironmentRequest {
-                scope: ScopeSelector::Global,
-                name: Some("SECRET".to_owned()),
-                hidden: true,
-                shell_format: false,
-            }))
-            .await,
+        handler.handle(show_env_request("SECRET", true)).await,
         Response::Error(_)
     ));
 }
@@ -979,41 +898,18 @@ async fn internal_runtime_expansion_skips_source_only_flag_validation_without_ex
 #[tokio::test]
 async fn internal_parse_time_assignments_apply_visible_and_hidden_values() {
     let handler = RequestHandler::new();
-    let request = SourceFileRequest {
-        paths: vec![INTERNAL_PARSE_TIME_ASSIGNMENTS_PATH.to_owned()],
-        quiet: false,
-        parse_only: false,
-        verbose: false,
-        expand_paths: false,
-        target: None,
-        caller_cwd: None,
-        stdin: Some("FOO=bar ; %hidden SECRET=shh".to_owned()),
-    };
-
+    handler
+        .handle_ok(SourceFileRequest {
+            stdin: Some("FOO=bar ; %hidden SECRET=shh".to_owned()),
+            ..Fixture::fixture([INTERNAL_PARSE_TIME_ASSIGNMENTS_PATH])
+        })
+        .await;
     assert!(matches!(
-        handler.handle(Request::SourceFile(Box::new(request))).await,
-        Response::SourceFile(_)
-    ));
-    assert!(matches!(
-        handler
-            .handle(Request::ShowEnvironment(ShowEnvironmentRequest {
-                scope: ScopeSelector::Global,
-                name: Some("FOO".to_owned()),
-                hidden: false,
-                shell_format: false,
-            }))
-            .await,
+        handler.handle(show_env_request("FOO", false)).await,
         Response::ShowEnvironment(_)
     ));
     assert!(matches!(
-        handler
-            .handle(Request::ShowEnvironment(ShowEnvironmentRequest {
-                scope: ScopeSelector::Global,
-                name: Some("SECRET".to_owned()),
-                hidden: true,
-                shell_format: false,
-            }))
-            .await,
+        handler.handle(show_env_request("SECRET", true)).await,
         Response::ShowEnvironment(_)
     ));
 }
@@ -1022,29 +918,16 @@ async fn internal_parse_time_assignments_apply_visible_and_hidden_values() {
 async fn internal_parse_time_assignment_payload_rejects_commands_atomically() {
     let handler = RequestHandler::new();
     let request = SourceFileRequest {
-        paths: vec![INTERNAL_PARSE_TIME_ASSIGNMENTS_PATH.to_owned()],
-        quiet: false,
-        parse_only: false,
-        verbose: false,
-        expand_paths: false,
-        target: None,
-        caller_cwd: None,
         stdin: Some("FOO=bar ; display-message no".to_owned()),
+        ..Fixture::fixture([INTERNAL_PARSE_TIME_ASSIGNMENTS_PATH])
     };
 
     assert!(matches!(
-        handler.handle(Request::SourceFile(Box::new(request))).await,
+        handler.handle(request.into_request()).await,
         Response::Error(_)
     ));
     assert!(matches!(
-        handler
-            .handle(Request::ShowEnvironment(ShowEnvironmentRequest {
-                scope: ScopeSelector::Global,
-                name: Some("FOO".to_owned()),
-                hidden: false,
-                shell_format: false,
-            }))
-            .await,
+        handler.handle(show_env_request("FOO", false)).await,
         Response::Error(_)
     ));
 }
@@ -1058,26 +941,17 @@ async fn mixed_or_unknown_internal_source_paths_fail_closed_without_execution() 
         INTERNAL_CANONICAL_COMMAND_EXECUTION_PATH,
         "\0rmux-unknown-internal-v1",
     ] {
-        let response = handler
-            .handle(Request::SourceFile(Box::new(SourceFileRequest {
-                paths: vec![reserved_path.to_owned(), "-".to_owned()],
-                quiet: false,
-                parse_only: false,
-                verbose: false,
-                expand_paths: false,
-                target: None,
-                caller_cwd: None,
-                stdin: Some("set-buffer -b internal-path-canary mutated".to_owned()),
-            })))
-            .await;
+        let request = SourceFileRequest {
+            stdin: Some("set-buffer -b internal-path-canary mutated".to_owned()),
+            ..Fixture::fixture([reserved_path, "-"])
+        };
+        let response = handler.handle(request.into_request()).await;
         assert!(matches!(response, Response::Error(_)), "{response:?}");
     }
 
     assert!(matches!(
         handler
-            .handle(Request::ShowBuffer(ShowBufferRequest {
-                name: Some("internal-path-canary".to_owned()),
-            }))
+            .handle(show_buffer_request("internal-path-canary"))
             .await,
         Response::Error(_)
     ));
@@ -1090,13 +964,14 @@ async fn source_file_parse_only_validates_command_flags_without_executing() {
     let config = root.join("main.conf");
     write_config(&config, "new-window -Q\nset-buffer -b parsed value\n");
 
-    let mut request = match source_file_request(vec!["main.conf".to_owned()], Some(root)) {
-        Request::SourceFile(request) => request,
-        _ => unreachable!("source file request"),
-    };
-    request.parse_only = true;
+    let request = SourceFileRequest {
+        parse_only: true,
+        caller_cwd: Some(root),
+        ..Fixture::fixture(["main.conf"])
+    }
+    .into_request();
 
-    let response = handler.handle(Request::SourceFile(request)).await;
+    let response = handler.handle(request).await;
 
     let Response::Error(response) = response else {
         panic!("expected source-file -n to reject invalid command flags");
@@ -1110,11 +985,7 @@ async fn source_file_parse_only_validates_command_flags_without_executing() {
         response.error
     );
     assert!(matches!(
-        handler
-            .handle(Request::ShowBuffer(ShowBufferRequest {
-                name: Some("parsed".to_owned()),
-            }))
-            .await,
+        handler.handle(show_buffer_request("parsed")).await,
         Response::Error(_)
     ));
 }
@@ -1132,23 +1003,20 @@ async fn source_file_parse_only_does_not_load_nested_source_files() {
         "set-buffer -b inner parsed\nnew-window -Q\n",
     );
 
-    let mut request = match source_file_request(vec!["main.conf".to_owned()], Some(root)) {
-        Request::SourceFile(request) => request,
-        _ => unreachable!("source file request"),
-    };
-    request.parse_only = true;
+    let request = SourceFileRequest {
+        parse_only: true,
+        caller_cwd: Some(root),
+        ..Fixture::fixture(["main.conf"])
+    }
+    .into_request();
 
     assert_eq!(
-        handler.handle(Request::SourceFile(request)).await,
+        handler.handle(request).await,
         Response::SourceFile(rmux_proto::SourceFileResponse::no_output())
     );
     for name in ["inner", "outer"] {
         assert!(matches!(
-            handler
-                .handle(Request::ShowBuffer(ShowBufferRequest {
-                    name: Some(name.to_owned()),
-                }))
-                .await,
+            handler.handle(show_buffer_request(name)).await,
             Response::Error(_)
         ));
     }
@@ -1168,14 +1036,15 @@ async fn source_file_parse_only_does_not_load_if_shell_nested_source_files() {
         ),
     );
 
-    let mut request = match source_file_request(vec!["main.conf".to_owned()], Some(root)) {
-        Request::SourceFile(request) => request,
-        _ => unreachable!("source file request"),
-    };
-    request.parse_only = true;
-    request.verbose = true;
+    let request = SourceFileRequest {
+        parse_only: true,
+        verbose: true,
+        caller_cwd: Some(root),
+        ..Fixture::fixture(["main.conf"])
+    }
+    .into_request();
 
-    let response = handler.handle(Request::SourceFile(request)).await;
+    let response = handler.handle(request).await;
     let output = response
         .command_output()
         .expect("parse-only verbose output");
@@ -1193,13 +1062,14 @@ async fn source_file_parse_only_stops_at_first_command_validation_error() {
         "new-window -Q\nserver-access --help\n",
     );
 
-    let mut request = match source_file_request(vec!["main.conf".to_owned()], Some(root)) {
-        Request::SourceFile(request) => request,
-        _ => unreachable!("source file request"),
-    };
-    request.parse_only = true;
+    let request = SourceFileRequest {
+        parse_only: true,
+        caller_cwd: Some(root),
+        ..Fixture::fixture(["main.conf"])
+    }
+    .into_request();
 
-    let Response::Error(response) = handler.handle(Request::SourceFile(request)).await else {
+    let Response::Error(response) = handler.handle(request).await else {
         panic!("expected source-file -n to reject the first invalid command flag");
     };
     let message = response.error.to_string();
@@ -1222,14 +1092,15 @@ async fn source_file_parse_only_verbose_omits_commands_after_first_error() {
         "set -g @before yes\nnew-window -Q\nset -g @after yes\n",
     );
 
-    let mut request = match source_file_request(vec!["main.conf".to_owned()], Some(root)) {
-        Request::SourceFile(request) => request,
-        _ => unreachable!("source file request"),
-    };
-    request.parse_only = true;
-    request.verbose = true;
+    let request = SourceFileRequest {
+        parse_only: true,
+        verbose: true,
+        caller_cwd: Some(root),
+        ..Fixture::fixture(["main.conf"])
+    }
+    .into_request();
 
-    let Response::SourceFile(response) = handler.handle(Request::SourceFile(request)).await else {
+    let Response::SourceFile(response) = handler.handle(request).await else {
         panic!("expected source-file -n -v to return tmux-style stdout");
     };
     assert_eq!(response.exit_status(), Some(1));
@@ -1261,14 +1132,15 @@ async fn source_file_parse_only_verbose_omits_commands_after_first_parse_error()
         "set -g @before yes\nbogus\nset -g @after yes\n",
     );
 
-    let mut request = match source_file_request(vec!["main.conf".to_owned()], Some(root)) {
-        Request::SourceFile(request) => request,
-        _ => unreachable!("source file request"),
-    };
-    request.parse_only = true;
-    request.verbose = true;
+    let request = SourceFileRequest {
+        parse_only: true,
+        verbose: true,
+        caller_cwd: Some(root),
+        ..Fixture::fixture(["main.conf"])
+    }
+    .into_request();
 
-    let Response::SourceFile(response) = handler.handle(Request::SourceFile(request)).await else {
+    let Response::SourceFile(response) = handler.handle(request).await else {
         panic!("expected source-file -n -v to return tmux-style stdout");
     };
     assert_eq!(response.exit_status(), Some(1));
@@ -1300,13 +1172,14 @@ async fn source_file_parse_only_validates_nested_command_blocks() {
         "if-shell -F 1 { new-window -Q }\nset-buffer -b after parsed\n",
     );
 
-    let mut request = match source_file_request(vec!["main.conf".to_owned()], Some(root)) {
-        Request::SourceFile(request) => request,
-        _ => unreachable!("source file request"),
-    };
-    request.parse_only = true;
+    let request = SourceFileRequest {
+        parse_only: true,
+        caller_cwd: Some(root),
+        ..Fixture::fixture(["main.conf"])
+    }
+    .into_request();
 
-    let Response::Error(response) = handler.handle(Request::SourceFile(request)).await else {
+    let Response::Error(response) = handler.handle(request).await else {
         panic!("expected source-file -n to reject invalid command inside block");
     };
     assert!(
@@ -1318,11 +1191,7 @@ async fn source_file_parse_only_validates_nested_command_blocks() {
         response.error
     );
     assert!(matches!(
-        handler
-            .handle(Request::ShowBuffer(ShowBufferRequest {
-                name: Some("after".to_owned()),
-            }))
-            .await,
+        handler.handle(show_buffer_request("after")).await,
         Response::Error(_)
     ));
 }
@@ -1336,13 +1205,14 @@ async fn source_file_parse_only_validates_embedded_binding_and_hook_commands() {
         "bind-key X { new-window -Q }\nset-hook -g after-new-session { server-access --help }\n",
     );
 
-    let mut request = match source_file_request(vec!["main.conf".to_owned()], Some(root)) {
-        Request::SourceFile(request) => request,
-        _ => unreachable!("source file request"),
-    };
-    request.parse_only = true;
+    let request = SourceFileRequest {
+        parse_only: true,
+        caller_cwd: Some(root),
+        ..Fixture::fixture(["main.conf"])
+    }
+    .into_request();
 
-    let Response::Error(response) = handler.handle(Request::SourceFile(request)).await else {
+    let Response::Error(response) = handler.handle(request).await else {
         panic!("expected source-file -n to reject invalid embedded commands");
     };
     let message = response.error.to_string();
@@ -1365,14 +1235,15 @@ async fn source_file_parse_only_preserves_bind_key_quoted_semicolons() {
         "bind-key X display-message \"foo; new-window -Q\"\n",
     );
 
-    let mut request = match source_file_request(vec!["main.conf".to_owned()], Some(root)) {
-        Request::SourceFile(request) => request,
-        _ => unreachable!("source file request"),
-    };
-    request.parse_only = true;
+    let request = SourceFileRequest {
+        parse_only: true,
+        caller_cwd: Some(root),
+        ..Fixture::fixture(["main.conf"])
+    }
+    .into_request();
 
     assert_eq!(
-        handler.handle(Request::SourceFile(request)).await,
+        handler.handle(request).await,
         Response::SourceFile(rmux_proto::SourceFileResponse::no_output())
     );
 }
@@ -1386,13 +1257,14 @@ async fn source_file_parse_only_rejects_server_access_help_and_bare_dash() {
         "server-access --help\nserver-access -\n",
     );
 
-    let mut request = match source_file_request(vec!["main.conf".to_owned()], Some(root)) {
-        Request::SourceFile(request) => request,
-        _ => unreachable!("source file request"),
-    };
-    request.parse_only = true;
+    let request = SourceFileRequest {
+        parse_only: true,
+        caller_cwd: Some(root),
+        ..Fixture::fixture(["main.conf"])
+    }
+    .into_request();
 
-    let Response::Error(response) = handler.handle(Request::SourceFile(request)).await else {
+    let Response::Error(response) = handler.handle(request).await else {
         panic!("expected source-file -n to reject invalid server-access flags");
     };
     let message = response.error.to_string();
@@ -1415,14 +1287,15 @@ async fn source_file_quiet_suppresses_missing_file_and_glob_miss() {
     let root = temp_root("quiet");
     fs::create_dir_all(&root).expect("quiet temp root");
 
-    let mut request = match source_file_request(vec!["missing*.conf".to_owned()], Some(root)) {
-        Request::SourceFile(request) => request,
-        _ => unreachable!("source file request"),
-    };
-    request.quiet = true;
+    let request = SourceFileRequest {
+        quiet: true,
+        caller_cwd: Some(root),
+        ..Fixture::fixture(["missing*.conf"])
+    }
+    .into_request();
 
     assert_eq!(
-        handler.handle(Request::SourceFile(request)).await,
+        handler.handle(request).await,
         Response::SourceFile(rmux_proto::SourceFileResponse::no_output())
     );
 }
@@ -1431,33 +1304,17 @@ async fn source_file_quiet_suppresses_missing_file_and_glob_miss() {
 async fn source_file_format_expands_path_against_target_context() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: alpha.clone(),
-                detached: true,
-                size: Some(TerminalSize { cols: 80, rows: 24 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
+    handler.create_session(&alpha).await;
 
     let root = temp_root("format-path");
     let config = root.join("alpha.conf");
     write_config(&config, "set-buffer -b formatted ok\n");
-    let response = handler
-        .handle(Request::SourceFile(Box::new(SourceFileRequest {
-            paths: vec![format!("{}/#{{session_name}}.conf", root.display())],
-            quiet: false,
-            parse_only: false,
-            verbose: false,
-            expand_paths: true,
-            target: Some(PaneTarget::with_window(alpha, 0, 0)),
-            caller_cwd: None,
-            stdin: None,
-        })))
-        .await;
+    let request = SourceFileRequest {
+        expand_paths: true,
+        target: Some(PaneTarget::with_window(alpha, 0, 0)),
+        ..Fixture::fixture([format!("{}/#{{session_name}}.conf", root.display())])
+    };
+    let response = handler.handle(request.into_request()).await;
 
     assert_eq!(
         response,
@@ -1465,9 +1322,7 @@ async fn source_file_format_expands_path_against_target_context() {
     );
     assert_eq!(
         handler
-            .handle(Request::ShowBuffer(ShowBufferRequest {
-                name: Some("formatted".to_owned()),
-            }))
+            .handle(show_buffer_request("formatted"))
             .await
             .command_output()
             .expect("formatted buffer output")
@@ -1480,17 +1335,7 @@ async fn source_file_format_expands_path_against_target_context() {
 async fn source_file_if_condition_uses_target_format_context_at_parse_time() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: alpha.clone(),
-                detached: true,
-                size: Some(TerminalSize { cols: 80, rows: 24 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
+    handler.create_session(&alpha).await;
 
     let root = temp_root("if-target-format");
     write_config(
@@ -1498,18 +1343,12 @@ async fn source_file_if_condition_uses_target_format_context_at_parse_time() {
         "%if #{session_name}\nset-buffer -b parse-target yes\n%else\nset-buffer -b parse-target no\n%endif\n",
     );
 
-    let response = handler
-        .handle(Request::SourceFile(Box::new(SourceFileRequest {
-            paths: vec!["target.conf".to_owned()],
-            quiet: false,
-            parse_only: false,
-            verbose: false,
-            expand_paths: false,
-            target: Some(PaneTarget::with_window(alpha, 0, 0)),
-            caller_cwd: Some(root),
-            stdin: None,
-        })))
-        .await;
+    let request = SourceFileRequest {
+        target: Some(PaneTarget::with_window(alpha, 0, 0)),
+        caller_cwd: Some(root),
+        ..Fixture::fixture(["target.conf"])
+    };
+    let response = handler.handle(request.into_request()).await;
 
     assert_eq!(
         response,
@@ -1517,9 +1356,7 @@ async fn source_file_if_condition_uses_target_format_context_at_parse_time() {
     );
     assert_eq!(
         handler
-            .handle(Request::ShowBuffer(ShowBufferRequest {
-                name: Some("parse-target".to_owned()),
-            }))
+            .handle(show_buffer_request("parse-target"))
             .await
             .command_output()
             .expect("parse-target buffer output")
@@ -1550,9 +1387,7 @@ async fn nested_source_file_format_expansion_sees_current_file() {
     );
     assert_eq!(
         handler
-            .handle(Request::ShowBuffer(ShowBufferRequest {
-                name: Some("current-file".to_owned()),
-            }))
+            .handle(show_buffer_request("current-file"))
             .await
             .command_output()
             .expect("current-file buffer output")
@@ -1564,18 +1399,7 @@ async fn nested_source_file_format_expansion_sees_current_file() {
 #[tokio::test]
 async fn nested_source_file_format_path_inherits_current_target() {
     let handler = RequestHandler::new();
-    let session = session_name("s");
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: session.clone(),
-                detached: true,
-                size: Some(TerminalSize { cols: 80, rows: 24 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
+    handler.create_session("s").await;
 
     let root = temp_root("nested-format-option-path");
     write_config(
@@ -1597,9 +1421,7 @@ async fn nested_source_file_format_path_inherits_current_target() {
     );
     assert_eq!(
         handler
-            .handle(Request::ShowBuffer(ShowBufferRequest {
-                name: Some("nested-target".to_owned()),
-            }))
+            .handle(show_buffer_request("nested-target"))
             .await
             .command_output()
             .expect("nested-target buffer output")
@@ -1614,17 +1436,7 @@ async fn queued_source_file_accepts_compact_format_target_with_attached_value() 
     let alpha = session_name("alpha");
     let beta = session_name("beta");
     for session in [&alpha, &beta] {
-        assert!(matches!(
-            handler
-                .handle(Request::NewSession(NewSessionRequest {
-                    session_name: session.clone(),
-                    detached: true,
-                    size: Some(TerminalSize { cols: 80, rows: 24 }),
-                    environment: None,
-                }))
-                .await,
-            Response::NewSession(_)
-        ));
+        handler.create_session(session).await;
     }
 
     let root = temp_root("source-file-compact-format-target");
@@ -1648,9 +1460,7 @@ async fn queued_source_file_accepts_compact_format_target_with_attached_value() 
     assert_eq!(output.stdout(), b"beta\n");
     assert_eq!(
         handler
-            .handle(Request::ShowBuffer(ShowBufferRequest {
-                name: Some("compact-source".to_owned()),
-            }))
+            .handle(show_buffer_request("compact-source"))
             .await
             .command_output()
             .expect("compact-source buffer output")
@@ -1668,78 +1478,38 @@ async fn queued_source_file_target_finder_uses_active_indexed_pane() {
         (OptionName::BaseIndex, "3"),
         (OptionName::PaneBaseIndex, "4"),
     ] {
-        assert!(matches!(
-            handler
-                .handle(Request::SetOption(SetOptionRequest {
-                    scope: ScopeSelector::Global,
-                    option,
-                    value: value.to_owned(),
-                    mode: SetOptionMode::Replace,
-                }))
-                .await,
-            Response::SetOption(_)
-        ));
+        handler
+            .set_option(ScopeSelector::Global, option, value)
+            .await;
     }
 
     let beta = session_name("beta");
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: beta.clone(),
-                detached: true,
-                size: Some(TerminalSize { cols: 80, rows: 24 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
-    assert!(matches!(
-        handler
-            .handle(Request::NewWindow(Box::new(NewWindowRequest {
-                target: beta.clone(),
-                name: Some("active".to_owned()),
-                detached: true,
-                start_directory: None,
-                environment: None,
-                command: None,
-                process_command: None,
-                target_window_index: Some(5),
-                insert_at_target: false,
-            })))
-            .await,
-        Response::NewWindow(_)
-    ));
-    assert!(matches!(
-        handler
-            .handle(Request::SplitWindow(SplitWindowRequest {
-                target: SplitWindowTarget::Pane(PaneTarget::with_window(beta.clone(), 5, 0)),
-                direction: SplitDirection::Horizontal,
-                before: false,
-                environment: None,
-            }))
-            .await,
-        Response::SplitWindow(_)
-    ));
-    assert!(matches!(
-        handler
-            .handle(Request::SelectWindow(rmux_proto::SelectWindowRequest {
-                target: WindowTarget::with_window(beta.clone(), 5),
-            }))
-            .await,
-        Response::SelectWindow(_)
-    ));
-    assert!(matches!(
-        handler
-            .handle(Request::SelectPane(Box::new(SelectPaneRequest {
-                target: PaneTarget::with_window(beta.clone(), 5, 1),
-                title: None,
-                style: None,
-                input_disabled: None,
-                preserve_zoom: false,
-            })))
-            .await,
-        Response::SelectPane(_)
-    ));
+    handler.create_session(&beta).await;
+    handler
+        .create_window(NewWindowRequest {
+            name: Some("active".to_owned()),
+            target_window_index: Some(5),
+            ..Fixture::fixture(&beta)
+        })
+        .await;
+    handler
+        .handle_ok(SplitWindowRequest {
+            direction: SplitDirection::Horizontal,
+            ..Fixture::fixture(PaneTarget::with_window(beta.clone(), 5, 0))
+        })
+        .await;
+    handler
+        .handle_ok(rmux_proto::SelectWindowRequest {
+            target: WindowTarget::with_window(beta.clone(), 5),
+        })
+        .await;
+    handler
+        .handle_ok(SelectPaneRequest::fixture(PaneTarget::with_window(
+            beta.clone(),
+            5,
+            1,
+        )))
+        .await;
 
     let root = temp_root("source-file-active-indexed-pane");
     write_config(
@@ -1814,14 +1584,11 @@ async fn queued_source_file_preserves_assignment_order_across_multi_paths() {
     }
     assert_eq!(
         handler
-            .handle(Request::ShowOptions(rmux_proto::ShowOptionsRequest {
-                scope: OptionScopeSelector::SessionGlobal,
-                name: Some("@queued_order".to_owned()),
-                value_only: true,
-                include_inherited: false,
-                quiet: false,
-                include_hooks: false,
-            }))
+            .handle(show_option_request(
+                OptionScopeSelector::SessionGlobal,
+                "@queued_order",
+                false,
+            ))
             .await
             .command_output()
             .expect("queued source option output")
@@ -1830,14 +1597,11 @@ async fn queued_source_file_preserves_assignment_order_across_multi_paths() {
     );
     assert!(
         handler
-            .handle(Request::ShowOptions(rmux_proto::ShowOptionsRequest {
-                scope: OptionScopeSelector::SessionGlobal,
-                name: Some("@queued_must_not_run".to_owned()),
-                value_only: true,
-                include_inherited: false,
-                quiet: true,
-                include_hooks: false,
-            }))
+            .handle(show_option_request(
+                OptionScopeSelector::SessionGlobal,
+                "@queued_must_not_run",
+                true,
+            ))
             .await
             .command_output()
             .expect("queued quiet show-options output")
@@ -1852,17 +1616,7 @@ async fn queued_source_file_preserves_assignment_order_across_multi_paths() {
 async fn queued_display_message_accepts_compact_print_and_commands_flags() {
     let handler = RequestHandler::new();
     let alpha = session_name("display-compact-pc");
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: alpha.clone(),
-                detached: true,
-                size: Some(TerminalSize { cols: 80, rows: 24 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
+    handler.create_session(&alpha).await;
 
     let parsed = CommandParser::new()
         .parse("display-message -pC '#{session_name}'")
@@ -1886,35 +1640,15 @@ async fn source_file_set_window_option_alias_uses_explicit_window_target_metadat
     let alpha = session_name("alpha");
     let beta = session_name("beta");
     for session in [&alpha, &beta] {
-        assert!(matches!(
-            handler
-                .handle(Request::NewSession(NewSessionRequest {
-                    session_name: session.clone(),
-                    detached: true,
-                    size: Some(TerminalSize { cols: 80, rows: 24 }),
-                    environment: None,
-                }))
-                .await,
-            Response::NewSession(_)
-        ));
+        handler.create_session(session).await;
     }
     for (session, name) in [(&alpha, "one"), (&alpha, "named"), (&beta, "other")] {
-        assert!(matches!(
-            handler
-                .handle(Request::NewWindow(Box::new(NewWindowRequest {
-                    target: session.clone(),
-                    name: Some(name.to_owned()),
-                    detached: true,
-                    start_directory: None,
-                    environment: None,
-                    command: None,
-                    process_command: None,
-                    target_window_index: None,
-                    insert_at_target: false,
-                })))
-                .await,
-            Response::NewWindow(_)
-        ));
+        handler
+            .create_window(NewWindowRequest {
+                name: Some(name.to_owned()),
+                ..Fixture::fixture(session)
+            })
+            .await;
     }
 
     let root = temp_root("source-set-window-option-alias");
@@ -1971,16 +1705,12 @@ async fn source_file_set_window_option_alias_uses_explicit_window_target_metadat
         "set-option -w -t nosuch automatic-rename off\n",
     );
     let missing_source_request = |path: &str| {
-        Request::SourceFile(Box::new(SourceFileRequest {
-            paths: vec![path.to_owned()],
-            quiet: false,
-            parse_only: false,
-            verbose: false,
-            expand_paths: false,
+        SourceFileRequest {
             target: Some(PaneTarget::with_window(alpha.clone(), 0, 0)),
             caller_cwd: Some(root.clone()),
-            stdin: None,
-        }))
+            ..Fixture::fixture([path])
+        }
+        .into_request()
     };
 
     let Response::SourceFile(alias_response) = handler
@@ -2012,56 +1742,29 @@ async fn source_file_resolves_announced_window_and_pane_target_metadata() {
     let alpha = session_name("metadata-alpha");
     let beta = session_name("metadata-beta");
     for session in [&alpha, &beta] {
-        assert!(matches!(
-            handler
-                .handle(Request::NewSession(NewSessionRequest {
-                    session_name: session.clone(),
-                    detached: true,
-                    size: Some(TerminalSize { cols: 80, rows: 24 }),
-                    environment: None,
-                }))
-                .await,
-            Response::NewSession(_)
-        ));
+        handler.create_session(session).await;
     }
-    assert!(matches!(
-        handler
-            .handle(Request::NewWindow(Box::new(NewWindowRequest {
-                target: alpha.clone(),
-                name: Some("metadata-logs".to_owned()),
-                detached: true,
-                start_directory: None,
-                environment: None,
-                command: None,
-                process_command: None,
-                target_window_index: Some(1),
-                insert_at_target: false,
-            })))
-            .await,
-        Response::NewWindow(_)
-    ));
-    assert!(matches!(
-        handler
-            .handle(Request::SplitWindow(SplitWindowRequest {
-                target: SplitWindowTarget::Pane(PaneTarget::with_window(alpha.clone(), 0, 0)),
-                direction: SplitDirection::Vertical,
-                environment: None,
-                before: false,
-            }))
-            .await,
-        Response::SplitWindow(_)
-    ));
-    assert!(matches!(
-        handler
-            .handle(Request::SetOption(SetOptionRequest {
-                scope: ScopeSelector::Window(WindowTarget::with_window(alpha.clone(), 1)),
-                option: OptionName::AutomaticRename,
-                value: "off".to_owned(),
-                mode: SetOptionMode::Replace,
-            }))
-            .await,
-        Response::SetOption(_)
-    ));
+    handler
+        .create_window(NewWindowRequest {
+            name: Some("metadata-logs".to_owned()),
+            target_window_index: Some(1),
+            ..Fixture::fixture(&alpha)
+        })
+        .await;
+    handler
+        .handle_ok(SplitWindowRequest::fixture(PaneTarget::with_window(
+            alpha.clone(),
+            0,
+            0,
+        )))
+        .await;
+    handler
+        .set_option(
+            ScopeSelector::Window(WindowTarget::with_window(alpha.clone(), 1)),
+            OptionName::AutomaticRename,
+            "off",
+        )
+        .await;
     let pane_id = {
         let state = handler.state.lock().await;
         state
@@ -2123,18 +1826,8 @@ async fn source_file_resolves_announced_window_and_pane_target_metadata() {
 #[tokio::test]
 async fn nested_source_file_preserves_implicit_target_canfail_behavior() {
     let handler = RequestHandler::new();
-    for session in [session_name("alpha"), session_name("beta")] {
-        assert!(matches!(
-            handler
-                .handle(Request::NewSession(NewSessionRequest {
-                    session_name: session,
-                    detached: true,
-                    size: Some(TerminalSize { cols: 80, rows: 24 }),
-                    environment: None,
-                }))
-                .await,
-            Response::NewSession(_)
-        ));
+    for session in ["alpha", "beta"] {
+        handler.create_session(session).await;
     }
 
     let root = temp_root("nested-source-implicit-canfail");
@@ -2232,9 +1925,7 @@ async fn source_file_multiple_paths_loads_all_in_order() {
     );
     assert_eq!(
         handler
-            .handle(Request::ShowBuffer(ShowBufferRequest {
-                name: Some("multi".to_owned()),
-            }))
+            .handle(show_buffer_request("multi"))
             .await
             .command_output()
             .expect("multi buffer output")
@@ -2271,9 +1962,7 @@ async fn source_file_glob_reports_directories_after_loading_regular_files() {
     );
     assert_eq!(
         handler
-            .handle(Request::ShowBuffer(ShowBufferRequest {
-                name: Some("glob".to_owned()),
-            }))
+            .handle(show_buffer_request("glob"))
             .await
             .command_output()
             .expect("glob buffer output")
@@ -2312,9 +2001,7 @@ async fn source_file_continues_after_missing_paths_and_reports_one_clean_error_p
     );
     assert_eq!(
         handler
-            .handle(Request::ShowBuffer(ShowBufferRequest {
-                name: Some("multi".to_owned()),
-            }))
+            .handle(show_buffer_request("multi"))
             .await
             .command_output()
             .expect("multi buffer output")
@@ -2359,14 +2046,11 @@ async fn source_file_continues_after_runtime_errors_and_reports_error() {
     );
     assert_eq!(
         handler
-            .handle(Request::ShowOptions(rmux_proto::ShowOptionsRequest {
-                scope: OptionScopeSelector::SessionGlobal,
-                name: Some("@after_runtime".to_owned()),
-                value_only: true,
-                include_inherited: false,
-                quiet: false,
-                include_hooks: false,
-            }))
+            .handle(show_option_request(
+                OptionScopeSelector::SessionGlobal,
+                "@after_runtime",
+                false,
+            ))
             .await
             .command_output()
             .expect("show-options output")
@@ -2379,33 +2063,14 @@ async fn source_file_continues_after_runtime_errors_and_reports_error() {
 async fn source_file_new_window_k_validates_environment_before_replacing_target() {
     let handler = RequestHandler::new();
     let alpha = session_name("source-new-window-k-env-validation");
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: alpha.clone(),
-                detached: true,
-                size: Some(TerminalSize { cols: 80, rows: 24 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
-    assert!(matches!(
-        handler
-            .handle(Request::NewWindow(Box::new(NewWindowRequest {
-                target: alpha.clone(),
-                name: Some("protected".to_owned()),
-                detached: true,
-                start_directory: None,
-                environment: None,
-                command: None,
-                process_command: None,
-                target_window_index: Some(1),
-                insert_at_target: false,
-            })))
-            .await,
-        Response::NewWindow(_)
-    ));
+    handler.create_session(&alpha).await;
+    handler
+        .create_window(NewWindowRequest {
+            name: Some("protected".to_owned()),
+            target_window_index: Some(1),
+            ..Fixture::fixture(&alpha)
+        })
+        .await;
     let protected_window_id = handler
         .state
         .lock()
@@ -2494,14 +2159,11 @@ async fn source_file_multi_paths_carry_assignments_and_continue_after_file_error
     ] {
         assert_eq!(
             handler
-                .handle(Request::ShowOptions(rmux_proto::ShowOptionsRequest {
-                    scope: OptionScopeSelector::SessionGlobal,
-                    name: Some(name.to_owned()),
-                    value_only: true,
-                    include_inherited: false,
-                    quiet: false,
-                    include_hooks: false,
-                }))
+                .handle(show_option_request(
+                    OptionScopeSelector::SessionGlobal,
+                    name,
+                    false,
+                ))
                 .await
                 .command_output()
                 .expect("show-options output")
@@ -2511,14 +2173,11 @@ async fn source_file_multi_paths_carry_assignments_and_continue_after_file_error
     }
     assert!(
         handler
-            .handle(Request::ShowOptions(rmux_proto::ShowOptionsRequest {
-                scope: OptionScopeSelector::SessionGlobal,
-                name: Some("@must_not_run".to_owned()),
-                value_only: true,
-                include_inherited: false,
-                quiet: true,
-                include_hooks: false,
-            }))
+            .handle(show_option_request(
+                OptionScopeSelector::SessionGlobal,
+                "@must_not_run",
+                true,
+            ))
             .await
             .command_output()
             .expect("quiet show-options output")
@@ -2549,14 +2208,11 @@ async fn source_file_sets_server_option_without_explicit_scope_or_target() {
     assert!(response.stderr().is_empty());
     assert_eq!(
         handler
-            .handle(Request::ShowOptions(rmux_proto::ShowOptionsRequest {
-                scope: OptionScopeSelector::ServerGlobal,
-                name: Some("escape-time".to_owned()),
-                value_only: true,
-                include_inherited: false,
-                quiet: false,
-                include_hooks: false,
-            }))
+            .handle(show_option_request(
+                OptionScopeSelector::ServerGlobal,
+                "escape-time",
+                false,
+            ))
             .await
             .command_output()
             .expect("show-options output")
@@ -2569,29 +2225,20 @@ async fn source_file_sets_server_option_without_explicit_scope_or_target() {
 async fn source_file_sets_bare_server_option_with_current_runtime_target() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: alpha.clone(),
-                detached: true,
-                size: Some(TerminalSize { cols: 80, rows: 24 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
+    handler.create_session(&alpha).await;
     let root = temp_root("server-option-current-target");
     write_config(
         &root.join("server.conf"),
         "set escape-time 77\nset -q escape-time 78\nset -g @after_runtime_escape yes\n",
     );
-    let mut request = match source_file_request(vec!["server.conf".to_owned()], Some(root)) {
-        Request::SourceFile(request) => request,
-        _ => unreachable!("source file request"),
-    };
-    request.target = Some(PaneTarget::with_window(alpha, 0, 0));
+    let request = SourceFileRequest {
+        target: Some(PaneTarget::with_window(alpha, 0, 0)),
+        caller_cwd: Some(root),
+        ..Fixture::fixture(["server.conf"])
+    }
+    .into_request();
 
-    let response = handler.handle(Request::SourceFile(request)).await;
+    let response = handler.handle(request).await;
 
     let Response::SourceFile(response) = response else {
         panic!("source-file should accept server option with current target, got {response:?}");
@@ -2600,14 +2247,11 @@ async fn source_file_sets_bare_server_option_with_current_runtime_target() {
     assert!(response.stderr().is_empty());
     assert_eq!(
         handler
-            .handle(Request::ShowOptions(rmux_proto::ShowOptionsRequest {
-                scope: OptionScopeSelector::ServerGlobal,
-                name: Some("escape-time".to_owned()),
-                value_only: true,
-                include_inherited: false,
-                quiet: false,
-                include_hooks: false,
-            }))
+            .handle(show_option_request(
+                OptionScopeSelector::ServerGlobal,
+                "escape-time",
+                false,
+            ))
             .await
             .command_output()
             .expect("show-options output")
@@ -2616,14 +2260,11 @@ async fn source_file_sets_bare_server_option_with_current_runtime_target() {
     );
     assert_eq!(
         handler
-            .handle(Request::ShowOptions(rmux_proto::ShowOptionsRequest {
-                scope: OptionScopeSelector::SessionGlobal,
-                name: Some("@after_runtime_escape".to_owned()),
-                value_only: true,
-                include_inherited: false,
-                quiet: false,
-                include_hooks: false,
-            }))
+            .handle(show_option_request(
+                OptionScopeSelector::SessionGlobal,
+                "@after_runtime_escape",
+                false,
+            ))
             .await
             .command_output()
             .expect("show-options output")
@@ -2660,14 +2301,11 @@ async fn source_file_continues_after_non_quiet_legacy_option_lookup_errors() {
     for name in ["@before_legacy_error", "@after_legacy_error"] {
         assert_eq!(
             handler
-                .handle(Request::ShowOptions(rmux_proto::ShowOptionsRequest {
-                    scope: OptionScopeSelector::SessionGlobal,
-                    name: Some(name.to_owned()),
-                    value_only: true,
-                    include_inherited: false,
-                    quiet: false,
-                    include_hooks: false,
-                }))
+                .handle(show_option_request(
+                    OptionScopeSelector::SessionGlobal,
+                    name,
+                    false,
+                ))
                 .await
                 .command_output()
                 .expect("show-options output")
@@ -2755,39 +2393,24 @@ async fn source_file_set_option_quiet_does_not_suppress_bad_values() {
 #[tokio::test]
 async fn source_file_grouped_new_window_insertion_preserves_and_arms_silence_timers() {
     let handler = RequestHandler::new();
-    let owner =
-        create_quiet_source_timer_session(&handler, "source-new-window-timer-owner", None).await;
-    let response = handler
-        .handle(Request::LinkWindow(LinkWindowRequest {
-            source: WindowTarget::with_window(owner.clone(), 0),
-            target: WindowTarget::with_window(owner.clone(), 1),
-            after: false,
-            before: false,
-            kill_destination: false,
-            detached: true,
-        }))
+    let owner = handler
+        .create_session(Quiet("source-new-window-timer-owner"))
         .await;
-    assert!(matches!(response, Response::LinkWindow(_)), "{response:?}");
-    let peer = create_quiet_source_timer_session(
-        &handler,
-        "source-new-window-timer-peer",
-        Some(owner.clone()),
-    )
-    .await;
+    handler
+        .handle_ok(LinkWindowRequest::fixture((
+            WindowTarget::with_window(owner.clone(), 0),
+            WindowTarget::with_window(owner.clone(), 1),
+        )))
+        .await;
+    let peer = handler
+        .create_session(Grouped("source-new-window-timer-peer", &owner))
+        .await;
 
-    assert!(matches!(
-        handler
-            .handle(Request::SetOption(SetOptionRequest {
-                scope: ScopeSelector::Global,
-                option: OptionName::MonitorSilence,
-                value: "60".to_owned(),
-                mode: SetOptionMode::Replace,
-            }))
-            .await,
-        Response::SetOption(_)
-    ));
+    handler
+        .set_option(ScopeSelector::Global, OptionName::MonitorSilence, "60")
+        .await;
 
-    let base_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(120);
+    let base_deadline = tokio::time::Instant::now() + Duration::from_secs(120);
     for (offset, target) in [&owner, &peer]
         .into_iter()
         .flat_map(|session_name| {
@@ -2799,7 +2422,7 @@ async fn source_file_grouped_new_window_insertion_preserves_and_arms_silence_tim
     {
         handler.replace_silence_timer_deadline_for_test(
             &target,
-            base_deadline + std::time::Duration::from_secs(offset as u64),
+            base_deadline + Duration::from_secs(offset as u64),
         );
     }
 
@@ -2899,42 +2522,4 @@ async fn source_file_grouped_new_window_insertion_preserves_and_arms_silence_tim
             session.window_at(0).expect("inserted window exists").id()
         );
     }
-}
-
-async fn create_quiet_source_timer_session(
-    handler: &RequestHandler,
-    name: &str,
-    group_target: Option<SessionName>,
-) -> SessionName {
-    let session = session_name(name);
-    let command = group_target
-        .is_none()
-        .then(quiet_source_timer_window_command);
-    let response = handler
-        .handle(Request::NewSessionExt(Box::new(NewSessionExtRequest {
-            session_name: Some(session.clone()),
-            working_directory: None,
-            detached: true,
-            size: Some(TerminalSize { cols: 80, rows: 24 }),
-            environment: None,
-            group_target,
-            attach_if_exists: false,
-            detach_other_clients: false,
-            kill_other_clients: false,
-            flags: None,
-            window_name: None,
-            print_session_info: false,
-            print_format: None,
-            command,
-            process_command: None,
-            client_environment: None,
-            skip_environment_update: false,
-        })))
-        .await;
-    assert!(matches!(response, Response::NewSession(_)), "{response:?}");
-    session
-}
-
-fn quiet_source_timer_window_command() -> Vec<String> {
-    vec!["/bin/sh".to_owned(), "-c".to_owned(), "sleep 60".to_owned()]
 }

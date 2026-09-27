@@ -64,50 +64,27 @@ async fn display_panes_default_selection_rejects_a_relinked_window_occurrence() 
     let requester_pid = std::process::id();
     let session = session_name("display-panes-relinked-occurrence");
     let _control_rx = create_attached_session(&handler, requester_pid, &session).await;
-    assert!(matches!(
-        handler
-            .handle(Request::SplitWindow(SplitWindowRequest {
-                target: SplitWindowTarget::Session(session.clone()),
-                direction: rmux_proto::SplitDirection::Vertical,
-                before: false,
-                environment: None,
-            }))
-            .await,
-        Response::SplitWindow(_)
-    ));
-    assert!(matches!(
-        handler
-            .handle(Request::SelectPane(Box::new(SelectPaneRequest {
-                target: PaneTarget::with_window(session.clone(), 0, 0),
-                title: None,
-                style: None,
-                input_disabled: None,
-                preserve_zoom: false,
-            })))
-            .await,
-        Response::SelectPane(_)
-    ));
-    assert!(matches!(
-        handler
-            .handle(Request::LinkWindow(LinkWindowRequest {
-                source: WindowTarget::with_window(session.clone(), 0),
-                target: WindowTarget::with_window(session.clone(), 2),
-                after: false,
-                before: false,
-                kill_destination: false,
-                detached: true,
-            }))
-            .await,
-        Response::LinkWindow(_)
-    ));
-    assert!(matches!(
-        handler
-            .handle(Request::SelectWindow(SelectWindowRequest {
-                target: WindowTarget::with_window(session.clone(), 2),
-            }))
-            .await,
-        Response::SelectWindow(_)
-    ));
+    handler
+        .handle_ok(SplitWindowRequest::fixture(&session))
+        .await;
+    handler
+        .handle_ok(SelectPaneRequest::fixture(PaneTarget::with_window(
+            session.clone(),
+            0,
+            0,
+        )))
+        .await;
+    handler
+        .handle_ok(LinkWindowRequest::fixture((
+            WindowTarget::with_window(session.clone(), 0),
+            WindowTarget::with_window(session.clone(), 2),
+        )))
+        .await;
+    handler
+        .handle_ok(SelectWindowRequest {
+            target: WindowTarget::with_window(session.clone(), 2),
+        })
+        .await;
 
     arm_display_panes(&handler, requester_pid, session.clone(), None, None).await;
     let label = displayed_label_for_pane(&handler, requester_pid, 1).await;
@@ -117,14 +94,10 @@ async fn display_panes_default_selection_rejects_a_relinked_window_occurrence() 
             .unlink_window(WindowTarget::with_window(session.clone(), 2), false)
             .expect("displayed occurrence unlinks");
         state
-            .link_window(LinkWindowRequest {
-                source: WindowTarget::with_window(session.clone(), 0),
-                target: WindowTarget::with_window(session.clone(), 2),
-                after: false,
-                before: false,
-                kill_destination: false,
-                detached: true,
-            })
+            .link_window(LinkWindowRequest::fixture((
+                WindowTarget::with_window(session.clone(), 0),
+                WindowTarget::with_window(session.clone(), 2),
+            )))
             .expect("same window relinks at the displayed slot");
     }
 
@@ -151,17 +124,9 @@ async fn display_panes_command_rejects_a_reused_pane_slot() {
     let requester_pid = std::process::id();
     let session = session_name("display-panes-pane-slot-aba");
     let _control_rx = create_attached_session(&handler, requester_pid, &session).await;
-    assert!(matches!(
-        handler
-            .handle(Request::SplitWindow(SplitWindowRequest {
-                target: SplitWindowTarget::Session(session.clone()),
-                direction: rmux_proto::SplitDirection::Vertical,
-                before: false,
-                environment: None,
-            }))
-            .await,
-        Response::SplitWindow(_)
-    ));
+    handler
+        .handle_ok(SplitWindowRequest::fixture(&session))
+        .await;
     arm_display_panes(
         &handler,
         requester_pid,
@@ -172,27 +137,18 @@ async fn display_panes_command_rejects_a_reused_pane_slot() {
     .await;
     let label = displayed_label_for_pane(&handler, requester_pid, 1).await;
 
-    let response = tokio::time::timeout(
+    tokio::time::timeout(
         std::time::Duration::from_secs(5),
-        handler.handle(Request::KillPane(rmux_proto::KillPaneRequest {
+        handler.handle_ok(rmux_proto::KillPaneRequest {
             target: PaneTarget::with_window(session.clone(), 0, 1),
             kill_all_except: false,
-        })),
+        }),
     )
     .await
     .expect("kill-pane must not wait behind its prepared selection notifications");
-    assert!(matches!(response, Response::KillPane(_)));
-    assert!(matches!(
-        handler
-            .handle(Request::SplitWindow(SplitWindowRequest {
-                target: SplitWindowTarget::Session(session.clone()),
-                direction: rmux_proto::SplitDirection::Vertical,
-                before: false,
-                environment: None,
-            }))
-            .await,
-        Response::SplitWindow(_)
-    ));
+    handler
+        .handle_ok(SplitWindowRequest::fixture(&session))
+        .await;
 
     let result = handler
         .handle_attached_live_input_for_test(requester_pid, label.as_bytes())
@@ -217,21 +173,11 @@ async fn display_panes_command_rejects_a_respawned_pane_generation() {
     .await;
     let label = displayed_label_for_pane(&handler, requester_pid, 0).await;
 
-    assert!(matches!(
-        handler
-            .handle(Request::RespawnPane(Box::new(
-                rmux_proto::RespawnPaneRequest {
-                    target: PaneTarget::with_window(session, 0, 0),
-                    kill: true,
-                    start_directory: None,
-                    environment: None,
-                    command: None,
-                    process_command: None,
-                }
-            )))
-            .await,
-        Response::RespawnPane(_)
-    ));
+    handler
+        .handle_ok(rmux_proto::RespawnPaneRequest::fixture(
+            PaneTarget::with_window(session, 0, 0),
+        ))
+        .await;
 
     let result = handler
         .handle_attached_live_input_for_test(requester_pid, label.as_bytes())
@@ -274,21 +220,9 @@ async fn display_panes_target_client_does_not_bypass_the_queued_lifecycle_lease(
         .expect("targeted display-panes arms while the lease is live");
     let label = displayed_label_for_pane(&handler, target_pid, 0).await;
 
-    assert!(matches!(
-        handler
-            .handle(Request::RespawnPane(Box::new(
-                rmux_proto::RespawnPaneRequest {
-                    target: lifecycle_target,
-                    kill: true,
-                    start_directory: None,
-                    environment: None,
-                    command: None,
-                    process_command: None,
-                }
-            )))
-            .await,
-        Response::RespawnPane(_)
-    ));
+    handler
+        .handle_ok(rmux_proto::RespawnPaneRequest::fixture(lifecycle_target))
+        .await;
 
     let result = handler
         .handle_attached_live_input_for_test(target_pid, label.as_bytes())

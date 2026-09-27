@@ -177,7 +177,7 @@ mod tests {
             "`exec -a` must reach the shell as two words, so it runs under a login argv0"
         );
         assert_eq!(
-            captured.completion.exit_code,
+            captured.completion.exit_code(),
             Some(0),
             "the shell that printed it exited cleanly"
         );

@@ -174,10 +174,7 @@ mod tests {
             name: "unavailable".to_owned(),
         }));
         let mut state = HandlerState::default();
-        assert!(matches!(
-            capture_queue_exact_target(&command, &invocation, &mut state),
-            Err(_)
-        ));
+        assert!(capture_queue_exact_target(&command, &invocation, &mut state).is_err());
     }
 
     #[test]
@@ -193,9 +190,6 @@ mod tests {
             kill_all_except: false,
         }));
         let mut state = HandlerState::default();
-        assert!(matches!(
-            capture_queue_exact_target(&command, &invocation, &mut state),
-            Err(_)
-        ));
+        assert!(capture_queue_exact_target(&command, &invocation, &mut state).is_err());
     }
 }

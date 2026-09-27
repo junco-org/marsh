@@ -1,51 +1,23 @@
 use super::*;
 
-use std::time::Duration;
-
-use rmux_proto::{LinkWindowRequest, UnlinkWindowRequest};
+use rmux_proto::UnlinkWindowRequest;
 
 use crate::handler::scripting_support::install_queue_exact_target_capture_pause;
-
-fn terminal_size() -> TerminalSize {
-    TerminalSize { cols: 80, rows: 24 }
-}
-
-async fn create_session(handler: &RequestHandler, name: &str) -> SessionName {
-    let name = session_name(name);
-    let response = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name: name.clone(),
-            detached: true,
-            size: Some(terminal_size()),
-            environment: None,
-        }))
-        .await;
-    assert!(matches!(response, Response::NewSession(_)), "{response:?}");
-    name
-}
-
-fn pane_context(session_name: &SessionName, window_index: u32) -> QueueExecutionContext {
-    QueueExecutionContext::without_caller_cwd().with_current_target(Some(Target::Pane(
-        PaneTarget::with_window(session_name.clone(), window_index, 0),
-    )))
-}
 
 async fn replace_window_slot(
     handler: &RequestHandler,
     source: &SessionName,
     target: &SessionName,
 ) -> rmux_core::WindowId {
-    let response = handler
-        .handle(Request::LinkWindow(LinkWindowRequest {
-            source: WindowTarget::with_window(source.clone(), 0),
-            target: WindowTarget::with_window(target.clone(), 0),
-            after: false,
-            before: false,
+    handler
+        .handle_ok(LinkWindowRequest {
             kill_destination: true,
-            detached: true,
-        }))
+            ..Fixture::fixture((
+                WindowTarget::with_window(source.clone(), 0),
+                WindowTarget::with_window(target.clone(), 0),
+            ))
+        })
         .await;
-    assert!(matches!(response, Response::LinkWindow(_)), "{response:?}");
     handler
         .state
         .lock()
@@ -61,8 +33,12 @@ async fn replace_window_slot(
 async fn exact_window_and_pane_targets_reject_post_parse_slot_replacement() {
     for command_name in ["rename-window", "kill-pane"] {
         let handler = RequestHandler::new();
-        let source = create_session(&handler, &format!("exact-{command_name}-source")).await;
-        let target = create_session(&handler, &format!("exact-{command_name}-target")).await;
+        let source = handler
+            .create_session(format!("exact-{command_name}-source"))
+            .await;
+        let target = handler
+            .create_session(format!("exact-{command_name}-target"))
+            .await;
         let (selector, original_window_id) = {
             let state = handler.state.lock().await;
             let window = state
@@ -126,7 +102,7 @@ async fn exact_window_and_pane_targets_reject_post_parse_slot_replacement() {
 #[tokio::test]
 async fn exact_pane_target_rejects_respawned_output_generation() {
     let handler = RequestHandler::new();
-    let target_session = create_session(&handler, "exact-pane-respawn").await;
+    let target_session = handler.create_session("exact-pane-respawn").await;
     let target = PaneTarget::with_window(target_session.clone(), 0, 0);
     let (pane_id, initial_generation) = {
         let state = handler.state.lock().await;
@@ -155,20 +131,12 @@ async fn exact_pane_target_rejects_respawned_output_generation() {
     });
 
     pause.wait_until_reached().await;
-    let respawned = handler
-        .handle(Request::RespawnPane(Box::new(RespawnPaneRequest {
-            target: target.clone(),
-            kill: true,
-            start_directory: None,
-            environment: None,
+    handler
+        .handle_ok(RespawnPaneRequest {
             command: Some(vec![crate::test_shell::stdin_discard_command()]),
-            process_command: None,
-        })))
+            ..Fixture::fixture(&target)
+        })
         .await;
-    assert!(
-        matches!(respawned, Response::RespawnPane(_)),
-        "{respawned:?}"
-    );
     let replacement_generation = {
         let state = handler.state.lock().await;
         assert_eq!(
@@ -216,7 +184,7 @@ async fn capture_initializes_only_the_addressed_lazy_occurrence() {
         let mut state = handler.state.lock().await;
         state
             .sessions
-            .create_session(target.clone(), terminal_size())
+            .create_session(target.clone(), TerminalSize::new(80, 24))
             .expect("create direct session");
         assert_eq!(state.window_link_occurrence_id(&target, 0), None);
         state
@@ -269,19 +237,14 @@ async fn capture_initializes_only_the_addressed_lazy_occurrence() {
 #[tokio::test]
 async fn unlink_relink_of_the_same_window_id_is_still_rejected() {
     let handler = RequestHandler::new();
-    let owner = create_session(&handler, "exact-target-owner").await;
-    let alias = create_session(&handler, "exact-target-alias").await;
-    let linked = handler
-        .handle(Request::LinkWindow(LinkWindowRequest {
-            source: WindowTarget::with_window(owner.clone(), 0),
-            target: WindowTarget::with_window(alias.clone(), 1),
-            after: false,
-            before: false,
-            kill_destination: false,
-            detached: true,
-        }))
+    let owner = handler.create_session("exact-target-owner").await;
+    let alias = handler.create_session("exact-target-alias").await;
+    handler
+        .handle_ok(LinkWindowRequest::fixture((
+            WindowTarget::with_window(owner.clone(), 0),
+            WindowTarget::with_window(alias.clone(), 1),
+        )))
         .await;
-    assert!(matches!(linked, Response::LinkWindow(_)), "{linked:?}");
     let window_id = handler
         .state
         .lock()
@@ -304,27 +267,18 @@ async fn unlink_relink_of_the_same_window_id_is_still_rejected() {
     });
 
     pause.wait_until_reached().await;
-    let unlinked = handler
-        .handle(Request::UnlinkWindow(UnlinkWindowRequest {
+    handler
+        .handle_ok(UnlinkWindowRequest {
             target: WindowTarget::with_window(alias.clone(), 1),
             kill_if_last: false,
-        }))
+        })
         .await;
-    assert!(
-        matches!(unlinked, Response::UnlinkWindow(_)),
-        "{unlinked:?}"
-    );
-    let relinked = handler
-        .handle(Request::LinkWindow(LinkWindowRequest {
-            source: WindowTarget::with_window(owner.clone(), 0),
-            target: WindowTarget::with_window(alias.clone(), 1),
-            after: false,
-            before: false,
-            kill_destination: false,
-            detached: true,
-        }))
+    handler
+        .handle_ok(LinkWindowRequest::fixture((
+            WindowTarget::with_window(owner.clone(), 0),
+            WindowTarget::with_window(alias.clone(), 1),
+        )))
         .await;
-    assert!(matches!(relinked, Response::LinkWindow(_)), "{relinked:?}");
     pause.release.notify_one();
 
     let error = tokio::time::timeout(Duration::from_secs(2), queued)
@@ -349,8 +303,8 @@ async fn unlink_relink_of_the_same_window_id_is_still_rejected() {
 #[tokio::test]
 async fn control_queue_uses_the_same_exact_target_guard() {
     let handler = RequestHandler::new();
-    let source = create_session(&handler, "exact-control-source").await;
-    let target = create_session(&handler, "exact-control-target").await;
+    let source = handler.create_session("exact-control-source").await;
+    let target = handler.create_session("exact-control-target").await;
     let selector = handler
         .state
         .lock()
@@ -362,8 +316,9 @@ async fn control_queue_uses_the_same_exact_target_guard() {
         .expect("target window exists")
         .to_string();
     let requester_pid = 82_991;
-    let (_control_id, _events) =
-        register_control_for_session(&handler, requester_pid, target.clone()).await;
+    let (_control_id, _events) = handler
+        .register_control_for_test(requester_pid, Some(&target))
+        .await;
     let parsed = CommandParser::new()
         .parse(&format!("rename-window -t {selector} stale-control"))
         .expect("command parses");
@@ -403,8 +358,8 @@ async fn control_queue_uses_the_same_exact_target_guard() {
 #[tokio::test]
 async fn source_file_queue_uses_the_same_exact_target_guard() {
     let handler = RequestHandler::new();
-    let source = create_session(&handler, "exact-source-file-source").await;
-    let target = create_session(&handler, "exact-source-file-target").await;
+    let source = handler.create_session("exact-source-file-source").await;
+    let target = handler.create_session("exact-source-file-target").await;
     let selector = handler
         .state
         .lock()
@@ -422,7 +377,7 @@ async fn source_file_queue_uses_the_same_exact_target_guard() {
         &format!("rename-window -t {selector} stale-source-file\n"),
     );
     let parsed = CommandParser::new()
-        .parse(&format!("source-file {}", shell_quote(&config)))
+        .parse(&format!("source-file {}", sh_quote_path(&config)))
         .expect("source-file command parses");
     let pause = install_queue_exact_target_capture_pause(&handler, "rename-window");
     let queued_handler = handler.clone();
@@ -460,8 +415,8 @@ async fn source_file_queue_uses_the_same_exact_target_guard() {
 #[tokio::test]
 async fn hook_command_path_uses_the_same_exact_target_guard() {
     let handler = RequestHandler::new();
-    let source = create_session(&handler, "exact-hook-source").await;
-    let target = create_session(&handler, "exact-hook-target").await;
+    let source = handler.create_session("exact-hook-source").await;
+    let target = handler.create_session("exact-hook-target").await;
     let selector = handler
         .state
         .lock()

@@ -12,13 +12,21 @@
 //! of the domain it was extracted from.
 
 mod directory;
+mod occurrences;
 mod recorder;
+mod retention;
 
 pub use directory::walk_directory;
+pub use occurrences::{extend_occurrence_map, group_keys_by_value};
 pub use recorder::Recorder;
+pub use retention::{BoundedRetention, FifoSet};
 
 #[cfg(feature = "watch")]
 mod completion;
+#[cfg(feature = "watch")]
+mod initialization;
 
 #[cfg(feature = "watch")]
 pub use completion::{WaitState, wait_for_completion};
+#[cfg(feature = "watch")]
+pub use initialization::{InitializationGate, InitializationRoute};

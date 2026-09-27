@@ -2,8 +2,7 @@ use super::*;
 
 #[test]
 fn top_level_help_footer_tracks_supported_surface_and_aliases() {
-    let error = parse_args(&["--help"]).unwrap_err();
-    let rendered = error.to_string();
+    let rendered = parse_error(&["--help"]).to_string();
 
     assert!(rendered.contains("list-commands (lscm)"));
     assert!(rendered.contains("set-window-option (setw)"));
@@ -17,11 +16,12 @@ fn top_level_help_footer_tracks_supported_surface_and_aliases() {
 }
 
 #[test]
-fn raw_cli_top_level_flags_match_tmux_usage_contract() {
+fn top_level_command_scan_flags_match_tmux_usage_contract() {
+    let command = super::super::TopLevelCommandScan::command();
     let mut switch_flags = BTreeSet::new();
     let mut valued_flags = BTreeSet::new();
 
-    for argument in super::super::RawCli::command().get_arguments() {
+    for argument in command.get_arguments() {
         let Some(short) = argument.get_short() else {
             continue;
         };
@@ -43,17 +43,11 @@ fn raw_cli_top_level_flags_match_tmux_usage_contract() {
     );
     assert_eq!(valued_flags, BTreeSet::from(['L', 'S', 'T', 'c', 'f']));
 
-    let help = super::super::RawCli::command().try_get_matches_from(["rmux", "-h"]);
-    assert!(matches!(
-        help,
-        Err(error) if error.kind() == clap::error::ErrorKind::DisplayHelp
-    ));
+    let help = command.clone().try_get_matches_from(["rmux", "-h"]);
+    assert!(matches!(help, Err(error) if error.kind() == ErrorKind::DisplayHelp));
 
-    let version = super::super::RawCli::command().try_get_matches_from(["rmux", "-V"]);
-    assert!(matches!(
-        version,
-        Err(error) if error.kind() == clap::error::ErrorKind::DisplayVersion
-    ));
+    let version = command.try_get_matches_from(["rmux", "-V"]);
+    assert!(matches!(version, Err(error) if error.kind() == ErrorKind::DisplayVersion));
 }
 
 #[test]
@@ -75,10 +69,7 @@ fn synthetic_completion_tree_tracks_public_command_surface() {
 
     assert_eq!(actual, expected);
 
-    let split_window = completion
-        .get_subcommands()
-        .find(|command| command.get_name() == "split-window")
-        .expect("split-window completion subcommand");
+    let split_window = completion_subcommand(&completion, "split-window");
     let horizontal = split_window
         .get_arguments()
         .find(|argument| argument.get_short() == Some('h'))
@@ -110,15 +101,11 @@ fn command_help_completions_and_parser_share_supported_window_flags() {
         ("select-window", &['T', 'l', 'n', 'p', 't'][..], &['Z'][..]),
         ("swap-window", &['d', 's', 't'][..], &['a'][..]),
     ] {
-        let help = parse_args(&[command_name, "--help"]).expect_err("--help renders command help");
-        assert_eq!(help.kind(), clap::error::ErrorKind::DisplayHelp);
+        let help = parse_error(&[command_name, "--help"]);
+        assert_eq!(help.kind(), ErrorKind::DisplayHelp);
         let help = help.to_string();
 
-        let completion_command = completion
-            .get_subcommands()
-            .find(|command| command.get_name() == command_name)
-            .unwrap_or_else(|| panic!("missing {command_name} completion subcommand"));
-        let completion_flags = completion_command
+        let completion_flags = completion_subcommand(&completion, command_name)
             .get_arguments()
             .filter(|argument| !argument.is_hide_set())
             .filter_map(|argument| argument.get_short())
@@ -132,9 +119,7 @@ fn command_help_completions_and_parser_share_supported_window_flags() {
         for flag in unsupported {
             let rendered_flag = format!("-{flag}");
             assert!(
-                !help
-                    .lines()
-                    .any(|line| line.trim_start().starts_with(&rendered_flag)),
+                !help_lists_flag(&help, &rendered_flag),
                 "{command_name} help advertised rejected flag {rendered_flag}: {help}"
             );
             assert!(
@@ -142,11 +127,10 @@ fn command_help_completions_and_parser_share_supported_window_flags() {
                 "{command_name} completion advertised rejected flag {rendered_flag}"
             );
 
-            let error = parse_args(&[command_name, &rendered_flag])
-                .expect_err("unsupported public flag must be rejected");
+            let error = parse_error(&[command_name, &rendered_flag]);
             assert_eq!(
                 error.kind(),
-                clap::error::ErrorKind::UnknownArgument,
+                ErrorKind::UnknownArgument,
                 "{command_name} {rendered_flag}: {error}"
             );
             assert!(
@@ -161,31 +145,18 @@ fn command_help_completions_and_parser_share_supported_window_flags() {
 
 #[test]
 fn split_window_percentage_is_public_and_value_taking_everywhere() {
-    let cli = parse_args(&["split-window", "-p", "50"])
-        .expect("implemented split-window percentage parses");
-    match cli.command.expect("parsed command") {
-        super::super::Command::SplitWindow(args) => {
-            assert_eq!(args.size_spec().as_deref(), Some("50%"));
-        }
-        _ => panic!("expected SplitWindow command"),
-    }
+    let args = parse_command!(SplitWindow, ["split-window", "-p", "50"]);
+    assert_eq!(args.size_spec().as_deref(), Some("50%"));
 
-    let help =
-        parse_args(&["split-window", "--help"]).expect_err("--help renders split-window help");
-    assert_eq!(help.kind(), clap::error::ErrorKind::DisplayHelp);
+    let help = parse_error(&["split-window", "--help"]);
+    assert_eq!(help.kind(), ErrorKind::DisplayHelp);
     assert!(
-        help.to_string()
-            .lines()
-            .any(|line| line.trim_start().starts_with("-p")),
+        help_lists_flag(&help.to_string(), "-p"),
         "split-window help must advertise its implemented -p value flag"
     );
 
     let completion = super::super::completion_command();
-    let split_window = completion
-        .get_subcommands()
-        .find(|command| command.get_name() == "split-window")
-        .expect("split-window completion subcommand");
-    let percentage = split_window
+    let percentage = completion_subcommand(&completion, "split-window")
         .get_arguments()
         .find(|argument| argument.get_short() == Some('p'))
         .expect("split-window -p percentage completion");
@@ -214,8 +185,11 @@ fn refresh_client_unsupported_fields_are_absent_from_cli_help_and_completion() {
         &["refresh-client", "-U"][..],
         &["refresh-client", "10"][..],
     ] {
-        let error = super::parse_args(arguments).expect_err("unsupported field must not parse");
-        assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+        assert_eq!(
+            parse_error(arguments).kind(),
+            ErrorKind::UnknownArgument,
+            "{arguments:?}"
+        );
     }
 
     for arguments in [
@@ -226,12 +200,11 @@ fn refresh_client_unsupported_fields_are_absent_from_cli_help_and_completion() {
         &["refresh-client", "-S"][..],
         &["refresh-client", "-t", "="][..],
     ] {
-        super::parse_args(arguments).expect("supported refresh-client field parses");
+        parse_args(arguments).expect("supported refresh-client field parses");
     }
 
-    let help =
-        super::parse_args(&["refresh-client", "--help"]).expect_err("--help renders command help");
-    assert_eq!(help.kind(), clap::error::ErrorKind::DisplayHelp);
+    let help = parse_error(&["refresh-client", "--help"]);
+    assert_eq!(help.kind(), ErrorKind::DisplayHelp);
     let help = help.to_string();
     assert!(
         !help.contains("adjustment"),
@@ -239,18 +212,13 @@ fn refresh_client_unsupported_fields_are_absent_from_cli_help_and_completion() {
     );
     for unsupported in ["-A", "-B", "-r", "-c", "-D", "-L", "-R", "-U"] {
         assert!(
-            !help
-                .lines()
-                .any(|line| line.trim_start().starts_with(unsupported)),
+            !help_lists_flag(&help, unsupported),
             "refresh-client help advertised reserved flag {unsupported}: {help}"
         );
     }
 
     let completion = super::super::completion_command();
-    let refresh = completion
-        .get_subcommands()
-        .find(|command| command.get_name() == "refresh-client")
-        .expect("refresh-client completion subcommand");
+    let refresh = completion_subcommand(&completion, "refresh-client");
     let shorts = refresh
         .get_arguments()
         .filter_map(|argument| argument.get_short())
@@ -312,7 +280,7 @@ fn command_value_flags_report_missing_values_with_tmux_style_prefix() {
             "command web-share: --frontend-url expects an argument",
         ),
     ] {
-        let error = parse_args(args).unwrap_err();
+        let error = parse_error(args);
         assert!(
             error.to_string().contains(expected),
             "expected {expected:?} in {error}"
@@ -346,7 +314,7 @@ fn implemented_surface_matches_the_full_tmux_command_table() {
         );
     }
 
-    let top_level_help = parse_args(&["--help"]).unwrap_err().to_string();
+    let top_level_help = parse_error(&["--help"]).to_string();
     assert!(top_level_help.contains("capabilities"));
     assert!(top_level_help.contains("claude"));
     assert!(top_level_help.contains("doctor"));
@@ -386,12 +354,24 @@ fn supported_commands_do_not_treat_short_h_as_clap_help() {
         if let Err(error) = parse_args(&[entry.name, "-h"]) {
             assert_ne!(
                 error.kind(),
-                clap::error::ErrorKind::DisplayHelp,
+                ErrorKind::DisplayHelp,
                 "{} consumed -h as Clap help",
                 entry.name
             );
         }
     }
+}
+
+fn completion_subcommand<'a>(completion: &'a clap::Command, name: &str) -> &'a clap::Command {
+    completion
+        .get_subcommands()
+        .find(|command| command.get_name() == name)
+        .unwrap_or_else(|| panic!("missing {name} completion subcommand"))
+}
+
+/// Reports whether a rendered help page has an option line starting with `flag`.
+fn help_lists_flag(help: &str, flag: &str) -> bool {
+    help.lines().any(|line| line.trim_start().starts_with(flag))
 }
 
 fn collect_nested_command_names(

@@ -1,53 +1,46 @@
 use super::RequestHandler;
 use crate::pane_io::AttachControl;
 use rmux_proto::{
-    DisplayMessageRequest, HookLifecycle, HookName, KillPaneRequest, KillSessionRequest,
-    KillWindowRequest, LastPaneRequest, LastWindowRequest, LayoutName, LinkWindowRequest,
-    ListPanesRequest, ListWindowsRequest, MoveWindowRequest, MoveWindowTarget,
-    NewSessionExtRequest, NewSessionRequest, NewWindowRequest, NextWindowRequest, OptionName,
-    PaneSelectRequest, PaneTarget, PaneTargetRef, PreviousWindowRequest, ProcessCommand,
-    RenameSessionRequest, RenameWindowRequest, Request, ResizeWindowAdjustment,
-    ResizeWindowRequest, ResolveTargetRequest, ResolveTargetType, RespawnWindowRequest, Response,
-    RotateWindowDirection, RotateWindowRequest, ScopeSelector, SelectLayoutRequest,
-    SelectLayoutTarget, SelectPaneAdjacentRequest, SelectPaneDirection, SelectPaneRequest,
-    SelectWindowRequest, SessionName, SetHookMutationRequest, SetOptionMode, SetOptionRequest,
-    SplitDirection, SplitWindowRequest, SplitWindowTarget, SwapWindowRequest, Target, TerminalSize,
+    HookLifecycle, HookName, KillPaneRequest, KillSessionRequest, KillWindowRequest,
+    LastPaneRequest, LastWindowRequest, LayoutName, LinkWindowRequest, ListPanesRequest,
+    ListWindowsRequest, MoveWindowRequest, NewSessionExtRequest, NewWindowRequest,
+    NextWindowRequest, OptionName, PaneSelectRequest, PaneTarget, PaneTargetRef,
+    PreviousWindowRequest, ProcessCommand, RenameSessionRequest, RenameWindowRequest, Request,
+    ResizeWindowAdjustment, ResizeWindowRequest, ResolveTargetRequest, ResolveTargetType,
+    RespawnWindowRequest, Response, RotateWindowDirection, RotateWindowRequest, ScopeSelector,
+    SelectLayoutRequest, SelectLayoutTarget, SelectPaneAdjacentRequest, SelectPaneDirection,
+    SelectPaneRequest, SelectWindowRequest, SessionName, SetOptionMode, SetOptionRequest,
+    SplitDirection, SplitWindowRequest, SwapWindowRequest, Target, TerminalSize,
     UnlinkWindowRequest, WindowTarget,
 };
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::path::Path;
 use tokio::sync::mpsc;
 use tokio::time::{timeout, Duration};
 
+use crate::test_fixtures::{
+    quiet_command, unique_temp_path, wait_for_file_contents, wait_until, Fixture, Owned,
+};
 use crate::test_names::session_name;
+use crate::test_shell::sh_quote_path;
 
-fn unique_window_temp_path(label: &str) -> PathBuf {
-    let unique = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time after epoch")
-        .as_nanos();
-    std::env::temp_dir().join(format!(
-        "rmux-window-{label}-{}-{unique}",
-        std::process::id()
-    ))
-}
-
-fn window_shell_quote(path: &Path) -> String {
-    crate::test_shell::sh_quote_path(path)
-}
+/// The size of every session the window tests create.
+const WINDOW_TEST_SIZE: TerminalSize = TerminalSize {
+    cols: 120,
+    rows: 40,
+};
 
 fn window_respawn_replay_command(output: &Path, tag: &str) -> String {
     format!(
         "printf '%s:%s:{tag}\\n' \"$(pwd)\" \"$RMUX_RESPAWN\" >> {}; sleep 60",
-        window_shell_quote(output)
+        sh_quote_path(output)
     )
 }
 
 fn window_respawn_shell_identity_command(output: &Path, tag: &str) -> String {
     format!(
         "printf '%s:%s:{tag}\\n' \"${{0##*/}}\" \"$SHELL\" >> {}; sleep 60",
-        window_shell_quote(output)
+        sh_quote_path(output)
     )
 }
 
@@ -60,26 +53,31 @@ fn window_respawn_shell_identity_command(output: &Path, tag: &str) -> String {
 /// is both what the caller asked for and what a regression loses: a start directory that was
 /// dropped opens at the snapshot root instead, where the path ends with the uid.
 async fn wait_for_window_respawn_probe(path: &Path, expected: &[(&str, &str, &str)]) {
-    let limit = Duration::from_secs(5);
-    let deadline = tokio::time::Instant::now() + limit;
-    loop {
-        let contents = fs::read_to_string(path).unwrap_or_default();
-        let lines = contents.lines().collect::<Vec<_>>();
-        if lines.len() == expected.len()
-            && lines
-                .iter()
-                .zip(expected)
-                .all(|(line, expectation)| window_respawn_probe_line_matches(line, expectation))
-        {
-            return;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
+    wait_until(
+        Duration::from_secs(5),
+        Duration::from_millis(25),
+        async || {
+            let contents = fs::read_to_string(path).unwrap_or_default();
+            let lines = contents.lines().collect::<Vec<_>>();
+            if lines.len() == expected.len()
+                && lines
+                    .iter()
+                    .zip(expected)
+                    .all(|(line, expectation)| window_respawn_probe_line_matches(line, expectation))
+            {
+                Ok(())
+            } else {
+                Err(contents)
+            }
+        },
+    )
+    .await
+    .unwrap_or_else(|contents| {
+        panic!(
             "timed out waiting for {} to hold {expected:?}, got {contents:?}",
             path.display()
-        );
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
+        )
+    });
 }
 
 /// Whether one probe line reports the expected directory, environment and command tag.
@@ -96,130 +94,36 @@ fn window_respawn_probe_line_matches(line: &str, expected: &(&str, &str, &str)) 
         && reported_tag == tag
 }
 
-async fn wait_for_window_file_contents(path: &Path, expected: &str) {
-    let timeout = Duration::from_secs(5);
-    let deadline = tokio::time::Instant::now() + timeout;
-    loop {
-        match fs::read_to_string(path) {
-            Ok(contents) if contents == expected => return,
-            Ok(_) | Err(_) if tokio::time::Instant::now() < deadline => {
-                tokio::time::sleep(Duration::from_millis(25)).await;
-            }
-            Ok(contents) => panic!(
-                "timed out waiting for {} to contain {:?}, got {:?}",
-                path.display(),
-                expected,
-                contents
-            ),
-            Err(error) => panic!(
-                "timed out waiting for {} to exist with {:?}: {error}",
-                path.display(),
-                expected
-            ),
-        }
-    }
+/// Creates the detached 120x40 session `name`, whose first pane runs [`quiet_command`].
+async fn create_session(handler: &RequestHandler, name: impl Owned<SessionName>) -> SessionName {
+    handler
+        .create_session(NewSessionExtRequest {
+            size: Some(WINDOW_TEST_SIZE),
+            command: Some(quiet_command()),
+            ..Fixture::fixture(name)
+        })
+        .await
 }
 
-async fn create_session(handler: &RequestHandler, name: &str) {
-    let created = handler
-        .handle(Request::NewSessionExt(Box::new(NewSessionExtRequest {
-            session_name: Some(session_name(name)),
-            working_directory: None,
-            detached: true,
-            size: Some(TerminalSize {
-                cols: 120,
-                rows: 40,
-            }),
-            environment: None,
-            group_target: None,
-            attach_if_exists: false,
-            detach_other_clients: false,
-            kill_other_clients: false,
-            flags: None,
-            window_name: None,
-            print_session_info: false,
-            print_format: None,
-            command: Some(quiet_window_test_command()),
-            process_command: None,
-            client_environment: None,
-            skip_environment_update: false,
-        })))
-        .await;
-    assert!(matches!(created, Response::NewSession(_)));
-}
-
-async fn create_grouped_session(handler: &RequestHandler, name: &str, group_target: &SessionName) {
-    let created = handler
-        .handle(Request::NewSessionExt(Box::new(NewSessionExtRequest {
-            session_name: Some(session_name(name)),
-            working_directory: None,
-            detached: true,
-            size: Some(TerminalSize {
-                cols: 120,
-                rows: 40,
-            }),
-            environment: None,
-            group_target: Some(group_target.clone()),
-            attach_if_exists: false,
-            detach_other_clients: false,
-            kill_other_clients: false,
-            flags: None,
-            window_name: None,
-            print_session_info: false,
-            print_format: None,
-            command: None,
-            process_command: None,
-            client_environment: None,
-            skip_environment_update: false,
-        })))
-        .await;
-    assert!(matches!(created, Response::NewSession(_)));
-}
-
-async fn create_session_with_size(handler: &RequestHandler, name: &str, size: TerminalSize) {
-    let created = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name: session_name(name),
-            detached: true,
-            size: Some(size),
-            environment: None,
-        }))
-        .await;
-    assert!(
-        matches!(created, Response::NewSession(_)),
-        "expected new-session success, got {created:?}"
-    );
+/// Creates the detached 120x40 session `name` in the group of `group`; its pane runs the shell.
+async fn create_grouped_session(
+    handler: &RequestHandler,
+    name: impl Owned<SessionName>,
+    group: impl Owned<SessionName>,
+) -> SessionName {
+    handler
+        .create_session(NewSessionExtRequest {
+            size: Some(WINDOW_TEST_SIZE),
+            group_target: Some(group.owned()),
+            ..Fixture::fixture(name)
+        })
+        .await
 }
 
 async fn enable_global_monitor_silence(handler: &RequestHandler) {
-    let response = handler
-        .handle(Request::SetOption(SetOptionRequest {
-            scope: ScopeSelector::Global,
-            option: OptionName::MonitorSilence,
-            value: "60".to_owned(),
-            mode: SetOptionMode::Replace,
-        }))
+    handler
+        .set_option(ScopeSelector::Global, OptionName::MonitorSilence, "60")
         .await;
-    assert!(matches!(response, Response::SetOption(_)), "{response:?}");
-}
-
-async fn set_window_test_default_shell(handler: &RequestHandler, shell: &str) {
-    let response = handler
-        .handle(Request::SetOption(SetOptionRequest {
-            scope: ScopeSelector::Global,
-            option: OptionName::DefaultShell,
-            value: shell.to_owned(),
-            mode: SetOptionMode::Replace,
-        }))
-        .await;
-    assert!(matches!(response, Response::SetOption(_)), "{response:?}");
-}
-
-fn quiet_window_test_command() -> Vec<String> {
-    ["/bin/sh", "-c", "sleep 60"]
-        .into_iter()
-        .map(str::to_owned)
-        .collect()
 }
 
 async fn insert_window(handler: &RequestHandler, session_name: &SessionName, window_index: u32) {
@@ -258,41 +162,18 @@ async fn insert_window(handler: &RequestHandler, session_name: &SessionName, win
         .expect("window terminal insert succeeds");
 }
 
-async fn create_window_at(handler: &RequestHandler, session_name: &SessionName, window_index: u32) {
-    let response = handler
-        .handle(Request::NewWindow(Box::new(NewWindowRequest {
-            target: session_name.clone(),
-            name: None,
-            detached: true,
-            start_directory: None,
-            environment: None,
-            command: Some(quiet_window_test_command()),
-            process_command: None,
-            target_window_index: Some(window_index),
-            insert_at_target: false,
-        })))
-        .await;
-    assert!(matches!(response, Response::NewWindow(_)), "{response:?}");
-    handler.wait_for_initial_panes_for_test().await;
-}
-
 async fn link_duplicate_window(
     handler: &RequestHandler,
     session_name: &SessionName,
     source_index: u32,
     destination_index: u32,
 ) {
-    let response = handler
-        .handle(Request::LinkWindow(LinkWindowRequest {
-            source: WindowTarget::with_window(session_name.clone(), source_index),
-            target: WindowTarget::with_window(session_name.clone(), destination_index),
-            after: false,
-            before: false,
-            kill_destination: false,
-            detached: true,
-        }))
+    handler
+        .handle_ok(LinkWindowRequest::fixture((
+            WindowTarget::with_window(session_name.clone(), source_index),
+            WindowTarget::with_window(session_name.clone(), destination_index),
+        )))
         .await;
-    assert!(matches!(response, Response::LinkWindow(_)), "{response:?}");
 }
 
 fn assert_refresh(control: AttachControl) {

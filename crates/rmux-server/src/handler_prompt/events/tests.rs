@@ -4,26 +4,51 @@ use super::super::{
     CommandPromptPlan, ConfirmBeforePlan, PromptCompletion, PromptField, PromptType,
 };
 use super::*;
+use crate::test_fixtures::Fixture;
 
-fn test_origin(requester_pid: u32) -> RequesterOrigin {
-    RequesterOrigin::new(requester_pid, DetachedRequesterAuthority::Denied)
+/// A foreground command prompt with one `prompt` field prefilled with `input`, expanding `%%`.
+impl<'a> Fixture<(&'a str, &'a str)> for CommandPromptPlan {
+    fn fixture((prompt, input): (&'a str, &'a str)) -> Self {
+        Self {
+            origin: RequesterOrigin::new(1, DetachedRequesterAuthority::Denied),
+            target_client: None,
+            context: QueueExecutionContext::without_caller_cwd(),
+            fields: vec![PromptField {
+                prompt: prompt.to_owned(),
+                input: input.to_owned(),
+            }],
+            template: "%%".to_owned(),
+            flags: 0,
+            prompt_type: PromptType::Command,
+            background: false,
+            format_values: Vec::new(),
+        }
+    }
+}
+
+/// A foreground `kill-window` confirmation showing `prompt`, accepted by `y` and declined on
+/// Enter.
+impl<'a> Fixture<&'a str> for ConfirmBeforePlan {
+    fn fixture(prompt: &'a str) -> Self {
+        Self {
+            origin: RequesterOrigin::new(1, DetachedRequesterAuthority::Denied),
+            target_client: None,
+            context: QueueExecutionContext::without_caller_cwd(),
+            prompt: prompt.to_owned(),
+            template: "kill-window".to_owned(),
+            confirm_key: 'y',
+            default_yes: false,
+            background: false,
+            format_values: Vec::new(),
+        }
+    }
 }
 
 #[test]
 fn command_prompt_initial_render_starts_in_entry_mode() {
     let plan = CommandPromptPlan {
-        origin: test_origin(1),
-        target_client: None,
-        context: QueueExecutionContext::without_caller_cwd(),
-        fields: vec![PromptField {
-            prompt: "(rename-window) ".to_owned(),
-            input: "bash".to_owned(),
-        }],
         template: "rename-window -- '%%'".to_owned(),
-        flags: 0,
-        prompt_type: PromptType::Command,
-        background: false,
-        format_values: Vec::new(),
+        ..Fixture::fixture(("(rename-window) ", "bash"))
     };
 
     let prompt =
@@ -35,20 +60,7 @@ fn command_prompt_initial_render_starts_in_entry_mode() {
 
 #[test]
 fn buffer_operations_with_multibyte_chars() {
-    let plan = CommandPromptPlan {
-        origin: test_origin(1),
-        target_client: None,
-        context: QueueExecutionContext::without_caller_cwd(),
-        fields: vec![PromptField {
-            prompt: ":".to_owned(),
-            input: String::new(),
-        }],
-        template: "%%".to_owned(),
-        flags: 0,
-        prompt_type: PromptType::Command,
-        background: false,
-        format_values: Vec::new(),
-    };
+    let plan = CommandPromptPlan::fixture((":", ""));
     let mut prompt = ClientPromptState::new_command(plan, PromptCompletion::Background);
 
     prompt.push_char('ñ');
@@ -76,20 +88,7 @@ fn buffer_operations_with_multibyte_chars() {
 
 #[test]
 fn batched_text_inserts_once_at_the_unicode_cursor() {
-    let plan = CommandPromptPlan {
-        origin: test_origin(1),
-        target_client: None,
-        context: QueueExecutionContext::without_caller_cwd(),
-        fields: vec![PromptField {
-            prompt: ":".to_owned(),
-            input: "a日本z".to_owned(),
-        }],
-        template: "%%".to_owned(),
-        flags: 0,
-        prompt_type: PromptType::Command,
-        background: false,
-        format_values: Vec::new(),
-    };
+    let plan = CommandPromptPlan::fixture((":", "a日本z"));
     let mut prompt = ClientPromptState::new_command(plan, PromptCompletion::Background);
     assert!(prompt.move_left());
 
@@ -107,18 +106,9 @@ fn per_event_prompt_types_reject_batched_text() {
         PROMPT_FLAG_INCREMENTAL,
     ] {
         let plan = CommandPromptPlan {
-            origin: test_origin(1),
-            target_client: None,
-            context: QueueExecutionContext::without_caller_cwd(),
-            fields: vec![PromptField {
-                prompt: ":".to_owned(),
-                input: String::new(),
-            }],
-            template: "%%".to_owned(),
             flags,
-            prompt_type: PromptType::Command,
             background: flags == PROMPT_FLAG_INCREMENTAL,
-            format_values: Vec::new(),
+            ..Fixture::fixture((":", ""))
         };
         let mut prompt = ClientPromptState::new_command(plan, PromptCompletion::Background);
         assert!(!prompt.insert_batched_text("é"), "flags={flags:#x}");
@@ -129,17 +119,7 @@ fn per_event_prompt_types_reject_batched_text() {
 
 #[test]
 fn confirm_key_mode_accepts_correct_key() {
-    let plan = ConfirmBeforePlan {
-        origin: test_origin(1),
-        target_client: None,
-        context: QueueExecutionContext::without_caller_cwd(),
-        prompt: "sure? ".to_owned(),
-        template: "kill-window".to_owned(),
-        confirm_key: 'y',
-        default_yes: false,
-        background: false,
-        format_values: Vec::new(),
-    };
+    let plan = ConfirmBeforePlan::fixture("sure? ");
     let mut prompt = ClientPromptState::new_confirm(plan, PromptCompletion::Background);
     let mut history = PromptHistoryStore::default();
 
@@ -159,17 +139,7 @@ fn confirm_key_mode_accepts_correct_key() {
 
 #[test]
 fn confirm_enter_without_default_yes_declines() {
-    let plan = ConfirmBeforePlan {
-        origin: test_origin(1),
-        target_client: None,
-        context: QueueExecutionContext::without_caller_cwd(),
-        prompt: "sure? ".to_owned(),
-        template: "kill-window".to_owned(),
-        confirm_key: 'y',
-        default_yes: false,
-        background: false,
-        format_values: Vec::new(),
-    };
+    let plan = ConfirmBeforePlan::fixture("sure? ");
     let mut prompt = ClientPromptState::new_confirm(plan, PromptCompletion::Background);
     let mut history = PromptHistoryStore::default();
 
@@ -184,15 +154,8 @@ fn confirm_enter_without_default_yes_declines() {
 #[test]
 fn confirm_enter_with_default_yes_accepts() {
     let plan = ConfirmBeforePlan {
-        origin: test_origin(1),
-        target_client: None,
-        context: QueueExecutionContext::without_caller_cwd(),
-        prompt: "sure? ".to_owned(),
-        template: "kill-window".to_owned(),
-        confirm_key: 'y',
         default_yes: true,
-        background: false,
-        format_values: Vec::new(),
+        ..Fixture::fixture("sure? ")
     };
     let mut prompt = ClientPromptState::new_confirm(plan, PromptCompletion::Background);
     let mut history = PromptHistoryStore::default();
@@ -208,18 +171,8 @@ fn confirm_enter_with_default_yes_accepts() {
 #[test]
 fn key_mode_captures_any_key() {
     let plan = CommandPromptPlan {
-        origin: test_origin(1),
-        target_client: None,
-        context: QueueExecutionContext::without_caller_cwd(),
-        fields: vec![PromptField {
-            prompt: "key: ".to_owned(),
-            input: String::new(),
-        }],
-        template: "%%".to_owned(),
         flags: PROMPT_FLAG_KEY,
-        prompt_type: PromptType::Command,
-        background: false,
-        format_values: Vec::new(),
+        ..Fixture::fixture(("key: ", ""))
     };
     let mut prompt = ClientPromptState::new_command(plan, PromptCompletion::Background);
     let mut history = PromptHistoryStore::default();
@@ -231,18 +184,8 @@ fn key_mode_captures_any_key() {
 #[test]
 fn numeric_mode_rejects_non_digits() {
     let plan = CommandPromptPlan {
-        origin: test_origin(1),
-        target_client: None,
-        context: QueueExecutionContext::without_caller_cwd(),
-        fields: vec![PromptField {
-            prompt: "num: ".to_owned(),
-            input: String::new(),
-        }],
-        template: "%%".to_owned(),
         flags: PROMPT_FLAG_NUMERIC,
-        prompt_type: PromptType::Command,
-        background: false,
-        format_values: Vec::new(),
+        ..Fixture::fixture(("num: ", ""))
     };
     let mut prompt = ClientPromptState::new_command(plan, PromptCompletion::Background);
     let mut history = PromptHistoryStore::default();
@@ -270,18 +213,10 @@ fn numeric_mode_rejects_non_digits() {
 #[test]
 fn incremental_mode_dispatches_on_each_char() {
     let plan = CommandPromptPlan {
-        origin: test_origin(1),
-        target_client: None,
-        context: QueueExecutionContext::without_caller_cwd(),
-        fields: vec![PromptField {
-            prompt: "(search) ".to_owned(),
-            input: String::new(),
-        }],
-        template: "%%".to_owned(),
         flags: PROMPT_FLAG_INCREMENTAL,
         prompt_type: PromptType::Search,
         background: true,
-        format_values: Vec::new(),
+        ..Fixture::fixture(("(search) ", ""))
     };
     let mut prompt = ClientPromptState::new_command(plan, PromptCompletion::Background);
     let mut history = PromptHistoryStore::default();
@@ -306,18 +241,8 @@ fn incremental_mode_dispatches_on_each_char() {
 #[test]
 fn bspace_exit_cancels_on_empty_buffer_backspace() {
     let plan = CommandPromptPlan {
-        origin: test_origin(1),
-        target_client: None,
-        context: QueueExecutionContext::without_caller_cwd(),
-        fields: vec![PromptField {
-            prompt: "> ".to_owned(),
-            input: String::new(),
-        }],
-        template: "%%".to_owned(),
         flags: PROMPT_FLAG_BSPACE_EXIT,
-        prompt_type: PromptType::Command,
-        background: false,
-        format_values: Vec::new(),
+        ..Fixture::fixture(("> ", ""))
     };
     let mut prompt = ClientPromptState::new_command(plan, PromptCompletion::Background);
     let mut history = PromptHistoryStore::default();
@@ -334,20 +259,7 @@ fn bspace_exit_cancels_on_empty_buffer_backspace() {
 
 #[test]
 fn delete_word_left_and_paste() {
-    let plan = CommandPromptPlan {
-        origin: test_origin(1),
-        target_client: None,
-        context: QueueExecutionContext::without_caller_cwd(),
-        fields: vec![PromptField {
-            prompt: ":".to_owned(),
-            input: "hello world".to_owned(),
-        }],
-        template: "%%".to_owned(),
-        flags: 0,
-        prompt_type: PromptType::Command,
-        background: false,
-        format_values: Vec::new(),
-    };
+    let plan = CommandPromptPlan::fixture((":", "hello world"));
     let mut prompt = ClientPromptState::new_command(plan, PromptCompletion::Background);
     assert_eq!(prompt.cursor, 11);
 
@@ -363,17 +275,7 @@ fn delete_word_left_and_paste() {
 
 #[test]
 fn confirm_key_y_accepts_y_char() {
-    let plan = ConfirmBeforePlan {
-        origin: test_origin(1),
-        target_client: None,
-        context: QueueExecutionContext::without_caller_cwd(),
-        prompt: "kill? ".to_owned(),
-        template: "kill-window".to_owned(),
-        confirm_key: 'y',
-        default_yes: false,
-        background: false,
-        format_values: Vec::new(),
-    };
+    let plan = ConfirmBeforePlan::fixture("kill? ");
     let mut prompt = ClientPromptState::new_confirm(plan, PromptCompletion::Background);
     let mut history = PromptHistoryStore::default();
 
@@ -392,17 +294,7 @@ fn confirm_key_y_accepts_y_char() {
 
 #[test]
 fn confirm_escape_cancels() {
-    let plan = ConfirmBeforePlan {
-        origin: test_origin(1),
-        target_client: None,
-        context: QueueExecutionContext::without_caller_cwd(),
-        prompt: "kill? ".to_owned(),
-        template: "kill-window".to_owned(),
-        confirm_key: 'y',
-        default_yes: false,
-        background: false,
-        format_values: Vec::new(),
-    };
+    let plan = ConfirmBeforePlan::fixture("kill? ");
     let mut prompt = ClientPromptState::new_confirm(plan, PromptCompletion::Background);
     let mut history = PromptHistoryStore::default();
 
@@ -415,17 +307,7 @@ fn confirm_escape_cancels() {
 
 #[test]
 fn confirm_ctrl_c_cancels() {
-    let plan = ConfirmBeforePlan {
-        origin: test_origin(1),
-        target_client: None,
-        context: QueueExecutionContext::without_caller_cwd(),
-        prompt: "kill? ".to_owned(),
-        template: "kill-window".to_owned(),
-        confirm_key: 'y',
-        default_yes: false,
-        background: false,
-        format_values: Vec::new(),
-    };
+    let plan = ConfirmBeforePlan::fixture("kill? ");
     let mut prompt = ClientPromptState::new_confirm(plan, PromptCompletion::Background);
     let mut history = PromptHistoryStore::default();
 
@@ -445,18 +327,8 @@ fn confirm_ctrl_c_cancels() {
 #[test]
 fn numeric_mode_escape_cancels() {
     let plan = CommandPromptPlan {
-        origin: test_origin(1),
-        target_client: None,
-        context: QueueExecutionContext::without_caller_cwd(),
-        fields: vec![PromptField {
-            prompt: "num: ".to_owned(),
-            input: String::new(),
-        }],
-        template: "%%".to_owned(),
         flags: PROMPT_FLAG_NUMERIC,
-        prompt_type: PromptType::Command,
-        background: false,
-        format_values: Vec::new(),
+        ..Fixture::fixture(("num: ", ""))
     };
     let mut prompt = ClientPromptState::new_command(plan, PromptCompletion::Background);
     let mut history = PromptHistoryStore::default();
@@ -469,18 +341,8 @@ fn numeric_mode_escape_cancels() {
 #[test]
 fn numeric_mode_backspace_on_empty_submits_empty() {
     let plan = CommandPromptPlan {
-        origin: test_origin(1),
-        target_client: None,
-        context: QueueExecutionContext::without_caller_cwd(),
-        fields: vec![PromptField {
-            prompt: "num: ".to_owned(),
-            input: String::new(),
-        }],
-        template: "%%".to_owned(),
         flags: PROMPT_FLAG_NUMERIC,
-        prompt_type: PromptType::Command,
-        background: false,
-        format_values: Vec::new(),
+        ..Fixture::fixture(("num: ", ""))
     };
     let mut prompt = ClientPromptState::new_command(plan, PromptCompletion::Background);
     let mut history = PromptHistoryStore::default();
@@ -497,26 +359,14 @@ fn numeric_mode_backspace_on_empty_submits_empty() {
 
 #[test]
 fn multi_prompt_advances_through_fields() {
-    let plan = CommandPromptPlan {
-        origin: test_origin(1),
-        target_client: None,
-        context: QueueExecutionContext::without_caller_cwd(),
-        fields: vec![
-            PromptField {
-                prompt: "first: ".to_owned(),
-                input: String::new(),
-            },
-            PromptField {
-                prompt: "second: ".to_owned(),
-                input: "default2".to_owned(),
-            },
-        ],
+    let mut plan = CommandPromptPlan {
         template: "%% %2".to_owned(),
-        flags: 0,
-        prompt_type: PromptType::Command,
-        background: false,
-        format_values: Vec::new(),
+        ..Fixture::fixture(("first: ", ""))
     };
+    plan.fields.push(PromptField {
+        prompt: "second: ".to_owned(),
+        input: "default2".to_owned(),
+    });
     let mut prompt = ClientPromptState::new_command(plan, PromptCompletion::Background);
     assert_eq!(prompt.prompt, "first: ");
     assert_eq!(prompt.buffer, "");
@@ -534,18 +384,10 @@ fn multi_prompt_advances_through_fields() {
 #[test]
 fn incremental_ctrl_r_with_empty_buffer_restores_last_input() {
     let plan = CommandPromptPlan {
-        origin: test_origin(1),
-        target_client: None,
-        context: QueueExecutionContext::without_caller_cwd(),
-        fields: vec![PromptField {
-            prompt: "(search) ".to_owned(),
-            input: "previous".to_owned(),
-        }],
-        template: "%%".to_owned(),
         flags: PROMPT_FLAG_INCREMENTAL,
         prompt_type: PromptType::Search,
         background: true,
-        format_values: Vec::new(),
+        ..Fixture::fixture(("(search) ", "previous"))
     };
     let mut prompt = ClientPromptState::new_command(plan, PromptCompletion::Background);
     let mut history = PromptHistoryStore::default();

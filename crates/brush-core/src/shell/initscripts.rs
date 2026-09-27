@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use crate::{Shell, error, extensions, interp};
+use crate::{Shell, error, extensions, extensions::ExecutionObserver as _, interp};
 
 /// Behavior for loading profile files.
 #[derive(Default)]
@@ -48,6 +48,21 @@ impl<SE: extensions::ShellExtensions> Shell<SE> {
     /// * `profile_behavior` - Behavior for loading profile files.
     /// * `rc_behavior` - Behavior for loading rc files.
     pub async fn load_config(
+        &mut self,
+        profile_behavior: &ProfileLoadBehavior,
+        rc_behavior: &RcLoadBehavior,
+    ) -> Result<(), error::Error> {
+        // Configuration files are shell code; loading them runs as a future scoped by the
+        // observer.
+        let observer = self.execution_observer.clone();
+        observer
+            .scope_future(self.load_config_in_scope(profile_behavior, rc_behavior))?
+            .await
+    }
+
+    /// Loads and executes standard shell configuration files; the caller has already entered
+    /// the observer's scope.
+    async fn load_config_in_scope(
         &mut self,
         profile_behavior: &ProfileLoadBehavior,
         rc_behavior: &RcLoadBehavior,

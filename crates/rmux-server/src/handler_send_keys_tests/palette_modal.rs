@@ -68,26 +68,16 @@ async fn command_prompt_supersedes_an_ignored_display_message() {
     let alpha = session_name("prompt-supersedes-message");
     let requester_pid = std::process::id();
     create_send_keys_test_session(&handler, &alpha).await;
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
     handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
+        .handle_ok(DisplayMessageExtRequest {
+            target: Some(Target::Session(alpha)),
+            target_client: Some(requester_pid.to_string()),
+            duration_ms: Some(rmux_proto::DisplayMessageDurationMillis::new(10_000)),
+            ignore_input: true,
+            ..Fixture::fixture("old message")
+        })
         .await;
-    assert!(matches!(
-        handler
-            .handle(Request::DisplayMessageExt(Box::new(
-                DisplayMessageExtRequest {
-                    target: Some(Target::Session(alpha)),
-                    print: false,
-                    message: Some("old message".to_owned()),
-                    target_client: Some(requester_pid.to_string()),
-                    empty_target_context: false,
-                    duration_ms: Some(rmux_proto::DisplayMessageDurationMillis::new(10_000)),
-                    ignore_input: true,
-                },
-            )))
-            .await,
-        Response::DisplayMessage(_)
-    ));
 
     activate_surface(&handler, requester_pid, PaletteModalSurface::Prompt).await;
     assert!(
@@ -108,17 +98,6 @@ async fn command_prompt_supersedes_an_ignored_display_message() {
             .input,
         "abc"
     );
-}
-
-async fn register_palette_query(
-    handler: &RequestHandler,
-    session: &rmux_proto::SessionName,
-    query: &[u8],
-) {
-    let mut state = handler.state.lock().await;
-    state
-        .append_bytes_to_pane_transcript_for_test(session, 0, 0, query)
-        .expect("pane emits palette query");
 }
 
 #[tokio::test]
@@ -149,11 +128,8 @@ async fn fragmented_correlated_palette_response_bypasses_every_attached_modal_su
         let alpha = session_name(&format!("palette-modal-{}", surface.name()));
         let requester_pid = std::process::id();
         create_send_keys_test_session(&handler, &alpha).await;
-        let (control_tx, _control_rx) = mpsc::unbounded_channel();
-        let _attach_id = handler
-            .register_attach(requester_pid, alpha.clone(), control_tx)
-            .await;
-        register_palette_query(&handler, &alpha, query).await;
+        let _control_rx = handler.attach_client(requester_pid, &alpha).await;
+        append_pane_output(&handler, &alpha, query).await;
         activate_surface(&handler, requester_pid, surface).await;
         let capture = RawPaneInputProbe::start(
             &handler,
@@ -204,10 +180,7 @@ async fn command_prompt_palette_response_survives_every_fragment_boundary() {
     let alpha = session_name("palette-modal-all-splits");
     let requester_pid = std::process::id();
     create_send_keys_test_session(&handler, &alpha).await;
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
     activate_surface(&handler, requester_pid, PaletteModalSurface::Prompt).await;
     let query = b"\x1b]4;9;?\x1b\\";
     let response = b"\x1b]4;9;rgb:1111/2222/3333\x1b\\";
@@ -221,7 +194,7 @@ async fn command_prompt_palette_response_survives_every_fragment_boundary() {
     .await;
 
     for split in 1..response.len() {
-        register_palette_query(&handler, &alpha, query).await;
+        append_pane_output(&handler, &alpha, query).await;
         let mut pending_input = Vec::new();
         handler
             .handle_attached_live_input(requester_pid, &mut pending_input, &response[..split])
@@ -248,11 +221,8 @@ async fn modal_close_palette_response_and_tail_keep_wire_order() {
     let alpha = session_name("palette-modal-close-order");
     let requester_pid = std::process::id();
     create_send_keys_test_session(&handler, &alpha).await;
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
-    register_palette_query(&handler, &alpha, b"\x1b]4;7;?\x07").await;
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
+    append_pane_output(&handler, &alpha, b"\x1b]4;7;?\x07").await;
     activate_surface(&handler, requester_pid, PaletteModalSurface::Prompt).await;
 
     let response = b"\x1b]4;7;rgb:1111/2222/3333\x07";
@@ -287,13 +257,10 @@ async fn modal_close_reveals_underlying_surface_before_response_and_tail() {
     let alpha = session_name("palette-modal-transition-order");
     let requester_pid = std::process::id();
     create_send_keys_test_session(&handler, &alpha).await;
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
     activate_surface(&handler, requester_pid, PaletteModalSurface::ModeTree).await;
     activate_surface(&handler, requester_pid, PaletteModalSurface::Prompt).await;
-    register_palette_query(&handler, &alpha, b"\x1b]4;11;?\x07").await;
+    append_pane_output(&handler, &alpha, b"\x1b]4;11;?\x07").await;
 
     let response = b"\x1b]4;11;rgb:1111/2222/3333\x07";
     let mut input = b"\x03".to_vec();
@@ -330,11 +297,8 @@ async fn correlated_response_does_not_join_or_discard_partial_modal_input() {
     let alpha = session_name("palette-modal-partial-input");
     let requester_pid = std::process::id();
     create_send_keys_test_session(&handler, &alpha).await;
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
-    register_palette_query(&handler, &alpha, b"\x1b]4;12;?\x07").await;
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
+    append_pane_output(&handler, &alpha, b"\x1b]4;12;?\x07").await;
     activate_surface(&handler, requester_pid, PaletteModalSurface::Prompt).await;
 
     let response = b"\x1b]4;12;rgb:1111/2222/3333\x07";
@@ -369,11 +333,8 @@ async fn retained_palette_response_survives_modal_replacement() {
     let alpha = session_name("palette-modal-replacement");
     let requester_pid = std::process::id();
     create_send_keys_test_session(&handler, &alpha).await;
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
-    register_palette_query(&handler, &alpha, b"\x1b]4;8;?\x1b\\").await;
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
+    append_pane_output(&handler, &alpha, b"\x1b]4;8;?\x1b\\").await;
     activate_surface(&handler, requester_pid, PaletteModalSurface::Prompt).await;
     let response = b"\x1b]4;8;rgb:1111/2222/3333\x1b\\";
     let split = response.len() - 1;
@@ -410,10 +371,7 @@ async fn incomplete_palette_like_user_input_resolves_on_escape_timeout() {
     let alpha = session_name("palette-modal-user-prefix");
     let requester_pid = std::process::id();
     create_send_keys_test_session(&handler, &alpha).await;
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
     activate_surface(&handler, requester_pid, PaletteModalSurface::Prompt).await;
     let capture = RawPaneInputProbe::start(&handler, &alpha, "palette-modal-user-prefix", 3).await;
     let mut pending_input = Vec::new();
@@ -442,10 +400,7 @@ async fn uncorrelated_palette_response_is_discarded_without_disturbing_modal_inp
     let alpha = session_name("palette-modal-uncorrelated");
     let requester_pid = std::process::id();
     create_send_keys_test_session(&handler, &alpha).await;
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
     activate_surface(&handler, requester_pid, PaletteModalSurface::Prompt).await;
 
     let response = b"\x1b]4;10;rgb:1111/2222/3333\x07";
@@ -477,13 +432,9 @@ async fn second_fanout_palette_response_cannot_close_an_attached_modal_surface()
         create_send_keys_test_session(&handler, &alpha).await;
         let mut control_receivers = Vec::new();
         for pid in [first_pid, second_pid] {
-            let (control_tx, control_rx) = mpsc::unbounded_channel();
-            let _attach_id = handler
-                .register_attach(pid, alpha.clone(), control_tx)
-                .await;
-            control_receivers.push(control_rx);
+            control_receivers.push(handler.attach_client(pid, &alpha).await);
         }
-        register_palette_query(&handler, &alpha, b"\x1b]4;7;?\x07").await;
+        append_pane_output(&handler, &alpha, b"\x1b]4;7;?\x07").await;
         activate_surface(&handler, second_pid, surface).await;
 
         let response = b"\x1b]4;7;rgb:1111/2222/3333\x07";
@@ -510,11 +461,8 @@ async fn pane_bound_terminal_string_stays_opaque_across_modal_fragmentation() {
     let alpha = session_name("palette-modal-opaque-dcs");
     let requester_pid = std::process::id();
     create_send_keys_test_session(&handler, &alpha).await;
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
-    register_palette_query(&handler, &alpha, b"\x1b]4;7;?\x07").await;
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
+    append_pane_output(&handler, &alpha, b"\x1b]4;7;?\x07").await;
     activate_surface(&handler, requester_pid, PaletteModalSurface::Prompt).await;
 
     let response = b"\x1b]4;7;rgb:1111/2222/3333\x07";
@@ -561,11 +509,8 @@ async fn pane_bound_terminal_string_stays_opaque_after_modal_transition() {
     let alpha = session_name("palette-modal-opaque-reroute");
     let requester_pid = std::process::id();
     create_send_keys_test_session(&handler, &alpha).await;
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
-    register_palette_query(&handler, &alpha, b"\x1b]4;9;?\x07").await;
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
+    append_pane_output(&handler, &alpha, b"\x1b]4;9;?\x07").await;
     activate_surface(&handler, requester_pid, PaletteModalSurface::Prompt).await;
 
     let response = b"\x1b]4;9;rgb:1111/2222/3333\x07";

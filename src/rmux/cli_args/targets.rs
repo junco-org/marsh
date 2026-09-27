@@ -31,70 +31,41 @@ impl fmt::Display for TargetSpec {
     }
 }
 
-impl PartialEq<SessionName> for TargetSpec {
-    /// True when this spec statically resolved to exactly that session.
-    fn eq(&self, other: &SessionName) -> bool {
-        matches!(self.exact(), Some(Target::Session(session_name)) if session_name == other)
-    }
+/// Implements `PartialEq` against proto targets as "this spec statically resolved to exactly that
+/// target": either one bare `Target` variant, or a `Session`-or-`$variant` enum such as the
+/// session or window a `move-window` names.
+macro_rules! target_spec_eq {
+    ($($other:ident => $variant:ident),+ $(,)?) => {$(
+        impl PartialEq<$other> for TargetSpec {
+            fn eq(&self, other: &$other) -> bool {
+                matches!(self.exact(), Some(Target::$variant(target)) if target == other)
+            }
+        }
+    )+};
+    ($($other:ident: Session | $variant:ident),+ $(,)?) => {$(
+        impl PartialEq<$other> for TargetSpec {
+            fn eq(&self, other: &$other) -> bool {
+                match (self.exact(), other) {
+                    (Some(Target::Session(target)), $other::Session(other)) => target == other,
+                    (Some(Target::$variant(target)), $other::$variant(other)) => target == other,
+                    _ => false,
+                }
+            }
+        }
+    )+};
 }
 
-impl PartialEq<WindowTarget> for TargetSpec {
-    /// True when this spec statically resolved to exactly that window.
-    fn eq(&self, other: &WindowTarget) -> bool {
-        matches!(self.exact(), Some(Target::Window(target)) if target == other)
-    }
-}
-
-impl PartialEq<PaneTarget> for TargetSpec {
-    /// True when this spec statically resolved to exactly that pane.
-    fn eq(&self, other: &PaneTarget) -> bool {
-        matches!(self.exact(), Some(Target::Pane(target)) if target == other)
-    }
+target_spec_eq! { SessionName => Session, WindowTarget => Window, PaneTarget => Pane }
+target_spec_eq! {
+    MoveWindowTarget: Session | Window,
+    SelectLayoutTarget: Session | Window,
+    SplitWindowTarget: Session | Pane,
 }
 
 impl PartialEq<Target> for TargetSpec {
     /// True when this spec statically resolved to exactly that target.
     fn eq(&self, other: &Target) -> bool {
         self.exact().is_some_and(|target| target == other)
-    }
-}
-
-impl PartialEq<MoveWindowTarget> for TargetSpec {
-    /// True when this spec statically resolved to the same session or window to move.
-    fn eq(&self, other: &MoveWindowTarget) -> bool {
-        match (self.exact(), other) {
-            (Some(Target::Session(session_name)), MoveWindowTarget::Session(other)) => {
-                session_name == other
-            }
-            (Some(Target::Window(target)), MoveWindowTarget::Window(other)) => target == other,
-            _ => false,
-        }
-    }
-}
-
-impl PartialEq<SelectLayoutTarget> for TargetSpec {
-    /// True when this spec statically resolved to the same session or window to lay out.
-    fn eq(&self, other: &SelectLayoutTarget) -> bool {
-        match (self.exact(), other) {
-            (Some(Target::Session(session_name)), SelectLayoutTarget::Session(other)) => {
-                session_name == other
-            }
-            (Some(Target::Window(target)), SelectLayoutTarget::Window(other)) => target == other,
-            _ => false,
-        }
-    }
-}
-
-impl PartialEq<SplitWindowTarget> for TargetSpec {
-    /// True when this spec statically resolved to the same session or pane to split.
-    fn eq(&self, other: &SplitWindowTarget) -> bool {
-        match (self.exact(), other) {
-            (Some(Target::Session(session_name)), SplitWindowTarget::Session(other)) => {
-                session_name == other
-            }
-            (Some(Target::Pane(target)), SplitWindowTarget::Pane(other)) => target == other,
-            _ => false,
-        }
     }
 }
 
@@ -105,36 +76,23 @@ pub(super) fn parse_session_name(value: &str) -> Result<SessionName, String> {
 
 /// Parses a `-t` value, deferring to the server when it names a runtime id or an unknown shape.
 pub(crate) fn parse_target_spec(value: &str) -> Result<TargetSpec, String> {
-    let parse_value = exact_match_target(value);
-
-    if contains_runtime_target_id(parse_value) {
-        return Ok(TargetSpec {
-            raw: value.to_owned(),
-            exact: None,
-        });
-    }
-
-    match Target::parse(parse_value) {
-        Ok(target) => Ok(TargetSpec {
-            raw: value.to_owned(),
-            exact: Some(target),
-        }),
-        Err(_) if is_runtime_resolved_target_shape(parse_value) => Ok(TargetSpec {
-            raw: value.to_owned(),
-            exact: None,
-        }),
-        Err(error) => Err(error.to_string()),
-    }
-}
-
-/// Strips the leading `=` that requests an exact rather than prefix match.
-fn exact_match_target(value: &str) -> &str {
-    value.strip_prefix('=').unwrap_or(value)
-}
-
-/// True for any nonempty value, which the running server may still resolve.
-const fn is_runtime_resolved_target_shape(value: &str) -> bool {
-    !value.is_empty()
+    // A leading `=` requests an exact rather than prefix match.
+    let parse_value = value.strip_prefix('=').unwrap_or(value);
+    // Live `$`/`@` ids, and any other nonempty text the static parser rejects, are left for the
+    // running server to resolve.
+    let exact = if contains_runtime_target_id(parse_value) {
+        None
+    } else {
+        match Target::parse(parse_value) {
+            Ok(target) => Some(target),
+            Err(_) if !parse_value.is_empty() => None,
+            Err(error) => return Err(error.to_string()),
+        }
+    };
+    Ok(TargetSpec {
+        raw: value.to_owned(),
+        exact,
+    })
 }
 
 /// True when a colon or dot component starts with `$` or `@`, naming a live session or window id.

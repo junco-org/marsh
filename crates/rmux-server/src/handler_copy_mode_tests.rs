@@ -1,77 +1,27 @@
-use std::{
-    fs,
-    path::{Path, PathBuf},
-    time::{Duration, SystemTime, UNIX_EPOCH},
-};
+use std::{fs, path::Path, time::Duration};
 
 use std::os::unix::fs::PermissionsExt;
 
 use super::super::RequestHandler;
-use super::session_name;
 use crate::outer_terminal::OuterTerminalContext;
 use crate::pane_io::AttachControl;
-use rmux_core::{input::InputParser, Screen};
+use crate::test_fixtures::{quiet_command, unique_temp_path, wait_until, Fixture};
 use rmux_proto::{
     CapturePaneRequest, CopyModeRequest, ListPanesRequest, NewSessionExtRequest, OptionName,
     OptionScopeSelector, PaneTarget, Request, Response, ScopeSelector, SendKeysExtRequest,
-    SetOptionByNameRequest, SetOptionMode, SetOptionRequest, ShowBufferRequest,
-    SwitchClientRequest, TerminalSize, WindowTarget,
+    ShowBufferRequest, SwitchClientRequest, TerminalSize, WindowTarget,
 };
 use tokio::time::sleep;
 
-fn capture_request(target: PaneTarget, use_mode_screen: bool) -> CapturePaneRequest {
-    CapturePaneRequest {
-        target,
-        start: None,
-        end: None,
-        print: true,
-        buffer_name: None,
-        alternate: false,
-        escape_ansi: false,
-        escape_sequences: false,
-        include_format: false,
-        hyperlinks: false,
-        line_numbers: false,
-        join_wrapped: false,
-        use_mode_screen,
-        preserve_trailing_spaces: false,
-        do_not_trim_spaces: false,
-        pending_input: false,
-        quiet: false,
-        start_is_absolute: false,
-        end_is_absolute: false,
-    }
-}
-
 async fn create_session(handler: &RequestHandler, name: &str, size: TerminalSize) -> PaneTarget {
-    let session_name = session_name(name);
-    let response = handler
-        .handle(Request::NewSessionExt(Box::new(NewSessionExtRequest {
-            session_name: Some(session_name.clone()),
-            working_directory: None,
-            detached: true,
+    let session = handler
+        .create_session(NewSessionExtRequest {
             size: Some(size),
-            environment: None,
-            group_target: None,
-            attach_if_exists: false,
-            detach_other_clients: false,
-            kill_other_clients: false,
-            flags: None,
-            window_name: None,
-            print_session_info: false,
-            print_format: None,
-            command: Some(quiet_copy_mode_command()),
-            process_command: None,
-            client_environment: None,
-            skip_environment_update: false,
-        })))
+            command: Some(quiet_command()),
+            ..Fixture::fixture(name)
+        })
         .await;
-    assert!(matches!(response, Response::NewSession(_)));
-    PaneTarget::with_window(session_name, 0, 0)
-}
-
-fn quiet_copy_mode_command() -> Vec<String> {
-    vec!["/bin/sh".to_owned(), "-c".to_owned(), "sleep 60".to_owned()]
+    PaneTarget::with_window(session, 0, 0)
 }
 
 async fn replace_transcript_contents(
@@ -83,23 +33,9 @@ async fn replace_transcript_contents(
     handler
         .wait_for_pane_startup_to_finish_for_test(target)
         .await;
-    let transcript = {
-        let state = handler.state.lock().await;
-        state
-            .transcript_handle(target)
-            .expect("session transcript must exist")
-    };
-    let history_limit = transcript
-        .lock()
-        .expect("pane transcript mutex must not be poisoned")
-        .history_limit();
-    let mut screen = Screen::new(size, history_limit);
-    let mut parser = InputParser::new();
-    parser.parse(content, &mut screen);
-    transcript
-        .lock()
-        .expect("pane transcript mutex must not be poisoned")
-        .set_screen_for_test(screen);
+    handler
+        .replace_transcript_for_test(target, size, content)
+        .await;
 }
 
 async fn wait_for_capture(
@@ -110,10 +46,10 @@ async fn wait_for_capture(
 ) -> String {
     for _ in 0..100 {
         let response = handler
-            .handle(Request::CapturePane(Box::new(capture_request(
-                target.clone(),
+            .handle(Request::CapturePane(Box::new(CapturePaneRequest {
                 use_mode_screen,
-            ))))
+                ..Fixture::fixture(target)
+            })))
             .await;
         let output = response
             .command_output()
@@ -128,22 +64,6 @@ async fn wait_for_capture(
     panic!("capture output never contained {needle}");
 }
 
-async fn enter_copy_mode(handler: &RequestHandler, target: &PaneTarget, page_up: bool) -> Response {
-    handler
-        .handle(Request::CopyMode(CopyModeRequest {
-            target: Some(target.clone()),
-            page_down: false,
-            exit_on_scroll: false,
-            hide_position: false,
-            mouse_drag_start: false,
-            cancel_mode: false,
-            scrollbar_scroll: false,
-            source: None,
-            page_up,
-        }))
-        .await
-}
-
 #[tokio::test]
 async fn direct_copy_mode_entry_enables_line_numbers() {
     let handler = RequestHandler::new();
@@ -154,10 +74,7 @@ async fn direct_copy_mode_entry_enables_line_numbers() {
     )
     .await;
 
-    assert!(matches!(
-        enter_copy_mode(&handler, &target, false).await,
-        Response::CopyMode(_)
-    ));
+    handler.handle_ok(CopyModeRequest::fixture(&target)).await;
     let transcript = {
         let state = handler.state.lock().await;
         state
@@ -178,74 +95,20 @@ async fn pane_terminal_size(handler: &RequestHandler, target: &PaneTarget) -> Te
     handler
         .wait_for_pane_startup_to_finish_for_test(target)
         .await;
-    let state = handler.state.lock().await;
-    state
-        .pane_terminal_size(
-            target.session_name(),
-            target.window_index(),
-            target.pane_index(),
-        )
-        .expect("pane terminal size is available")
+    handler.pane_terminal_size_for_test(target).await
 }
 
-async fn send_copy_mode_command(
-    handler: &RequestHandler,
-    target: &PaneTarget,
-    tokens: &[&str],
-) -> Response {
-    send_copy_mode_command_values(
-        handler,
-        target,
-        tokens.iter().map(|token| (*token).to_owned()).collect(),
-    )
-    .await
-}
-
-async fn send_copy_mode_command_values(
-    handler: &RequestHandler,
-    target: &PaneTarget,
-    tokens: Vec<String>,
-) -> Response {
-    handler
-        .handle(Request::SendKeysExt(SendKeysExtRequest {
-            target: Some(target.clone()),
-            keys: tokens,
-            expand_formats: false,
-            hex: false,
-            literal: false,
-            dispatch_key_table: false,
-            copy_mode_command: true,
-            forward_mouse_event: false,
-            reset_terminal: false,
-            repeat_count: None,
-        }))
-        .await
-}
-
-async fn send_copy_mode_command_values_as(
-    handler: &RequestHandler,
-    requester_pid: u32,
-    target: &PaneTarget,
-    tokens: Vec<String>,
-) -> Response {
-    handler
-        .dispatch(
-            requester_pid,
-            Request::SendKeysExt(SendKeysExtRequest {
-                target: Some(target.clone()),
-                keys: tokens,
-                expand_formats: false,
-                hex: false,
-                literal: false,
-                dispatch_key_table: false,
-                copy_mode_command: true,
-                forward_mouse_event: false,
-                reset_terminal: false,
-                repeat_count: None,
-            }),
-        )
-        .await
-        .response
+/// `send-keys -X tokens…` against `target`: the tokens are one copy-mode command.
+fn copy_mode_command<K>(target: &PaneTarget, tokens: K) -> SendKeysExtRequest
+where
+    K: IntoIterator,
+    K::Item: Into<String>,
+{
+    SendKeysExtRequest {
+        dispatch_key_table: false,
+        copy_mode_command: true,
+        ..Fixture::fixture((target, tokens))
+    }
 }
 
 fn platform_copy_mode_arg(arg: &str) -> String {
@@ -255,29 +118,18 @@ fn platform_copy_mode_arg(arg: &str) -> String {
     }
 }
 
-fn unique_copy_pipe_output_path(label: &str) -> PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system clock must be after Unix epoch")
-        .as_nanos();
-    std::env::temp_dir().join(format!(
-        "rmux-copy-pipe-{label}-{}-{nanos}.txt",
-        std::process::id()
-    ))
-}
-
-async fn wait_for_file_contents(path: &Path, expected: &str) -> String {
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            match fs::read_to_string(path) {
-                Ok(contents) if contents.contains(expected) => return contents,
-                Ok(_) | Err(_) => sleep(Duration::from_millis(20)).await,
-            }
-        }
-    })
+async fn wait_for_file_containing(path: &Path, expected: &str) -> String {
+    wait_until(
+        Duration::from_secs(5),
+        Duration::from_millis(20),
+        async || match fs::read_to_string(path) {
+            Ok(contents) if contents.contains(expected) => Ok(contents),
+            other => Err(other),
+        },
+    )
     .await
-    .unwrap_or_else(|_| {
-        let observation = fs::read_to_string(path)
+    .unwrap_or_else(|last| {
+        let observation = last
             .map(|contents| format!("contents were {contents:?}"))
             .unwrap_or_else(|error| format!("read failed: {error}"));
         panic!(
@@ -299,66 +151,6 @@ fn file_url_path(path: &Path) -> String {
     path.to_string_lossy().replace(' ', "%20")
 }
 
-async fn set_copy_command(handler: &RequestHandler, command: String) {
-    let response = handler
-        .handle(Request::SetOptionByName(Box::new(SetOptionByNameRequest {
-            scope: OptionScopeSelector::ServerGlobal,
-            name: "copy-command".to_owned(),
-            value: Some(command),
-            mode: SetOptionMode::Replace,
-            only_if_unset: false,
-            unset: false,
-            unset_pane_overrides: false,
-            format: false,
-            format_target: None,
-        })))
-        .await;
-    assert!(
-        matches!(response, Response::SetOptionByName(_)),
-        "set-option copy-command returned {response:?}"
-    );
-}
-
-async fn set_default_shell(handler: &RequestHandler, shell: &Path) {
-    let response = handler
-        .handle(Request::SetOptionByName(Box::new(SetOptionByNameRequest {
-            scope: OptionScopeSelector::ServerGlobal,
-            name: "default-shell".to_owned(),
-            value: Some(shell.to_string_lossy().into_owned()),
-            mode: SetOptionMode::Replace,
-            only_if_unset: false,
-            unset: false,
-            unset_pane_overrides: false,
-            format: false,
-            format_target: None,
-        })))
-        .await;
-    assert!(
-        matches!(response, Response::SetOptionByName(_)),
-        "set-option default-shell returned {response:?}"
-    );
-}
-
-async fn set_set_clipboard(handler: &RequestHandler, value: &str) {
-    let response = handler
-        .handle(Request::SetOptionByName(Box::new(SetOptionByNameRequest {
-            scope: OptionScopeSelector::ServerGlobal,
-            name: "set-clipboard".to_owned(),
-            value: Some(value.to_owned()),
-            mode: SetOptionMode::Replace,
-            only_if_unset: false,
-            unset: false,
-            unset_pane_overrides: false,
-            format: false,
-            format_target: None,
-        })))
-        .await;
-    assert!(
-        matches!(response, Response::SetOptionByName(_)),
-        "set-option set-clipboard returned {response:?}"
-    );
-}
-
 fn take_write(control: AttachControl) -> Option<Vec<u8>> {
     match control {
         AttachControl::Write(bytes) => Some(bytes),
@@ -367,8 +159,9 @@ fn take_write(control: AttachControl) -> Option<Vec<u8>> {
 }
 
 async fn prepare_transfer_selection(handler: &RequestHandler, target: &PaneTarget) {
-    let response = send_copy_mode_command(handler, target, &["select-line"]).await;
-    assert!(matches!(response, Response::SendKeys(_)));
+    handler
+        .handle_ok(copy_mode_command(target, ["select-line"]))
+        .await;
 }
 
 #[tokio::test]
@@ -384,7 +177,12 @@ async fn copy_mode_capture_uses_backing_screen_snapshot() {
     )
     .await;
 
-    let response = enter_copy_mode(&handler, &target, true).await;
+    let response = handler
+        .handle(Request::CopyMode(CopyModeRequest {
+            page_up: true,
+            ..Fixture::fixture(&target)
+        }))
+        .await;
     assert_eq!(
         response,
         Response::CopyMode(rmux_proto::CopyModeResponse {
@@ -405,58 +203,33 @@ async fn modal_scrollbar_resizes_pty_only_while_copy_mode_is_active() {
     let target = create_session(&handler, "scrollbar-modal", size).await;
     assert_eq!(pane_terminal_size(&handler, &target).await, size);
 
-    let response = handler
-        .handle(Request::SetOption(SetOptionRequest {
-            scope: ScopeSelector::Window(WindowTarget::with_window(
-                target.session_name().clone(),
-                target.window_index(),
-            )),
-            option: OptionName::PaneScrollbars,
-            value: "modal".to_owned(),
-            mode: SetOptionMode::Replace,
-        }))
+    let scope = ScopeSelector::Window(WindowTarget::with_window(
+        target.session_name().clone(),
+        target.window_index(),
+    ));
+    handler
+        .set_option(scope.clone(), OptionName::PaneScrollbars, "modal")
         .await;
-    assert!(matches!(response, Response::SetOption(_)));
     assert_eq!(pane_terminal_size(&handler, &target).await, size);
 
-    assert!(matches!(
-        enter_copy_mode(&handler, &target, false).await,
-        Response::CopyMode(_)
-    ));
+    handler.handle_ok(CopyModeRequest::fixture(&target)).await;
     assert_eq!(
         pane_terminal_size(&handler, &target).await,
         TerminalSize { cols: 19, rows: 8 }
     );
 
-    let response = handler
-        .handle(Request::CopyMode(CopyModeRequest {
-            target: Some(target.clone()),
-            page_down: false,
-            exit_on_scroll: false,
-            hide_position: false,
-            mouse_drag_start: false,
+    handler
+        .handle_ok(CopyModeRequest {
             cancel_mode: true,
-            scrollbar_scroll: false,
-            source: None,
-            page_up: false,
-        }))
+            ..Fixture::fixture(&target)
+        })
         .await;
-    assert!(matches!(response, Response::CopyMode(_)));
     assert_eq!(pane_terminal_size(&handler, &target).await, size);
 
     for (value, expected_cols) in [("on", 19), ("off", 20)] {
-        let response = handler
-            .handle(Request::SetOption(SetOptionRequest {
-                scope: ScopeSelector::Window(WindowTarget::with_window(
-                    target.session_name().clone(),
-                    target.window_index(),
-                )),
-                option: OptionName::PaneScrollbars,
-                value: value.to_owned(),
-                mode: SetOptionMode::Replace,
-            }))
+        handler
+            .set_option(scope.clone(), OptionName::PaneScrollbars, value)
             .await;
-        assert!(matches!(response, Response::SetOption(_)));
         assert_eq!(
             pane_terminal_size(&handler, &target).await,
             TerminalSize {
@@ -474,23 +247,15 @@ async fn copy_mode_line_number_gutter_never_resizes_the_pty() {
     let target = create_session(&handler, "line-number-pty", size).await;
     assert_eq!(pane_terminal_size(&handler, &target).await, size);
 
-    let response = handler
-        .handle(Request::SetOption(SetOptionRequest {
-            scope: ScopeSelector::Window(WindowTarget::with_window(
-                target.session_name().clone(),
-                target.window_index(),
-            )),
-            option: OptionName::CopyModeLineNumbers,
-            value: "absolute".to_owned(),
-            mode: SetOptionMode::Replace,
-        }))
-        .await;
-    assert!(matches!(response, Response::SetOption(_)));
-
-    assert!(matches!(
-        enter_copy_mode(&handler, &target, false).await,
-        Response::CopyMode(_)
+    let scope = ScopeSelector::Window(WindowTarget::with_window(
+        target.session_name().clone(),
+        target.window_index(),
     ));
+    handler
+        .set_option(scope, OptionName::CopyModeLineNumbers, "absolute")
+        .await;
+
+    handler.handle_ok(CopyModeRequest::fixture(&target)).await;
     assert_eq!(
         pane_terminal_size(&handler, &target).await,
         size,
@@ -510,30 +275,24 @@ async fn copy_mode_formats_report_live_state() {
         b"alpha beta gamma\r\nneedle here\r\nomega\r\n",
     )
     .await;
-    assert!(matches!(
-        handler
-            .handle(Request::SetOption(SetOptionRequest {
-                scope: ScopeSelector::Global,
-                option: OptionName::CopyModeLineNumbers,
-                value: "absolute".to_owned(),
-                mode: SetOptionMode::Replace,
-            }))
-            .await,
-        Response::SetOption(_)
-    ));
+    handler
+        .set_option(
+            ScopeSelector::Global,
+            OptionName::CopyModeLineNumbers,
+            "absolute",
+        )
+        .await;
 
-    assert!(matches!(
-        enter_copy_mode(&handler, &target, false).await,
-        Response::CopyMode(_)
-    ));
-    assert!(matches!(
-        send_copy_mode_command(&handler, &target, &["search-backward", "--", "needle"]).await,
-        Response::SendKeys(_)
-    ));
-    assert!(matches!(
-        send_copy_mode_command(&handler, &target, &["select-word"]).await,
-        Response::SendKeys(_)
-    ));
+    handler.handle_ok(CopyModeRequest::fixture(&target)).await;
+    handler
+        .handle_ok(copy_mode_command(
+            &target,
+            ["search-backward", "--", "needle"],
+        ))
+        .await;
+    handler
+        .handle_ok(copy_mode_command(&target, ["select-word"]))
+        .await;
 
     let listed = handler
         .handle(Request::ListPanes(Box::new(ListPanesRequest {
@@ -667,10 +426,7 @@ async fn copy_mode_command_table_dispatches_all_tmux_commands() {
     wait_for_capture(&handler, &target, "last line", false).await;
 
     for (command, args) in COMMANDS {
-        assert!(matches!(
-            enter_copy_mode(&handler, &target, false).await,
-            Response::CopyMode(_)
-        ));
+        handler.handle_ok(CopyModeRequest::fixture(&target)).await;
 
         match *command {
             "append-selection"
@@ -687,20 +443,42 @@ async fn copy_mode_command_table_dispatches_all_tmux_commands() {
             | "stop-selection" => prepare_transfer_selection(&handler, &target).await,
             "other-end" => {
                 prepare_transfer_selection(&handler, &target).await;
-                let _ = send_copy_mode_command(&handler, &target, &["cursor-right"]).await;
+                let _ = handler
+                    .handle(Request::SendKeysExt(copy_mode_command(
+                        &target,
+                        ["cursor-right"],
+                    )))
+                    .await;
             }
             "jump-again" | "jump-reverse" => {
-                let _ =
-                    send_copy_mode_command(&handler, &target, &["jump-forward", "--", "a"]).await;
+                let _ = handler
+                    .handle(Request::SendKeysExt(copy_mode_command(
+                        &target,
+                        ["jump-forward", "--", "a"],
+                    )))
+                    .await;
             }
             "jump-to-mark" => {
-                let _ = send_copy_mode_command(&handler, &target, &["set-mark"]).await;
-                let _ = send_copy_mode_command(&handler, &target, &["cursor-down"]).await;
+                let _ = handler
+                    .handle(Request::SendKeysExt(copy_mode_command(
+                        &target,
+                        ["set-mark"],
+                    )))
+                    .await;
+                let _ = handler
+                    .handle(Request::SendKeysExt(copy_mode_command(
+                        &target,
+                        ["cursor-down"],
+                    )))
+                    .await;
             }
             "search-again" | "search-reverse" => {
-                let _ =
-                    send_copy_mode_command(&handler, &target, &["search-backward", "--", "alpha"])
-                        .await;
+                let _ = handler
+                    .handle(Request::SendKeysExt(copy_mode_command(
+                        &target,
+                        ["search-backward", "--", "alpha"],
+                    )))
+                    .await;
             }
             _ => {}
         }
@@ -710,7 +488,9 @@ async fn copy_mode_command_table_dispatches_all_tmux_commands() {
             tokens.push("--".to_owned());
             tokens.extend(args.iter().map(|arg| platform_copy_mode_arg(arg)));
         }
-        let response = send_copy_mode_command_values(&handler, &target, tokens).await;
+        let response = handler
+            .handle(Request::SendKeysExt(copy_mode_command(&target, tokens)))
+            .await;
         assert!(
             !matches!(response, Response::Error(_)),
             "{command} returned {response:?}"
@@ -732,22 +512,19 @@ async fn copy_mode_copy_selection_and_cancel_writes_buffer() {
     .await;
     wait_for_capture(&handler, &target, "needle", false).await;
 
-    assert!(matches!(
-        enter_copy_mode(&handler, &target, false).await,
-        Response::CopyMode(_)
-    ));
-    assert!(matches!(
-        send_copy_mode_command(&handler, &target, &["search-backward", "--", "needle"]).await,
-        Response::SendKeys(_)
-    ));
-    assert!(matches!(
-        send_copy_mode_command(&handler, &target, &["select-word"]).await,
-        Response::SendKeys(_)
-    ));
-    assert!(matches!(
-        send_copy_mode_command(&handler, &target, &["copy-selection-and-cancel"]).await,
-        Response::SendKeys(_)
-    ));
+    handler.handle_ok(CopyModeRequest::fixture(&target)).await;
+    handler
+        .handle_ok(copy_mode_command(
+            &target,
+            ["search-backward", "--", "needle"],
+        ))
+        .await;
+    handler
+        .handle_ok(copy_mode_command(&target, ["select-word"]))
+        .await;
+    handler
+        .handle_ok(copy_mode_command(&target, ["copy-selection-and-cancel"]))
+        .await;
 
     let buffer = handler
         .handle(Request::ShowBuffer(ShowBufferRequest { name: None }))
@@ -772,14 +549,10 @@ async fn attached_copy_mode_switch_after_mutation_is_not_a_fatal_input_error() {
         TerminalSize { cols: 40, rows: 4 },
     )
     .await;
-    let (control_tx, _control_rx) = tokio::sync::mpsc::unbounded_channel();
-    handler
-        .register_attach(requester_pid, alpha.session_name().clone(), control_tx)
+    let _control_rx = handler
+        .attach_client(requester_pid, alpha.session_name())
         .await;
-    assert!(matches!(
-        enter_copy_mode(&handler, &alpha, false).await,
-        Response::CopyMode(_)
-    ));
+    handler.handle_ok(CopyModeRequest::fixture(&alpha)).await;
 
     let pause = super::super::copy_mode_support::install_copy_mode_mutation_pause(requester_pid);
     let input_handler = std::sync::Arc::clone(&handler);
@@ -821,8 +594,14 @@ async fn attached_copy_mode_switch_after_mutation_is_not_a_fatal_input_error() {
 async fn copy_pipe_without_command_uses_copy_command_option() {
     let handler = RequestHandler::new();
     let target = create_session(&handler, "copy-command", TerminalSize { cols: 40, rows: 4 }).await;
-    let output_path = unique_copy_pipe_output_path("fallback");
-    set_copy_command(&handler, stdin_to_file_command(&output_path)).await;
+    let output_path = unique_temp_path("copy-pipe-fallback");
+    handler
+        .set_option_by_name(
+            OptionScopeSelector::ServerGlobal,
+            "copy-command",
+            &stdin_to_file_command(&output_path),
+        )
+        .await;
 
     replace_transcript_contents(
         &handler,
@@ -833,24 +612,21 @@ async fn copy_pipe_without_command_uses_copy_command_option() {
     .await;
     wait_for_capture(&handler, &target, "needle fallback", false).await;
 
-    assert!(matches!(
-        enter_copy_mode(&handler, &target, false).await,
-        Response::CopyMode(_)
-    ));
-    assert!(matches!(
-        send_copy_mode_command(&handler, &target, &["search-backward", "--", "needle"]).await,
-        Response::SendKeys(_)
-    ));
-    assert!(matches!(
-        send_copy_mode_command(&handler, &target, &["select-line"]).await,
-        Response::SendKeys(_)
-    ));
-    assert!(matches!(
-        send_copy_mode_command(&handler, &target, &["copy-pipe-and-cancel"]).await,
-        Response::SendKeys(_)
-    ));
+    handler.handle_ok(CopyModeRequest::fixture(&target)).await;
+    handler
+        .handle_ok(copy_mode_command(
+            &target,
+            ["search-backward", "--", "needle"],
+        ))
+        .await;
+    handler
+        .handle_ok(copy_mode_command(&target, ["select-line"]))
+        .await;
+    handler
+        .handle_ok(copy_mode_command(&target, ["copy-pipe-and-cancel"]))
+        .await;
 
-    let output = wait_for_file_contents(&output_path, "needle fallback").await;
+    let output = wait_for_file_containing(&output_path, "needle fallback").await;
     let _ = fs::remove_file(&output_path);
     assert!(output.contains("needle fallback"));
 }
@@ -867,8 +643,14 @@ async fn copy_pipe_hands_the_copy_command_non_ascii_selections_byte_exactly() {
     let handler = RequestHandler::new();
     let size = TerminalSize { cols: 60, rows: 4 };
     let target = create_session(&handler, "copy-command-utf8", size).await;
-    let output_path = unique_copy_pipe_output_path("utf8");
-    set_copy_command(&handler, stdin_to_file_command(&output_path)).await;
+    let output_path = unique_temp_path("copy-pipe-utf8");
+    handler
+        .set_option_by_name(
+            OptionScopeSelector::ServerGlobal,
+            "copy-command",
+            &stdin_to_file_command(&output_path),
+        )
+        .await;
 
     replace_transcript_contents(
         &handler,
@@ -879,24 +661,21 @@ async fn copy_pipe_hands_the_copy_command_non_ascii_selections_byte_exactly() {
     .await;
     wait_for_capture(&handler, &target, NEEDLE, false).await;
 
-    assert!(matches!(
-        enter_copy_mode(&handler, &target, false).await,
-        Response::CopyMode(_)
-    ));
-    assert!(matches!(
-        send_copy_mode_command(&handler, &target, &["search-backward", "--", "needle"]).await,
-        Response::SendKeys(_)
-    ));
-    assert!(matches!(
-        send_copy_mode_command(&handler, &target, &["select-line"]).await,
-        Response::SendKeys(_)
-    ));
-    assert!(matches!(
-        send_copy_mode_command(&handler, &target, &["copy-pipe-and-cancel"]).await,
-        Response::SendKeys(_)
-    ));
+    handler.handle_ok(CopyModeRequest::fixture(&target)).await;
+    handler
+        .handle_ok(copy_mode_command(
+            &target,
+            ["search-backward", "--", "needle"],
+        ))
+        .await;
+    handler
+        .handle_ok(copy_mode_command(&target, ["select-line"]))
+        .await;
+    handler
+        .handle_ok(copy_mode_command(&target, ["copy-pipe-and-cancel"]))
+        .await;
 
-    wait_for_file_contents(&output_path, NEEDLE).await;
+    wait_for_file_containing(&output_path, NEEDLE).await;
     let piped = fs::read(&output_path).expect("copy-pipe output is readable");
     let _ = fs::remove_file(&output_path);
 
@@ -921,9 +700,15 @@ async fn copy_pipe_explicit_command_overrides_copy_command_option() {
         TerminalSize { cols: 40, rows: 4 },
     )
     .await;
-    let fallback_path = unique_copy_pipe_output_path("fallback-unused");
-    let explicit_path = unique_copy_pipe_output_path("explicit");
-    set_copy_command(&handler, stdin_to_file_command(&fallback_path)).await;
+    let fallback_path = unique_temp_path("copy-pipe-fallback-unused");
+    let explicit_path = unique_temp_path("copy-pipe-explicit");
+    handler
+        .set_option_by_name(
+            OptionScopeSelector::ServerGlobal,
+            "copy-command",
+            &stdin_to_file_command(&fallback_path),
+        )
+        .await;
 
     replace_transcript_contents(
         &handler,
@@ -934,34 +719,25 @@ async fn copy_pipe_explicit_command_overrides_copy_command_option() {
     .await;
     wait_for_capture(&handler, &target, "needle explicit", false).await;
 
-    assert!(matches!(
-        enter_copy_mode(&handler, &target, false).await,
-        Response::CopyMode(_)
-    ));
-    assert!(matches!(
-        send_copy_mode_command(&handler, &target, &["search-backward", "--", "needle"]).await,
-        Response::SendKeys(_)
-    ));
-    assert!(matches!(
-        send_copy_mode_command(&handler, &target, &["select-line"]).await,
-        Response::SendKeys(_)
-    ));
-    let explicit_command = stdin_to_file_command(&explicit_path);
-    assert!(matches!(
-        send_copy_mode_command_values(
-            &handler,
+    handler.handle_ok(CopyModeRequest::fixture(&target)).await;
+    handler
+        .handle_ok(copy_mode_command(
             &target,
-            vec![
-                "copy-pipe-and-cancel".to_owned(),
-                "--".to_owned(),
-                explicit_command,
-            ],
-        )
-        .await,
-        Response::SendKeys(_)
-    ));
+            ["search-backward", "--", "needle"],
+        ))
+        .await;
+    handler
+        .handle_ok(copy_mode_command(&target, ["select-line"]))
+        .await;
+    let explicit_command = stdin_to_file_command(&explicit_path);
+    handler
+        .handle_ok(copy_mode_command(
+            &target,
+            ["copy-pipe-and-cancel", "--", explicit_command.as_str()],
+        ))
+        .await;
 
-    let explicit_output = wait_for_file_contents(&explicit_path, "needle explicit").await;
+    let explicit_output = wait_for_file_containing(&explicit_path, "needle explicit").await;
     let fallback_output = fs::read_to_string(&fallback_path).ok();
     let _ = fs::remove_file(&explicit_path);
     let _ = fs::remove_file(&fallback_path);
@@ -982,7 +758,13 @@ async fn copy_mode_buffer_yank_emits_clipboard_when_set_clipboard_enabled() {
     )
     .await;
     let requester_pid = 42;
-    set_set_clipboard(&handler, "external").await;
+    handler
+        .set_option_by_name(
+            OptionScopeSelector::ServerGlobal,
+            "set-clipboard",
+            "external",
+        )
+        .await;
 
     let (control_tx, mut control_rx) = tokio::sync::mpsc::unbounded_channel();
     handler
@@ -1003,28 +785,24 @@ async fn copy_mode_buffer_yank_emits_clipboard_when_set_clipboard_enabled() {
     .await;
     wait_for_capture(&handler, &target, "needle clipboard", false).await;
 
-    assert!(matches!(
-        enter_copy_mode(&handler, &target, false).await,
-        Response::CopyMode(_)
-    ));
-    assert!(matches!(
-        send_copy_mode_command(&handler, &target, &["search-backward", "--", "needle"]).await,
-        Response::SendKeys(_)
-    ));
-    assert!(matches!(
-        send_copy_mode_command(&handler, &target, &["select-line"]).await,
-        Response::SendKeys(_)
-    ));
-    assert!(matches!(
-        send_copy_mode_command_values_as(
-            &handler,
-            requester_pid,
+    handler.handle_ok(CopyModeRequest::fixture(&target)).await;
+    handler
+        .handle_ok(copy_mode_command(
             &target,
-            vec!["copy-selection".to_owned()],
+            ["search-backward", "--", "needle"],
+        ))
+        .await;
+    handler
+        .handle_ok(copy_mode_command(&target, ["select-line"]))
+        .await;
+    let yanked = handler
+        .dispatch(
+            requester_pid,
+            Request::SendKeysExt(copy_mode_command(&target, ["copy-selection"])),
         )
-        .await,
-        Response::SendKeys(_)
-    ));
+        .await
+        .response;
+    assert!(matches!(yanked, Response::SendKeys(_)));
 
     let mut bytes = None;
     while let Ok(control) = control_rx.try_recv() {
@@ -1083,33 +861,25 @@ async fn copy_pipe_uses_local_osc7_file_url_as_working_directory() {
     }
     wait_for_capture(&handler, &target, "needle osc7 cwd", false).await;
 
-    assert!(matches!(
-        enter_copy_mode(&handler, &target, false).await,
-        Response::CopyMode(_)
-    ));
-    assert!(matches!(
-        send_copy_mode_command(&handler, &target, &["search-backward", "--", "needle"]).await,
-        Response::SendKeys(_)
-    ));
-    assert!(matches!(
-        send_copy_mode_command(&handler, &target, &["select-line"]).await,
-        Response::SendKeys(_)
-    ));
-    assert!(matches!(
-        send_copy_mode_command_values(
-            &handler,
+    handler.handle_ok(CopyModeRequest::fixture(&target)).await;
+    handler
+        .handle_ok(copy_mode_command(
             &target,
-            vec![
-                "copy-pipe-and-cancel".to_owned(),
-                "--".to_owned(),
-                stdin_to_relative_file_command("copied.txt"),
-            ],
-        )
-        .await,
-        Response::SendKeys(_)
-    ));
+            ["search-backward", "--", "needle"],
+        ))
+        .await;
+    handler
+        .handle_ok(copy_mode_command(&target, ["select-line"]))
+        .await;
+    let relative_command = stdin_to_relative_file_command("copied.txt");
+    handler
+        .handle_ok(copy_mode_command(
+            &target,
+            ["copy-pipe-and-cancel", "--", relative_command.as_str()],
+        ))
+        .await;
 
-    let output = wait_for_file_contents(&output_path, "needle osc7 cwd").await;
+    let output = wait_for_file_containing(&output_path, "needle osc7 cwd").await;
     let _ = fs::remove_file(&output_path);
     assert!(output.contains("needle osc7 cwd"));
 }
@@ -1117,14 +887,7 @@ async fn copy_pipe_uses_local_osc7_file_url_as_working_directory() {
 #[tokio::test]
 async fn copy_pipe_uses_bin_sh_instead_of_default_shell_like_tmux() {
     let handler = RequestHandler::new();
-    let root = std::env::temp_dir().join(format!(
-        "rmux-copy-pipe-bin-sh-{}-{}",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system clock must be after Unix epoch")
-            .as_nanos()
-    ));
+    let root = unique_temp_path("copy-pipe-bin-sh");
     fs::create_dir_all(&root).expect("temp dir exists");
     let fake_shell = root.join("fake-shell.sh");
     let marker_path = root.join("default-shell-used.txt");
@@ -1136,7 +899,13 @@ async fn copy_pipe_uses_bin_sh_instead_of_default_shell_like_tmux() {
             crate::test_shell::sh_quote_path(&marker_path)
         ),
     );
-    set_default_shell(&handler, &fake_shell).await;
+    handler
+        .set_option_by_name(
+            OptionScopeSelector::ServerGlobal,
+            "default-shell",
+            &fake_shell.to_string_lossy(),
+        )
+        .await;
 
     let target = create_session(
         &handler,
@@ -1153,34 +922,25 @@ async fn copy_pipe_uses_bin_sh_instead_of_default_shell_like_tmux() {
     .await;
     wait_for_capture(&handler, &target, "needle bin sh", false).await;
 
-    assert!(matches!(
-        enter_copy_mode(&handler, &target, false).await,
-        Response::CopyMode(_)
-    ));
-    assert!(matches!(
-        send_copy_mode_command(&handler, &target, &["search-backward", "--", "needle"]).await,
-        Response::SendKeys(_)
-    ));
-    assert!(matches!(
-        send_copy_mode_command(&handler, &target, &["select-line"]).await,
-        Response::SendKeys(_)
-    ));
-    let explicit_command = stdin_to_file_command(&output_path);
-    assert!(matches!(
-        send_copy_mode_command_values(
-            &handler,
+    handler.handle_ok(CopyModeRequest::fixture(&target)).await;
+    handler
+        .handle_ok(copy_mode_command(
             &target,
-            vec![
-                "copy-pipe-and-cancel".to_owned(),
-                "--".to_owned(),
-                explicit_command,
-            ],
-        )
-        .await,
-        Response::SendKeys(_)
-    ));
+            ["search-backward", "--", "needle"],
+        ))
+        .await;
+    handler
+        .handle_ok(copy_mode_command(&target, ["select-line"]))
+        .await;
+    let explicit_command = stdin_to_file_command(&output_path);
+    handler
+        .handle_ok(copy_mode_command(
+            &target,
+            ["copy-pipe-and-cancel", "--", explicit_command.as_str()],
+        ))
+        .await;
 
-    let output = wait_for_file_contents(&output_path, "needle bin sh").await;
+    let output = wait_for_file_containing(&output_path, "needle bin sh").await;
     assert!(output.contains("needle bin sh"));
     assert!(
         !marker_path.exists(),

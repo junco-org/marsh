@@ -4,7 +4,7 @@ use super::*;
 fn parsed_list_keys_accepts_attached_sort_order_format_and_reverse() {
     let handler = RequestHandler::new();
     let state = handler.state.blocking_lock();
-    let parsed = crate::handler::scripting_support::parse_request_from_parts(
+    let parsed = parse_request_from_parts(
         "list-keys".to_owned(),
         vec![
             "-r".to_owned(),
@@ -29,20 +29,9 @@ fn parsed_list_keys_accepts_attached_sort_order_format_and_reverse() {
 #[tokio::test]
 async fn parsed_list_panes_accepts_filter_sort_order_and_reverse() {
     let handler = RequestHandler::new();
-    let alpha = session_name("alpha");
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: alpha,
-                detached: true,
-                size: Some(TerminalSize { cols: 80, rows: 24 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
+    handler.create_session("alpha").await;
     let state = handler.state.lock().await;
-    let parsed = crate::handler::scripting_support::parse_request_from_parts(
+    let parsed = parse_request_from_parts(
         "list-panes".to_owned(),
         vec![
             "-t".to_owned(),
@@ -77,29 +66,12 @@ async fn parsed_list_panes_accepts_filter_sort_order_and_reverse() {
 async fn parsed_list_windows_applies_filter_sort_order_and_reverse() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: alpha.clone(),
-                detached: true,
-                size: Some(TerminalSize { cols: 80, rows: 24 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
+    handler.create_session(&alpha).await;
     handler
-        .handle(Request::NewWindow(Box::new(NewWindowRequest {
-            target: alpha.clone(),
-            name: None,
-            command: None,
-            process_command: None,
+        .create_window(NewWindowRequest {
             detached: false,
-            start_directory: None,
-            environment: None,
-            target_window_index: None,
-            insert_at_target: false,
-        })))
+            ..Fixture::fixture(&alpha)
+        })
         .await;
 
     let filtered = CommandParser::new()
@@ -124,18 +96,7 @@ async fn parsed_list_windows_applies_filter_sort_order_and_reverse() {
 #[tokio::test]
 async fn parsed_set_option_scope_flags_use_tmux_precedence_and_natural_tables() {
     let handler = RequestHandler::new();
-    let alpha = session_name("alpha");
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: alpha,
-                detached: true,
-                size: Some(TerminalSize { cols: 80, rows: 24 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
+    handler.create_session("alpha").await;
 
     let parsed = CommandParser::new()
         .parse("set-option -s -p @scope server")
@@ -158,7 +119,7 @@ async fn parsed_set_option_scope_flags_use_tmux_precedence_and_natural_tables() 
         .expect("set-option known option parses");
     {
         let state = handler.state.lock().await;
-        let request = crate::handler::scripting_support::parse_request_from_parts(
+        let request = parse_request_from_parts(
             "set-option".to_owned(),
             vec![
                 "-w".to_owned(),
@@ -339,9 +300,7 @@ async fn parsed_queue_set_hook_accepts_command_blocks() {
 
     let state = handler.state.lock().await;
     assert_eq!(
-        state
-            .hooks
-            .global_command(rmux_proto::HookName::AfterNewWindow),
+        state.hooks.global_command(HookName::AfterNewWindow),
         Some("display-message -p -- hook-block")
     );
 }
@@ -350,17 +309,7 @@ async fn parsed_queue_set_hook_accepts_command_blocks() {
 async fn parsed_queue_set_hook_resolves_relative_targets_before_block_parse() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: alpha.clone(),
-                detached: true,
-                size: Some(TerminalSize { cols: 80, rows: 24 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
+    handler.create_session(&alpha).await;
 
     let parsed = CommandParser::new()
         .parse("set-hook -t . after-new-window { display-message -p -- hook-block }")
@@ -380,17 +329,7 @@ async fn parsed_queue_set_hook_resolves_relative_targets_before_block_parse() {
 async fn parsed_queue_set_hook_session_target_uses_hook_natural_window_scope() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: alpha.clone(),
-                detached: true,
-                size: Some(TerminalSize { cols: 80, rows: 24 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
+    handler.create_session(&alpha).await;
 
     let parsed = CommandParser::new()
         .parse("set-hook -t alpha window-renamed { display-message -p -- renamed }")
@@ -418,17 +357,7 @@ async fn parsed_queue_set_hook_session_target_uses_hook_natural_window_scope() {
 async fn parsed_hook_commands_resolve_implicit_current_scopes() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha-implicit-hooks");
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: alpha.clone(),
-                detached: true,
-                size: Some(TerminalSize { cols: 80, rows: 24 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
+    handler.create_session(&alpha).await;
 
     let state = handler.state.lock().await;
     let current = TargetFindContext::new(Some(Target::Pane(PaneTarget::with_window(
@@ -447,7 +376,7 @@ async fn parsed_hook_commands_resolve_implicit_current_scopes() {
             ScopeSelector::Pane(PaneTarget::with_window(alpha.clone(), 0, 0)),
         ),
     ] {
-        let request = crate::handler::scripting_support::parse_request_from_parts(
+        let request = parse_request_from_parts(
             "show-hooks".to_owned(),
             arguments,
             None,
@@ -480,7 +409,7 @@ async fn parsed_hook_commands_resolve_implicit_current_scopes() {
             ScopeSelector::Pane(PaneTarget::with_window(alpha, 0, 0)),
         ),
     ] {
-        let request = crate::handler::scripting_support::parse_request_from_parts(
+        let request = parse_request_from_parts(
             "set-hook".to_owned(),
             arguments,
             None,
@@ -501,7 +430,7 @@ fn parsed_set_window_option_rejects_non_window_scope_flags() {
     let handler = RequestHandler::new();
     let state = handler.state.blocking_lock();
     for token in ["-s", "-w", "-p", "-U", "-gs", "-gw", "-gp", "-gU"] {
-        let error = crate::handler::scripting_support::parse_request_from_parts(
+        let error = parse_request_from_parts(
             "set-window-option".to_owned(),
             vec![
                 token.to_owned(),

@@ -3,25 +3,18 @@
 //! `execve` replacing the process — which would discard everything the session had not
 //! published yet, and everything the exec'd program goes on to write.
 
-use std::collections::HashMap;
 use std::io::Write;
 
-use brush_core::builtins::{self, Registration};
+use brush_core::builtins;
 use brush_core::commands;
 use brush_core::results::ExecutionControlFlow;
 use brush_core::{
     CommandArg, ExecutionContext, ExecutionExitCode, ExecutionResult, ShellExtensions,
 };
 
-/// The `exec` registration, keyed `"exec"`, to be inserted over the stock one.
-#[must_use]
-pub fn exec_builtins<SE: ShellExtensions>() -> HashMap<String, Registration<SE>> {
-    HashMap::from([("exec".to_string(), builtins::builtin::<ExecBuiltin, SE>())])
-}
-
 /// Runs a program in place of the shell — here: through the shell, then out of it.
 #[derive(clap::Parser)]
-struct ExecBuiltin {
+pub(super) struct ExecBuiltin {
     /// Pass given name as zeroth argument to command.
     #[arg(short = 'a', value_name = "NAME")]
     name_for_argv0: Option<String>,

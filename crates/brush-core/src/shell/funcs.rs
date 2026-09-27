@@ -1,7 +1,10 @@
 //! Function support for shells.
 
 use crate::{
-    ExecutionParameters, commands, error, extensions, functions, results::ExecutionWaitResult,
+    ExecutionParameters, commands, error,
+    extensions::{self, ExecutionObserver as _},
+    functions,
+    results::ExecutionWaitResult,
 };
 
 impl<SE: extensions::ShellExtensions> crate::Shell<SE> {
@@ -96,7 +99,26 @@ impl<SE: extensions::ShellExtensions> crate::Shell<SE> {
         args: I,
         params: &ExecutionParameters,
     ) -> Result<u8, error::Error> {
-        let name = name.as_ref();
+        let command_args = args
+            .into_iter()
+            .map(|s| commands::CommandArg::String(String::from(s.as_ref())))
+            .collect::<Vec<_>>();
+
+        // The function runs as a future scoped by the observer.
+        let observer = self.execution_observer.clone();
+        observer
+            .scope_future(self.invoke_function_in_scope(name.as_ref(), command_args, params))?
+            .await
+    }
+
+    /// Invokes a function defined in this shell, returning the resulting exit status; the
+    /// caller has already entered the observer's scope.
+    async fn invoke_function_in_scope(
+        &mut self,
+        name: &str,
+        command_args: Vec<commands::CommandArg>,
+        params: &ExecutionParameters,
+    ) -> Result<u8, error::Error> {
         let command_name = String::from(name);
 
         let func_registration = self
@@ -111,11 +133,6 @@ impl<SE: extensions::ShellExtensions> crate::Shell<SE> {
             params: params.clone(),
             process_group_id: None,
         };
-
-        let command_args = args
-            .into_iter()
-            .map(|s| commands::CommandArg::String(String::from(s.as_ref())))
-            .collect::<Vec<_>>();
 
         let result =
             commands::invoke_shell_function(func_registration, context, &command_args).await?;

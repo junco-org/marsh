@@ -14,7 +14,7 @@
 //! its next OSC 0 is `TARGET=beta|CLIENT=beta`.
 
 use super::set_titles_support::{
-    delivered_titles, new_detached_session, remembered_title, set_global, title_capable_context,
+    attach_title_capable_client, delivered_titles, remembered_title, set_global,
 };
 use super::*;
 
@@ -27,28 +27,11 @@ async fn arm_two_sessions(
     alpha: &rmux_proto::SessionName,
     beta: &rmux_proto::SessionName,
 ) {
-    new_detached_session(handler, alpha).await;
-    new_detached_session(handler, beta).await;
+    handler.create_session(alpha).await;
+    handler.create_session(beta).await;
     // The reviewer's reproduction: no periodic redraw may repair the frame.
     set_global(handler, OptionName::StatusInterval, "0").await;
     set_global(handler, OptionName::SetTitlesString, SWITCH_TITLE_FORMAT).await;
-}
-
-async fn attach_title_capable_client(
-    handler: &RequestHandler,
-    session: &rmux_proto::SessionName,
-    attach_pid: u32,
-) -> mpsc::UnboundedReceiver<AttachControl> {
-    let (control_tx, control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach_with_terminal_context(
-            attach_pid,
-            session.clone(),
-            control_tx,
-            title_capable_context(),
-        )
-        .await;
-    control_rx
 }
 
 fn expected_title(session: &str, attach_pid: u32) -> String {

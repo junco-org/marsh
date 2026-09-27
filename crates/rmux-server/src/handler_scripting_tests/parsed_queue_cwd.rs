@@ -12,7 +12,12 @@ async fn queued_window_spawns_use_non_attached_caller_cwd() {
         fs::canonicalize(root.child("session").path()).expect("canonical session cwd");
     let caller_cwd = fs::canonicalize(root.child("caller").path()).expect("canonical caller cwd");
     let session = session_name("queued-window-caller-cwd");
-    create_session_with_cwd(&handler, &session, &session_cwd).await;
+    handler
+        .create_session(NewSessionExtRequest {
+            working_directory: Some(session_cwd.to_string_lossy().into_owned()),
+            ..Fixture::fixture(&session)
+        })
+        .await;
 
     let context = QueueExecutionContext::new(Some(caller_cwd.clone())).with_current_target(Some(
         Target::Pane(PaneTarget::with_window(session.clone(), 0, 0)),
@@ -42,7 +47,12 @@ async fn queued_window_spawns_without_caller_cwd_keep_session_cwd() {
     let session_cwd =
         fs::canonicalize(root.child("session").path()).expect("canonical session cwd");
     let session = session_name("queued-window-attached-cwd");
-    create_session_with_cwd(&handler, &session, &session_cwd).await;
+    handler
+        .create_session(NewSessionExtRequest {
+            working_directory: Some(session_cwd.to_string_lossy().into_owned()),
+            ..Fixture::fixture(&session)
+        })
+        .await;
 
     let context = QueueExecutionContext::without_caller_cwd().with_current_target(Some(
         Target::Pane(PaneTarget::with_window(session.clone(), 0, 0)),
@@ -75,7 +85,12 @@ async fn queued_window_explicit_cwd_overrides_non_attached_caller_cwd() {
     let explicit_cwd =
         fs::canonicalize(root.child("explicit").path()).expect("canonical explicit cwd");
     let session = session_name("queued-window-explicit-cwd");
-    create_session_with_cwd(&handler, &session, &session_cwd).await;
+    handler
+        .create_session(NewSessionExtRequest {
+            working_directory: Some(session_cwd.to_string_lossy().into_owned()),
+            ..Fixture::fixture(&session)
+        })
+        .await;
 
     let context = QueueExecutionContext::new(Some(caller_cwd)).with_current_target(Some(
         Target::Pane(PaneTarget::with_window(session.clone(), 0, 0)),
@@ -83,7 +98,7 @@ async fn queued_window_explicit_cwd_overrides_non_attached_caller_cwd() {
     let new_window = CommandParser::new()
         .parse(&format!(
             "new-window -d -n explicit-window -c {}",
-            shell_quote(&explicit_cwd)
+            sh_quote_path(&explicit_cwd)
         ))
         .expect("new-window parses");
     handler
@@ -93,7 +108,7 @@ async fn queued_window_explicit_cwd_overrides_non_attached_caller_cwd() {
     let split_window = CommandParser::new()
         .parse(&format!(
             "split-window -d -c {}",
-            shell_quote(&explicit_cwd)
+            sh_quote_path(&explicit_cwd)
         ))
         .expect("split-window parses");
     handler
@@ -102,31 +117,6 @@ async fn queued_window_explicit_cwd_overrides_non_attached_caller_cwd() {
         .expect("split-window executes");
 
     assert_window_and_split_cwds(&handler, &session, &explicit_cwd).await;
-}
-
-async fn create_session_with_cwd(handler: &RequestHandler, session: &SessionName, cwd: &Path) {
-    let response = handler
-        .handle(Request::NewSessionExt(Box::new(NewSessionExtRequest {
-            session_name: Some(session.clone()),
-            working_directory: Some(cwd.to_string_lossy().into_owned()),
-            detached: true,
-            size: Some(TerminalSize { cols: 80, rows: 24 }),
-            environment: None,
-            group_target: None,
-            attach_if_exists: false,
-            detach_other_clients: false,
-            kill_other_clients: false,
-            flags: None,
-            window_name: None,
-            print_session_info: false,
-            print_format: None,
-            command: None,
-            process_command: None,
-            client_environment: None,
-            skip_environment_update: false,
-        })))
-        .await;
-    assert!(matches!(response, Response::NewSession(_)), "{response:?}");
 }
 
 async fn assert_window_and_split_cwds(

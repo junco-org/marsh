@@ -12,19 +12,27 @@ publish = false
 [lib]
 bench = false
 
+[features]
+testing = ["marsh-btrfs/fake"]
+
 [dependencies]
 brush-core.workspace = true
 brush-builtins.workspace = true
-brush-interactive = "^0.4.0"
+brush-interactive = { version = "^0.4.0", features = ["basic"] }
 clap = { version = "4.6.0", features = ["derive"] }
 marsh-btrfs = { path = "../marsh-btrfs" }
 marsh-lib = { path = "../marsh-lib", default-features = false, features = ["watch"] }
 marsh-wal = { path = "../marsh-wal" }
 marsh-instrument = { path = "../marsh-instrument" }
+lurk-cli.workspace = true
+syscalls.workspace = true
+nix-observer = { package = "nix", version = "=0.30.1", features = ["process"] }
+glob = "0.3"
+futures-util = "0.3"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0.149"
 thiserror = "2.0.18"
-tokio = { version = "1.52.3", features = ["rt", "rt-multi-thread", "sync", "net"] }
+tokio = { version = "1.52.3", features = ["rt", "rt-multi-thread", "sync", "net", "macros", "time"] }
 # The pty ioctls, the `read`/`write` on its master, and the `kill(-pgid, SIGKILL)` a forced stop
 # sends: all of them syscalls with no safe wrapper in this dependency set.
 libc = "0.2"
@@ -38,6 +46,7 @@ junco-rust-validator = { path = "../../../junco-policy" }
 
 [dev-dependencies]
 marsh-btrfs = { path = "../marsh-btrfs", features = ["fake"] }
+marsh-instrument = { path = "../marsh-instrument", features = ["testing"] }
 tempfile = "3.27.0"
 hex = "0.4"
 serial_test = "3"

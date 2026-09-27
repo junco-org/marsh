@@ -1,7 +1,5 @@
 use clap::{ArgAction, Args};
 
-use super::QueuedCommand;
-
 /// Arguments for `command-prompt`, which asks the attached client for input before a command.
 #[derive(Debug, Clone, Args)]
 pub(crate) struct PromptArgs {
@@ -64,25 +62,4 @@ pub(crate) struct PromptHistoryArgs {
     pub(crate) prompt_type: Option<String>,
     #[arg(skip = String::new())]
     pub(crate) queue_command: String,
-}
-
-impl QueuedCommand for PromptArgs {
-    /// Records the original `command-prompt` text so the server can re-parse it when resolved.
-    fn set_queue_command(&mut self, queue_command: String) {
-        self.queue_command = queue_command;
-    }
-}
-
-impl QueuedCommand for ConfirmBeforeArgs {
-    /// Records the original `confirm-before` text so the server can re-parse it once confirmed.
-    fn set_queue_command(&mut self, queue_command: String) {
-        self.queue_command = queue_command;
-    }
-}
-
-impl QueuedCommand for PromptHistoryArgs {
-    /// Records the original prompt-history command text for server-side re-parsing.
-    fn set_queue_command(&mut self, queue_command: String) {
-        self.queue_command = queue_command;
-    }
 }

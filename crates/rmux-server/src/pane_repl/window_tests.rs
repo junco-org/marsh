@@ -9,10 +9,7 @@
 use std::collections::HashSet;
 
 use marsh_core::shellmux::{JobIo, JobView};
-use rmux_proto::{
-    ListWindowsRequest, NewSessionRequest, Request, Response, SessionName, TerminalSize,
-    WindowListEntry,
-};
+use rmux_proto::{ListWindowsRequest, SessionName, WindowListEntry};
 
 use super::Prompt;
 use crate::handler::RequestHandler;
@@ -29,18 +26,7 @@ async fn prompt_over_session(name: &str) -> (RequestHandler, ShellIo, SessionNam
     let seed = io.default_dir().to_path_buf();
     std::fs::create_dir_all(seed.join("docs")).expect("a directory for `sd` to name");
 
-    let session = SessionName::new(name).expect("valid session name");
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: session.clone(),
-                detached: true,
-                size: Some(TerminalSize { cols: 80, rows: 24 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
+    let session = handler.create_session(name).await;
 
     let view = terminal_jobs(&io)
         .into_iter()
@@ -60,19 +46,16 @@ fn terminal_jobs(io: &ShellIo) -> Vec<JobView> {
 }
 
 async fn list_windows(handler: &RequestHandler, session: &SessionName) -> Vec<WindowListEntry> {
-    match handler
-        .handle(Request::ListWindows(Box::new(ListWindowsRequest {
+    handler
+        .handle_ok(ListWindowsRequest {
             target: session.clone(),
             format: None,
             filter: None,
             sort_order: None,
             reversed: false,
-        })))
+        })
         .await
-    {
-        Response::ListWindows(listed) => listed.windows,
-        other => panic!("list-windows answered {other:?}"),
-    }
+        .windows
 }
 
 /// Which window the session is showing.

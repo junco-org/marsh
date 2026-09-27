@@ -51,8 +51,7 @@
 use std::sync::{Mutex, MutexGuard, PoisonError, Weak};
 
 use crate::shellmux::command::{CommandCompletion, CommandHandle};
-use crate::shellmux::jobs::JobEnd;
-use crate::shellmux::types::{OutputChannel, TerminalGeometry};
+use crate::shellmux::types::{JobEnd, OutputChannel, TerminalGeometry};
 use crate::shellmux::{Sandbox, Shell, ShellMux};
 
 /// A receipt a frontend returns to slow one output stream to its own pace.
@@ -189,24 +188,20 @@ pub enum FrontendEvent<'a> {
     },
 }
 
-/// Delivers `event` to `frontend`, recovering a poisoned lock like the rest of this module.
-///
-/// A frontend that panicked in one callback left the mux's own state untouched, and refusing to
-/// deliver to it afterwards would silently stop a session that is otherwise still running.
+/// Delivers `event` to `frontend` under one short acquisition of [`lock_frontend`].
 pub(crate) fn notify(
     frontend: &Mutex<dyn ShellFrontend>,
     event: FrontendEvent<'_>,
 ) -> Option<OutputReceipt> {
-    let mut guard = frontend.lock().unwrap_or_else(PoisonError::into_inner);
-    let receipt = guard.update(event);
-    drop(guard);
-    receipt
+    lock_frontend(frontend).update(event)
 }
 
-/// The frontend, with the same poisoning recovery as [`notify`].
+/// The frontend, recovering a poisoned lock like the rest of this module.
 ///
-/// For the two places that need more than one call under one guard: binding a fresh mux and
-/// announcing its first state, and detaching at shutdown.
+/// A frontend that panicked in one callback left the mux's own state untouched, and refusing to
+/// deliver to it afterwards would silently stop a session that is otherwise still running. Held
+/// across more than one call only to bind a fresh mux and announce its first state, and to detach
+/// at shutdown.
 pub(crate) fn lock_frontend(
     frontend: &Mutex<dyn ShellFrontend>,
 ) -> MutexGuard<'_, dyn ShellFrontend> {

@@ -1,12 +1,4 @@
 use super::*;
-use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
-
-use crate::control::{ControlModeUpgrade, ControlServerEvent, CONTROL_SERVER_EVENT_CAPACITY};
-use crate::handler::ControlRegistration;
-use crate::outer_terminal::OuterTerminalContext;
-use rmux_os::identity::UserIdentity;
-use tokio::sync::mpsc;
 
 #[tokio::test]
 async fn parsed_command_list_routes_start_server_and_named_inventory_lookups() {
@@ -49,25 +41,7 @@ async fn parsed_command_list_routes_start_server_and_named_inventory_lookups() {
 async fn control_queue_allows_read_only_start_server_and_list_commands() {
     let handler = RequestHandler::new();
     let requester_pid = 52_001;
-    let (event_tx, _event_rx) = mpsc::channel::<ControlServerEvent>(CONTROL_SERVER_EVENT_CAPACITY);
-    handler
-        .register_control_with_access(
-            requester_pid,
-            ControlModeUpgrade {
-                initial_command_count: 0,
-                mode: rmux_proto::ControlMode::Plain,
-                terminal_context: OuterTerminalContext::default(),
-            },
-            ControlRegistration {
-                event_tx,
-                closing: Arc::new(AtomicBool::new(false)),
-                uid: 1000,
-                user: UserIdentity::Uid(1000),
-                can_write: false,
-            },
-        )
-        .await
-        .expect("control registration succeeds");
+    let _event_rx = register_control_client(&handler, requester_pid, false).await;
     let parsed = CommandParser::new()
         .parse("start-server ; list-commands new-window")
         .expect("control commands parse");

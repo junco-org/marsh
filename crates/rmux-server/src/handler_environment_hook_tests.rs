@@ -1,93 +1,20 @@
 use std::fs;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use super::RequestHandler;
 use rmux_core::LifecycleEvent;
 use rmux_proto::{
-    ErrorResponse, HookLifecycle, HookName, MoveWindowRequest, MoveWindowTarget,
+    ErrorResponse, HookLifecycle, HookName, KillPaneRequest, KillSessionRequest,
+    KillSessionResponse, KillWindowRequest, LinkWindowRequest, MoveWindowRequest,
     NewSessionExtRequest, NewSessionRequest, NewWindowRequest, OptionName, PaneTarget,
-    ProcessCommand, Request, Response, RmuxError, ScopeSelector, SessionName,
+    ProcessCommand, Request, RespawnPaneRequest, Response, RmuxError, ScopeSelector,
     SetEnvironmentRequest, SetHookRequest, SetOptionMode, SetOptionRequest, ShowEnvironmentRequest,
-    ShowOptionsRequest, TerminalSize, WindowTarget,
+    ShowOptionsRequest, SplitWindowRequest, UnlinkWindowRequest, WindowTarget,
 };
 
+use crate::test_fixtures::{unique_temp_path, wait_until, Fixture, Grouped};
 use crate::test_names::session_name;
-
-fn temp_path(label: &str) -> std::path::PathBuf {
-    let stamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("current time after epoch")
-        .as_nanos();
-    std::env::temp_dir().join(format!("rmux-{label}-{stamp}-{}", std::process::id()))
-}
-
-async fn create_session(handler: &RequestHandler, name: &str) {
-    let response = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name: session_name(name),
-            detached: true,
-            size: Some(TerminalSize { cols: 80, rows: 24 }),
-            environment: None,
-        }))
-        .await;
-
-    assert!(matches!(response, Response::NewSession(_)));
-}
-
-async fn create_grouped_session(handler: &RequestHandler, name: &str, group_target: &SessionName) {
-    let response = handler
-        .handle(Request::NewSessionExt(Box::new(NewSessionExtRequest {
-            session_name: Some(session_name(name)),
-            working_directory: None,
-            detached: true,
-            size: Some(TerminalSize { cols: 80, rows: 24 }),
-            environment: None,
-            group_target: Some(group_target.clone()),
-            attach_if_exists: false,
-            detach_other_clients: false,
-            kill_other_clients: false,
-            flags: None,
-            window_name: None,
-            print_session_info: false,
-            print_format: None,
-            command: None,
-            process_command: None,
-            client_environment: None,
-            skip_environment_update: false,
-        })))
-        .await;
-
-    assert!(matches!(response, Response::NewSession(_)));
-}
-
-async fn set_global_hook(handler: &RequestHandler, hook: HookName, command: &str) {
-    assert!(matches!(
-        handler
-            .handle(Request::SetHook(SetHookRequest {
-                scope: ScopeSelector::Global,
-                hook,
-                command: command.to_owned(),
-                lifecycle: HookLifecycle::Persistent,
-            }))
-            .await,
-        Response::SetHook(_)
-    ));
-}
-
-async fn wait_for_buffer(handler: &RequestHandler, name: &str, expected: &str) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        let actual = buffer_text(handler, name).await;
-        if actual.as_deref() == Some(expected) {
-            return;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "timed out waiting for buffer {name:?} to equal {expected:?}, got {actual:?}"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-}
+use crate::test_shell::{command_quote, sh_quote_path};
 
 async fn buffer_text(handler: &RequestHandler, name: &str) -> Option<String> {
     let state = handler.state.lock().await;
@@ -120,7 +47,7 @@ async fn global_environment_applies_to_initial_panes_created_after_mutation() {
         })
     );
 
-    create_session(&handler, "alpha").await;
+    handler.create_session("alpha").await;
 
     let state = handler.state.lock().await;
     let pane_zero = state
@@ -149,7 +76,7 @@ async fn default_terminal_applies_to_initial_panes_and_yields_to_explicit_term()
         })
     );
 
-    create_session(&handler, "alpha").await;
+    handler.create_session("alpha").await;
 
     {
         let state = handler.state.lock().await;
@@ -176,15 +103,9 @@ async fn default_terminal_applies_to_initial_panes_and_yields_to_explicit_term()
         })
     );
 
-    let split = handler
-        .handle(Request::SplitWindow(rmux_proto::SplitWindowRequest {
-            target: rmux_proto::SplitWindowTarget::Session(session_name("alpha")),
-            direction: rmux_proto::SplitDirection::Vertical,
-            before: false,
-            environment: None,
-        }))
+    handler
+        .handle_ok(SplitWindowRequest::fixture(session_name("alpha")))
         .await;
-    assert!(matches!(split, Response::SplitWindow(_)));
 
     let state = handler.state.lock().await;
     let pane_one = state
@@ -193,15 +114,12 @@ async fn default_terminal_applies_to_initial_panes_and_yields_to_explicit_term()
     assert_eq!(pane_one.environment_value("TERM"), Some("tmux-256color"));
     drop(state);
 
-    let split = handler
-        .handle(Request::SplitWindow(rmux_proto::SplitWindowRequest {
-            target: rmux_proto::SplitWindowTarget::Session(session_name("alpha")),
-            direction: rmux_proto::SplitDirection::Vertical,
-            before: false,
+    handler
+        .handle_ok(SplitWindowRequest {
             environment: Some(vec!["TERM=screen-256color".to_owned()]),
-        }))
+            ..Fixture::fixture(session_name("alpha"))
+        })
         .await;
-    assert!(matches!(split, Response::SplitWindow(_)));
 
     let state = handler.state.lock().await;
     let pane_two = state
@@ -214,7 +132,7 @@ async fn default_terminal_applies_to_initial_panes_and_yields_to_explicit_term()
 async fn environment_mutations_apply_only_to_future_panes_and_session_values_win() {
     let handler = RequestHandler::new();
     let variable_name = "RMUX_TEST_SESSION_VALUE";
-    create_session(&handler, "alpha").await;
+    handler.create_session("alpha").await;
 
     {
         let state = handler.state.lock().await;
@@ -254,15 +172,9 @@ async fn environment_mutations_apply_only_to_future_panes_and_session_values_win
         );
     }
 
-    let first_split = handler
-        .handle(Request::SplitWindow(rmux_proto::SplitWindowRequest {
-            target: rmux_proto::SplitWindowTarget::Session(session_name("alpha")),
-            direction: rmux_proto::SplitDirection::Vertical,
-            before: false,
-            environment: None,
-        }))
+    handler
+        .handle_ok(SplitWindowRequest::fixture(session_name("alpha")))
         .await;
-    assert!(matches!(first_split, Response::SplitWindow(_)));
     {
         let state = handler.state.lock().await;
         let pane_one = state
@@ -301,15 +213,9 @@ async fn environment_mutations_apply_only_to_future_panes_and_session_values_win
         );
     }
 
-    let second_split = handler
-        .handle(Request::SplitWindow(rmux_proto::SplitWindowRequest {
-            target: rmux_proto::SplitWindowTarget::Session(session_name("alpha")),
-            direction: rmux_proto::SplitDirection::Vertical,
-            before: false,
-            environment: None,
-        }))
+    handler
+        .handle_ok(SplitWindowRequest::fixture(session_name("alpha")))
         .await;
-    assert!(matches!(second_split, Response::SplitWindow(_)));
 
     let state = handler.state.lock().await;
     let pane_two = state
@@ -324,7 +230,7 @@ async fn environment_mutations_apply_only_to_future_panes_and_session_values_win
 #[tokio::test]
 async fn set_hook_updates_the_store_and_one_shot_hooks_are_consumed_on_attach() {
     let handler = RequestHandler::new();
-    create_session(&handler, "alpha").await;
+    handler.create_session("alpha").await;
 
     assert_eq!(
         handler
@@ -390,7 +296,7 @@ async fn set_hook_updates_the_store_and_one_shot_hooks_are_consumed_on_attach() 
 #[tokio::test]
 async fn session_closed_hooks_fire_before_session_scope_is_removed() {
     let handler = RequestHandler::new();
-    create_session(&handler, "alpha").await;
+    handler.create_session("alpha").await;
     let lifecycle_events = handler
         .take_lifecycle_dispatch_receiver()
         .expect("test owns the lifecycle dispatch receiver");
@@ -402,31 +308,22 @@ async fn session_closed_hooks_fire_before_session_scope_is_removed() {
             .await;
     });
 
-    assert!(matches!(
-        handler
-            .handle(Request::SetHook(SetHookRequest {
-                scope: ScopeSelector::Session(session_name("alpha")),
-                hook: HookName::SessionClosed,
-                command: "if-shell -F '#{==:#{hook_session_name},alpha}' 'set-buffer -b closed ok' 'set-buffer -b closed bad'".to_owned(),
-                lifecycle: HookLifecycle::Persistent,
-            }))
-            .await,
-        Response::SetHook(_)
-    ));
+    handler
+        .handle_ok(SetHookRequest::fixture((
+            ScopeSelector::Session(session_name("alpha")),
+            HookName::SessionClosed,
+            "if-shell -F '#{==:#{hook_session_name},alpha}' 'set-buffer -b closed ok' 'set-buffer -b closed bad'",
+        )))
+        .await;
 
     assert_eq!(
         handler
-            .handle(Request::KillSession(rmux_proto::KillSessionRequest {
-                target: session_name("alpha"),
-                kill_all_except_target: false,
-                clear_alerts: false,
-                kill_group: false,
-            }))
+            .handle(Request::KillSession(KillSessionRequest::fixture("alpha")))
             .await,
-        Response::KillSession(rmux_proto::KillSessionResponse { existed: true })
+        Response::KillSession(KillSessionResponse { existed: true })
     );
 
-    wait_for_buffer(&handler, "closed", "ok").await;
+    handler.wait_for_buffer("closed", "ok").await;
     let _ = hook_shutdown.send(());
     hook_task.await.expect("lifecycle hook task joins");
 }
@@ -436,17 +333,9 @@ async fn move_window_last_source_session_emits_lifecycle_hooks_in_tmux_3_7b_orde
     let handler = RequestHandler::new();
     let source = session_name("move-lifecycle-source");
     let destination = session_name("move-lifecycle-destination");
-    create_session(&handler, source.as_str()).await;
-    create_session(&handler, destination.as_str()).await;
-    let source_session_id = {
-        let state = handler.state.lock().await;
-        state
-            .sessions
-            .session(&source)
-            .expect("source session exists")
-            .id()
-            .as_u32()
-    };
+    handler.create_session(&source).await;
+    handler.create_session(&destination).await;
+    let source_session_id = handler.session_id_for_test(&source).await.as_u32();
     let hook_commands = [
         (
             HookName::WindowLinked,
@@ -462,22 +351,22 @@ async fn move_window_last_source_session_emits_lifecycle_hooks_in_tmux_3_7b_orde
         ),
     ];
     for (hook, command) in hook_commands {
-        set_global_hook(&handler, hook, command).await;
+        handler
+            .handle_ok(SetHookRequest::fixture((
+                ScopeSelector::Global,
+                hook,
+                command,
+            )))
+            .await;
     }
     let mut events = handler.subscribe_lifecycle_events();
 
-    let response = handler
-        .handle(Request::MoveWindow(MoveWindowRequest {
-            source: Some(WindowTarget::with_window(source.clone(), 0)),
-            target: MoveWindowTarget::Window(WindowTarget::with_window(destination.clone(), 1)),
-            renumber: false,
-            kill_destination: false,
-            detached: true,
-            after: false,
-            before: false,
-        }))
+    handler
+        .handle_ok(MoveWindowRequest::fixture((
+            WindowTarget::with_window(source.clone(), 0),
+            WindowTarget::with_window(destination.clone(), 1),
+        )))
         .await;
-    assert!(matches!(response, Response::MoveWindow(_)), "{response:?}");
 
     let lifecycle = std::iter::from_fn(|| events.try_recv().ok())
         .filter(|event| {
@@ -525,30 +414,30 @@ async fn move_window_last_source_group_emits_tmux_3_7b_lifecycle_batch_order() {
     let owner = session_name("move-group-lifecycle-owner");
     let peer = session_name("move-group-lifecycle-peer");
     let destination = session_name("move-group-lifecycle-destination");
-    create_session(&handler, owner.as_str()).await;
-    create_grouped_session(&handler, peer.as_str(), &owner).await;
-    create_session(&handler, destination.as_str()).await;
+    handler.create_session(&owner).await;
+    handler.create_session(Grouped(&peer, &owner)).await;
+    handler.create_session(&destination).await;
     for (hook, command) in [
         (HookName::WindowLinked, "display-message group-linked"),
         (HookName::WindowUnlinked, "display-message group-unlinked"),
         (HookName::SessionClosed, "display-message group-closed"),
     ] {
-        set_global_hook(&handler, hook, command).await;
+        handler
+            .handle_ok(SetHookRequest::fixture((
+                ScopeSelector::Global,
+                hook,
+                command,
+            )))
+            .await;
     }
     let mut events = handler.subscribe_lifecycle_events();
 
-    let response = handler
-        .handle(Request::MoveWindow(MoveWindowRequest {
-            source: Some(WindowTarget::with_window(peer.clone(), 0)),
-            target: MoveWindowTarget::Window(WindowTarget::with_window(destination.clone(), 1)),
-            renumber: false,
-            kill_destination: false,
-            detached: true,
-            after: false,
-            before: false,
-        }))
+    handler
+        .handle_ok(MoveWindowRequest::fixture((
+            WindowTarget::with_window(peer.clone(), 0),
+            WindowTarget::with_window(destination.clone(), 1),
+        )))
         .await;
-    assert!(matches!(response, Response::MoveWindow(_)), "{response:?}");
 
     let lifecycle = std::iter::from_fn(|| events.try_recv().ok())
         .filter_map(|event| match &event.event {
@@ -604,36 +493,32 @@ async fn move_window_last_source_session_preserves_local_closed_hook_product_div
     let handler = RequestHandler::new();
     let source = session_name("move-local-hook-source");
     let destination = session_name("move-local-hook-destination");
-    create_session(&handler, source.as_str()).await;
-    create_session(&handler, destination.as_str()).await;
+    handler.create_session(&source).await;
+    handler.create_session(&destination).await;
     let global_command = "display-message global-session-closed-fallback";
     let local_command = "display-message local-session-closed";
-    set_global_hook(&handler, HookName::SessionClosed, global_command).await;
-    assert!(matches!(
-        handler
-            .handle(Request::SetHook(SetHookRequest {
-                scope: ScopeSelector::Session(source.clone()),
-                hook: HookName::SessionClosed,
-                command: local_command.to_owned(),
-                lifecycle: HookLifecycle::Persistent,
-            }))
-            .await,
-        Response::SetHook(_)
-    ));
+    handler
+        .handle_ok(SetHookRequest::fixture((
+            ScopeSelector::Global,
+            HookName::SessionClosed,
+            global_command,
+        )))
+        .await;
+    handler
+        .handle_ok(SetHookRequest::fixture((
+            ScopeSelector::Session(source.clone()),
+            HookName::SessionClosed,
+            local_command,
+        )))
+        .await;
     let mut events = handler.subscribe_lifecycle_events();
 
-    let response = handler
-        .handle(Request::MoveWindow(MoveWindowRequest {
-            source: Some(WindowTarget::with_window(source.clone(), 0)),
-            target: MoveWindowTarget::Window(WindowTarget::with_window(destination, 1)),
-            renumber: false,
-            kill_destination: false,
-            detached: true,
-            after: false,
-            before: false,
-        }))
+    handler
+        .handle_ok(MoveWindowRequest::fixture((
+            WindowTarget::with_window(source.clone(), 0),
+            WindowTarget::with_window(destination, 1),
+        )))
         .await;
-    assert!(matches!(response, Response::MoveWindow(_)), "{response:?}");
 
     let closed = std::iter::from_fn(|| events.try_recv().ok())
         .find(|event| {
@@ -666,40 +551,27 @@ async fn move_window_last_source_session_preserves_local_closed_hook_product_div
 #[tokio::test]
 async fn kill_pane_does_not_synthesize_pane_exited_hook_like_tmux() {
     let handler = RequestHandler::new();
-    create_session(&handler, "alpha").await;
+    handler.create_session("alpha").await;
 
-    let split = handler
-        .handle(Request::SplitWindow(rmux_proto::SplitWindowRequest {
-            target: rmux_proto::SplitWindowTarget::Session(session_name("alpha")),
-            direction: rmux_proto::SplitDirection::Vertical,
-            before: false,
-            environment: None,
-        }))
+    handler
+        .handle_ok(SplitWindowRequest::fixture(session_name("alpha")))
         .await;
-    assert!(matches!(split, Response::SplitWindow(_)));
 
-    let pane_target = rmux_proto::PaneTarget::with_window(session_name("alpha"), 0, 1);
-    assert!(matches!(
-        handler
-            .handle(Request::SetHook(SetHookRequest {
-                scope: ScopeSelector::Pane(pane_target.clone()),
-                hook: HookName::PaneExited,
-                command: "set-buffer -b exited bad".to_owned(),
-                lifecycle: HookLifecycle::Persistent,
-            }))
-            .await,
-        Response::SetHook(_)
-    ));
+    let pane_target = PaneTarget::with_window(session_name("alpha"), 0, 1);
+    handler
+        .handle_ok(SetHookRequest::fixture((
+            ScopeSelector::Pane(pane_target.clone()),
+            HookName::PaneExited,
+            "set-buffer -b exited bad",
+        )))
+        .await;
 
-    assert!(matches!(
-        handler
-            .handle(Request::KillPane(rmux_proto::KillPaneRequest {
-                target: pane_target,
-                kill_all_except: false,
-            }))
-            .await,
-        Response::KillPane(_)
-    ));
+    handler
+        .handle_ok(KillPaneRequest {
+            target: pane_target,
+            kill_all_except: false,
+        })
+        .await;
 
     let state = handler.state.lock().await;
     assert!(
@@ -711,60 +583,28 @@ async fn kill_pane_does_not_synthesize_pane_exited_hook_like_tmux() {
 #[tokio::test]
 async fn window_unlinked_hooks_keep_removed_window_name_and_id() {
     let handler = RequestHandler::new();
-    create_session(&handler, "alpha").await;
+    handler.create_session("alpha").await;
 
-    let response = handler
-        .handle(Request::NewWindow(Box::new(NewWindowRequest {
-            target: session_name("alpha"),
+    let window = handler
+        .create_window(NewWindowRequest {
             name: Some("logs".to_owned()),
-            detached: true,
-            start_directory: None,
-            environment: None,
-            command: None,
-            process_command: None,
-            target_window_index: None,
-            insert_at_target: false,
-        })))
+            ..Fixture::fixture("alpha")
+        })
         .await;
-    let Response::NewWindow(success) = response else {
-        panic!("new-window should succeed");
-    };
-    let window_id = {
-        let state = handler.state.lock().await;
-        let session = state
-            .sessions
-            .session(&session_name("alpha"))
-            .expect("alpha session exists");
-        session
-            .window_at(success.target.window_index())
-            .expect("logs window exists")
-            .id()
-            .as_u32()
-    };
+    let window_id = handler.window_id_for_test(&window).await.as_u32();
 
-    assert!(matches!(
-        handler
-            .handle(Request::SetHook(SetHookRequest {
-                scope: ScopeSelector::Global,
-                hook: HookName::WindowUnlinked,
-                command: format!(
-                    "if-shell -F '#{{==:#{{hook_window_name}} #{{hook_window}},logs @{window_id}}}' 'set-buffer -b unlinked ok' 'set-buffer -b unlinked bad'"
-                ),
-                lifecycle: HookLifecycle::Persistent,
-            }))
-            .await,
-        Response::SetHook(_)
-    ));
+    handler
+        .handle_ok(SetHookRequest::fixture((
+            ScopeSelector::Global,
+            HookName::WindowUnlinked,
+            format!(
+                "if-shell -F '#{{==:#{{hook_window_name}} #{{hook_window}},logs @{window_id}}}' 'set-buffer -b unlinked ok' 'set-buffer -b unlinked bad'"
+            )
+            .as_str(),
+        )))
+        .await;
 
-    assert!(matches!(
-        handler
-            .handle(Request::KillWindow(rmux_proto::KillWindowRequest {
-                target: success.target.clone(),
-                kill_all_others: false,
-            }))
-            .await,
-        Response::KillWindow(_)
-    ));
+    handler.handle_ok(KillWindowRequest::fixture(window)).await;
 
     let state = handler.state.lock().await;
     let (_, content) = state
@@ -778,22 +618,15 @@ async fn window_unlinked_hooks_keep_removed_window_name_and_id() {
 async fn kill_window_renumbered_unlinked_hook_keeps_removed_formats_and_active_target() {
     let handler = RequestHandler::new();
     let alpha = session_name("kill-window-unlinked-target");
-    create_session(&handler, alpha.as_str()).await;
+    handler.create_session(&alpha).await;
     for (window_index, name) in [(1, "removed"), (2, "renumbered")] {
-        let response = handler
-            .handle(Request::NewWindow(Box::new(NewWindowRequest {
-                target: alpha.clone(),
+        handler
+            .create_window(NewWindowRequest {
                 name: Some(name.to_owned()),
-                detached: true,
-                start_directory: None,
-                environment: None,
-                command: None,
-                process_command: None,
                 target_window_index: Some(window_index),
-                insert_at_target: false,
-            })))
+                ..Fixture::fixture(&alpha)
+            })
             .await;
-        assert!(matches!(response, Response::NewWindow(_)), "{response:?}");
     }
 
     let (active_window_id, removed_window_id, renumbered_window_id) = {
@@ -805,33 +638,30 @@ async fn kill_window_renumbered_unlinked_hook_keeps_removed_formats_and_active_t
             session.window_at(2).expect("renumbered window exists").id(),
         )
     };
-    assert!(matches!(
-        handler
-            .handle(Request::SetOption(SetOptionRequest {
-                scope: ScopeSelector::Session(alpha.clone()),
-                option: OptionName::RenumberWindows,
-                value: "on".to_owned(),
-                mode: SetOptionMode::Replace,
-            }))
-            .await,
-        Response::SetOption(_)
-    ));
-    set_global_hook(
-        &handler,
-        HookName::WindowUnlinked,
-        &format!(
-            "if-shell -F '#{{==:#{{window_id}} #{{hook_window}} #{{hook_window_name}},{active_window_id} {removed_window_id} removed}}' 'set-buffer -b kill-window-unlinked-target active-removed' 'set-buffer -b kill-window-unlinked-target wrong'"
-        ),
-    )
-    .await;
-
-    let response = handler
-        .handle(Request::KillWindow(rmux_proto::KillWindowRequest {
-            target: WindowTarget::with_window(alpha.clone(), 1),
-            kill_all_others: false,
-        }))
+    handler
+        .set_option(
+            ScopeSelector::Session(alpha.clone()),
+            OptionName::RenumberWindows,
+            "on",
+        )
         .await;
-    assert!(matches!(response, Response::KillWindow(_)), "{response:?}");
+    handler
+        .handle_ok(SetHookRequest::fixture((
+            ScopeSelector::Global,
+            HookName::WindowUnlinked,
+            format!(
+                "if-shell -F '#{{==:#{{window_id}} #{{hook_window}} #{{hook_window_name}},{active_window_id} {removed_window_id} removed}}' 'set-buffer -b kill-window-unlinked-target active-removed' 'set-buffer -b kill-window-unlinked-target wrong'"
+            )
+            .as_str(),
+        )))
+        .await;
+
+    handler
+        .handle_ok(KillWindowRequest::fixture(WindowTarget::with_window(
+            alpha.clone(),
+            1,
+        )))
+        .await;
 
     assert_eq!(
         buffer_text(&handler, "kill-window-unlinked-target").await,
@@ -855,61 +685,39 @@ async fn unlink_window_unlinked_hook_targets_the_surviving_window_alias() {
     let handler = RequestHandler::new();
     let alpha = session_name("unlink-window-unlinked-source");
     let keeper = session_name("unlink-window-unlinked-keeper");
-    create_session(&handler, alpha.as_str()).await;
-    create_session(&handler, keeper.as_str()).await;
-    let response = handler
-        .handle(Request::NewWindow(Box::new(NewWindowRequest {
-            target: alpha.clone(),
+    handler.create_session(&alpha).await;
+    handler.create_session(&keeper).await;
+    let linked = handler
+        .create_window(NewWindowRequest {
             name: Some("linked".to_owned()),
-            detached: true,
-            start_directory: None,
-            environment: None,
-            command: None,
-            process_command: None,
             target_window_index: Some(1),
-            insert_at_target: false,
-        })))
+            ..Fixture::fixture(&alpha)
+        })
         .await;
-    assert!(matches!(response, Response::NewWindow(_)), "{response:?}");
-    let linked_window_id = {
-        let state = handler.state.lock().await;
-        state
-            .sessions
-            .session(&alpha)
-            .and_then(|session| session.window_at(1))
-            .expect("linked source exists")
-            .id()
-    };
-    let response = handler
-        .handle(Request::LinkWindow(rmux_proto::LinkWindowRequest {
-            source: WindowTarget::with_window(alpha.clone(), 1),
-            target: WindowTarget::with_window(keeper.clone(), 5),
-            after: false,
-            before: false,
-            kill_destination: false,
-            detached: true,
-        }))
+    let linked_window_id = handler.window_id_for_test(&linked).await;
+    handler
+        .handle_ok(LinkWindowRequest::fixture((
+            &linked,
+            WindowTarget::with_window(keeper.clone(), 5),
+        )))
         .await;
-    assert!(matches!(response, Response::LinkWindow(_)), "{response:?}");
-    set_global_hook(
-        &handler,
-        HookName::WindowUnlinked,
-        &format!(
-            "if-shell -F '#{{==:#{{window_id}},{linked_window_id}}}' 'set-buffer -b unlink-window-unlinked-target alias' 'set-buffer -b unlink-window-unlinked-target wrong'"
-        ),
-    )
-    .await;
+    handler
+        .handle_ok(SetHookRequest::fixture((
+            ScopeSelector::Global,
+            HookName::WindowUnlinked,
+            format!(
+                "if-shell -F '#{{==:#{{window_id}},{linked_window_id}}}' 'set-buffer -b unlink-window-unlinked-target alias' 'set-buffer -b unlink-window-unlinked-target wrong'"
+            )
+            .as_str(),
+        )))
+        .await;
 
-    let response = handler
-        .handle(Request::UnlinkWindow(rmux_proto::UnlinkWindowRequest {
-            target: WindowTarget::with_window(alpha.clone(), 1),
+    handler
+        .handle_ok(UnlinkWindowRequest {
+            target: linked,
             kill_if_last: false,
-        }))
+        })
         .await;
-    assert!(
-        matches!(response, Response::UnlinkWindow(_)),
-        "{response:?}"
-    );
 
     assert_eq!(
         buffer_text(&handler, "unlink-window-unlinked-target").await,
@@ -937,22 +745,15 @@ async fn unlink_window_unlinked_hook_targets_the_surviving_window_alias() {
 async fn unlink_window_kill_if_last_renumbered_hook_keeps_removed_formats_and_active_target() {
     let handler = RequestHandler::new();
     let alpha = session_name("unlink-kill-unlinked-target");
-    create_session(&handler, alpha.as_str()).await;
+    handler.create_session(&alpha).await;
     for window_index in [1, 2] {
-        let response = handler
-            .handle(Request::NewWindow(Box::new(NewWindowRequest {
-                target: alpha.clone(),
+        handler
+            .create_window(NewWindowRequest {
                 name: Some(format!("window-{window_index}")),
-                detached: true,
-                start_directory: None,
-                environment: None,
-                command: None,
-                process_command: None,
                 target_window_index: Some(window_index),
-                insert_at_target: false,
-            })))
+                ..Fixture::fixture(&alpha)
+            })
             .await;
-        assert!(matches!(response, Response::NewWindow(_)), "{response:?}");
     }
     let (active_window_id, removed_window_id) = {
         let state = handler.state.lock().await;
@@ -962,36 +763,30 @@ async fn unlink_window_kill_if_last_renumbered_hook_keeps_removed_formats_and_ac
             session.window_at(1).expect("removed window exists").id(),
         )
     };
-    assert!(matches!(
-        handler
-            .handle(Request::SetOption(SetOptionRequest {
-                scope: ScopeSelector::Session(alpha.clone()),
-                option: OptionName::RenumberWindows,
-                value: "on".to_owned(),
-                mode: SetOptionMode::Replace,
-            }))
-            .await,
-        Response::SetOption(_)
-    ));
-    set_global_hook(
-        &handler,
-        HookName::WindowUnlinked,
-        &format!(
-            "if-shell -F '#{{==:#{{window_id}} #{{hook_window}} #{{hook_window_name}},{active_window_id} {removed_window_id} window-1}}' 'set-buffer -b unlink-kill-unlinked-target active-removed' 'set-buffer -b unlink-kill-unlinked-target wrong'"
-        ),
-    )
-    .await;
+    handler
+        .set_option(
+            ScopeSelector::Session(alpha.clone()),
+            OptionName::RenumberWindows,
+            "on",
+        )
+        .await;
+    handler
+        .handle_ok(SetHookRequest::fixture((
+            ScopeSelector::Global,
+            HookName::WindowUnlinked,
+            format!(
+                "if-shell -F '#{{==:#{{window_id}} #{{hook_window}} #{{hook_window_name}},{active_window_id} {removed_window_id} window-1}}' 'set-buffer -b unlink-kill-unlinked-target active-removed' 'set-buffer -b unlink-kill-unlinked-target wrong'"
+            )
+            .as_str(),
+        )))
+        .await;
 
-    let response = handler
-        .handle(Request::UnlinkWindow(rmux_proto::UnlinkWindowRequest {
+    handler
+        .handle_ok(UnlinkWindowRequest {
             target: WindowTarget::with_window(alpha.clone(), 1),
             kill_if_last: true,
-        }))
+        })
         .await;
-    assert!(
-        matches!(response, Response::UnlinkWindow(_)),
-        "{response:?}"
-    );
 
     assert_eq!(
         buffer_text(&handler, "unlink-kill-unlinked-target").await,
@@ -1004,57 +799,44 @@ async fn unlink_window_kill_if_last_renumbered_hook_keeps_removed_formats_and_ac
 async fn relative_move_window_unlinked_hook_follows_the_moved_window_identity() {
     let handler = RequestHandler::new();
     let alpha = session_name("relative-move-unlinked");
-    create_session(&handler, alpha.as_str()).await;
+    handler.create_session(&alpha).await;
     for (window_index, name) in [(1, "middle"), (2, "moved")] {
-        let response = handler
-            .handle(Request::NewWindow(Box::new(NewWindowRequest {
-                target: alpha.clone(),
+        handler
+            .create_window(NewWindowRequest {
                 name: Some(name.to_owned()),
-                detached: true,
-                start_directory: None,
-                environment: None,
-                command: None,
-                process_command: None,
                 target_window_index: Some(window_index),
-                insert_at_target: false,
-            })))
+                ..Fixture::fixture(&alpha)
+            })
             .await;
-        assert!(matches!(response, Response::NewWindow(_)), "{response:?}");
     }
-    handler.wait_for_initial_panes_for_test().await;
-    let moved_window_id = {
-        let state = handler.state.lock().await;
-        state
-            .sessions
-            .session(&alpha)
-            .and_then(|session| session.window_at(2))
-            .map(rmux_core::Window::id)
-            .expect("source window exists")
-    };
-    set_global_hook(
-        &handler,
-        HookName::WindowUnlinked,
-        &format!(
-            "if-shell -F '#{{==:#{{hook_window}} #{{window_index}} #{{window_id}},{} 0 {}}}' 'set-buffer -b relative-move-unlinked ok' 'set-buffer -b relative-move-unlinked bad'",
-            moved_window_id, moved_window_id
-        ),
-    )
-    .await;
-
-    let response = handler
-        .handle(Request::MoveWindow(MoveWindowRequest {
-            source: Some(WindowTarget::with_window(alpha.clone(), 2)),
-            target: MoveWindowTarget::Window(WindowTarget::with_window(alpha.clone(), 0)),
-            renumber: false,
-            kill_destination: false,
-            detached: true,
-            after: false,
-            before: true,
-        }))
+    let moved_window_id = handler
+        .window_id_for_test(&WindowTarget::with_window(alpha.clone(), 2))
         .await;
-    assert!(matches!(response, Response::MoveWindow(_)), "{response:?}");
+    handler
+        .handle_ok(SetHookRequest::fixture((
+            ScopeSelector::Global,
+            HookName::WindowUnlinked,
+            format!(
+                "if-shell -F '#{{==:#{{hook_window}} #{{window_index}} #{{window_id}},{} 0 {}}}' 'set-buffer -b relative-move-unlinked ok' 'set-buffer -b relative-move-unlinked bad'",
+                moved_window_id, moved_window_id
+            )
+            .as_str(),
+        )))
+        .await;
 
-    wait_for_buffer(&handler, "relative-move-unlinked", "ok").await;
+    handler
+        .handle_ok(MoveWindowRequest {
+            before: true,
+            ..Fixture::fixture((
+                WindowTarget::with_window(alpha.clone(), 2),
+                WindowTarget::with_window(alpha.clone(), 0),
+            ))
+        })
+        .await;
+
+    handler
+        .wait_for_buffer("relative-move-unlinked", "ok")
+        .await;
     let state = handler.state.lock().await;
     assert_eq!(
         state
@@ -1069,62 +851,30 @@ async fn relative_move_window_unlinked_hook_follows_the_moved_window_identity() 
 #[tokio::test]
 async fn kill_session_emits_window_unlinked_for_removed_windows() {
     let handler = RequestHandler::new();
-    create_session(&handler, "alpha").await;
+    handler.create_session("alpha").await;
 
-    let response = handler
-        .handle(Request::NewWindow(Box::new(NewWindowRequest {
-            target: session_name("alpha"),
+    let window = handler
+        .create_window(NewWindowRequest {
             name: Some("logs".to_owned()),
-            detached: true,
-            start_directory: None,
-            environment: None,
-            command: None,
-            process_command: None,
-            target_window_index: None,
-            insert_at_target: false,
-        })))
+            ..Fixture::fixture("alpha")
+        })
         .await;
-    let Response::NewWindow(success) = response else {
-        panic!("new-window should succeed");
-    };
-    let window_id = {
-        let state = handler.state.lock().await;
-        let session = state
-            .sessions
-            .session(&session_name("alpha"))
-            .expect("alpha session exists");
-        session
-            .window_at(success.target.window_index())
-            .expect("logs window exists")
-            .id()
-            .as_u32()
-    };
+    let window_id = handler.window_id_for_test(&window).await.as_u32();
 
-    assert!(matches!(
-        handler
-            .handle(Request::SetHook(SetHookRequest {
-                scope: ScopeSelector::Global,
-                hook: HookName::WindowUnlinked,
-                command: format!(
-                    "if-shell -F '#{{==:#{{hook_window_name}} #{{hook_window}},logs @{window_id}}}' 'set-buffer -b kill-session-unlinked ok' 'set-buffer -b kill-session-unlinked bad'"
-                ),
-                lifecycle: HookLifecycle::Persistent,
-            }))
-            .await,
-        Response::SetHook(_)
-    ));
+    handler
+        .handle_ok(SetHookRequest::fixture((
+            ScopeSelector::Global,
+            HookName::WindowUnlinked,
+            format!(
+                "if-shell -F '#{{==:#{{hook_window_name}} #{{hook_window}},logs @{window_id}}}' 'set-buffer -b kill-session-unlinked ok' 'set-buffer -b kill-session-unlinked bad'"
+            )
+            .as_str(),
+        )))
+        .await;
 
-    assert!(matches!(
-        handler
-            .handle(Request::KillSession(rmux_proto::KillSessionRequest {
-                target: session_name("alpha"),
-                kill_all_except_target: false,
-                clear_alerts: false,
-                kill_group: false,
-            }))
-            .await,
-        Response::KillSession(_)
-    ));
+    handler
+        .handle_ok(KillSessionRequest::fixture("alpha"))
+        .await;
 
     let state = handler.state.lock().await;
     let (_, content) = state
@@ -1139,31 +889,21 @@ async fn unlink_only_linked_window_runs_window_hook_before_session_cleanup() {
     let handler = RequestHandler::new();
     let owner = session_name("unlink-order-owner");
     let alias = session_name("unlink-order-alias");
-    create_session(&handler, owner.as_str()).await;
-    create_session(&handler, alias.as_str()).await;
+    handler.create_session(&owner).await;
+    handler.create_session(&alias).await;
 
-    assert!(matches!(
-        handler
-            .handle(Request::LinkWindow(rmux_proto::LinkWindowRequest {
-                source: WindowTarget::with_window(owner.clone(), 0),
-                target: WindowTarget::with_window(alias.clone(), 9),
-                after: false,
-                before: false,
-                kill_destination: false,
-                detached: true,
-            }))
-            .await,
-        Response::LinkWindow(_)
-    ));
-    assert!(matches!(
-        handler
-            .handle(Request::KillWindow(rmux_proto::KillWindowRequest {
-                target: WindowTarget::with_window(alias.clone(), 0),
-                kill_all_others: false,
-            }))
-            .await,
-        Response::KillWindow(_)
-    ));
+    handler
+        .handle_ok(LinkWindowRequest::fixture((
+            WindowTarget::with_window(owner.clone(), 0),
+            WindowTarget::with_window(alias.clone(), 9),
+        )))
+        .await;
+    handler
+        .handle_ok(KillWindowRequest::fixture(WindowTarget::with_window(
+            alias.clone(),
+            0,
+        )))
+        .await;
     assert_eq!(
         handler
             .handle(Request::SetEnvironment(Box::new(SetEnvironmentRequest {
@@ -1180,48 +920,41 @@ async fn unlink_only_linked_window_runs_window_hook_before_session_cleanup() {
             name: "RMUX_UNLINK_HOOK_DEPENDENCY".to_owned(),
         })
     );
-    set_global_hook(
-        &handler,
-        HookName::WindowUnlinked,
-        "if-shell -F '#{==:#{RMUX_UNLINK_HOOK_DEPENDENCY},alive}' \
-         'set-buffer -a -b unlink-hook-order window-saw-alive,' \
-         'set-buffer -a -b unlink-hook-order window-saw-missing,'",
-    )
-    .await;
-    set_global_hook(
-        &handler,
-        HookName::SessionClosed,
-        "run-shell -C 'set-buffer -a -b unlink-hook-order session-cleanup, ; \
-         set-environment -gu RMUX_UNLINK_HOOK_DEPENDENCY'",
-    )
-    .await;
+    handler
+        .handle_ok(SetHookRequest::fixture((
+            ScopeSelector::Global,
+            HookName::WindowUnlinked,
+            "if-shell -F '#{==:#{RMUX_UNLINK_HOOK_DEPENDENCY},alive}' \
+             'set-buffer -a -b unlink-hook-order window-saw-alive,' \
+             'set-buffer -a -b unlink-hook-order window-saw-missing,'",
+        )))
+        .await;
+    handler
+        .handle_ok(SetHookRequest::fixture((
+            ScopeSelector::Global,
+            HookName::SessionClosed,
+            "run-shell -C 'set-buffer -a -b unlink-hook-order session-cleanup, ; \
+             set-environment -gu RMUX_UNLINK_HOOK_DEPENDENCY'",
+        )))
+        .await;
 
-    let response = handler
-        .handle(Request::UnlinkWindow(rmux_proto::UnlinkWindowRequest {
+    handler
+        .handle_ok(UnlinkWindowRequest {
             target: WindowTarget::with_window(alias.clone(), 9),
             kill_if_last: false,
-        }))
+        })
         .await;
-    assert!(
-        matches!(response, Response::UnlinkWindow(_)),
-        "{response:?}"
-    );
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    let observed = loop {
-        let actual = buffer_text(&handler, "unlink-hook-order").await;
-        if actual
-            .as_deref()
-            .is_some_and(|value| value.matches(',').count() == 2)
-        {
-            break actual.expect("hook buffer exists");
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "timed out waiting for both unlink hooks, got {actual:?}"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    };
+    let observed = wait_until(
+        Duration::from_secs(5),
+        Duration::from_millis(20),
+        async || match buffer_text(&handler, "unlink-hook-order").await {
+            Some(value) if value.matches(',').count() == 2 => Ok(value),
+            actual => Err(actual),
+        },
+    )
+    .await
+    .unwrap_or_else(|actual| panic!("timed out waiting for both unlink hooks, got {actual:?}"));
     assert_eq!(
         observed, "window-saw-alive,session-cleanup,",
         "window-unlinked must consume shared hook state before session-closed tears it down"
@@ -1239,91 +972,68 @@ async fn unlink_only_linked_window_runs_window_hook_before_session_cleanup() {
 #[tokio::test]
 async fn kill_session_emits_session_closed_before_window_unlinked() {
     let handler = RequestHandler::new();
-    create_session(&handler, "alpha").await;
-    create_session(&handler, "keeper").await;
-    assert!(matches!(
-        handler
-            .handle(Request::NewWindow(Box::new(NewWindowRequest {
-                target: session_name("alpha"),
-                name: Some("logs".to_owned()),
-                detached: true,
-                start_directory: None,
-                environment: None,
-                command: None,
-                process_command: None,
-                target_window_index: None,
-                insert_at_target: false,
-            })))
-            .await,
-        Response::NewWindow(_)
-    ));
-    set_global_hook(
-        &handler,
-        HookName::SessionClosed,
-        "set-buffer -a -b kill-session-order session-closed,",
-    )
-    .await;
-    set_global_hook(
-        &handler,
-        HookName::WindowUnlinked,
-        "set-buffer -a -b kill-session-order unlinked,",
-    )
-    .await;
+    handler.create_session("alpha").await;
+    handler.create_session("keeper").await;
+    handler
+        .create_window(NewWindowRequest {
+            name: Some("logs".to_owned()),
+            ..Fixture::fixture("alpha")
+        })
+        .await;
+    handler
+        .handle_ok(SetHookRequest::fixture((
+            ScopeSelector::Global,
+            HookName::SessionClosed,
+            "set-buffer -a -b kill-session-order session-closed,",
+        )))
+        .await;
+    handler
+        .handle_ok(SetHookRequest::fixture((
+            ScopeSelector::Global,
+            HookName::WindowUnlinked,
+            "set-buffer -a -b kill-session-order unlinked,",
+        )))
+        .await;
 
     assert_eq!(
         handler
-            .handle(Request::KillSession(rmux_proto::KillSessionRequest {
-                target: session_name("alpha"),
-                kill_all_except_target: false,
-                clear_alerts: false,
-                kill_group: false,
-            }))
+            .handle(Request::KillSession(KillSessionRequest::fixture("alpha")))
             .await,
-        Response::KillSession(rmux_proto::KillSessionResponse { existed: true })
+        Response::KillSession(KillSessionResponse { existed: true })
     );
 
-    wait_for_buffer(
-        &handler,
-        "kill-session-order",
-        "session-closed,unlinked,unlinked,",
-    )
-    .await;
+    handler
+        .wait_for_buffer("kill-session-order", "session-closed,unlinked,unlinked,")
+        .await;
 }
 
 #[tokio::test]
 async fn last_pane_shell_exit_emits_window_unlinked_before_session_closed() {
     let handler = RequestHandler::new();
-    create_session(&handler, "alpha").await;
-    create_session(&handler, "keeper").await;
-    set_global_hook(
-        &handler,
-        HookName::WindowUnlinked,
-        "set-buffer -a -b last-pane-order unlinked,",
-    )
-    .await;
-    set_global_hook(
-        &handler,
-        HookName::SessionClosed,
-        "set-buffer -a -b last-pane-order session-closed,",
-    )
-    .await;
+    handler.create_session("alpha").await;
+    handler.create_session("keeper").await;
+    handler
+        .handle_ok(SetHookRequest::fixture((
+            ScopeSelector::Global,
+            HookName::WindowUnlinked,
+            "set-buffer -a -b last-pane-order unlinked,",
+        )))
+        .await;
+    handler
+        .handle_ok(SetHookRequest::fixture((
+            ScopeSelector::Global,
+            HookName::SessionClosed,
+            "set-buffer -a -b last-pane-order session-closed,",
+        )))
+        .await;
     let mut lifecycle_events = handler.subscribe_lifecycle_events();
 
-    assert!(matches!(
-        handler
-            .handle(Request::RespawnPane(Box::new(
-                rmux_proto::RespawnPaneRequest {
-                    target: PaneTarget::new(session_name("alpha"), 0),
-                    kill: true,
-                    start_directory: None,
-                    environment: None,
-                    command: None,
-                    process_command: Some(ProcessCommand::Shell("exit 0".to_owned())),
-                }
-            )))
-            .await,
-        Response::RespawnPane(_)
-    ));
+    handler
+        .handle_ok(RespawnPaneRequest {
+            process_command: Some(ProcessCommand::Shell("exit 0".to_owned())),
+            ..Fixture::fixture(PaneTarget::new(session_name("alpha"), 0))
+        })
+        .await;
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
@@ -1349,20 +1059,22 @@ async fn last_pane_shell_exit_emits_window_unlinked_before_session_closed() {
 #[tokio::test]
 async fn kill_server_emits_session_closed_without_window_unlinked() {
     let handler = RequestHandler::new();
-    create_session(&handler, "alpha").await;
-    create_session(&handler, "beta").await;
-    set_global_hook(
-        &handler,
-        HookName::SessionClosed,
-        "set-buffer -a -b kill-server-hooks session-closed,",
-    )
-    .await;
-    set_global_hook(
-        &handler,
-        HookName::WindowUnlinked,
-        "set-buffer -a -b kill-server-hooks unlinked,",
-    )
-    .await;
+    handler.create_session("alpha").await;
+    handler.create_session("beta").await;
+    handler
+        .handle_ok(SetHookRequest::fixture((
+            ScopeSelector::Global,
+            HookName::SessionClosed,
+            "set-buffer -a -b kill-server-hooks session-closed,",
+        )))
+        .await;
+    handler
+        .handle_ok(SetHookRequest::fixture((
+            ScopeSelector::Global,
+            HookName::WindowUnlinked,
+            "set-buffer -a -b kill-server-hooks unlinked,",
+        )))
+        .await;
 
     assert_eq!(
         handler
@@ -1371,18 +1083,15 @@ async fn kill_server_emits_session_closed_without_window_unlinked() {
         Response::KillServer(rmux_proto::KillServerResponse)
     );
 
-    wait_for_buffer(
-        &handler,
-        "kill-server-hooks",
-        "session-closed,session-closed,",
-    )
-    .await;
+    handler
+        .wait_for_buffer("kill-server-hooks", "session-closed,session-closed,")
+        .await;
 }
 
 #[tokio::test]
 async fn self_unsetting_hook_payloads_are_normalized_to_one_shot_shell_commands() {
     let handler = RequestHandler::new();
-    create_session(&handler, "alpha").await;
+    handler.create_session("alpha").await;
 
     assert_eq!(
         handler
@@ -1391,7 +1100,7 @@ async fn self_unsetting_hook_payloads_are_normalized_to_one_shot_shell_commands(
                 hook: HookName::ClientAttached,
                 command: format!(
                     "run-shell {}; set-hook -u -t alpha client-attached",
-                    shell_quote_str("printf attached > /tmp/rmux-hook")
+                    command_quote("printf attached > /tmp/rmux-hook")
                 ),
                 lifecycle: HookLifecycle::Persistent,
             }))
@@ -1439,44 +1148,32 @@ async fn session_scoped_mutations_require_live_sessions_and_are_cleared_on_kill(
         })
     );
 
-    create_session(&handler, "alpha").await;
-    assert!(matches!(
-        handler
-            .handle(Request::SetOption(SetOptionRequest {
-                scope: ScopeSelector::Session(session_name("alpha")),
-                option: OptionName::Status,
-                value: "off".to_owned(),
-                mode: SetOptionMode::Replace,
-            }))
-            .await,
-        Response::SetOption(_)
-    ));
-    assert!(matches!(
-        handler
-            .handle(Request::SetEnvironment(Box::new(SetEnvironmentRequest {
-                scope: ScopeSelector::Session(session_name("alpha")),
-                name: "TERM".to_owned(),
-                value: "screen".to_owned(),
-                mode: None,
-                hidden: false,
-                format: false,
-            })))
-            .await,
-        Response::SetEnvironment(_)
-    ));
+    handler.create_session("alpha").await;
+    handler
+        .set_option(
+            ScopeSelector::Session(session_name("alpha")),
+            OptionName::Status,
+            "off",
+        )
+        .await;
+    handler
+        .handle_ok(SetEnvironmentRequest {
+            scope: ScopeSelector::Session(session_name("alpha")),
+            name: "TERM".to_owned(),
+            value: "screen".to_owned(),
+            mode: None,
+            hidden: false,
+            format: false,
+        })
+        .await;
     assert_eq!(
         handler
-            .handle(Request::KillSession(rmux_proto::KillSessionRequest {
-                target: session_name("alpha"),
-                kill_all_except_target: false,
-                clear_alerts: false,
-                kill_group: false,
-            }))
+            .handle(Request::KillSession(KillSessionRequest::fixture("alpha")))
             .await,
-        Response::KillSession(rmux_proto::KillSessionResponse { existed: true })
+        Response::KillSession(KillSessionResponse { existed: true })
     );
 
-    create_session(&handler, "alpha").await;
+    handler.create_session("alpha").await;
     {
         let state = handler.state.lock().await;
         assert_eq!(
@@ -1502,17 +1199,13 @@ async fn session_scoped_mutations_require_live_sessions_and_are_cleared_on_kill(
 async fn after_show_options_runs_without_triggering_nested_notify_hooks() {
     let handler = RequestHandler::new();
 
-    assert!(matches!(
-        handler
-            .handle(Request::SetHook(SetHookRequest {
-                scope: ScopeSelector::Global,
-                hook: HookName::AfterShowOptions,
-                command: "if-shell -F '#{==:#{hook},after-show-options}' 'set-buffer -b observed ok' 'set-buffer -b observed bad'".to_owned(),
-                lifecycle: HookLifecycle::Persistent,
-            }))
-            .await,
-        Response::SetHook(_)
-    ));
+    handler
+        .handle_ok(SetHookRequest::fixture((
+            ScopeSelector::Global,
+            HookName::AfterShowOptions,
+            "if-shell -F '#{==:#{hook},after-show-options}' 'set-buffer -b observed ok' 'set-buffer -b observed bad'",
+        )))
+        .await;
     assert!(matches!(
         handler
             .handle(Request::SetHook(SetHookRequest {
@@ -1554,31 +1247,21 @@ async fn after_show_options_runs_without_triggering_nested_notify_hooks() {
 #[tokio::test]
 async fn split_window_runs_after_hook_once() {
     let handler = RequestHandler::new();
-    let output_path = temp_path("after-split-window");
-    let shell_command = append_x_command(&output_path);
-    create_session(&handler, "alpha").await;
+    let output_path = unique_temp_path("after-split-window");
+    let shell_command = format!("printf x >> {}", sh_quote_path(&output_path));
+    handler.create_session("alpha").await;
 
-    assert!(matches!(
-        handler
-            .handle(Request::SetHook(SetHookRequest {
-                scope: ScopeSelector::Global,
-                hook: HookName::AfterSplitWindow,
-                command: format!("run-shell {}", shell_quote_str(&shell_command)),
-                lifecycle: HookLifecycle::Persistent,
-            }))
-            .await,
-        Response::SetHook(_)
-    ));
-
-    let response = handler
-        .handle(Request::SplitWindow(rmux_proto::SplitWindowRequest {
-            target: rmux_proto::SplitWindowTarget::Session(session_name("alpha")),
-            direction: rmux_proto::SplitDirection::Vertical,
-            before: false,
-            environment: None,
-        }))
+    handler
+        .handle_ok(SetHookRequest::fixture((
+            ScopeSelector::Global,
+            HookName::AfterSplitWindow,
+            format!("run-shell {}", command_quote(&shell_command)).as_str(),
+        )))
         .await;
-    assert!(matches!(response, Response::SplitWindow(_)));
+
+    handler
+        .handle_ok(SplitWindowRequest::fixture(session_name("alpha")))
+        .await;
 
     assert_eq!(
         fs::read_to_string(&output_path).expect("split hook output exists"),
@@ -1590,43 +1273,29 @@ async fn split_window_runs_after_hook_once() {
 #[tokio::test]
 async fn window_linked_hooks_receive_session_and_window_format_context() {
     let handler = RequestHandler::new();
-    create_session(&handler, "alpha").await;
+    handler.create_session("alpha").await;
 
-    assert!(matches!(
-        handler
-            .handle(Request::SetHook(SetHookRequest {
-                scope: ScopeSelector::Global,
-                hook: HookName::WindowLinked,
-                command: "if-shell -F '#{==:#{hook_session} #{hook_window},$0 @1}' 'set-buffer -b linked ok' 'set-buffer -b linked bad'".to_owned(),
-                lifecycle: HookLifecycle::Persistent,
-            }))
-            .await,
-        Response::SetHook(_)
-    ));
-
-    let response = handler
-        .handle(Request::NewWindow(Box::new(NewWindowRequest {
-            target: session_name("alpha"),
-            name: None,
-            detached: false,
-            start_directory: None,
-            environment: None,
-            command: None,
-            process_command: None,
-            target_window_index: None,
-            insert_at_target: false,
-        })))
+    handler
+        .handle_ok(SetHookRequest::fixture((
+            ScopeSelector::Global,
+            HookName::WindowLinked,
+            "if-shell -F '#{==:#{hook_session} #{hook_window},$0 @1}' 'set-buffer -b linked ok' 'set-buffer -b linked bad'",
+        )))
         .await;
-    let Response::NewWindow(success) = response else {
-        panic!("new-window should succeed");
-    };
+
+    let window = handler
+        .create_window(NewWindowRequest {
+            detached: false,
+            ..Fixture::fixture("alpha")
+        })
+        .await;
 
     let state = handler.state.lock().await;
     assert!(
         state
             .sessions
             .session(&session_name("alpha"))
-            .and_then(|session| session.window_at(success.target.window_index()))
+            .and_then(|session| session.window_at(window.window_index()))
             .is_some(),
         "new window exists"
     );
@@ -1640,36 +1309,23 @@ async fn window_linked_hooks_receive_session_and_window_format_context() {
 #[tokio::test]
 async fn hook_commands_do_not_pre_expand_set_buffer_arguments() {
     let handler = RequestHandler::new();
-    create_session(&handler, "alpha").await;
+    handler.create_session("alpha").await;
 
-    assert!(matches!(
-        handler
-            .handle(Request::SetHook(SetHookRequest {
-                scope: ScopeSelector::Global,
-                hook: HookName::AfterNewWindow,
-                command: "set-buffer -b hook '#{hook} #{hook_window_name}'".to_owned(),
-                lifecycle: HookLifecycle::Persistent,
-            }))
-            .await,
-        Response::SetHook(_)
-    ));
+    handler
+        .handle_ok(SetHookRequest::fixture((
+            ScopeSelector::Global,
+            HookName::AfterNewWindow,
+            "set-buffer -b hook '#{hook} #{hook_window_name}'",
+        )))
+        .await;
 
-    assert!(matches!(
-        handler
-            .handle(Request::NewWindow(Box::new(NewWindowRequest {
-                target: session_name("alpha"),
-                name: Some("hooked".to_owned()),
-                detached: false,
-                start_directory: None,
-                environment: None,
-                command: None,
-                process_command: None,
-                target_window_index: None,
-                insert_at_target: false,
-            })))
-            .await,
-        Response::NewWindow(_)
-    ));
+    handler
+        .create_window(NewWindowRequest {
+            name: Some("hooked".to_owned()),
+            detached: false,
+            ..Fixture::fixture("alpha")
+        })
+        .await;
 
     let state = handler.state.lock().await;
     let (_, content) = state
@@ -1685,7 +1341,7 @@ async fn hook_commands_do_not_pre_expand_set_buffer_arguments() {
 #[tokio::test]
 async fn spawned_pane_environment_contains_pane_id_with_percent_prefix() {
     let handler = RequestHandler::new();
-    create_session(&handler, "alpha").await;
+    handler.create_session("alpha").await;
 
     let state = handler.state.lock().await;
     let pane_zero = state
@@ -1712,7 +1368,7 @@ async fn spawned_pane_environment_contains_pane_id_with_percent_prefix() {
 #[tokio::test]
 async fn spawned_pane_environment_contains_mux_socket_pid_session_format() {
     let handler = RequestHandler::new();
-    create_session(&handler, "alpha").await;
+    handler.create_session("alpha").await;
 
     let state = handler.state.lock().await;
     let pane_zero = state
@@ -1742,30 +1398,24 @@ async fn spawned_pane_environment_contains_mux_socket_pid_session_format() {
 async fn environment_override_layering_session_then_override_then_rmux_pane() {
     let handler = RequestHandler::new();
 
-    assert!(matches!(
-        handler
-            .handle(Request::SetEnvironment(Box::new(SetEnvironmentRequest {
-                scope: ScopeSelector::Global,
-                name: "MY_VAR".to_owned(),
-                value: "global".to_owned(),
-                mode: None,
-                hidden: false,
-                format: false,
-            })))
-            .await,
-        Response::SetEnvironment(_)
-    ));
+    handler
+        .handle_ok(SetEnvironmentRequest {
+            scope: ScopeSelector::Global,
+            name: "MY_VAR".to_owned(),
+            value: "global".to_owned(),
+            mode: None,
+            hidden: false,
+            format: false,
+        })
+        .await;
 
     // Create session with -e overrides: MY_VAR should be overridden by -e.
-    let response = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name: session_name("alpha"),
-            detached: true,
-            size: Some(TerminalSize { cols: 80, rows: 24 }),
+    handler
+        .create_session(NewSessionRequest {
             environment: Some(vec!["MY_VAR=override".to_owned()]),
-        }))
+            ..Fixture::fixture("alpha")
+        })
         .await;
-    assert!(matches!(response, Response::NewSession(_)));
 
     let state = handler.state.lock().await;
     let pane_zero = state
@@ -1798,41 +1448,24 @@ async fn new_session_ext_client_environment_respects_tmux_precedence() {
     let session = session_name("client-env");
 
     for name in ["RMUX_GLOBAL_ENV_SENTINEL", "RMUX_OVERRIDE_ENV_SENTINEL"] {
-        assert!(matches!(
-            handler
-                .handle(Request::SetEnvironment(Box::new(SetEnvironmentRequest {
-                    scope: ScopeSelector::Global,
-                    name: name.to_owned(),
-                    value: "from-server".to_owned(),
-                    mode: None,
-                    hidden: false,
-                    format: false,
-                })))
-                .await,
-            Response::SetEnvironment(_)
-        ));
+        handler
+            .handle_ok(SetEnvironmentRequest {
+                scope: ScopeSelector::Global,
+                name: name.to_owned(),
+                value: "from-server".to_owned(),
+                mode: None,
+                hidden: false,
+                format: false,
+            })
+            .await;
     }
 
-    let response = handler
-        .handle(Request::NewSessionExt(Box::new(NewSessionExtRequest {
-            session_name: Some(session.clone()),
-            working_directory: None,
-            detached: true,
-            size: Some(TerminalSize { cols: 80, rows: 24 }),
+    handler
+        .create_session(NewSessionExtRequest {
             environment: Some(vec![
                 "RMUX_OVERRIDE_ENV_SENTINEL=from-explicit".to_owned(),
                 "RMUX_CLIENT_ENV_SENTINEL=from-explicit".to_owned(),
             ]),
-            group_target: None,
-            attach_if_exists: false,
-            detach_other_clients: false,
-            kill_other_clients: false,
-            flags: None,
-            window_name: None,
-            print_session_info: false,
-            print_format: None,
-            command: None,
-            process_command: None,
             client_environment: Some(vec![
                 "PATH=/tmp/rmux-client-bin:/usr/bin".to_owned(),
                 "SSH_AUTH_SOCK=/tmp/rmux-client-agent.sock".to_owned(),
@@ -1841,11 +1474,9 @@ async fn new_session_ext_client_environment_respects_tmux_precedence() {
                 "RMUX_CLIENT_ENV_SENTINEL=from-client".to_owned(),
                 "RMUX_CLIENT_ONLY_ENV_SENTINEL=from-client".to_owned(),
             ]),
-            skip_environment_update: false,
-        })))
+            ..Fixture::fixture(&session)
+        })
         .await;
-
-    assert!(matches!(response, Response::NewSession(_)));
 
     let state = handler.state.lock().await;
     let pane_zero = state
@@ -1893,32 +1524,16 @@ async fn new_session_ext_skip_environment_update_keeps_client_spawn_environment(
     let handler = RequestHandler::new();
     let session = session_name("skip-client-env");
 
-    let response = handler
-        .handle(Request::NewSessionExt(Box::new(NewSessionExtRequest {
-            session_name: Some(session.clone()),
-            working_directory: None,
-            detached: true,
-            size: Some(TerminalSize { cols: 80, rows: 24 }),
-            environment: None,
-            group_target: None,
-            attach_if_exists: false,
-            detach_other_clients: false,
-            kill_other_clients: false,
-            flags: None,
-            window_name: None,
-            print_session_info: false,
-            print_format: None,
-            command: None,
-            process_command: None,
+    handler
+        .create_session(NewSessionExtRequest {
             client_environment: Some(vec![
                 "PATH=/tmp/rmux-client-bin:/usr/bin".to_owned(),
                 "RMUX_CLIENT_ONLY_ENV_SENTINEL=from-client".to_owned(),
             ]),
             skip_environment_update: true,
-        })))
+            ..Fixture::fixture(&session)
+        })
         .await;
-
-    assert!(matches!(response, Response::NewSession(_)));
 
     let state = handler.state.lock().await;
     let pane_zero = state
@@ -1939,15 +1554,4 @@ async fn new_session_ext_skip_environment_update_keeps_client_spawn_environment(
         }))
         .await;
     assert!(matches!(shown, Response::Error(_)));
-}
-
-fn shell_quote_str(value: &str) -> String {
-    crate::test_shell::command_quote(value)
-}
-
-fn append_x_command(path: &std::path::Path) -> String {
-    format!(
-        "printf x >> {}",
-        shell_quote_str(&path.display().to_string())
-    )
 }

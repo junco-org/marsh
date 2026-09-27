@@ -2,40 +2,26 @@ use super::RequestHandler;
 use rmux_core::Utf8Config;
 use rmux_proto::types::OptionScopeSelector;
 use rmux_proto::{
-    ErrorResponse, NewSessionRequest, OptionName, PaneTarget, Request, Response, RmuxError,
-    ScopeSelector, SetOptionByNameRequest, SetOptionMode, SetOptionRequest, TerminalSize,
-    WindowTarget,
+    ErrorResponse, OptionName, PaneTarget, Request, Response, RmuxError, ScopeSelector,
+    SetOptionByNameRequest, SetOptionMode, SetOptionRequest, WindowTarget,
 };
 
+use crate::test_fixtures::Fixture;
 use crate::test_names::session_name;
-
-async fn create_session(handler: &RequestHandler, name: &str) {
-    let response = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name: session_name(name),
-            detached: true,
-            size: Some(TerminalSize { cols: 80, rows: 24 }),
-            environment: None,
-        }))
-        .await;
-
-    assert!(matches!(response, Response::NewSession(_)));
-}
 
 #[tokio::test]
 async fn set_option_updates_the_store_and_session_values_override_global() {
     let handler = RequestHandler::new();
-    create_session(&handler, "alpha").await;
-    create_session(&handler, "beta").await;
+    handler.create_session("alpha").await;
+    handler.create_session("beta").await;
 
     assert_eq!(
         handler
-            .handle(Request::SetOption(SetOptionRequest {
-                scope: ScopeSelector::Global,
-                option: OptionName::Status,
-                value: "off".to_owned(),
-                mode: SetOptionMode::Replace,
-            }))
+            .handle(Request::SetOption(SetOptionRequest::fixture((
+                ScopeSelector::Global,
+                OptionName::Status,
+                "off",
+            ))))
             .await,
         Response::SetOption(rmux_proto::SetOptionResponse {
             scope: ScopeSelector::Global,
@@ -45,12 +31,11 @@ async fn set_option_updates_the_store_and_session_values_override_global() {
     );
     assert_eq!(
         handler
-            .handle(Request::SetOption(SetOptionRequest {
-                scope: ScopeSelector::Session(session_name("alpha")),
-                option: OptionName::Status,
-                value: "on".to_owned(),
-                mode: SetOptionMode::Replace,
-            }))
+            .handle(Request::SetOption(SetOptionRequest::fixture((
+                ScopeSelector::Session(session_name("alpha")),
+                OptionName::Status,
+                "on",
+            ))))
             .await,
         Response::SetOption(rmux_proto::SetOptionResponse {
             scope: ScopeSelector::Session(session_name("alpha")),
@@ -85,28 +70,23 @@ async fn typed_and_named_default_shell_mutations_reject_unsuitable_paths() {
 
     assert_eq!(
         handler
-            .handle(Request::SetOption(SetOptionRequest {
-                scope: ScopeSelector::Global,
-                option: OptionName::DefaultShell,
-                value: invalid.to_owned(),
-                mode: SetOptionMode::Replace,
-            }))
+            .handle(Request::SetOption(SetOptionRequest::fixture((
+                ScopeSelector::Global,
+                OptionName::DefaultShell,
+                invalid,
+            ))))
             .await,
         expected
     );
     assert_eq!(
         handler
-            .handle(Request::SetOptionByName(Box::new(SetOptionByNameRequest {
-                scope: OptionScopeSelector::SessionGlobal,
-                name: "default-shell".to_owned(),
-                value: Some(invalid.to_owned()),
-                mode: SetOptionMode::Replace,
-                only_if_unset: false,
-                unset: false,
-                unset_pane_overrides: false,
-                format: false,
-                format_target: None,
-            })))
+            .handle(Request::SetOptionByName(Box::new(
+                SetOptionByNameRequest::fixture((
+                    OptionScopeSelector::SessionGlobal,
+                    "default-shell",
+                    invalid,
+                ))
+            )))
             .await,
         expected
     );
@@ -120,24 +100,14 @@ async fn typed_and_named_default_shell_mutations_reject_unsuitable_paths() {
         None
     );
 
-    assert!(matches!(
-        handler
-            .handle(Request::SetOption(SetOptionRequest {
-                scope: ScopeSelector::Global,
-                option: OptionName::DefaultShell,
-                value: "/bin/sh".to_owned(),
-                mode: SetOptionMode::Replace,
-            }))
-            .await,
-        Response::SetOption(_)
-    ));
+    handler
+        .set_option(ScopeSelector::Global, OptionName::DefaultShell, "/bin/sh")
+        .await;
     assert_eq!(
         handler
             .handle(Request::SetOption(SetOptionRequest {
-                scope: ScopeSelector::Global,
-                option: OptionName::DefaultShell,
-                value: ".invalid".to_owned(),
                 mode: SetOptionMode::Append,
+                ..Fixture::fixture((ScopeSelector::Global, OptionName::DefaultShell, ".invalid"))
             }))
             .await,
         Response::Error(ErrorResponse {
@@ -158,15 +128,17 @@ async fn typed_and_named_default_shell_mutations_reject_unsuitable_paths() {
 #[tokio::test]
 async fn terminal_features_append_preserves_order_and_invalid_requests_fail_first() {
     let handler = RequestHandler::new();
-    create_session(&handler, "alpha").await;
+    handler.create_session("alpha").await;
 
     assert_eq!(
         handler
             .handle(Request::SetOption(SetOptionRequest {
-                scope: ScopeSelector::Global,
-                option: OptionName::TerminalFeatures,
-                value: "xterm*:RGB".to_owned(),
                 mode: SetOptionMode::Append,
+                ..Fixture::fixture((
+                    ScopeSelector::Global,
+                    OptionName::TerminalFeatures,
+                    "xterm*:RGB",
+                ))
             }))
             .await,
         Response::SetOption(rmux_proto::SetOptionResponse {
@@ -178,10 +150,12 @@ async fn terminal_features_append_preserves_order_and_invalid_requests_fail_firs
     assert_eq!(
         handler
             .handle(Request::SetOption(SetOptionRequest {
-                scope: ScopeSelector::Global,
-                option: OptionName::TerminalFeatures,
-                value: "screen*:AX".to_owned(),
                 mode: SetOptionMode::Append,
+                ..Fixture::fixture((
+                    ScopeSelector::Global,
+                    OptionName::TerminalFeatures,
+                    "screen*:AX",
+                ))
             }))
             .await,
         Response::SetOption(rmux_proto::SetOptionResponse {
@@ -193,10 +167,8 @@ async fn terminal_features_append_preserves_order_and_invalid_requests_fail_firs
 
     let scalar_append = handler
         .handle(Request::SetOption(SetOptionRequest {
-            scope: ScopeSelector::Global,
-            option: OptionName::Status,
-            value: "off".to_owned(),
             mode: SetOptionMode::Append,
+            ..Fixture::fixture((ScopeSelector::Global, OptionName::Status, "off"))
         }))
         .await;
     assert_eq!(
@@ -209,12 +181,11 @@ async fn terminal_features_append_preserves_order_and_invalid_requests_fail_firs
     );
 
     let invalid_value = handler
-        .handle(Request::SetOption(SetOptionRequest {
-            scope: ScopeSelector::Global,
-            option: OptionName::Status,
-            value: "maybe".to_owned(),
-            mode: SetOptionMode::Replace,
-        }))
+        .handle(Request::SetOption(SetOptionRequest::fixture((
+            ScopeSelector::Global,
+            OptionName::Status,
+            "maybe",
+        ))))
         .await;
     assert_eq!(
         invalid_value,
@@ -236,7 +207,7 @@ async fn terminal_features_append_preserves_order_and_invalid_requests_fail_firs
 #[tokio::test]
 async fn set_option_by_name_refreshes_existing_transcripts_for_server_utf8_options() {
     let handler = RequestHandler::new();
-    create_session(&handler, "alpha").await;
+    handler.create_session("alpha").await;
     let alpha = session_name("alpha");
 
     let before = {
@@ -248,17 +219,13 @@ async fn set_option_by_name_refreshes_existing_transcripts_for_server_utf8_optio
 
     assert_eq!(
         handler
-            .handle(Request::SetOptionByName(Box::new(SetOptionByNameRequest {
-                scope: OptionScopeSelector::ServerGlobal,
-                name: "variation-selector-always-wide".to_owned(),
-                value: Some("off".to_owned()),
-                mode: SetOptionMode::Replace,
-                only_if_unset: false,
-                unset: false,
-                unset_pane_overrides: false,
-                format: false,
-                format_target: None,
-            })))
+            .handle(Request::SetOptionByName(Box::new(
+                SetOptionByNameRequest::fixture((
+                    OptionScopeSelector::ServerGlobal,
+                    "variation-selector-always-wide",
+                    "off",
+                ))
+            )))
             .await,
         Response::SetOptionByName(rmux_proto::SetOptionByNameResponse {
             scope: OptionScopeSelector::ServerGlobal,
@@ -280,66 +247,46 @@ async fn set_option_by_name_refreshes_existing_transcripts_for_server_utf8_optio
 #[tokio::test]
 async fn pane_style_options_resolve_session_then_global_for_supported_variants() {
     let handler = RequestHandler::new();
-    create_session(&handler, "alpha").await;
-    create_session(&handler, "beta").await;
+    handler.create_session("alpha").await;
+    handler.create_session("beta").await;
     let alpha_window = WindowTarget::with_window(session_name("alpha"), 0);
     let alpha_pane = PaneTarget::with_window(session_name("alpha"), 0, 0);
 
-    assert!(matches!(
-        handler
-            .handle(Request::SetOption(SetOptionRequest {
-                scope: ScopeSelector::Global,
-                option: OptionName::PaneBorderStyle,
-                value: "fg=colour1".to_owned(),
-                mode: SetOptionMode::Replace,
-            }))
-            .await,
-        Response::SetOption(_)
-    ));
-    assert!(matches!(
-        handler
-            .handle(Request::SetOption(SetOptionRequest {
-                scope: ScopeSelector::Global,
-                option: OptionName::PaneActiveBorderStyle,
-                value: "fg=colour2".to_owned(),
-                mode: SetOptionMode::Replace,
-            }))
-            .await,
-        Response::SetOption(_)
-    ));
-    assert!(matches!(
-        handler
-            .handle(Request::SetOption(SetOptionRequest {
-                scope: ScopeSelector::Window(alpha_window),
-                option: OptionName::PaneBorderStyle,
-                value: "fg=colour3".to_owned(),
-                mode: SetOptionMode::Replace,
-            }))
-            .await,
-        Response::SetOption(_)
-    ));
-    assert!(matches!(
-        handler
-            .handle(Request::SetOption(SetOptionRequest {
-                scope: ScopeSelector::Pane(alpha_pane.clone()),
-                option: OptionName::PaneBorderStyle,
-                value: "fg=colour4".to_owned(),
-                mode: SetOptionMode::Replace,
-            }))
-            .await,
-        Response::SetOption(_)
-    ));
-    assert!(matches!(
-        handler
-            .handle(Request::SetOption(SetOptionRequest {
-                scope: ScopeSelector::Pane(alpha_pane),
-                option: OptionName::PaneActiveBorderStyle,
-                value: "fg=colour5".to_owned(),
-                mode: SetOptionMode::Replace,
-            }))
-            .await,
-        Response::SetOption(_)
-    ));
+    handler
+        .set_option(
+            ScopeSelector::Global,
+            OptionName::PaneBorderStyle,
+            "fg=colour1",
+        )
+        .await;
+    handler
+        .set_option(
+            ScopeSelector::Global,
+            OptionName::PaneActiveBorderStyle,
+            "fg=colour2",
+        )
+        .await;
+    handler
+        .set_option(
+            ScopeSelector::Window(alpha_window),
+            OptionName::PaneBorderStyle,
+            "fg=colour3",
+        )
+        .await;
+    handler
+        .set_option(
+            ScopeSelector::Pane(alpha_pane.clone()),
+            OptionName::PaneBorderStyle,
+            "fg=colour4",
+        )
+        .await;
+    handler
+        .set_option(
+            ScopeSelector::Pane(alpha_pane),
+            OptionName::PaneActiveBorderStyle,
+            "fg=colour5",
+        )
+        .await;
 
     let state = handler.state.lock().await;
     assert_eq!(
@@ -396,12 +343,11 @@ async fn set_option_to_nonexistent_session_returns_session_not_found() {
     let handler = RequestHandler::new();
 
     let response = handler
-        .handle(Request::SetOption(SetOptionRequest {
-            scope: ScopeSelector::Session(session_name("missing")),
-            option: OptionName::Status,
-            value: "off".to_owned(),
-            mode: SetOptionMode::Replace,
-        }))
+        .handle(Request::SetOption(SetOptionRequest::fixture((
+            ScopeSelector::Session(session_name("missing")),
+            OptionName::Status,
+            "off",
+        ))))
         .await;
 
     assert_eq!(
@@ -416,16 +362,12 @@ async fn set_option_to_nonexistent_session_returns_session_not_found() {
 async fn set_option_append_empty_string_is_noop() {
     let handler = RequestHandler::new();
 
-    let response = handler
-        .handle(Request::SetOption(SetOptionRequest {
-            scope: ScopeSelector::Global,
-            option: OptionName::TerminalFeatures,
-            value: String::new(),
+    handler
+        .handle_ok(SetOptionRequest {
             mode: SetOptionMode::Append,
-        }))
+            ..Fixture::fixture((ScopeSelector::Global, OptionName::TerminalFeatures, ""))
+        })
         .await;
-
-    assert!(matches!(response, Response::SetOption(_)));
 
     let state = handler.state.lock().await;
     assert_eq!(

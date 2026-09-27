@@ -1,6 +1,9 @@
 //! Trap handling for the shell.
 
-use crate::{ExecutionParameters, ExecutionResult, ProcessGroupPolicy, error, traps::TrapSignal};
+use crate::{
+    ExecutionParameters, ExecutionResult, ProcessGroupPolicy, error,
+    extensions::ExecutionObserver as _, traps::TrapSignal,
+};
 
 impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
     /// Runs any exit steps for the shell.
@@ -8,7 +11,11 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
     /// This currently includes invoking the `EXIT` trap handler, if any.
     pub async fn on_exit(&mut self) -> Result<(), error::Error> {
         if self.traps.handles(TrapSignal::Exit) {
-            self.invoke_trap_handler(TrapSignal::Exit, &self.default_exec_params())
+            // The handler runs as a future scoped by the observer.
+            let params = self.default_exec_params();
+            let observer = self.execution_observer.clone();
+            observer
+                .scope_future(self.invoke_trap_handler(TrapSignal::Exit, &params))?
                 .await?;
         }
 
@@ -77,8 +84,9 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
         // (never early-returned with `?`), so `leave_trap_handler()` always runs.
         self.enter_trap_handler(signal, Some(&handler));
 
+        // Trap handlers only fire from code that already runs within the observer's scope.
         let result = self
-            .run_string(&handler.command, &handler.source_info, &params)
+            .run_string_in_scope(handler.command, &handler.source_info, &params)
             .await;
 
         self.leave_trap_handler();

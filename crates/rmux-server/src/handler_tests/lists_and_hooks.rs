@@ -1,4 +1,5 @@
 use super::*;
+use crate::test_fixtures::{Fixture, Sizeless};
 
 #[tokio::test]
 async fn list_sessions_returns_empty_output_when_no_sessions_exist() {
@@ -23,16 +24,7 @@ async fn list_sessions_returns_empty_output_when_no_sessions_exist() {
 async fn list_sessions_sorts_sessions_by_name() {
     let handler = RequestHandler::new();
     for name in ["charlie", "alpha", "bravo"] {
-        let created = handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: session_name(name),
-                detached: true,
-                size: None,
-
-                environment: None,
-            }))
-            .await;
-        assert!(matches!(created, Response::NewSession(_)));
+        handler.create_session(Sizeless(name)).await;
     }
 
     let response = handler
@@ -64,28 +56,13 @@ async fn list_sessions_format_uses_each_sessions_active_pane_context() {
     let beta_dir = canonical_context_path(root.child("beta").path());
 
     for (name, path) in [("alpha", &alpha_dir), ("beta", &beta_dir)] {
-        let created = handler
-            .handle(Request::NewSessionExt(Box::new(NewSessionExtRequest {
-                session_name: Some(session_name(name)),
+        handler
+            .create_session(NewSessionExtRequest {
                 working_directory: Some(path.to_string_lossy().into_owned()),
-                detached: true,
                 size: None,
-                environment: None,
-                group_target: None,
-                attach_if_exists: false,
-                detach_other_clients: false,
-                kill_other_clients: false,
-                flags: None,
-                window_name: None,
-                print_session_info: false,
-                print_format: None,
-                command: None,
-                process_command: None,
-                client_environment: None,
-                skip_environment_update: false,
-            })))
+                ..Fixture::fixture(name)
+            })
             .await;
-        assert!(matches!(created, Response::NewSession(_)));
     }
 
     let response = handler
@@ -122,49 +99,21 @@ async fn session_path_stays_at_session_cwd_when_pane_cwds_differ() {
     let split_dir = canonical_context_path(root.child("split").path());
     let session = session_name("session-path-context");
 
-    let created = handler
-        .handle(Request::NewSessionExt(Box::new(NewSessionExtRequest {
-            session_name: Some(session.clone()),
+    handler
+        .create_session(NewSessionExtRequest {
             working_directory: Some(session_dir.to_string_lossy().into_owned()),
-            detached: true,
             size: None,
-            environment: None,
-            group_target: None,
-            attach_if_exists: false,
-            detach_other_clients: false,
-            kill_other_clients: false,
-            flags: None,
-            window_name: None,
-            print_session_info: false,
-            print_format: None,
-            command: None,
-            process_command: None,
-            client_environment: None,
-            skip_environment_update: false,
-        })))
+            ..Fixture::fixture(&session)
+        })
         .await;
-    assert!(matches!(created, Response::NewSession(_)), "{created:?}");
 
-    let split = handler
-        .handle(Request::SplitWindowExt(Box::new(
-            rmux_proto::SplitWindowExtRequest {
-                target: SplitWindowTarget::Session(session.clone()),
-                direction: rmux_proto::SplitDirection::Vertical,
-                before: false,
-                environment: None,
-                command: None,
-                process_command: None,
-                start_directory: Some(split_dir.clone()),
-                keep_alive_on_exit: None,
-                detached: true,
-                size: None,
-                preserve_zoom: false,
-                full_size: false,
-                stdin_payload: None,
-            },
-        )))
+    handler
+        .handle_ok(rmux_proto::SplitWindowExtRequest {
+            start_directory: Some(split_dir.clone()),
+            detached: true,
+            ..Fixture::fixture(&session)
+        })
         .await;
-    assert!(matches!(split, Response::SplitWindow(_)), "{split:?}");
 
     let response = handler
         .handle(Request::ListPanes(Box::new(ListPanesRequest {

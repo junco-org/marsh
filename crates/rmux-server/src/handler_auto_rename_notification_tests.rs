@@ -1,96 +1,16 @@
-use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
 use std::time::Duration;
 
 use rmux_core::LifecycleEvent;
 use rmux_proto::{
-    ControlMode, HookLifecycle, HookName, LinkWindowRequest, NewSessionExtRequest, OptionName,
-    PaneTarget, RenameWindowRequest, Request, Response, ScopeSelector, SessionName, SetHookRequest,
-    SetOptionMode, SetOptionRequest, TerminalSize, WindowTarget,
+    HookLifecycle, HookName, LinkWindowRequest, OptionName, RenameWindowRequest, ScopeSelector,
+    SetHookRequest, WindowTarget,
 };
 use tokio::sync::{broadcast, mpsc, oneshot};
 
 use super::{QueuedLifecycleEvent, RequestHandler};
-use crate::control::{ControlModeUpgrade, ControlServerEvent, CONTROL_SERVER_EVENT_CAPACITY};
+use crate::control::ControlServerEvent;
 use crate::pane_io::PaneAlertEvent;
-
-use crate::test_names::session_name;
-
-async fn create_session(handler: &RequestHandler, name: &str) -> SessionName {
-    let session = session_name(name);
-    let response = handler
-        .handle(Request::NewSessionExt(Box::new(NewSessionExtRequest {
-            session_name: Some(session.clone()),
-            working_directory: None,
-            detached: true,
-            size: Some(TerminalSize { cols: 80, rows: 24 }),
-            environment: None,
-            group_target: None,
-            attach_if_exists: false,
-            detach_other_clients: false,
-            kill_other_clients: false,
-            flags: None,
-            window_name: None,
-            print_session_info: false,
-            print_format: None,
-            command: Some(quiet_command()),
-            process_command: None,
-            client_environment: None,
-            skip_environment_update: false,
-        })))
-        .await;
-    assert!(matches!(response, Response::NewSession(_)), "{response:?}");
-    handler
-        .wait_for_pane_startup_to_finish_for_test(&PaneTarget::new(session.clone(), 0))
-        .await;
-    session
-}
-
-fn quiet_command() -> Vec<String> {
-    ["/bin/sh", "-c", "sleep 60"]
-        .into_iter()
-        .map(str::to_owned)
-        .collect()
-}
-
-async fn link_window(handler: &RequestHandler, source: WindowTarget, target: WindowTarget) {
-    let response = handler
-        .handle(Request::LinkWindow(LinkWindowRequest {
-            source,
-            target,
-            after: false,
-            before: false,
-            kill_destination: false,
-            detached: true,
-        }))
-        .await;
-    assert!(matches!(response, Response::LinkWindow(_)), "{response:?}");
-}
-
-async fn register_control_client(
-    handler: &RequestHandler,
-    requester_pid: u32,
-    session: &SessionName,
-) -> mpsc::Receiver<ControlServerEvent> {
-    let (event_tx, event_rx) = mpsc::channel(CONTROL_SERVER_EVENT_CAPACITY);
-    handler
-        .register_control_with_closing(
-            requester_pid,
-            ControlModeUpgrade {
-                initial_command_count: 0,
-                mode: ControlMode::Plain,
-                terminal_context: crate::outer_terminal::OuterTerminalContext::default(),
-            },
-            event_tx,
-            Arc::new(AtomicBool::new(false)),
-        )
-        .await;
-    handler
-        .set_control_session(requester_pid, Some(session.clone()))
-        .await
-        .expect("control session set succeeds");
-    event_rx
-}
+use crate::test_fixtures::{Fixture, Quiet};
 
 fn drain_control_notifications(rx: &mut mpsc::Receiver<ControlServerEvent>) -> Vec<String> {
     let mut notifications = Vec::new();
@@ -130,30 +50,6 @@ fn assert_control_rename_before_hook(
     );
 }
 
-async fn set_automatic_rename_format(handler: &RequestHandler, target: WindowTarget, value: &str) {
-    let response = handler
-        .handle(Request::SetOption(SetOptionRequest {
-            scope: ScopeSelector::Window(target),
-            option: OptionName::AutomaticRenameFormat,
-            value: value.to_owned(),
-            mode: SetOptionMode::Replace,
-        }))
-        .await;
-    assert!(matches!(response, Response::SetOption(_)), "{response:?}");
-}
-
-async fn set_window_renamed_hook(handler: &RequestHandler, buffer_name: &str) {
-    let response = handler
-        .handle(Request::SetHook(SetHookRequest {
-            scope: ScopeSelector::Global,
-            hook: HookName::WindowRenamed,
-            command: format!("set-buffer -b {buffer_name} fired"),
-            lifecycle: HookLifecycle::OneShot,
-        }))
-        .await;
-    assert!(matches!(response, Response::SetHook(_)), "{response:?}");
-}
-
 async fn recv_window_renamed(
     events: &mut broadcast::Receiver<QueuedLifecycleEvent>,
 ) -> QueuedLifecycleEvent {
@@ -191,38 +87,6 @@ fn assert_hook_window_name(event: &QueuedLifecycleEvent, expected: &str) {
     );
 }
 
-async fn wait_for_hook_buffer(handler: &RequestHandler, buffer_name: &str) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-    loop {
-        let actual = {
-            let state = handler.state.lock().await;
-            state
-                .buffers
-                .show(Some(buffer_name))
-                .ok()
-                .map(|(_, bytes)| String::from_utf8_lossy(bytes).into_owned())
-        };
-        if actual.as_deref() == Some("fired") {
-            return;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "rename hook buffer {buffer_name} did not fire; last={actual:?}"
-        );
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-}
-
-async fn window_id(handler: &RequestHandler, target: &WindowTarget) -> u32 {
-    let state = handler.state.lock().await;
-    state
-        .sessions
-        .session(target.session_name())
-        .and_then(|session| session.window_at(target.window_index()))
-        .map(|window| window.id().as_u32())
-        .expect("window exists")
-}
-
 async fn active_pane_id(handler: &RequestHandler, target: &WindowTarget) -> rmux_proto::PaneId {
     let state = handler.state.lock().await;
     state
@@ -256,14 +120,37 @@ async fn automatic_and_manual_renames_publish_one_link_aware_event_before_the_ho
     // renames publish one linked/unlinked control notification per client,
     // followed by exactly one window-renamed hook.
     let handler = RequestHandler::new();
-    let alpha = create_session(&handler, "auto-rename-alpha").await;
-    let beta = create_session(&handler, "auto-rename-beta").await;
-    let gamma = create_session(&handler, "auto-rename-gamma").await;
+    let alpha = handler
+        .create_started_session(Quiet("auto-rename-alpha"))
+        .await;
+    let beta = handler
+        .create_started_session(Quiet("auto-rename-beta"))
+        .await;
+    let gamma = handler
+        .create_started_session(Quiet("auto-rename-gamma"))
+        .await;
     let alpha_target = WindowTarget::with_window(alpha.clone(), 0);
     let gamma_target = WindowTarget::with_window(gamma.clone(), 1);
-    link_window(&handler, alpha_target.clone(), gamma_target.clone()).await;
-    set_automatic_rename_format(&handler, alpha_target.clone(), "automatic-oracle").await;
-    set_window_renamed_hook(&handler, "automatic-rename-hook").await;
+    handler
+        .handle_ok(LinkWindowRequest::fixture((&alpha_target, &gamma_target)))
+        .await;
+    handler
+        .set_option(
+            ScopeSelector::Window(alpha_target.clone()),
+            OptionName::AutomaticRenameFormat,
+            "automatic-oracle",
+        )
+        .await;
+    handler
+        .handle_ok(SetHookRequest {
+            lifecycle: HookLifecycle::OneShot,
+            ..Fixture::fixture((
+                ScopeSelector::Global,
+                HookName::WindowRenamed,
+                "set-buffer -b automatic-rename-hook fired",
+            ))
+        })
+        .await;
     let lifecycle_dispatch = handler
         .take_lifecycle_dispatch_receiver()
         .expect("test owns lifecycle hook dispatch");
@@ -275,36 +162,31 @@ async fn automatic_and_manual_renames_publish_one_link_aware_event_before_the_ho
             .await;
     });
 
-    let mut alpha_control = register_control_client(&handler, 51_001, &alpha).await;
-    let mut beta_control = register_control_client(&handler, 51_002, &beta).await;
-    let mut gamma_control = register_control_client(&handler, 51_003, &gamma).await;
+    let (_, mut alpha_control) = handler
+        .register_control_for_test(51_001, Some(&alpha))
+        .await;
+    let (_, mut beta_control) = handler.register_control_for_test(51_002, Some(&beta)).await;
+    let (_, mut gamma_control) = handler
+        .register_control_for_test(51_003, Some(&gamma))
+        .await;
     let _ = drain_control_notifications(&mut alpha_control);
     let _ = drain_control_notifications(&mut beta_control);
     let _ = drain_control_notifications(&mut gamma_control);
     let mut lifecycle = handler.subscribe_lifecycle_events();
     let pane_id = active_pane_id(&handler, &alpha_target).await;
-    let shared_window_id = window_id(&handler, &alpha_target).await;
+    let shared_window_id = handler.window_id_for_test(&alpha_target).await.as_u32();
 
     handler
         .handle_pane_alert_event(PaneAlertEvent {
-            session_name: alpha.clone(),
-            pane_id,
-            bell_count: 0,
-            title_changed: false,
-            title_change: None,
-            path_changed: false,
-            clipboard_set: false,
-            clipboard_writes: Vec::new(),
-            clipboard_queries: Vec::new(),
-            mouse_mode_changed: false,
-            alternate_mode_changed: false,
             queue_activity_alert: true,
-            generation: None,
+            ..Fixture::fixture((&alpha, pane_id))
         })
         .await;
 
     let automatic_event = recv_window_renamed(&mut lifecycle).await;
-    wait_for_hook_buffer(&handler, "automatic-rename-hook").await;
+    handler
+        .wait_for_buffer("automatic-rename-hook", "fired")
+        .await;
     assert_eq!(automatic_event.hooks.len(), 1);
     assert_control_rename_before_hook(
         &mut alpha_control,
@@ -330,20 +212,25 @@ async fn automatic_and_manual_renames_publish_one_link_aware_event_before_the_ho
     assert_hook_window_name(&automatic_event, "automatic-oracle");
     assert_no_additional_window_renamed(&mut lifecycle);
 
-    set_window_renamed_hook(&handler, "manual-rename-hook").await;
-    let response = handler
-        .handle(Request::RenameWindow(RenameWindowRequest {
+    handler
+        .handle_ok(SetHookRequest {
+            lifecycle: HookLifecycle::OneShot,
+            ..Fixture::fixture((
+                ScopeSelector::Global,
+                HookName::WindowRenamed,
+                "set-buffer -b manual-rename-hook fired",
+            ))
+        })
+        .await;
+    handler
+        .handle_ok(RenameWindowRequest {
             target: alpha_target,
             name: "manual-oracle".to_owned(),
-        }))
+        })
         .await;
-    assert!(
-        matches!(response, Response::RenameWindow(_)),
-        "{response:?}"
-    );
 
     let manual_event = recv_window_renamed(&mut lifecycle).await;
-    wait_for_hook_buffer(&handler, "manual-rename-hook").await;
+    handler.wait_for_buffer("manual-rename-hook", "fired").await;
     assert_eq!(manual_event.hooks.len(), 1);
     assert_control_rename_before_hook(
         &mut alpha_control,

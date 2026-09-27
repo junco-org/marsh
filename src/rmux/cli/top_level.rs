@@ -4,6 +4,7 @@ use crate::cli_args::{Cli, scan_top_level_command};
 use crate::os_string::os_str_bytes;
 
 use super::ExitFailure;
+use super::aux_command::failure;
 
 /// Short usage banner printed for `-h` and for rejected top-level invocations.
 const RMUX_USAGE: &str = "usage: rmux [-2CDhlNuVv] [-c shell-command] [-f file] [-L socket-name]\n            [-S socket-path] [-T features] [command [flags]]";
@@ -205,32 +206,28 @@ pub(super) fn validate_top_level_invocation(
 /// `-N`, and `-C` would be parsed as a harmless prefix and then silently
 /// discarded by the managed launcher.
 pub(super) fn validate_claude_top_level_invocation(
-    invocation: Option<&ClaudeTopLevelInvocation>,
+    invocation: &ClaudeTopLevelInvocation,
 ) -> Result<(), ExitFailure> {
-    let Some(invocation) = invocation else {
-        return Ok(());
-    };
-
     if invocation.shell_command || invocation.no_fork {
         return Err(ExitFailure::new(1, RMUX_USAGE));
     }
     if invocation.no_start_server {
-        return Err(ExitFailure::new(
-            1,
-            "rmux claude: -N is incompatible with the managed private server",
+        return Err(failure(
+            "claude",
+            "-N is incompatible with the managed private server",
         ));
     }
     if invocation.control_mode {
-        return Err(ExitFailure::new(
-            1,
-            "rmux claude: -C control mode is not supported by the managed launcher",
+        return Err(failure(
+            "claude",
+            "-C control mode is not supported by the managed launcher",
         ));
     }
     if let Some(option) = invocation.unsupported_option {
-        return Err(ExitFailure::new(
-            1,
-            format!(
-                "rmux claude: top-level option {option} is not supported by the managed private launcher; use `rmux claude [claude-args...]`"
+        return Err(failure(
+            "claude",
+            format_args!(
+                "top-level option {option} is not supported by the managed private launcher; use `rmux claude [claude-args...]`"
             ),
         ));
     }
@@ -250,11 +247,6 @@ pub(super) struct ClaudeTopLevelInvocation {
 }
 
 impl ClaudeTopLevelInvocation {
-    /// The arguments forwarded to `claude` after the extension name.
-    pub(super) fn arguments(&self) -> &[OsString] {
-        &self.arguments
-    }
-
     /// Consumes the invocation, yielding the arguments forwarded to `claude`.
     pub(super) fn into_arguments(self) -> Vec<OsString> {
         self.arguments
@@ -312,12 +304,11 @@ mod top_level_option_tests {
         scan_claude_top_level_invocation, top_level_version_requested,
         validate_claude_top_level_invocation,
     };
+    use crate::cli::aux_command::args;
     use crate::cli_args::scan_top_level_command;
-    use std::ffi::OsString;
 
-    fn requests_version(args: &[&str]) -> bool {
-        let args = args.iter().map(OsString::from).collect::<Vec<_>>();
-        top_level_version_requested(&args)
+    fn requests_version(values: &[&str]) -> bool {
+        top_level_version_requested(&args(values))
     }
 
     #[test]
@@ -369,7 +360,7 @@ mod top_level_option_tests {
             // Unlike -f, -L explicitly accepts a hyphen-prefixed value.
             &["-L", "-f", "claude"][..],
         ] {
-            let arguments = arguments.iter().map(OsString::from).collect::<Vec<_>>();
+            let arguments = args(arguments);
             assert!(
                 scan_claude_top_level_invocation(&arguments).is_some(),
                 "valid clap prefix must find claude: {arguments:?}"
@@ -384,7 +375,7 @@ mod top_level_option_tests {
             &["-f", "--help", "claude"][..],
             &["-x", "claude"][..],
         ] {
-            let arguments = arguments.iter().map(OsString::from).collect::<Vec<_>>();
+            let arguments = args(arguments);
             assert!(
                 scan_claude_top_level_invocation(&arguments).is_none(),
                 "invalid clap prefix must not dispatch claude: {arguments:?}"
@@ -397,7 +388,7 @@ mod top_level_option_tests {
             &["-uvfconfig", "claude"][..],
             &["-vcfoo", "claude"][..],
         ] {
-            let arguments = arguments.iter().map(OsString::from).collect::<Vec<_>>();
+            let arguments = args(arguments);
             let scan = scan_top_level_command(&arguments)
                 .expect("the public parser preserves the compact token as command input");
             assert_eq!(
@@ -419,11 +410,11 @@ mod top_level_option_tests {
             &["-v", "-C", "claude"][..],
             &["-cfoo", "claude"][..],
         ] {
-            let arguments = arguments.iter().map(OsString::from).collect::<Vec<_>>();
+            let arguments = args(arguments);
             let invocation = scan_claude_top_level_invocation(&arguments)
                 .expect("valid clap prefix finds claude");
             assert!(
-                validate_claude_top_level_invocation(Some(&invocation)).is_err(),
+                validate_claude_top_level_invocation(&invocation).is_err(),
                 "incompatible mode must be rejected: {arguments:?}"
             );
         }
@@ -446,10 +437,10 @@ mod top_level_option_tests {
             (&["-v", "-Ldemo", "claude"][..], "-L"),
             (&["-L", "-f", "claude"][..], "-L"),
         ] {
-            let arguments = arguments.iter().map(OsString::from).collect::<Vec<_>>();
+            let arguments = args(arguments);
             let invocation = scan_claude_top_level_invocation(&arguments)
                 .expect("syntactically valid prefix finds claude");
-            let error = validate_claude_top_level_invocation(Some(&invocation))
+            let error = validate_claude_top_level_invocation(&invocation)
                 .expect_err("unhonored top-level option must be rejected");
             assert!(
                 error.message().contains(option),

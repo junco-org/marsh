@@ -1,6 +1,6 @@
 use std::ffi::OsString;
 use std::fmt::Write as _;
-use std::io::{self, ErrorKind, Write};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 
@@ -8,24 +8,17 @@ use rmux_client::{connect, resolve_socket_path};
 use rmux_proto::Response;
 
 use super::ExitFailure;
-
-/// Selects whether `rmux diagnose` prints its human summary or a JSON object.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DiagnoseFormat {
-    Human,
-    Json,
-}
+use super::aux_command::{AuxCommand, OutputFormat, TopLevelFlag, command_word, stdout_written};
 
 /// Command-line state `rmux diagnose` needs: output format plus tmux-style top-level flags.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(super) struct DiagnoseInvocation {
-    format: DiagnoseFormat,
+    format: OutputFormat,
     socket_name: Option<OsString>,
     socket_path: Option<PathBuf>,
     config_files: Vec<PathBuf>,
     terminal_features: Vec<String>,
     assume_256_colors: bool,
-    utf8: bool,
 }
 
 /// The collected, already-redacted diagnostic facts rendered by either output format.
@@ -47,175 +40,48 @@ struct DiagnoseReport {
     osc52: String,
 }
 
-/// Recognizes `rmux diagnose` in an argument vector, returning `None` for any other command.
-pub(super) fn parse_invocation(
-    arguments: &[OsString],
-) -> Result<Option<DiagnoseInvocation>, ExitFailure> {
-    let Some((command_index, prefix)) = split_top_level_prefix(arguments) else {
-        return Ok(None);
-    };
-    let Some(command) = arguments
-        .get(command_index)
-        .and_then(|value| value.to_str())
-    else {
-        return Ok(None);
-    };
-    if command != "diagnose" {
-        return Ok(None);
+impl AuxCommand for DiagnoseInvocation {
+    /// Recognizes `diagnose` after the top-level flags, keeping the ones that shape its report.
+    fn parse(arguments: &[OsString]) -> Result<Option<Self>, ExitFailure> {
+        let mut invocation = Self::default();
+        let Some(("diagnose", rest)) =
+            command_word(arguments, "fLST", "fLST", |flag| invocation.record(flag))
+        else {
+            return Ok(None);
+        };
+        invocation.format = OutputFormat::parse("diagnose", rest)?;
+        Ok(Some(invocation))
     }
 
-    let format = parse_diagnose_format(&arguments[command_index + 1..])?;
-    Ok(Some(DiagnoseInvocation {
-        format,
-        socket_name: prefix.socket_name,
-        socket_path: prefix.socket_path,
-        config_files: prefix.config_files,
-        terminal_features: prefix.terminal_features,
-        assume_256_colors: prefix.assume_256_colors,
-        utf8: prefix.utf8,
-    }))
+    /// Collects the report and writes it to stdout in the requested format.
+    fn run(self, _argv: &[OsString]) -> Result<i32, ExitFailure> {
+        let format = self.format;
+        let report = DiagnoseReport::collect(self)?;
+        let output = match format {
+            OutputFormat::Human => report.render_human(),
+            OutputFormat::Json => report.render_json(),
+        };
+        stdout_written(io::stdout().lock().write_all(output.as_bytes()), |error| {
+            error.to_string()
+        })
+    }
 }
 
-/// Collects the report and writes it to stdout in the requested format, yielding the exit code.
-pub(super) fn run(invocation: DiagnoseInvocation) -> Result<i32, ExitFailure> {
-    let format = invocation.format;
-    let report = DiagnoseReport::collect(invocation)?;
-    let output = match format {
-        DiagnoseFormat::Human => report.render_human(),
-        DiagnoseFormat::Json => report.render_json(),
-    };
-    write_stdout(&output)
-}
-
-/// Tmux top-level flags that affect diagnose output, gathered before the command word.
-#[derive(Default)]
-struct TopLevelPrefix {
-    socket_name: Option<OsString>,
-    socket_path: Option<PathBuf>,
-    config_files: Vec<PathBuf>,
-    terminal_features: Vec<String>,
-    assume_256_colors: bool,
-    utf8: bool,
-}
-
-/// Scans leading top-level flags, returning the command word's index and the flags that matter.
-fn split_top_level_prefix(arguments: &[OsString]) -> Option<(usize, TopLevelPrefix)> {
-    let mut prefix = TopLevelPrefix::default();
-    let mut index = 0;
-
-    while let Some(argument) = arguments.get(index) {
-        let value = argument.to_str()?;
-        if value == "--" {
-            return Some((index + 1, prefix));
-        }
-        if !value.starts_with('-') || value == "-" {
-            return Some((index, prefix));
-        }
-
-        match value {
-            "-2" => prefix.assume_256_colors = true,
-            "-u" => prefix.utf8 = true,
-            "-D" | "-N" | "-l" => {}
-            "-C" | "-v" => {}
-            "-L" => {
-                index += 1;
-                prefix.socket_name = arguments.get(index).cloned();
-            }
-            "-S" => {
-                index += 1;
-                prefix.socket_path = arguments.get(index).map(PathBuf::from);
-            }
-            "-f" => {
-                index += 1;
-                if let Some(path) = arguments.get(index) {
-                    prefix.config_files.push(PathBuf::from(path));
+impl DiagnoseInvocation {
+    /// Keeps a top-level flag that affects the report: `-2`, `-L`, `-S`, `-f`, and `-T`.
+    fn record(&mut self, flag: TopLevelFlag<'_>) {
+        match flag {
+            TopLevelFlag::Switches(switches) => self.assume_256_colors |= switches.contains('2'),
+            TopLevelFlag::Value('L', name) => self.socket_name = Some(name.to_owned()),
+            TopLevelFlag::Value('S', path) => self.socket_path = Some(PathBuf::from(path)),
+            TopLevelFlag::Value('f', path) => self.config_files.push(PathBuf::from(path)),
+            TopLevelFlag::Value(_, features) => {
+                if let Some(features) = features.to_str() {
+                    push_terminal_features(&mut self.terminal_features, features);
                 }
             }
-            "-T" => {
-                index += 1;
-                if let Some(features) = arguments.get(index).and_then(|value| value.to_str()) {
-                    push_terminal_features(&mut prefix.terminal_features, features);
-                }
-            }
-            _ if value.starts_with("-L") && value.len() > 2 => {
-                prefix.socket_name =
-                    Some(OsString::from(value.strip_prefix("-L").unwrap_or_default()));
-            }
-            _ if value.starts_with("-S") && value.len() > 2 => {
-                prefix.socket_path =
-                    Some(PathBuf::from(value.strip_prefix("-S").unwrap_or_default()));
-            }
-            _ if value.starts_with("-f") && value.len() > 2 => {
-                prefix
-                    .config_files
-                    .push(PathBuf::from(value.strip_prefix("-f").unwrap_or_default()));
-            }
-            _ if value.starts_with("-T") && value.len() > 2 => {
-                push_terminal_features(
-                    &mut prefix.terminal_features,
-                    value.strip_prefix("-T").unwrap_or_default(),
-                );
-            }
-            _ if is_short_flag_cluster(value, "2CDNluv") => {
-                prefix.assume_256_colors |= value.contains('2');
-                prefix.utf8 |= value.contains('u');
-            }
-            _ => return Some((index, prefix)),
-        }
-
-        index += 1;
-    }
-
-    None
-}
-
-/// Reports whether `value` is a bundled short-flag group such as `-2u` drawn only from `allowed`.
-use super::is_short_flag_cluster;
-
-/// Parses the `--human` / `--json` / `--help` arguments that follow the `diagnose` command word.
-fn parse_diagnose_format(arguments: &[OsString]) -> Result<DiagnoseFormat, ExitFailure> {
-    let mut format = None;
-    for argument in arguments {
-        match argument.to_str() {
-            Some("--human") => set_format(&mut format, DiagnoseFormat::Human)?,
-            Some("--json") => set_format(&mut format, DiagnoseFormat::Json)?,
-            Some("--help") => {
-                return Err(ExitFailure::new_stdout(
-                    0,
-                    "usage: rmux diagnose [--human|--json]",
-                ));
-            }
-            Some(other) => {
-                return Err(ExitFailure::new(
-                    1,
-                    format!("rmux diagnose: unknown argument '{other}'"),
-                ));
-            }
-            None => {
-                return Err(ExitFailure::new(
-                    1,
-                    "rmux diagnose: arguments must be valid UTF-8",
-                ));
-            }
         }
     }
-
-    Ok(format.unwrap_or(DiagnoseFormat::Human))
-}
-
-/// Records a format choice, rejecting a second conflicting one.
-fn set_format(
-    current: &mut Option<DiagnoseFormat>,
-    next: DiagnoseFormat,
-) -> Result<(), ExitFailure> {
-    if current.is_some_and(|current| current != next) {
-        return Err(ExitFailure::new(
-            1,
-            "rmux diagnose: choose only one of --human or --json",
-        ));
-    }
-    *current = Some(next);
-    Ok(())
 }
 
 impl DiagnoseReport {
@@ -255,11 +121,11 @@ impl DiagnoseReport {
             version: rmux_server::VERSION.to_owned(),
             os_name: std::env::consts::OS.to_owned(),
             os_arch: std::env::consts::ARCH.to_owned(),
-            os_version: os_version(),
+            os_version: command_output("uname", &["-sr"]),
             terminal_host,
             term,
             term_program,
-            shell: detected_shell(),
+            shell: env_value("SHELL"),
             config_mode: if custom_config_files {
                 "custom".to_owned()
             } else {
@@ -426,7 +292,6 @@ fn redact_text_paths_against(text: &str, homes: &[PathBuf]) -> String {
         let home = home.to_string_lossy();
         if !home.is_empty() {
             redacted = redacted.replace(home.as_ref(), "~");
-            redacted = redacted.replace("~\\", "~/");
         }
     }
     redacted
@@ -456,7 +321,7 @@ fn push_terminal_features(features: &mut Vec<String>, raw: &str) {
 }
 
 /// Appends `value` only when it is not already present, keeping first-seen order.
-fn push_unique(values: &mut Vec<String>, value: String) {
+fn push_unique<T: PartialEq>(values: &mut Vec<T>, value: T) {
     if !values.contains(&value) {
         values.push(value);
     }
@@ -482,16 +347,6 @@ fn detect_terminal_host(term: &str, term_program: &str) -> String {
         return term.to_owned();
     }
     "unknown".to_owned()
-}
-
-/// The user's shell, from `SHELL`.
-fn detected_shell() -> String {
-    env_value("SHELL")
-}
-
-/// The operating system version string, from `uname -sr`.
-fn os_version() -> String {
-    command_output("uname", &["-sr"])
 }
 
 /// Runs a helper program and returns its trimmed stdout, or `unknown` on any failure.
@@ -528,33 +383,22 @@ fn terminal_looks_clipboard_capable(
         || term_program.eq_ignore_ascii_case("mintty")
 }
 
-/// The config files `rmux` would load when no `-f` was given, in platform lookup order.
+/// The config files `rmux` would load when no `-f` was given, in lookup order:
+/// `/etc/rmux.conf`, `~/.rmux.conf`, then the `XDG` locations.
 fn default_config_paths() -> Vec<PathBuf> {
-    unix_default_config_paths()
-}
-
-/// The Unix config lookup order: `/etc/rmux.conf`, `~/.rmux.conf`, then the `XDG` locations.
-fn unix_default_config_paths() -> Vec<PathBuf> {
+    let home = nonempty_env_os("HOME").map(PathBuf::from);
+    let xdg_config_home = nonempty_env_os("XDG_CONFIG_HOME").map(PathBuf::from);
     let mut paths = Vec::new();
-    push_unique_path(&mut paths, PathBuf::from("/etc/rmux.conf"));
-    if let Some(home) = nonempty_env_os("HOME") {
-        let home = PathBuf::from(home);
-        push_unique_path(&mut paths, home.join(".rmux.conf"));
-    }
-    if let Some(xdg_config_home) = nonempty_env_os("XDG_CONFIG_HOME") {
-        push_unique_path(
-            &mut paths,
-            PathBuf::from(xdg_config_home)
-                .join("rmux")
-                .join("rmux.conf"),
-        );
-    }
-    if let Some(home) = nonempty_env_os("HOME") {
-        let home = PathBuf::from(home);
-        push_unique_path(
-            &mut paths,
-            home.join(".config").join("rmux").join("rmux.conf"),
-        );
+    for path in [
+        Some(PathBuf::from("/etc/rmux.conf")),
+        home.as_ref().map(|home| home.join(".rmux.conf")),
+        xdg_config_home.map(|config| config.join("rmux").join("rmux.conf")),
+        home.map(|home| home.join(".config").join("rmux").join("rmux.conf")),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        push_unique(&mut paths, path);
     }
     paths
 }
@@ -562,13 +406,6 @@ fn unix_default_config_paths() -> Vec<PathBuf> {
 /// Reads an environment variable as an `OsString`, treating an empty value as absent.
 fn nonempty_env_os(name: &str) -> Option<OsString> {
     std::env::var_os(name).filter(|value| !value.is_empty())
-}
-
-/// Appends a path only when it is not already in the list, preserving lookup order.
-fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
-    if !paths.contains(&path) {
-        paths.push(path);
-    }
 }
 
 /// Renders a path with the current user's home directory replaced by `~`.
@@ -593,13 +430,9 @@ fn redact_path_against(path: &Path, homes: &[PathBuf]) -> String {
     path.display().to_string()
 }
 
-/// The home directories diagnose output must never leak, in tmux's lookup order.
+/// The nonempty HOME prefix diagnose output must redact.
 fn home_prefixes() -> Vec<PathBuf> {
-    ["HOME", "USERPROFILE"]
-        .into_iter()
-        .filter_map(nonempty_env_os)
-        .map(PathBuf::from)
-        .collect()
+    nonempty_env_os("HOME").map(PathBuf::from).into_iter().collect()
 }
 
 /// Joins terminal feature names for human output, printing `none` when there are none.
@@ -642,15 +475,6 @@ fn json_string(value: &str) -> String {
     }
     output.push('"');
     output
-}
-
-/// Writes the rendered report to stdout, treating a broken pipe as success.
-fn write_stdout(output: &str) -> Result<i32, ExitFailure> {
-    match io::stdout().lock().write_all(output.as_bytes()) {
-        Ok(()) => Ok(0),
-        Err(error) if error.kind() == ErrorKind::BrokenPipe => Ok(0),
-        Err(error) => Err(ExitFailure::new(1, error.to_string())),
-    }
 }
 
 #[cfg(test)]

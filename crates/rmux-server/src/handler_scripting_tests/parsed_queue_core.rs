@@ -1,17 +1,10 @@
 use super::*;
-use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
 
-use crate::control::{ControlModeUpgrade, ControlServerEvent, CONTROL_SERVER_EVENT_CAPACITY};
 use crate::handler::scripting_support::{
     CONTROL_QUEUE_INSERTED_COMMAND_LIMIT, CONTROL_QUEUE_STDOUT_LIMIT,
 };
-use crate::handler::ControlRegistration;
-use crate::outer_terminal::OuterTerminalContext;
 use rmux_core::LifecycleEvent;
-use rmux_os::identity::UserIdentity;
-use rmux_proto::{HookLifecycle, SetBufferRequest, SetHookRequest};
-use tokio::sync::mpsc;
+use rmux_proto::SetHookRequest;
 
 /// Waits until `window_index` is (or is no longer) present, without starving what it waits for.
 ///
@@ -69,7 +62,7 @@ async fn parsed_queue_assignments_apply_before_following_commands() {
 async fn read_only_control_rejects_parse_time_assignments() {
     let handler = RequestHandler::new();
     let requester_pid = 42_001;
-    let _control_events = register_read_only_control_client(&handler, requester_pid).await;
+    let _control_events = register_control_client(&handler, requester_pid, false).await;
     let parsed = CommandParser::new()
         .parse("FOO=bar list-sessions")
         .expect("commands parse");
@@ -93,7 +86,7 @@ async fn read_only_control_rejects_parse_time_assignments() {
 async fn read_only_control_rejects_nested_assignment_in_an_unselected_runtime_branch() {
     let handler = RequestHandler::new();
     let requester_pid = 42_002;
-    let _control_events = register_read_only_control_client(&handler, requester_pid).await;
+    let _control_events = register_control_client(&handler, requester_pid, false).await;
     let parsed = CommandParser::new()
         .parse("if-shell -F 0 { FOO=bar list-sessions }")
         .expect("commands parse");
@@ -144,7 +137,7 @@ async fn nested_assignments_apply_at_parse_time_across_runtime_branches_and_hook
 async fn read_only_control_rejects_special_queue_invocations() {
     let handler = RequestHandler::new();
     let requester_pid = 42_003;
-    let _control_events = register_read_only_control_client(&handler, requester_pid).await;
+    let _control_events = register_control_client(&handler, requester_pid, false).await;
 
     for command in [
         "if-shell -F 1 { list-sessions }",
@@ -282,17 +275,9 @@ async fn control_queue_bounds_aggregate_stdout_before_extension() {
     let requester_pid = 424_006;
     let _control_events = register_control_client(&handler, requester_pid, true).await;
     let chunk = vec![b'x'; CONTROL_QUEUE_STDOUT_LIMIT / 2 + 1];
-    let response = handler
-        .handle(Request::SetBuffer(Box::new(SetBufferRequest {
-            name: Some("control-limit".to_owned()),
-            content: chunk.clone(),
-            append: false,
-            new_name: None,
-            set_clipboard: false,
-            target_client: None,
-        })))
+    handler
+        .handle_ok(SetBufferRequest::fixture(("control-limit", chunk.clone())))
         .await;
-    assert!(matches!(response, Response::SetBuffer(_)), "{response:?}");
     let parsed = CommandParser::new()
         .parse("show-buffer -b control-limit ; show-buffer -b control-limit")
         .expect("bounded output commands parse");
@@ -316,7 +301,7 @@ async fn control_queue_bounds_aggregate_stdout_before_extension() {
 async fn read_only_control_allows_list_panes_all_observation() {
     let handler = RequestHandler::new();
     let requester_pid = 42_004;
-    let _control_events = register_read_only_control_client(&handler, requester_pid).await;
+    let _control_events = register_control_client(&handler, requester_pid, false).await;
     let parsed = CommandParser::new()
         .parse("list-panes -a")
         .expect("commands parse");
@@ -331,19 +316,11 @@ async fn read_only_control_allows_list_panes_all_observation() {
 #[tokio::test]
 async fn read_only_control_allows_list_windows_all_observation() {
     let handler = RequestHandler::new();
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: session_name("read-only-windows"),
-                detached: true,
-                size: Some(TerminalSize { cols: 80, rows: 24 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
+    handler
+        .create_session(session_name("read-only-windows"))
+        .await;
     let requester_pid = 42_104;
-    let _control_events = register_read_only_control_client(&handler, requester_pid).await;
+    let _control_events = register_control_client(&handler, requester_pid, false).await;
     let parsed = CommandParser::new()
         .parse("list-windows -a -F '#{session_name}:#{window_index}'")
         .expect("commands parse");
@@ -361,17 +338,7 @@ async fn compact_short_options_execute_in_control_queue() {
     let handler = RequestHandler::new();
     let requester_pid = 42_005;
     let _control_events = register_control_client(&handler, requester_pid, true).await;
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: session_name("alpha"),
-                detached: true,
-                size: Some(TerminalSize { cols: 80, rows: 24 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
+    handler.create_session(session_name("alpha")).await;
 
     let commands = handler
         .parse_control_commands("run-shell -Ctalpha:0.0 'set-buffer -b compact-control ok'")
@@ -384,9 +351,7 @@ async fn compact_short_options_execute_in_control_queue() {
     assert_eq!(result.error, None, "compact control command should execute");
     assert_eq!(
         handler
-            .handle(Request::ShowBuffer(ShowBufferRequest {
-                name: Some("compact-control".to_owned()),
-            }))
+            .handle(show_buffer_request("compact-control"))
             .await
             .command_output()
             .expect("compact control buffer")
@@ -398,17 +363,7 @@ async fn compact_short_options_execute_in_control_queue() {
 #[tokio::test]
 async fn compact_short_options_execute_in_detached_queue() {
     let handler = RequestHandler::new();
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: session_name("alpha"),
-                detached: true,
-                size: Some(TerminalSize { cols: 80, rows: 24 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
+    handler.create_session(session_name("alpha")).await;
     let commands = CommandParser::new()
         .parse("capture-pane -epJtalpha:0.0")
         .expect("detached queue command parses");
@@ -426,20 +381,9 @@ async fn parsed_queue_lock_client_defaults_to_current_client() {
     let handler = RequestHandler::new();
     let alpha = SessionName::new("alpha").expect("valid session name");
 
-    let created = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name: alpha.clone(),
-            detached: true,
-            size: Some(TerminalSize { cols: 80, rows: 24 }),
-            environment: None,
-        }))
-        .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    handler.create_session(&alpha).await;
 
-    let (control_tx, _control_rx) = tokio::sync::mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(std::process::id(), alpha, control_tx)
-        .await;
+    let _control_rx = handler.attach_client(std::process::id(), alpha).await;
 
     let parsed = CommandParser::new()
         .parse("lock-client")
@@ -451,40 +395,6 @@ async fn parsed_queue_lock_client_defaults_to_current_client() {
         .expect("queue succeeds");
 
     assert!(output.stdout().is_empty());
-}
-
-async fn register_read_only_control_client(
-    handler: &RequestHandler,
-    requester_pid: u32,
-) -> mpsc::Receiver<ControlServerEvent> {
-    register_control_client(handler, requester_pid, false).await
-}
-
-async fn register_control_client(
-    handler: &RequestHandler,
-    requester_pid: u32,
-    can_write: bool,
-) -> mpsc::Receiver<ControlServerEvent> {
-    let (event_tx, event_rx) = mpsc::channel::<ControlServerEvent>(CONTROL_SERVER_EVENT_CAPACITY);
-    handler
-        .register_control_with_access(
-            requester_pid,
-            ControlModeUpgrade {
-                initial_command_count: 0,
-                mode: rmux_proto::ControlMode::Plain,
-                terminal_context: OuterTerminalContext::default(),
-            },
-            ControlRegistration {
-                event_tx,
-                closing: Arc::new(AtomicBool::new(false)),
-                uid: 1000,
-                user: UserIdentity::Uid(1000),
-                can_write,
-            },
-        )
-        .await
-        .expect("control registration succeeds");
-    event_rx
 }
 
 #[tokio::test]
@@ -529,18 +439,12 @@ async fn queue_error_aborts_later_commands_in_the_same_group_only() {
 
     assert!(result.is_err());
     assert!(matches!(
-        handler
-            .handle(Request::ShowBuffer(ShowBufferRequest {
-                name: Some("skipped".to_owned()),
-            }))
-            .await,
+        handler.handle(show_buffer_request("skipped")).await,
         Response::Error(_)
     ));
     assert_eq!(
         handler
-            .handle(Request::ShowBuffer(ShowBufferRequest {
-                name: Some("kept".to_owned()),
-            }))
+            .handle(show_buffer_request("kept"))
             .await
             .command_output()
             .expect("kept buffer output")
@@ -552,17 +456,7 @@ async fn queue_error_aborts_later_commands_in_the_same_group_only() {
 #[tokio::test]
 async fn parsed_queue_set_buffer_accepts_target_and_rename_trailing_content() {
     let handler = RequestHandler::new();
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: session_name("alpha"),
-                detached: true,
-                size: Some(TerminalSize { cols: 80, rows: 24 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
+    handler.create_session(session_name("alpha")).await;
 
     let parsed = CommandParser::new()
         .parse(
@@ -588,9 +482,7 @@ async fn parsed_queue_set_buffer_accepts_target_and_rename_trailing_content() {
     );
     assert_eq!(
         handler
-            .handle(Request::ShowBuffer(ShowBufferRequest {
-                name: Some("dst".to_owned()),
-            }))
+            .handle(show_buffer_request("dst"))
             .await
             .command_output()
             .expect("renamed buffer output")
@@ -613,9 +505,7 @@ async fn if_shell_uses_preparsed_brace_command_lists_at_execution_time() {
     assert!(result.is_err());
     assert_eq!(
         handler
-            .handle(Request::ShowBuffer(ShowBufferRequest {
-                name: Some("kept".to_owned()),
-            }))
+            .handle(show_buffer_request("kept"))
             .await
             .command_output()
             .expect("kept buffer output")
@@ -638,9 +528,7 @@ async fn if_shell_inserted_brace_errors_do_not_abort_parent_line_tail() {
     assert!(result.is_err());
     assert_eq!(
         handler
-            .handle(Request::ShowBuffer(ShowBufferRequest {
-                name: Some("kept".to_owned()),
-            }))
+            .handle(show_buffer_request("kept"))
             .await
             .command_output()
             .expect("kept buffer output")
@@ -654,24 +542,18 @@ async fn if_shell_string_mode_newlines_share_one_abort_group() {
     let handler = RequestHandler::new();
 
     let response = handler
-        .handle(Request::IfShell(Box::new(IfShellRequest {
-            condition: "1".to_owned(),
-            format_mode: true,
-            then_command: "show-buffer -b missing\nset-buffer -b skipped no".to_owned(),
-            else_command: None,
-            target: None,
-            caller_cwd: None,
-            background: false,
-        })))
+        .handle(
+            IfShellRequest {
+                format_mode: true,
+                ..Fixture::fixture(("1", "show-buffer -b missing\nset-buffer -b skipped no"))
+            }
+            .into_request(),
+        )
         .await;
 
     assert!(matches!(response, Response::Error(_)));
     assert!(matches!(
-        handler
-            .handle(Request::ShowBuffer(ShowBufferRequest {
-                name: Some("skipped".to_owned()),
-            }))
-            .await,
+        handler.handle(show_buffer_request("skipped")).await,
         Response::Error(_)
     ));
 }
@@ -680,33 +562,13 @@ async fn if_shell_string_mode_newlines_share_one_abort_group() {
 async fn parsed_queue_resolves_unresolved_window_targets_before_protocol_dispatch() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: alpha.clone(),
-                detached: true,
-                size: Some(TerminalSize { cols: 80, rows: 24 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
-    assert!(matches!(
-        handler
-            .handle(Request::NewWindow(Box::new(NewWindowRequest {
-                target: alpha.clone(),
-                name: Some("logs".to_owned()),
-                detached: true,
-                start_directory: None,
-                environment: None,
-                command: None,
-                process_command: None,
-                target_window_index: None,
-                insert_at_target: false,
-            })))
-            .await,
-        Response::NewWindow(_)
-    ));
+    handler.create_session(&alpha).await;
+    handler
+        .create_window(NewWindowRequest {
+            name: Some("logs".to_owned()),
+            ..Fixture::fixture(&alpha)
+        })
+        .await;
 
     let parsed = CommandParser::new()
         .parse("rename-window -t alp:1 renamed")
@@ -734,17 +596,7 @@ async fn parsed_queue_resolves_unresolved_window_targets_before_protocol_dispatc
 async fn parsed_queue_resolves_session_only_new_window_targets_at_protocol_boundary() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: alpha.clone(),
-                detached: true,
-                size: Some(TerminalSize { cols: 80, rows: 24 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
+    handler.create_session(&alpha).await;
     let parsed = CommandParser::new()
         .parse("new-window -t alp -d -n logs")
         .expect("commands parse");
@@ -775,26 +627,14 @@ async fn parsed_queue_resolves_session_only_new_window_targets_at_protocol_bound
 async fn parsed_queue_new_window_prepares_linked_identity_before_same_slot_reuse() {
     let handler = Arc::new(RequestHandler::new());
     let alpha = session_name("queued-new-window-slot-reuse");
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: alpha.clone(),
-                detached: true,
-                size: Some(TerminalSize { cols: 80, rows: 24 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
-    let hook = handler
-        .handle(Request::SetHook(SetHookRequest {
-            scope: ScopeSelector::Global,
-            hook: HookName::WindowLinked,
-            command: "kill-window".to_owned(),
-            lifecycle: HookLifecycle::Persistent,
-        }))
+    handler.create_session(&alpha).await;
+    handler
+        .handle_ok(SetHookRequest::fixture((
+            ScopeSelector::Global,
+            HookName::WindowLinked,
+            "kill-window",
+        )))
         .await;
-    assert!(matches!(hook, Response::SetHook(_)), "{hook:?}");
     let mut events = handler.subscribe_lifecycle_events();
     let pause = handler.install_window_lifecycle_emit_pause();
     let parsed = CommandParser::new()
@@ -815,10 +655,10 @@ async fn parsed_queue_new_window_prepares_linked_identity_before_same_slot_reuse
     let remove_alpha = alpha.clone();
     let removing = tokio::spawn(async move {
         remove_handler
-            .handle_kill_window(KillWindowRequest {
-                target: WindowTarget::with_window(remove_alpha, 1),
-                kill_all_others: false,
-            })
+            .handle_kill_window(KillWindowRequest::fixture(WindowTarget::with_window(
+                remove_alpha,
+                1,
+            )))
             .await
     });
     assert!(
@@ -834,15 +674,8 @@ async fn parsed_queue_new_window_prepares_linked_identity_before_same_slot_reuse
             .handle_new_window(
                 std::process::id(),
                 NewWindowRequest {
-                    target: replacement_alpha,
-                    name: None,
-                    detached: true,
-                    start_directory: None,
-                    environment: None,
-                    command: None,
-                    process_command: None,
                     target_window_index: Some(1),
-                    insert_at_target: false,
+                    ..Fixture::fixture(replacement_alpha)
                 },
             )
             .await
@@ -897,17 +730,7 @@ async fn parsed_queue_new_window_prepares_linked_identity_before_same_slot_reuse
 async fn parsed_queue_resolves_session_colon_new_window_targets_at_protocol_boundary() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha-colon");
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: alpha.clone(),
-                detached: true,
-                size: Some(TerminalSize { cols: 80, rows: 24 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
+    handler.create_session(&alpha).await;
     let parsed = CommandParser::new()
         .parse("new-window -t alpha-col: -d -n logs")
         .expect("commands parse");
@@ -934,17 +757,7 @@ async fn parsed_queue_resolves_session_colon_new_window_targets_at_protocol_boun
 async fn parsed_queue_keeps_signed_new_window_targets_relative() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha-relative");
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: alpha.clone(),
-                detached: true,
-                size: Some(TerminalSize { cols: 80, rows: 24 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
+    handler.create_session(&alpha).await;
     let parsed = CommandParser::new()
         .parse(
             "new-window -d -t alpha-relative:1 -n one ; \
@@ -974,17 +787,7 @@ async fn parsed_queue_keeps_signed_new_window_targets_relative() {
 async fn parsed_queue_accepts_compact_new_window_flags() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: alpha.clone(),
-                detached: true,
-                size: Some(TerminalSize { cols: 80, rows: 24 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
+    handler.create_session(&alpha).await;
 
     let parsed = CommandParser::new()
         .parse(
@@ -1018,17 +821,7 @@ async fn parsed_queue_accepts_compact_new_window_flags() {
 async fn parsed_queue_new_window_k_validates_environment_before_replacing_target() {
     let handler = RequestHandler::new();
     let alpha = session_name("new-window-k-env-validation");
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: alpha.clone(),
-                detached: true,
-                size: Some(TerminalSize { cols: 80, rows: 24 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
+    handler.create_session(&alpha).await;
     let setup = CommandParser::new()
         .parse("new-window -d -t new-window-k-env-validation:1 -n protected")
         .expect("window setup parses");
@@ -1074,17 +867,7 @@ async fn parsed_queue_new_window_k_validates_environment_before_replacing_target
 async fn parsed_queue_new_window_k_replaces_the_only_window_without_destroying_session() {
     let handler = RequestHandler::new();
     let alpha = session_name("queued-new-window-k-only");
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: alpha.clone(),
-                detached: true,
-                size: Some(TerminalSize { cols: 80, rows: 24 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
+    handler.create_session(&alpha).await;
     let previous_window_id = handler
         .state
         .lock()
@@ -1118,17 +901,7 @@ async fn parsed_queue_new_window_before_beats_after_like_tmux() {
     for flags in ["-b -a", "-ba"] {
         let handler = RequestHandler::new();
         let session = session_name("alpha");
-        assert!(matches!(
-            handler
-                .handle(Request::NewSession(NewSessionRequest {
-                    session_name: session.clone(),
-                    detached: true,
-                    size: Some(TerminalSize { cols: 80, rows: 24 }),
-                    environment: None,
-                }))
-                .await,
-            Response::NewSession(_)
-        ));
+        handler.create_session(&session).await;
 
         let parsed = CommandParser::new()
             .parse(&format!("new-window {flags} -t alpha:0 -n inserted"))
@@ -1161,17 +934,7 @@ async fn parsed_queue_accepts_compact_break_pane_flag_clusters() {
     ] {
         let handler = RequestHandler::new();
         let alpha = session_name(session);
-        assert!(matches!(
-            handler
-                .handle(Request::NewSession(NewSessionRequest {
-                    session_name: alpha.clone(),
-                    detached: true,
-                    size: Some(TerminalSize { cols: 80, rows: 24 }),
-                    environment: None,
-                }))
-                .await,
-            Response::NewSession(_)
-        ));
+        handler.create_session(&alpha).await;
 
         let parsed = CommandParser::new()
             .parse(&format!(
@@ -1200,17 +963,7 @@ async fn parsed_queue_accepts_compact_break_pane_flag_clusters() {
 async fn parsed_queue_accepts_compact_kill_window_and_kill_pane_targets() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: alpha.clone(),
-                detached: true,
-                size: Some(TerminalSize { cols: 80, rows: 24 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
+    handler.create_session(&alpha).await;
 
     let setup = CommandParser::new()
         .parse("new-window -d -n keep ; new-window -d -n remove")
@@ -1228,17 +981,12 @@ async fn parsed_queue_accepts_compact_kill_window_and_kill_pane_targets() {
         .await
         .expect("compact kill-window target should execute");
 
-    assert!(matches!(
-        handler
-            .handle(Request::SplitWindow(SplitWindowRequest {
-                target: SplitWindowTarget::Pane(PaneTarget::with_window(alpha.clone(), 1, 0)),
-                direction: SplitDirection::Horizontal,
-                before: false,
-                environment: None,
-            }))
-            .await,
-        Response::SplitWindow(_)
-    ));
+    handler
+        .handle_ok(SplitWindowRequest {
+            direction: SplitDirection::Horizontal,
+            ..Fixture::fixture(PaneTarget::with_window(alpha.clone(), 1, 0))
+        })
+        .await;
 
     let kill_pane = CommandParser::new()
         .parse("kill-pane -at alpha:1.1")
@@ -1267,17 +1015,7 @@ async fn parsed_queue_accepts_compact_kill_window_and_kill_pane_targets() {
 async fn parsed_queue_uses_current_target_for_new_window_split_and_zoom() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: alpha.clone(),
-                detached: true,
-                size: Some(TerminalSize { cols: 80, rows: 24 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
+    handler.create_session(&alpha).await;
     let current_target = Target::Pane(PaneTarget::with_window(alpha.clone(), 0, 0));
 
     for command in ["new-window -d -n logs", "split-window -h", "resize-pane -Z"] {
@@ -1317,17 +1055,7 @@ async fn parsed_queue_uses_current_target_for_new_window_split_and_zoom() {
 async fn parsed_queue_reports_missing_target_client_before_input() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: alpha.clone(),
-                detached: true,
-                size: Some(TerminalSize { cols: 80, rows: 24 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
+    handler.create_session(&alpha).await;
 
     for command in [
         "send-keys -c 999999 -t alpha:0.0 echo SHOULD_NOT_TYPE",
@@ -1360,21 +1088,8 @@ async fn parsed_queue_uses_current_target_for_display_panes_without_t() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
     let requester_pid = 52_u32;
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: alpha.clone(),
-                detached: true,
-                size: Some(TerminalSize { cols: 80, rows: 24 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
-    let (control_tx, mut control_rx) = tokio::sync::mpsc::unbounded_channel();
-    handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
+    handler.create_session(&alpha).await;
+    let mut control_rx = handler.attach_client(requester_pid, &alpha).await;
 
     let parsed = CommandParser::new()
         .parse("display-panes")
@@ -1396,17 +1111,7 @@ async fn parsed_queue_uses_current_target_for_display_panes_without_t() {
 async fn parsed_queue_display_panes_t_reports_target_client_errors_like_cli() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: alpha,
-                detached: true,
-                size: Some(TerminalSize { cols: 80, rows: 24 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
+    handler.create_session(alpha).await;
 
     for (command, expected) in [
         ("display-panes -t 999999", "can't find client: 999999"),
@@ -1430,17 +1135,7 @@ async fn parsed_queue_display_panes_t_reports_target_client_errors_like_cli() {
 async fn parsed_queue_compact_client_and_overlay_flags_preserve_their_meaning() {
     let handler = RequestHandler::new();
     let alpha = session_name("compact-flags");
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: alpha.clone(),
-                detached: true,
-                size: Some(TerminalSize { cols: 80, rows: 24 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
+    handler.create_session(&alpha).await;
 
     let state = handler.state.lock().await;
     let current = TargetFindContext::new(Some(Target::Pane(PaneTarget::with_window(alpha, 0, 0))));
@@ -1663,28 +1358,13 @@ async fn parsed_queue_server_access_list_ignores_conflicting_flags() {
 async fn parsed_queue_uses_current_target_for_kill_pane_without_t() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: alpha.clone(),
-                detached: true,
-                size: Some(TerminalSize { cols: 80, rows: 24 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
-    assert!(matches!(
-        handler
-            .handle(Request::SplitWindow(SplitWindowRequest {
-                target: SplitWindowTarget::Pane(PaneTarget::with_window(alpha.clone(), 0, 0)),
-                direction: SplitDirection::Horizontal,
-                before: false,
-                environment: None,
-            }))
-            .await,
-        Response::SplitWindow(_)
-    ));
+    handler.create_session(&alpha).await;
+    handler
+        .handle_ok(SplitWindowRequest {
+            direction: SplitDirection::Horizontal,
+            ..Fixture::fixture(PaneTarget::with_window(alpha.clone(), 0, 0))
+        })
+        .await;
 
     let parsed = CommandParser::new()
         .parse("kill-pane")

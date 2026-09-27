@@ -1,6 +1,6 @@
 [package]
 name = "marsh-instrument"
-description = "builtin and command lifecycle instrumentation for marsh's stock brush shell"
+description = "native syscall observation and shell-run attribution for marsh"
 version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
@@ -12,21 +12,20 @@ publish = false
 [lib]
 bench = false
 
+[features]
+testing = []
+
 [dependencies]
-brush-core.workspace = true
-marsh-lib = { path = "../marsh-lib", default-features = false }
+lurk-cli.workspace = true
+syscalls.workspace = true
+nix = { version = "=0.30.1", features = ["ptrace", "signal", "process"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tempfile = "3"
-
-[target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
+rustix = { version = "=1.1.4", features = ["net"] }
 
 [dev-dependencies]
-brush-builtins.workspace = true
-mockall = "0.13"
-serial_test = "3"
-tokio = { version = "1", features = ["rt", "macros"] }
+tempfile = "3"
 
 
 [lints]

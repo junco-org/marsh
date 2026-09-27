@@ -1,6 +1,6 @@
 use clap::{ArgAction, Args};
 
-use super::{TargetSpec, parse_target_spec};
+use super::{TargetSpec, parse_target_spec, validate::Validate};
 
 /// Flags for `set-buffer`, which stores or renames a paste buffer's contents.
 #[derive(Debug, Clone, Args)]
@@ -15,13 +15,12 @@ pub(crate) struct SetBufferArgs {
     pub(crate) target_client: Option<String>,
     #[arg(short = 'w', action = ArgAction::SetTrue)]
     pub(crate) set_clipboard: bool,
-    #[arg()]
     pub(crate) content: Option<String>,
 }
 
-impl SetBufferArgs {
+impl Validate for SetBufferArgs {
     /// Requires either literal content or `-n`, since renaming alone needs a name.
-    pub(crate) fn validate(self) -> Result<Self, clap::Error> {
+    fn validate(self, _: &'static str) -> Result<Self, clap::Error> {
         if self.content.is_none() && self.new_name.is_none() {
             return Err(clap::Error::raw(
                 clap::error::ErrorKind::MissingRequiredArgument,

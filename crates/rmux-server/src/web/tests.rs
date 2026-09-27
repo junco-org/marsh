@@ -8,14 +8,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::pane_io::pane_output_channel_with_limits;
+use crate::test_fixtures::{operator_token, spectator_token, token_from_url, Fixture};
 use crate::web::origin::validate_public_base_url;
 use crate::web::secrets::{derive_spectator_token, random_token};
 use crate::web::{WebShareRegistry, WebShareSettings};
 
 fn available_registry() -> WebShareRegistry {
-    let registry = WebShareRegistry::default();
-    registry.mark_listener_available();
-    registry
+    available_registry_with_settings(WebShareSettings::default())
 }
 
 fn available_registry_with_settings(settings: WebShareSettings) -> WebShareRegistry {
@@ -62,23 +61,11 @@ fn create_returns_secret_urls_but_list_is_redacted() {
     let registry = available_registry();
     let created = registry
         .create(CreateWebShareRequest {
-            scope: WebShareScope::Pane(target()),
             public_base_url: Some("https://share.example".to_owned()),
-            tunnel_provider: None,
-            frontend_url: None,
             ttl_seconds: Some(60),
-            expires_at_unix: None,
             max_spectators: Some(2),
-            max_operators: None,
-            url_options: Default::default(),
-            require_pin: false,
-            operator_pin: None,
-            spectator_pin: None,
-            terminal_palette: None,
             operator: true,
-            spectator: true,
-            controls: false,
-            kill_session_on_expire: false,
+            ..target_share()
         })
         .expect("share creates");
 
@@ -106,49 +93,23 @@ fn create_returns_secret_urls_but_list_is_redacted() {
 
 #[tokio::test]
 async fn default_local_share_uses_hosted_frontend_and_local_websocket_endpoint() {
-    let registry = available_registry();
-    let created = registry
-        .create(CreateWebShareRequest {
-            scope: WebShareScope::Pane(target()),
-            public_base_url: None,
-            tunnel_provider: None,
-            frontend_url: None,
+    let spectator_url = assert_spectator_frontend(
+        &available_registry(),
+        CreateWebShareRequest {
             ttl_seconds: Some(60),
-            expires_at_unix: None,
             max_spectators: Some(2),
-            max_operators: None,
-            url_options: Default::default(),
-            require_pin: false,
-            operator_pin: None,
-            spectator_pin: None,
-            terminal_palette: None,
-            operator: false,
-            spectator: true,
-            controls: false,
-            kill_session_on_expire: false,
-        })
-        .expect("share creates");
-
-    assert!(created
-        .spectator_url
-        .as_deref()
-        .expect("spectator URL")
-        .starts_with("https://share.rmux.io/#t="));
-    assert!(!created
-        .spectator_url
-        .as_deref()
-        .expect("spectator URL")
-        .contains("role="));
-
-    let spectator_token = token_from_url(created.spectator_url.as_deref().expect("spectator URL"));
-    let access = registry
-        .connect(&spectator_token, None)
-        .await
-        .expect("spectator connects");
-    assert!(access.origin_allowed("https://share.rmux.io"));
-    assert!(access.origin_allowed("http://localhost:4321"));
-    assert!(access.origin_allowed("http://127.0.0.1:5173"));
-    assert!(!access.origin_allowed("https://evil.example"));
+            ..target_share()
+        },
+        "https://share.rmux.io/#t=",
+        &[
+            "https://share.rmux.io",
+            "http://localhost:4321",
+            "http://127.0.0.1:5173",
+        ],
+        &["https://evil.example"],
+    )
+    .await;
+    assert!(!spectator_url.contains("role="));
 }
 
 #[tokio::test]
@@ -156,23 +117,8 @@ async fn both_role_share_has_no_expiry_and_default_role_caps() {
     let registry = available_registry();
     let created = registry
         .create(CreateWebShareRequest {
-            scope: WebShareScope::Pane(target()),
-            public_base_url: None,
-            tunnel_provider: None,
-            frontend_url: None,
-            ttl_seconds: None,
-            expires_at_unix: None,
-            max_spectators: None,
-            max_operators: None,
-            url_options: Default::default(),
-            require_pin: false,
-            operator_pin: None,
-            spectator_pin: None,
-            terminal_palette: None,
             operator: true,
-            spectator: true,
-            controls: false,
-            kill_session_on_expire: false,
+            ..target_share()
         })
         .expect("share creates");
 
@@ -188,7 +134,7 @@ async fn both_role_share_has_no_expiry_and_default_role_caps() {
     assert!(stdout.contains("operator URL emitted on stderr"));
     assert!(stdout.contains("share does not expire"));
 
-    let spectator_token = token_from_url(created.spectator_url.as_deref().expect("spectator URL"));
+    let spectator_token = spectator_token(&created);
     let first = registry
         .connect(&spectator_token, None)
         .await
@@ -206,23 +152,9 @@ fn operator_only_share_does_not_mint_spectator_url() {
     let registry = available_registry();
     let created = registry
         .create(CreateWebShareRequest {
-            scope: WebShareScope::Pane(target()),
-            public_base_url: None,
-            tunnel_provider: None,
-            frontend_url: None,
-            ttl_seconds: None,
-            expires_at_unix: None,
-            max_spectators: None,
-            max_operators: None,
-            url_options: Default::default(),
-            require_pin: false,
-            operator_pin: None,
-            spectator_pin: None,
-            terminal_palette: None,
             operator: true,
             spectator: false,
-            controls: false,
-            kill_session_on_expire: false,
+            ..target_share()
         })
         .expect("operator-only share creates");
 
@@ -242,62 +174,30 @@ fn operator_only_share_does_not_mint_spectator_url() {
 
 #[test]
 fn max_spectators_requires_spectator_url() {
-    let registry = available_registry();
-    let error = registry
-        .create(CreateWebShareRequest {
-            scope: WebShareScope::Pane(target()),
-            public_base_url: None,
-            tunnel_provider: None,
-            frontend_url: None,
-            ttl_seconds: None,
-            expires_at_unix: None,
+    assert_create_rejected(
+        &available_registry(),
+        CreateWebShareRequest {
             max_spectators: Some(1),
-            max_operators: None,
-            url_options: Default::default(),
-            require_pin: false,
-            operator_pin: None,
-            spectator_pin: None,
-            terminal_palette: None,
             operator: true,
             spectator: false,
-            controls: false,
-            kill_session_on_expire: false,
-        })
-        .expect_err("spectator cap without spectator is invalid");
-
-    assert!(error
-        .to_string()
-        .contains("web-share --max-spectators cannot be used without a spectator URL"));
+            ..target_share()
+        },
+        "spectator cap without spectator is invalid",
+        "web-share --max-spectators cannot be used without a spectator URL",
+    );
 }
 
 #[test]
 fn max_operators_requires_operator_url() {
-    let registry = available_registry();
-    let error = registry
-        .create(CreateWebShareRequest {
-            scope: WebShareScope::Pane(target()),
-            public_base_url: None,
-            tunnel_provider: None,
-            frontend_url: None,
-            ttl_seconds: None,
-            expires_at_unix: None,
-            max_spectators: None,
+    assert_create_rejected(
+        &available_registry(),
+        CreateWebShareRequest {
             max_operators: Some(1),
-            url_options: Default::default(),
-            require_pin: false,
-            operator_pin: None,
-            spectator_pin: None,
-            terminal_palette: None,
-            operator: false,
-            spectator: true,
-            controls: false,
-            kill_session_on_expire: false,
-        })
-        .expect_err("operator cap without operator is invalid");
-
-    assert!(error
-        .to_string()
-        .contains("web-share --max-operators cannot be used without an operator URL"));
+            ..target_share()
+        },
+        "operator cap without operator is invalid",
+        "web-share --max-operators cannot be used without an operator URL",
+    );
 }
 
 #[tokio::test]
@@ -305,26 +205,12 @@ async fn known_token_origin_precheck_does_not_consume_a_read_slot() {
     let registry = available_registry();
     let created = registry
         .create(CreateWebShareRequest {
-            scope: WebShareScope::Pane(target()),
-            public_base_url: None,
-            tunnel_provider: None,
-            frontend_url: None,
             ttl_seconds: Some(60),
-            expires_at_unix: None,
             max_spectators: Some(1),
-            max_operators: None,
-            url_options: Default::default(),
-            require_pin: false,
-            operator_pin: None,
-            spectator_pin: None,
-            terminal_palette: None,
-            operator: false,
-            spectator: true,
-            controls: false,
-            kill_session_on_expire: false,
+            ..target_share()
         })
         .expect("share creates");
-    let token = token_from_url(created.spectator_url.as_deref().expect("spectator URL"));
+    let token = spectator_token(&created);
 
     assert_eq!(
         registry.known_token_origin_allowed(&token, "https://evil.example"),
@@ -340,85 +226,39 @@ async fn known_token_origin_precheck_does_not_consume_a_read_slot() {
 #[tokio::test]
 async fn frontend_override_changes_browser_origin_without_changing_local_endpoint() {
     let registry = available_registry_with_settings(
-        crate::web::WebShareSettings::from_options(
-            9778,
-            Some("https://share.fork.example".to_owned()),
-        )
-        .expect("settings"),
+        WebShareSettings::from_options(9778, Some("https://share.fork.example".to_owned()))
+            .expect("settings"),
     );
-    let created = registry
-        .create(CreateWebShareRequest {
-            scope: WebShareScope::Pane(target()),
-            public_base_url: None,
-            tunnel_provider: None,
-            frontend_url: None,
+    assert_spectator_frontend(
+        &registry,
+        CreateWebShareRequest {
             ttl_seconds: Some(60),
-            expires_at_unix: None,
             max_spectators: Some(2),
-            max_operators: None,
-            url_options: Default::default(),
-            require_pin: false,
-            operator_pin: None,
-            spectator_pin: None,
-            terminal_palette: None,
-            operator: false,
-            spectator: true,
-            controls: false,
-            kill_session_on_expire: false,
-        })
-        .expect("share creates");
-
-    assert!(created
-        .spectator_url
-        .as_deref()
-        .expect("spectator URL")
-        .starts_with("https://share.fork.example/#e=ws://127.0.0.1:9778/share&t="));
-    let spectator_token = token_from_url(created.spectator_url.as_deref().expect("spectator URL"));
-    let access = registry
-        .connect(&spectator_token, None)
-        .await
-        .expect("spectator connects");
-    assert!(access.origin_allowed("https://share.fork.example"));
-    assert!(!access.origin_allowed("https://share.rmux.io"));
+            ..target_share()
+        },
+        "https://share.fork.example/#e=ws://127.0.0.1:9778/share&t=",
+        &["https://share.fork.example"],
+        &["https://share.rmux.io"],
+    )
+    .await;
 }
 
 #[tokio::test]
 async fn per_share_frontend_url_overrides_daemon_default() {
-    let registry = available_registry();
-    let created = registry
-        .create(CreateWebShareRequest {
-            scope: WebShareScope::Pane(target()),
+    assert_spectator_frontend(
+        &available_registry(),
+        CreateWebShareRequest {
             public_base_url: Some("https://terminal.example".to_owned()),
-            tunnel_provider: None,
             frontend_url: Some("https://share.fork.example/share".to_owned()),
             ttl_seconds: Some(60),
-            expires_at_unix: None,
             max_spectators: Some(2),
-            max_operators: None,
-            url_options: Default::default(),
-            require_pin: false,
-            operator_pin: None,
-            spectator_pin: None,
-            terminal_palette: None,
-            operator: false,
-            spectator: true,
-            controls: false,
-            kill_session_on_expire: false,
-        })
-        .expect("share creates");
-
-    assert!(created
-        .spectator_url
-        .as_deref()
-        .expect("spectator URL")
-        .starts_with("https://share.fork.example/share/#e=wss://terminal.example/share&t="));
-    let spectator_token = token_from_url(created.spectator_url.as_deref().expect("spectator URL"));
-    let access = registry
-        .connect(&spectator_token, None)
-        .await
-        .expect("spectator connects");
-    assert!(access.origin_allowed("https://share.fork.example"));
-    assert!(!access.origin_allowed("https://share.rmux.io"));
+            ..target_share()
+        },
+        "https://share.fork.example/share/#e=wss://terminal.example/share&t=",
+        &["https://share.fork.example"],
+        &["https://share.rmux.io"],
+    )
+    .await;
 }
 
 #[test]
@@ -430,34 +270,23 @@ fn public_base_url_rejects_query_and_fragment() {
 
 #[test]
 fn tunnel_provider_and_tunnel_url_are_mutually_exclusive() {
-    let registry = available_registry();
-    let error = registry
-        .create(CreateWebShareRequest {
-            scope: WebShareScope::Pane(target()),
+    assert_create_rejected(
+        &available_registry(),
+        CreateWebShareRequest {
             public_base_url: Some("https://share.example".to_owned()),
             tunnel_provider: Some("srv-us".to_owned()),
-            frontend_url: None,
             ttl_seconds: Some(60),
-            expires_at_unix: None,
             max_spectators: Some(2),
-            max_operators: None,
-            url_options: Default::default(),
-            require_pin: false,
-            operator_pin: None,
-            spectator_pin: None,
-            terminal_palette: None,
-            operator: false,
-            spectator: true,
-            controls: false,
-            kill_session_on_expire: false,
-        })
-        .expect_err("mutually exclusive tunnel options are rejected");
-    assert!(error.to_string().contains("mutually exclusive"));
+            ..target_share()
+        },
+        "mutually exclusive tunnel options are rejected",
+        "mutually exclusive",
+    );
 }
 
 #[test]
 fn local_web_share_requires_bound_listener_and_valid_port() {
-    assert!(crate::web::WebShareSettings::from_options(0, None).is_err());
+    assert!(WebShareSettings::from_options(0, None).is_err());
 
     let cold_registry = WebShareRegistry::default();
     assert!(cold_registry
@@ -468,28 +297,17 @@ fn local_web_share_requires_bound_listener_and_valid_port() {
 
     let registry = available_registry();
     registry.mark_listener_unavailable("address already in use");
-    let error = registry
-        .create(CreateWebShareRequest {
-            scope: WebShareScope::Pane(target()),
-            public_base_url: None,
-            tunnel_provider: None,
-            frontend_url: None,
-            ttl_seconds: Some(60),
-            expires_at_unix: None,
-            max_spectators: Some(2),
-            max_operators: None,
-            url_options: Default::default(),
-            require_pin: false,
-            operator_pin: None,
-            spectator_pin: None,
-            terminal_palette: None,
-            operator: false,
-            spectator: true,
-            controls: false,
-            kill_session_on_expire: false,
-        })
-        .expect_err("dead listener must reject local share URLs");
-    assert!(error.to_string().contains("listener unavailable"));
+    let local_share = || CreateWebShareRequest {
+        ttl_seconds: Some(60),
+        max_spectators: Some(2),
+        ..target_share()
+    };
+    assert_create_rejected(
+        &registry,
+        local_share(),
+        "dead listener must reject local share URLs",
+        "listener unavailable",
+    );
     assert!(registry
         .config(rmux_proto::WebShareConfigRequest)
         .expect_err("dead listener must reject config")
@@ -497,27 +315,7 @@ fn local_web_share_requires_bound_listener_and_valid_port() {
         .contains("listener unavailable"));
 
     registry.mark_listener_available();
-    assert!(registry
-        .create(CreateWebShareRequest {
-            scope: WebShareScope::Pane(target()),
-            public_base_url: None,
-            tunnel_provider: None,
-            frontend_url: None,
-            ttl_seconds: Some(60),
-            expires_at_unix: None,
-            max_spectators: Some(2),
-            max_operators: None,
-            url_options: Default::default(),
-            require_pin: false,
-            operator_pin: None,
-            spectator_pin: None,
-            terminal_palette: None,
-            operator: false,
-            spectator: true,
-            controls: false,
-            kill_session_on_expire: false,
-        })
-        .is_ok());
+    assert!(registry.create(local_share()).is_ok());
 }
 
 #[test]
@@ -525,23 +323,10 @@ fn public_url_scheme_is_case_insensitive_for_websocket_endpoint() {
     let registry = available_registry();
     let created = registry
         .create(CreateWebShareRequest {
-            scope: WebShareScope::Pane(target()),
             public_base_url: Some("HTTPS://terminal.example".to_owned()),
-            tunnel_provider: None,
-            frontend_url: None,
             ttl_seconds: Some(60),
-            expires_at_unix: None,
             max_spectators: Some(2),
-            max_operators: None,
-            url_options: Default::default(),
-            require_pin: false,
-            operator_pin: None,
-            spectator_pin: None,
-            terminal_palette: None,
-            operator: false,
-            spectator: true,
-            controls: false,
-            kill_session_on_expire: false,
+            ..target_share()
         })
         .expect("uppercase HTTPS is valid");
 
@@ -557,51 +342,24 @@ async fn url_options_are_encoded_in_spectator_urls() {
     let registry = available_registry();
     let created = registry
         .create(CreateWebShareRequest {
-            scope: WebShareScope::Pane(target()),
-            public_base_url: None,
-            tunnel_provider: None,
-            frontend_url: None,
             ttl_seconds: Some(60),
-            expires_at_unix: None,
             max_spectators: Some(2),
-            max_operators: None,
             url_options: WebShareUrlOptions {
                 no_navbar: true,
                 no_disclaimer: true,
                 show_viewers: true,
                 terminal_theme: Some(WebTerminalTheme::Light),
             },
-            require_pin: false,
-            operator_pin: None,
-            spectator_pin: None,
-            terminal_palette: None,
             operator: true,
-            spectator: true,
-            controls: false,
-            kill_session_on_expire: false,
+            ..target_share()
         })
         .expect("share creates");
 
-    assert!(created
-        .spectator_url
-        .as_deref()
-        .expect("spectator URL")
-        .contains("&navbar=off"));
-    assert!(created
-        .spectator_url
-        .as_deref()
-        .expect("spectator URL")
-        .contains("&disclaimer=off"));
-    assert!(!created
-        .spectator_url
-        .as_deref()
-        .expect("spectator URL")
-        .contains("&viewers=on"));
-    assert!(created
-        .spectator_url
-        .as_deref()
-        .expect("spectator URL")
-        .contains("&theme=light"));
+    let spectator_url = created.spectator_url.as_deref().expect("spectator URL");
+    assert!(spectator_url.contains("&navbar=off"));
+    assert!(spectator_url.contains("&disclaimer=off"));
+    assert!(!spectator_url.contains("&viewers=on"));
+    assert!(spectator_url.contains("&theme=light"));
     assert!(created
         .operator_url
         .as_deref()
@@ -610,9 +368,8 @@ async fn url_options_are_encoded_in_spectator_urls() {
             && !url.contains("&viewers=on")
             && url.contains("&theme=light")));
 
-    let spectator_token = token_from_url(created.spectator_url.as_deref().expect("spectator URL"));
     let access = registry
-        .connect(&spectator_token, None)
+        .connect(&spectator_token(&created), None)
         .await
         .expect("spectator token connects");
     assert!(access.show_viewers());
@@ -623,23 +380,10 @@ async fn pairing_code_is_required_out_of_band_when_pin_enabled() {
     let registry = available_registry();
     let created = registry
         .create(CreateWebShareRequest {
-            scope: WebShareScope::Pane(target()),
-            public_base_url: None,
-            tunnel_provider: None,
-            frontend_url: None,
             ttl_seconds: Some(60),
-            expires_at_unix: None,
             max_spectators: Some(2),
-            max_operators: None,
-            url_options: Default::default(),
             require_pin: true,
-            operator_pin: None,
-            spectator_pin: None,
-            terminal_palette: None,
-            operator: false,
-            spectator: true,
-            controls: false,
-            kill_session_on_expire: false,
+            ..target_share()
         })
         .expect("share creates");
 
@@ -653,20 +397,13 @@ async fn pairing_code_is_required_out_of_band_when_pin_enabled() {
         .expect("pin-enabled spectator share returns pairing code");
     assert_eq!(pairing_code.len(), 6);
     assert!(pairing_code.bytes().all(|byte| byte.is_ascii_digit()));
-    assert!(!created
-        .spectator_url
-        .as_deref()
-        .expect("spectator URL")
-        .contains("&pin=required"));
-    assert!(!created
-        .spectator_url
-        .as_deref()
-        .expect("spectator URL")
-        .contains(pairing_code));
+    let spectator_url = created.spectator_url.as_deref().expect("spectator URL");
+    assert!(!spectator_url.contains("&pin=required"));
+    assert!(!spectator_url.contains(pairing_code));
     let stdout = String::from_utf8_lossy(created.output.stdout());
     assert!(stdout.contains(&format!("spectator pin {pairing_code}\n")));
 
-    let spectator_token = token_from_url(created.spectator_url.as_deref().expect("spectator URL"));
+    let spectator_token = spectator_token(&created);
     assert!(registry
         .connect(&spectator_token, None)
         .await
@@ -689,30 +426,23 @@ async fn role_specific_pairing_codes_are_bound_to_their_access_role() {
     let created = registry
         .create(CreateWebShareRequest {
             scope: WebShareScope::Session("alpha".parse().expect("session name")),
-            public_base_url: None,
-            tunnel_provider: None,
-            frontend_url: None,
             ttl_seconds: Some(60),
-            expires_at_unix: None,
             max_spectators: Some(2),
             max_operators: Some(2),
-            url_options: Default::default(),
             require_pin: true,
             operator_pin: Some("123456".to_owned()),
             spectator_pin: Some("654321".to_owned()),
-            terminal_palette: None,
             operator: true,
-            spectator: true,
             controls: true,
-            kill_session_on_expire: false,
+            ..target_share()
         })
         .expect("share creates");
 
     assert_eq!(created.operator_pairing_code.as_deref(), Some("123456"));
     assert_eq!(created.spectator_pairing_code.as_deref(), Some("654321"));
 
-    let operator_token = token_from_url(created.operator_url.as_deref().expect("operator URL"));
-    let spectator_token = token_from_url(created.spectator_url.as_deref().expect("spectator URL"));
+    let operator_token = operator_token(&created);
+    let spectator_token = spectator_token(&created);
 
     assert!(registry
         .connect(&operator_token, Some("654321"))
@@ -748,45 +478,17 @@ fn controls_are_derived_for_operator_session_shares() {
     let spectator_share = registry
         .create(CreateWebShareRequest {
             scope: WebShareScope::Session(session.clone()),
-            public_base_url: None,
-            tunnel_provider: None,
-            frontend_url: None,
-            ttl_seconds: None,
-            expires_at_unix: None,
-            max_spectators: None,
-            max_operators: None,
-            url_options: Default::default(),
-            require_pin: false,
-            operator_pin: None,
-            spectator_pin: None,
-            terminal_palette: None,
-            operator: false,
-            spectator: true,
             controls: true,
-            kill_session_on_expire: false,
+            ..target_share()
         })
         .expect("spectator session share creates");
     assert!(!spectator_share.controls);
 
     let pane = registry
         .create(CreateWebShareRequest {
-            scope: WebShareScope::Pane(target()),
-            public_base_url: None,
-            tunnel_provider: None,
-            frontend_url: None,
-            ttl_seconds: None,
-            expires_at_unix: None,
-            max_spectators: None,
-            max_operators: None,
-            url_options: Default::default(),
-            require_pin: false,
-            operator_pin: None,
-            spectator_pin: None,
-            terminal_palette: None,
             operator: true,
-            spectator: true,
             controls: true,
-            kill_session_on_expire: false,
+            ..target_share()
         })
         .expect("operator pane share creates");
     assert!(!pane.controls);
@@ -794,25 +496,11 @@ fn controls_are_derived_for_operator_session_shares() {
     let created = registry
         .create(CreateWebShareRequest {
             scope: WebShareScope::Session(session.clone()),
-            public_base_url: None,
-            tunnel_provider: None,
-            frontend_url: None,
-            ttl_seconds: None,
-            expires_at_unix: None,
-            max_spectators: None,
-            max_operators: None,
-            url_options: Default::default(),
-            require_pin: false,
-            operator_pin: None,
-            spectator_pin: None,
-            terminal_palette: None,
             operator: true,
-            spectator: true,
-            controls: false,
-            kill_session_on_expire: false,
+            ..target_share()
         })
         .expect("operator session share creates");
-    assert!(matches!(created.scope, WebShareScope::Session(ref actual) if actual == &session));
+    assert!(matches!(&created.scope, WebShareScope::Session(actual) if actual == &session));
     assert!(created.controls);
 
     let listed = registry.list(ListWebSharesRequest);
@@ -822,8 +510,8 @@ fn controls_are_derived_for_operator_session_shares() {
         .find(|share| share.share_id == created.share_id)
         .expect("created share should be listed");
     assert!(matches!(
-        summary.scope,
-        WebShareScope::Session(ref actual) if actual == &session
+        &summary.scope,
+        WebShareScope::Session(actual) if actual == &session
     ));
     assert!(summary.controls);
 }
@@ -834,144 +522,65 @@ fn expiration_accepts_absolute_deadline_and_rejects_invalid_combinations() {
     let future = unix_seconds(SystemTime::now() + Duration::from_secs(60));
     let created = registry
         .create(CreateWebShareRequest {
-            scope: WebShareScope::Pane(target()),
-            public_base_url: None,
-            tunnel_provider: None,
-            frontend_url: None,
-            ttl_seconds: None,
             expires_at_unix: Some(future),
-            max_spectators: None,
-            max_operators: None,
-            url_options: Default::default(),
-            require_pin: false,
-            operator_pin: None,
-            spectator_pin: None,
-            terminal_palette: None,
-            operator: false,
-            spectator: true,
-            controls: false,
-            kill_session_on_expire: false,
+            ..target_share()
         })
         .expect("absolute expiry creates");
     assert_eq!(created.expires_at_unix, Some(future));
     assert!(String::from_utf8_lossy(created.output.stdout()).contains("share expires at "));
 
-    let both_error = registry
-        .create(CreateWebShareRequest {
-            scope: WebShareScope::Pane(target()),
-            public_base_url: None,
-            tunnel_provider: None,
-            frontend_url: None,
+    assert_create_rejected(
+        &registry,
+        CreateWebShareRequest {
             ttl_seconds: Some(10),
             expires_at_unix: Some(future),
-            max_spectators: None,
-            max_operators: None,
-            url_options: Default::default(),
-            require_pin: false,
-            operator_pin: None,
-            spectator_pin: None,
-            terminal_palette: None,
-            operator: false,
-            spectator: true,
-            controls: false,
-            kill_session_on_expire: false,
-        })
-        .expect_err("ttl and absolute expiry conflict");
-    assert!(both_error.to_string().contains("mutually exclusive"));
-
-    let past_error = registry
-        .create(CreateWebShareRequest {
-            scope: WebShareScope::Pane(target()),
-            public_base_url: None,
-            tunnel_provider: None,
-            frontend_url: None,
-            ttl_seconds: None,
+            ..target_share()
+        },
+        "ttl and absolute expiry conflict",
+        "mutually exclusive",
+    );
+    assert_create_rejected(
+        &registry,
+        CreateWebShareRequest {
             expires_at_unix: Some(1),
-            max_spectators: None,
-            max_operators: None,
-            url_options: Default::default(),
-            require_pin: false,
-            operator_pin: None,
-            spectator_pin: None,
-            terminal_palette: None,
-            operator: false,
-            spectator: true,
-            controls: false,
-            kill_session_on_expire: false,
-        })
-        .expect_err("past expiry is rejected");
-    assert!(past_error.to_string().contains("must be in the future"));
-
-    let range_error = registry
-        .create(CreateWebShareRequest {
-            scope: WebShareScope::Pane(target()),
-            public_base_url: None,
-            tunnel_provider: None,
-            frontend_url: None,
-            ttl_seconds: None,
+            ..target_share()
+        },
+        "past expiry is rejected",
+        "must be in the future",
+    );
+    assert_create_rejected(
+        &registry,
+        CreateWebShareRequest {
             expires_at_unix: Some(u64::MAX),
-            max_spectators: None,
-            max_operators: None,
-            url_options: Default::default(),
-            require_pin: false,
-            operator_pin: None,
-            spectator_pin: None,
-            terminal_palette: None,
-            operator: false,
-            spectator: true,
-            controls: false,
-            kill_session_on_expire: false,
-        })
-        .expect_err("overflowing expiry is rejected");
-    assert!(range_error.to_string().contains("out of range"));
+            ..target_share()
+        },
+        "overflowing expiry is rejected",
+        "out of range",
+    );
 }
 
 #[test]
 fn kill_session_on_expire_requires_session_scope() {
     let registry = available_registry();
-    let pane_error = registry
-        .create(CreateWebShareRequest {
-            scope: WebShareScope::Pane(target()),
-            public_base_url: None,
-            tunnel_provider: None,
-            frontend_url: None,
+    assert_create_rejected(
+        &registry,
+        CreateWebShareRequest {
             ttl_seconds: Some(60),
-            expires_at_unix: None,
-            max_spectators: None,
-            max_operators: None,
-            url_options: Default::default(),
-            require_pin: false,
-            operator_pin: None,
-            spectator_pin: None,
-            terminal_palette: None,
-            operator: false,
-            spectator: true,
-            controls: false,
             kill_session_on_expire: true,
-        })
-        .expect_err("pane expiry cannot kill a session");
-    assert!(pane_error.to_string().contains("requires a session target"));
+            ..target_share()
+        },
+        "pane expiry cannot kill a session",
+        "requires a session target",
+    );
 
     let session = SessionName::new("expiry").expect("valid session");
     let created = registry
         .create(CreateWebShareRequest {
             scope: WebShareScope::Session(session),
-            public_base_url: None,
-            tunnel_provider: None,
-            frontend_url: None,
             ttl_seconds: Some(60),
-            expires_at_unix: None,
-            max_spectators: None,
-            max_operators: None,
-            url_options: Default::default(),
-            require_pin: false,
-            operator_pin: None,
-            spectator_pin: None,
-            terminal_palette: None,
             operator: true,
-            spectator: true,
-            controls: false,
             kill_session_on_expire: true,
+            ..target_share()
         })
         .expect("session kill-on-expiry share creates");
     assert!(created.kill_session_on_expire);
@@ -983,27 +592,7 @@ fn kill_session_on_expire_requires_session_scope() {
 fn stop_all_reports_removed_share_count() {
     let registry = available_registry();
     for _ in 0..2 {
-        registry
-            .create(CreateWebShareRequest {
-                scope: WebShareScope::Pane(target()),
-                public_base_url: None,
-                tunnel_provider: None,
-                frontend_url: None,
-                ttl_seconds: None,
-                expires_at_unix: None,
-                max_spectators: None,
-                max_operators: None,
-                url_options: Default::default(),
-                require_pin: false,
-                operator_pin: None,
-                spectator_pin: None,
-                terminal_palette: None,
-                operator: false,
-                spectator: true,
-                controls: false,
-                kill_session_on_expire: false,
-            })
-            .expect("share creates");
+        registry.create(target_share()).expect("share creates");
     }
     assert_eq!(registry.stop_all(StopAllWebSharesRequest).stopped, 2);
     assert!(registry.list(ListWebSharesRequest).shares.is_empty());
@@ -1014,27 +603,14 @@ async fn connect_enforces_role_caps() {
     let registry = available_registry();
     let created = registry
         .create(CreateWebShareRequest {
-            scope: WebShareScope::Pane(target()),
-            public_base_url: None,
-            tunnel_provider: None,
-            frontend_url: None,
-            ttl_seconds: None,
-            expires_at_unix: None,
             max_spectators: Some(1),
             max_operators: Some(2),
-            url_options: Default::default(),
-            require_pin: false,
-            operator_pin: None,
-            spectator_pin: None,
-            terminal_palette: None,
             operator: true,
-            spectator: true,
-            controls: false,
-            kill_session_on_expire: false,
+            ..target_share()
         })
         .expect("share creates");
-    let spectator_token = token_from_url(created.spectator_url.as_deref().expect("spectator URL"));
-    let operator_token = token_from_url(created.operator_url.as_deref().expect("operator url"));
+    let spectator_token = spectator_token(&created);
+    let operator_token = operator_token(&created);
 
     let spectator = registry
         .connect(&spectator_token, None)
@@ -1074,54 +650,13 @@ async fn connect_enforces_authenticated_process_capacity() {
     let registry = WebShareRegistry::new_with_authenticated_connection_limit(1);
     registry.mark_listener_available();
     let first = registry
-        .create(CreateWebShareRequest {
-            scope: WebShareScope::Pane(target()),
-            public_base_url: None,
-            tunnel_provider: None,
-            frontend_url: None,
-            ttl_seconds: None,
-            expires_at_unix: None,
-            max_spectators: None,
-            max_operators: None,
-            url_options: Default::default(),
-            require_pin: false,
-            operator_pin: None,
-            spectator_pin: None,
-            terminal_palette: None,
-            operator: false,
-            spectator: true,
-            controls: false,
-            kill_session_on_expire: false,
-        })
+        .create(target_share())
         .expect("first share creates");
     let second = registry
-        .create(CreateWebShareRequest {
-            scope: WebShareScope::Pane(target()),
-            public_base_url: None,
-            tunnel_provider: None,
-            frontend_url: None,
-            ttl_seconds: None,
-            expires_at_unix: None,
-            max_spectators: None,
-            max_operators: None,
-            url_options: Default::default(),
-            require_pin: false,
-            operator_pin: None,
-            spectator_pin: None,
-            terminal_palette: None,
-            operator: false,
-            spectator: true,
-            controls: false,
-            kill_session_on_expire: false,
-        })
+        .create(target_share())
         .expect("second share creates");
-    let first_token = token_from_url(first.spectator_url.as_deref().expect("first spectator URL"));
-    let second_token = token_from_url(
-        second
-            .spectator_url
-            .as_deref()
-            .expect("second spectator URL"),
-    );
+    let first_token = spectator_token(&first);
+    let second_token = spectator_token(&second);
 
     let first_access = registry
         .connect(&first_token, None)
@@ -1143,13 +678,7 @@ async fn connect_enforces_authenticated_process_capacity() {
 async fn authentication_wait_capacity_is_per_key_and_releases_on_cancel() {
     let registry = Arc::new(WebShareRegistry::new_with_authentication_limits(1, 2, 1, 2));
     registry.mark_listener_available();
-    let created = registry
-        .create(spectator_share_request(true))
-        .expect("share creates");
-    let token = token_from_url(created.spectator_url.as_deref().expect("spectator URL"));
-    let pairing_code = created
-        .spectator_pairing_code
-        .expect("PIN-protected share has a pairing code");
+    let (token, pairing_code) = create_protected_share(&registry);
 
     let first_error = registry
         .connect(&token, Some("definitely-not-the-pairing-code"))
@@ -1200,19 +729,11 @@ async fn authentication_wait_capacity_is_per_key_and_releases_on_cancel() {
 async fn backoff_waiter_does_not_block_an_unrelated_share() {
     let registry = Arc::new(WebShareRegistry::new_with_authentication_limits(1, 2, 1, 2));
     registry.mark_listener_available();
-    let protected = registry
-        .create(spectator_share_request(true))
-        .expect("protected share creates");
+    let (protected_token, protected_pin) = create_protected_share(&registry);
     let unrelated = registry
-        .create(spectator_share_request(false))
+        .create(target_share())
         .expect("unrelated share creates");
-    let protected_token =
-        token_from_url(protected.spectator_url.as_deref().expect("protected URL"));
-    let protected_pin = protected
-        .spectator_pairing_code
-        .expect("protected share has a PIN");
-    let unrelated_token =
-        token_from_url(unrelated.spectator_url.as_deref().expect("unrelated URL"));
+    let unrelated_token = spectator_token(&unrelated);
 
     registry
         .connect(&protected_token, Some("wrong-pin"))
@@ -1251,20 +772,8 @@ async fn backoff_waiter_does_not_block_an_unrelated_share() {
 async fn authentication_wait_capacity_isolated_by_network_peer() {
     let registry = Arc::new(WebShareRegistry::new_with_authentication_limits(4, 3, 2, 1));
     registry.mark_listener_available();
-    let first = registry
-        .create(spectator_share_request(true))
-        .expect("first protected share creates");
-    let second = registry
-        .create(spectator_share_request(true))
-        .expect("second protected share creates");
-    let first_token = token_from_url(first.spectator_url.as_deref().expect("first URL"));
-    let first_pin = first
-        .spectator_pairing_code
-        .expect("first protected share has a PIN");
-    let second_token = token_from_url(second.spectator_url.as_deref().expect("second URL"));
-    let second_pin = second
-        .spectator_pairing_code
-        .expect("second protected share has a PIN");
+    let (first_token, first_pin) = create_protected_share(&registry);
+    let (second_token, second_pin) = create_protected_share(&registry);
     let busy_peer = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10));
     let other_peer = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 11));
 
@@ -1325,48 +834,23 @@ async fn capability_tokens_grant_only_their_daemon_owned_roles() {
     let registry = available_registry();
     let created = registry
         .create(CreateWebShareRequest {
-            scope: WebShareScope::Pane(target()),
-            public_base_url: None,
-            tunnel_provider: None,
-            frontend_url: None,
-            ttl_seconds: None,
-            expires_at_unix: None,
             max_spectators: Some(2),
-            max_operators: None,
-            url_options: Default::default(),
-            require_pin: false,
-            operator_pin: None,
-            spectator_pin: None,
-            terminal_palette: None,
             operator: true,
-            spectator: true,
-            controls: false,
-            kill_session_on_expire: false,
+            ..target_share()
         })
         .expect("share creates");
 
-    assert!(!created
-        .spectator_url
-        .as_deref()
-        .expect("spectator URL")
-        .contains("id="));
-    assert!(!created
-        .spectator_url
-        .as_deref()
-        .expect("spectator URL")
-        .contains("key="));
-    assert!(!created
-        .spectator_url
-        .as_deref()
-        .expect("spectator URL")
-        .contains("role="));
-    let operator_url = created.operator_url.as_deref().expect("operator URL");
-    assert!(!operator_url.contains("id="));
-    assert!(!operator_url.contains("key="));
-    assert!(!operator_url.contains("role="));
+    for url in [
+        created.spectator_url.as_deref().expect("spectator URL"),
+        created.operator_url.as_deref().expect("operator URL"),
+    ] {
+        for parameter in ["id=", "key=", "role="] {
+            assert!(!url.contains(parameter), "{url}");
+        }
+    }
 
-    let spectator_token = token_from_url(created.spectator_url.as_deref().expect("spectator URL"));
-    let operator_token = token_from_url(operator_url);
+    let spectator_token = spectator_token(&created);
+    let operator_token = operator_token(&created);
     assert_eq!(
         spectator_token,
         derive_spectator_token(&operator_token).expect("derived spectator token")
@@ -1393,27 +877,13 @@ async fn stopped_or_expired_share_rejects_previous_tokens() {
     let registry = available_registry();
     let created = registry
         .create(CreateWebShareRequest {
-            scope: WebShareScope::Pane(target()),
-            public_base_url: None,
-            tunnel_provider: None,
-            frontend_url: None,
-            ttl_seconds: None,
-            expires_at_unix: None,
             max_spectators: Some(2),
-            max_operators: None,
-            url_options: Default::default(),
-            require_pin: false,
-            operator_pin: None,
-            spectator_pin: None,
-            terminal_palette: None,
             operator: true,
-            spectator: true,
-            controls: false,
-            kill_session_on_expire: false,
+            ..target_share()
         })
         .expect("share creates");
-    let spectator_token = token_from_url(created.spectator_url.as_deref().expect("spectator URL"));
-    let operator_token = token_from_url(created.operator_url.as_deref().expect("operator URL"));
+    let spectator_token = spectator_token(&created);
+    let operator_token = operator_token(&created);
 
     assert!(
         registry
@@ -1431,23 +901,8 @@ async fn auth_failures_backoff_per_share_id() {
     let registry = available_registry();
     let _created = registry
         .create(CreateWebShareRequest {
-            scope: WebShareScope::Pane(target()),
-            public_base_url: None,
-            tunnel_provider: None,
-            frontend_url: None,
-            ttl_seconds: None,
-            expires_at_unix: None,
             max_spectators: Some(2),
-            max_operators: None,
-            url_options: Default::default(),
-            require_pin: false,
-            operator_pin: None,
-            spectator_pin: None,
-            terminal_palette: None,
-            operator: false,
-            spectator: true,
-            controls: false,
-            kill_session_on_expire: false,
+            ..target_share()
         })
         .expect("share creates");
     let wrong_token = random_token().expect("test token");
@@ -1470,37 +925,64 @@ fn target() -> PaneTargetRef {
     )
 }
 
-fn spectator_share_request(require_pin: bool) -> CreateWebShareRequest {
-    CreateWebShareRequest {
-        scope: WebShareScope::Pane(target()),
-        public_base_url: None,
-        tunnel_provider: None,
-        frontend_url: None,
-        ttl_seconds: None,
-        expires_at_unix: None,
-        max_spectators: None,
-        max_operators: None,
-        url_options: Default::default(),
-        require_pin,
-        operator_pin: None,
-        spectator_pin: None,
-        terminal_palette: None,
-        operator: false,
-        spectator: true,
-        controls: false,
-        kill_session_on_expire: false,
-    }
+/// A spectator-only share of [`target`] with every other option off; session shares override
+/// `scope`.
+fn target_share() -> CreateWebShareRequest {
+    CreateWebShareRequest::fixture(WebShareScope::Pane(target()))
 }
 
-fn token_from_url(url: &str) -> String {
-    url.split_once('#')
-        .and_then(|(_, fragment)| {
-            fragment.split('&').find_map(|param| {
-                let (key, value) = param.split_once('=')?;
-                (key == "t").then_some(value.to_owned())
-            })
+/// Creates a PIN-protected spectator share; returns its access token and pairing code.
+fn create_protected_share(registry: &WebShareRegistry) -> (String, String) {
+    let created = registry
+        .create(CreateWebShareRequest {
+            require_pin: true,
+            ..target_share()
         })
-        .expect("token fragment")
+        .expect("protected share creates");
+    let token = spectator_token(&created);
+    let pairing_code = created
+        .spectator_pairing_code
+        .expect("protected share has a pairing code");
+    (token, pairing_code)
+}
+
+/// Asserts that `registry` rejects `request` (`reason` explains why) with an error mentioning
+/// `expected`.
+#[track_caller]
+fn assert_create_rejected(
+    registry: &WebShareRegistry,
+    request: CreateWebShareRequest,
+    reason: &str,
+    expected: &str,
+) {
+    let error = registry.create(request).expect_err(reason);
+    assert!(error.to_string().contains(expected), "{error}");
+}
+
+/// Creates `request`, asserts its spectator URL starts with `url_prefix`, then connects as that
+/// spectator and asserts the access admits each `allowed` browser origin and no `denied` one.
+/// Returns the spectator URL.
+async fn assert_spectator_frontend(
+    registry: &WebShareRegistry,
+    request: CreateWebShareRequest,
+    url_prefix: &str,
+    allowed: &[&str],
+    denied: &[&str],
+) -> String {
+    let created = registry.create(request).expect("share creates");
+    let spectator_url = created.spectator_url.expect("spectator URL");
+    assert!(spectator_url.starts_with(url_prefix), "{spectator_url}");
+    let access = registry
+        .connect(&token_from_url(&spectator_url), None)
+        .await
+        .expect("spectator connects");
+    for origin in allowed {
+        assert!(access.origin_allowed(origin), "{origin}");
+    }
+    for origin in denied {
+        assert!(!access.origin_allowed(origin), "{origin}");
+    }
+    spectator_url
 }
 
 fn unix_seconds(value: SystemTime) -> u64 {

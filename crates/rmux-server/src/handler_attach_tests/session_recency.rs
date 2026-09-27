@@ -9,29 +9,15 @@
 
 use super::*;
 
-const SIZE: TerminalSize = TerminalSize { cols: 80, rows: 24 };
-
 /// One arbitrary but fixed second shared by every session in a fixture.
 const PINNED_SECOND: i64 = 1_785_500_000;
-
-async fn create_detached_session(handler: &RequestHandler, name: &str) {
-    let created = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name: session_name(name),
-            detached: true,
-            size: Some(SIZE),
-            environment: None,
-        }))
-        .await;
-    assert!(matches!(created, Response::NewSession(_)), "{created:?}");
-}
 
 /// Creates `creation_order`, marks `use_order` as used, then pins every public
 /// timestamp so no whole second can order the result.
 async fn same_second_handler(creation_order: &[&str], use_order: &[&str]) -> RequestHandler {
     let handler = RequestHandler::new();
     for name in creation_order {
-        create_detached_session(&handler, name).await;
+        handler.create_session(*name).await;
     }
     let mut state = handler.state.lock().await;
     for name in use_order {
@@ -60,22 +46,11 @@ async fn same_second_handler(creation_order: &[&str], use_order: &[&str]) -> Req
     handler
 }
 
-async fn session_id(handler: &RequestHandler, name: &str) -> rmux_proto::SessionId {
-    handler
-        .state
-        .lock()
-        .await
-        .sessions
-        .session(&session_name(name))
-        .expect("session exists")
-        .id()
-}
-
 #[tokio::test]
 async fn targetless_attach_picks_the_last_used_session_not_the_lowest_id_or_name() {
     let handler = same_second_handler(&["m03", "z99", "a01"], &["z99", "m03"]).await;
     assert_eq!(
-        session_id(&handler, "m03").await,
+        handler.session_id_for_test("m03").await,
         rmux_proto::SessionId::new(0),
         "the truly last-used session deliberately holds the lowest creation id"
     );
@@ -92,12 +67,9 @@ async fn targetless_attach_picks_the_last_used_session_not_the_lowest_id_or_name
 #[tokio::test]
 async fn targetless_attach_prefers_an_unattached_session_over_the_most_recent_one() {
     let handler = same_second_handler(&["a01", "z99", "m03"], &["a01", "m03"]).await;
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
     // `finish_attach` is the teardown half of an attach, so the client has to
     // stay registered for m03 to count as attached at all.
-    handler
-        .register_attach(140_001, session_name("m03"), control_tx)
-        .await;
+    let _control_rx = handler.attach_client(140_001, "m03").await;
     {
         // Attaching is itself use, so m03 is now both the most recently used
         // session and the only attached one.
@@ -129,7 +101,7 @@ async fn targetless_attach_ranks_a_later_creation_above_an_earlier_attach() {
     // afterwards. Attach history must not outrank the later lifetime event.
     let handler = RequestHandler::new();
     for name in ["m03", "a01"] {
-        create_detached_session(&handler, name).await;
+        handler.create_session(name).await;
     }
     {
         let mut state = handler.state.lock().await;
@@ -139,7 +111,7 @@ async fn targetless_attach_ranks_a_later_creation_above_an_earlier_attach() {
             .expect("a01 exists")
             .touch_attached();
     }
-    create_detached_session(&handler, "z99").await;
+    handler.create_session("z99").await;
     // Targetless selection prefers sessions whose deferred pane process is
     // live before it ranks by recency. Equalize that independent precondition
     // so this fixture measures only the lifetime order it names.
@@ -176,13 +148,14 @@ async fn targetless_attach_ranks_a_later_creation_above_an_earlier_attach() {
 #[tokio::test]
 async fn destroy_switch_ranks_the_all_session_candidate_set_by_recency() {
     let handler = same_second_handler(&["m03", "z99", "a01", "source"], &["z99", "m03"]).await;
-    set_detach_on_destroy(&handler, "off").await;
-
-    let (control_tx, mut control_rx) = mpsc::unbounded_channel();
     handler
-        .register_attach(141_001, session_name("source"), control_tx)
+        .set_detach_on_destroy_for_test(&session_name("source"), "off")
         .await;
-    kill_source_session(&handler).await;
+
+    let mut control_rx = handler.attach_client(141_001, "source").await;
+    handler
+        .handle_ok(KillSessionRequest::fixture("source"))
+        .await;
 
     let target = recv_switch_target(&mut control_rx, "detach-on-destroy off").await;
     assert_eq!(target.session_name, session_name("m03"));
@@ -193,45 +166,16 @@ async fn destroy_switch_establishes_its_detached_candidate_set_before_ranking_it
     // c03 is the most recently used session but is already attached, so the
     // no-detached policy must rank only b02, a01 and pick b02.
     let handler = same_second_handler(&["a01", "b02", "c03", "source"], &["b02", "c03"]).await;
-    set_detach_on_destroy(&handler, "no-detached").await;
+    handler
+        .set_detach_on_destroy_for_test(&session_name("source"), "no-detached")
+        .await;
 
-    let (occupied_tx, _occupied_rx) = mpsc::unbounded_channel();
+    let _occupied_rx = handler.attach_client(142_001, "c03").await;
+    let mut control_rx = handler.attach_client(142_002, "source").await;
     handler
-        .register_attach(142_001, session_name("c03"), occupied_tx)
+        .handle_ok(KillSessionRequest::fixture("source"))
         .await;
-    let (control_tx, mut control_rx) = mpsc::unbounded_channel();
-    handler
-        .register_attach(142_002, session_name("source"), control_tx)
-        .await;
-    kill_source_session(&handler).await;
 
     let target = recv_switch_target(&mut control_rx, "detach-on-destroy no-detached").await;
     assert_eq!(target.session_name, session_name("b02"));
-}
-
-async fn set_detach_on_destroy(handler: &RequestHandler, value: &str) {
-    handler
-        .state
-        .lock()
-        .await
-        .options
-        .set(
-            ScopeSelector::Session(session_name("source")),
-            OptionName::DetachOnDestroy,
-            value.to_owned(),
-            SetOptionMode::Replace,
-        )
-        .expect("detach-on-destroy policy is valid");
-}
-
-async fn kill_source_session(handler: &RequestHandler) {
-    let response = handler
-        .handle(Request::KillSession(KillSessionRequest {
-            target: session_name("source"),
-            kill_all_except_target: false,
-            clear_alerts: false,
-            kill_group: false,
-        }))
-        .await;
-    assert!(matches!(response, Response::KillSession(_)), "{response:?}");
 }

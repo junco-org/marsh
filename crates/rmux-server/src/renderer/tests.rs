@@ -12,17 +12,40 @@ use rmux_proto::{
     WindowTarget,
 };
 
+use crate::test_fixtures::option_store;
 use crate::test_names::session_name;
 
+fn alpha_session(size: TerminalSize) -> Session {
+    Session::new(session_name("alpha"), size)
+}
+
+fn split_alpha_session(size: TerminalSize) -> Session {
+    let mut session = alpha_session(size);
+    session.split_active_pane().expect("split succeeds");
+    session
+}
+
 fn session_with_three_panes() -> Session {
-    let mut session = Session::new(session_name("alpha"), TerminalSize { cols: 80, rows: 24 });
-    session.split_active_pane().expect("first split succeeds");
+    let mut session = split_alpha_session(TerminalSize::new(80, 24));
     session.split_pane(1).expect("second split succeeds");
     session
 }
 
 fn border_style(value: Option<&str>) -> Style {
     parse_standalone_style(value)
+}
+
+fn window_border_cells(
+    session: &Session,
+    inactive: BorderStyle,
+    active: BorderStyle,
+) -> Vec<super::BorderCell> {
+    border_cells(
+        session.window(),
+        session.active_pane_index(),
+        inactive,
+        active,
+    )
 }
 
 fn screen_with(bytes: &[u8], size: TerminalSize) -> Screen {
@@ -36,6 +59,99 @@ fn visible_line_text(screen: &Screen, row: usize, cols: usize) -> String {
     let mut text = String::new();
     assert!(screen.visit_visible_line_cells(row, cols, |cell| text.push_str(cell.text())));
     text
+}
+
+/// The full-width visible text of `row` after replaying `frame` onto a `size` screen.
+fn frame_row(frame: &[u8], size: TerminalSize, row: usize) -> String {
+    visible_line_text(&screen_with(frame, size), row, usize::from(size.cols))
+}
+
+/// Global replacements of `entries`, then blank `window-status-format` and
+/// `window-status-current-format`.
+fn status_options<'a>(entries: impl IntoIterator<Item = (OptionName, &'a str)>) -> OptionStore {
+    option_store(
+        entries
+            .into_iter()
+            .chain([
+                (OptionName::WindowStatusFormat, ""),
+                (OptionName::WindowStatusCurrentFormat, ""),
+            ])
+            .map(|(option, value)| (ScopeSelector::Global, option, value, SetOptionMode::Replace)),
+    )
+}
+
+fn set_session_option_by_name(
+    options: &mut OptionStore,
+    session: &Session,
+    name: &str,
+    value: impl Into<String>,
+) {
+    options
+        .set_by_name(
+            rmux_proto::types::OptionScopeSelector::Session(session.name().clone()),
+            name,
+            Some(value.into()),
+            SetOptionMode::Replace,
+            false,
+            false,
+            false,
+        )
+        .expect("status-format option set succeeds");
+}
+
+fn render_text(session: &Session, options: &OptionStore) -> String {
+    String::from_utf8(render(session, options)).expect("frame is utf-8")
+}
+
+/// Renders pane 0 of `session` over a `size` screen fed `bytes`.
+fn pane_zero_frame(
+    session: &Session,
+    options: &OptionStore,
+    bytes: &[u8],
+    size: TerminalSize,
+) -> String {
+    let pane = session.window().pane(0).expect("pane 0 exists");
+    let screen = screen_with(bytes, size);
+    String::from_utf8(super::render_pane_screen(session, options, pane, &screen))
+        .expect("pane frame is utf-8")
+}
+
+/// Renders the only pane of a `size` `alpha` session over a `size` screen fed `bytes`.
+fn single_pane_frame(size: TerminalSize, options: &OptionStore, bytes: &[u8]) -> String {
+    pane_zero_frame(&alpha_session(size), options, bytes, size)
+}
+
+fn pane_cursor_frame(screen: &Screen) -> String {
+    let session = alpha_session(TerminalSize::new(20, 4));
+    let pane = session.active_pane().expect("active pane exists");
+    String::from_utf8(super::render_pane_cursor(
+        &session,
+        &OptionStore::new(),
+        pane,
+        screen,
+    ))
+    .expect("cursor frame is utf-8")
+}
+
+fn status_text(
+    session: &Session,
+    options: &OptionStore,
+    columns: u16,
+    attached_count: usize,
+) -> String {
+    status_bar_runs(session, options, columns, attached_count)
+        .into_iter()
+        .map(|run| run.text)
+        .collect()
+}
+
+fn status_message_frame(size: TerminalSize, message: &str) -> String {
+    String::from_utf8(super::render_status_message(
+        &alpha_session(size),
+        &OptionStore::new(),
+        message,
+    ))
+    .expect("status message frame is utf-8")
 }
 
 /// Renders the status line until `needle` appears, or fails on the deadline.
@@ -112,6 +228,54 @@ fn copy_mode_summary_with_time(top_line_time: i64) -> CopyModeSummary {
     }
 }
 
+/// Renders the copy-mode position badge for pane 0 of a `size` `alpha` session.
+fn copy_mode_position_frame(
+    size: TerminalSize,
+    options: &OptionStore,
+    summary: &CopyModeSummary,
+    history_size: usize,
+) -> String {
+    let session = alpha_session(size);
+    let pane = session.window().pane(0).expect("pane 0 exists");
+    String::from_utf8(super::render_copy_mode_position(
+        &session,
+        options,
+        0,
+        pane,
+        summary,
+        history_size,
+        false,
+    ))
+    .expect("copy-mode position frame is utf-8")
+}
+
+fn line_number_options() -> OptionStore {
+    option_store([(
+        ScopeSelector::Global,
+        OptionName::CopyModeLineNumbers,
+        "absolute",
+        SetOptionMode::Replace,
+    )])
+}
+
+fn assert_copy_mode_badge_starts_at_bracket(cols: u16, top_line_time: i64, separator: &str) {
+    let frame = copy_mode_position_frame(
+        TerminalSize::new(cols, 4),
+        &OptionStore::new(),
+        &copy_mode_summary_with_time(top_line_time),
+        1,
+    );
+
+    assert!(
+        frame.contains("\u{1b}[0;30;43m[0/1]") || frame.contains("\u{1b}[30;43m[0/1]"),
+        "copy-mode badge should start styling at '[': {frame:?}"
+    );
+    assert!(
+        !frame.contains("\u{1b}[0;30;43m [0/1]") && !frame.contains("\u{1b}[30;43m [0/1]"),
+        "copy-mode badge must not paint {separator}: {frame:?}"
+    );
+}
+
 #[test]
 fn rendered_pane_line_truncates_to_pane_width_without_counting_sgr() {
     let utf8 = Utf8Config::default();
@@ -180,18 +344,11 @@ fn rendered_pane_line_keeps_composed_cells_at_pane_width() {
 
 #[test]
 fn pane_render_keeps_modified_emoji_text_at_right_edge() {
-    let size = TerminalSize { cols: 5, rows: 3 };
-    let session = Session::new(session_name("alpha"), size);
-    let pane = session.window().pane(0).expect("pane 0 exists");
-    let screen = screen_with("👋🏽ABC".as_bytes(), size);
-
-    let frame = String::from_utf8(super::render_pane_screen(
-        &session,
+    let frame = single_pane_frame(
+        TerminalSize::new(5, 3),
         &OptionStore::new(),
-        pane,
-        &screen,
-    ))
-    .expect("pane frame is utf-8");
+        "👋🏽ABC".as_bytes(),
+    );
 
     assert!(
         frame.contains("👋🏽ABC"),
@@ -201,75 +358,24 @@ fn pane_render_keeps_modified_emoji_text_at_right_edge() {
 
 #[test]
 fn copy_mode_position_truncation_does_not_style_separator_before_bracket() {
-    let session = Session::new(session_name("alpha"), TerminalSize { cols: 6, rows: 4 });
-    let pane = session.window().pane(0).expect("pane 0 exists");
-    let frame = String::from_utf8(super::render_copy_mode_position(
-        &session,
-        &OptionStore::new(),
-        0,
-        pane,
-        &copy_mode_summary_with_time(1),
-        1,
-        false,
-    ))
-    .expect("copy-mode position frame is utf-8");
-
-    assert!(
-        frame.contains("\u{1b}[0;30;43m[0/1]") || frame.contains("\u{1b}[30;43m[0/1]"),
-        "copy-mode badge should start styling at '[': {frame:?}"
-    );
-    assert!(
-        !frame.contains("\u{1b}[0;30;43m [0/1]") && !frame.contains("\u{1b}[30;43m [0/1]"),
-        "copy-mode badge must not paint the truncated separator space: {frame:?}"
-    );
+    assert_copy_mode_badge_starts_at_bracket(6, 1, "the truncated separator space");
 }
 
 #[test]
 fn copy_mode_position_without_time_does_not_style_separator_before_bracket() {
-    let session = Session::new(session_name("alpha"), TerminalSize { cols: 100, rows: 4 });
-    let pane = session.window().pane(0).expect("pane 0 exists");
-    let frame = String::from_utf8(super::render_copy_mode_position(
-        &session,
-        &OptionStore::new(),
-        0,
-        pane,
-        &copy_mode_summary_with_time(0),
-        1,
-        false,
-    ))
-    .expect("copy-mode position frame is utf-8");
-
-    assert!(
-        frame.contains("\u{1b}[0;30;43m[0/1]") || frame.contains("\u{1b}[30;43m[0/1]"),
-        "copy-mode badge should start styling at '[': {frame:?}"
-    );
-    assert!(
-        !frame.contains("\u{1b}[0;30;43m [0/1]") && !frame.contains("\u{1b}[30;43m [0/1]"),
-        "copy-mode badge must not paint a leading separator when no time is shown: {frame:?}"
-    );
+    assert_copy_mode_badge_starts_at_bracket(100, 0, "a leading separator when no time is shown");
 }
 
 #[test]
 fn copy_mode_position_badge_stays_out_of_the_line_number_gutter() {
-    let session = Session::new(session_name("alpha"), TerminalSize { cols: 6, rows: 4 });
-    let pane = session.window().pane(0).expect("pane 0 exists");
-    let mut options = OptionStore::new();
-    options
-        .set(
-            ScopeSelector::Global,
-            OptionName::CopyModeLineNumbers,
-            "absolute".to_owned(),
-            SetOptionMode::Replace,
-        )
-        .expect("copy-mode line numbers option set succeeds");
-    let mut summary = copy_mode_summary_with_time(0);
-    summary.line_numbers_enabled = true;
-    summary.history_size = 0;
-    summary.backing_rows = 4;
-    let frame = String::from_utf8(super::render_copy_mode_position(
-        &session, &options, 0, pane, &summary, 0, false,
-    ))
-    .expect("copy-mode position frame is utf-8");
+    let summary = CopyModeSummary {
+        line_numbers_enabled: true,
+        history_size: 0,
+        backing_rows: 4,
+        ..copy_mode_summary_with_time(0)
+    };
+    let frame =
+        copy_mode_position_frame(TerminalSize::new(6, 4), &line_number_options(), &summary, 0);
 
     assert!(
         frame.contains("\u{1b}[1;5H"),
@@ -279,34 +385,21 @@ fn copy_mode_position_badge_stays_out_of_the_line_number_gutter() {
 
 #[test]
 fn copy_mode_position_uses_tmux_absolute_line_number_formats() {
-    let session = Session::new(session_name("alpha"), TerminalSize { cols: 20, rows: 10 });
-    let pane = session.window().pane(0).expect("pane 0 exists");
-    let mut options = OptionStore::new();
-    options
-        .set(
-            ScopeSelector::Global,
-            OptionName::CopyModeLineNumbers,
-            "absolute".to_owned(),
-            SetOptionMode::Replace,
-        )
-        .expect("copy-mode line numbers option set succeeds");
-    let mut summary = copy_mode_summary_with_time(0);
-    summary.line_numbers_enabled = true;
-    summary.history_size = 31;
-    summary.backing_rows = 10;
-    summary.scroll_position = 31;
+    let size = TerminalSize::new(20, 10);
+    let options = line_number_options();
+    let mut summary = CopyModeSummary {
+        line_numbers_enabled: true,
+        history_size: 31,
+        backing_rows: 10,
+        scroll_position: 31,
+        ..copy_mode_summary_with_time(0)
+    };
 
-    let absolute = String::from_utf8(super::render_copy_mode_position(
-        &session, &options, 0, pane, &summary, 31, false,
-    ))
-    .expect("copy-mode position frame is utf-8");
+    let absolute = copy_mode_position_frame(size, &options, &summary, 31);
     assert!(absolute.contains("[1/41]"), "absolute format: {absolute:?}");
 
     summary.line_numbers_enabled = false;
-    let mouse_origin = String::from_utf8(super::render_copy_mode_position(
-        &session, &options, 0, pane, &summary, 31, false,
-    ))
-    .expect("copy-mode position frame is utf-8");
+    let mouse_origin = copy_mode_position_frame(size, &options, &summary, 31);
     assert!(
         mouse_origin.contains("[31/31]"),
         "mouse-origin format: {mouse_origin:?}"
@@ -315,44 +408,27 @@ fn copy_mode_position_uses_tmux_absolute_line_number_formats() {
 
 #[test]
 fn hidden_copy_mode_position_emits_no_badge() {
-    let session = Session::new(session_name("alpha"), TerminalSize { cols: 20, rows: 4 });
-    let pane = session.window().pane(0).expect("pane 0 exists");
-    let mut summary = copy_mode_summary_with_time(0);
-    summary.show_position = false;
+    let summary = CopyModeSummary {
+        show_position: false,
+        ..copy_mode_summary_with_time(0)
+    };
 
-    assert!(super::render_copy_mode_position(
-        &session,
-        &OptionStore::new(),
-        0,
-        pane,
-        &summary,
-        1,
-        false,
-    )
-    .is_empty());
+    assert!(
+        copy_mode_position_frame(TerminalSize::new(20, 4), &OptionStore::new(), &summary, 1,)
+            .is_empty()
+    );
 }
 
 #[test]
 fn clipped_cursor_marker_is_repainted_after_position_badge() {
-    let session = Session::new(session_name("alpha"), TerminalSize { cols: 8, rows: 2 });
-    let pane = session.window().pane(0).expect("pane 0 exists");
-    let mut options = OptionStore::new();
-    options
-        .set(
-            ScopeSelector::Global,
-            OptionName::CopyModeLineNumbers,
-            "absolute".to_owned(),
-            SetOptionMode::Replace,
-        )
-        .expect("copy-mode line numbers option set succeeds");
-    let mut summary = copy_mode_summary_with_time(0);
-    summary.line_numbers_enabled = true;
-    summary.cursor_x = 7;
+    let summary = CopyModeSummary {
+        line_numbers_enabled: true,
+        cursor_x: 7,
+        ..copy_mode_summary_with_time(0)
+    };
 
-    let frame = String::from_utf8(super::render_copy_mode_position(
-        &session, &options, 0, pane, &summary, 1, false,
-    ))
-    .expect("copy-mode position frame is utf-8");
+    let frame =
+        copy_mode_position_frame(TerminalSize::new(8, 2), &line_number_options(), &summary, 1);
     assert!(
         frame.ends_with("\u{1b}[1;8H\u{1b}[0m$\u{1b}[0m"),
         "tmux paints '$' after the top-row badge: {frame:?}"
@@ -432,28 +508,18 @@ fn style_parser_maps_supported_forms_to_exact_ansi_bytes() {
 
 #[test]
 fn sessions_without_visible_borders_emit_status_only_when_enabled() {
-    let session = Session::new(session_name("alpha"), TerminalSize { cols: 80, rows: 24 });
-    assert!(border_cells(
-        session.window(),
-        session.active_pane_index(),
-        Style::default(),
-        Style::default()
-    )
-    .is_empty());
-    let default_frame =
-        String::from_utf8(render(&session, &OptionStore::new())).expect("status frame is utf-8");
+    let session = alpha_session(TerminalSize::new(80, 24));
+    assert!(window_border_cells(&session, Style::default(), Style::default()).is_empty());
+    let default_frame = render_text(&session, &OptionStore::new());
     assert!(default_frame.contains("[alpha]"));
     assert!(!default_frame.contains('┬'));
 
-    let mut status_off = OptionStore::new();
-    status_off
-        .set(
-            ScopeSelector::Session(session.name().clone()),
-            OptionName::Status,
-            "off".to_owned(),
-            SetOptionMode::Replace,
-        )
-        .expect("status off succeeds");
+    let status_off = option_store([(
+        ScopeSelector::Session(session.name().clone()),
+        OptionName::Status,
+        "off",
+        SetOptionMode::Replace,
+    )]);
     assert!(render(&session, &status_off).is_empty());
 
     let mut narrow = Session::new(session_name("narrow"), TerminalSize { cols: 3, rows: 2 });
@@ -471,8 +537,7 @@ fn sessions_without_visible_borders_emit_status_only_when_enabled() {
 
 #[test]
 fn zoomed_sessions_clear_before_redrawing_active_pane() {
-    let mut session = Session::new(session_name("alpha"), TerminalSize { cols: 80, rows: 24 });
-    session.split_active_pane().expect("split succeeds");
+    let mut session = split_alpha_session(TerminalSize::new(80, 24));
     session
         .resize_pane(0, ResizePaneAdjustment::Zoom)
         .expect("zoom succeeds");
@@ -487,22 +552,14 @@ fn zoomed_sessions_clear_before_redrawing_active_pane() {
 #[test]
 fn zoomed_sessions_render_only_the_active_pane_screen() {
     let size = TerminalSize { cols: 20, rows: 6 };
-    let mut session = Session::new(session_name("alpha"), size);
-    session.split_active_pane().expect("split succeeds");
+    let mut session = split_alpha_session(size);
     session
         .resize_pane(0, ResizePaneAdjustment::Zoom)
         .expect("zoom succeeds");
     let options = OptionStore::new();
-    let active_pane = session.window().pane(0).expect("pane 0 exists");
     let inactive_pane = session.window().pane(1).expect("pane 1 exists");
 
-    let active_frame = String::from_utf8(super::render_pane_screen(
-        &session,
-        &options,
-        active_pane,
-        &screen_with(b"VISIBLE_LEFT", size),
-    ))
-    .expect("active pane frame is utf-8");
+    let active_frame = pane_zero_frame(&session, &options, b"VISIBLE_LEFT", size);
     let inactive_frame = super::render_pane_screen(
         &session,
         &options,
@@ -519,14 +576,11 @@ fn zoomed_sessions_render_only_the_active_pane_screen() {
 
 #[test]
 fn pane_render_leaves_default_cells_at_terminal_default_without_user_style() {
-    let size = TerminalSize { cols: 6, rows: 2 };
-    let session = Session::new(session_name("alpha"), size);
-    let pane = session.window().pane(0).expect("pane 0 exists");
-    let screen = screen_with(b"\x1b[44mB\x1b[0mD", size);
-    let options = OptionStore::new();
-
-    let frame = String::from_utf8(super::render_pane_screen(&session, &options, pane, &screen))
-        .expect("pane frame is utf-8");
+    let frame = single_pane_frame(
+        TerminalSize::new(6, 2),
+        &OptionStore::new(),
+        b"\x1b[44mB\x1b[0mD",
+    );
 
     assert!(frame.contains("\u{1b}[44mB"), "{frame:?}");
     assert!(frame.contains("\u{1b}[49mD"), "{frame:?}");
@@ -535,14 +589,7 @@ fn pane_render_leaves_default_cells_at_terminal_default_without_user_style() {
 
 #[test]
 fn pane_render_uses_line_clear_for_unstyled_full_width_panes() {
-    let size = TerminalSize { cols: 12, rows: 3 };
-    let session = Session::new(session_name("alpha"), size);
-    let pane = session.window().pane(0).expect("pane 0 exists");
-    let screen = screen_with(b"short", size);
-    let options = OptionStore::new();
-
-    let frame = String::from_utf8(super::render_pane_screen(&session, &options, pane, &screen))
-        .expect("pane frame is utf-8");
+    let frame = single_pane_frame(TerminalSize::new(12, 3), &OptionStore::new(), b"short");
 
     assert!(
         frame.contains("\u{1b}[1;1H\u{1b}[0mshort\u{1b}[0m\u{1b}[K"),
@@ -557,58 +604,50 @@ fn pane_render_uses_line_clear_for_unstyled_full_width_panes() {
 
 #[test]
 fn pane_selection_overlay_style_expands_defaults_and_overrides() {
-    let size = TerminalSize { cols: 6, rows: 2 };
-    let session = Session::new(session_name("alpha"), size);
+    let session = alpha_session(TerminalSize::new(6, 2));
     let pane = session.window().pane(0).expect("pane 0 exists");
+    let overlay_style = |options: &OptionStore| {
+        super::pane_screen::pane_selection_overlay_style(&session, options, pane)
+    };
 
     // Default: copy-mode-selection-style is "#{E:mode-style}", which must
     // expand through the format engine to the mode-style default instead of
     // reaching the cell style parser as a raw template (issue #90).
-    let options = OptionStore::new();
-    let style = super::pane_screen::pane_selection_overlay_style(&session, &options, pane)
-        .expect("default selection style expands");
+    let style = overlay_style(&OptionStore::new()).expect("default selection style expands");
     assert!(
         style.contains("fg=black") && style.contains("bg=yellow"),
         "default selection style must expand mode-style, got {style:?}"
     );
 
     // The default follows a changed mode-style.
-    let mut options = OptionStore::new();
-    options
-        .set(
-            ScopeSelector::Global,
-            OptionName::ModeStyle,
-            "bg=blue,fg=white".to_owned(),
-            SetOptionMode::Replace,
-        )
-        .expect("set mode-style");
-    let style = super::pane_screen::pane_selection_overlay_style(&session, &options, pane)
-        .expect("inherited selection style expands");
+    let style = overlay_style(&option_store([(
+        ScopeSelector::Global,
+        OptionName::ModeStyle,
+        "bg=blue,fg=white",
+        SetOptionMode::Replace,
+    )]))
+    .expect("inherited selection style expands");
     assert!(
         style.contains("bg=blue"),
         "selection style must follow mode-style, got {style:?}"
     );
 
     // An explicit copy-mode-selection-style wins over mode-style.
-    let mut options = OptionStore::new();
-    options
-        .set(
+    let style = overlay_style(&option_store([
+        (
             ScopeSelector::Global,
             OptionName::ModeStyle,
-            "bg=blue,fg=white".to_owned(),
+            "bg=blue,fg=white",
             SetOptionMode::Replace,
-        )
-        .expect("set mode-style");
-    options
-        .set(
+        ),
+        (
             ScopeSelector::Global,
             OptionName::CopyModeSelectionStyle,
-            "bg=red".to_owned(),
+            "bg=red",
             SetOptionMode::Replace,
-        )
-        .expect("set copy-mode-selection-style");
-    let style = super::pane_screen::pane_selection_overlay_style(&session, &options, pane)
-        .expect("explicit selection style expands");
+        ),
+    ]))
+    .expect("explicit selection style expands");
     assert!(
         style.contains("bg=red") && !style.contains("bg=blue"),
         "explicit selection style must win, got {style:?}"
@@ -618,7 +657,7 @@ fn pane_selection_overlay_style_expands_defaults_and_overrides() {
 #[test]
 fn styled_pane_screen_borrows_when_no_overlay_is_needed() {
     let size = TerminalSize { cols: 6, rows: 2 };
-    let session = Session::new(session_name("alpha"), size);
+    let session = alpha_session(size);
     let pane = session.window().pane(0).expect("pane 0 exists");
     let screen = screen_with(b"D", size);
     let options = OptionStore::new();
@@ -633,7 +672,7 @@ fn selected_cell_colours(
     options: &OptionStore,
 ) -> (rmux_core::input::Colour, rmux_core::input::Colour) {
     let size = TerminalSize { cols: 6, rows: 2 };
-    let session = Session::new(session_name("alpha"), size);
+    let session = alpha_session(size);
     let pane = session.window().pane(0).expect("pane 0 exists");
     let mut screen = screen_with(b"D", size);
     screen.mark_selected_row_range(0, 0, 0);
@@ -653,15 +692,12 @@ fn copy_mode_selection_style_default_expands_mode_style() {
 
 #[test]
 fn copy_mode_selection_style_tracks_mode_style_until_explicitly_overridden() {
-    let mut options = OptionStore::new();
-    options
-        .set(
-            ScopeSelector::Global,
-            OptionName::ModeStyle,
-            "bg=magenta,fg=white".to_owned(),
-            SetOptionMode::Replace,
-        )
-        .expect("mode-style override succeeds");
+    let mut options = option_store([(
+        ScopeSelector::Global,
+        OptionName::ModeStyle,
+        "bg=magenta,fg=white",
+        SetOptionMode::Replace,
+    )]);
     assert_eq!(selected_cell_colours(&options), (7, 5));
 
     options
@@ -671,28 +707,22 @@ fn copy_mode_selection_style_tracks_mode_style_until_explicitly_overridden() {
             "bg=cyan,fg=red".to_owned(),
             SetOptionMode::Replace,
         )
-        .expect("copy-mode-selection-style override succeeds");
+        .expect("option set succeeds");
     assert_eq!(selected_cell_colours(&options), (1, 6));
 }
 
 #[test]
 fn attach_render_golden_normal_idle_pane_is_byte_stable() {
-    let size = TerminalSize { cols: 6, rows: 2 };
-    let session = Session::new(session_name("alpha"), size);
-    let pane = session.window().pane(0).expect("pane 0 exists");
-    let screen = screen_with(b"D", size);
-    let options = OptionStore::new();
-
     assert_eq!(
-        super::render_pane_screen(&session, &options, pane, &screen),
-        b"\x1b[s\x1b[?25l\x1b[0m\x1b[1;1H\x1b[0mD\x1b[0m\x1b[K\x1b[0m\x1b[u\x1b[1;2H\x1b[?25h"
+        single_pane_frame(TerminalSize::new(6, 2), &OptionStore::new(), b"D"),
+        "\x1b[s\x1b[?25l\x1b[0m\x1b[1;1H\x1b[0mD\x1b[0m\x1b[K\x1b[0m\x1b[u\x1b[1;2H\x1b[?25h"
     );
 }
 
 #[test]
 fn attach_render_pane_screen_with_prompt_preserves_prompt_cursor() {
     let size = TerminalSize { cols: 6, rows: 2 };
-    let session = Session::new(session_name("alpha"), size);
+    let session = alpha_session(size);
     let pane = session.window().pane(0).expect("pane 0 exists");
     let screen = screen_with(b"D", size);
     let options = OptionStore::new();
@@ -706,14 +736,12 @@ fn attach_render_pane_screen_with_prompt_preserves_prompt_cursor() {
 #[test]
 fn pane_render_keeps_padding_for_split_panes_to_avoid_clearing_neighbors() {
     let size = TerminalSize { cols: 20, rows: 4 };
-    let mut session = Session::new(session_name("alpha"), size);
-    session.split_active_pane().expect("split succeeds");
-    let pane = session.window().pane(0).expect("pane 0 exists");
-    let screen = screen_with(b"left", size);
-    let options = OptionStore::new();
-
-    let frame = String::from_utf8(super::render_pane_screen(&session, &options, pane, &screen))
-        .expect("pane frame is utf-8");
+    let frame = pane_zero_frame(
+        &split_alpha_session(size),
+        &OptionStore::new(),
+        b"left",
+        size,
+    );
 
     assert!(
         !frame.contains("\u{1b}[K"),
@@ -724,14 +752,12 @@ fn pane_render_keeps_padding_for_split_panes_to_avoid_clearing_neighbors() {
 #[test]
 fn pane_render_resets_before_default_split_pane_row_after_styled_row() {
     let size = TerminalSize { cols: 20, rows: 4 };
-    let mut session = Session::new(session_name("alpha"), size);
-    session.split_active_pane().expect("split succeeds");
-    let pane = session.window().pane(0).expect("pane 0 exists");
-    let screen = screen_with(b"\x1b[48;5;255m          \r\n\x1b[0mplain", size);
-    let options = OptionStore::new();
-
-    let frame = String::from_utf8(super::render_pane_screen(&session, &options, pane, &screen))
-        .expect("pane frame is utf-8");
+    let frame = pane_zero_frame(
+        &split_alpha_session(size),
+        &OptionStore::new(),
+        b"\x1b[48;5;255m          \r\n\x1b[0mplain",
+        size,
+    );
 
     assert!(
         frame.contains("\u{1b}[1;1H\u{1b}[0m\u{1b}[48;5;255m"),
@@ -749,23 +775,15 @@ fn pane_render_resets_before_default_split_pane_row_after_styled_row() {
 
 #[test]
 fn pane_render_applies_window_style_to_default_cells() {
-    let size = TerminalSize { cols: 6, rows: 2 };
-    let session = Session::new(session_name("alpha"), size);
-    let window = WindowTarget::with_window(session.name().clone(), 0);
-    let pane = session.window().pane(0).expect("pane 0 exists");
-    let screen = screen_with(b"\x1b[44mB\x1b[0mD", size);
-    let mut options = OptionStore::new();
-    options
-        .set(
-            ScopeSelector::Window(window),
-            OptionName::WindowStyle,
-            "bg=black".to_owned(),
-            SetOptionMode::Replace,
-        )
-        .expect("window style set succeeds");
+    let window = WindowTarget::with_window(session_name("alpha"), 0);
+    let options = option_store([(
+        ScopeSelector::Window(window),
+        OptionName::WindowStyle,
+        "bg=black",
+        SetOptionMode::Replace,
+    )]);
 
-    let frame = String::from_utf8(super::render_pane_screen(&session, &options, pane, &screen))
-        .expect("pane frame is utf-8");
+    let frame = single_pane_frame(TerminalSize::new(6, 2), &options, b"\x1b[44mB\x1b[0mD");
 
     assert!(frame.contains("\u{1b}[44mB"), "{frame:?}");
     assert!(frame.contains("\u{1b}[40mD"), "{frame:?}");
@@ -777,39 +795,32 @@ fn pane_render_applies_window_style_to_default_cells() {
 
 #[test]
 fn pane_render_active_style_overlays_window_style_for_default_cells() {
-    let size = TerminalSize { cols: 6, rows: 2 };
-    let session = Session::new(session_name("alpha"), size);
-    let window = WindowTarget::with_window(session.name().clone(), 0);
-    let pane = session.window().pane(0).expect("pane 0 exists");
-    let screen = screen_with(b"D", size);
-    let mut options = OptionStore::new();
-    for (option, value) in [
-        (OptionName::WindowStyle, "bg=black"),
-        (OptionName::WindowActiveStyle, "bg=red"),
-    ] {
-        options
-            .set(
-                ScopeSelector::Window(window.clone()),
-                option,
-                value.to_owned(),
-                SetOptionMode::Replace,
-            )
-            .expect("window style set succeeds");
-    }
+    let window = WindowTarget::with_window(session_name("alpha"), 0);
+    let options = option_store([
+        (
+            ScopeSelector::Window(window.clone()),
+            OptionName::WindowStyle,
+            "bg=black",
+            SetOptionMode::Replace,
+        ),
+        (
+            ScopeSelector::Window(window),
+            OptionName::WindowActiveStyle,
+            "bg=red",
+            SetOptionMode::Replace,
+        ),
+    ]);
 
-    let frame = String::from_utf8(super::render_pane_screen(&session, &options, pane, &screen))
-        .expect("pane frame is utf-8");
+    let frame = single_pane_frame(TerminalSize::new(6, 2), &options, b"D");
 
     assert!(frame.contains("\u{1b}[41mD"), "{frame:?}");
 }
 
 #[test]
 fn two_pane_sessions_render_the_main_vertical_border_column_and_exact_frame_bytes() {
-    let mut session = Session::new(session_name("alpha"), TerminalSize { cols: 4, rows: 2 });
-    session.split_active_pane().expect("split succeeds");
-    let cells = border_cells(
-        session.window(),
-        session.active_pane_index(),
+    let session = split_alpha_session(TerminalSize::new(4, 2));
+    let cells = window_border_cells(
+        &session,
         border_style(Some("red")),
         border_style(Some("red")),
     );
@@ -825,16 +836,10 @@ fn two_pane_sessions_render_the_main_vertical_border_column_and_exact_frame_byte
 
 #[test]
 fn two_pane_sessions_colour_only_the_active_half_of_the_shared_border() {
-    let mut session = Session::new(session_name("alpha"), TerminalSize { cols: 10, rows: 4 });
-    session.split_active_pane().expect("split succeeds");
+    let session = split_alpha_session(TerminalSize::new(10, 4));
     let inactive = border_style(Some("blue"));
     let active = border_style(Some("red"));
-    let cells = border_cells(
-        session.window(),
-        session.active_pane_index(),
-        inactive.clone(),
-        active.clone(),
-    );
+    let cells = window_border_cells(&session, inactive.clone(), active.clone());
 
     assert!(has_styled_cell(&cells, 5, 0, '│', &inactive));
     assert!(has_styled_cell(&cells, 5, 1, '│', &inactive));
@@ -844,30 +849,18 @@ fn two_pane_sessions_colour_only_the_active_half_of_the_shared_border() {
 #[test]
 fn three_pane_sessions_render_full_height_vertical_dividers() {
     let session = session_with_three_panes();
-    let cells = border_cells(
-        session.window(),
-        session.active_pane_index(),
-        Style::default(),
-        Style::default(),
-    );
+    let cells = window_border_cells(&session, Style::default(), Style::default());
 
-    assert!(has_cell(&cells, 40, 0, '│'));
-    assert!(has_cell(&cells, 40, 12, '│'));
-    assert!(has_cell(&cells, 60, 0, '│'));
-    assert!(has_cell(&cells, 60, 12, '│'));
-    assert!(has_cell(&cells, 60, 23, '│'));
+    for (x, y) in [(40, 0), (40, 12), (60, 0), (60, 12), (60, 23)] {
+        assert!(has_cell(&cells, x, y, '│'));
+    }
 }
 
 #[test]
 fn four_pane_sessions_keep_vertical_splits_as_full_height_bars() {
     let mut session = session_with_three_panes();
     session.split_pane(2).expect("third split succeeds");
-    let cells = border_cells(
-        session.window(),
-        session.active_pane_index(),
-        Style::default(),
-        Style::default(),
-    );
+    let cells = window_border_cells(&session, Style::default(), Style::default());
 
     assert_eq!(
         cells.iter().filter(|cell| cell.glyph == '┬').count(),
@@ -883,19 +876,14 @@ fn four_pane_sessions_keep_vertical_splits_as_full_height_bars() {
 
 #[test]
 fn lower_vertical_split_joins_top_bottom_border_with_a_top_tee() {
-    let mut session = Session::new(session_name("alpha"), TerminalSize { cols: 80, rows: 24 });
+    let mut session = alpha_session(TerminalSize::new(80, 24));
     let bottom = session
         .split_active_pane_with_direction(SplitDirection::Horizontal)
         .expect("horizontal split succeeds");
     session
         .split_pane_with_direction(bottom, SplitDirection::Vertical)
         .expect("vertical split succeeds");
-    let cells = border_cells(
-        session.window(),
-        session.active_pane_index(),
-        Style::default(),
-        Style::default(),
-    );
+    let cells = window_border_cells(&session, Style::default(), Style::default());
 
     let top_geometry = session
         .window()
@@ -928,12 +916,7 @@ fn active_and_inactive_styles_follow_the_active_pane_border_segments() {
     session.select_pane(0).expect("pane selection succeeds");
     let active = border_style(Some("red"));
     let inactive = border_style(Some("blue"));
-    let cells = border_cells(
-        session.window(),
-        session.active_pane_index(),
-        inactive.clone(),
-        active.clone(),
-    );
+    let cells = window_border_cells(&session, inactive.clone(), active.clone());
 
     assert!(has_styled_cell(&cells, 40, 18, '│', &active));
     assert!(has_styled_cell(&cells, 60, 6, '│', &inactive));
@@ -948,34 +931,38 @@ fn renderer_uses_session_option_resolution_and_renders_status_when_enabled() {
     session.select_pane(0).expect("pane selection succeeds");
     let session_name = session.name().clone();
     let window = WindowTarget::with_window(session_name.clone(), 0);
-    let mut options = OptionStore::new();
-    for (scope, option, value) in [
-        (ScopeSelector::Global, OptionName::PaneBorderStyle, "blue"),
+    let mut options = option_store([
+        (
+            ScopeSelector::Global,
+            OptionName::PaneBorderStyle,
+            "blue",
+            SetOptionMode::Replace,
+        ),
         (
             ScopeSelector::Window(window.clone()),
             OptionName::PaneBorderStyle,
             "yellow",
+            SetOptionMode::Replace,
         ),
         (
             ScopeSelector::Window(window),
             OptionName::PaneActiveBorderStyle,
             "colour196",
+            SetOptionMode::Replace,
         ),
         (
             ScopeSelector::Session(session_name.clone()),
             OptionName::Status,
             "off",
+            SetOptionMode::Replace,
         ),
         (
             ScopeSelector::Session(session_name.clone()),
             OptionName::StatusLeft,
             "status #{session_name}",
+            SetOptionMode::Replace,
         ),
-    ] {
-        options
-            .set(scope, option, value.to_owned(), SetOptionMode::Replace)
-            .expect("option set succeeds");
-    }
+    ]);
 
     let frame = render(&session, &options);
     let frame_text = String::from_utf8_lossy(&frame);
@@ -994,7 +981,7 @@ fn renderer_uses_session_option_resolution_and_renders_status_when_enabled() {
             "on".to_owned(),
             SetOptionMode::Replace,
         )
-        .expect("status on succeeds");
+        .expect("option set succeeds");
     let status_frame = render(&session, &options);
     let status_text = String::from_utf8_lossy(&status_frame);
     assert!(status_text.contains("status al"));
@@ -1005,25 +992,22 @@ fn renderer_uses_session_option_resolution_and_renders_status_when_enabled() {
 fn renderer_applies_pane_border_line_style() {
     let session = session_with_three_panes();
     let session_name = session.name().clone();
-    let mut options = OptionStore::new();
-    options
-        .set(
+    let options = option_store([
+        (
             ScopeSelector::Session(session_name.clone()),
             OptionName::Status,
-            "off".to_owned(),
+            "off",
             SetOptionMode::Replace,
-        )
-        .expect("status option set succeeds");
-    options
-        .set(
-            ScopeSelector::Window(WindowTarget::with_window(session_name.clone(), 0)),
+        ),
+        (
+            ScopeSelector::Window(WindowTarget::with_window(session_name, 0)),
             OptionName::PaneBorderLines,
-            "heavy".to_owned(),
+            "heavy",
             SetOptionMode::Replace,
-        )
-        .expect("pane-border-lines option set succeeds");
+        ),
+    ]);
 
-    let frame = String::from_utf8(render(&session, &options)).expect("frame is utf8");
+    let frame = render_text(&session, &options);
 
     assert!(frame.contains('┃'), "{frame:?}");
     assert!(!frame.contains('│'), "{frame:?}");
@@ -1032,18 +1016,14 @@ fn renderer_applies_pane_border_line_style() {
 #[test]
 fn top_status_reserves_the_first_row_and_offsets_border_cells() {
     let session = session_with_three_panes();
-    let session_name = session.name().clone();
-    let mut options = OptionStore::new();
-    options
-        .set(
-            ScopeSelector::Session(session_name),
-            OptionName::StatusPosition,
-            "top".to_owned(),
-            SetOptionMode::Replace,
-        )
-        .expect("status-position top succeeds");
+    let options = option_store([(
+        ScopeSelector::Session(session.name().clone()),
+        OptionName::StatusPosition,
+        "top",
+        SetOptionMode::Replace,
+    )]);
 
-    let frame = String::from_utf8(render(&session, &options)).expect("frame is utf-8");
+    let frame = render_text(&session, &options);
 
     assert!(frame.contains("\u{1b}[1;1H"));
     assert!(frame.contains("\u{1b}[2;41H"));
@@ -1052,44 +1032,68 @@ fn top_status_reserves_the_first_row_and_offsets_border_cells() {
 
 #[test]
 fn status_window_list_uses_expanded_truncation_justify_and_raw_flags() {
-    let mut session = Session::new(session_name("alpha"), TerminalSize { cols: 20, rows: 4 });
+    let size = TerminalSize { cols: 20, rows: 4 };
+    let mut session = alpha_session(size);
     session
-        .insert_window_with_initial_pane(1, TerminalSize { cols: 20, rows: 4 })
+        .insert_window_with_initial_pane(1, size)
         .expect("window 1 insert succeeds");
     session
-        .insert_window_with_initial_pane(2, TerminalSize { cols: 20, rows: 4 })
+        .insert_window_with_initial_pane(2, size)
         .expect("window 2 insert succeeds");
     session.select_window(2).expect("window 2 select succeeds");
     session.select_window(1).expect("window 1 select succeeds");
-    let mut options = OptionStore::new();
-
-    for (option, value) in [
-        (OptionName::StatusStyle, "default"),
-        (OptionName::StatusLeft, "L#{session_name}LONG"),
-        (OptionName::StatusLeftLength, "4"),
-        (OptionName::StatusRight, "R#{session_windows}"),
-        (OptionName::StatusRightLength, "2"),
-        (OptionName::StatusJustify, "right"),
+    let options = option_store([
         (
+            ScopeSelector::Global,
+            OptionName::StatusStyle,
+            "default",
+            SetOptionMode::Replace,
+        ),
+        (
+            ScopeSelector::Global,
+            OptionName::StatusLeft,
+            "L#{session_name}LONG",
+            SetOptionMode::Replace,
+        ),
+        (
+            ScopeSelector::Global,
+            OptionName::StatusLeftLength,
+            "4",
+            SetOptionMode::Replace,
+        ),
+        (
+            ScopeSelector::Global,
+            OptionName::StatusRight,
+            "R#{session_windows}",
+            SetOptionMode::Replace,
+        ),
+        (
+            ScopeSelector::Global,
+            OptionName::StatusRightLength,
+            "2",
+            SetOptionMode::Replace,
+        ),
+        (
+            ScopeSelector::Global,
+            OptionName::StatusJustify,
+            "right",
+            SetOptionMode::Replace,
+        ),
+        (
+            ScopeSelector::Global,
             OptionName::WindowStatusFormat,
             "#{window_index}#{window_raw_flags}",
+            SetOptionMode::Replace,
         ),
         (
+            ScopeSelector::Global,
             OptionName::WindowStatusCurrentFormat,
             "#{window_index}#{window_raw_flags}",
+            SetOptionMode::Replace,
         ),
-    ] {
-        options
-            .set(
-                ScopeSelector::Global,
-                option,
-                value.to_owned(),
-                SetOptionMode::Replace,
-            )
-            .expect("status option set succeeds");
-    }
+    ]);
 
-    let frame = String::from_utf8(render(&session, &options)).expect("frame is utf-8");
+    let frame = render_text(&session, &options);
 
     assert!(frame.contains("Lalp"), "{frame}");
     assert!(frame.contains("1*"), "{frame}");
@@ -1098,21 +1102,16 @@ fn status_window_list_uses_expanded_truncation_justify_and_raw_flags() {
 
 #[test]
 fn status_format_override_replaces_default_status_line() {
-    let session = Session::new(session_name("alpha"), TerminalSize { cols: 20, rows: 3 });
+    let session = alpha_session(TerminalSize::new(20, 3));
     let mut options = OptionStore::new();
-    options
-        .set_by_name(
-            rmux_proto::types::OptionScopeSelector::Session(session.name().clone()),
-            "status-format[0]",
-            Some("custom #{session_name}".to_owned()),
-            SetOptionMode::Replace,
-            false,
-            false,
-            false,
-        )
-        .expect("status-format option set succeeds");
+    set_session_option_by_name(
+        &mut options,
+        &session,
+        "status-format[0]",
+        "custom #{session_name}",
+    );
 
-    let frame = String::from_utf8(render(&session, &options)).expect("frame is utf-8");
+    let frame = render_text(&session, &options);
 
     assert!(frame.contains("custom alpha"), "{frame}");
     assert!(!frame.contains("0:zsh"), "{frame}");
@@ -1121,79 +1120,41 @@ fn status_format_override_replaces_default_status_line() {
 #[test]
 fn status_numeric_value_reserves_and_renders_multiple_status_lines() {
     let size = TerminalSize { cols: 20, rows: 6 };
-    let session = Session::new(session_name("alpha"), size);
-    let mut options = OptionStore::new();
-    options
-        .set(
-            ScopeSelector::Global,
-            OptionName::Status,
-            "3".to_owned(),
-            SetOptionMode::Replace,
-        )
-        .expect("status option set succeeds");
+    let session = alpha_session(size);
+    let mut options = option_store([(
+        ScopeSelector::Global,
+        OptionName::Status,
+        "3",
+        SetOptionMode::Replace,
+    )]);
     for (name, value) in [
         ("status-format[0]", "ZERO"),
         ("status-format[1]", "ONE"),
         ("status-format[2]", "TWO"),
     ] {
-        options
-            .set_by_name(
-                rmux_proto::types::OptionScopeSelector::Session(session.name().clone()),
-                name,
-                Some(value.to_owned()),
-                SetOptionMode::Replace,
-                false,
-                false,
-                false,
-            )
-            .expect("status-format option set succeeds");
+        set_session_option_by_name(&mut options, &session, name, value);
     }
 
-    let frame = render(&session, &options);
-    let screen = screen_with(&frame, size);
+    let screen = screen_with(&render(&session, &options), size);
 
-    assert_eq!(
-        visible_line_text(&screen, 3, usize::from(size.cols))
-            .trim_end()
-            .to_owned(),
-        "ZERO"
-    );
-    assert_eq!(
-        visible_line_text(&screen, 4, usize::from(size.cols))
-            .trim_end()
-            .to_owned(),
-        "ONE"
-    );
-    assert_eq!(
-        visible_line_text(&screen, 5, usize::from(size.cols))
-            .trim_end()
-            .to_owned(),
-        "TWO"
-    );
+    for (row, expected) in [(3, "ZERO"), (4, "ONE"), (5, "TWO")] {
+        assert_eq!(
+            visible_line_text(&screen, row, usize::from(size.cols)).trim_end(),
+            expected
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn status_left_expands_shell_job() {
-    let session = Session::new(session_name("alpha"), TerminalSize { cols: 80, rows: 3 });
-    let mut options = OptionStore::new();
+    let session = alpha_session(TerminalSize::new(80, 3));
     let marker = format!("statusjob{}", std::process::id());
     let command = format!("#(echo {marker})");
-    for (option, value) in [
+    let options = status_options([
         (OptionName::StatusLeft, command.as_str()),
         (OptionName::StatusLeftLength, "32"),
         (OptionName::StatusRight, ""),
-        (OptionName::WindowStatusFormat, ""),
-        (OptionName::WindowStatusCurrentFormat, ""),
-    ] {
-        options
-            .set(
-                ScopeSelector::Global,
-                option,
-                value.to_owned(),
-                SetOptionMode::Replace,
-            )
-            .expect("status option set succeeds");
-    }
+    ]);
 
     let frame = render_until_contains(&session, &options, &marker).await;
     assert!(frame.contains(&marker), "{frame}");
@@ -1201,20 +1162,15 @@ async fn status_left_expands_shell_job() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn status_format_expands_shell_job() {
-    let session = Session::new(session_name("alpha"), TerminalSize { cols: 80, rows: 3 });
+    let session = alpha_session(TerminalSize::new(80, 3));
     let mut options = OptionStore::new();
     let marker = format!("statusformatjob{}", std::process::id());
-    options
-        .set_by_name(
-            rmux_proto::types::OptionScopeSelector::Session(session.name().clone()),
-            "status-format[0]",
-            Some(format!("#(echo {marker})")),
-            SetOptionMode::Replace,
-            false,
-            false,
-            false,
-        )
-        .expect("status-format option set succeeds");
+    set_session_option_by_name(
+        &mut options,
+        &session,
+        "status-format[0]",
+        format!("#(echo {marker})"),
+    );
 
     let frame = render_until_contains(&session, &options, &marker).await;
     assert!(frame.contains(&marker), "{frame}");
@@ -1222,23 +1178,23 @@ async fn status_format_expands_shell_job() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn status_format_expands_shell_job_introduced_by_status_left() {
-    let session = Session::new(session_name("alpha"), TerminalSize { cols: 80, rows: 3 });
-    let mut options = OptionStore::new();
+    let session = alpha_session(TerminalSize::new(80, 3));
     let marker = format!("statusleftjob{}", std::process::id());
     let status_left = format!("X#(echo {marker})Y");
-    for (option, value) in [
-        (OptionName::StatusFormat, "#{T:status-left}"),
-        (OptionName::StatusLeft, status_left.as_str()),
-    ] {
-        options
-            .set(
-                ScopeSelector::Global,
-                option,
-                value.to_owned(),
-                SetOptionMode::Replace,
-            )
-            .expect("status option set succeeds");
-    }
+    let options = option_store([
+        (
+            ScopeSelector::Global,
+            OptionName::StatusFormat,
+            "#{T:status-left}",
+            SetOptionMode::Replace,
+        ),
+        (
+            ScopeSelector::Global,
+            OptionName::StatusLeft,
+            status_left.as_str(),
+            SetOptionMode::Replace,
+        ),
+    ]);
 
     let frame = render_until_contains(&session, &options, &marker).await;
     assert!(frame.contains(&format!("X{marker}Y")), "{frame}");
@@ -1247,30 +1203,16 @@ async fn status_format_expands_shell_job_introduced_by_status_left() {
 #[test]
 fn status_right_inline_styles_do_not_consume_length_budget() {
     let size = TerminalSize { cols: 20, rows: 3 };
-    let session = Session::new(session_name("alpha"), size);
-    let mut options = OptionStore::new();
-    for (option, value) in [
+    let options = status_options([
         (OptionName::StatusLeft, ""),
         (
             OptionName::StatusRight,
             "#[fg=#{?session_attached,green,red},bold]CLOCK-DATE-HOST",
         ),
         (OptionName::StatusRightLength, "10"),
-        (OptionName::WindowStatusFormat, ""),
-        (OptionName::WindowStatusCurrentFormat, ""),
-    ] {
-        options
-            .set(
-                ScopeSelector::Global,
-                option,
-                value.to_owned(),
-                SetOptionMode::Replace,
-            )
-            .expect("status option set succeeds");
-    }
+    ]);
 
-    let screen = screen_with(&render(&session, &options), size);
-    let status = visible_line_text(&screen, 2, usize::from(size.cols));
+    let status = frame_row(&render(&alpha_session(size), &options), size, 2);
 
     assert_eq!(status, "          CLOCK-DATE", "{status:?}");
 }
@@ -1278,27 +1220,22 @@ fn status_right_inline_styles_do_not_consume_length_budget() {
 #[test]
 fn explicit_status_format_width_modifier_ignores_inline_styles() {
     let size = TerminalSize { cols: 20, rows: 3 };
-    let session = Session::new(session_name("alpha"), size);
-    let mut options = OptionStore::new();
-    for (option, value) in [
+    let options = option_store([
         (
+            ScopeSelector::Global,
             OptionName::StatusFormat,
             "#[align=right]#{T;=/10:status-right}",
+            SetOptionMode::Replace,
         ),
-        (OptionName::StatusRight, "#[fg=green]CLOCK-DATE-HOST"),
-    ] {
-        options
-            .set(
-                ScopeSelector::Global,
-                option,
-                value.to_owned(),
-                SetOptionMode::Replace,
-            )
-            .expect("status option set succeeds");
-    }
+        (
+            ScopeSelector::Global,
+            OptionName::StatusRight,
+            "#[fg=green]CLOCK-DATE-HOST",
+            SetOptionMode::Replace,
+        ),
+    ]);
 
-    let screen = screen_with(&render(&session, &options), size);
-    let status = visible_line_text(&screen, 2, usize::from(size.cols));
+    let status = frame_row(&render(&alpha_session(size), &options), size, 2);
 
     assert_eq!(status, "          CLOCK-DATE", "{status:?}");
 }
@@ -1306,27 +1243,13 @@ fn explicit_status_format_width_modifier_ignores_inline_styles() {
 #[test]
 fn status_left_inline_styles_preserve_unicode_cell_truncation() {
     let size = TerminalSize { cols: 12, rows: 3 };
-    let session = Session::new(session_name("alpha"), size);
-    let mut options = OptionStore::new();
-    for (option, value) in [
+    let options = status_options([
         (OptionName::StatusLeft, "#[fg=red]表A#[bold]👋🏽B"),
         (OptionName::StatusLeftLength, "5"),
         (OptionName::StatusRight, ""),
-        (OptionName::WindowStatusFormat, ""),
-        (OptionName::WindowStatusCurrentFormat, ""),
-    ] {
-        options
-            .set(
-                ScopeSelector::Global,
-                option,
-                value.to_owned(),
-                SetOptionMode::Replace,
-            )
-            .expect("status option set succeeds");
-    }
+    ]);
 
-    let screen = screen_with(&render(&session, &options), size);
-    let status = visible_line_text(&screen, 2, usize::from(size.cols));
+    let status = frame_row(&render(&alpha_session(size), &options), size, 2);
 
     // Screen visitors expose each wide glyph's continuation cell as a space.
     assert_eq!(status, "表 A👋🏽        ", "{status:?}");
@@ -1334,28 +1257,14 @@ fn status_left_inline_styles_preserve_unicode_cell_truncation() {
 
 #[test]
 fn status_component_limit_keeps_a_zwj_grapheme_whole_product_divergence() {
-    let size = TerminalSize { cols: 8, rows: 3 };
-    let session = Session::new(session_name("alpha"), size);
-    let mut options = OptionStore::new();
-    for (option, value) in [
+    let session = alpha_session(TerminalSize::new(8, 3));
+    let options = status_options([
         (OptionName::StatusLeft, "#[fg=red]👩\u{200d}💻A"),
         (OptionName::StatusLeftLength, "2"),
         (OptionName::StatusRight, ""),
-        (OptionName::WindowStatusFormat, ""),
-        (OptionName::WindowStatusCurrentFormat, ""),
-    ] {
-        options
-            .set(
-                ScopeSelector::Global,
-                option,
-                value.to_owned(),
-                SetOptionMode::Replace,
-            )
-            .expect("status option set succeeds");
-    }
+    ]);
 
-    let frame = render(&session, &options);
-    let frame = String::from_utf8(frame).expect("status frame is utf-8");
+    let frame = render_text(&session, &options);
     assert!(
         frame.contains("👩\u{200d}💻"),
         "the ZWJ grapheme must survive the formatted frame"
@@ -1365,41 +1274,28 @@ fn status_component_limit_keeps_a_zwj_grapheme_whole_product_divergence() {
 
 #[test]
 fn status_fill_applies_background_when_text_background_is_default() {
-    let session = Session::new(session_name("alpha"), TerminalSize { cols: 8, rows: 2 });
-    let mut options = OptionStore::new();
-
-    for (option, value) in [
+    let session = alpha_session(TerminalSize::new(8, 2));
+    let options = status_options([
         (OptionName::StatusStyle, "fill=blue"),
         (OptionName::StatusLeft, "X"),
         (OptionName::StatusRight, ""),
-        (OptionName::WindowStatusFormat, ""),
-        (OptionName::WindowStatusCurrentFormat, ""),
-    ] {
-        options
-            .set(
-                ScopeSelector::Global,
-                option,
-                value.to_owned(),
-                SetOptionMode::Replace,
-            )
-            .expect("status option set succeeds");
-    }
+    ]);
 
-    let frame = String::from_utf8(render(&session, &options)).expect("frame is utf-8");
+    let frame = render_text(&session, &options);
     assert!(frame.contains("\u{1b}[44m"));
 }
 
 #[test]
 fn status_only_render_starts_from_a_reset_sgr_state() {
-    let session = Session::new(session_name("alpha"), TerminalSize { cols: 8, rows: 2 });
+    let session = alpha_session(TerminalSize::new(8, 2));
 
-    let frame = String::from_utf8(render(&session, &OptionStore::new())).expect("frame is utf-8");
+    let frame = render_text(&session, &OptionStore::new());
     assert!(frame.starts_with("\u{1b}7\u{1b}[0m"));
 }
 
 #[test]
 fn prompt_status_render_positions_cursor_on_the_input_cell() {
-    let session = Session::new(session_name("alpha"), TerminalSize { cols: 20, rows: 4 });
+    let session = alpha_session(TerminalSize::new(20, 4));
     let prompt = super::RenderedPrompt {
         prompt: "rename-window ".to_owned(),
         input: String::new(),
@@ -1423,91 +1319,42 @@ fn prompt_status_render_positions_cursor_on_the_input_cell() {
 
 #[test]
 fn pane_cursor_render_repositions_and_shows_the_terminal_cursor() {
-    let session = Session::new(session_name("alpha"), TerminalSize { cols: 20, rows: 4 });
-    let pane = session.active_pane().expect("active pane exists");
     let screen = screen_with(b"abc", TerminalSize { cols: 20, rows: 3 });
 
-    let frame = String::from_utf8(super::render_pane_cursor(
-        &session,
-        &OptionStore::new(),
-        pane,
-        &screen,
-    ))
-    .expect("cursor frame is utf-8");
-
-    assert_eq!(frame, "\u{1b}[1;4H\u{1b}[?25h");
+    assert_eq!(pane_cursor_frame(&screen), "\u{1b}[1;4H\u{1b}[?25h");
 }
 
 #[test]
 fn pane_cursor_render_hides_terminal_cursor_when_screen_cursor_is_hidden() {
-    let session = Session::new(session_name("alpha"), TerminalSize { cols: 20, rows: 4 });
-    let pane = session.active_pane().expect("active pane exists");
     let screen = screen_with(b"\x1b[?25l", TerminalSize { cols: 20, rows: 3 });
     assert_eq!(screen.mode() & mode::MODE_CURSOR, 0);
 
-    let frame = String::from_utf8(super::render_pane_cursor(
-        &session,
-        &OptionStore::new(),
-        pane,
-        &screen,
-    ))
-    .expect("cursor frame is utf-8");
-
-    assert_eq!(frame, "\u{1b}[1;1H\u{1b}[?25l");
+    assert_eq!(pane_cursor_frame(&screen), "\u{1b}[1;1H\u{1b}[?25l");
 }
 
 #[test]
 fn border_render_starts_from_a_reset_sgr_state() {
-    let mut session = Session::new(session_name("alpha"), TerminalSize { cols: 8, rows: 4 });
-    session.split_active_pane().expect("split succeeds");
+    let session = split_alpha_session(TerminalSize::new(8, 4));
 
-    let frame = String::from_utf8(render(&session, &OptionStore::new())).expect("frame is utf-8");
+    let frame = render_text(&session, &OptionStore::new());
     assert!(frame.starts_with("\u{1b}[s\u{1b}[0m"));
 }
 
 #[test]
 fn status_bar_runs_include_session_attached_in_status_context() {
-    let session = Session::new(session_name("alpha"), TerminalSize { cols: 4, rows: 2 });
-    let mut options = OptionStore::new();
-
-    for (option, value) in [
+    let session = alpha_session(TerminalSize::new(4, 2));
+    let options = status_options([
         (OptionName::StatusLeft, "#{session_attached}"),
         (OptionName::StatusRight, ""),
-        (OptionName::WindowStatusFormat, ""),
-        (OptionName::WindowStatusCurrentFormat, ""),
-    ] {
-        options
-            .set(
-                ScopeSelector::Global,
-                option,
-                value.to_owned(),
-                SetOptionMode::Replace,
-            )
-            .expect("status option set succeeds");
-    }
+    ]);
 
-    let rendered_with_attach = status_bar_runs(&session, &options, 4, 1)
-        .into_iter()
-        .map(|run| run.text)
-        .collect::<String>();
-    let rendered_without_attach = status_bar_runs(&session, &options, 4, 0)
-        .into_iter()
-        .map(|run| run.text)
-        .collect::<String>();
-
-    assert_eq!(rendered_with_attach, "1   ");
-    assert_eq!(rendered_without_attach, "0   ");
+    assert_eq!(status_text(&session, &options, 4, 1), "1   ");
+    assert_eq!(status_text(&session, &options, 4, 0), "0   ");
 }
 
 #[test]
 fn status_message_text_cannot_emit_control_characters_into_the_status_row() {
-    let session = Session::new(session_name("alpha"), TerminalSize { cols: 20, rows: 4 });
-    let frame = String::from_utf8(super::render_status_message(
-        &session,
-        &OptionStore::new(),
-        "hi\nthere\t\x1b[31m",
-    ))
-    .expect("status message frame is utf-8");
+    let frame = status_message_frame(TerminalSize::new(20, 4), "hi\nthere\t\x1b[31m");
 
     assert!(!frame.contains('\n'));
     assert!(!frame.contains('\t'));
@@ -1516,13 +1363,7 @@ fn status_message_text_cannot_emit_control_characters_into_the_status_row() {
 
 #[test]
 fn status_message_renders_default_message_style_from_message_format() {
-    let session = Session::new(session_name("alpha"), TerminalSize { cols: 20, rows: 4 });
-    let frame = String::from_utf8(super::render_status_message(
-        &session,
-        &OptionStore::new(),
-        "No next window",
-    ))
-    .expect("status message frame is utf-8");
+    let frame = status_message_frame(TerminalSize::new(20, 4), "No next window");
 
     assert!(
         frame.contains("\x1b[0;30;43m") || frame.contains("\x1b[30;43m"),
@@ -1532,13 +1373,7 @@ fn status_message_renders_default_message_style_from_message_format() {
 
 #[test]
 fn status_message_style_fills_the_full_status_line() {
-    let session = Session::new(session_name("alpha"), TerminalSize { cols: 20, rows: 4 });
-    let frame = String::from_utf8(super::render_status_message(
-        &session,
-        &OptionStore::new(),
-        "No next window",
-    ))
-    .expect("status message frame is utf-8");
+    let frame = status_message_frame(TerminalSize::new(20, 4), "No next window");
 
     assert!(
         frame.contains("\x1b[0;30;43mNo next window      \x1b[0m")
@@ -1550,20 +1385,22 @@ fn status_message_style_fills_the_full_status_line() {
 #[test]
 fn status_message_uses_message_line_with_multiline_status() {
     let size = TerminalSize { cols: 20, rows: 5 };
-    let session = Session::new(session_name("alpha"), size);
-    let mut options = OptionStore::new();
-    for (option, value) in [(OptionName::Status, "2"), (OptionName::MessageLine, "1")] {
-        options
-            .set(
-                ScopeSelector::Global,
-                option,
-                value.to_owned(),
-                SetOptionMode::Replace,
-            )
-            .expect("status option set succeeds");
-    }
+    let options = option_store([
+        (
+            ScopeSelector::Global,
+            OptionName::Status,
+            "2",
+            SetOptionMode::Replace,
+        ),
+        (
+            ScopeSelector::Global,
+            OptionName::MessageLine,
+            "1",
+            SetOptionMode::Replace,
+        ),
+    ]);
 
-    let frame = super::render_status_message(&session, &options, "line-one");
+    let frame = super::render_status_message(&alpha_session(size), &options, "line-one");
     let screen = screen_with(&frame, size);
 
     assert_eq!(visible_line_text(&screen, 3, 8), "        ");
@@ -1575,18 +1412,14 @@ fn status_message_uses_last_terminal_row_when_status_is_off() {
     // Oracle tmux 3.7b: disabling status changes the backing row from status
     // storage to pane content, but does not suppress the message overlay.
     let size = TerminalSize { cols: 20, rows: 5 };
-    let session = Session::new(session_name("alpha"), size);
-    let mut options = OptionStore::new();
-    options
-        .set(
-            ScopeSelector::Global,
-            OptionName::Status,
-            "off".to_owned(),
-            SetOptionMode::Replace,
-        )
-        .expect("status off");
+    let options = option_store([(
+        ScopeSelector::Global,
+        OptionName::Status,
+        "off",
+        SetOptionMode::Replace,
+    )]);
 
-    let frame = super::render_status_message(&session, &options, "status-off");
+    let frame = super::render_status_message(&alpha_session(size), &options, "status-off");
     let screen = screen_with(&frame, size);
 
     for row in 0..4 {
@@ -1597,13 +1430,7 @@ fn status_message_uses_last_terminal_row_when_status_is_off() {
 
 #[test]
 fn status_message_truncates_by_display_width_instead_of_scalar_count() {
-    let session = Session::new(session_name("alpha"), TerminalSize { cols: 3, rows: 4 });
-    let frame = String::from_utf8(super::render_status_message(
-        &session,
-        &OptionStore::new(),
-        "表ab",
-    ))
-    .expect("status message frame is utf-8");
+    let frame = status_message_frame(TerminalSize::new(3, 4), "表ab");
 
     assert!(frame.contains("表a"));
     assert!(!frame.contains("表ab"));
@@ -1611,57 +1438,33 @@ fn status_message_truncates_by_display_width_instead_of_scalar_count() {
 
 #[test]
 fn status_bar_spacing_uses_display_width_for_cjk_and_emoji() {
-    let session = Session::new(session_name("alpha"), TerminalSize { cols: 6, rows: 4 });
-    let mut options = OptionStore::new();
-
-    for (option, value) in [
+    let session = alpha_session(TerminalSize::new(6, 4));
+    let options = status_options([
         (OptionName::StatusLeft, "表A"),
         (OptionName::StatusRight, "🇨🇭"),
-        (OptionName::WindowStatusFormat, ""),
-        (OptionName::WindowStatusCurrentFormat, ""),
-    ] {
-        options
-            .set(
-                ScopeSelector::Global,
-                option,
-                value.to_owned(),
-                SetOptionMode::Replace,
-            )
-            .expect("status option set succeeds");
-    }
+    ]);
 
-    let rendered = status_bar_runs(&session, &options, 6, 0)
-        .into_iter()
-        .map(|run| run.text)
-        .collect::<String>();
-
-    assert_eq!(rendered, "表A 🇨🇭");
+    assert_eq!(status_text(&session, &options, 6, 0), "表A 🇨🇭");
 }
 
 #[test]
 fn pane_active_border_style_conditionals_are_runtime_expanded() {
-    let mut session = Session::new(session_name("alpha"), TerminalSize { cols: 10, rows: 4 });
-    session.split_active_pane().expect("split succeeds");
-    let session_name = session.name().clone();
-    let window = WindowTarget::with_window(session_name.clone(), 0);
-    let mut options = OptionStore::new();
-
-    options
-        .set(
+    let session = split_alpha_session(TerminalSize::new(10, 4));
+    let window = WindowTarget::with_window(session.name().clone(), 0);
+    let options = option_store([
+        (
             ScopeSelector::Window(window.clone()),
             OptionName::PaneBorderStyle,
-            "green".to_owned(),
+            "green",
             SetOptionMode::Replace,
-        )
-        .expect("inactive border style set succeeds");
-    options
-        .set(
+        ),
+        (
             ScopeSelector::Window(window),
             OptionName::PaneActiveBorderStyle,
-            "#{?pane_active,red,blue}".to_owned(),
+            "#{?pane_active,red,blue}",
             SetOptionMode::Replace,
-        )
-        .expect("active border style set succeeds");
+        ),
+    ]);
 
     let frame = render(&session, &options);
     let frame_text = String::from_utf8_lossy(&frame);

@@ -171,7 +171,7 @@ pub(in super::super) struct PopupJob {
     ///
     /// The uid rather than the name: a popup's shell is anonymous and its name may be reused, and
     /// a surface that accepted bytes by name would eventually paint another job's output.
-    uid: marsh_core::shellmux::SnapshotUid,
+    uid: marsh_core::shellmux::Principal,
     /// The one-shot command this popup was created to run, if it was created to run one.
     ///
     /// Retained rather than re-resolved because a receipt outlives its job: the waiter must still
@@ -192,7 +192,7 @@ impl PopupJob {
     }
 
     /// The job generation this popup presents.
-    pub(super) fn uid(&self) -> &marsh_core::shellmux::SnapshotUid {
+    pub(super) fn uid(&self) -> &marsh_core::shellmux::Principal {
         &self.uid
     }
 
@@ -387,7 +387,6 @@ pub(super) async fn spawn_popup_job(
                     &handle,
                     text,
                     CommandOptions {
-                        on_finish: None,
                         // The popup ran one thing and that thing is over; the closure is recorded
                         // at admission so nothing can slip a second line into the gap between the
                         // command's last byte and its verdict.
@@ -546,7 +545,7 @@ impl RequestHandler {
     /// and a popup produces far fewer chunks than the panes this daemon is pumping.
     async fn popup_surface_for_job(
         &self,
-        uid: &marsh_core::shellmux::SnapshotUid,
+        uid: &marsh_core::shellmux::Principal,
     ) -> Option<(ActiveAttachIdentity, u64, Arc<StdMutex<PopupSurface>>)> {
         let active_attach = self.active_attach.lock().await;
         for (attach_pid, active) in &active_attach.by_pid {
@@ -593,7 +592,7 @@ impl RequestHandler {
             let status = match command {
                 Some(command) => match command.wait().await {
                     Ok(completion) => {
-                        gated_status(completion.exit_code, completion.is_published(), false)
+                        gated_status(completion.exit_code(), completion.is_published(), false)
                     }
                     // No verdict was produced at all: teardown or a lost producer. There is no
                     // honest exit code for that, and `1` is what every other refusal reports.
@@ -604,7 +603,7 @@ impl RequestHandler {
                         let failed = end.error.is_some();
                         match end.completion.as_ref() {
                             Some(completion) => gated_status(
-                                completion.exit_code,
+                                completion.exit_code(),
                                 completion.is_published(),
                                 failed,
                             ),

@@ -3,12 +3,15 @@ mod common;
 use std::error::Error;
 use std::time::Duration;
 
-use common::{send_request, session_name, start_server, TestHarness, PTY_TEST_LOCK};
-use rmux_proto::{
-    CapturePaneRequest, NewSessionRequest, PaneTarget, Request, Response, SendKeysRequest,
-    ShowBufferRequest, TerminalSize,
+use common::{
+    create_session, send, send_ok, send_request, session_name, start_server, wait_for_capture,
+    Fixture, TestHarness, PTY_TEST_LOCK,
 };
-use tokio::time::sleep;
+use rmux_proto::{
+    CapturePaneRequest, PaneTarget, Request, Response, SendKeysRequest, ShowBufferRequest,
+};
+
+const CAPTURE_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[tokio::test(flavor = "multi_thread")]
 async fn capture_pane_reads_unattached_transcript() -> Result<(), Box<dyn Error>> {
@@ -18,54 +21,26 @@ async fn capture_pane_reads_unattached_transcript() -> Result<(), Box<dyn Error>
     let target = PaneTarget::with_window(session_name("alpha"), 0, 0);
     let marker = "server_capture_unattached_marker";
 
-    let created = send_request(
+    create_session(harness.socket_path(), "alpha").await?;
+    send_ok(
         harness.socket_path(),
-        &Request::NewSession(NewSessionRequest {
-            session_name: session_name("alpha"),
-            detached: true,
-            size: Some(TerminalSize { cols: 80, rows: 24 }),
-            environment: None,
-        }),
+        SendKeysRequest::fixture((
+            &target,
+            [format!("printf '{marker}\\n'"), "Enter".to_owned()],
+        )),
     )
     .await?;
-    assert!(matches!(created, Response::NewSession(_)));
 
-    let sent = send_request(
+    let output = wait_for_capture(harness.socket_path(), &target, marker, CAPTURE_TIMEOUT).await?;
+    assert!(output.contains(marker));
+
+    let captured = send(
         harness.socket_path(),
-        &Request::SendKeys(SendKeysRequest {
-            target: target.clone(),
-            keys: vec![format!("printf '{marker}\\n'"), "Enter".to_owned()],
-        }),
-    )
-    .await?;
-    assert!(matches!(sent, Response::SendKeys(_)));
-
-    let output = wait_for_capture(harness.socket_path(), target.clone(), marker).await?;
-    assert!(String::from_utf8_lossy(&output).contains(marker));
-
-    let captured = send_request(
-        harness.socket_path(),
-        &Request::CapturePane(Box::new(CapturePaneRequest {
-            target,
-            start: None,
-            end: None,
+        CapturePaneRequest {
             print: false,
             buffer_name: Some("server-cap".to_owned()),
-            alternate: false,
-            escape_ansi: false,
-            escape_sequences: false,
-            include_format: false,
-            hyperlinks: false,
-            line_numbers: false,
-            join_wrapped: false,
-            use_mode_screen: false,
-            preserve_trailing_spaces: false,
-            do_not_trim_spaces: false,
-            pending_input: false,
-            quiet: false,
-            start_is_absolute: false,
-            end_is_absolute: false,
-        })),
+            ..Fixture::fixture(target)
+        },
     )
     .await?;
     match captured {
@@ -92,48 +67,4 @@ async fn capture_pane_reads_unattached_transcript() -> Result<(), Box<dyn Error>
 
     server.shutdown().await?;
     Ok(())
-}
-
-async fn wait_for_capture(
-    socket_path: &std::path::Path,
-    target: PaneTarget,
-    marker: &str,
-) -> Result<Vec<u8>, Box<dyn Error>> {
-    for _ in 0..100 {
-        let response = send_request(
-            socket_path,
-            &Request::CapturePane(Box::new(CapturePaneRequest {
-                target: target.clone(),
-                start: None,
-                end: None,
-                print: true,
-                buffer_name: None,
-                alternate: false,
-                escape_ansi: false,
-                escape_sequences: false,
-                include_format: false,
-                hyperlinks: false,
-                line_numbers: false,
-                join_wrapped: false,
-                use_mode_screen: false,
-                preserve_trailing_spaces: false,
-                do_not_trim_spaces: false,
-                pending_input: false,
-                quiet: false,
-                start_is_absolute: false,
-                end_is_absolute: false,
-            })),
-        )
-        .await?;
-        let output = response
-            .command_output()
-            .expect("capture-pane -p returns output");
-        if String::from_utf8_lossy(output.stdout()).contains(marker) {
-            return Ok(output.stdout().to_vec());
-        }
-
-        sleep(Duration::from_millis(20)).await;
-    }
-
-    Err(format!("capture output never contained marker {marker}").into())
 }

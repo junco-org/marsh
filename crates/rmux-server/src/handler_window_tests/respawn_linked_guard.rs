@@ -1,32 +1,24 @@
 use super::*;
+use rmux_proto::CapturePaneRequest;
 
 async fn create_linked_respawn_family(
     handler: &RequestHandler,
 ) -> (SessionName, SessionName, SessionName) {
-    let owner = session_name("respawn-linked-guard-owner");
-    let alias1 = session_name("respawn-linked-guard-alias1");
-    let alias2 = session_name("respawn-linked-guard-alias2");
-    create_session(handler, owner.as_str()).await;
-    create_session(handler, alias1.as_str()).await;
-    create_session(handler, alias2.as_str()).await;
+    let owner = create_session(handler, "respawn-linked-guard-owner").await;
+    let alias1 = create_session(handler, "respawn-linked-guard-alias1").await;
+    let alias2 = create_session(handler, "respawn-linked-guard-alias2").await;
 
     for alias in [&alias1, &alias2] {
-        let response = handler
-            .handle(Request::LinkWindow(LinkWindowRequest {
-                source: WindowTarget::with_window(owner.clone(), 0),
-                target: WindowTarget::with_window(alias.clone(), 0),
-                after: false,
-                before: false,
+        handler
+            .handle_ok(LinkWindowRequest {
                 kill_destination: true,
-                detached: true,
-            }))
+                ..Fixture::fixture((
+                    WindowTarget::with_window(owner.clone(), 0),
+                    WindowTarget::with_window(alias.clone(), 0),
+                ))
+            })
             .await;
-        assert!(
-            matches!(response, Response::LinkWindow(_)),
-            "expected linked alias setup, got {response:?}"
-        );
     }
-    handler.wait_for_initial_panes_for_test().await;
 
     (owner, alias1, alias2)
 }
@@ -43,46 +35,13 @@ fn linked_targets(
     ]
 }
 
-async fn append_linked_marker(handler: &RequestHandler, session_name: &SessionName, marker: &[u8]) {
-    let mut state = handler.state.lock().await;
-    state
-        .append_bytes_to_pane_transcript_for_test(session_name, 0, 0, marker)
-        .expect("linked marker transcript append succeeds");
-}
-
-async fn capture_pane_print(handler: &RequestHandler, target: PaneTarget) -> String {
-    let response = handler
-        .handle(Request::CapturePane(Box::new(
-            rmux_proto::CapturePaneRequest {
-                target,
-                start: None,
-                end: None,
-                print: true,
-                buffer_name: None,
-                alternate: false,
-                escape_ansi: false,
-                escape_sequences: false,
-                include_format: false,
-                hyperlinks: false,
-                line_numbers: false,
-                join_wrapped: false,
-                use_mode_screen: false,
-                preserve_trailing_spaces: false,
-                do_not_trim_spaces: false,
-                pending_input: false,
-                quiet: false,
-                start_is_absolute: false,
-                end_is_absolute: false,
-            },
-        )))
-        .await;
-    let Response::CapturePane(response) = response else {
-        panic!("expected capture-pane response, got {response:?}");
-    };
-    let output = response
-        .command_output()
+async fn capture_pane_print(handler: &RequestHandler, target: &PaneTarget) -> String {
+    let output = handler
+        .handle_ok(CapturePaneRequest::fixture(target))
+        .await
+        .output
         .expect("capture-pane -p should return command output");
-    String::from_utf8(output.stdout().to_vec()).expect("capture-pane stdout is utf-8")
+    String::from_utf8(output.stdout).expect("capture-pane stdout is utf-8")
 }
 
 /// The process this linked window's pane is running, once it has one.
@@ -107,7 +66,7 @@ async fn respawn_window(handler: &RequestHandler, target: WindowTarget, kill: bo
             kill,
             start_directory: None,
             environment: None,
-            command: Some(quiet_window_test_command()),
+            command: Some(quiet_command()),
         })))
         .await
 }
@@ -119,9 +78,14 @@ async fn respawn_window_without_kill_rejects_active_linked_window_from_each_alia
     let owner_target = WindowTarget::with_window(owner.clone(), 0);
     let owner_pane = PaneTarget::with_window(owner.clone(), 0, 0);
 
-    append_linked_marker(&handler, &owner, b"respawn-linked-old").await;
+    handler
+        .state
+        .lock()
+        .await
+        .append_bytes_to_pane_transcript_for_test(&owner, 0, 0, b"respawn-linked-old")
+        .expect("linked marker transcript append succeeds");
     let initial_pid = pane_pid(&handler, &owner_target).await;
-    let initial_capture = capture_pane_print(&handler, owner_pane.clone()).await;
+    let initial_capture = capture_pane_print(&handler, &owner_pane).await;
     assert!(
         initial_capture.contains("respawn-linked-old"),
         "expected linked marker in capture, got {initial_capture:?}"
@@ -139,7 +103,7 @@ async fn respawn_window_without_kill_rejects_active_linked_window_from_each_alia
             "respawn-window without -k must preserve the shared runtime from {target}"
         );
         assert_eq!(
-            capture_pane_print(&handler, owner_pane.clone()).await,
+            capture_pane_print(&handler, &owner_pane).await,
             initial_capture,
             "respawn-window without -k must preserve pane contents from {target}"
         );
@@ -159,7 +123,6 @@ async fn respawn_window_with_kill_restarts_active_linked_window_from_each_alias(
             matches!(&response, Response::RespawnWindow(result) if result.target == target),
             "expected respawn-window -k success for {target}, got {response:?}"
         );
-        handler.wait_for_initial_panes_for_test().await;
 
         let after_pid = pane_pid(&handler, &owner_target).await;
         assert_ne!(

@@ -6,8 +6,9 @@ use std::sync::Arc;
 mod common;
 
 use common::{
-    create_stale_socket, daemon_over_seed, send_request, session_name, start_server,
-    wait_for_socket_removal, ClientConnection, TestHarness,
+    create_session, create_stale_socket, daemon_over_seed, kill_session, send, send_request,
+    session_name, start_server, wait_for_socket_removal, ClientConnection, Fixture, Sizeless,
+    TestHarness,
 };
 use rmux_proto::{
     AttachSessionRequest, HasSessionRequest, KillSessionRequest, NewSessionRequest,
@@ -42,17 +43,15 @@ async fn new_session_round_trips_through_the_real_socket() -> Result<(), Box<dyn
     let socket_path = harness.socket_path().to_path_buf();
     let handle = start_server(&harness).await?;
 
-    let response = send_request(
+    let response = send(
         &socket_path,
-        &Request::NewSession(NewSessionRequest {
-            session_name: session_name("alpha"),
-            detached: true,
+        NewSessionRequest {
             size: Some(TerminalSize {
                 cols: 120,
                 rows: 40,
             }),
-            environment: None,
-        }),
+            ..Fixture::fixture("alpha")
+        },
     )
     .await?;
 
@@ -114,17 +113,7 @@ async fn has_session_reports_live_and_missing_sessions() -> Result<(), Box<dyn E
         Response::HasSession(rmux_proto::HasSessionResponse { exists: false })
     );
 
-    let created = send_request(
-        &socket_path,
-        &Request::NewSession(NewSessionRequest {
-            session_name: session_name("alpha"),
-            detached: true,
-            size: None,
-            environment: None,
-        }),
-    )
-    .await?;
-    assert!(matches!(created, Response::NewSession(_)));
+    create_session(&socket_path, Sizeless("alpha")).await?;
 
     let present = send_request(
         &socket_path,
@@ -148,55 +137,12 @@ async fn kill_session_is_live_then_idempotent() -> Result<(), Box<dyn Error>> {
     let socket_path = harness.socket_path().to_path_buf();
     let handle = start_server(&harness).await?;
 
-    let created = send_request(
-        &socket_path,
-        &Request::NewSession(NewSessionRequest {
-            session_name: session_name("alpha"),
-            detached: true,
-            size: None,
-            environment: None,
-        }),
-    )
-    .await?;
-    assert!(matches!(created, Response::NewSession(_)));
+    create_session(&socket_path, Sizeless("alpha")).await?;
+    create_session(&socket_path, Sizeless("keepalive")).await?;
 
-    let keepalive = send_request(
-        &socket_path,
-        &Request::NewSession(NewSessionRequest {
-            session_name: session_name("keepalive"),
-            detached: true,
-            size: None,
-            environment: None,
-        }),
-    )
-    .await?;
-    assert!(matches!(keepalive, Response::NewSession(_)));
+    kill_session(&socket_path, "alpha").await?;
 
-    let removed = send_request(
-        &socket_path,
-        &Request::KillSession(KillSessionRequest {
-            target: session_name("alpha"),
-            kill_all_except_target: false,
-            clear_alerts: false,
-            kill_group: false,
-        }),
-    )
-    .await?;
-    assert_eq!(
-        removed,
-        Response::KillSession(rmux_proto::KillSessionResponse { existed: true })
-    );
-
-    let idempotent = send_request(
-        &socket_path,
-        &Request::KillSession(KillSessionRequest {
-            target: session_name("alpha"),
-            kill_all_except_target: false,
-            clear_alerts: false,
-            kill_group: false,
-        }),
-    )
-    .await?;
+    let idempotent = send(&socket_path, KillSessionRequest::fixture("alpha")).await?;
     assert_eq!(
         idempotent,
         Response::Error(rmux_proto::ErrorResponse {
@@ -214,17 +160,7 @@ async fn rename_session_round_trips_through_the_real_socket() -> Result<(), Box<
     let socket_path = harness.socket_path().to_path_buf();
     let handle = start_server(&harness).await?;
 
-    let created = send_request(
-        &socket_path,
-        &Request::NewSession(NewSessionRequest {
-            session_name: session_name("alpha"),
-            detached: true,
-            size: None,
-            environment: None,
-        }),
-    )
-    .await?;
-    assert!(matches!(created, Response::NewSession(_)));
+    create_session(&socket_path, Sizeless("alpha")).await?;
 
     let renamed = send_request(
         &socket_path,
@@ -358,17 +294,7 @@ async fn attach_session_returns_an_upgrade_response() -> Result<(), Box<dyn Erro
     let harness = TestHarness::new("attach-upgrade");
     let socket_path = harness.socket_path().to_path_buf();
     let handle = start_server(&harness).await?;
-    let created = send_request(
-        &socket_path,
-        &Request::NewSession(NewSessionRequest {
-            session_name: session_name("alpha"),
-            detached: true,
-            size: None,
-            environment: None,
-        }),
-    )
-    .await?;
-    assert!(matches!(created, Response::NewSession(_)));
+    create_session(&socket_path, Sizeless("alpha")).await?;
 
     let response = send_request(
         &socket_path,
@@ -395,17 +321,7 @@ async fn switch_and_detach_require_an_attached_client_before_any_session_lookup(
     let harness = TestHarness::new("attached-client-required");
     let socket_path = harness.socket_path().to_path_buf();
     let handle = start_server(&harness).await?;
-    let created = send_request(
-        &socket_path,
-        &Request::NewSession(NewSessionRequest {
-            session_name: session_name("alpha"),
-            detached: true,
-            size: None,
-            environment: None,
-        }),
-    )
-    .await?;
-    assert!(matches!(created, Response::NewSession(_)));
+    create_session(&socket_path, Sizeless("alpha")).await?;
 
     let switch_response = send_request(
         &socket_path,
@@ -460,15 +376,7 @@ async fn persistent_connection_handles_multiple_requests() -> Result<(), Box<dyn
     let handle = start_server(&harness).await?;
     let mut client = ClientConnection::connect(&socket_path).await?;
 
-    let created = client
-        .send_request(&Request::NewSession(NewSessionRequest {
-            session_name: session_name("alpha"),
-            detached: true,
-            size: None,
-            environment: None,
-        }))
-        .await?;
-    assert!(matches!(created, Response::NewSession(_)));
+    client.create_session(Sizeless("alpha")).await?;
 
     let present = client
         .send_request(&Request::HasSession(HasSessionRequest {
@@ -480,14 +388,7 @@ async fn persistent_connection_handles_multiple_requests() -> Result<(), Box<dyn
         Response::HasSession(rmux_proto::HasSessionResponse { exists: true })
     );
 
-    let removed = client
-        .send_request(&Request::KillSession(KillSessionRequest {
-            target: session_name("alpha"),
-            kill_all_except_target: false,
-            clear_alerts: false,
-            kill_group: false,
-        }))
-        .await?;
+    let removed = client.send(KillSessionRequest::fixture("alpha")).await?;
     assert_eq!(
         removed,
         Response::KillSession(rmux_proto::KillSessionResponse { existed: true })
@@ -503,15 +404,7 @@ async fn shutdown_closes_existing_connections() -> Result<(), Box<dyn Error>> {
     let socket_path = harness.socket_path().to_path_buf();
     let handle = start_server(&harness).await?;
     let mut client = ClientConnection::connect(&socket_path).await?;
-    let created = client
-        .send_request(&Request::NewSession(NewSessionRequest {
-            session_name: session_name("alpha"),
-            detached: true,
-            size: None,
-            environment: None,
-        }))
-        .await?;
-    assert!(matches!(created, Response::NewSession(_)));
+    client.create_session(Sizeless("alpha")).await?;
     handle.shutdown().await?;
     let error = client
         .send_request(&Request::HasSession(HasSessionRequest {
@@ -539,10 +432,8 @@ async fn concurrent_duplicate_creates_are_serialized() -> Result<(), Box<dyn Err
     let handle = start_server(&harness).await?;
     let barrier = Arc::new(Barrier::new(3));
     let request = Request::NewSession(NewSessionRequest {
-        session_name: session_name("alpha"),
-        detached: true,
         size: None,
-        environment: None,
+        ..Fixture::fixture("alpha")
     });
 
     let first_task = spawn_request_task(socket_path.clone(), request.clone(), barrier.clone());

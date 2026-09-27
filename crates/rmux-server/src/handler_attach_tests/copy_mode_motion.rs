@@ -1,29 +1,14 @@
 use super::*;
 
 async fn enter_copy_mode_with_motion_seed(handler: &RequestHandler, target: &PaneTarget) -> String {
-    replace_transcript_contents(
-        handler,
-        target,
-        TerminalSize { cols: 80, rows: 24 },
-        b"alpha beta gamma\r\nsecond beta line\r\nthird alpha marker\r\nfourth delta marker\r\nfifth beta tail\x1b[2;6H",
-    )
-    .await;
-    assert!(matches!(
-        handler
-            .handle(Request::CopyMode(CopyModeRequest {
-                target: Some(target.clone()),
-                page_down: false,
-                exit_on_scroll: false,
-                hide_position: false,
-                mouse_drag_start: false,
-                cancel_mode: false,
-                scrollbar_scroll: false,
-                source: None,
-                page_up: false,
-            }))
-            .await,
-        Response::CopyMode(_)
-    ));
+    handler
+        .replace_transcript_for_test(
+            target,
+            TerminalSize { cols: 80, rows: 24 },
+            b"alpha beta gamma\r\nsecond beta line\r\nthird alpha marker\r\nfourth delta marker\r\nfifth beta tail\x1b[2;6H",
+        )
+        .await;
+    handler.handle_ok(CopyModeRequest::fixture(target)).await;
     copy_motion_status(handler, target.clone()).await
 }
 

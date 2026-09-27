@@ -5,10 +5,10 @@ use std::time::Duration;
 use rmux_proto::{KillSessionRequest, Response, SessionName};
 
 use crate::cli_args::WithSessionArgs;
-use crate::cli_response::tmux_cli_error_message;
 
 use super::super::ExitFailure;
-use super::common::{connect_cli, duration_millis, sleep_poll_interval};
+use super::super::target_resolution::connect_cli;
+use super::common::{duration_millis, response_error, sleep_poll_interval};
 
 /// Runs `with-session`: holds a renewed session lease for as long as a child command runs.
 pub(crate) fn run_with_session(
@@ -100,17 +100,7 @@ fn create_lease(
         Response::CreateSessionLease(response) => Ok(Lease {
             token: response.token,
         }),
-        Response::Error(error) => Err(ExitFailure::new(
-            1,
-            tmux_cli_error_message("with-session", &error.error),
-        )),
-        other => Err(ExitFailure::new(
-            1,
-            format!(
-                "protocol error: unexpected '{}' response for with-session",
-                other.command_name()
-            ),
-        )),
+        other => Err(response_error(&other, "with-session", "for with-session")),
     }
 }
 
@@ -127,17 +117,7 @@ fn renew_lease(
     {
         Response::RenewSessionLease(response) if response.renewed => Ok(()),
         Response::RenewSessionLease(_) => Err(ExitFailure::new(1, "with-session lease was lost")),
-        Response::Error(error) => Err(ExitFailure::new(
-            1,
-            tmux_cli_error_message("with-session", &error.error),
-        )),
-        other => Err(ExitFailure::new(
-            1,
-            format!(
-                "protocol error: unexpected '{}' response for with-session",
-                other.command_name()
-            ),
-        )),
+        other => Err(response_error(&other, "with-session", "for with-session")),
     }
 }
 
@@ -156,16 +136,10 @@ fn release_lease(
             1,
             "with-session lease was already released or lost",
         )),
-        Response::Error(error) => Err(ExitFailure::new(
-            1,
-            tmux_cli_error_message("with-session", &error.error),
-        )),
-        other => Err(ExitFailure::new(
-            1,
-            format!(
-                "protocol error: unexpected '{}' response for with-session release",
-                other.command_name()
-            ),
+        other => Err(response_error(
+            &other,
+            "with-session",
+            "for with-session release",
         )),
     }
 }
@@ -190,16 +164,10 @@ fn kill_owned_session(
         {
             Ok(())
         }
-        Response::Error(error) => Err(ExitFailure::new(
-            1,
-            tmux_cli_error_message("with-session", &error.error),
-        )),
-        other => Err(ExitFailure::new(
-            1,
-            format!(
-                "protocol error: unexpected '{}' response for with-session cleanup",
-                other.command_name()
-            ),
+        other => Err(response_error(
+            &other,
+            "with-session",
+            "for with-session cleanup",
         )),
     }
 }

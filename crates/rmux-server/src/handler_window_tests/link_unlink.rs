@@ -1,13 +1,17 @@
 use super::*;
 
+use rmux_proto::{
+    LinkWindowResponse, OptionScopeSelector, PaneOptionSetRequest, SendKeysRequest,
+    SetOptionByNameRequest,
+};
+
 async fn assert_send_keys_succeeds(handler: &RequestHandler, target: PaneTarget) {
-    let response = handler
-        .handle(Request::SendKeys(rmux_proto::SendKeysRequest {
+    handler
+        .handle_ok(SendKeysRequest {
             target,
             keys: vec!["x".to_owned()],
-        }))
+        })
         .await;
-    assert!(matches!(response, Response::SendKeys(_)), "{response:?}");
 }
 
 async fn assert_pane_output_observes(
@@ -43,49 +47,44 @@ async fn grouped_unlink_k_preserves_each_session_local_fallback_identity() {
                 let peer = session_name(&format!(
                     "unlink-local-peer-{target_index}-{renumber}-{peer_target_active}"
                 ));
-                let base_index = handler
-                    .handle(Request::SetOption(SetOptionRequest {
-                        scope: ScopeSelector::Global,
-                        option: OptionName::BaseIndex,
-                        value: target_index.to_string(),
-                        mode: SetOptionMode::Replace,
-                    }))
+                handler
+                    .set_option(
+                        ScopeSelector::Global,
+                        OptionName::BaseIndex,
+                        &target_index.to_string(),
+                    )
                     .await;
-                assert!(
-                    matches!(base_index, Response::SetOption(_)),
-                    "{base_index:?}"
-                );
-                create_session(&handler, owner.as_str()).await;
+                create_session(&handler, &owner).await;
                 for window_index in 0..target_index {
-                    create_window_at(&handler, &owner, window_index).await;
+                    handler
+                        .create_window(NewWindowRequest {
+                            command: Some(quiet_command()),
+                            target_window_index: Some(window_index),
+                            ..Fixture::fixture(&owner)
+                        })
+                        .await;
                 }
-                create_grouped_session(&handler, peer.as_str(), &owner).await;
+                create_grouped_session(&handler, &peer, &owner).await;
                 if peer_target_active {
                     // tmux starts the peer on index 0, so this single command
                     // records 0 as its local last window. On the regression
                     // base RMUX has already copied the owner's target, making
                     // the same command a no-op with no fallback history.
-                    let selected = handler
-                        .handle(Request::SelectWindow(SelectWindowRequest {
+                    handler
+                        .handle_ok(SelectWindowRequest {
                             target: WindowTarget::with_window(peer.clone(), target_index),
-                        }))
+                        })
                         .await;
-                    assert!(
-                        matches!(selected, Response::SelectWindow(_)),
-                        "{selected:?}"
-                    );
                 }
 
                 for session_name in [&owner, &peer] {
-                    let response = handler
-                        .handle(Request::SetOption(SetOptionRequest {
-                            scope: ScopeSelector::Session(session_name.clone()),
-                            option: OptionName::RenumberWindows,
-                            value: if renumber { "on" } else { "off" }.to_owned(),
-                            mode: SetOptionMode::Replace,
-                        }))
+                    handler
+                        .set_option(
+                            ScopeSelector::Session(session_name.clone()),
+                            OptionName::RenumberWindows,
+                            if renumber { "on" } else { "off" },
+                        )
                         .await;
-                    assert!(matches!(response, Response::SetOption(_)), "{response:?}");
                 }
 
                 let (owner_expected, peer_expected) = {
@@ -104,16 +103,12 @@ async fn grouped_unlink_k_preserves_each_session_local_fallback_identity() {
                     (owner_expected, peer_expected)
                 };
 
-                let response = handler
-                    .handle(Request::UnlinkWindow(UnlinkWindowRequest {
+                handler
+                    .handle_ok(UnlinkWindowRequest {
                         target: WindowTarget::with_window(owner.clone(), target_index),
                         kill_if_last: true,
-                    }))
+                    })
                     .await;
-                assert!(
-                    matches!(response, Response::UnlinkWindow(_)),
-                    "{response:?}"
-                );
 
                 let state = handler.state.lock().await;
                 assert_eq!(
@@ -144,12 +139,9 @@ async fn grouped_unlink_k_preserves_each_session_local_fallback_identity() {
 #[tokio::test]
 async fn link_window_refreshes_attached_non_syntactic_group_peer_output_receiver() {
     let handler = RequestHandler::new();
-    let owner = session_name("linked-refresh-owner");
-    let peer = session_name("linked-refresh-peer");
-    let source = session_name("linked-refresh-source");
-    create_session(&handler, owner.as_str()).await;
-    create_grouped_session(&handler, peer.as_str(), &owner).await;
-    create_session(&handler, source.as_str()).await;
+    let owner = create_session(&handler, "linked-refresh-owner").await;
+    let peer = create_grouped_session(&handler, "linked-refresh-peer", &owner).await;
+    let source = create_session(&handler, "linked-refresh-source").await;
 
     let source_pane_id = {
         let state = handler.state.lock().await;
@@ -164,21 +156,18 @@ async fn link_window_refreshes_attached_non_syntactic_group_peer_output_receiver
             .id()
     };
 
-    let (control_tx, mut control_rx) = mpsc::unbounded_channel();
-    handler.register_attach(42, peer.clone(), control_tx).await;
+    let mut control_rx = handler.attach_client(42, &peer).await;
     drain_attach_controls(&mut control_rx).await;
 
-    let response = handler
-        .handle(Request::LinkWindow(LinkWindowRequest {
-            source: WindowTarget::with_window(source.clone(), 0),
-            target: WindowTarget::with_window(owner, 0),
-            after: false,
-            before: false,
+    handler
+        .handle_ok(LinkWindowRequest {
             kill_destination: true,
-            detached: true,
-        }))
+            ..Fixture::fixture((
+                WindowTarget::with_window(source.clone(), 0),
+                WindowTarget::with_window(owner, 0),
+            ))
+        })
         .await;
-    assert!(matches!(response, Response::LinkWindow(_)), "{response:?}");
 
     let control = timeout(Duration::from_secs(2), control_rx.recv())
         .await
@@ -217,80 +206,55 @@ async fn scrollbar_options_resize_shared_runtime_and_refresh_linked_alias() {
     for kind in ["typed", "named", "sdk"] {
         let handler = RequestHandler::new();
         let suffix = kind;
-        let owner = session_name(&format!("scrollbar-option-owner-{suffix}"));
-        let alias = session_name(&format!("scrollbar-option-alias-{suffix}"));
-        create_session(&handler, owner.as_str()).await;
-        create_session(&handler, alias.as_str()).await;
+        let owner = create_session(&handler, format!("scrollbar-option-owner-{suffix}")).await;
+        let alias = create_session(&handler, format!("scrollbar-option-alias-{suffix}")).await;
 
-        let linked = handler
-            .handle(Request::LinkWindow(LinkWindowRequest {
-                source: WindowTarget::with_window(owner.clone(), 0),
-                target: WindowTarget::with_window(alias.clone(), 0),
-                after: false,
-                before: false,
+        handler
+            .handle_ok(LinkWindowRequest {
                 kill_destination: true,
-                detached: true,
-            }))
+                ..Fixture::fixture((
+                    WindowTarget::with_window(owner.clone(), 0),
+                    WindowTarget::with_window(alias.clone(), 0),
+                ))
+            })
             .await;
-        assert!(matches!(linked, Response::LinkWindow(_)), "{linked:?}");
-        handler.wait_for_initial_panes_for_test().await;
         if kind == "sdk" {
-            assert!(matches!(
-                handler
-                    .handle(Request::SetOption(SetOptionRequest {
-                        scope: ScopeSelector::Window(WindowTarget::with_window(owner.clone(), 0)),
-                        option: OptionName::PaneScrollbars,
-                        value: "on".to_owned(),
-                        mode: SetOptionMode::Replace,
-                    }))
-                    .await,
-                Response::SetOption(_)
-            ));
+            handler
+                .set_option(
+                    ScopeSelector::Window(WindowTarget::with_window(owner.clone(), 0)),
+                    OptionName::PaneScrollbars,
+                    "on",
+                )
+                .await;
         }
 
-        let (control_tx, mut control_rx) = mpsc::unbounded_channel();
-        handler
-            .register_attach(
-                match kind {
-                    "typed" => 44,
-                    "named" => 45,
-                    "sdk" => 46,
-                    _ => unreachable!(),
-                },
-                alias.clone(),
-                control_tx,
-            )
-            .await;
+        let requester_pid = match kind {
+            "typed" => 44,
+            "named" => 45,
+            "sdk" => 46,
+            _ => unreachable!(),
+        };
+        let mut control_rx = handler.attach_client(requester_pid, &alias).await;
         drain_attach_controls(&mut control_rx).await;
 
         let request = match kind {
-            "named" => Request::SetOptionByName(Box::new(rmux_proto::SetOptionByNameRequest {
-                scope: rmux_proto::OptionScopeSelector::Window(WindowTarget::with_window(
-                    owner.clone(),
-                    0,
-                )),
-                name: "pane-scrollbars".to_owned(),
-                value: Some("on".to_owned()),
-                mode: SetOptionMode::Replace,
-                only_if_unset: false,
-                unset: false,
-                unset_pane_overrides: false,
-                format: false,
-                format_target: None,
-            })),
-            "sdk" => Request::PaneOptionSet(rmux_proto::PaneOptionSetRequest {
+            "named" => Request::SetOptionByName(Box::new(SetOptionByNameRequest::fixture((
+                OptionScopeSelector::Window(WindowTarget::with_window(owner.clone(), 0)),
+                "pane-scrollbars",
+                "on",
+            )))),
+            "sdk" => Request::PaneOptionSet(PaneOptionSetRequest {
                 target: PaneTargetRef::slot(PaneTarget::with_window(owner.clone(), 0, 0)),
                 name: "pane-scrollbars-style".to_owned(),
                 value: Some("width=2,pad=1".to_owned()),
                 mode: SetOptionMode::Replace,
                 unset: false,
             }),
-            "typed" => Request::SetOption(SetOptionRequest {
-                scope: ScopeSelector::Window(WindowTarget::with_window(owner.clone(), 0)),
-                option: OptionName::PaneScrollbars,
-                value: "on".to_owned(),
-                mode: SetOptionMode::Replace,
-            }),
+            "typed" => Request::SetOption(SetOptionRequest::fixture((
+                ScopeSelector::Window(WindowTarget::with_window(owner.clone(), 0)),
+                OptionName::PaneScrollbars,
+                "on",
+            ))),
             _ => unreachable!(),
         };
         let response = handler.handle(request).await;
@@ -346,24 +310,16 @@ async fn scrollbar_options_resize_shared_runtime_and_refresh_linked_alias() {
 #[tokio::test]
 async fn link_window_k_rejects_same_window_identity_through_group_peer_atomically() {
     let handler = RequestHandler::new();
-    let owner = session_name("link-self-owner");
-    let peer = session_name("link-self-peer");
-    let external = session_name("link-self-external");
-    create_session(&handler, owner.as_str()).await;
-    create_grouped_session(&handler, peer.as_str(), &owner).await;
-    create_session(&handler, external.as_str()).await;
+    let owner = create_session(&handler, "link-self-owner").await;
+    let peer = create_grouped_session(&handler, "link-self-peer", &owner).await;
+    let external = create_session(&handler, "link-self-external").await;
 
-    let linked = handler
-        .handle(Request::LinkWindow(LinkWindowRequest {
-            source: WindowTarget::with_window(owner.clone(), 0),
-            target: WindowTarget::with_window(external.clone(), 1),
-            after: false,
-            before: false,
-            kill_destination: false,
-            detached: true,
-        }))
+    handler
+        .handle_ok(LinkWindowRequest::fixture((
+            WindowTarget::with_window(owner.clone(), 0),
+            WindowTarget::with_window(external.clone(), 1),
+        )))
         .await;
-    assert!(matches!(linked, Response::LinkWindow(_)), "{linked:?}");
 
     let (before_sessions, before_targets, stable_window_id) = {
         let state = handler.state.lock().await;
@@ -419,12 +375,8 @@ async fn link_window_k_rejects_same_window_identity_through_group_peer_atomicall
     ] {
         let response = handler
             .handle(Request::LinkWindow(LinkWindowRequest {
-                source: source.clone(),
-                target: WindowTarget::with_window(owner.clone(), 0),
-                after: false,
-                before: false,
                 kill_destination: true,
-                detached: true,
+                ..Fixture::fixture((&source, WindowTarget::with_window(owner.clone(), 0)))
             }))
             .await;
         assert!(
@@ -480,24 +432,15 @@ async fn link_window_k_rejects_same_window_identity_through_group_peer_atomicall
 #[tokio::test]
 async fn link_window_k_between_distinct_grouped_window_ids_remains_supported() {
     let handler = RequestHandler::new();
-    let owner = session_name("link-distinct-owner");
-    let peer = session_name("link-distinct-peer");
-    create_session(&handler, owner.as_str()).await;
-    create_grouped_session(&handler, peer.as_str(), &owner).await;
-    let created = handler
-        .handle(Request::NewWindow(Box::new(NewWindowRequest {
-            target: owner.clone(),
-            name: None,
-            detached: true,
-            start_directory: None,
-            environment: None,
-            command: Some(quiet_window_test_command()),
-            process_command: None,
+    let owner = create_session(&handler, "link-distinct-owner").await;
+    let peer = create_grouped_session(&handler, "link-distinct-peer", &owner).await;
+    handler
+        .create_window(NewWindowRequest {
+            command: Some(quiet_command()),
             target_window_index: Some(1),
-            insert_at_target: false,
-        })))
+            ..Fixture::fixture(&owner)
+        })
         .await;
-    assert!(matches!(created, Response::NewWindow(_)), "{created:?}");
 
     let source_window_id = {
         let state = handler.state.lock().await;
@@ -517,20 +460,16 @@ async fn link_window_k_between_distinct_grouped_window_ids_remains_supported() {
         source_window_id
     };
 
-    let response = handler
-        .handle(Request::LinkWindow(LinkWindowRequest {
-            source: WindowTarget::with_window(peer.clone(), 1),
-            target: WindowTarget::with_window(owner.clone(), 0),
-            after: false,
-            before: false,
+    // Distinct grouped WindowIds must remain replaceable.
+    handler
+        .handle_ok(LinkWindowRequest {
             kill_destination: true,
-            detached: true,
-        }))
+            ..Fixture::fixture((
+                WindowTarget::with_window(peer.clone(), 1),
+                WindowTarget::with_window(owner.clone(), 0),
+            ))
+        })
         .await;
-    assert!(
-        matches!(response, Response::LinkWindow(_)),
-        "distinct grouped WindowIds must remain replaceable, got {response:?}"
-    );
 
     {
         let state = handler.state.lock().await;
@@ -567,50 +506,26 @@ async fn link_window_k_between_distinct_grouped_window_ids_remains_supported() {
 #[tokio::test]
 async fn unlink_window_via_group_peer_refreshes_exact_family_and_removes_exact_timers() {
     let handler = RequestHandler::new();
-    let monitor = handler
-        .handle(Request::SetOption(SetOptionRequest {
-            scope: ScopeSelector::Global,
-            option: OptionName::MonitorSilence,
-            value: "60".to_owned(),
-            mode: SetOptionMode::Replace,
-        }))
-        .await;
-    assert!(matches!(monitor, Response::SetOption(_)), "{monitor:?}");
+    enable_global_monitor_silence(&handler).await;
 
-    let owner = session_name("unlink-refresh-owner");
-    let peer = session_name("unlink-refresh-peer");
-    let external = session_name("unlink-refresh-external");
-    create_session(&handler, owner.as_str()).await;
-    create_grouped_session(&handler, peer.as_str(), &owner).await;
-    create_session(&handler, external.as_str()).await;
-    let created = handler
-        .handle(Request::NewWindow(Box::new(NewWindowRequest {
-            target: owner.clone(),
-            name: None,
-            detached: true,
-            start_directory: None,
-            environment: None,
-            command: Some(quiet_window_test_command()),
-            process_command: None,
+    let owner = create_session(&handler, "unlink-refresh-owner").await;
+    let peer = create_grouped_session(&handler, "unlink-refresh-peer", &owner).await;
+    let external = create_session(&handler, "unlink-refresh-external").await;
+    handler
+        .create_window(NewWindowRequest {
+            command: Some(quiet_command()),
             target_window_index: Some(1),
-            insert_at_target: false,
-        })))
+            ..Fixture::fixture(&owner)
+        })
         .await;
-    assert!(matches!(created, Response::NewWindow(_)), "{created:?}");
-    let linked = handler
-        .handle(Request::LinkWindow(LinkWindowRequest {
-            source: WindowTarget::with_window(owner.clone(), 0),
-            target: WindowTarget::with_window(external.clone(), 1),
-            after: false,
-            before: false,
-            kill_destination: false,
-            detached: true,
-        }))
+    handler
+        .handle_ok(LinkWindowRequest::fixture((
+            WindowTarget::with_window(owner.clone(), 0),
+            WindowTarget::with_window(external.clone(), 1),
+        )))
         .await;
-    assert!(matches!(linked, Response::LinkWindow(_)), "{linked:?}");
 
-    let (control_tx, mut control_rx) = mpsc::unbounded_channel();
-    handler.register_attach(43, owner.clone(), control_tx).await;
+    let mut control_rx = handler.attach_client(43, &owner).await;
     drain_attach_controls(&mut control_rx).await;
 
     let removed_targets = [
@@ -634,16 +549,13 @@ async fn unlink_window_via_group_peer_refreshes_exact_family_and_removes_exact_t
         .map(|target| handler.silence_timer_snapshot_for_test(target))
         .collect::<Vec<_>>();
 
-    let response = handler
-        .handle(Request::UnlinkWindow(UnlinkWindowRequest {
+    let unlinked = handler
+        .handle_ok(UnlinkWindowRequest {
             target: WindowTarget::with_window(peer.clone(), 0),
             kill_if_last: false,
-        }))
+        })
         .await;
-    assert!(
-        matches!(&response, Response::UnlinkWindow(result) if result.target == WindowTarget::with_window(peer.clone(), 1)),
-        "expected grouped peer unlink success, got {response:?}"
-    );
+    assert_eq!(unlinked.target, WindowTarget::with_window(peer.clone(), 1));
 
     let control = timeout(Duration::from_secs(2), control_rx.recv())
         .await
@@ -703,26 +615,19 @@ async fn unlink_window_via_group_peer_refreshes_exact_family_and_removes_exact_t
 #[tokio::test]
 async fn link_window_shares_runtime_tracks_linked_sessions_and_unlinks_cleanly() {
     let handler = RequestHandler::new();
-    let alpha = session_name("alpha");
-    let beta = session_name("beta");
-    create_session(&handler, "alpha").await;
-    create_session(&handler, "beta").await;
+    let alpha = create_session(&handler, "alpha").await;
+    let beta = create_session(&handler, "beta").await;
 
-    let response = handler
-        .handle(Request::LinkWindow(LinkWindowRequest {
-            source: WindowTarget::with_window(alpha.clone(), 0),
-            target: WindowTarget::with_window(beta.clone(), 1),
-            after: false,
-            before: false,
-            kill_destination: false,
+    let linked = handler
+        .handle_ok(LinkWindowRequest {
             detached: false,
-        }))
+            ..Fixture::fixture((
+                WindowTarget::with_window(alpha.clone(), 0),
+                WindowTarget::with_window(beta.clone(), 1),
+            ))
+        })
         .await;
-
-    assert!(
-        matches!(&response, Response::LinkWindow(r) if r.target == WindowTarget::with_window(beta.clone(), 1)),
-        "expected link-window success, got {response:?}"
-    );
+    assert_eq!(linked.target, WindowTarget::with_window(beta.clone(), 1));
 
     {
         let state = handler.state.lock().await;
@@ -751,32 +656,20 @@ async fn link_window_shares_runtime_tracks_linked_sessions_and_unlinks_cleanly()
     }
 
     let linked_formats = handler
-        .handle(Request::DisplayMessage(DisplayMessageRequest {
-            target: Some(Target::Window(WindowTarget::with_window(alpha.clone(), 0))),
-            print: true,
-            message: Some(
-                "#{window_linked}:#{window_linked_sessions}:#{window_linked_sessions_list}"
-                    .to_owned(),
-            ),
-            empty_target_context: false,
-        }))
-        .await
-        .command_output()
-        .expect("window linked format output")
-        .stdout()
-        .to_vec();
+        .display_print(
+            WindowTarget::with_window(alpha.clone(), 0),
+            "#{window_linked}:#{window_linked_sessions}:#{window_linked_sessions_list}",
+        )
+        .await;
     assert_eq!(String::from_utf8_lossy(&linked_formats), "1:2:alpha,beta\n");
 
-    let rename = handler
-        .handle(Request::RenameWindow(RenameWindowRequest {
+    let renamed = handler
+        .handle_ok(RenameWindowRequest {
             target: WindowTarget::with_window(beta.clone(), 1),
             name: "logs".to_owned(),
-        }))
+        })
         .await;
-    assert!(
-        matches!(&rename, Response::RenameWindow(r) if r.target == WindowTarget::with_window(beta.clone(), 1)),
-        "expected rename-window success, got {rename:?}"
-    );
+    assert_eq!(renamed.target, WindowTarget::with_window(beta.clone(), 1));
 
     {
         let state = handler.state.lock().await;
@@ -795,16 +688,13 @@ async fn link_window_shares_runtime_tracks_linked_sessions_and_unlinks_cleanly()
         assert_eq!(beta_window.name(), Some("logs"));
     }
 
-    let unlink = handler
-        .handle(Request::UnlinkWindow(UnlinkWindowRequest {
+    let unlinked = handler
+        .handle_ok(UnlinkWindowRequest {
             target: WindowTarget::with_window(beta.clone(), 1),
             kill_if_last: false,
-        }))
+        })
         .await;
-    assert!(
-        matches!(&unlink, Response::UnlinkWindow(r) if r.target == WindowTarget::with_window(beta.clone(), 0)),
-        "expected unlink-window success, got {unlink:?}"
-    );
+    assert_eq!(unlinked.target, WindowTarget::with_window(beta.clone(), 0));
 
     let state = handler.state.lock().await;
     assert_eq!(state.window_link_count(&alpha, 0), 1);
@@ -830,43 +720,28 @@ async fn link_window_shares_runtime_tracks_linked_sessions_and_unlinks_cleanly()
 #[tokio::test]
 async fn linked_session_formats_include_session_group_peers() {
     let handler = RequestHandler::new();
-    let alpha = session_name("alpha");
-    let gamma = session_name("gamma");
-    create_session(&handler, "alpha").await;
+    let alpha = create_session(&handler, "alpha").await;
     create_grouped_session(&handler, "beta", &alpha).await;
-    create_session(&handler, "gamma").await;
+    let gamma = create_session(&handler, "gamma").await;
     create_grouped_session(&handler, "delta", &gamma).await;
 
-    let response = handler
-        .handle(Request::LinkWindow(LinkWindowRequest {
-            source: WindowTarget::with_window(alpha.clone(), 0),
-            target: WindowTarget::with_window(gamma.clone(), 1),
-            after: false,
-            before: false,
-            kill_destination: false,
+    let linked = handler
+        .handle_ok(LinkWindowRequest {
             detached: false,
-        }))
+            ..Fixture::fixture((
+                WindowTarget::with_window(alpha.clone(), 0),
+                WindowTarget::with_window(gamma.clone(), 1),
+            ))
+        })
         .await;
-    assert!(
-        matches!(&response, Response::LinkWindow(r) if r.target == WindowTarget::with_window(gamma.clone(), 1)),
-        "expected link-window success, got {response:?}"
-    );
+    assert_eq!(linked.target, WindowTarget::with_window(gamma, 1));
 
     let linked_formats = handler
-        .handle(Request::DisplayMessage(DisplayMessageRequest {
-            target: Some(Target::Window(WindowTarget::with_window(alpha.clone(), 0))),
-            print: true,
-            message: Some(
-                "#{window_linked}:#{window_linked_sessions}:#{window_linked_sessions_list}"
-                    .to_owned(),
-            ),
-            empty_target_context: false,
-        }))
-        .await
-        .command_output()
-        .expect("window linked format output")
-        .stdout()
-        .to_vec();
+        .display_print(
+            WindowTarget::with_window(alpha, 0),
+            "#{window_linked}:#{window_linked_sessions}:#{window_linked_sessions_list}",
+        )
+        .await;
 
     assert_eq!(
         String::from_utf8_lossy(&linked_formats),
@@ -877,35 +752,26 @@ async fn linked_session_formats_include_session_group_peers() {
 #[tokio::test]
 async fn linked_windows_survive_runtime_owner_session_rename() {
     let handler = RequestHandler::new();
-    let alpha = session_name("alpha");
-    let beta = session_name("beta");
+    let alpha = create_session(&handler, "alpha").await;
+    let beta = create_session(&handler, "beta").await;
     let gamma = session_name("gamma");
-    create_session(&handler, "alpha").await;
-    create_session(&handler, "beta").await;
 
-    assert!(matches!(
-        handler
-            .handle(Request::LinkWindow(LinkWindowRequest {
-                source: WindowTarget::with_window(alpha.clone(), 0),
-                target: WindowTarget::with_window(beta.clone(), 1),
-                after: false,
-                before: false,
-                kill_destination: false,
-                detached: false,
-            }))
-            .await,
-        Response::LinkWindow(_)
-    ));
+    handler
+        .handle_ok(LinkWindowRequest {
+            detached: false,
+            ..Fixture::fixture((
+                WindowTarget::with_window(alpha.clone(), 0),
+                WindowTarget::with_window(beta.clone(), 1),
+            ))
+        })
+        .await;
 
-    assert!(matches!(
-        handler
-            .handle(Request::RenameSession(RenameSessionRequest {
-                target: alpha,
-                new_name: gamma.clone(),
-            }))
-            .await,
-        Response::RenameSession(_)
-    ));
+    handler
+        .handle_ok(RenameSessionRequest {
+            target: alpha,
+            new_name: gamma.clone(),
+        })
+        .await;
 
     {
         let state = handler.state.lock().await;
@@ -921,27 +787,24 @@ async fn linked_windows_survive_runtime_owner_session_rename() {
         );
     }
 
+    // Linked list-panes must survive the owner rename.
     let list = handler
-        .handle(Request::ListPanes(Box::new(ListPanesRequest {
+        .handle_ok(ListPanesRequest {
             target: beta,
             target_window_index: Some(1),
             format: Some("#{session_name}:#{window_index}:#{pane_index}".to_owned()),
             filter: None,
             sort_order: None,
             reversed: false,
-        })))
+        })
         .await;
-    let Response::ListPanes(list) = list else {
-        panic!("linked list-panes should survive owner rename, got {list:?}");
-    };
     assert_eq!(String::from_utf8_lossy(list.output.stdout()), "beta:1:0\n");
 }
 
 #[tokio::test]
 async fn link_window_relative_same_destination_slot_makes_room_like_tmux() {
     let handler = RequestHandler::new();
-    let alpha = session_name("alpha");
-    create_session(&handler, "alpha").await;
+    let alpha = create_session(&handler, "alpha").await;
     insert_window(&handler, &alpha, 1).await;
     insert_window(&handler, &alpha, 2).await;
 
@@ -956,21 +819,21 @@ async fn link_window_relative_same_destination_slot_makes_room_like_tmux() {
     };
 
     let response = handler
-        .handle(Request::LinkWindow(LinkWindowRequest {
-            source: WindowTarget::with_window(alpha.clone(), 1),
-            target: WindowTarget::with_window(alpha.clone(), 0),
+        .handle_ok(LinkWindowRequest {
             after: true,
-            before: false,
-            kill_destination: false,
             detached: false,
-        }))
+            ..Fixture::fixture((
+                WindowTarget::with_window(alpha.clone(), 1),
+                WindowTarget::with_window(alpha.clone(), 0),
+            ))
+        })
         .await;
 
     assert_eq!(
         response,
-        Response::LinkWindow(rmux_proto::LinkWindowResponse {
+        LinkWindowResponse {
             target: WindowTarget::with_window(alpha.clone(), 1),
-        })
+        }
     );
 
     let state = handler.state.lock().await;
@@ -988,47 +851,27 @@ async fn link_window_relative_same_destination_slot_makes_room_like_tmux() {
 #[tokio::test]
 async fn linked_windows_survive_runtime_owner_session_removal_after_rename() {
     let handler = RequestHandler::new();
-    let alpha = session_name("alpha");
-    let beta = session_name("beta");
+    let alpha = create_session(&handler, "alpha").await;
+    let beta = create_session(&handler, "beta").await;
     let gamma = session_name("gamma");
-    create_session(&handler, "alpha").await;
-    create_session(&handler, "beta").await;
 
-    assert!(matches!(
-        handler
-            .handle(Request::LinkWindow(LinkWindowRequest {
-                source: WindowTarget::with_window(alpha.clone(), 0),
-                target: WindowTarget::with_window(beta.clone(), 1),
-                after: false,
-                before: false,
-                kill_destination: false,
-                detached: false,
-            }))
-            .await,
-        Response::LinkWindow(_)
-    ));
-    assert!(matches!(
-        handler
-            .handle(Request::RenameSession(RenameSessionRequest {
-                target: alpha,
-                new_name: gamma.clone(),
-            }))
-            .await,
-        Response::RenameSession(_)
-    ));
-
-    let kill = handler
-        .handle(Request::KillSession(KillSessionRequest {
-            target: gamma.clone(),
-            kill_all_except_target: false,
-            clear_alerts: false,
-            kill_group: false,
-        }))
+    handler
+        .handle_ok(LinkWindowRequest {
+            detached: false,
+            ..Fixture::fixture((
+                WindowTarget::with_window(alpha.clone(), 0),
+                WindowTarget::with_window(beta.clone(), 1),
+            ))
+        })
         .await;
-    assert!(
-        matches!(kill, Response::KillSession(_)),
-        "expected kill-session success, got {kill:?}"
-    );
+    handler
+        .handle_ok(RenameSessionRequest {
+            target: alpha,
+            new_name: gamma.clone(),
+        })
+        .await;
+
+    handler.handle_ok(KillSessionRequest::fixture(&gamma)).await;
 
     {
         let state = handler.state.lock().await;
@@ -1047,53 +890,40 @@ async fn linked_windows_survive_runtime_owner_session_removal_after_rename() {
         );
     }
 
+    // Linked list-panes must survive the owner removal.
     let list = handler
-        .handle(Request::ListPanes(Box::new(ListPanesRequest {
+        .handle_ok(ListPanesRequest {
             target: beta,
             target_window_index: Some(1),
             format: Some("#{session_name}:#{window_index}:#{pane_index}".to_owned()),
             filter: None,
             sort_order: None,
             reversed: false,
-        })))
+        })
         .await;
-    let Response::ListPanes(list) = list else {
-        panic!("linked list-panes should survive owner removal, got {list:?}");
-    };
     assert_eq!(String::from_utf8_lossy(list.output.stdout()), "beta:1:0\n");
 }
 
 #[tokio::test]
 async fn unlink_window_runtime_owner_transfers_runtime_to_surviving_alias() {
     let handler = RequestHandler::new();
-    let owner = session_name("unlink-runtime-owner");
-    let external = session_name("unlink-runtime-external");
-    create_session(&handler, owner.as_str()).await;
+    let owner = create_session(&handler, "unlink-runtime-owner").await;
     insert_window(&handler, &owner, 1).await;
-    create_session(&handler, external.as_str()).await;
+    let external = create_session(&handler, "unlink-runtime-external").await;
 
-    let linked = handler
-        .handle(Request::LinkWindow(LinkWindowRequest {
-            source: WindowTarget::with_window(owner.clone(), 0),
-            target: WindowTarget::with_window(external.clone(), 1),
-            after: false,
-            before: false,
-            kill_destination: false,
-            detached: true,
-        }))
+    handler
+        .handle_ok(LinkWindowRequest::fixture((
+            WindowTarget::with_window(owner.clone(), 0),
+            WindowTarget::with_window(external.clone(), 1),
+        )))
         .await;
-    assert!(matches!(linked, Response::LinkWindow(_)), "{linked:?}");
 
-    let unlinked = handler
-        .handle(Request::UnlinkWindow(UnlinkWindowRequest {
+    handler
+        .handle_ok(UnlinkWindowRequest {
             target: WindowTarget::with_window(owner.clone(), 0),
             kill_if_last: false,
-        }))
+        })
         .await;
-    assert!(
-        matches!(unlinked, Response::UnlinkWindow(_)),
-        "{unlinked:?}"
-    );
 
     {
         let state = handler.state.lock().await;
@@ -1111,37 +941,27 @@ async fn unlink_window_runtime_owner_transfers_runtime_to_surviving_alias() {
 #[tokio::test]
 async fn link_window_k_runtime_owner_transfers_replaced_runtime_to_surviving_alias() {
     let handler = RequestHandler::new();
-    let owner = session_name("link-k-runtime-owner");
-    let external = session_name("link-k-runtime-external");
-    let replacement = session_name("link-k-runtime-replacement");
-    create_session(&handler, owner.as_str()).await;
+    let owner = create_session(&handler, "link-k-runtime-owner").await;
     insert_window(&handler, &owner, 1).await;
-    create_session(&handler, external.as_str()).await;
-    create_session(&handler, replacement.as_str()).await;
+    let external = create_session(&handler, "link-k-runtime-external").await;
+    let replacement = create_session(&handler, "link-k-runtime-replacement").await;
 
-    let linked = handler
-        .handle(Request::LinkWindow(LinkWindowRequest {
-            source: WindowTarget::with_window(owner.clone(), 0),
-            target: WindowTarget::with_window(external.clone(), 1),
-            after: false,
-            before: false,
-            kill_destination: false,
-            detached: true,
-        }))
+    handler
+        .handle_ok(LinkWindowRequest::fixture((
+            WindowTarget::with_window(owner.clone(), 0),
+            WindowTarget::with_window(external.clone(), 1),
+        )))
         .await;
-    assert!(matches!(linked, Response::LinkWindow(_)), "{linked:?}");
 
-    let replaced = handler
-        .handle(Request::LinkWindow(LinkWindowRequest {
-            source: WindowTarget::with_window(replacement.clone(), 0),
-            target: WindowTarget::with_window(owner.clone(), 0),
-            after: false,
-            before: false,
+    handler
+        .handle_ok(LinkWindowRequest {
             kill_destination: true,
-            detached: true,
-        }))
+            ..Fixture::fixture((
+                WindowTarget::with_window(replacement.clone(), 0),
+                WindowTarget::with_window(owner.clone(), 0),
+            ))
+        })
         .await;
-    assert!(matches!(replaced, Response::LinkWindow(_)), "{replaced:?}");
 
     {
         let state = handler.state.lock().await;
@@ -1160,34 +980,18 @@ async fn link_window_k_runtime_owner_transfers_replaced_runtime_to_surviving_ali
 #[tokio::test]
 async fn killing_grouped_runtime_owner_preserves_external_linked_alias() {
     let handler = RequestHandler::new();
-    let owner = session_name("group-kill-runtime-owner");
-    let peer = session_name("group-kill-runtime-peer");
-    let external = session_name("group-kill-runtime-external");
-    create_session(&handler, owner.as_str()).await;
-    create_grouped_session(&handler, peer.as_str(), &owner).await;
-    create_session(&handler, external.as_str()).await;
+    let owner = create_session(&handler, "group-kill-runtime-owner").await;
+    let peer = create_grouped_session(&handler, "group-kill-runtime-peer", &owner).await;
+    let external = create_session(&handler, "group-kill-runtime-external").await;
 
-    let linked = handler
-        .handle(Request::LinkWindow(LinkWindowRequest {
-            source: WindowTarget::with_window(owner.clone(), 0),
-            target: WindowTarget::with_window(external.clone(), 1),
-            after: false,
-            before: false,
-            kill_destination: false,
-            detached: true,
-        }))
+    handler
+        .handle_ok(LinkWindowRequest::fixture((
+            WindowTarget::with_window(owner.clone(), 0),
+            WindowTarget::with_window(external.clone(), 1),
+        )))
         .await;
-    assert!(matches!(linked, Response::LinkWindow(_)), "{linked:?}");
 
-    let killed = handler
-        .handle(Request::KillSession(KillSessionRequest {
-            target: owner.clone(),
-            kill_all_except_target: false,
-            clear_alerts: false,
-            kill_group: false,
-        }))
-        .await;
-    assert!(matches!(killed, Response::KillSession(_)), "{killed:?}");
+    handler.handle_ok(KillSessionRequest::fixture(&owner)).await;
 
     {
         let state = handler.state.lock().await;
@@ -1213,60 +1017,37 @@ async fn killing_grouped_runtime_owner_preserves_external_linked_alias() {
 #[tokio::test]
 async fn link_window_shares_pane_base_index_with_linked_slots() {
     let handler = RequestHandler::new();
-    let alpha = session_name("alpha");
-    let beta = session_name("beta");
-    create_session(&handler, "alpha").await;
-    create_session(&handler, "beta").await;
+    let alpha = create_session(&handler, "alpha").await;
+    let beta = create_session(&handler, "beta").await;
 
-    assert!(matches!(
-        handler
-            .handle(Request::SplitWindow(SplitWindowRequest {
-                target: SplitWindowTarget::Session(alpha.clone()),
-                direction: SplitDirection::Vertical,
-                before: false,
-                environment: None,
-            }))
-            .await,
-        Response::SplitWindow(_)
-    ));
-    assert!(matches!(
-        handler
-            .handle(Request::SetOption(SetOptionRequest {
-                scope: ScopeSelector::Window(WindowTarget::with_window(alpha.clone(), 0)),
-                option: OptionName::PaneBaseIndex,
-                value: "1".to_owned(),
-                mode: SetOptionMode::Replace,
-            }))
-            .await,
-        Response::SetOption(_)
-    ));
-    assert!(matches!(
-        handler
-            .handle(Request::LinkWindow(LinkWindowRequest {
-                source: WindowTarget::with_window(alpha.clone(), 0),
-                target: WindowTarget::with_window(beta.clone(), 1),
-                after: false,
-                before: false,
-                kill_destination: false,
-                detached: false,
-            }))
-            .await,
-        Response::LinkWindow(_)
-    ));
+    handler.handle_ok(SplitWindowRequest::fixture(&alpha)).await;
+    handler
+        .set_option(
+            ScopeSelector::Window(WindowTarget::with_window(alpha.clone(), 0)),
+            OptionName::PaneBaseIndex,
+            "1",
+        )
+        .await;
+    handler
+        .handle_ok(LinkWindowRequest {
+            detached: false,
+            ..Fixture::fixture((
+                WindowTarget::with_window(alpha.clone(), 0),
+                WindowTarget::with_window(beta.clone(), 1),
+            ))
+        })
+        .await;
 
     let list = handler
-        .handle(Request::ListPanes(Box::new(ListPanesRequest {
+        .handle_ok(ListPanesRequest {
             target: beta.clone(),
             target_window_index: Some(1),
             format: Some("#{pane_index}".to_owned()),
             filter: None,
             sort_order: None,
             reversed: false,
-        })))
+        })
         .await;
-    let Response::ListPanes(list) = list else {
-        panic!("linked list-panes should succeed, got {list:?}");
-    };
     assert_eq!(
         String::from_utf8_lossy(list.output.stdout()),
         "1\n2\n",
@@ -1293,24 +1074,15 @@ async fn link_window_shares_pane_base_index_with_linked_slots() {
 #[tokio::test]
 async fn linked_window_id_resolution_prefers_current_session_slot() {
     let handler = RequestHandler::new();
-    let alpha = session_name("alpha");
-    let beta = session_name("beta");
-    create_session(&handler, "alpha").await;
-    create_session(&handler, "beta").await;
+    let alpha = create_session(&handler, "alpha").await;
+    let beta = create_session(&handler, "beta").await;
 
-    assert!(matches!(
-        handler
-            .handle(Request::LinkWindow(LinkWindowRequest {
-                source: WindowTarget::with_window(alpha.clone(), 0),
-                target: WindowTarget::with_window(beta.clone(), 1),
-                after: false,
-                before: false,
-                kill_destination: false,
-                detached: true,
-            }))
-            .await,
-        Response::LinkWindow(_)
-    ));
+    handler
+        .handle_ok(LinkWindowRequest::fixture((
+            WindowTarget::with_window(alpha.clone(), 0),
+            WindowTarget::with_window(beta.clone(), 1),
+        )))
+        .await;
 
     let window_id = {
         let state = handler.state.lock().await;
@@ -1343,20 +1115,19 @@ async fn linked_window_id_resolution_prefers_current_session_slot() {
 #[tokio::test]
 async fn unlink_window_kill_if_last_deletes_an_unshared_window_slot() {
     let handler = RequestHandler::new();
-    let alpha = session_name("alpha");
-    create_session(&handler, "alpha").await;
+    let alpha = create_session(&handler, "alpha").await;
     insert_window(&handler, &alpha, 1).await;
 
-    let response = handler
-        .handle(Request::UnlinkWindow(UnlinkWindowRequest {
+    let unlinked = handler
+        .handle_ok(UnlinkWindowRequest {
             target: WindowTarget::with_window(alpha.clone(), 1),
             kill_if_last: true,
-        }))
+        })
         .await;
-
-    assert!(
-        matches!(&response, Response::UnlinkWindow(r) if r.target == WindowTarget::with_window(alpha.clone(), 0)),
-        "expected unlink-window -k to remove the unshared slot, got {response:?}"
+    assert_eq!(
+        unlinked.target,
+        WindowTarget::with_window(alpha.clone(), 0),
+        "expected unlink-window -k to remove the unshared slot"
     );
 
     let state = handler.state.lock().await;
@@ -1374,44 +1145,28 @@ async fn unlink_only_linked_window_destroys_the_empty_session() {
     // window removes that session when the window survives through another
     // link.
     let handler = RequestHandler::new();
-    let owner = session_name("unlink-only-window-owner");
-    let alias = session_name("unlink-only-window-alias");
-    create_session(&handler, owner.as_str()).await;
-    create_session(&handler, alias.as_str()).await;
+    let owner = create_session(&handler, "unlink-only-window-owner").await;
+    let alias = create_session(&handler, "unlink-only-window-alias").await;
 
-    assert!(matches!(
-        handler
-            .handle(Request::LinkWindow(LinkWindowRequest {
-                source: WindowTarget::with_window(owner.clone(), 0),
-                target: WindowTarget::with_window(alias.clone(), 9),
-                after: false,
-                before: false,
-                kill_destination: false,
-                detached: true,
-            }))
-            .await,
-        Response::LinkWindow(_)
-    ));
-    assert!(matches!(
-        handler
-            .handle(Request::KillWindow(KillWindowRequest {
-                target: WindowTarget::with_window(alias.clone(), 0),
-                kill_all_others: false,
-            }))
-            .await,
-        Response::KillWindow(_)
-    ));
+    handler
+        .handle_ok(LinkWindowRequest::fixture((
+            WindowTarget::with_window(owner.clone(), 0),
+            WindowTarget::with_window(alias.clone(), 9),
+        )))
+        .await;
+    handler
+        .handle_ok(KillWindowRequest::fixture(WindowTarget::with_window(
+            alias.clone(),
+            0,
+        )))
+        .await;
 
-    let response = handler
-        .handle(Request::UnlinkWindow(UnlinkWindowRequest {
+    handler
+        .handle_ok(UnlinkWindowRequest {
             target: WindowTarget::with_window(alias.clone(), 9),
             kill_if_last: false,
-        }))
+        })
         .await;
-    assert!(
-        matches!(response, Response::UnlinkWindow(_)),
-        "{response:?}"
-    );
 
     let state = handler.state.lock().await;
     assert!(
@@ -1431,29 +1186,21 @@ async fn unlink_only_linked_window_destroys_the_empty_session() {
 #[tokio::test]
 async fn unlink_only_linked_window_preserves_a_concurrently_added_window() {
     let handler = std::sync::Arc::new(RequestHandler::new());
-    let owner = session_name("unlink-race-owner");
-    let alias = session_name("unlink-race-alias");
-    create_session(&handler, owner.as_str()).await;
-    create_session(&handler, alias.as_str()).await;
+    let owner = create_session(&handler, "unlink-race-owner").await;
+    let alias = create_session(&handler, "unlink-race-alias").await;
 
-    let linked = handler
-        .handle(Request::LinkWindow(LinkWindowRequest {
-            source: WindowTarget::with_window(owner.clone(), 0),
-            target: WindowTarget::with_window(alias.clone(), 9),
-            after: false,
-            before: false,
-            kill_destination: false,
-            detached: true,
-        }))
+    handler
+        .handle_ok(LinkWindowRequest::fixture((
+            WindowTarget::with_window(owner.clone(), 0),
+            WindowTarget::with_window(alias.clone(), 9),
+        )))
         .await;
-    assert!(matches!(linked, Response::LinkWindow(_)), "{linked:?}");
-    let killed = handler
-        .handle(Request::KillWindow(KillWindowRequest {
-            target: WindowTarget::with_window(alias.clone(), 0),
-            kill_all_others: false,
-        }))
+    handler
+        .handle_ok(KillWindowRequest::fixture(WindowTarget::with_window(
+            alias.clone(),
+            0,
+        )))
         .await;
-    assert!(matches!(killed, Response::KillWindow(_)), "{killed:?}");
 
     let pause = handler.install_kill_session_selection_identity_pause(alias.clone());
     let unlink_handler = std::sync::Arc::clone(&handler);
@@ -1470,20 +1217,13 @@ async fn unlink_only_linked_window_preserves_a_concurrently_added_window() {
         .await
         .expect("conditional session removal reaches the identity pause");
 
-    let created = handler
-        .handle(Request::NewWindow(Box::new(NewWindowRequest {
-            target: alias.clone(),
-            name: None,
-            detached: true,
-            start_directory: None,
-            environment: None,
-            command: Some(quiet_window_test_command()),
-            process_command: None,
+    handler
+        .create_window(NewWindowRequest {
+            command: Some(quiet_command()),
             target_window_index: Some(10),
-            insert_at_target: false,
-        })))
+            ..Fixture::fixture(&alias)
+        })
         .await;
-    assert!(matches!(created, Response::NewWindow(_)), "{created:?}");
     pause.release.notify_one();
 
     let unlinked = timeout(Duration::from_secs(2), unlinking)
@@ -1515,31 +1255,19 @@ async fn unlink_only_linked_window_preserves_a_concurrently_added_window() {
 #[tokio::test]
 async fn unlink_window_kill_if_last_rekeys_renumbered_silence_timers_without_delay() {
     let handler = RequestHandler::new();
-    let alpha = session_name("unlink-renumber-timers");
-    let unrelated = session_name("unlink-renumber-unrelated");
-    create_session(&handler, alpha.as_str()).await;
+    let alpha = create_session(&handler, "unlink-renumber-timers").await;
     insert_window(&handler, &alpha, 1).await;
     insert_window(&handler, &alpha, 2).await;
-    create_session(&handler, unrelated.as_str()).await;
+    let unrelated = create_session(&handler, "unlink-renumber-unrelated").await;
 
-    let response = handler
-        .handle(Request::SetOption(SetOptionRequest {
-            scope: ScopeSelector::Session(alpha.clone()),
-            option: OptionName::RenumberWindows,
-            value: "on".to_owned(),
-            mode: SetOptionMode::Replace,
-        }))
+    handler
+        .set_option(
+            ScopeSelector::Session(alpha.clone()),
+            OptionName::RenumberWindows,
+            "on",
+        )
         .await;
-    assert!(matches!(response, Response::SetOption(_)), "{response:?}");
-    let response = handler
-        .handle(Request::SetOption(SetOptionRequest {
-            scope: ScopeSelector::Global,
-            option: OptionName::MonitorSilence,
-            value: "60".to_owned(),
-            mode: SetOptionMode::Replace,
-        }))
-        .await;
-    assert!(matches!(response, Response::SetOption(_)), "{response:?}");
+    enable_global_monitor_silence(&handler).await;
 
     let targets = [
         WindowTarget::with_window(alpha.clone(), 0),
@@ -1564,15 +1292,16 @@ async fn unlink_window_kill_if_last_rekeys_renumbered_silence_timers_without_del
         ]
     };
 
-    let response = handler
-        .handle(Request::UnlinkWindow(UnlinkWindowRequest {
+    let unlinked = handler
+        .handle_ok(UnlinkWindowRequest {
             target: targets[0].clone(),
             kill_if_last: true,
-        }))
+        })
         .await;
-    assert!(
-        matches!(&response, Response::UnlinkWindow(result) if result.target == WindowTarget::with_window(alpha.clone(), 1)),
-        "expected unlink-window -k success with renumbering, got {response:?}"
+    assert_eq!(
+        unlinked.target,
+        WindowTarget::with_window(alpha.clone(), 1),
+        "expected unlink-window -k success with renumbering"
     );
 
     {
@@ -1619,41 +1348,27 @@ async fn unlink_window_kill_if_last_rekeys_renumbered_silence_timers_without_del
 #[tokio::test]
 async fn unlink_window_restores_previous_last_window_flag_after_active_link_removal() {
     let handler = RequestHandler::new();
-    let alpha = session_name("alpha");
-    create_session(&handler, "alpha").await;
+    let alpha = create_session(&handler, "alpha").await;
     insert_window(&handler, &alpha, 1).await;
     insert_window(&handler, &alpha, 2).await;
 
-    assert!(matches!(
+    for window_index in [1, 0] {
         handler
-            .handle(Request::SelectWindow(SelectWindowRequest {
-                target: WindowTarget::with_window(alpha.clone(), 1),
-            }))
-            .await,
-        Response::SelectWindow(_)
-    ));
-    assert!(matches!(
-        handler
-            .handle(Request::SelectWindow(SelectWindowRequest {
-                target: WindowTarget::with_window(alpha.clone(), 0),
-            }))
-            .await,
-        Response::SelectWindow(_)
-    ));
+            .handle_ok(SelectWindowRequest {
+                target: WindowTarget::with_window(alpha.clone(), window_index),
+            })
+            .await;
+    }
 
-    assert!(matches!(
-        handler
-            .handle(Request::LinkWindow(LinkWindowRequest {
-                source: WindowTarget::with_window(alpha.clone(), 0),
-                target: WindowTarget::with_window(alpha.clone(), 9),
-                after: false,
-                before: false,
-                kill_destination: false,
-                detached: false,
-            }))
-            .await,
-        Response::LinkWindow(_)
-    ));
+    handler
+        .handle_ok(LinkWindowRequest {
+            detached: false,
+            ..Fixture::fixture((
+                WindowTarget::with_window(alpha.clone(), 0),
+                WindowTarget::with_window(alpha.clone(), 9),
+            ))
+        })
+        .await;
     {
         let state = handler.state.lock().await;
         assert_eq!(state.window_link_count(&alpha, 0), 2);
@@ -1663,15 +1378,12 @@ async fn unlink_window_restores_previous_last_window_flag_after_active_link_remo
             vec![alpha.clone()]
         );
     }
-    assert!(matches!(
-        handler
-            .handle(Request::UnlinkWindow(UnlinkWindowRequest {
-                target: WindowTarget::with_window(alpha.clone(), 9),
-                kill_if_last: true,
-            }))
-            .await,
-        Response::UnlinkWindow(_)
-    ));
+    handler
+        .handle_ok(UnlinkWindowRequest {
+            target: WindowTarget::with_window(alpha.clone(), 9),
+            kill_if_last: true,
+        })
+        .await;
 
     let state = handler.state.lock().await;
     let session = state.sessions.session(&alpha).expect("alpha should exist");

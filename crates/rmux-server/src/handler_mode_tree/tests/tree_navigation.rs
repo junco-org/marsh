@@ -2,42 +2,10 @@ use super::*;
 
 #[test]
 fn collapse_or_parent_moves_to_parent_when_already_collapsed() {
-    let mut items = BTreeMap::new();
-    items.insert(
-        "parent".to_owned(),
-        ModeTreeItem {
-            id: "parent".to_owned(),
-            parent: None,
-            children: vec!["child".to_owned()],
-            depth: 0,
-            line: String::new(),
-            search_text: String::new(),
-            preview: Vec::new(),
-            no_tag: false,
-            action: ModeTreeAction::None,
-        },
-    );
-    items.insert(
-        "child".to_owned(),
-        ModeTreeItem {
-            id: "child".to_owned(),
-            parent: Some("parent".to_owned()),
-            children: Vec::new(),
-            depth: 1,
-            line: String::new(),
-            search_text: String::new(),
-            preview: Vec::new(),
-            no_tag: false,
-            action: ModeTreeAction::None,
-        },
-    );
-    let build = ModeTreeBuild {
-        items,
-        roots: vec!["parent".to_owned()],
-        order: vec!["parent".to_owned(), "child".to_owned()],
-        visible: vec!["parent".to_owned(), "child".to_owned()],
-        no_matches: false,
-    };
+    let build = tree_build(vec![
+        tree_item("parent", None, &["child"], 0),
+        tree_item("child", Some("parent"), &[], 1),
+    ]);
     let mut mode = test_mode(10);
     mode.selected_id = Some("child".to_owned());
     collapse_or_parent(&mut mode, &build);
@@ -46,42 +14,10 @@ fn collapse_or_parent_moves_to_parent_when_already_collapsed() {
 
 #[test]
 fn expand_or_child_expands_then_enters() {
-    let mut items = BTreeMap::new();
-    items.insert(
-        "parent".to_owned(),
-        ModeTreeItem {
-            id: "parent".to_owned(),
-            parent: None,
-            children: vec!["child".to_owned()],
-            depth: 0,
-            line: String::new(),
-            search_text: String::new(),
-            preview: Vec::new(),
-            no_tag: false,
-            action: ModeTreeAction::None,
-        },
-    );
-    items.insert(
-        "child".to_owned(),
-        ModeTreeItem {
-            id: "child".to_owned(),
-            parent: Some("parent".to_owned()),
-            children: Vec::new(),
-            depth: 1,
-            line: String::new(),
-            search_text: String::new(),
-            preview: Vec::new(),
-            no_tag: false,
-            action: ModeTreeAction::None,
-        },
-    );
-    let build = ModeTreeBuild {
-        items,
-        roots: vec!["parent".to_owned()],
-        order: vec!["parent".to_owned(), "child".to_owned()],
-        visible: vec!["parent".to_owned(), "child".to_owned()],
-        no_matches: false,
-    };
+    let build = tree_build(vec![
+        tree_item("parent", None, &["child"], 0),
+        tree_item("child", Some("parent"), &[], 1),
+    ]);
     let mut mode = test_mode(10);
     mode.selected_id = Some("parent".to_owned());
     // First right-arrow: expand
@@ -106,29 +42,8 @@ fn stable_order_reverses_primary_but_not_tiebreaker() {
 
 #[test]
 fn expand_or_child_skips_ghost_children() {
-    let mut items = BTreeMap::new();
-    items.insert(
-        "parent".to_owned(),
-        ModeTreeItem {
-            id: "parent".to_owned(),
-            parent: None,
-            // "ghost" is listed as a child but not in items
-            children: vec!["ghost".to_owned()],
-            depth: 0,
-            line: String::new(),
-            search_text: String::new(),
-            preview: Vec::new(),
-            no_tag: false,
-            action: ModeTreeAction::None,
-        },
-    );
-    let build = ModeTreeBuild {
-        items,
-        roots: vec!["parent".to_owned()],
-        order: vec!["parent".to_owned()],
-        visible: vec!["parent".to_owned()],
-        no_matches: false,
-    };
+    // "ghost" is listed as a child but not in items
+    let build = tree_build(vec![tree_item("parent", None, &["ghost"], 0)]);
     let mut mode = test_mode(10);
     mode.selected_id = Some("parent".to_owned());
     mode.expanded.insert("parent".to_owned());
@@ -183,10 +98,7 @@ fn search_resets_preview_scroll_on_match() {
 
 #[test]
 fn parse_choose_tree_with_template_and_flags() {
-    let parsed = CommandParser::new()
-        .parse_one_group("choose-tree -sZ display-message")
-        .expect("parses");
-    let mode = RequestHandler::parse_mode_tree_queue_command(parsed.commands()[0].clone())
+    let mode = parse_mode_tree_source("choose-tree -sZ display-message")
         .expect("ok")
         .expect("recognized");
     assert_eq!(mode.tree_depth, TreeDepth::Session);
@@ -203,12 +115,7 @@ fn parse_choose_tree_preserves_single_argv_template_for_runtime_reparse() {
         "switch-client -t '#{?#{==:#{session_name},target},%%,missing}'",
         "switch-client -t '%%' ; display-message -p selected",
     ] {
-        let parsed = CommandParser::new()
-            .parse_arguments(["choose-tree", template])
-            .expect("parses");
-        let mode = RequestHandler::parse_mode_tree_queue_command(parsed.commands()[0].clone())
-            .expect("ok")
-            .expect("recognized");
+        let mode = parse_mode_tree(&["choose-tree", template]);
         assert_eq!(mode.template.as_deref(), Some(template));
     }
 }
@@ -216,10 +123,7 @@ fn parse_choose_tree_preserves_single_argv_template_for_runtime_reparse() {
 #[test]
 fn parse_choose_tree_preserves_quoted_source_template_for_runtime_reparse() {
     let template = "switch-client -t '%%' ; display-message -p selected";
-    let parsed = CommandParser::new()
-        .parse_one_group(&format!("choose-tree {template:?}"))
-        .expect("parses");
-    let mode = RequestHandler::parse_mode_tree_queue_command(parsed.commands()[0].clone())
+    let mode = parse_mode_tree_source(&format!("choose-tree {template:?}"))
         .expect("ok")
         .expect("recognized");
     assert_eq!(mode.template.as_deref(), Some(template));
@@ -227,12 +131,7 @@ fn parse_choose_tree_preserves_quoted_source_template_for_runtime_reparse() {
 
 #[test]
 fn parse_choose_tree_zw_preserves_trailing_direct_command_arguments_from_argv() {
-    let parsed = CommandParser::new()
-        .parse_arguments(["choose-tree", "-Zw", "set-buffer", "-b", "chosen", "%%"])
-        .expect("parses");
-    let mode = RequestHandler::parse_mode_tree_queue_command(parsed.commands()[0].clone())
-        .expect("ok")
-        .expect("recognized");
+    let mode = parse_mode_tree(&["choose-tree", "-Zw", "set-buffer", "-b", "chosen", "%%"]);
     assert_eq!(mode.tree_depth, TreeDepth::Window);
     assert!(mode.zoom);
     assert_eq!(
@@ -243,10 +142,7 @@ fn parse_choose_tree_zw_preserves_trailing_direct_command_arguments_from_argv() 
 
 #[test]
 fn parse_choose_tree_double_dash_separates_template() {
-    let parsed = CommandParser::new()
-        .parse_one_group("choose-tree -- -not-a-flag")
-        .expect("parses");
-    let mode = RequestHandler::parse_mode_tree_queue_command(parsed.commands()[0].clone())
+    let mode = parse_mode_tree_source("choose-tree -- -not-a-flag")
         .expect("ok")
         .expect("recognized");
     assert_eq!(mode.template.as_deref(), Some("-not-a-flag"));
@@ -254,9 +150,5 @@ fn parse_choose_tree_double_dash_separates_template() {
 
 #[test]
 fn customize_mode_rejects_extra_argument() {
-    let parsed = CommandParser::new()
-        .parse_one_group("customize-mode unexpected")
-        .expect("parses");
-    let err = RequestHandler::parse_mode_tree_queue_command(parsed.commands()[0].clone());
-    assert!(err.is_err());
+    assert!(parse_mode_tree_source("customize-mode unexpected").is_err());
 }

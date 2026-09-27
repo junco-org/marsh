@@ -367,9 +367,6 @@ pub(crate) async fn open_pane_terminal(
         },
         environment: Some(environment),
         automatic_close,
-        // A pane's name is a reusable label typed by whoever runs the multiplexer, not a stable
-        // agent identity an embedding caller controls.
-        durable: false,
     };
 
     let admission = io.admission_lock().lock().await;
@@ -401,7 +398,6 @@ pub(crate) async fn open_pane_terminal(
                     &handle,
                     line,
                     CommandOptions {
-                        on_finish: None,
                         // An engine-owned pane already reclaims itself; every other one closes
                         // because this command said so.
                         close_on_finish: !automatic_close,

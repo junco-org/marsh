@@ -1,69 +1,70 @@
 use std::fs;
+use std::future::Future;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use super::control_support::{with_control_queue_identity, ControlClientIdentity};
 use super::RequestHandler;
 use crate::control::{ControlModeUpgrade, ControlServerEvent, CONTROL_SERVER_EVENT_CAPACITY};
-use crate::handler::scripting_support::QueueExecutionContext;
+use crate::handler::scripting_support::{parse_request_from_parts, QueueExecutionContext};
+use crate::handler::ControlRegistration;
 use crate::hook_runtime::with_hook_execution;
+use crate::input_keys::MouseForwardEvent;
+use crate::mouse::{AttachedMouseEvent, MouseLocation};
 use crate::outer_terminal::OuterTerminalContext;
+use crate::pane_io::AttachControl;
 use crate::pane_terminals::seed_scratch_dir;
 use crate::server_access::AccessMode;
+use crate::test_fixtures::{quiet_command, unique_temp_path, Fixture, Quiet, TestRequest};
+use crate::test_shell::{command_quote, sh_quote_path};
 use rmux_core::command_parser::CommandParser;
-use rmux_core::TargetFindContext;
+use rmux_core::input::InputParser;
+use rmux_core::{OptionStore, PaneId, Screen, SessionStore, TargetFindContext};
+use rmux_os::identity::UserIdentity;
 use rmux_proto::{
-    encode_internal_runtime_command_arguments, BreakPaneRequest, DisplayMessageRequest, HookName,
-    IfShellRequest, KillSessionRequest, KillWindowRequest, LastWindowRequest, LinkWindowRequest,
-    NewSessionExtRequest, NewSessionRequest, NewWindowRequest, NextWindowRequest, OptionName,
-    OptionScopeSelector, PaneTarget, PreviousWindowRequest, Request, RespawnPaneRequest,
-    RespawnWindowRequest, Response, RotateWindowDirection, RotateWindowRequest,
-    RunShellDelaySeconds, RunShellRequest, RunShellResponse, ScopeSelector, SelectPaneRequest,
-    SessionName, SetEnvironmentRequest, SetOptionMode, SetOptionRequest, ShowBufferRequest,
-    ShowEnvironmentRequest, ShowOptionsRequest, SourceFileRequest, SplitDirection,
-    SplitWindowRequest, SplitWindowTarget, SwapPaneDirection, SwapPaneRequest, Target,
-    TerminalSize, WaitForMode, WaitForRequest, WaitForResponse, WindowTarget,
+    encode_internal_runtime_command_arguments, BreakPaneRequest, HookName, IfShellRequest,
+    KillSessionRequest, KillWindowRequest, LastWindowRequest, LinkWindowRequest,
+    NewSessionExtRequest, NewWindowRequest, NextWindowRequest, OptionName, OptionScopeSelector,
+    PaneTarget, PreviousWindowRequest, Request, RespawnPaneRequest, RespawnWindowRequest, Response,
+    RmuxError, RotateWindowDirection, RotateWindowRequest, RunShellDelaySeconds, RunShellRequest,
+    RunShellResponse, ScopeSelector, SelectPaneRequest, SessionName, SetBufferRequest,
+    SetEnvironmentRequest, ShowBufferRequest, ShowEnvironmentRequest, ShowOptionsRequest,
+    SourceFileRequest, SplitDirection, SplitWindowRequest, SwapPaneDirection, SwapPaneRequest,
+    Target, TerminalSize, WaitForMode, WaitForRequest, WaitForResponse, WindowTarget,
     INTERNAL_CANONICAL_COMMAND_EXECUTION_PATH, INTERNAL_PARSE_TIME_ASSIGNMENTS_PATH,
     INTERNAL_RUNTIME_COMMAND_EXPANSION_PATH,
 };
+use tokio::sync::mpsc;
 
 use crate::test_names::session_name;
 
 fn wait_for(channel: &str, mode: WaitForMode) -> Request {
-    Request::WaitFor(WaitForRequest {
-        channel: channel.to_owned(),
-        mode,
-    })
+    WaitForRequest::fixture((channel, mode)).into_request()
 }
 
 fn run_shell(command: &str, background: bool) -> Request {
-    Request::RunShell(Box::new(RunShellRequest {
-        command: command.to_owned(),
-        arguments: Vec::new(),
+    RunShellRequest {
         background,
-        as_commands: false,
-        show_stderr: false,
-        delay_seconds: None,
-        start_directory: None,
-        target: None,
-        source_depth: None,
-    }))
+        ..Fixture::fixture(command)
+    }
+    .into_request()
 }
 
 fn source_file_request(paths: Vec<String>, cwd: Option<PathBuf>) -> Request {
-    Request::SourceFile(Box::new(SourceFileRequest {
-        paths,
-        quiet: false,
-        parse_only: false,
-        verbose: false,
-        expand_paths: false,
-        target: None,
+    SourceFileRequest {
         caller_cwd: cwd,
-        stdin: None,
-    }))
+        ..Fixture::fixture(paths)
+    }
+    .into_request()
+}
+
+fn show_buffer_request(name: &str) -> Request {
+    Request::ShowBuffer(ShowBufferRequest {
+        name: Some(name.to_owned()),
+    })
 }
 
 fn source_file_stdout_failure(response: Response) -> String {
@@ -96,14 +97,7 @@ fn source_file_stdout_failure(response: Response) -> String {
 /// the daemon genuinely cannot honour and refuses loudly. Use
 /// [`seed_scratch_dir`](crate::pane_terminals::seed_scratch_dir) for those.
 fn temp_root(label: &str) -> PathBuf {
-    let unique = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time after epoch")
-        .as_nanos();
-    std::env::temp_dir().join(format!(
-        "rmux-source-file-{label}-{}-{unique}",
-        std::process::id()
-    ))
+    unique_temp_path(&format!("source-file-{label}"))
 }
 
 fn write_config(path: &Path, contents: &str) {
@@ -120,21 +114,205 @@ fn write_executable_script(path: &Path, contents: &str) {
     fs::set_permissions(path, permissions).expect("script permissions");
 }
 
-fn shell_quote(path: &Path) -> String {
-    format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
+/// Worker stack for tests whose queues nest command dispatch and attached rendering in one poll:
+/// the daemon worker budget, independent of the test harness thread stack.
+const DAEMON_TEST_STACK_SIZE: usize = 8 * 1024 * 1024;
+
+/// Runs `test` to completion on a current-thread runtime in a thread with the daemon's stack.
+fn run_on_daemon_test_stack<F, Fut>(test: F)
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: Future<Output = ()> + 'static,
+{
+    let worker = std::thread::Builder::new()
+        .name("scripting-test".to_owned())
+        .stack_size(DAEMON_TEST_STACK_SIZE)
+        .spawn(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("scripting test runtime should build");
+            runtime.block_on(test());
+        })
+        .expect("scripting test worker should spawn");
+    if let Err(panic) = worker.join() {
+        std::panic::resume_unwind(panic);
+    }
 }
 
-fn command_quote(command: &str) -> String {
-    crate::test_shell::command_quote(command)
+/// A session store holding 80x24 session `alpha`, and a find context whose current pane is
+/// `alpha:0.0`.
+fn parser_fixture() -> (SessionStore, TargetFindContext) {
+    let alpha = session_name("alpha");
+    let mut sessions = SessionStore::new();
+    sessions
+        .create_session(alpha.clone(), TerminalSize { cols: 80, rows: 24 })
+        .expect("parser fixture session");
+    let find_context =
+        TargetFindContext::from_target(Target::Pane(PaneTarget::with_window(alpha, 0, 0)));
+    (sessions, find_context)
+}
+
+fn parse_server_request(
+    command: &str,
+    arguments: &[&str],
+    sessions: &SessionStore,
+    find_context: &TargetFindContext,
+) -> Result<Request, RmuxError> {
+    parse_request_from_parts(
+        command.to_owned(),
+        arguments
+            .iter()
+            .map(|argument| (*argument).to_owned())
+            .collect(),
+        None,
+        sessions,
+        &OptionStore::default(),
+        find_context,
+    )
+}
+
+/// A queue context whose current target is pane 0 of `session_name:window_index`.
+fn pane_context(session_name: &SessionName, window_index: u32) -> QueueExecutionContext {
+    QueueExecutionContext::without_caller_cwd().with_current_target(Some(Target::Pane(
+        PaneTarget::with_window(session_name.clone(), window_index, 0),
+    )))
+}
+
+/// Parses and runs `command` for this process, panicking if either step fails.
+async fn execute(handler: &RequestHandler, command: &str) {
+    let parsed = CommandParser::new().parse(command).expect("command parses");
+    handler
+        .execute_parsed_commands_for_test(std::process::id(), parsed)
+        .await
+        .unwrap_or_else(|error| panic!("{command} should execute: {error}"));
+}
+
+/// Registers a plain control client for uid 1000, writable when `can_write`.
+async fn register_control_client(
+    handler: &RequestHandler,
+    requester_pid: u32,
+    can_write: bool,
+) -> mpsc::Receiver<ControlServerEvent> {
+    let (event_tx, event_rx) = mpsc::channel::<ControlServerEvent>(CONTROL_SERVER_EVENT_CAPACITY);
+    handler
+        .register_control_with_access(
+            requester_pid,
+            ControlModeUpgrade {
+                initial_command_count: 0,
+                mode: rmux_proto::ControlMode::Plain,
+                terminal_context: OuterTerminalContext::default(),
+            },
+            ControlRegistration {
+                event_tx,
+                closing: Arc::new(AtomicBool::new(false)),
+                uid: 1000,
+                user: UserIdentity::Uid(1000),
+                can_write,
+            },
+        )
+        .await
+        .expect("control registration succeeds");
+    event_rx
+}
+
+/// A handler with started 20x6 quiet session `name`, and that session's first pane.
+async fn mouse_fixture(name: &str) -> (RequestHandler, SessionName, PaneTarget) {
+    let handler = RequestHandler::new();
+    let session = handler
+        .create_started_session(NewSessionExtRequest {
+            size: Some(TerminalSize { cols: 20, rows: 6 }),
+            command: Some(quiet_command()),
+            ..Fixture::fixture(name)
+        })
+        .await;
+    let target = PaneTarget::with_window(session.clone(), 0, 0);
+    (handler, session, target)
+}
+
+/// A left-button press at (1, 1) inside pane 0 of `target`.
+fn mouse_event(target: &PaneTarget) -> AttachedMouseEvent {
+    AttachedMouseEvent {
+        raw: MouseForwardEvent {
+            b: 0,
+            lb: 0,
+            x: 1,
+            y: 1,
+            lx: 1,
+            ly: 1,
+            sgr_b: 0,
+            sgr_type: 'M',
+            ignore: false,
+        },
+        session_id: 1,
+        window_id: Some(1),
+        pane_id: Some(PaneId::new(0)),
+        pane_target: Some(target.clone()),
+        location: MouseLocation::Pane,
+        status_at: None,
+        status_lines: 0,
+        ignore: false,
+    }
+}
+
+/// Replaces the screen of 20x6 pane `target` with three known lines.
+async fn seed_copy_mode_screen(handler: &RequestHandler, target: &PaneTarget) {
+    let transcript = {
+        let state = handler.state.lock().await;
+        state.transcript_handle(target).expect("pane transcript")
+    };
+    let history_limit = transcript
+        .lock()
+        .expect("pane transcript mutex")
+        .history_limit();
+    let mut screen = Screen::new(TerminalSize { cols: 20, rows: 6 }, history_limit);
+    let mut parser = InputParser::new();
+    parser.parse(
+        b"zero one two three\r\nalpha beta gamma\r\nomega sigma tau\r\n",
+        &mut screen,
+    );
+    transcript
+        .lock()
+        .expect("pane transcript mutex")
+        .set_screen_for_test(screen);
+}
+
+/// Enters copy mode on `target` with the cursor six cells into the top history line.
+fn copy_cursor_command(target: &PaneTarget) -> String {
+    format!(
+        "copy-mode -t {target}; send-keys -Xt {target} history-top; \
+         send-keys -Xt {target} start-of-line; send-keys -N6 -Xt {target} cursor-right"
+    )
+}
+
+async fn selection_coordinates(
+    handler: &RequestHandler,
+    session: &SessionName,
+) -> Option<(u32, usize)> {
+    let state = handler.state.lock().await;
+    state
+        .pane_copy_mode_summary(session, PaneId::new(0))
+        .and_then(|summary| summary.selection_start)
+        .map(|position| (position.x, position.y))
+}
+
+/// Waits up to `timeout` for the background task `name` to stop running.
+async fn wait_for_background_task(handler: &RequestHandler, name: &'static str, timeout: Duration) {
+    tokio::task::yield_now().await;
+    tokio::time::timeout(timeout, async {
+        while handler.background_task_running_for_test(name) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("background task {name} did not finish"));
 }
 
 async fn wait_for_named_buffer(handler: &RequestHandler, name: &str, expected: &[u8]) {
     tokio::time::timeout(background_shell_test_timeout(), async {
         loop {
             if let Some(output) = handler
-                .handle(Request::ShowBuffer(ShowBufferRequest {
-                    name: Some(name.to_owned()),
-                }))
+                .handle(show_buffer_request(name))
                 .await
                 .command_output()
             {
@@ -142,7 +320,7 @@ async fn wait_for_named_buffer(handler: &RequestHandler, name: &str, expected: &
                     return;
                 }
             }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
@@ -158,69 +336,25 @@ async fn wait_for_detached_request_count(handler: &RequestHandler, expected: usi
             if active == expected {
                 return;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
         }
     })
     .await
     .unwrap_or_else(|_| panic!("detached request count did not become {expected}"));
 }
 
-fn background_shell_test_timeout() -> std::time::Duration {
+fn background_shell_test_timeout() -> Duration {
     // Background shell startup competes with thousands of async tests in
     // the full server suite. Keep this as a bounded liveness budget, not a
     // scheduler-latency assertion.
-    std::time::Duration::from_secs(8)
-}
-
-async fn register_control_for_session(
-    handler: &RequestHandler,
-    requester_pid: u32,
-    session_name: SessionName,
-) -> (u64, tokio::sync::mpsc::Receiver<ControlServerEvent>) {
-    let (event_tx, event_rx) =
-        tokio::sync::mpsc::channel::<ControlServerEvent>(CONTROL_SERVER_EVENT_CAPACITY);
-    let control_id = handler
-        .register_control_with_closing(
-            requester_pid,
-            ControlModeUpgrade {
-                initial_command_count: 0,
-                mode: rmux_proto::ControlMode::Plain,
-                terminal_context: OuterTerminalContext::default(),
-            },
-            event_tx,
-            Arc::new(AtomicBool::new(false)),
-        )
-        .await;
-    handler
-        .set_control_session(requester_pid, Some(session_name))
-        .await
-        .expect("control session binds");
-    (control_id, event_rx)
-}
-
-async fn create_background_identity_session(handler: &RequestHandler, session_name: SessionName) {
-    let response = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name,
-            detached: true,
-            size: Some(TerminalSize { cols: 80, rows: 24 }),
-            environment: None,
-        }))
-        .await;
-    assert!(matches!(response, Response::NewSession(_)), "{response:?}");
+    Duration::from_secs(8)
 }
 
 async fn replace_background_identity_session(handler: &RequestHandler, session_name: SessionName) {
-    let response = handler
-        .handle(Request::KillSession(KillSessionRequest {
-            target: session_name.clone(),
-            kill_all_except_target: false,
-            clear_alerts: false,
-            kill_group: false,
-        }))
+    handler
+        .handle_ok(KillSessionRequest::fixture(&session_name))
         .await;
-    assert!(matches!(response, Response::KillSession(_)), "{response:?}");
-    create_background_identity_session(handler, session_name).await;
+    handler.create_session(session_name).await;
 }
 
 async fn wait_for_active_window_name(

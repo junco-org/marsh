@@ -1,5 +1,7 @@
 #![allow(dead_code)]
 
+mod requests;
+
 use std::collections::BTreeSet;
 use std::error::Error;
 use std::fs::{File, OpenOptions};
@@ -13,8 +15,10 @@ use std::time::Duration;
 
 use marsh_core::shellmux::TerminalGeometry;
 use rmux_proto::{
-    decode_frame, encode_frame, AttachSessionRequest, AttachSessionResponse, FrameDecoder, Request,
-    Response, RmuxError, SessionName, TerminalSize, DEFAULT_MAX_DETACHED_FRAME_LENGTH,
+    decode_frame, encode_frame, AttachMessage, AttachSessionRequest, AttachSessionResponse,
+    CapturePaneRequest, FrameDecoder, KillSessionRequest, KillSessionResponse,
+    NewSessionExtRequest, NewSessionRequest, NewSessionResponse, PaneTarget, Request, Response,
+    RmuxError, SessionName, SplitWindowTarget, TerminalSize, DEFAULT_MAX_DETACHED_FRAME_LENGTH,
     RMUX_FRAME_MAGIC, RMUX_WIRE_VERSION,
 };
 use rmux_server::{DaemonConfig, RmuxFrontend};
@@ -37,6 +41,137 @@ const SOCKET_REMOVAL_POLL_INTERVAL: Duration = Duration::from_millis(5);
 const SEED_ROWS: u16 = 24;
 /// Default width, as above.
 const SEED_COLS: u16 = 80;
+/// The pane geometry every sized [`Fixture`] starts from.
+pub(crate) const DEFAULT_SIZE: TerminalSize = TerminalSize { cols: 80, rows: 24 };
+/// How often the `wait_for_*` helpers re-check their condition.
+const POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+/// A request payload with its usual test defaults, built from the value(s) a test always varies.
+///
+/// Mirrors the crate's unit-test fixtures, which these separate test crates cannot see. `Key` is
+/// that value, or a tuple of them; every other field takes the most common value the tests spelled
+/// out. Override fields with struct-update syntax:
+/// `NewWindowRequest { name: Some("logs".to_owned()), ..Fixture::fixture(&alpha) }`.
+pub(crate) trait Fixture<Key> {
+    /// Builds the payload for `key`.
+    fn fixture(key: Key) -> Self;
+}
+
+/// A fixture argument that stands for an owned `T`: the value itself, a borrow of it, or a
+/// shorthand such as a session-name literal.
+pub(crate) trait Owned<T> {
+    /// Converts the argument into the value it stands for.
+    fn owned(self) -> T;
+}
+
+impl<T> Owned<T> for T {
+    fn owned(self) -> T {
+        self
+    }
+}
+
+impl<T: Clone> Owned<T> for &T {
+    fn owned(self) -> T {
+        self.clone()
+    }
+}
+
+impl Owned<SessionName> for &str {
+    fn owned(self) -> SessionName {
+        session_name(self)
+    }
+}
+
+/// Lets each listed target type, owned or borrowed, stand for its [`SplitWindowTarget`] variant.
+macro_rules! split_targets {
+    ($($source:ty => $variant:path),* $(,)?) => {$(
+        impl Owned<SplitWindowTarget> for $source {
+            fn owned(self) -> SplitWindowTarget {
+                $variant(self)
+            }
+        }
+
+        impl Owned<SplitWindowTarget> for &$source {
+            fn owned(self) -> SplitWindowTarget {
+                $variant(self.clone())
+            }
+        }
+    )*};
+}
+
+split_targets!(SessionName => SplitWindowTarget::Session, PaneTarget => SplitWindowTarget::Pane);
+
+/// A request payload [`ClientConnection::send_ok`] can send, paired with the response variant that
+/// means it succeeded.
+pub(crate) trait TestRequest {
+    /// The payload of the success response.
+    type Success;
+
+    /// Wraps the payload in its [`Request`] variant.
+    fn into_request(self) -> Request;
+
+    /// Unwraps the success payload, or hands back any other response unchanged.
+    fn success(response: Response) -> Result<Self::Success, Response>;
+}
+
+/// What [`create_session`] accepts: a session name (a detached 80x24 `new-session`), a
+/// `(name, TerminalSize)` pair, [`Sizeless`], or a complete request.
+pub(crate) trait SessionSpec {
+    /// The request the spec sends.
+    type Request: TestRequest<Success = NewSessionResponse>;
+
+    /// Builds that request.
+    fn into_session_request(self) -> Self::Request;
+}
+
+impl<N: Owned<SessionName>> SessionSpec for N {
+    type Request = NewSessionRequest;
+
+    fn into_session_request(self) -> NewSessionRequest {
+        NewSessionRequest::fixture(self)
+    }
+}
+
+impl<N: Owned<SessionName>> SessionSpec for (N, TerminalSize) {
+    type Request = NewSessionRequest;
+
+    fn into_session_request(self) -> NewSessionRequest {
+        NewSessionRequest {
+            size: Some(self.1),
+            ..Fixture::fixture(self.0)
+        }
+    }
+}
+
+impl SessionSpec for NewSessionRequest {
+    type Request = Self;
+
+    fn into_session_request(self) -> Self {
+        self
+    }
+}
+
+impl SessionSpec for NewSessionExtRequest {
+    type Request = Self;
+
+    fn into_session_request(self) -> Self {
+        self
+    }
+}
+
+/// A session spec for a detached `new-session` of `.0` that sends no size.
+pub(crate) struct Sizeless<N>(pub(crate) N);
+
+impl<N: Owned<SessionName>> SessionSpec for Sizeless<N> {
+    type Request = NewSessionRequest;
+
+    fn into_session_request(self) -> NewSessionRequest {
+        NewSessionRequest {
+            size: None,
+            ..Fixture::fixture(self.0)
+        }
+    }
+}
 
 pub(crate) struct PtyTestLock;
 
@@ -103,7 +238,7 @@ pub(crate) async fn daemon_over_seed(
     let filesystem = Arc::new(marsh_btrfs::fake::CopyTree::new());
     filesystem.register(&seed);
 
-    RmuxFrontend::open_with(
+    rmux_server::test_support::open_frontend(
         config,
         &seed,
         brush_core::env::ShellEnvironment::new(),
@@ -129,6 +264,213 @@ pub(crate) async fn send_request(
 ) -> Result<Response, Box<dyn Error>> {
     let mut client = ClientConnection::connect(socket_path).await?;
     client.send_request(request).await
+}
+
+/// Sends `request` on a fresh connection and answers with the daemon's response.
+pub(crate) async fn send(
+    socket_path: &Path,
+    request: impl TestRequest,
+) -> Result<Response, Box<dyn Error>> {
+    send_request(socket_path, &request.into_request()).await
+}
+
+/// [`ClientConnection::send_ok`] on a fresh connection.
+pub(crate) async fn send_ok<R: TestRequest>(
+    socket_path: &Path,
+    request: R,
+) -> Result<R::Success, Box<dyn Error>> {
+    ClientConnection::connect(socket_path)
+        .await?
+        .send_ok(request)
+        .await
+}
+
+/// [`ClientConnection::create_session`] on a fresh connection.
+pub(crate) async fn create_session(
+    socket_path: &Path,
+    spec: impl SessionSpec,
+) -> Result<SessionName, Box<dyn Error>> {
+    ClientConnection::connect(socket_path)
+        .await?
+        .create_session(spec)
+        .await
+}
+
+/// Kills the session `target` and asserts that it existed.
+pub(crate) async fn kill_session(
+    socket_path: &Path,
+    target: impl Owned<SessionName>,
+) -> Result<(), Box<dyn Error>> {
+    let removed = send(socket_path, KillSessionRequest::fixture(target)).await?;
+    assert_eq!(
+        removed,
+        Response::KillSession(KillSessionResponse { existed: true })
+    );
+    Ok(())
+}
+
+/// The `capture-pane -p` text of `target`.
+pub(crate) async fn capture_pane_text(
+    socket_path: &Path,
+    target: &PaneTarget,
+) -> Result<String, Box<dyn Error>> {
+    let response = send(socket_path, CapturePaneRequest::fixture(target)).await?;
+    let output = response
+        .command_output()
+        .ok_or_else(|| io::Error::other("capture-pane -p returned no command output"))?;
+    Ok(String::from_utf8_lossy(output.stdout()).into_owned())
+}
+
+/// Polls [`capture_pane_text`] of `target` for up to `timeout` until it contains `needle`, and
+/// answers with that capture.
+pub(crate) async fn wait_for_capture(
+    socket_path: &Path,
+    target: &PaneTarget,
+    needle: &str,
+    timeout: Duration,
+) -> Result<String, Box<dyn Error>> {
+    let deadline = Instant::now() + timeout;
+
+    while Instant::now() < deadline {
+        let capture = capture_pane_text(socket_path, target).await?;
+        if capture.contains(needle) {
+            return Ok(capture);
+        }
+
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+
+    Err(io::Error::other(format!(
+        "timed out waiting for pane capture containing {needle:?}"
+    ))
+    .into())
+}
+
+/// Polls the file at `path` for up to `timeout`, answering whether it came to hold exactly
+/// `expected`. A missing file counts as not there yet; any other read error fails.
+pub(crate) async fn poll_file_contents(
+    path: &Path,
+    expected: &str,
+    timeout: Duration,
+) -> Result<bool, Box<dyn Error>> {
+    let deadline = Instant::now() + timeout;
+
+    while Instant::now() < deadline {
+        match std::fs::read_to_string(path) {
+            Ok(contents) if contents == expected => return Ok(true),
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+
+    Ok(false)
+}
+
+/// [`poll_file_contents`], failing when the file never holds `expected`.
+pub(crate) async fn wait_for_file_contents(
+    path: &Path,
+    expected: &str,
+    timeout: Duration,
+) -> Result<(), Box<dyn Error>> {
+    if poll_file_contents(path, expected, timeout).await? {
+        return Ok(());
+    }
+
+    Err(io::Error::other(format!(
+        "file '{}' never reached expected contents '{expected}' within {timeout:?}",
+        path.display()
+    ))
+    .into())
+}
+
+/// Single-quotes `value` as one `sh` word.
+pub(crate) fn shell_quote_str(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+/// Single-quotes `path` as one `sh` word.
+pub(crate) fn shell_quote(path: &Path) -> String {
+    shell_quote_str(&path.display().to_string())
+}
+
+/// Reads the next message of an attach stream, or `None` once the stream has ended.
+pub(crate) async fn read_attach_message(
+    stream: &mut UnixStream,
+) -> Result<Option<AttachMessage>, Box<dyn Error>> {
+    let mut tag = [0_u8; 1];
+    let bytes_read = stream.read(&mut tag).await?;
+    if bytes_read == 0 {
+        return Ok(None);
+    }
+
+    match tag[0] {
+        1 => Ok(Some(AttachMessage::Data(
+            read_attach_payload(stream).await?,
+        ))),
+        2 => {
+            let mut size = [0_u8; 4];
+            stream.read_exact(&mut size).await?;
+            Ok(Some(AttachMessage::Resize(TerminalSize {
+                cols: u16::from_le_bytes([size[0], size[1]]),
+                rows: u16::from_le_bytes([size[2], size[3]]),
+            })))
+        }
+        5 => Ok(Some(AttachMessage::Suspend)),
+        13 => Ok(Some(AttachMessage::Render(
+            read_attach_payload(stream).await?,
+        ))),
+        other => {
+            Err(RmuxError::Decode(format!("unknown attach-stream message tag {other}")).into())
+        }
+    }
+}
+
+async fn read_attach_payload(stream: &mut UnixStream) -> Result<Vec<u8>, Box<dyn Error>> {
+    let mut length = [0_u8; 4];
+    stream.read_exact(&mut length).await?;
+    let mut payload = vec![0_u8; u32::from_le_bytes(length) as usize];
+    stream.read_exact(&mut payload).await?;
+    Ok(payload)
+}
+
+/// Reads attach output for up to `timeout` until it contains `needle`, and answers with all the
+/// output read.
+pub(crate) async fn read_attach_until_contains(
+    stream: &mut UnixStream,
+    needle: &str,
+    timeout: Duration,
+) -> Result<String, Box<dyn Error>> {
+    let deadline = Instant::now() + timeout;
+    let mut output = String::new();
+
+    while Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let read = tokio::time::timeout(remaining, read_attach_message(stream)).await;
+        let Some(message) = read.map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("timed out waiting for attach output containing {needle:?}: {output:?}"),
+            )
+        })??
+        else {
+            break;
+        };
+
+        if let AttachMessage::Data(bytes) | AttachMessage::Render(bytes) = message {
+            output.push_str(&String::from_utf8_lossy(&bytes));
+            if output.contains(needle) {
+                return Ok(output);
+            }
+        }
+    }
+
+    Err(io::Error::other(format!(
+        "timed out waiting for attach output containing {needle:?}: {output:?}"
+    ))
+    .into())
 }
 
 pub(crate) fn session_name(value: &str) -> SessionName {
@@ -319,6 +661,43 @@ impl ClientConnection {
         let frame = encode_frame(request)?;
         self.stream.write_all(&frame).await?;
         self.read_response().await
+    }
+
+    /// Sends `request` and answers with the daemon's response.
+    pub(crate) async fn send(
+        &mut self,
+        request: impl TestRequest,
+    ) -> Result<Response, Box<dyn Error>> {
+        self.send_request(&request.into_request()).await
+    }
+
+    /// Sends `request` and answers with its success payload.
+    ///
+    /// # Panics
+    ///
+    /// Panics with the response when the request fails or answers with another variant.
+    pub(crate) async fn send_ok<R: TestRequest>(
+        &mut self,
+        request: R,
+    ) -> Result<R::Success, Box<dyn Error>> {
+        let request = request.into_request();
+        let command = request.command_name();
+        let response = self.send_request(&request).await?;
+        Ok(
+            R::success(response)
+                .unwrap_or_else(|response| panic!("{command} failed: {response:?}")),
+        )
+    }
+
+    /// Creates the detached session `spec` describes and answers with its name.
+    pub(crate) async fn create_session(
+        &mut self,
+        spec: impl SessionSpec,
+    ) -> Result<SessionName, Box<dyn Error>> {
+        Ok(self
+            .send_ok(spec.into_session_request())
+            .await?
+            .session_name)
     }
 
     async fn read_response(&mut self) -> Result<Response, Box<dyn Error>> {

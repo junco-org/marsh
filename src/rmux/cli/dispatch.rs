@@ -1,10 +1,10 @@
 use std::io::{Read, Write};
 use std::path::Path;
 
-use rmux_client::connect;
+use rmux_client::{ClientError, Connection};
 use rmux_proto::{
     ClientTerminalContext, CopyModeRequest, ErrorResponse, INTERNAL_PARSE_TIME_ASSIGNMENTS_PATH,
-    LayoutName, Response,
+    LayoutName, Response, SelectLayoutTarget, WindowTarget,
 };
 
 use super::attach_transport::{
@@ -44,9 +44,8 @@ use super::session_commands::{
     run_has_session, run_kill_session, run_list_sessions, run_new_session, run_rename_session,
 };
 use super::target_resolution::{
-    resolve_canfail_pane_target_spec, resolve_current_pane_target, resolve_current_session_target,
-    resolve_pane_target_or_current, resolve_pane_target_spec, resolve_select_layout_target_spec,
-    resolve_window_target_or_current,
+    connect_cli, resolve_canfail_pane_target_spec, resolve_optional_pane_target,
+    resolve_window_target_or_current, run_targeted,
 };
 use super::web_commands::run_web_share;
 use super::window_commands::{
@@ -57,6 +56,7 @@ use super::window_commands::{
 use super::{ExitFailure, StartupOptions, connect_with_startserver};
 use crate::cli_args::{
     Command, NewSessionArgs, SelectLayoutMode, SetOptionCommandKind, ShowOptionsCommandKind,
+    TargetSpec,
 };
 use crate::cli_response::tmux_cli_error_message;
 use crate::empty_server_lifecycle::shutdown_started_empty_server_at;
@@ -355,166 +355,87 @@ fn dispatch(
         Command::LockSession(args) => run_lock_session(args, socket_path),
         Command::LockClient(args) => run_lock_client(args, socket_path),
         Command::NewWindow(args) => run_new_window(args, socket_path),
-        Command::KillWindow(args) => run_kill_window(args, socket_path),
+        Command::KillWindow(args) => run_kill_window(&args, socket_path),
         Command::SelectWindow(args) => run_select_window(args, socket_path),
-        Command::RenameWindow(args) => run_rename_window(args, socket_path),
-        Command::NextWindow(args) => run_next_window(args, socket_path),
-        Command::PreviousWindow(args) => run_previous_window(args, socket_path),
-        Command::LastWindow(args) => run_last_window(args, socket_path),
+        Command::RenameWindow(args) => run_rename_window(&args, socket_path),
+        Command::NextWindow(args) => run_next_window(&args, socket_path),
+        Command::PreviousWindow(args) => run_previous_window(&args, socket_path),
+        Command::LastWindow(args) => run_last_window(&args, socket_path),
         Command::ListSessions(args) => run_list_sessions(args, socket_path),
-        Command::ListWindows(args) => run_list_windows(args, socket_path),
+        Command::ListWindows(args) => run_list_windows(&args, socket_path),
         Command::LinkWindow(args) => run_link_window(args, socket_path),
         Command::MoveWindow(args) => run_move_window(args, socket_path),
         Command::SwapWindow(args) => run_swap_window(args, socket_path),
-        Command::RotateWindow(args) => run_rotate_window(args, socket_path),
-        Command::ResizeWindow(args) => run_resize_window(args, socket_path),
+        Command::RotateWindow(args) => run_rotate_window(&args, socket_path),
+        Command::ResizeWindow(args) => run_resize_window(&args, socket_path),
         Command::RespawnWindow(args) => run_respawn_window(args, socket_path),
         Command::SplitWindow(args) => run_split_window(args, socket_path),
         Command::SwapPane(args) => run_swap_pane(args, socket_path),
-        Command::LastPane(args) => run_last_pane(args, socket_path),
+        Command::LastPane(args) => run_last_pane(&args, socket_path),
         Command::JoinPane(args) => run_join_pane(args, socket_path),
         Command::MovePane(args) => run_move_pane(args, socket_path),
         Command::BreakPane(args) => run_break_pane(args, socket_path),
         Command::PipePane(args) => run_pipe_pane(args, socket_path),
         Command::RespawnPane(args) => run_respawn_pane(args, socket_path),
-        Command::KillPane(args) => {
-            run_command_resolved(socket_path, "kill-pane", move |connection| {
-                let target = match args.target.as_ref() {
-                    Some(target) => resolve_pane_target_spec(connection, target)?,
-                    None => resolve_current_pane_target(connection, "kill-pane")?,
-                };
-                connection
-                    .kill_pane_with_options(target, args.kill_all_except)
-                    .map_err(ExitFailure::from)
-            })
-        }
+        Command::KillPane(args) => run_targeted(
+            socket_path,
+            "kill-pane",
+            args.target.as_ref(),
+            |connection, target| connection.kill_pane_with_options(target, args.kill_all_except),
+        ),
         Command::SelectLayout(args) => {
-            let mode = args.mode();
-            if mode == Some(SelectLayoutMode::Next) {
-                return run_command_resolved(socket_path, "select-layout", move |connection| {
-                    let target = resolve_window_target_or_current(
-                        connection,
-                        args.target.as_ref(),
-                        "select-layout",
-                    )?;
-                    connection.next_layout(target).map_err(ExitFailure::from)
-                });
+            let target = args.target.as_ref();
+            match (args.mode(), args.layout) {
+                (None, None) => run_select_layout_noop(target, socket_path),
+                (None, Some(layout)) => run_targeted(
+                    socket_path,
+                    "select-layout",
+                    target,
+                    |connection, window| select_named_layout(connection, window, layout),
+                ),
+                (Some(mode), layout) => run_targeted(
+                    socket_path,
+                    "select-layout",
+                    target,
+                    |connection, window| select_layout_mode(connection, window, mode, layout),
+                ),
             }
-            if mode == Some(SelectLayoutMode::Previous) {
-                return run_command_resolved(socket_path, "select-layout", move |connection| {
-                    let target = resolve_window_target_or_current(
-                        connection,
-                        args.target.as_ref(),
-                        "select-layout",
-                    )?;
-                    connection
-                        .previous_layout(target)
-                        .map_err(ExitFailure::from)
-                });
-            }
-            if mode == Some(SelectLayoutMode::Spread) {
-                return run_command_resolved(socket_path, "select-layout", move |connection| {
-                    let target = match args.target.as_ref() {
-                        Some(target) => resolve_select_layout_target_spec(connection, target)?,
-                        None => rmux_proto::SelectLayoutTarget::Window(
-                            resolve_window_target_or_current(connection, None, "select-layout")?,
-                        ),
-                    };
-                    connection.spread_layout(target).map_err(ExitFailure::from)
-                });
-            }
-            if mode == Some(SelectLayoutMode::Old) && args.layout.is_none() {
-                return run_command_resolved(socket_path, "select-layout", move |connection| {
-                    let target = match args.target.as_ref() {
-                        Some(target) => resolve_select_layout_target_spec(connection, target)?,
-                        None => rmux_proto::SelectLayoutTarget::Window(
-                            resolve_window_target_or_current(connection, None, "select-layout")?,
-                        ),
-                    };
-                    connection
-                        .select_old_layout(target)
-                        .map_err(ExitFailure::from)
-                });
-            }
-            let Some(layout) = args.layout else {
-                return run_select_layout_noop(args.target.as_ref(), socket_path);
-            };
-            run_command_resolved(socket_path, "select-layout", move |connection| {
-                let target = match args.target.as_ref() {
-                    Some(target) => resolve_select_layout_target_spec(connection, target)?,
-                    None => rmux_proto::SelectLayoutTarget::Window(
-                        resolve_window_target_or_current(connection, None, "select-layout")?,
-                    ),
-                };
-                if mode == Some(SelectLayoutMode::Old) {
-                    return connection
-                        .select_custom_layout(target, layout)
-                        .map_err(ExitFailure::from);
-                }
-                match layout.parse::<LayoutName>() {
-                    Ok(parsed) => connection
-                        .select_layout(target, parsed)
-                        .map_err(ExitFailure::from),
-                    Err(_) if looks_like_custom_layout(&layout) => connection
-                        .select_custom_layout(target, layout)
-                        .map_err(ExitFailure::from),
-                    Err(_) => Err(invalid_layout_failure(&layout)),
-                }
-            })
         }
-        Command::NextLayout(args) => {
-            run_command_resolved(socket_path, "next-layout", move |connection| {
-                let target = resolve_window_target_or_current(
-                    connection,
-                    args.target.as_ref(),
-                    "next-layout",
-                )?;
-                connection.next_layout(target).map_err(ExitFailure::from)
-            })
-        }
+        Command::NextLayout(args) => run_targeted(
+            socket_path,
+            "next-layout",
+            args.target.as_ref(),
+            |connection, window| connection.next_layout(window),
+        ),
         Command::PreviousLayout(args) => {
-            run_command_resolved(socket_path, "previous-layout", move |connection| {
-                let target = resolve_window_target_or_current(
-                    connection,
-                    args.target.as_ref(),
-                    "previous-layout",
-                )?;
-                connection
-                    .previous_layout(target)
-                    .map_err(ExitFailure::from)
-            })
+            let target = args.target.as_ref();
+            run_targeted(
+                socket_path,
+                "previous-layout",
+                target,
+                |connection, window| connection.previous_layout(window),
+            )
         }
         Command::ResizePane(args) => run_resize_pane(&args, socket_path),
         Command::DisplayPanes(args) => {
             let template = args.template_command();
-            run_command_resolved(socket_path, "display-panes", move |connection| {
-                let target = resolve_current_session_target(connection)?;
-                connection
-                    .display_panes_target_client(
-                        target,
-                        args.duration_ms,
-                        args.non_blocking,
-                        args.no_command,
-                        template,
-                        args.target_client,
-                    )
-                    .map_err(ExitFailure::from)
+            run_targeted(socket_path, "display-panes", None, |connection, session| {
+                connection.display_panes_target_client(
+                    session,
+                    args.duration_ms,
+                    args.non_blocking,
+                    args.no_command,
+                    template,
+                    args.target_client,
+                )
             })
         }
-        Command::ListPanes(args) => run_list_panes(args, socket_path),
+        Command::ListPanes(args) => run_list_panes(&args, socket_path),
         Command::SelectPane(args) => run_select_pane(args, socket_path),
         Command::CopyMode(args) => {
             run_command_resolved(socket_path, "copy-mode", move |connection| {
-                let target = args
-                    .target
-                    .as_ref()
-                    .map(|target| resolve_pane_target_spec(connection, target))
-                    .transpose()?;
-                let source = args
-                    .source
-                    .as_ref()
-                    .map(|target| resolve_pane_target_spec(connection, target))
-                    .transpose()?;
+                let target = resolve_optional_pane_target(connection, args.target.as_ref())?;
+                let source = resolve_optional_pane_target(connection, args.source.as_ref())?;
                 connection
                     .copy_mode(CopyModeRequest {
                         target,
@@ -530,16 +451,12 @@ fn dispatch(
                     .map_err(ExitFailure::from)
             })
         }
-        Command::ClockMode(args) => {
-            run_command_resolved(socket_path, "clock-mode", move |connection| {
-                let target = args
-                    .target
-                    .as_ref()
-                    .map(|target| resolve_pane_target_spec(connection, target))
-                    .transpose()?;
-                connection.clock_mode(target).map_err(ExitFailure::from)
-            })
-        }
+        Command::ClockMode(args) => run_targeted(
+            socket_path,
+            "clock-mode",
+            args.target.as_ref(),
+            |connection, target| connection.clock_mode(target),
+        ),
         Command::WaitPane(args) => run_wait_pane(&args, socket_path),
         Command::PaneSnapshot(args) => run_pane_snapshot(&args, socket_path),
         Command::StreamPane(args) => run_stream_pane(&args, socket_path),
@@ -555,7 +472,7 @@ fn dispatch(
         Command::UnbindKey(args) => run_unbind_key(args, socket_path),
         Command::ListCommands(args) => run_list_commands(&args, socket_path),
         Command::ListKeys(args) => run_list_keys(args, socket_path),
-        Command::SendPrefix(args) => run_send_prefix(args, socket_path),
+        Command::SendPrefix(args) => run_send_prefix(&args, socket_path),
         Command::Prompt(args) => {
             run_queued_server_command(socket_path, "command-prompt", args.queue_command)
         }
@@ -633,23 +550,17 @@ fn dispatch(
             })
         }
         Command::PasteBuffer(args) => {
-            run_command_resolved(socket_path, "paste-buffer", move |connection| {
-                let target = resolve_pane_target_or_current(
-                    connection,
-                    args.target.as_ref(),
-                    "paste-buffer",
-                )?;
-                connection
-                    .paste_buffer(
-                        args.name,
-                        target,
-                        args.delete_after,
-                        args.separator,
-                        args.linefeed,
-                        args.raw,
-                        args.bracketed,
-                    )
-                    .map_err(ExitFailure::from)
+            let target = args.target.as_ref();
+            run_targeted(socket_path, "paste-buffer", target, |connection, pane| {
+                connection.paste_buffer(
+                    args.name,
+                    pane,
+                    args.delete_after,
+                    args.separator,
+                    args.linefeed,
+                    args.raw,
+                    args.bracketed,
+                )
             })
         }
         Command::ListBuffers(args) => {
@@ -677,15 +588,9 @@ fn dispatch(
             })
         }
         Command::ClearHistory(args) => {
-            run_command_resolved(socket_path, "clear-history", move |connection| {
-                let target = resolve_pane_target_or_current(
-                    connection,
-                    args.target.as_ref(),
-                    "clear-history",
-                )?;
-                connection
-                    .clear_history(target, args.reset_hyperlinks)
-                    .map_err(ExitFailure::from)
+            let target = args.target.as_ref();
+            run_targeted(socket_path, "clear-history", target, |connection, pane| {
+                connection.clear_history(pane, args.reset_hyperlinks)
             })
         }
         Command::DisplayMessage(args) => run_display_message(args, socket_path),
@@ -754,8 +659,7 @@ fn run_shell_foreground(
     args: crate::cli_args::RunShellArgs,
 ) -> Result<i32, ExitFailure> {
     let (command, arguments) = run_shell_command_and_arguments(args.command, args.as_commands);
-    let mut connection = connect(socket_path)
-        .map_err(|error| ExitFailure::from_client_connect(socket_path, error))?;
+    let mut connection = connect_cli(socket_path)?;
     let target = resolve_canfail_pane_target(&mut connection, args.target.as_ref())?;
     let response = connection
         .run_shell(
@@ -798,8 +702,8 @@ fn run_shell_command_and_arguments(
 
 /// Resolves an optional pane target spec, tolerating a target that no longer exists.
 fn resolve_canfail_pane_target(
-    connection: &mut rmux_client::Connection,
-    target: Option<&crate::cli_args::TargetSpec>,
+    connection: &mut Connection,
+    target: Option<&TargetSpec>,
 ) -> Result<Option<rmux_proto::PaneTarget>, ExitFailure> {
     match target {
         Some(target) => resolve_canfail_pane_target_spec(connection, target),
@@ -809,26 +713,51 @@ fn resolve_canfail_pane_target(
 
 /// Handles the layout commands that only validate their target and otherwise do nothing.
 fn run_select_layout_noop(
-    target: Option<&crate::cli_args::TargetSpec>,
+    target: Option<&TargetSpec>,
     socket_path: &Path,
 ) -> Result<i32, ExitFailure> {
-    let mut connection = connect(socket_path)
-        .map_err(|error| ExitFailure::from_client_connect(socket_path, error))?;
-    match target {
-        Some(target) => {
-            let _ = resolve_select_layout_target_spec(&mut connection, target)?;
-        }
-        None => {
-            let _ = resolve_window_target_or_current(&mut connection, None, "select-layout")?;
+    let mut connection = connect_cli(socket_path)?;
+    resolve_window_target_or_current(&mut connection, target, "select-layout")?;
+    Ok(0)
+}
+
+/// Sends the `select-layout` request a mode flag selects for `window`.
+fn select_layout_mode(
+    connection: &mut Connection,
+    window: WindowTarget,
+    mode: SelectLayoutMode,
+    layout: Option<String>,
+) -> Result<Response, ClientError> {
+    let target = SelectLayoutTarget::Window;
+    match (mode, layout) {
+        (SelectLayoutMode::Next, _) => connection.next_layout(window),
+        (SelectLayoutMode::Previous, _) => connection.previous_layout(window),
+        (SelectLayoutMode::Spread, _) => connection.spread_layout(target(window)),
+        (SelectLayoutMode::Old, None) => connection.select_old_layout(target(window)),
+        (SelectLayoutMode::Old, Some(layout)) => {
+            connection.select_custom_layout(target(window), layout)
         }
     }
-    Ok(0)
+}
+
+/// Applies a named layout, or a custom layout description, to `window`.
+fn select_named_layout(
+    connection: &mut Connection,
+    window: WindowTarget,
+    layout: String,
+) -> Result<Response, ExitFailure> {
+    let target = SelectLayoutTarget::Window(window);
+    match layout.parse::<LayoutName>() {
+        Ok(parsed) => Ok(connection.select_layout(target, parsed)?),
+        // A comma marks a custom layout description rather than a layout name.
+        Err(_) if layout.contains(',') => Ok(connection.select_custom_layout(target, layout)?),
+        Err(_) => Err(ExitFailure::new(1, format!("invalid layout: {layout}"))),
+    }
 }
 
 /// Handles the no-op command by only proving that the daemon is reachable.
 fn run_noop(socket_path: &Path) -> Result<i32, ExitFailure> {
-    let _connection = connect(socket_path)
-        .map_err(|error| ExitFailure::from_client_connect(socket_path, error))?;
+    let _connection = connect_cli(socket_path)?;
     Ok(0)
 }
 
@@ -837,8 +766,7 @@ fn run_apply_parse_time_assignments(
     socket_path: &Path,
     assignments: String,
 ) -> Result<i32, ExitFailure> {
-    let mut connection = connect(socket_path)
-        .map_err(|error| ExitFailure::from_client_connect(socket_path, error))?;
+    let mut connection = connect_cli(socket_path)?;
     let response = connection
         .source_file(
             vec![INTERNAL_PARSE_TIME_ASSIGNMENTS_PATH.to_owned()],
@@ -851,16 +779,6 @@ fn run_apply_parse_time_assignments(
         )
         .map_err(ExitFailure::from)?;
     finish_command_success(response, "source-file")
-}
-
-/// Whether the layout string is a custom layout description rather than a named layout.
-fn looks_like_custom_layout(layout: &str) -> bool {
-    layout.contains(',')
-}
-
-/// The exit-code-1 failure reported for an unrecognized layout name.
-fn invalid_layout_failure(layout: &str) -> ExitFailure {
-    ExitFailure::new(1, format!("invalid layout: {layout}"))
 }
 
 /// Whether this command may start the daemon when none is running.

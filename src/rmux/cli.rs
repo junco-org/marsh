@@ -13,6 +13,9 @@ mod attach_transport;
 /// Scripted automation commands: pane discovery, snapshots, output streaming, and waits.
 #[path = "cli/automation/mod.rs"]
 mod automation;
+/// The trait and helpers rmux's auxiliary top-level commands share.
+#[path = "cli/aux_command.rs"]
+mod aux_command;
 /// The `load-buffer` and `save-buffer` paste-buffer transfer commands.
 #[path = "cli/buffer_commands.rs"]
 mod buffer_commands;
@@ -110,8 +113,9 @@ mod web_share_display;
 mod window_commands;
 
 use crate::cli_args::{Cli, parse, parse_with_runtime_command_groups, scan_top_level_command};
-use crate::cli_response::{expect_command_output, expect_command_success};
+use crate::cli_response::{expect_command_output, expect_command_success, unexpected_response};
 use attach_transport::{attach_with_connection, require_attach_terminal};
+use aux_command::AuxCommand;
 use client_commands::{
     client_terminal_context_from_cli, optional_client_flags, run_control_mode, run_detach_client,
     run_list_clients, run_refresh_client, run_suspend_client, run_switch_client,
@@ -124,9 +128,7 @@ pub(crate) use command_runner::{
     run_command_resolved, run_payload_command, run_payload_command_resolved,
     target_action_needs_legacy_retry,
 };
-use command_runner::{
-    finish_command_success, unexpected_response, write_command_output, write_lines_output,
-};
+use command_runner::{finish_command_success, write_command_output, write_lines_output};
 use control_mode_error::parse_failure as control_mode_parse_failure;
 #[cfg(test)]
 use dispatch::default_client_command;
@@ -146,17 +148,15 @@ use startup::{
 use target_resolution::{
     list_session_names, listed_pane_index_matches_target, resolve_current_pane_target,
     resolve_current_session_target, resolve_existing_window_target_or_current,
-    resolve_pane_target_or_current, resolve_pane_target_spec, resolve_session_listing_target,
-    resolve_session_target_or_current, resolve_session_target_spec,
-    resolve_split_window_target_spec, resolve_target_spec,
+    resolve_pane_target_or_current, resolve_pane_target_spec, resolve_session_target_or_current,
+    resolve_session_target_spec, resolve_target_spec,
     resolve_window_index_target_or_current_session, resolve_window_target_or_current,
-    resolve_window_target_spec, response_name_for_target,
+    resolve_window_target_spec,
 };
 use terminal_size::{build_terminal_size, current_terminal_size};
 use top_level::{
-    accept_compatibility_options, infer_client_utf8_from_env, scan_claude_top_level_invocation,
-    top_level_parse_failure, top_level_version_output, top_level_version_requested,
-    validate_claude_top_level_invocation, validate_top_level_invocation,
+    accept_compatibility_options, infer_client_utf8_from_env, top_level_parse_failure,
+    top_level_version_output, top_level_version_requested, validate_top_level_invocation,
 };
 
 const TMUX_COMPAT_OVERRIDE_ENV: &str = "RMUX_INTERNAL_INVOKED_AS_TMUX";
@@ -173,41 +173,24 @@ where
     T: Into<OsString> + Clone,
 {
     let args: Vec<OsString> = args.into_iter().map(Into::into).collect();
-    if let Some(error) = top_level_parse_failure(args.get(1..).unwrap_or(&[])) {
+    let arguments = args.get(1..).unwrap_or(&[]);
+    if let Some(error) = top_level_parse_failure(arguments) {
         return Err(error);
     }
-    if top_level_version_requested(args.get(1..).unwrap_or(&[])) {
+    if top_level_version_requested(arguments) {
         return Err(ExitFailure::new_stdout(
             0,
             top_level_version_output(invoked_as_tmux(&args)),
         ));
     }
-    let claude_invocation = scan_claude_top_level_invocation(args.get(1..).unwrap_or(&[]));
-    validate_claude_top_level_invocation(claude_invocation.as_ref())?;
-    if let Some(invocation) = diagnose::parse_invocation(args.get(1..).unwrap_or(&[]))? {
-        return diagnose::run(invocation);
-    }
-    if let Some(invocation) = tmux_dropin::parse_invocation(args.get(1..).unwrap_or(&[]))? {
-        return tmux_dropin::run(invocation, args.first());
-    }
-    if let Some(claude_invocation) = claude_invocation {
-        if let Some(invocation) = claude_skill::parse_invocation(claude_invocation.arguments())? {
-            return claude_skill::run(invocation);
-        }
-        // `rmux claude` is dispatched before the typed queue is parsed, because its arguments
-        // belong to Claude rather than to rmux. It still needs the daemon this invocation would
-        // otherwise resolve, so the top-level `-L`/`-S` selection is recovered from raw argv —
-        // the same recovery the unknown-command path below uses.
-        let (socket_path, startup) = top_level_startup(&args)?;
-        return claude_launcher::run(
-            claude_launcher::ClaudeInvocation::new(claude_invocation.into_arguments()),
-            &socket_path,
-            startup,
-        )
-        .map_err(|error| error.with_socket_context(&socket_path));
-    }
-    if let Some(invocation) = capabilities::parse_invocation(args.get(1..).unwrap_or(&[]))? {
-        return capabilities::run(invocation);
+    // Extensions whose arguments are not tmux commands are served from raw argv, in this order,
+    // before the typed queue is parsed.
+    if let Some(exit) = diagnose::DiagnoseInvocation::dispatch(&args)
+        .or_else(|| tmux_dropin::DropinInvocation::dispatch(&args))
+        .or_else(|| claude_launcher::ClaudeInvocation::dispatch(&args))
+        .or_else(|| capabilities::CapabilitiesInvocation::dispatch(&args))
+    {
+        return exit;
     }
     let runtime_resolution =
         alias_fallback::runtime_command_resolution_for_invocation(&args, invoked_as_tmux(&args))?;
@@ -221,8 +204,8 @@ where
     let mut cli = match parsed_cli {
         Ok(cli) => cli,
         Err(error) if runtime_resolution.is_some() => {
-            let control_mode = scan_top_level_command(args.get(1..).unwrap_or(&[]))
-                .map_or(0, |scan| scan.control_mode);
+            let control_mode =
+                scan_top_level_command(arguments).map_or(0, |scan| scan.control_mode);
             if control_mode != 0 {
                 return Err(control_mode_parse_failure(error, control_mode));
             }
@@ -600,65 +583,55 @@ fn parse_failure_should_probe_server(args: &[OsString], error: &clap::Error) -> 
 
 /// Recovers the `-L`/`-S` socket selection from raw argv when the typed parse failed.
 fn recover_socket_selection(arguments: &[OsString]) -> Option<(Option<OsString>, Option<PathBuf>)> {
-    let mut socket_name = None;
-    let mut socket_path = None;
-    let mut index = 0;
-
-    while index < arguments.len() {
-        let argument = arguments[index].to_str()?;
-        if argument == "--" {
-            break;
+    let (mut socket_name, mut socket_path) = (None, None);
+    command_index(arguments, |flag, value| match flag {
+        "-L" => socket_name = value.cloned(),
+        "-S" => socket_path = value.map(PathBuf::from),
+        _ if flag.len() > 2 && flag.starts_with("-L") => {
+            socket_name = flag.get(2..).map(OsString::from);
         }
-        if !argument.starts_with('-') || argument == "-" {
-            break;
+        _ if flag.len() > 2 && flag.starts_with("-S") => {
+            socket_path = flag.get(2..).map(PathBuf::from);
         }
-
-        match argument {
-            "-L" => {
-                index += 1;
-                socket_name = arguments.get(index).cloned();
-            }
-            "-S" => {
-                index += 1;
-                socket_path = arguments.get(index).cloned().map(PathBuf::from);
-            }
-            "-c" | "-f" | "-T" => {
-                index += 1;
-            }
-            value if value.starts_with("-L") && value.len() > 2 => {
-                socket_name = value.get(2..).map(OsString::from);
-            }
-            value if value.starts_with("-S") && value.len() > 2 => {
-                socket_path = value.get(2..).map(PathBuf::from);
-            }
-            _ => {}
-        }
-        index += 1;
-    }
-
+        _ => {}
+    })?;
     Some((socket_name, socket_path))
 }
 
 /// Returns the first non-flag argument, the command name, skipping top-level flag values.
 fn first_command_token(arguments: &[OsString]) -> Option<String> {
-    let mut index = 0;
+    let index = command_index(arguments, |_, _| {})?;
+    arguments.get(index)?.to_str().map(str::to_owned)
+}
 
-    while index < arguments.len() {
-        let argument = arguments[index].to_str()?;
+/// The index of the command word after the top-level flags, skipping every flag word.
+///
+/// `-c`, `-f`, `-L`, `-S` and `-T` take the next argument as their value, and `visit` sees each
+/// flag word with that value. The index is past the end when argv runs out first, and `None`
+/// means a flag word was not UTF-8.
+fn command_index(
+    arguments: &[OsString],
+    mut visit: impl FnMut(&str, Option<&OsString>),
+) -> Option<usize> {
+    let mut index = 0;
+    while let Some(argument) = arguments.get(index) {
+        let argument = argument.to_str()?;
         if argument == "--" {
-            return arguments.get(index + 1)?.to_str().map(str::to_owned);
+            return Some(index + 1);
         }
         if !argument.starts_with('-') || argument == "-" {
-            return Some(argument.to_owned());
+            return Some(index);
         }
-
-        if matches!(argument, "-c" | "-f" | "-L" | "-S" | "-T") {
+        let value = if matches!(argument, "-c" | "-f" | "-L" | "-S" | "-T") {
             index += 1;
-        }
+            arguments.get(index)
+        } else {
+            None
+        };
+        visit(argument, value);
         index += 1;
     }
-
-    None
+    Some(index)
 }
 
 /// Connects for the next queued command, discarding the connection's startup provenance.
@@ -738,15 +711,10 @@ fn shell_command_token(token: &str) -> String {
     format!("'{}'", token.replace('\'', "'\\''"))
 }
 
-fn is_short_flag_cluster(value: &str, allowed: &str) -> bool {
-    value.len() > 2
-        && value.starts_with('-')
-        && !value.starts_with("--")
-        && value.chars().skip(1).all(|flag| allowed.contains(flag))
-}
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 mod tests {
+    use super::aux_command::args;
     use super::{
         ServerStartupConfig, command_has_start_server_flag, default_client_command,
         render_list_commands_line, run, startup_config_from_cli, top_level_parse_failure,
@@ -755,12 +723,7 @@ mod tests {
         AttachSessionArgs, Command, ListSessionsArgs, NewWindowArgs, StartServerArgs,
         parse as parse_cli, parse_target_spec,
     };
-    use std::ffi::OsString;
     use std::path::PathBuf;
-
-    fn args(values: &[&str]) -> Vec<OsString> {
-        values.iter().map(OsString::from).collect()
-    }
 
     #[test]
     fn top_level_preparse_accepts_tmux_short_help() {

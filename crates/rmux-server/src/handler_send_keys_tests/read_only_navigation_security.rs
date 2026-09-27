@@ -1,53 +1,12 @@
 use super::*;
-use crate::pane_io::AttachControl;
-
-async fn register_read_only_attach(
-    handler: &RequestHandler,
-    requester_pid: u32,
-    session: &rmux_proto::SessionName,
-) -> mpsc::UnboundedReceiver<AttachControl> {
-    let (control_tx, control_rx) = mpsc::unbounded_channel();
-    handler
-        .register_attach(requester_pid, session.clone(), control_tx)
-        .await;
-    let mut active_attach = handler.active_attach.lock().await;
-    let active = active_attach
-        .by_pid
-        .get_mut(&requester_pid)
-        .expect("read-only attach is active");
-    active.can_write = false;
-    active.flags = active.flags.with_read_only();
-    control_rx
-}
 
 async fn bind_key(handler: &RequestHandler, key: &str, command: &[&str]) {
-    let response = handler
-        .handle(Request::BindKey(Box::new(BindKeyRequest {
-            table_name: "root".to_owned(),
-            key: key.to_owned(),
-            note: Some("read-only security boundary test".to_owned()),
-            repeat: false,
-            command: Some(
-                command
-                    .iter()
-                    .map(|argument| (*argument).to_owned())
-                    .collect(),
-            ),
-        })))
-        .await;
-    assert!(matches!(response, Response::BindKey(_)), "{response:?}");
-}
-
-async fn active_session(handler: &RequestHandler, requester_pid: u32) -> rmux_proto::SessionName {
     handler
-        .active_attach
-        .lock()
-        .await
-        .by_pid
-        .get(&requester_pid)
-        .expect("read-only attach remains active")
-        .session_name
-        .clone()
+        .handle_ok(BindKeyRequest {
+            note: Some("read-only security boundary test".to_owned()),
+            ..Fixture::fixture(("root", key, command.iter().copied()))
+        })
+        .await;
 }
 
 fn assert_no_terminal_control(control_rx: &mut mpsc::UnboundedReceiver<AttachControl>) {
@@ -123,8 +82,8 @@ async fn read_only_switch_allowlist_rejects_privilege_targeting_and_session_muta
             .handle_attached_live_input_for_test(requester_pid, key)
             .await
             .expect("unsafe read-only switch input is consumed");
-        assert_eq!(active_session(&handler, requester_pid).await, alpha);
-        assert_eq!(active_session(&handler, witness_pid).await, alpha);
+        assert_eq!(active_session_name(&handler, requester_pid).await, alpha);
+        assert_eq!(active_session_name(&handler, witness_pid).await, alpha);
         assert!(
             handler
                 .active_attach
@@ -189,8 +148,8 @@ async fn read_only_detach_allowlist_rejects_every_nonlocal_form() {
             .handle_attached_live_input_for_test(requester_pid, key)
             .await
             .expect("unsafe read-only detach input is consumed");
-        assert_eq!(active_session(&handler, requester_pid).await, alpha);
-        assert_eq!(active_session(&handler, witness_pid).await, alpha);
+        assert_eq!(active_session_name(&handler, requester_pid).await, alpha);
+        assert_eq!(active_session_name(&handler, witness_pid).await, alpha);
         assert_no_terminal_control(&mut requester_rx);
         assert_no_terminal_control(&mut witness_rx);
     }
@@ -217,7 +176,7 @@ async fn read_only_safe_switch_cannot_lead_a_composed_mutation() {
         .await
         .expect("composed read-only switch input is consumed");
 
-    assert_eq!(active_session(&handler, requester_pid).await, alpha);
+    assert_eq!(active_session_name(&handler, requester_pid).await, alpha);
     assert_eq!(
         handler
             .state
@@ -253,13 +212,7 @@ async fn read_only_key_table_switch_cannot_lead_a_composed_mutation() {
         .await
         .expect("composed read-only key-table input is consumed");
 
-    let active_attach = handler.active_attach.lock().await;
-    let active = active_attach
-        .by_pid
-        .get(&requester_pid)
-        .expect("requester remains active");
-    assert_eq!(active.key_table_name, None);
-    drop(active_attach);
+    assert_eq!(client_key_table(&handler, requester_pid).await, None);
     assert_eq!(
         handler
             .state

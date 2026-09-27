@@ -166,7 +166,7 @@ pub(crate) fn expect_command_output<'a>(
 }
 
 /// Builds the protocol-error failure reported when a response does not match its command.
-fn unexpected_response(command_name: &str, response: &Response) -> ExitFailure {
+pub(crate) fn unexpected_response(command_name: &str, response: &Response) -> ExitFailure {
     ExitFailure::new(
         1,
         format!(

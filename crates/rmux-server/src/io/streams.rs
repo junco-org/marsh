@@ -18,7 +18,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
 
-use marsh_core::shellmux::{OutputChannel, SnapshotUid};
+use marsh_core::shellmux::{OutputChannel, Principal};
 use rmux_core::events::{
     OutputCursor, OutputCursorItem, OutputEvent, OutputRing, DEFAULT_OUTPUT_RING_CAPACITY,
     DEFAULT_RECENT_LIVE_BUFFER_CAPACITY,
@@ -32,7 +32,7 @@ use rmux_core::events::{
 const OWNER_CAPACITY: usize = 64;
 
 /// One job stream's identity.
-pub(crate) type StreamKey = (SnapshotUid, OutputChannel);
+pub(crate) type StreamKey = (Principal, OutputChannel);
 
 /// One stream's retained bytes and its registered readers.
 #[derive(Debug)]
@@ -86,7 +86,7 @@ pub(crate) struct Streams {
 /// Everything [`Streams`] holds, so one lock covers all of it.
 #[derive(Debug, Default)]
 struct State {
-    /// Keyed by snapshot id and channel, so a reused job name never mixes two generations.
+    /// Keyed by principal and channel, so a reused job name never mixes two generations.
     streams: HashMap<StreamKey, Stream>,
     /// Streams that ended and were reclaimed, most recent last.
     ///

@@ -1,7 +1,8 @@
 use clap::{ArgAction, Args};
 use rmux_proto::SessionName;
 
-use super::{TargetSpec, parse_session_name, parse_target_spec};
+use super::targets::{TargetSpec, parse_session_name, parse_target_spec};
+use super::validate::Validate;
 
 /// Parsed `new-session` flags: creation, attach-if-exists, geometry and the initial command.
 #[derive(Debug, Clone, Args)]
@@ -52,16 +53,12 @@ fn parse_new_session_rows(value: &str) -> Result<u16, String> {
 
 /// Parses a non-negative terminal dimension, reporting `label` in the rejection message.
 fn parse_new_session_dimension(value: &str, label: &str) -> Result<u16, String> {
-    let parsed = value
-        .parse::<i64>()
-        .map_err(|_| format!("{label} invalid"))?;
-    if parsed < 0 {
-        return Err(format!("{label} too small"));
-    }
-    if parsed > i64::from(u16::MAX) {
-        return Err(format!("{label} too large"));
-    }
-    u16::try_from(parsed).map_err(|_| format!("{label} invalid"))
+    let problem = match value.parse::<i64>() {
+        Err(_) => "invalid",
+        Ok(parsed) if parsed < 0 => "too small",
+        Ok(parsed) => return u16::try_from(parsed).map_err(|_| format!("{label} too large")),
+    };
+    Err(format!("{label} {problem}"))
 }
 
 /// Parsed `attach-session` flags: which session to join and how existing clients are treated.
@@ -126,9 +123,9 @@ pub(crate) struct ServerAccessArgs {
     pub(crate) user: Option<String>,
 }
 
-impl ServerAccessArgs {
+impl Validate for ServerAccessArgs {
     /// Rejects the mutually exclusive `-a`/`-d` and `-r`/`-w` pairs outside list mode.
-    pub(super) fn validate(self) -> Result<Self, clap::Error> {
+    fn validate(self, _: &'static str) -> Result<Self, clap::Error> {
         if !self.list && self.add && self.deny {
             return Err(clap::Error::raw(
                 clap::error::ErrorKind::ArgumentConflict,

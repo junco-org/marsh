@@ -2,11 +2,12 @@ use std::cmp::Ordering;
 use std::collections::BTreeSet;
 use std::path::Path;
 
-use rmux_client::{Connection, connect};
-use rmux_core::formats::{DEFAULT_LIST_WINDOWS_ALL_FORMAT, DEFAULT_LIST_WINDOWS_FORMAT, is_truthy};
+use rmux_client::Connection;
+use rmux_core::formats::{DEFAULT_LIST_WINDOWS_ALL_FORMAT, DEFAULT_LIST_WINDOWS_FORMAT};
 use rmux_proto::{
     CAPABILITY_CLI_LIST_WINDOWS_ALL_QUEUE, CommandOutput, ErrorResponse, ListWindowsResponse,
-    MoveWindowTarget, OptionScopeSelector, ResolveTargetType, Response, WindowListEntry,
+    MoveWindowTarget, OptionScopeSelector, PaneTarget, ResizeWindowAdjustment, ResolveTargetType,
+    Response, SessionName, Target, WindowListEntry, WindowTarget,
 };
 
 use super::command_runner::{
@@ -18,25 +19,26 @@ use super::format_print::print_target_format;
 use super::json_output::{
     list_windows_json_format, write_length_prefixed_list_windows_json, write_list_windows_json,
 };
+use super::target_resolution::{
+    LISTING_FIELD_SEPARATOR, connect_cli, filtered_listing_line, parse_spec,
+    resolve_active_window_index, response_failure, run_targeted, wrong_target_kind,
+};
 use super::{
-    ExitFailure, expect_command_output, expect_command_success, list_session_names,
-    resolve_current_pane_target, resolve_current_session_target,
-    resolve_existing_window_target_or_current, resolve_session_listing_target,
+    ExitFailure, expect_command_output, list_session_names, resolve_current_pane_target,
+    resolve_current_session_target, resolve_existing_window_target_or_current,
     resolve_session_target_or_current, resolve_session_target_spec, resolve_target_spec,
     resolve_window_index_target_or_current_session, resolve_window_target_or_current,
-    resolve_window_target_spec, response_name_for_target, run_command_resolved,
-    unexpected_response, write_lines_output,
+    resolve_window_target_spec, run_command_resolved, unexpected_response, write_lines_output,
 };
 use crate::cli_args::{
     AlertSessionTargetArgs, KillWindowArgs, LinkWindowArgs, ListWindowsArgs, MoveWindowArgs,
     NewWindowArgs, RenameWindowArgs, ResizeWindowArgs, RespawnWindowArgs, RotateWindowArgs,
     SelectWindowArgs, SessionTargetArgs, SwapWindowArgs, TargetSpec, UnlinkWindowArgs,
 };
+use crate::cli_response::tmux_cli_error_message;
 
 /// Default `-P` print format for `new-window`, naming its session, window and pane.
 const DEFAULT_NEW_WINDOW_PRINT_FORMAT: &str = "#{session_name}:#{window_index}.#{pane_index}";
-/// Unit separator delimiting filter and sort fields prefixed to each `list-windows` line.
-const LIST_WINDOWS_FILTER_SEPARATOR: char = '\x1f';
 /// Format fragment requesting window activity and creation timestamps for client-side sorting.
 const LIST_WINDOWS_SORT_METADATA_FORMAT: &str = "#{window_activity}\x1f#{window_created}";
 
@@ -75,14 +77,14 @@ fn resolve_link_window_target(
     after: bool,
     before: bool,
     command_name: &str,
-) -> Result<rmux_proto::WindowTarget, ExitFailure> {
+) -> Result<WindowTarget, ExitFailure> {
     let Some(target) = target else {
         if after || before {
             return resolve_window_placement_anchor_target(connection, None, command_name);
         }
         let session_name = resolve_session_target_or_current(connection, None, command_name)?;
         let index = first_available_window_index(connection, &session_name)?;
-        return Ok(rmux_proto::WindowTarget::with_window(session_name, index));
+        return Ok(WindowTarget::with_window(session_name, index));
     };
 
     if after || before {
@@ -109,7 +111,7 @@ fn link_target_is_explicit_session_only(target: &TargetSpec) -> bool {
     {
         return true;
     }
-    raw.starts_with('=') && matches!(target.exact(), Some(rmux_proto::Target::Session(_)))
+    raw.starts_with('=') && matches!(target.exact(), Some(Target::Session(_)))
 }
 
 /// Reports whether the raw target is a special window token such as `^` or `{last}`.
@@ -125,7 +127,7 @@ fn resolve_window_destination_target(
     connection: &mut Connection,
     target: &TargetSpec,
     command_name: &str,
-) -> Result<rmux_proto::WindowTarget, ExitFailure> {
+) -> Result<WindowTarget, ExitFailure> {
     if let Some(target) =
         resolve_bare_relative_window_target(connection, target.raw(), command_name)?
     {
@@ -133,15 +135,15 @@ fn resolve_window_destination_target(
     }
     if let Some(index) = parse_bare_window_index(target.raw())? {
         let session_name = resolve_session_target_or_current(connection, None, command_name)?;
-        return Ok(rmux_proto::WindowTarget::with_window(session_name, index));
+        return Ok(WindowTarget::with_window(session_name, index));
     }
-    if let Some(rmux_proto::Target::Window(target)) = target.exact() {
+    if let Some(Target::Window(target)) = target.exact() {
         return Ok(target.clone());
     }
     if link_target_is_explicit_session_only(target) {
         let session_name = resolve_session_only_destination(connection, target)?;
         let index = first_available_window_index(connection, &session_name)?;
-        return Ok(rmux_proto::WindowTarget::with_window(session_name, index));
+        return Ok(WindowTarget::with_window(session_name, index));
     }
     if let Some(target) =
         resolve_exact_current_window_name_destination(connection, target.raw(), command_name)?
@@ -160,7 +162,7 @@ fn resolve_exact_current_window_name_destination(
     connection: &mut Connection,
     raw_target: &str,
     command_name: &str,
-) -> Result<Option<rmux_proto::WindowTarget>, ExitFailure> {
+) -> Result<Option<WindowTarget>, ExitFailure> {
     if !link_target_is_bare_session_candidate(raw_target) {
         return Ok(None);
     }
@@ -172,7 +174,7 @@ fn resolve_exact_current_window_name_destination(
 fn resolve_bare_session_window_destination(
     connection: &mut Connection,
     target: &TargetSpec,
-) -> Result<Option<rmux_proto::WindowTarget>, ExitFailure> {
+) -> Result<Option<WindowTarget>, ExitFailure> {
     if !link_target_is_bare_session_candidate(target.raw()) {
         return Ok(None);
     }
@@ -180,10 +182,7 @@ fn resolve_bare_session_window_destination(
         return Ok(None);
     };
     let index = first_available_window_index(connection, &session_name)?;
-    Ok(Some(rmux_proto::WindowTarget::with_window(
-        session_name,
-        index,
-    )))
+    Ok(Some(WindowTarget::with_window(session_name, index)))
 }
 
 /// Reports whether a raw target is a plain name that could denote a session or window name.
@@ -203,13 +202,13 @@ fn resolve_bare_relative_window_target(
     connection: &mut Connection,
     raw_target: &str,
     command_name: &str,
-) -> Result<Option<rmux_proto::WindowTarget>, ExitFailure> {
+) -> Result<Option<WindowTarget>, ExitFailure> {
     let Some(offset) = parse_bare_relative_window_offset(raw_target)? else {
         return Ok(None);
     };
     let current = resolve_window_target_or_current(connection, None, command_name)?;
     let index = apply_window_index_offset(current.window_index(), offset)?;
-    Ok(Some(rmux_proto::WindowTarget::with_window(
+    Ok(Some(WindowTarget::with_window(
         current.session_name().clone(),
         index,
     )))
@@ -220,61 +219,31 @@ fn resolve_window_placement_anchor_target(
     connection: &mut Connection,
     target: Option<&TargetSpec>,
     command_name: &str,
-) -> Result<rmux_proto::WindowTarget, ExitFailure> {
+) -> Result<WindowTarget, ExitFailure> {
     let Some(target) = target else {
-        let pane = resolve_current_pane_target(connection, command_name)?;
-        return Ok(rmux_proto::WindowTarget::with_window(
-            pane.session_name().clone(),
-            pane.window_index(),
-        ));
+        return resolve_window_target_or_current(connection, None, command_name);
     };
 
-    if let Some(session_target) = signed_window_target_session_part(target.raw()) {
-        if let SignedWindowSession::Named(session_target) = session_target {
-            let session_target = crate::cli_args::parse_target_spec(session_target)
-                .map_err(|error| ExitFailure::new(1, error))?;
-            let session_name = resolve_session_target_spec(connection, &session_target, false)?;
+    match signed_window_target_session_part(target.raw()) {
+        Some(SignedWindowSession::Named(session_target)) => {
+            let session_name = resolve_raw_session(connection, session_target)?;
             let window_index =
                 resolve_active_window_index(connection, &session_name, command_name)?;
-            return Ok(rmux_proto::WindowTarget::with_window(
-                session_name,
-                window_index,
-            ));
+            Ok(WindowTarget::with_window(session_name, window_index))
         }
-        return resolve_window_target_or_current(connection, None, command_name);
+        Some(SignedWindowSession::Current) => {
+            resolve_window_target_or_current(connection, None, command_name)
+        }
+        None => resolve_window_target_spec(connection, target, false),
     }
-
-    resolve_window_target_spec(connection, target, false)
 }
 
-/// Asks the server for the index of the active window in `session_name`.
-fn resolve_active_window_index(
+/// Resolves the raw session part of a `session:window` spec to its session name.
+fn resolve_raw_session(
     connection: &mut Connection,
-    session_name: &rmux_proto::SessionName,
-    command_name: &str,
-) -> Result<u32, ExitFailure> {
-    let response = connection
-        .list_windows(
-            session_name.clone(),
-            Some("#{window_index}:#{window_active}".to_owned()),
-        )
-        .map_err(ExitFailure::from)?;
-    let output = expect_command_output(&response, "list-windows")?;
-    let stdout = String::from_utf8_lossy(output.stdout());
-    for line in stdout.lines() {
-        let Some((index, active)) = line.split_once(':') else {
-            continue;
-        };
-        if active == "1" {
-            return index.parse::<u32>().map_err(|error| {
-                ExitFailure::new(1, format!("{command_name}: invalid active window: {error}"))
-            });
-        }
-    }
-    Err(ExitFailure::new(
-        1,
-        format!("{command_name}: no active window in session {session_name}"),
-    ))
+    raw_session: &str,
+) -> Result<SessionName, ExitFailure> {
+    resolve_session_target_spec(connection, &parse_spec(raw_session)?, false)
 }
 
 /// Session part of a signed `+`/`-` window target.
@@ -340,19 +309,17 @@ fn parse_bare_window_index(value: &str) -> Result<Option<u32>, ExitFailure> {
 fn resolve_session_only_destination(
     connection: &mut Connection,
     target: &TargetSpec,
-) -> Result<rmux_proto::SessionName, ExitFailure> {
-    if let Some(session) = target.raw().strip_suffix(':') {
-        let session_target = crate::cli_args::parse_target_spec(session)
-            .map_err(|error| ExitFailure::new(1, error))?;
-        return resolve_session_target_spec(connection, &session_target, false);
+) -> Result<SessionName, ExitFailure> {
+    match target.raw().strip_suffix(':') {
+        Some(session) => resolve_raw_session(connection, session),
+        None => resolve_session_target_spec(connection, target, false),
     }
-    resolve_session_target_spec(connection, target, false)
 }
 
 /// Finds the lowest unused window index at or above the session's `base-index`.
 fn first_available_window_index(
     connection: &mut Connection,
-    session_name: &rmux_proto::SessionName,
+    session_name: &SessionName,
 ) -> Result<u32, ExitFailure> {
     let response = connection
         .list_windows(session_name.clone(), Some("#{window_index}".to_owned()))
@@ -367,22 +334,15 @@ fn first_available_window_index(
         })
         .collect::<Result<BTreeSet<_>, _>>()?;
     let base_index = session_base_index(connection, session_name)?;
-    let mut index = base_index;
-    loop {
-        if !used.contains(&index) {
-            return Ok(index);
-        }
-        let Some(next_index) = index.checked_add(1) else {
-            return Err(ExitFailure::new(1, "window index space exhausted"));
-        };
-        index = next_index;
-    }
+    (base_index..=u32::MAX)
+        .find(|index| !used.contains(index))
+        .ok_or_else(|| ExitFailure::new(1, "window index space exhausted"))
 }
 
 /// Reads the session's effective `base-index` option from the server.
 fn session_base_index(
     connection: &mut Connection,
-    session_name: &rmux_proto::SessionName,
+    session_name: &SessionName,
 ) -> Result<u32, ExitFailure> {
     let response = connection
         .show_options(
@@ -411,14 +371,26 @@ pub(super) fn run_move_window(
     }
 
     run_command_resolved(socket_path, "move-window", move |connection| {
-        let request = resolve_move_window_args(connection, &args)?;
+        // `-r` renumbers a session (or one window) in place instead of moving a source window.
+        let (source, target) = if args.reindex {
+            let target = match args.target.as_ref() {
+                Some(target) => resolve_move_window_reindex_target(connection, target)?,
+                None => MoveWindowTarget::Session(resolve_current_session_target(connection)?),
+            };
+            (None, target)
+        } else {
+            let source =
+                resolve_window_target_or_current(connection, args.source.as_ref(), "move-window")?;
+            let target = resolve_move_window_destination(connection, args.target.as_ref())?;
+            (Some(source), MoveWindowTarget::Window(target))
+        };
         connection
             .move_window(
-                request.source,
-                request.target,
-                request.renumber,
-                request.kill_destination,
-                request.detached,
+                source,
+                target,
+                args.reindex,
+                args.kill_target,
+                args.detached,
             )
             .map_err(ExitFailure::from)
     })
@@ -426,8 +398,7 @@ pub(super) fn run_move_window(
 
 /// Performs `move-window` insertion before or after an anchor window.
 fn run_move_window_relative(args: &MoveWindowArgs, socket_path: &Path) -> Result<i32, ExitFailure> {
-    let mut connection = connect(socket_path)
-        .map_err(|error| ExitFailure::from_client_connect(socket_path, error))?;
+    let mut connection = connect_cli(socket_path)?;
     let source =
         resolve_window_target_or_current(&mut connection, args.source.as_ref(), "move-window")?;
     let target = resolve_window_placement_anchor_target(
@@ -447,13 +418,9 @@ fn run_move_window_relative(args: &MoveWindowArgs, socket_path: &Path) -> Result
         )
         .map_err(ExitFailure::from)?;
     match response {
-        Response::MoveWindow(_) => {}
-        Response::Error(ErrorResponse { error }) => {
-            return Err(ExitFailure::new(1, error.to_string()));
-        }
-        other => return Err(unexpected_response("move-window", &other)),
+        Response::MoveWindow(_) => Ok(0),
+        other => Err(response_failure("move-window", &other)),
     }
-    Ok(0)
 }
 
 /// Runs `swap-window`, exchanging the source and target windows.
@@ -482,14 +449,12 @@ pub(super) fn run_swap_window(
 fn resolve_window_source_or_marked_or_current(
     connection: &mut Connection,
     source: Option<&TargetSpec>,
-) -> Result<rmux_proto::WindowTarget, ExitFailure> {
+) -> Result<WindowTarget, ExitFailure> {
     if let Some(source) = source {
         return resolve_window_target_spec(connection, source, false);
     }
 
-    let marked = crate::cli_args::parse_target_spec("{marked}")
-        .map_err(|error| ExitFailure::new(1, error))?;
-    match resolve_window_target_spec(connection, &marked, false) {
+    match resolve_window_target_spec(connection, &parse_spec("{marked}")?, false) {
         Ok(target) => Ok(target),
         Err(error) if error.message().contains("{marked}") => {
             resolve_window_target_or_current(connection, None, "swap-window")
@@ -500,48 +465,46 @@ fn resolve_window_source_or_marked_or_current(
 
 /// Runs `rotate-window`, rotating panes in the target window and optionally restoring zoom.
 pub(super) fn run_rotate_window(
-    args: RotateWindowArgs,
+    args: &RotateWindowArgs,
     socket_path: &Path,
 ) -> Result<i32, ExitFailure> {
-    let direction = args.direction();
-    let restore_zoom = args.restore_zoom;
-    run_command_resolved(socket_path, "rotate-window", move |connection| {
-        let target =
-            resolve_window_target_or_current(connection, args.target.as_ref(), "rotate-window")?;
-        connection
-            .rotate_window_with_zoom(target, direction, restore_zoom)
-            .map_err(ExitFailure::from)
-    })
+    run_targeted(
+        socket_path,
+        "rotate-window",
+        args.target.as_ref(),
+        |connection, target| {
+            connection.rotate_window_with_zoom(target, args.direction(), args.restore_zoom)
+        },
+    )
 }
 
 /// Runs `resize-window`, translating the direction and size flags into one adjustment.
 pub(super) fn run_resize_window(
-    args: ResizeWindowArgs,
+    args: &ResizeWindowArgs,
     socket_path: &Path,
 ) -> Result<i32, ExitFailure> {
     let adjust = args.adjustment.unwrap_or(1);
     let adjustment = if args.up {
-        Some(rmux_proto::ResizeWindowAdjustment::Up(adjust))
+        Some(ResizeWindowAdjustment::Up(adjust))
     } else if args.down {
-        Some(rmux_proto::ResizeWindowAdjustment::Down(adjust))
+        Some(ResizeWindowAdjustment::Down(adjust))
     } else if args.left {
-        Some(rmux_proto::ResizeWindowAdjustment::Left(adjust))
+        Some(ResizeWindowAdjustment::Left(adjust))
     } else if args.right {
-        Some(rmux_proto::ResizeWindowAdjustment::Right(adjust))
+        Some(ResizeWindowAdjustment::Right(adjust))
     } else if args.expand {
-        Some(rmux_proto::ResizeWindowAdjustment::LargestLinkedSession)
+        Some(ResizeWindowAdjustment::LargestLinkedSession)
     } else if args.shrink {
-        Some(rmux_proto::ResizeWindowAdjustment::SmallestLinkedSession)
+        Some(ResizeWindowAdjustment::SmallestLinkedSession)
     } else {
         None
     };
-    run_command_resolved(socket_path, "resize-window", move |connection| {
-        let target =
-            resolve_window_target_or_current(connection, args.target.as_ref(), "resize-window")?;
-        connection
-            .resize_window(target, args.width, args.height, adjustment)
-            .map_err(ExitFailure::from)
-    })
+    run_targeted(
+        socket_path,
+        "resize-window",
+        args.target.as_ref(),
+        |connection, target| connection.resize_window(target, args.width, args.height, adjustment),
+    )
 }
 
 /// Runs `respawn-window`, restarting the target window's panes with the given command.
@@ -549,24 +512,20 @@ pub(super) fn run_respawn_window(
     args: RespawnWindowArgs,
     socket_path: &Path,
 ) -> Result<i32, ExitFailure> {
-    let env = if args.environment.is_empty() {
-        None
-    } else {
-        Some(args.environment)
-    };
-    run_command_resolved(socket_path, "respawn-window", move |connection| {
-        let target =
-            resolve_window_target_or_current(connection, args.target.as_ref(), "respawn-window")?;
-        connection
-            .respawn_window_with_environment(
+    run_targeted(
+        socket_path,
+        "respawn-window",
+        args.target.as_ref(),
+        |connection, target| {
+            connection.respawn_window_with_environment(
                 target,
                 args.kill,
-                env,
+                (!args.environment.is_empty()).then_some(args.environment),
                 args.start_directory,
                 (!args.command.is_empty()).then_some(args.command),
             )
-            .map_err(ExitFailure::from)
-    })
+        },
+    )
 }
 
 /// Runs `unlink-window`, detaching the target window from its session.
@@ -586,119 +545,41 @@ pub(super) fn run_unlink_window(
     })
 }
 
-/// Fully resolved arguments for a non-relative `move-window` request.
-struct ResolvedMoveWindowArgs {
-    source: Option<rmux_proto::WindowTarget>,
-    target: MoveWindowTarget,
-    renumber: bool,
-    kill_destination: bool,
-    detached: bool,
-}
-
-/// Resolves `move-window` arguments, treating `-r` as a session renumber rather than a move.
-fn resolve_move_window_args(
-    connection: &mut rmux_client::Connection,
-    args: &MoveWindowArgs,
-) -> Result<ResolvedMoveWindowArgs, ExitFailure> {
-    let effective_reindex = args.reindex;
-    let source = if effective_reindex {
-        None
-    } else {
-        Some(resolve_window_target_or_current(
-            connection,
-            args.source.as_ref(),
-            "move-window",
-        )?)
-    };
-    let target = if effective_reindex {
-        match args.target.as_ref() {
-            Some(target) => resolve_move_window_reindex_target(connection, target)?,
-            None => MoveWindowTarget::Session(resolve_current_session(connection)?),
-        }
-    } else {
-        debug_assert!(
-            source.is_some(),
-            "non-reindex move-window source is resolved"
-        );
-        MoveWindowTarget::Window(resolve_move_window_destination(
-            connection,
-            args.target.as_ref(),
-        )?)
-    };
-
-    Ok(ResolvedMoveWindowArgs {
-        source,
-        target,
-        renumber: effective_reindex,
-        kill_destination: args.kill_target,
-        detached: args.detached,
-    })
-}
-
 /// Resolves the `-r` renumber target, which may name a session or a single window.
 fn resolve_move_window_reindex_target(
-    connection: &mut rmux_client::Connection,
+    connection: &mut Connection,
     target: &TargetSpec,
 ) -> Result<MoveWindowTarget, ExitFailure> {
-    if let Some((session_part, window_part)) = target.raw().split_once(':') {
-        if !window_part.is_empty() {
-            return Ok(MoveWindowTarget::Window(resolve_window_destination_target(
-                connection,
-                target,
-                "move-window",
-            )?));
+    match target.raw().split_once(':') {
+        Some((_, window_part)) if !window_part.is_empty() => Ok(MoveWindowTarget::Window(
+            resolve_window_destination_target(connection, target, "move-window")?,
+        )),
+        Some((session_part, _)) => {
+            resolve_raw_session(connection, session_part).map(MoveWindowTarget::Session)
         }
-        let session_target = crate::cli_args::parse_target_spec(session_part)
-            .map_err(|error| ExitFailure::new(1, error))?;
-        return resolve_session_target_spec(connection, &session_target, false)
-            .map(MoveWindowTarget::Session);
+        None => {
+            resolve_session_target_spec(connection, target, false).map(MoveWindowTarget::Session)
+        }
     }
-    resolve_session_target_spec(connection, target, false).map(MoveWindowTarget::Session)
 }
 
 /// Resolves a move destination, defaulting to the current session's first free window index.
 fn resolve_move_window_destination(
-    connection: &mut rmux_client::Connection,
+    connection: &mut Connection,
     target: Option<&TargetSpec>,
-) -> Result<rmux_proto::WindowTarget, ExitFailure> {
+) -> Result<WindowTarget, ExitFailure> {
     let Some(target) = target else {
-        let session_name = resolve_current_session(connection)?;
+        let session_name = resolve_current_session_target(connection)?;
         let index = first_available_window_index(connection, &session_name)?;
-        return Ok(rmux_proto::WindowTarget::with_window(session_name, index));
+        return Ok(WindowTarget::with_window(session_name, index));
     };
     resolve_window_destination_target(connection, target, "move-window")
 }
 
-/// Asks the server which session the client is currently attached to.
-fn resolve_current_session(
-    connection: &mut rmux_client::Connection,
-) -> Result<rmux_proto::SessionName, ExitFailure> {
-    match connection
-        .resolve_target(None, rmux_proto::ResolveTargetType::Session, false, false)
-        .map_err(ExitFailure::from)?
-    {
-        rmux_proto::Response::ResolveTarget(response) => match response.target {
-            rmux_proto::Target::Session(session_name) => Ok(session_name),
-            other => Err(ExitFailure::new(
-                1,
-                format!(
-                    "resolve-target produced {} where a session target was required",
-                    super::response_name_for_target(&other)
-                ),
-            )),
-        },
-        rmux_proto::Response::Error(rmux_proto::ErrorResponse { error }) => {
-            Err(ExitFailure::new(1, error.to_string()))
-        }
-        other => Err(super::unexpected_response("resolve-target", &other)),
-    }
-}
-
 /// Runs `new-window`, placing, optionally reusing, creating and printing the new window.
 pub(super) fn run_new_window(args: NewWindowArgs, socket_path: &Path) -> Result<i32, ExitFailure> {
+    let mut connection = connect_cli(socket_path)?;
     if args.kill_existing {
-        let mut connection = connect(socket_path)
-            .map_err(|error| ExitFailure::from_client_connect(socket_path, error))?;
         let target = resolve_current_pane_target(&mut connection, "new-window")?;
         return run_queued_server_command_at_target_with_connection(
             &mut connection,
@@ -708,19 +589,6 @@ pub(super) fn run_new_window(args: NewWindowArgs, socket_path: &Path) -> Result<
         );
     }
 
-    let start_directory = args
-        .start_directory
-        .clone()
-        .or_else(|| std::env::current_dir().ok());
-    let print_target = args.print_target;
-    let print_format = args
-        .format
-        .clone()
-        .unwrap_or_else(|| DEFAULT_NEW_WINDOW_PRINT_FORMAT.to_owned());
-    let name = args.name.clone();
-    let select_existing = args.select_existing;
-    let mut connection = connect(socket_path)
-        .map_err(|error| ExitFailure::from_client_connect(socket_path, error))?;
     let insert_at_target = args.after || args.before;
     let (target, target_window_index) = if insert_at_target {
         resolve_new_window_placement_target(
@@ -732,8 +600,9 @@ pub(super) fn run_new_window(args: NewWindowArgs, socket_path: &Path) -> Result<
     } else {
         resolve_new_window_target_spec(&mut connection, args.target.as_ref())?
     };
-    if select_existing && target_window_index.is_none() {
-        if let Some(existing) = name
+    if args.select_existing && target_window_index.is_none() {
+        if let Some(existing) = args
+            .name
             .as_deref()
             .and_then(|name| find_window_by_name(&mut connection, &target, name).transpose())
             .transpose()?
@@ -750,71 +619,75 @@ pub(super) fn run_new_window(args: NewWindowArgs, socket_path: &Path) -> Result<
         .new_window_at_with_environment(
             target,
             target_window_index,
-            name,
+            args.name,
             args.detached,
             (!args.environment.is_empty()).then_some(args.environment),
-            start_directory,
+            args.start_directory
+                .or_else(|| std::env::current_dir().ok()),
             (!args.command.is_empty()).then_some(args.command),
             insert_at_target,
         )
         .map_err(ExitFailure::from)?;
-    let target = match response {
+    let window = match response {
         Response::NewWindow(response) => response.target,
-        response @ Response::Error(_) => {
-            expect_command_success(response, "new-window")?;
-            unreachable!("new-window error response should return from expect_command_success")
+        Response::Error(ErrorResponse { error }) => {
+            return Err(ExitFailure::new(
+                1,
+                tmux_cli_error_message("new-window", &error),
+            ));
         }
         other => return Err(unexpected_response("new-window", &other)),
     };
 
-    if print_target {
-        let pane = rmux_proto::PaneTarget::with_window(
-            target.session_name().clone(),
-            target.window_index(),
-            0,
-        );
-        print_target_format(
-            &mut connection,
-            "new-window",
-            rmux_proto::Target::Pane(pane),
-            &print_format,
-        )?;
+    if args.print_target {
+        let pane = PaneTarget::with_window(window.session_name().clone(), window.window_index(), 0);
+        let format = args
+            .format
+            .as_deref()
+            .unwrap_or(DEFAULT_NEW_WINDOW_PRINT_FORMAT);
+        print_target_format(&mut connection, "new-window", Target::Pane(pane), format)?;
     }
-
     Ok(0)
+}
+
+/// Asks the server for `session_name`'s windows rendered as `index`, separator, `name` lines.
+fn list_window_names(
+    connection: &mut Connection,
+    session_name: &SessionName,
+) -> Result<Response, ExitFailure> {
+    connection
+        .list_windows(
+            session_name.clone(),
+            Some(format!(
+                "#{{window_index}}{LISTING_FIELD_SEPARATOR}#{{window_name}}"
+            )),
+        )
+        .map_err(ExitFailure::from)
 }
 
 /// Finds the uniquely named window in a session, failing when the name is ambiguous.
 fn find_window_by_name(
     connection: &mut Connection,
-    session_name: &rmux_proto::SessionName,
+    session_name: &SessionName,
     name: &str,
-) -> Result<Option<rmux_proto::WindowTarget>, ExitFailure> {
-    let response = connection
-        .list_windows(
-            session_name.clone(),
-            Some(format!(
-                "#{{window_index}}{LIST_WINDOWS_FILTER_SEPARATOR}#{{window_name}}"
-            )),
-        )
-        .map_err(ExitFailure::from)?;
+) -> Result<Option<WindowTarget>, ExitFailure> {
+    let response = list_window_names(connection, session_name)?;
     let output = expect_command_output(&response, "list-windows")?;
     let mut matched = None;
-    for line in String::from_utf8_lossy(output.stdout()).lines() {
-        let Some((index, window_name)) = line.split_once(LIST_WINDOWS_FILTER_SEPARATOR) else {
-            continue;
-        };
-        if window_name == name {
-            let window_index = index
-                .parse::<u32>()
-                .map_err(|_| ExitFailure::new(1, format!("invalid window index: {index}")))?;
-            let target = rmux_proto::WindowTarget::with_window(session_name.clone(), window_index);
-            if matched.replace(target).is_some() {
-                return Err(ExitFailure::new(
-                    1,
-                    format!("multiple windows named {name}"),
-                ));
-            }
+    for (index, _) in String::from_utf8_lossy(output.stdout())
+        .lines()
+        .filter_map(|line| line.split_once(LISTING_FIELD_SEPARATOR))
+        .filter(|(_, window_name)| *window_name == name)
+    {
+        let window_index = index
+            .parse::<u32>()
+            .map_err(|_| ExitFailure::new(1, format!("invalid window index: {index}")))?;
+        let target = WindowTarget::with_window(session_name.clone(), window_index);
+        if matched.replace(target).is_some() {
+            return Err(ExitFailure::new(
+                1,
+                format!("multiple windows named {name}"),
+            ));
         }
     }
     Ok(matched)
@@ -826,7 +699,7 @@ fn resolve_new_window_placement_target(
     target: Option<&TargetSpec>,
     after: bool,
     command_name: &str,
-) -> Result<(rmux_proto::SessionName, Option<u32>), ExitFailure> {
+) -> Result<(SessionName, Option<u32>), ExitFailure> {
     let window = resolve_window_placement_anchor_target(connection, target, command_name)?;
     let window_index = if after {
         window.window_index().checked_add(1).ok_or_else(|| {
@@ -848,7 +721,7 @@ fn resolve_new_window_placement_target(
 fn resolve_new_window_target_spec(
     connection: &mut Connection,
     target: Option<&TargetSpec>,
-) -> Result<(rmux_proto::SessionName, Option<u32>), ExitFailure> {
+) -> Result<(SessionName, Option<u32>), ExitFailure> {
     let Some(target) = target else {
         return resolve_current_session_target(connection).map(|session| (session, None));
     };
@@ -856,35 +729,20 @@ fn resolve_new_window_target_spec(
     if let Some(window) =
         resolve_bare_relative_window_target(connection, target.raw(), "new-window")?
     {
-        return Ok((window.session_name().clone(), Some(window.window_index())));
+        return Ok(new_window_slot(&window));
     }
 
     if new_window_target_requests_window_index(target.raw()) {
-        return match resolve_target_spec(
-            connection,
-            target,
-            ResolveTargetType::Window,
-            true,
-            false,
-        )? {
-            rmux_proto::Target::Window(window) => {
-                Ok((window.session_name().clone(), Some(window.window_index())))
-            }
-            other => Err(ExitFailure::new(
-                1,
-                format!(
-                    "resolve-target produced {} where a new-window target was required",
-                    response_name_for_target(&other)
-                ),
-            )),
+        let resolved =
+            resolve_target_spec(connection, target, ResolveTargetType::Window, true, false)?;
+        return match resolved {
+            Target::Window(window) => Ok(new_window_slot(&window)),
+            other => Err(wrong_target_kind(&other, "new-window")),
         };
     }
 
-    if let Some(window_target) = resolve_new_window_bare_window_target(connection, target)? {
-        return Ok((
-            window_target.session_name().clone(),
-            Some(window_target.window_index()),
-        ));
+    if let Some(window) = resolve_new_window_bare_window_target(connection, target)? {
+        return Ok(new_window_slot(&window));
     }
 
     if let Some(session_name) = resolve_new_window_session_only_target(connection, target)? {
@@ -892,15 +750,14 @@ fn resolve_new_window_target_spec(
     }
 
     match resolve_target_spec(connection, target, ResolveTargetType::Session, false, false)? {
-        rmux_proto::Target::Session(session_name) => Ok((session_name, None)),
-        other => Err(ExitFailure::new(
-            1,
-            format!(
-                "resolve-target produced {} where a new-window target was required",
-                response_name_for_target(&other)
-            ),
-        )),
+        Target::Session(session_name) => Ok((session_name, None)),
+        other => Err(wrong_target_kind(&other, "new-window")),
     }
+}
+
+/// The session and explicit window index `new-window` creates its window at.
+fn new_window_slot(window: &WindowTarget) -> (SessionName, Option<u32>) {
+    (window.session_name().clone(), Some(window.window_index()))
 }
 
 /// Reports whether a `new-window` target names a window index rather than a session.
@@ -932,21 +789,17 @@ fn signed_window_index_target(value: &str) -> bool {
 fn resolve_new_window_bare_window_target(
     connection: &mut Connection,
     target: &TargetSpec,
-) -> Result<Option<rmux_proto::WindowTarget>, ExitFailure> {
+) -> Result<Option<WindowTarget>, ExitFailure> {
     let raw = target.raw();
     if !new_window_target_is_bare_lookup(raw)
-        || !matches!(target.exact(), None | Some(rmux_proto::Target::Session(_)))
+        || !matches!(target.exact(), None | Some(Target::Session(_)))
     {
         return Ok(None);
     }
 
     match resolve_target_spec(connection, target, ResolveTargetType::Window, false, false) {
-        Ok(rmux_proto::Target::Window(window)) => {
-            if window_name_matches_target(connection, &window, raw)? {
-                Ok(Some(window))
-            } else {
-                Ok(None)
-            }
+        Ok(Target::Window(window)) => {
+            Ok(window_name_matches_target(connection, &window, raw)?.then_some(window))
         }
         Ok(_) => Ok(None),
         Err(window_error) => match resolve_session_target_spec(connection, target, false) {
@@ -967,62 +820,45 @@ fn new_window_target_is_bare_lookup(raw_target: &str) -> bool {
 /// Checks the server-reported name of `window` against an exact, prefix or `fnmatch` pattern.
 fn window_name_matches_target(
     connection: &mut Connection,
-    window: &rmux_proto::WindowTarget,
+    window: &WindowTarget,
     target: &str,
 ) -> Result<bool, ExitFailure> {
-    let response = connection
-        .list_windows(
-            window.session_name().clone(),
-            Some(format!(
-                "#{{window_index}}{LIST_WINDOWS_FILTER_SEPARATOR}#{{window_name}}"
-            )),
-        )
-        .map_err(ExitFailure::from)?;
+    let response = list_window_names(connection, window.session_name())?;
     let output = expect_command_output(&response, "list-windows")?;
-    for line in String::from_utf8_lossy(output.stdout()).lines() {
-        let Some((index, window_name)) = line.split_once(LIST_WINDOWS_FILTER_SEPARATOR) else {
-            continue;
-        };
-        if index != window.window_index().to_string() {
-            continue;
-        }
-        return Ok(window_name == target
-            || window_name.starts_with(target)
-            || rmux_core::fnmatch(target, window_name));
-    }
-    Ok(false)
+    let window_index = window.window_index().to_string();
+    Ok(String::from_utf8_lossy(output.stdout())
+        .lines()
+        .filter_map(|line| line.split_once(LISTING_FIELD_SEPARATOR))
+        .find(|(index, _)| *index == window_index)
+        .is_some_and(|(_, window_name)| {
+            window_name == target
+                || window_name.starts_with(target)
+                || rmux_core::fnmatch(target, window_name)
+        }))
 }
 
 /// Resolves a `session:` target with an empty window part to that session.
 fn resolve_new_window_session_only_target(
     connection: &mut Connection,
     target: &TargetSpec,
-) -> Result<Option<rmux_proto::SessionName>, ExitFailure> {
-    let raw_target = target.raw();
-    let Some((session_name, window_part)) = raw_target.split_once(':') else {
-        return Ok(None);
-    };
-    if !window_part.is_empty() {
-        return Ok(None);
+) -> Result<Option<SessionName>, ExitFailure> {
+    match target.raw().split_once(':') {
+        Some((session_name, "")) => resolve_raw_session(connection, session_name).map(Some),
+        _ => Ok(None),
     }
-    let session_target = crate::cli_args::parse_target_spec(session_name)
-        .map_err(|error| ExitFailure::new(1, error))?;
-    resolve_session_target_spec(connection, &session_target, false).map(Some)
 }
 
 /// Runs `kill-window`, destroying the target window or every other window with `-a`.
 pub(super) fn run_kill_window(
-    args: KillWindowArgs,
+    args: &KillWindowArgs,
     socket_path: &Path,
 ) -> Result<i32, ExitFailure> {
-    run_command_resolved(socket_path, "kill-window", move |connection| {
-        let target =
-            resolve_window_target_or_current(connection, args.target.as_ref(), "kill-window")?;
-        let response = connection
-            .kill_window(target, args.kill_others)
-            .map_err(ExitFailure::from)?;
-        Ok(response)
-    })
+    run_targeted(
+        socket_path,
+        "kill-window",
+        args.target.as_ref(),
+        |connection, target| connection.kill_window(target, args.kill_others),
+    )
 }
 
 /// Runs `select-window`, handling the next, previous and last shortcuts plus `-T` toggling.
@@ -1030,29 +866,25 @@ pub(super) fn run_select_window(
     args: SelectWindowArgs,
     socket_path: &Path,
 ) -> Result<i32, ExitFailure> {
+    if args.next || args.previous || args.last {
+        let target = args.target.as_ref();
+        return run_targeted(
+            socket_path,
+            "select-window",
+            target,
+            |connection, session| {
+                if args.next {
+                    connection.next_window(session, false)
+                } else if args.previous {
+                    connection.previous_window(session, false)
+                } else {
+                    connection.last_window(session)
+                }
+            },
+        );
+    }
+
     run_command_resolved(socket_path, "select-window", move |connection| {
-        if args.next {
-            let target =
-                resolve_session_listing_target(connection, args.target.clone(), "select-window")?;
-            return connection
-                .next_window(target, false)
-                .map_err(ExitFailure::from);
-        }
-
-        if args.previous {
-            let target =
-                resolve_session_listing_target(connection, args.target.clone(), "select-window")?;
-            return connection
-                .previous_window(target, false)
-                .map_err(ExitFailure::from);
-        }
-
-        if args.last {
-            let target =
-                resolve_session_listing_target(connection, args.target.clone(), "select-window")?;
-            return connection.last_window(target).map_err(ExitFailure::from);
-        }
-
         let target =
             resolve_window_target_or_current(connection, args.target.as_ref(), "select-window")?;
         if args.toggle_last && window_target_is_current(connection, &target)? {
@@ -1068,7 +900,7 @@ pub(super) fn run_select_window(
 /// Reports whether the target window is the client's currently active window.
 fn window_target_is_current(
     connection: &mut Connection,
-    target: &rmux_proto::WindowTarget,
+    target: &WindowTarget,
 ) -> Result<bool, ExitFailure> {
     let current = resolve_current_pane_target(connection, "select-window")?;
     Ok(target.session_name() == current.session_name()
@@ -1077,61 +909,55 @@ fn window_target_is_current(
 
 /// Runs `rename-window` after escaping backslashes in the new name.
 pub(super) fn run_rename_window(
-    args: RenameWindowArgs,
+    args: &RenameWindowArgs,
     socket_path: &Path,
 ) -> Result<i32, ExitFailure> {
-    run_command_resolved(socket_path, "rename-window", move |connection| {
-        let target =
-            resolve_window_target_or_current(connection, args.target.as_ref(), "rename-window")?;
-        connection
-            .rename_window(target, tmux_rename_window_name(&args.new_name))
-            .map_err(ExitFailure::from)
-    })
-}
-
-/// Doubles backslashes so the new name survives format interpretation.
-fn tmux_rename_window_name(name: &str) -> String {
-    name.replace('\\', r"\\")
+    // Backslashes are doubled so the new name survives format interpretation.
+    run_targeted(
+        socket_path,
+        "rename-window",
+        args.target.as_ref(),
+        |connection, target| connection.rename_window(target, args.new_name.replace('\\', r"\\")),
+    )
 }
 
 /// Runs `next-window`, optionally restricting movement to windows with alerts.
 pub(super) fn run_next_window(
-    args: AlertSessionTargetArgs,
+    args: &AlertSessionTargetArgs,
     socket_path: &Path,
 ) -> Result<i32, ExitFailure> {
-    run_command_resolved(socket_path, "next-window", move |connection| {
-        let target =
-            resolve_session_listing_target(connection, args.target.clone(), "next-window")?;
-        connection
-            .next_window(target, args.alerts_only)
-            .map_err(ExitFailure::from)
-    })
+    run_targeted(
+        socket_path,
+        "next-window",
+        args.target.as_ref(),
+        |connection, target| connection.next_window(target, args.alerts_only),
+    )
 }
 
 /// Runs `previous-window`, optionally restricting movement to windows with alerts.
 pub(super) fn run_previous_window(
-    args: AlertSessionTargetArgs,
+    args: &AlertSessionTargetArgs,
     socket_path: &Path,
 ) -> Result<i32, ExitFailure> {
-    run_command_resolved(socket_path, "previous-window", move |connection| {
-        let target =
-            resolve_session_listing_target(connection, args.target.clone(), "previous-window")?;
-        connection
-            .previous_window(target, args.alerts_only)
-            .map_err(ExitFailure::from)
-    })
+    run_targeted(
+        socket_path,
+        "previous-window",
+        args.target.as_ref(),
+        |connection, target| connection.previous_window(target, args.alerts_only),
+    )
 }
 
 /// Runs `last-window`, returning the session to its previously selected window.
 pub(super) fn run_last_window(
-    args: SessionTargetArgs,
+    args: &SessionTargetArgs,
     socket_path: &Path,
 ) -> Result<i32, ExitFailure> {
-    run_command_resolved(socket_path, "last-window", move |connection| {
-        let target =
-            resolve_session_target_or_current(connection, args.target.as_ref(), "last-window")?;
-        connection.last_window(target).map_err(ExitFailure::from)
-    })
+    run_targeted(
+        socket_path,
+        "last-window",
+        args.target.as_ref(),
+        |connection, target| connection.last_window(target),
+    )
 }
 
 /// Runs `list-windows`, using the server-side `-a` queue when available, then sorts or emits JSON.
@@ -1140,19 +966,18 @@ pub(super) fn run_last_window(
     reason = "one linear list-windows pipeline; splitting it would obscure the ordering"
 )]
 pub(super) fn run_list_windows(
-    args: ListWindowsArgs,
+    args: &ListWindowsArgs,
     socket_path: &Path,
 ) -> Result<i32, ExitFailure> {
     let json = args.json;
-    let mut connection = connect(socket_path)
-        .map_err(|error| ExitFailure::from_client_connect(socket_path, error))?;
+    let mut connection = connect_cli(socket_path)?;
     let queued_all_sessions = args.all_sessions
         && connection
             .supports_capability(CAPABILITY_CLI_LIST_WINDOWS_ALL_QUEUE)
             .map_err(ExitFailure::from)?;
     if queued_all_sessions {
         let json_format = json.then(list_windows_json_format);
-        let arguments = list_windows_all_queue_arguments(&args, json_format.as_deref());
+        let arguments = list_windows_all_queue_arguments(args, json_format.as_deref());
         if json {
             let (exit_status, output) = capture_list_windows_all_server_command_with_connection(
                 &mut connection,
@@ -1168,9 +993,9 @@ pub(super) fn run_list_windows(
     let targets = if args.all_sessions {
         list_session_names(&mut connection)?
     } else {
-        vec![resolve_session_listing_target(
+        vec![resolve_session_target_or_current(
             &mut connection,
-            args.target,
+            args.target.as_ref(),
             "list-windows",
         )?]
     };
@@ -1189,61 +1014,36 @@ pub(super) fn run_list_windows(
     let mut lines = Vec::new();
     let mut windows = Vec::new();
     for target in targets {
-        let target_sort_order = if args.all_sessions {
-            None
-        } else {
-            args.sort_order.clone()
-        };
-        let target_reversed = !args.all_sessions && args.reversed;
         let response = connection
             .list_windows_with_options(
                 target,
                 format.clone(),
                 args.filter.clone(),
-                target_sort_order,
-                target_reversed,
+                (!args.all_sessions)
+                    .then(|| args.sort_order.clone())
+                    .flatten(),
+                !args.all_sessions && args.reversed,
             )
             .map_err(ExitFailure::from)?;
-        match response {
-            Response::ListWindows(response) => {
-                let parsed_windows = response
-                    .windows
+        let response = match response {
+            Response::ListWindows(response) => response,
+            other => return Err(response_failure("list-windows", &other)),
+        };
+        let parsed_windows = response
+            .windows
+            .into_iter()
+            .filter_map(|window| {
+                list_window_entry(window, args.filter.as_deref(), include_sort_metadata).transpose()
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if json || args.all_sessions {
+            windows.extend(parsed_windows);
+        } else {
+            lines.extend(
+                parsed_windows
                     .into_iter()
-                    .filter_map(|mut window| {
-                        let rendered = match list_windows_filtered_line(
-                            &window.rendered,
-                            args.filter.as_deref(),
-                        ) {
-                            Ok(rendered) => rendered?,
-                            Err(error) => return Some(Err(error)),
-                        };
-                        let (activity_at, created_at, rendered) =
-                            match list_windows_sort_metadata(rendered, include_sort_metadata) {
-                                Ok(parsed) => parsed,
-                                Err(error) => return Some(Err(error)),
-                            };
-                        window.rendered = rendered.to_owned();
-                        Some(Ok(CliWindowListEntry {
-                            window,
-                            activity_at,
-                            created_at,
-                        }))
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                if json || args.all_sessions {
-                    windows.extend(parsed_windows);
-                } else {
-                    lines.extend(
-                        parsed_windows
-                            .into_iter()
-                            .map(|window| window.window.rendered),
-                    );
-                }
-            }
-            Response::Error(ErrorResponse { error }) => {
-                return Err(ExitFailure::new(1, error.to_string()));
-            }
-            other => return Err(unexpected_response("list-windows", &other)),
+                    .map(|window| window.window.rendered),
+            );
         }
     }
     if args.all_sessions {
@@ -1267,17 +1067,16 @@ fn list_windows_all_queue_arguments(
     format_override: Option<&str>,
 ) -> Vec<String> {
     let mut command = vec!["list-windows".to_owned(), "-a".to_owned()];
-    if let Some(target) = args.target.as_ref() {
-        command.extend(["-t".to_owned(), target.raw().to_owned()]);
-    }
-    if let Some(format) = format_override.or(args.format.as_deref()) {
-        command.extend(["-F".to_owned(), format.to_owned()]);
-    }
-    if let Some(filter) = args.filter.as_deref() {
-        command.extend(["-f".to_owned(), filter.to_owned()]);
-    }
-    if let Some(sort_order) = args.sort_order.as_deref() {
-        command.extend(["-O".to_owned(), sort_order.to_owned()]);
+    let flags = [
+        ("-t", args.target.as_ref().map(TargetSpec::raw)),
+        ("-F", format_override.or(args.format.as_deref())),
+        ("-f", args.filter.as_deref()),
+        ("-O", args.sort_order.as_deref()),
+    ];
+    for (flag, value) in flags {
+        if let Some(value) = value {
+            command.extend([flag.to_owned(), value.to_owned()]);
+        }
     }
     if args.reversed {
         command.push("-r".to_owned());
@@ -1324,6 +1123,25 @@ struct CliWindowListEntry {
     window: WindowListEntry,
     activity_at: Option<i64>,
     created_at: Option<i64>,
+}
+
+/// Strips the filter and sort-metadata prefixes from one listed window, dropping filtered rows.
+fn list_window_entry(
+    mut window: WindowListEntry,
+    filter: Option<&str>,
+    include_sort_metadata: bool,
+) -> Result<Option<CliWindowListEntry>, ExitFailure> {
+    let Some(rendered) = filtered_listing_line(&window.rendered, filter, "list-windows")? else {
+        return Ok(None);
+    };
+    let (activity_at, created_at, rendered) =
+        list_windows_sort_metadata(rendered, include_sort_metadata)?;
+    window.rendered = rendered.to_owned();
+    Ok(Some(CliWindowListEntry {
+        window,
+        activity_at,
+        created_at,
+    }))
 }
 
 /// Sorts all-session entries by the requested key, with stable session, index and name tiebreaks.
@@ -1396,13 +1214,13 @@ fn list_windows_server_format(
     if include_sort_metadata {
         let rendered = line_format.as_deref().unwrap_or(default_format);
         line_format = Some(format!(
-            "{LIST_WINDOWS_SORT_METADATA_FORMAT}{LIST_WINDOWS_FILTER_SEPARATOR}{rendered}"
+            "{LIST_WINDOWS_SORT_METADATA_FORMAT}{LISTING_FIELD_SEPARATOR}{rendered}"
         ));
     }
     filter
         .map(|filter| {
             let line_format = line_format.as_deref().unwrap_or(default_format);
-            format!("{filter}{LIST_WINDOWS_FILTER_SEPARATOR}{line_format}")
+            format!("{filter}{LISTING_FIELD_SEPARATOR}{line_format}")
         })
         .or(line_format)
 }
@@ -1416,13 +1234,13 @@ fn list_windows_sort_metadata(
         return Ok((None, None, line));
     }
 
-    let Some((activity, rest)) = line.split_once(LIST_WINDOWS_FILTER_SEPARATOR) else {
+    let Some((activity, rest)) = line.split_once(LISTING_FIELD_SEPARATOR) else {
         return Err(ExitFailure::new(
             1,
             "list-windows sort metadata missing activity separator",
         ));
     };
-    let Some((created, rendered)) = rest.split_once(LIST_WINDOWS_FILTER_SEPARATOR) else {
+    let Some((created, rendered)) = rest.split_once(LISTING_FIELD_SEPARATOR) else {
         return Err(ExitFailure::new(
             1,
             "list-windows sort metadata missing creation separator",
@@ -1437,78 +1255,48 @@ fn list_windows_sort_metadata(
     Ok((Some(activity_at), Some(created_at), rendered))
 }
 
-/// Drops a rendered line whose prefixed filter field is not truthy.
-fn list_windows_filtered_line<'a>(
-    line: &'a str,
-    filter: Option<&str>,
-) -> Result<Option<&'a str>, ExitFailure> {
-    if filter.is_none() {
-        return Ok(Some(line));
-    }
-    let Some((filter_value, rendered_line)) = line.split_once(LIST_WINDOWS_FILTER_SEPARATOR) else {
-        return Err(ExitFailure::new(
-            1,
-            "list-windows filter output missing separator",
-        ));
-    };
-    Ok(is_truthy(filter_value).then_some(rendered_line))
-}
-
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 mod tests {
     use super::*;
 
     #[test]
-    fn new_window_signed_targets_request_window_index_resolution() {
-        assert!(new_window_target_requests_window_index("+3"));
-        assert!(new_window_target_requests_window_index("-1"));
-        assert!(new_window_target_requests_window_index("3"));
-        assert!(new_window_target_requests_window_index("alpha:+3"));
-        assert!(new_window_target_requests_window_index("alpha:-1"));
-        assert!(new_window_target_requests_window_index("^"));
-        assert!(new_window_target_requests_window_index("!"));
+    fn new_window_targets_request_window_index_only_for_window_tokens() {
+        for (raw, window_index) in [
+            ("+3", true),
+            ("-1", true),
+            ("3", true),
+            ("alpha:+3", true),
+            ("alpha:-1", true),
+            ("^", true),
+            ("!", true),
+            ("alpha", false),
+            ("alpha:", false),
+        ] {
+            assert_eq!(
+                new_window_target_requests_window_index(raw),
+                window_index,
+                "{raw}"
+            );
+        }
     }
 
     #[test]
-    fn new_window_session_only_targets_stay_session_scoped() {
-        assert!(!new_window_target_requests_window_index("alpha"));
-        assert!(!new_window_target_requests_window_index("alpha:"));
-    }
-
-    #[test]
-    fn numeric_link_targets_are_window_indices() {
-        let target = crate::cli_args::parse_target_spec("3").expect("target parses");
-        assert!(!link_target_is_explicit_session_only(&target));
-    }
-
-    #[test]
-    fn bare_session_link_targets_are_not_explicit_session_only() {
-        let target = crate::cli_args::parse_target_spec("beta").expect("target parses");
-        assert!(!link_target_is_explicit_session_only(&target));
-    }
-
-    #[test]
-    fn colon_session_link_targets_are_explicit_session_only() {
-        let target = crate::cli_args::parse_target_spec("beta:").expect("target parses");
-        assert!(link_target_is_explicit_session_only(&target));
-    }
-
-    #[test]
-    fn exact_session_link_targets_are_session_only() {
-        let target = crate::cli_args::parse_target_spec("=beta").expect("target parses");
-        assert!(link_target_is_explicit_session_only(&target));
-    }
-
-    #[test]
-    fn special_link_targets_are_window_targets() {
-        let target = crate::cli_args::parse_target_spec("{end}").expect("target parses");
-        assert!(!link_target_is_explicit_session_only(&target));
-    }
-
-    #[test]
-    fn relative_link_targets_are_window_targets() {
-        let target = crate::cli_args::parse_target_spec("+1").expect("target parses");
-        assert!(!link_target_is_explicit_session_only(&target));
+    fn only_colon_and_exact_session_link_targets_are_explicit_session_only() {
+        for (raw, session_only) in [
+            ("3", false),
+            ("beta", false),
+            ("beta:", true),
+            ("=beta", true),
+            ("{end}", false),
+            ("+1", false),
+        ] {
+            let target = crate::cli_args::parse_target_spec(raw).expect("target parses");
+            assert_eq!(
+                link_target_is_explicit_session_only(&target),
+                session_only,
+                "{raw}"
+            );
+        }
     }
 }

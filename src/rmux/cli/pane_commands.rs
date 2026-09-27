@@ -1,13 +1,14 @@
 use std::path::Path;
 
-use rmux_client::{Connection, connect};
+use rmux_client::{ClientError, Connection};
 use rmux_core::formats::{
     DEFAULT_LIST_PANES_ALL_FORMAT, DEFAULT_LIST_PANES_SESSION_FORMAT,
-    DEFAULT_LIST_PANES_WINDOW_FORMAT, is_truthy,
+    DEFAULT_LIST_PANES_WINDOW_FORMAT,
 };
 use rmux_proto::{
     CommandOutput, ResizePaneAdjustment, ResizePaneRelativeDirection,
-    ResizePaneTargetActionRequest, ResolveTargetType, RespawnPaneRequest,
+    ResizePaneTargetActionRequest, ResolveTargetType, RespawnPaneRequest, Response, SessionName,
+    Target,
 };
 
 /// Client-side implementation of `split-window`.
@@ -20,56 +21,51 @@ mod transfer;
 use super::json_output::{
     filter_delimited_json_output, list_panes_json_format, write_list_panes_json,
 };
+use super::target_resolution::{
+    CommandTarget, LISTING_FIELD_SEPARATOR, connect_cli, filtered_listing_line,
+    resolve_active_window_index, run_targeted, target_session,
+};
 use super::{
     ExitFailure, cli_target_actions_enabled, expect_command_output, expect_command_success,
-    list_session_names, listed_pane_index_matches_target, resolve_current_pane_target,
-    resolve_pane_target_or_current, resolve_pane_target_spec, resolve_session_listing_target,
-    resolve_target_spec, resolve_window_target_or_current, run_command_resolved,
-    shell_command_text, target_action_needs_legacy_retry, write_lines_output,
+    list_session_names, listed_pane_index_matches_target, resolve_current_session_target,
+    resolve_pane_target_or_current, resolve_target_spec, shell_command_text,
+    target_action_needs_legacy_retry, write_lines_output,
 };
 use crate::cli_args::{
-    LastPaneArgs, ListPanesArgs, PipePaneArgs, ResizePaneArgs, RespawnPaneArgs, SelectPaneArgs,
-    TargetSpec,
+    LastPaneArgs, ListPanesArgs, PipePaneArgs, ResizePaneArgs, ResizePaneSize, RespawnPaneArgs,
+    SelectPaneArgs, TargetSpec,
 };
 
 pub(super) use split::run_split_window;
 pub(super) use transfer::{run_break_pane, run_join_pane, run_move_pane, run_swap_pane};
 
-/// Unit separator that carries the server-side filter result on each `list-panes` line.
-const LIST_PANES_FILTER_SEPARATOR: char = '\x1f';
-
 /// Runs `last-pane`, switching a window back to its previously active pane.
-pub(super) fn run_last_pane(args: LastPaneArgs, socket_path: &Path) -> Result<i32, ExitFailure> {
-    run_command_resolved(socket_path, "last-pane", move |connection| {
-        let target =
-            resolve_window_target_or_current(connection, args.target.as_ref(), "last-pane")?;
-        let input_disabled = if args.enable_input {
-            Some(false)
-        } else if args.disable_input {
-            Some(true)
-        } else {
-            None
-        };
-        connection
-            .last_pane_with_options(target, args.keep_zoom, input_disabled)
-            .map_err(ExitFailure::from)
-    })
+pub(super) fn run_last_pane(args: &LastPaneArgs, socket_path: &Path) -> Result<i32, ExitFailure> {
+    let input_disabled = if args.enable_input {
+        Some(false)
+    } else {
+        args.disable_input.then_some(true)
+    };
+    run_targeted(
+        socket_path,
+        "last-pane",
+        args.target.as_ref(),
+        |connection, target| {
+            connection.last_pane_with_options(target, args.keep_zoom, input_disabled)
+        },
+    )
 }
 
 /// Runs `pipe-pane`, wiring pane output (and optionally input) into a shell command.
 pub(super) fn run_pipe_pane(args: PipePaneArgs, socket_path: &Path) -> Result<i32, ExitFailure> {
     let command = (!args.command.is_empty()).then(|| shell_command_text(args.command));
-    let stdout = if !args.stdin && !args.stdout {
-        true
-    } else {
-        args.stdout
-    };
-    run_command_resolved(socket_path, "pipe-pane", move |connection| {
-        let target = resolve_pane_target_or_current(connection, args.target.as_ref(), "pipe-pane")?;
-        connection
-            .pipe_pane(target, args.stdin, stdout, args.once, command)
-            .map_err(ExitFailure::from)
-    })
+    let stdout = args.stdout || !args.stdin;
+    run_targeted(
+        socket_path,
+        "pipe-pane",
+        args.target.as_ref(),
+        |connection, target| connection.pipe_pane(target, args.stdin, stdout, args.once, command),
+    )
 }
 
 /// Runs `respawn-pane`, restarting a pane's process in place.
@@ -77,11 +73,12 @@ pub(super) fn run_respawn_pane(
     args: RespawnPaneArgs,
     socket_path: &Path,
 ) -> Result<i32, ExitFailure> {
-    run_command_resolved(socket_path, "respawn-pane", move |connection| {
-        let target =
-            resolve_pane_target_or_current(connection, args.target.as_ref(), "respawn-pane")?;
-        connection
-            .respawn_pane(RespawnPaneRequest {
+    run_targeted(
+        socket_path,
+        "respawn-pane",
+        args.target.as_ref(),
+        |connection, target| {
+            connection.respawn_pane(RespawnPaneRequest {
                 target,
                 kill: args.kill,
                 start_directory: args.start_directory,
@@ -89,52 +86,36 @@ pub(super) fn run_respawn_pane(
                 command: (!args.command.is_empty()).then_some(args.command),
                 process_command: None,
             })
-            .map_err(ExitFailure::from)
-    })
+        },
+    )
 }
 
 /// Runs `list-panes`, rendering panes of one window, one session, or every session.
-pub(super) fn run_list_panes(args: ListPanesArgs, socket_path: &Path) -> Result<i32, ExitFailure> {
-    let mut connection = connect(socket_path)
-        .map_err(|error| ExitFailure::from_client_connect(socket_path, error))?;
+pub(super) fn run_list_panes(args: &ListPanesArgs, socket_path: &Path) -> Result<i32, ExitFailure> {
+    let mut connection = connect_cli(socket_path)?;
     let json = args.json;
-    let default_format = list_panes_default_format(args.all_sessions, args.session_scope);
-    let format = if json {
-        Some(list_panes_server_format(
-            Some(&list_panes_json_format()),
-            args.filter.as_deref(),
-            default_format,
-        ))
-    } else {
-        Some(list_panes_server_format(
-            args.format.as_deref(),
-            args.filter.as_deref(),
-            default_format,
-        ))
-    };
+    let json_format = json.then(list_panes_json_format);
+    let format = Some(list_panes_server_format(
+        json_format.as_deref().or(args.format.as_deref()),
+        args.filter.as_deref(),
+        list_panes_default_format(args.all_sessions, args.session_scope),
+    ));
     let pane_targets = if args.all_sessions {
         list_session_names(&mut connection)?
             .into_iter()
             .map(|session_name| (session_name, None))
             .collect::<Vec<_>>()
     } else {
-        let (session_name, target_window_index) =
-            resolve_list_panes_target(&mut connection, args.target, "list-panes")?;
-        vec![(
-            session_name,
-            if args.session_scope {
-                None
-            } else {
-                target_window_index
-            },
-        )]
+        let (session_name, window_index) =
+            resolve_list_panes_target(&mut connection, args.target.as_ref(), "list-panes")?;
+        vec![(session_name, window_index.filter(|_| !args.session_scope))]
     };
     let mut lines = Vec::new();
     let mut json_stdout = Vec::new();
     for (session_name, target_window_index) in pane_targets {
         let response = connection
             .list_panes_in_window_with_options(
-                session_name.clone(),
+                session_name,
                 target_window_index,
                 format.clone(),
                 args.filter.clone(),
@@ -144,22 +125,18 @@ pub(super) fn run_list_panes(args: ListPanesArgs, socket_path: &Path) -> Result<
             .map_err(ExitFailure::from)?;
         let output = expect_command_output(&response, "list-panes")?;
         if json {
-            let filtered;
-            let output = if args.filter.is_some() {
-                filtered = filter_delimited_json_output(output, "list-panes")?;
-                &filtered
+            if args.filter.is_some() {
+                let filtered = filter_delimited_json_output(output, "list-panes")?;
+                json_stdout.extend_from_slice(filtered.stdout());
             } else {
-                output
-            };
-            json_stdout.extend_from_slice(output.stdout());
+                json_stdout.extend_from_slice(output.stdout());
+            }
             continue;
         }
-        let text = String::from_utf8_lossy(output.stdout());
-        for line in text.lines() {
-            let Some(line) = list_panes_filtered_line(line, args.filter.as_deref())? else {
-                continue;
-            };
-            lines.push(line.to_owned());
+        for line in String::from_utf8_lossy(output.stdout()).lines() {
+            if let Some(line) = filtered_listing_line(line, args.filter.as_deref(), "list-panes")? {
+                lines.push(line.to_owned());
+            }
         }
     }
     if json {
@@ -188,90 +165,30 @@ fn list_panes_server_format(
     let line_format = format.unwrap_or(default_format);
     filter.map_or_else(
         || line_format.to_owned(),
-        |filter| format!("{filter}{LIST_PANES_FILTER_SEPARATOR}{line_format}"),
+        |filter| format!("{filter}{LISTING_FIELD_SEPARATOR}{line_format}"),
     )
-}
-
-/// Splits a filtered `list-panes` line, keeping its rendered text only when the filter matched.
-fn list_panes_filtered_line<'a>(
-    line: &'a str,
-    filter: Option<&str>,
-) -> Result<Option<&'a str>, ExitFailure> {
-    if filter.is_none() {
-        return Ok(Some(line));
-    }
-    let Some((filter_value, rendered_line)) = line.split_once(LIST_PANES_FILTER_SEPARATOR) else {
-        return Err(ExitFailure::new(
-            1,
-            "list-panes filter output missing separator",
-        ));
-    };
-    Ok(is_truthy(filter_value).then_some(rendered_line))
 }
 
 /// Resolves a `list-panes` target spec into a session name and optional window index.
 fn resolve_list_panes_target(
     connection: &mut Connection,
-    target: Option<TargetSpec>,
+    target: Option<&TargetSpec>,
     command_name: &str,
-) -> Result<(rmux_proto::SessionName, Option<u32>), ExitFailure> {
-    let Some(target) = target else {
-        let session_name = resolve_session_listing_target(connection, None, command_name)?;
-        let window_index = resolve_active_window_index(connection, &session_name, command_name)?;
-        return Ok((session_name, Some(window_index)));
-    };
-
-    match resolve_target_spec(connection, &target, ResolveTargetType::Pane, false, false)? {
-        rmux_proto::Target::Window(window_target) => Ok((
-            window_target.session_name().clone(),
-            Some(window_target.window_index()),
-        )),
-        rmux_proto::Target::Pane(pane_target) => Ok((
-            pane_target.session_name().clone(),
-            Some(pane_target.window_index()),
-        )),
-        rmux_proto::Target::Session(session_name) => {
-            let window_index =
-                resolve_active_window_index(connection, &session_name, command_name)?;
-            Ok((session_name, Some(window_index)))
+) -> Result<(SessionName, Option<u32>), ExitFailure> {
+    let target = match target {
+        Some(target) => {
+            resolve_target_spec(connection, target, ResolveTargetType::Pane, false, false)?
         }
-    }
-}
-
-/// Asks the server which window of `session_name` is active.
-fn resolve_active_window_index(
-    connection: &mut Connection,
-    session_name: &rmux_proto::SessionName,
-    command_name: &str,
-) -> Result<u32, ExitFailure> {
-    let response = connection
-        .list_windows(
-            session_name.clone(),
-            Some("#{window_index}:#{window_active}".to_owned()),
-        )
-        .map_err(ExitFailure::from)?;
-    let output = expect_command_output(&response, "list-windows")?;
-    let stdout = String::from_utf8_lossy(output.stdout());
-    let active_line = stdout
-        .lines()
-        .find(|line| line.rsplit(':').next() == Some("1"))
-        .ok_or_else(|| {
-            ExitFailure::new(
-                1,
-                format!("{command_name} could not resolve the active window"),
-            )
-        })?;
-    active_line
-        .split(':')
-        .next()
-        .ok_or_else(|| ExitFailure::new(1, "active window output is malformed"))?
-        .parse::<u32>()
-        .map_err(|error| {
-            ExitFailure::new(
-                1,
-                format!("invalid active window index from server: {error}"),
-            )
-        })
+        None => Target::Session(resolve_current_session_target(connection)?),
+    };
+    let window_index = match &target {
+        Target::Session(session_name) => {
+            resolve_active_window_index(connection, session_name, command_name)?
+        }
+        Target::Window(window) => window.window_index(),
+        Target::Pane(pane) => pane.window_index(),
+    };
+    Ok((target_session(target), Some(window_index)))
 }
 
 /// Runs `select-pane`, covering input toggles, last-pane, directional moves, styles, and marks.
@@ -280,75 +197,44 @@ pub(super) fn run_select_pane(
     socket_path: &Path,
 ) -> Result<i32, ExitFailure> {
     let keep_zoom = args.keep_zoom;
+    let target = args.target.as_ref();
     if args.disable_input || args.enable_input {
-        let mut connection = connect(socket_path)
-            .map_err(|error| ExitFailure::from_client_connect(socket_path, error))?;
-        let target = match args.target {
-            Some(target) => resolve_pane_target_spec(&mut connection, &target)?,
-            None => resolve_current_pane_target(&mut connection, "select-pane")?,
-        };
-        let response = connection
-            .select_pane_with_options(
-                target,
-                None,
-                args.style.clone(),
-                Some(args.disable_input),
-                keep_zoom,
-            )
-            .map_err(ExitFailure::from)?;
-        expect_command_success(response, "select-pane")?;
-        return Ok(0);
+        let input_disabled = Some(args.disable_input);
+        return select_pane_uncached(socket_path, "select-pane", target, |connection, pane| {
+            connection.select_pane_with_options(pane, None, args.style, input_disabled, keep_zoom)
+        });
     }
     if args.last {
-        let mut connection = connect(socket_path)
-            .map_err(|error| ExitFailure::from_client_connect(socket_path, error))?;
-        let target =
-            resolve_window_target_or_current(&mut connection, args.target.as_ref(), "select-pane")?;
-        let response = connection
-            .last_pane_with_zoom(target, keep_zoom)
-            .map_err(ExitFailure::from)?;
-        expect_command_success(response, "last-pane")?;
-        return Ok(0);
+        return select_pane_uncached(socket_path, "last-pane", target, |connection, window| {
+            connection.last_pane_with_zoom(window, keep_zoom)
+        });
     }
-
     if let Some(direction) = args.direction() {
-        let target = args.target;
-        return run_command_resolved(socket_path, "select-pane", move |connection| {
-            let target = match target {
-                Some(target) => resolve_pane_target_spec(connection, &target)?,
-                None => resolve_current_pane_target(connection, "select-pane")?,
-            };
-            connection
-                .select_pane_adjacent_with_zoom(target, direction, keep_zoom)
-                .map_err(ExitFailure::from)
+        return run_targeted(socket_path, "select-pane", target, |connection, pane| {
+            connection.select_pane_adjacent_with_zoom(pane, direction, keep_zoom)
         });
     }
-
     if !args.mark && !args.clear_marked {
-        let title = args.title;
-        let style = args.style;
-        let target = args.target;
-        return run_command_resolved(socket_path, "select-pane", move |connection| {
-            let target = match target {
-                Some(target) => resolve_pane_target_spec(connection, &target)?,
-                None => resolve_current_pane_target(connection, "select-pane")?,
-            };
-            connection
-                .select_pane_with_options(target, title.clone(), style.clone(), None, keep_zoom)
-                .map_err(ExitFailure::from)
+        return run_targeted(socket_path, "select-pane", target, |connection, pane| {
+            connection.select_pane_with_options(pane, args.title, args.style, None, keep_zoom)
         });
     }
+    select_pane_uncached(socket_path, "select-pane", target, |connection, pane| {
+        connection.select_pane_mark_with_title(pane, args.clear_marked, args.title)
+    })
+}
 
-    let mut connection = connect(socket_path)
-        .map_err(|error| ExitFailure::from_client_connect(socket_path, error))?;
-    let target = match args.target {
-        Some(target) => resolve_pane_target_spec(&mut connection, &target)?,
-        None => resolve_current_pane_target(&mut connection, "select-pane")?,
-    };
-    let response = connection
-        .select_pane_mark_with_title(target, args.clear_marked, args.title)
-        .map_err(ExitFailure::from)?;
-    expect_command_success(response, "select-pane")?;
+/// Resolves a `select-pane` target over a fresh connection, then checks the response to the
+/// request `send` builds as `check_name` without printing any output it carries.
+fn select_pane_uncached<T: CommandTarget>(
+    socket_path: &Path,
+    check_name: &'static str,
+    target: Option<&TargetSpec>,
+    send: impl FnOnce(&mut Connection, T) -> Result<Response, ClientError>,
+) -> Result<i32, ExitFailure> {
+    let mut connection = connect_cli(socket_path)?;
+    let target = T::RESOLVE(&mut connection, target, "select-pane")?;
+    expect_command_success(send(&mut connection, target)?, check_name)?;
     Ok(0)
 }
 
@@ -363,46 +249,35 @@ pub(super) fn run_resize_pane(
 
     let target = args.target.as_ref().map(|target| target.raw().to_owned());
     let adjustment = resize_pane_adjustment(args, None);
-    let mut connection = connect(socket_path)
-        .map_err(|error| ExitFailure::from_client_connect(socket_path, error))?;
+    let mut connection = connect_cli(socket_path)?;
     let response =
         connection.resize_pane_target_action(ResizePaneTargetActionRequest { target, adjustment });
     if target_action_needs_legacy_retry(&response) {
         return run_resize_pane_legacy(args, socket_path);
     }
-    response.map_err(ExitFailure::from).and_then(|response| {
-        expect_command_success(response, "resize-pane")?;
-        Ok(0)
-    })
+    expect_command_success(response?, "resize-pane")?;
+    Ok(0)
 }
 
 /// Resizes a pane after resolving its target locally, as older servers require.
 fn run_resize_pane_legacy(args: &ResizePaneArgs, socket_path: &Path) -> Result<i32, ExitFailure> {
-    let mut connection = connect(socket_path)
-        .map_err(|error| ExitFailure::from_client_connect(socket_path, error))?;
+    let mut connection = connect_cli(socket_path)?;
     let target =
         resolve_pane_target_or_current(&mut connection, args.target.as_ref(), "resize-pane")?;
     let window_size = resize_pane_uses_percent(args)
         .then(|| resize_pane_window_size(&mut connection, &target))
         .transpose()?;
     let adjustment = resize_pane_adjustment(args, window_size);
-
-    connection
-        .resize_pane(target, adjustment)
-        .map_err(ExitFailure::from)
-        .and_then(|response| {
-            expect_command_success(response, "resize-pane")?;
-            Ok(0)
-        })
+    expect_command_success(connection.resize_pane(target, adjustment)?, "resize-pane")?;
+    Ok(0)
 }
 
 /// Reports whether either requested dimension is a percentage, which needs the window size.
 fn resize_pane_uses_percent(args: &ResizePaneArgs) -> bool {
-    args.columns
-        .is_some_and(|size| matches!(size, crate::cli_args::ResizePaneSize::Percent(_)))
-        || args
-            .rows
-            .is_some_and(|size| matches!(size, crate::cli_args::ResizePaneSize::Percent(_)))
+    [args.columns, args.rows]
+        .into_iter()
+        .flatten()
+        .any(|size| matches!(size, ResizePaneSize::Percent(_)))
 }
 
 /// Turns the parsed `resize-pane` flags into the single adjustment the server understands.
@@ -434,24 +309,15 @@ fn resize_pane_adjustment(
     };
 
     match (columns, rows, relative) {
-        (Some(columns), Some(rows), Some((relative, cells))) => ResizePaneAdjustment::Composite {
-            columns: Some(columns),
-            rows: Some(rows),
-            relative: Some(relative),
-            cells,
-        },
-        (Some(columns), None, Some((relative, cells))) => ResizePaneAdjustment::Composite {
-            columns: Some(columns),
-            rows: None,
-            relative: Some(relative),
-            cells,
-        },
-        (None, Some(rows), Some((relative, cells))) => ResizePaneAdjustment::Composite {
-            columns: None,
-            rows: Some(rows),
-            relative: Some(relative),
-            cells,
-        },
+        (columns @ Some(_), rows, Some((relative, cells)))
+        | (columns @ None, rows @ Some(_), Some((relative, cells))) => {
+            ResizePaneAdjustment::Composite {
+                columns,
+                rows,
+                relative: Some(relative),
+                cells,
+            }
+        }
         (Some(columns), Some(rows), None) => ResizePaneAdjustment::AbsoluteSize { columns, rows },
         (Some(columns), None, None) => ResizePaneAdjustment::AbsoluteWidth { columns },
         (None, Some(rows), None) => ResizePaneAdjustment::AbsoluteHeight { rows },

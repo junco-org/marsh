@@ -3,18 +3,21 @@ use std::time::{Duration, Instant};
 
 use rmux_client::Connection;
 use rmux_proto::{
-    ErrorResponse, ListClientsRequest, PaneOutputSubscriptionId, PaneOutputSubscriptionStart,
-    PaneTarget, ResolveTargetType, Response, SendKeysExt2Request, SendKeysExtRequest, Target,
+    ListClientsRequest, PaneOutputSubscriptionId, PaneOutputSubscriptionStart, PaneTarget,
+    ResolveTargetType, Response, Target,
 };
 use serde_json::{Value, json};
 
 use crate::cli_args::{SendKeysArgs, SendKeysWaitMode, WaitPaneArgs};
-use crate::cli_response::{expect_command_success, tmux_cli_error_message};
+use crate::cli_response::expect_command_success;
 
-use super::super::ExitFailure;
+use super::super::key_commands::send_keys_extended;
+use super::super::target_resolution::connect_cli;
+use super::super::{ExitFailure, resolve_pane_target_or_current};
 use super::common::{
-    DEFAULT_STABLE_FOR, check_disabled, connect_cli, duration_millis, elapsed_millis,
-    find_visible_text, sleep_poll_interval, timeout_deadline, visible_text, write_json,
+    DEFAULT_STABLE_FOR, check_disabled, duration_millis, elapsed_millis, find_visible_text,
+    response_error, sleep_poll_interval, target_kind_name, timeout_deadline, visible_text,
+    write_json_line,
 };
 use super::pane_exit::PaneExitStatus;
 use super::stream;
@@ -38,7 +41,7 @@ pub(crate) fn run_wait_pane(args: &WaitPaneArgs, socket_path: &Path) -> Result<i
         WaitCompletion::Matched { pane_exit } => {
             if args.json {
                 let pane_exit = pane_exit.map_or(Value::Null, PaneExitStatus::json_value);
-                return write_json(&json!({
+                return write_json_line(&json!({
                     "schema_version": 1,
                     "ok": true,
                     "condition": condition.name(),
@@ -88,17 +91,14 @@ pub(crate) fn run_send_keys_with_wait(
             wait_target_ref,
             PaneOutputSubscriptionStart::Now,
         )?;
-        let send_response = match send_keys_through_command_path(
-            &mut send_connection,
-            args,
-            target_plan.send_target,
-        ) {
-            Ok(response) => response,
-            Err(error) => {
-                let _ = wait_connection.unsubscribe_pane_output(subscription_id);
-                return Err(error);
-            }
-        };
+        let send_response =
+            match send_keys_extended(&mut send_connection, args, target_plan.send_target) {
+                Ok(response) => response,
+                Err(error) => {
+                    let _ = wait_connection.unsubscribe_pane_output(subscription_id);
+                    return Err(error);
+                }
+            };
         if let Err(error) = expect_command_success(send_response, "send-keys") {
             let _ = wait_connection.unsubscribe_pane_output(subscription_id);
             return Err(error);
@@ -122,8 +122,7 @@ pub(crate) fn run_send_keys_with_wait(
     } else {
         None
     };
-    let send_response =
-        send_keys_through_command_path(&mut send_connection, args, target_plan.send_target)?;
+    let send_response = send_keys_extended(&mut send_connection, args, target_plan.send_target)?;
     expect_command_success(send_response, "send-keys")?;
 
     match wait_condition(
@@ -158,7 +157,7 @@ fn write_timeout_result(
     timeout: Duration,
 ) -> Result<i32, ExitFailure> {
     if json_output {
-        return write_json(&json!({
+        return write_json_line(&json!({
             "schema_version": 1,
             "ok": false,
             "error": "timeout",
@@ -203,7 +202,7 @@ fn write_lag_result(
     missed_events: u64,
 ) -> Result<i32, ExitFailure> {
     if json_output {
-        return write_json(&lag_json_value(condition, target, missed_events)).map(|_| 1);
+        return write_json_line(&lag_json_value(condition, target, missed_events)).map(|_| 1);
     }
     Err(next_text_lag_error(missed_events))
 }
@@ -452,7 +451,7 @@ fn wait_pane_output_eof(
         };
 
     loop {
-        let batch = stream::poll_output_silent_lag(connection, subscription_id, "wait-pane")?;
+        let batch = stream::poll_output(connection, subscription_id, "wait-pane", false)?;
         if let Some(lag) = batch.lag {
             let _ = connection.unsubscribe_pane_output(subscription_id);
             return Ok(PaneOutputEofWait::Lag {
@@ -503,7 +502,7 @@ fn wait_next_text_subscription(
 ) -> Result<WaitCompletion, ExitFailure> {
     let mut tail = Vec::new();
     loop {
-        let batch = stream::poll_output_silent_lag(connection, subscription_id, "wait-pane")?;
+        let batch = stream::poll_output(connection, subscription_id, "wait-pane", false)?;
         if let Some(lag) = batch.lag {
             return Ok(WaitCompletion::Lag {
                 missed_events: lag.missed_events,
@@ -556,7 +555,7 @@ fn send_keys_target_plan(
     args: &SendKeysArgs,
 ) -> Result<SendKeysTargetPlan, ExitFailure> {
     let send_target = if args.target.is_some() {
-        Some(super::common::resolve_pane_slot(
+        Some(resolve_pane_target_or_current(
             connection,
             args.target.as_ref(),
             "send-keys",
@@ -569,7 +568,7 @@ fn send_keys_target_plan(
     } else if let Some(target_client) = args.client_target.as_deref() {
         attached_target_client_pane_ref(connection, target_client)?
     } else {
-        let current = super::common::resolve_pane_slot(connection, None, "send-keys")?;
+        let current = resolve_pane_target_or_current(connection, None, "send-keys")?;
         Some(wait_target::for_slot(connection, &current, "send-keys")?)
     };
 
@@ -603,21 +602,7 @@ fn attached_target_client_pane_ref(
                 ));
             }
         },
-        Response::Error(ErrorResponse { error }) => {
-            return Err(ExitFailure::new(
-                1,
-                tmux_cli_error_message("send-keys", &error),
-            ));
-        }
-        other => {
-            return Err(ExitFailure::new(
-                1,
-                format!(
-                    "protocol error: unexpected '{}' response for send-keys",
-                    other.command_name()
-                ),
-            ));
-        }
+        other => return Err(response_error(&other, "send-keys", "for send-keys")),
     };
 
     wait_target::for_slot(connection, &target, "send-keys").map(Some)
@@ -650,21 +635,7 @@ fn attached_target_client_session(
         .map_err(ExitFailure::from)?;
     let output = match response {
         Response::ListClients(response) => response.output,
-        Response::Error(ErrorResponse { error }) => {
-            return Err(ExitFailure::new(
-                1,
-                tmux_cli_error_message("send-keys", &error),
-            ));
-        }
-        other => {
-            return Err(ExitFailure::new(
-                1,
-                format!(
-                    "protocol error: unexpected '{}' response for send-keys",
-                    other.command_name()
-                ),
-            ));
-        }
+        other => return Err(response_error(&other, "send-keys", "for send-keys")),
     };
     let target_client = normalize_target_client(target_client);
     if target_client == "=" {
@@ -738,55 +709,6 @@ fn client_path_matches(path: &str, target_client: &str) -> bool {
 /// Strips the optional trailing `:` from a target-client specifier.
 fn normalize_target_client(target_client: &str) -> &str {
     target_client.strip_suffix(':').unwrap_or(target_client)
-}
-
-/// The human readable kind name of a resolved `Target`.
-const fn target_kind_name(target: &Target) -> &'static str {
-    match target {
-        Target::Session(_) => "session",
-        Target::Window(_) => "window",
-        Target::Pane(_) => "pane",
-    }
-}
-
-/// Sends the keys through the extended request, using the target-client variant when set.
-fn send_keys_through_command_path(
-    connection: &mut Connection,
-    args: SendKeysArgs,
-    target: Option<PaneTarget>,
-) -> Result<Response, ExitFailure> {
-    if let Some(target_client) = args.client_target {
-        return connection
-            .send_keys_extended_target_client(SendKeysExt2Request {
-                target,
-                keys: args.keys,
-                expand_formats: args.expand_formats,
-                hex: args.hex,
-                literal: args.literal,
-                dispatch_key_table: args.key_table,
-                copy_mode_command: args.copy_mode,
-                forward_mouse_event: args.mouse,
-                reset_terminal: args.reset_terminal,
-                repeat_count: args.repeat_count,
-                target_client: Some(target_client),
-            })
-            .map_err(ExitFailure::from);
-    }
-
-    connection
-        .send_keys_extended(SendKeysExtRequest {
-            target,
-            keys: args.keys,
-            expand_formats: args.expand_formats,
-            hex: args.hex,
-            literal: args.literal,
-            dispatch_key_table: args.key_table,
-            copy_mode_command: args.copy_mode,
-            forward_mouse_event: args.mouse,
-            reset_terminal: args.reset_terminal,
-            repeat_count: args.repeat_count,
-        })
-        .map_err(ExitFailure::from)
 }
 
 /// The target's reference string as shown in messages and JSON output.

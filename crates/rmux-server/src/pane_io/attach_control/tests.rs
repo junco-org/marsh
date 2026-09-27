@@ -4,14 +4,69 @@ use crate::pane_io::live_render::LivePaneRender;
 use crate::pane_io::types::{pane_output_channel, AttachTarget, PaneOutputSender};
 use rmux_core::PaneGeometry;
 use rmux_proto::TerminalSize;
+
+/// A sender with a `backlog_limit`-unit budget, the receiver it feeds, and the backlog counter
+/// and closing flag it shares.
+fn control_queue(
+    backlog_limit: usize,
+) -> (
+    AttachControlSender,
+    mpsc::UnboundedReceiver<AttachControl>,
+    Arc<AtomicUsize>,
+    Arc<AtomicBool>,
+) {
+    let (inner, receiver) = mpsc::unbounded_channel();
+    let backlog = Arc::new(AtomicUsize::new(0));
+    let closing = Arc::new(AtomicBool::new(false));
+    let sender = AttachControlSender::new(
+        inner,
+        Arc::clone(&backlog),
+        backlog_limit,
+        Arc::clone(&closing),
+    );
+    (sender, receiver, backlog, closing)
+}
+
+/// A plain target for `session` that draws `render_frame` over a `size` pane and follows
+/// `output` from now on.
+fn attach_target(
+    output: &PaneOutputSender,
+    session: &str,
+    size: TerminalSize,
+    render_frame: Vec<u8>,
+    live_pane: Option<Box<LivePaneRender>>,
+) -> AttachTarget {
+    let (pane_output_start_sequence, pane_output) = output.subscribe_live_from_now();
+    AttachTarget {
+        session_name: rmux_proto::SessionName::new(session).expect("valid session name"),
+        live_pane_handover: false,
+        pane_output,
+        pane_output_start_sequence,
+        render_frame,
+        outer_terminal: OuterTerminal::resolve(
+            &rmux_core::OptionStore::default(),
+            crate::outer_terminal::OuterTerminalContext::default(),
+        ),
+        client_title: None,
+        cursor_style: 0,
+        active_pane_geometry: PaneGeometry::new(0, 0, size.cols, size.rows),
+        raw_passthrough: false,
+        kitty_graphics_passthrough: false,
+        sixel_passthrough: false,
+        persistent_overlay_state_id: None,
+        live_pane,
+    }
+}
+
 fn deep_coalescible_target(
     output: &PaneOutputSender,
     marker: u8,
     render_len: usize,
 ) -> AttachTarget {
     let size = TerminalSize { cols: 10, rows: 4 };
+    let session_name = format!("switch-{marker}");
     let session = rmux_core::Session::new(
-        rmux_proto::SessionName::new(format!("switch-{marker}")).expect("valid session name"),
+        rmux_proto::SessionName::new(session_name.clone()).expect("valid session name"),
         size,
     );
     let pane = session
@@ -33,49 +88,44 @@ fn deep_coalescible_target(
         )
         .expect("test target has a live render snapshot"),
     );
-    let (pane_output_start_sequence, pane_output) = output.subscribe_live_from_now();
-    AttachTarget {
-        session_name: rmux_proto::SessionName::new(format!("switch-{marker}"))
-            .expect("valid session name"),
-        live_pane_handover: false,
-        pane_output,
-        pane_output_start_sequence,
-        render_frame: vec![marker; render_len.max(1)],
-        outer_terminal: OuterTerminal::resolve(
-            &rmux_core::OptionStore::default(),
-            crate::outer_terminal::OuterTerminalContext::default(),
-        ),
-        client_title: None,
-        cursor_style: 0,
-        active_pane_geometry: PaneGeometry::new(0, 0, size.cols, size.rows),
-        raw_passthrough: false,
-        kitty_graphics_passthrough: false,
-        sixel_passthrough: false,
-        persistent_overlay_state_id: None,
+    attach_target(
+        output,
+        &session_name,
+        size,
+        vec![marker; render_len.max(1)],
         live_pane,
-    }
+    )
+}
+
+/// A [`deep_coalescible_target`] with an 8-byte frame that carries persistent overlay state
+/// `marker`, which keeps it out of the coalescing slot.
+fn persistent_target(output: &PaneOutputSender, marker: u8) -> AttachTarget {
+    let mut target = deep_coalescible_target(output, marker, 8);
+    target.persistent_overlay_state_id = Some(u64::from(marker));
+    target
+}
+
+/// Receives the terminal detach sentinel a full sender queued, releases it, and checks that
+/// nothing stays accounted.
+fn release_detach_sentinel(
+    receiver: &mut mpsc::UnboundedReceiver<AttachControl>,
+    backlog: &Arc<AtomicUsize>,
+) {
+    let detach = receiver.try_recv().expect("terminal detach sentinel");
+    assert!(matches!(&detach, AttachControl::Detach));
+    release_attach_control_backlog(backlog, detach.received_backlog_units());
+    assert_eq!(backlog.load(Ordering::Acquire), 0);
 }
 
 #[test]
 fn attach_control_sender_retains_only_latest_consecutive_deep_switch() {
-    let (inner, mut receiver) = mpsc::unbounded_channel();
-    let backlog = Arc::new(AtomicUsize::new(0));
-    let sender = AttachControlSender::new(
-        inner,
-        Arc::clone(&backlog),
-        64,
-        Arc::new(AtomicBool::new(false)),
-    );
+    let (sender, mut receiver, backlog, _) = control_queue(64);
     let second_producer = sender.clone();
+    let producers = [&sender, &second_producer];
     let output = pane_output_channel();
 
     for marker in 0_u8..64 {
-        let producer = if marker % 2 == 0 {
-            &sender
-        } else {
-            &second_producer
-        };
-        producer
+        producers[usize::from(marker % 2)]
             .send(AttachControl::switch(deep_coalescible_target(
                 &output, marker, 32,
             )))
@@ -107,19 +157,13 @@ fn attach_control_sender_retains_only_latest_consecutive_deep_switch() {
 
 #[test]
 fn interleaved_controls_cannot_open_unbounded_deep_switch_slots() {
-    let (inner, mut receiver) = mpsc::unbounded_channel();
-    let backlog = Arc::new(AtomicUsize::new(0));
-    let closing = Arc::new(AtomicBool::new(false));
-    let sender = AttachControlSender::new(inner, Arc::clone(&backlog), 16, Arc::clone(&closing));
+    let (sender, mut receiver, backlog, closing) = control_queue(16);
     let second_producer = sender.clone();
+    let producers = [&sender, &second_producer];
     let output = pane_output_channel();
 
     for marker in 0..AttachControlSender::MAX_PENDING_DEEP_SWITCHES as u8 {
-        let producer = if marker % 2 == 0 {
-            &sender
-        } else {
-            &second_producer
-        };
+        let producer = producers[usize::from(marker % 2)];
         producer
             .send(AttachControl::switch(deep_coalescible_target(
                 &output, marker, 8,
@@ -165,22 +209,12 @@ fn interleaved_controls_cannot_open_unbounded_deep_switch_slots() {
         release_attach_control_backlog(&backlog, boundary.received_backlog_units());
     }
     assert_eq!(sender.pending_deep_switches.load(Ordering::Acquire), 0);
-    let detach = receiver.try_recv().expect("terminal detach sentinel");
-    assert!(matches!(&detach, AttachControl::Detach));
-    release_attach_control_backlog(&backlog, detach.received_backlog_units());
-    assert_eq!(backlog.load(Ordering::Acquire), 0);
+    release_detach_sentinel(&mut receiver, &backlog);
 }
 
 #[test]
 fn attach_control_sender_closes_switch_slot_at_interleaved_control() {
-    let (inner, mut receiver) = mpsc::unbounded_channel();
-    let backlog = Arc::new(AtomicUsize::new(0));
-    let sender = AttachControlSender::new(
-        inner,
-        Arc::clone(&backlog),
-        8,
-        Arc::new(AtomicBool::new(false)),
-    );
+    let (sender, mut receiver, backlog, _) = control_queue(8);
     let second_producer = sender.clone();
     let output = pane_output_channel();
 
@@ -214,20 +248,11 @@ fn attach_control_sender_closes_switch_slot_at_interleaved_control() {
 
 #[test]
 fn attach_control_sender_does_not_coalesce_persistent_switches() {
-    let (inner, mut receiver) = mpsc::unbounded_channel();
-    let backlog = Arc::new(AtomicUsize::new(0));
-    let sender = AttachControlSender::new(
-        inner,
-        Arc::clone(&backlog),
-        8,
-        Arc::new(AtomicBool::new(false)),
-    );
+    let (sender, mut receiver, backlog, _) = control_queue(8);
     let output = pane_output_channel();
     for marker in [1_u8, 2] {
-        let mut target = deep_coalescible_target(&output, marker, 8);
-        target.persistent_overlay_state_id = Some(u64::from(marker));
         sender
-            .send(AttachControl::switch(target))
+            .send(AttachControl::switch(persistent_target(&output, marker)))
             .expect("persistent switch fits");
     }
 
@@ -250,22 +275,13 @@ fn attach_control_sender_does_not_coalesce_persistent_switches() {
 
 #[test]
 fn attach_control_sender_bounds_non_coalescible_deep_switches() {
-    let (inner, mut receiver) = mpsc::unbounded_channel();
-    let backlog = Arc::new(AtomicUsize::new(0));
-    let closing = Arc::new(AtomicBool::new(false));
-    let sender = AttachControlSender::new(inner, Arc::clone(&backlog), 16, Arc::clone(&closing));
+    let (sender, mut receiver, backlog, closing) = control_queue(16);
     let second_producer = sender.clone();
+    let producers = [&sender, &second_producer];
     let output = pane_output_channel();
     for marker in 0..AttachControlSender::MAX_PENDING_DEEP_SWITCHES as u8 {
-        let mut target = deep_coalescible_target(&output, marker, 8);
-        target.persistent_overlay_state_id = Some(u64::from(marker));
-        let producer = if marker % 2 == 0 {
-            &sender
-        } else {
-            &second_producer
-        };
-        producer
-            .send(AttachControl::switch(target))
+        producers[usize::from(marker % 2)]
+            .send(AttachControl::switch(persistent_target(&output, marker)))
             .expect("bounded persistent switch fits");
     }
     assert_eq!(
@@ -274,10 +290,11 @@ fn attach_control_sender_bounds_non_coalescible_deep_switches() {
     );
 
     let rejected_marker = AttachControlSender::MAX_PENDING_DEEP_SWITCHES as u8;
-    let mut rejected = deep_coalescible_target(&output, rejected_marker, 8);
-    rejected.persistent_overlay_state_id = Some(u64::from(rejected_marker));
     let error = second_producer
-        .send(AttachControl::switch(rejected))
+        .send(AttachControl::switch(persistent_target(
+            &output,
+            rejected_marker,
+        )))
         .expect_err("deep non-coalescible retention is capped");
 
     assert!(error.is_full());
@@ -304,22 +321,12 @@ fn attach_control_sender_bounds_non_coalescible_deep_switches() {
         assert_eq!(target.into_target().render_frame[0], marker);
     }
     assert_eq!(sender.pending_deep_switches.load(Ordering::Acquire), 0);
-    let detach = receiver.try_recv().expect("terminal detach sentinel");
-    assert!(matches!(&detach, AttachControl::Detach));
-    release_attach_control_backlog(&backlog, detach.received_backlog_units());
-    assert_eq!(backlog.load(Ordering::Acquire), 0);
+    release_detach_sentinel(&mut receiver, &backlog);
 }
 
 #[test]
 fn dropping_attach_control_receiver_releases_coalesced_switch() {
-    let (inner, receiver) = mpsc::unbounded_channel();
-    let backlog = Arc::new(AtomicUsize::new(0));
-    let sender = AttachControlSender::new(
-        inner,
-        Arc::clone(&backlog),
-        8,
-        Arc::new(AtomicBool::new(false)),
-    );
+    let (sender, receiver, backlog, _) = control_queue(8);
     let output = pane_output_channel();
     sender
         .send(AttachControl::switch(deep_coalescible_target(
@@ -338,19 +345,10 @@ fn dropping_attach_control_receiver_releases_coalesced_switch() {
 
 #[test]
 fn dropping_attach_control_receiver_releases_deep_switch_permit() {
-    let (inner, receiver) = mpsc::unbounded_channel();
-    let backlog = Arc::new(AtomicUsize::new(0));
-    let sender = AttachControlSender::new(
-        inner,
-        Arc::clone(&backlog),
-        8,
-        Arc::new(AtomicBool::new(false)),
-    );
+    let (sender, receiver, backlog, _) = control_queue(8);
     let output = pane_output_channel();
-    let mut target = deep_coalescible_target(&output, 1, 8);
-    target.persistent_overlay_state_id = Some(1);
     sender
-        .send(AttachControl::switch(target))
+        .send(AttachControl::switch(persistent_target(&output, 1)))
         .expect("persistent switch fits");
     assert_eq!(sender.pending_deep_switches.load(Ordering::Acquire), 1);
     assert_eq!(backlog.load(Ordering::Acquire), 1);
@@ -365,10 +363,7 @@ fn dropping_attach_control_receiver_releases_deep_switch_permit() {
 
 #[test]
 fn growing_coalesced_switch_still_enforces_weighted_limit() {
-    let (inner, mut receiver) = mpsc::unbounded_channel();
-    let backlog = Arc::new(AtomicUsize::new(0));
-    let closing = Arc::new(AtomicBool::new(false));
-    let sender = AttachControlSender::new(inner, Arc::clone(&backlog), 1, Arc::clone(&closing));
+    let (sender, mut receiver, backlog, closing) = control_queue(1);
     let output = pane_output_channel();
     sender
         .send(AttachControl::switch(deep_coalescible_target(
@@ -400,18 +395,12 @@ fn growing_coalesced_switch_still_enforces_weighted_limit() {
         panic!("expected the original switch");
     };
     assert_eq!(target.into_target().render_frame[0], 1);
-    let detach = receiver.try_recv().expect("terminal detach sentinel");
-    assert!(matches!(&detach, AttachControl::Detach));
-    release_attach_control_backlog(&backlog, detach.received_backlog_units());
-    assert_eq!(backlog.load(Ordering::Acquire), 0);
+    release_detach_sentinel(&mut receiver, &backlog);
 }
 
 #[test]
 fn attach_control_sender_shares_one_weighted_budget_across_payload_types() {
-    let (inner, mut receiver) = mpsc::unbounded_channel();
-    let backlog = Arc::new(AtomicUsize::new(0));
-    let closing = Arc::new(AtomicBool::new(false));
-    let sender = AttachControlSender::new(inner, Arc::clone(&backlog), 3, Arc::clone(&closing));
+    let (sender, mut receiver, backlog, closing) = control_queue(3);
 
     sender
         .send(AttachControl::Refresh)
@@ -455,10 +444,7 @@ fn attach_control_sender_shares_one_weighted_budget_across_payload_types() {
 
 #[test]
 fn attach_control_sender_rolls_back_reservation_when_receiver_closed() {
-    let (inner, receiver) = mpsc::unbounded_channel();
-    let backlog = Arc::new(AtomicUsize::new(0));
-    let closing = Arc::new(AtomicBool::new(false));
-    let sender = AttachControlSender::new(inner, Arc::clone(&backlog), 4, Arc::clone(&closing));
+    let (sender, receiver, backlog, closing) = control_queue(4);
     sender
         .send(AttachControl::Refresh)
         .expect("queued control reserves one unit");
@@ -477,14 +463,7 @@ fn attach_control_sender_rolls_back_reservation_when_receiver_closed() {
 
 #[test]
 fn payload_control_cannot_release_a_later_control_reservation() {
-    let (inner, mut receiver) = mpsc::unbounded_channel();
-    let backlog = Arc::new(AtomicUsize::new(0));
-    let sender = AttachControlSender::new(
-        inner,
-        Arc::clone(&backlog),
-        4,
-        Arc::new(AtomicBool::new(false)),
-    );
+    let (sender, mut receiver, backlog, _) = control_queue(4);
 
     sender
         .send(AttachControl::Write(b"payload".to_vec()))
@@ -505,14 +484,7 @@ fn payload_control_cannot_release_a_later_control_reservation() {
 
 #[test]
 fn receiver_deferred_clipboard_cannot_release_a_later_control_reservation() {
-    let (inner, mut receiver) = mpsc::unbounded_channel();
-    let backlog = Arc::new(AtomicUsize::new(0));
-    let sender = AttachControlSender::new(
-        inner,
-        Arc::clone(&backlog),
-        4,
-        Arc::new(AtomicBool::new(false)),
-    );
+    let (sender, mut receiver, backlog, _) = control_queue(4);
 
     sender
         .send(AttachControl::ClipboardWrite {
@@ -595,26 +567,13 @@ fn every_attach_control_variant_has_a_positive_backlog_cost() {
     }
 
     let output = pane_output_channel();
-    let (pane_output_start_sequence, pane_output) = output.subscribe_live_from_now();
-    let target = AttachTarget {
-        session_name: rmux_proto::SessionName::new("backlog-cost").expect("valid session name"),
-        live_pane_handover: false,
-        pane_output,
-        pane_output_start_sequence,
-        render_frame: vec![b'x'; AttachControl::BACKLOG_UNIT_BYTES],
-        outer_terminal: OuterTerminal::resolve(
-            &rmux_core::OptionStore::default(),
-            crate::outer_terminal::OuterTerminalContext::default(),
-        ),
-        client_title: None,
-        cursor_style: 0,
-        active_pane_geometry: PaneGeometry::new(0, 0, 80, 24),
-        raw_passthrough: false,
-        kitty_graphics_passthrough: false,
-        sixel_passthrough: false,
-        persistent_overlay_state_id: None,
-        live_pane: None,
-    };
+    let target = attach_target(
+        &output,
+        "backlog-cost",
+        TerminalSize { cols: 80, rows: 24 },
+        vec![b'x'; AttachControl::BACKLOG_UNIT_BYTES],
+        None,
+    );
     assert_eq!(AttachControl::switch(target).backlog_units(), 2);
 }
 
@@ -622,14 +581,7 @@ fn every_attach_control_variant_has_a_positive_backlog_cost() {
 /// sender's coalescing slot: only the newest frame is worth drawing.
 #[test]
 fn a_titleless_switch_is_still_replaced_by_a_later_refresh() {
-    let (inner, mut receiver) = mpsc::unbounded_channel();
-    let backlog = Arc::new(AtomicUsize::new(0));
-    let sender = AttachControlSender::new(
-        inner,
-        Arc::clone(&backlog),
-        64,
-        Arc::new(AtomicBool::new(false)),
-    );
+    let (sender, mut receiver, _, _) = control_queue(64);
     let output = pane_output_channel();
 
     for marker in 0_u8..3 {
@@ -662,14 +614,7 @@ fn a_titleless_switch_is_still_replaced_by_a_later_refresh() {
 /// actually delivered.
 #[test]
 fn a_title_carrying_switch_is_not_replaced_by_a_later_refresh() {
-    let (inner, mut receiver) = mpsc::unbounded_channel();
-    let backlog = Arc::new(AtomicUsize::new(0));
-    let sender = AttachControlSender::new(
-        inner,
-        Arc::clone(&backlog),
-        64,
-        Arc::new(AtomicBool::new(false)),
-    );
+    let (sender, mut receiver, _, _) = control_queue(64);
     let output = pane_output_channel();
 
     let terminal = OuterTerminal::resolve(

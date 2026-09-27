@@ -8,15 +8,10 @@
 //! never be cleared.
 
 use super::set_titles_support::{
-    active_pane_id, append_global, delivered_paths, delivered_titles, set_global,
-    title_capable_context,
+    active_pane_id, attach_title_capable_client, delivered_paths, delivered_titles, enable_osc7,
+    set_global,
 };
 use super::*;
-
-/// A terminal family advertising both the title and OSC 7 templates.
-async fn enable_osc7(handler: &RequestHandler) {
-    append_global(handler, OptionName::TerminalFeatures, "xterm*:osc7").await;
-}
 
 /// Feeds bytes to a pane through the production reader path and applies the
 /// alert events production built from them.
@@ -76,18 +71,10 @@ async fn pane_path(handler: &RequestHandler, session: &rmux_proto::SessionName) 
 async fn a_live_pane_path_change_reaches_the_outer_terminal() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    create_quiet_session(&handler, &alpha).await;
+    handler.create_session(Quiet(&alpha)).await;
 
     let attach_pid = std::process::id();
-    let (control_tx, mut control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach_with_terminal_context(
-            attach_pid,
-            alpha.clone(),
-            control_tx,
-            title_capable_context(),
-        )
-        .await;
+    let mut control_rx = attach_title_capable_client(&handler, &alpha, attach_pid).await;
     enable_osc7(&handler).await;
     set_global(&handler, OptionName::SetTitlesString, "PATHTEST").await;
     set_global(&handler, OptionName::SetTitles, "on").await;
@@ -119,18 +106,10 @@ async fn a_live_pane_path_change_reaches_the_outer_terminal() {
 async fn a_pane_clearing_its_path_clears_the_outer_terminal() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    create_quiet_session(&handler, &alpha).await;
+    handler.create_session(Quiet(&alpha)).await;
 
     let attach_pid = std::process::id();
-    let (control_tx, mut control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach_with_terminal_context(
-            attach_pid,
-            alpha.clone(),
-            control_tx,
-            title_capable_context(),
-        )
-        .await;
+    let mut control_rx = attach_title_capable_client(&handler, &alpha, attach_pid).await;
     enable_osc7(&handler).await;
     set_global(&handler, OptionName::SetTitlesString, "PATHTEST").await;
     set_global(&handler, OptionName::SetTitles, "on").await;
@@ -168,18 +147,10 @@ async fn a_pane_clearing_its_path_clears_the_outer_terminal() {
 async fn a_path_change_writes_nothing_while_set_titles_is_off() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    create_quiet_session(&handler, &alpha).await;
+    handler.create_session(Quiet(&alpha)).await;
 
     let attach_pid = std::process::id();
-    let (control_tx, mut control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach_with_terminal_context(
-            attach_pid,
-            alpha.clone(),
-            control_tx,
-            title_capable_context(),
-        )
-        .await;
+    let mut control_rx = attach_title_capable_client(&handler, &alpha, attach_pid).await;
     enable_osc7(&handler).await;
     // Drain the terminal-features refresh; set-titles stays at its "off" default.
     let _ = delivered_paths(&mut control_rx);
@@ -202,18 +173,10 @@ async fn a_path_change_writes_nothing_while_set_titles_is_off() {
 async fn a_client_without_the_osc7_capability_receives_no_path() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    create_quiet_session(&handler, &alpha).await;
+    handler.create_session(Quiet(&alpha)).await;
 
     let attach_pid = std::process::id();
-    let (control_tx, mut control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach_with_terminal_context(
-            attach_pid,
-            alpha.clone(),
-            control_tx,
-            title_capable_context(),
-        )
-        .await;
+    let mut control_rx = attach_title_capable_client(&handler, &alpha, attach_pid).await;
     set_global(&handler, OptionName::SetTitlesString, "NOPATH").await;
     set_global(&handler, OptionName::SetTitles, "on").await;
     assert_eq!(delivered_titles(&mut control_rx), vec!["NOPATH".to_owned()]);
@@ -233,51 +196,34 @@ async fn a_linked_session_with_set_titles_off_is_not_redrawn_by_a_title_change()
     let handler = RequestHandler::new();
     let owner = session_name("titled-owner");
     let peer = session_name("untitled-peer");
-    create_quiet_session(&handler, &owner).await;
-    create_quiet_session(&handler, &peer).await;
+    handler.create_session(Quiet(&owner)).await;
+    handler.create_session(Quiet(&peer)).await;
 
     let owner_pid = u32::MAX - 182;
     let peer_pid = u32::MAX - 183;
-    let (owner_tx, mut owner_rx) = mpsc::unbounded_channel();
-    let (peer_tx, mut peer_rx) = mpsc::unbounded_channel();
-    let _owner_id = handler
-        .register_attach_with_terminal_context(
-            owner_pid,
-            owner.clone(),
-            owner_tx,
-            title_capable_context(),
-        )
-        .await;
-    let _peer_id = handler
-        .register_attach_with_terminal_context(
-            peer_pid,
-            peer.clone(),
-            peer_tx,
-            title_capable_context(),
-        )
-        .await;
+    let mut owner_rx = attach_title_capable_client(&handler, &owner, owner_pid).await;
+    let mut peer_rx = attach_title_capable_client(&handler, &peer, peer_pid).await;
 
-    let linked = handler
-        .handle(Request::LinkWindow(LinkWindowRequest {
-            source: WindowTarget::with_window(owner.clone(), 0),
-            target: WindowTarget::with_window(peer.clone(), 0),
-            after: false,
-            before: false,
+    handler
+        .handle_ok(LinkWindowRequest {
             kill_destination: true,
             detached: false,
-        }))
+            ..Fixture::fixture((
+                WindowTarget::with_window(owner.clone(), 0),
+                WindowTarget::with_window(peer.clone(), 0),
+            ))
+        })
         .await;
-    assert!(matches!(linked, Response::LinkWindow(_)), "{linked:?}");
 
-    set_session_option(
-        &handler,
-        &owner,
-        OptionName::SetTitlesString,
-        "T:#{pane_title}",
-    )
-    .await;
-    set_session_option(&handler, &owner, OptionName::SetTitles, "on").await;
-    set_session_option(&handler, &peer, OptionName::SetTitles, "off").await;
+    for (session, option, value) in [
+        (&owner, OptionName::SetTitlesString, "T:#{pane_title}"),
+        (&owner, OptionName::SetTitles, "on"),
+        (&peer, OptionName::SetTitles, "off"),
+    ] {
+        handler
+            .set_option(ScopeSelector::Session(session.clone()), option, value)
+            .await;
+    }
     let _ = delivered_titles(&mut owner_rx);
     let _ = delivered_titles(&mut peer_rx);
 
@@ -293,21 +239,4 @@ async fn a_linked_session_with_set_titles_off_is_not_redrawn_by_a_title_change()
         matches!(peer_rx.try_recv(), Err(TryRecvError::Empty)),
         "a linked session with set-titles off must pay no redraw for a title change"
     );
-}
-
-async fn set_session_option(
-    handler: &RequestHandler,
-    session: &rmux_proto::SessionName,
-    option: OptionName,
-    value: &str,
-) {
-    let set = handler
-        .handle(Request::SetOption(SetOptionRequest {
-            scope: ScopeSelector::Session(session.clone()),
-            option,
-            value: value.to_owned(),
-            mode: SetOptionMode::Replace,
-        }))
-        .await;
-    assert!(matches!(set, Response::SetOption(_)), "set {option:?}");
 }

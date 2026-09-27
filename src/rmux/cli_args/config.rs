@@ -3,6 +3,7 @@ use rmux_proto::HookName;
 #[cfg(test)]
 use rmux_proto::{ScopeSelector, SessionName};
 
+use super::validate::selected_count;
 use super::{TargetSpec, parse_target_spec};
 
 /// Distinguishes the `set-option` and `set-window-option` spellings that share one argument type.
@@ -23,7 +24,7 @@ impl SetOptionCommandKind {
 }
 
 /// Parsed arguments of `set-option`, covering scope flags, the option name, and its value.
-#[derive(Debug, Clone, Args)]
+#[derive(Debug, Clone, Default, Args)]
 pub(crate) struct SetOptionArgs {
     #[arg(short = 'g', action = ArgAction::SetTrue)]
     pub(crate) global: bool,
@@ -56,11 +57,7 @@ impl SetOptionArgs {
     /// Rejects a `set-option` invocation that names more than one of `-s`, `-w`, or `-p`.
     pub(crate) fn validate(self, kind: SetOptionCommandKind) -> Result<Self, clap::Error> {
         if matches!(kind, SetOptionCommandKind::SetOption)
-            && [self.server, self.window, self.pane]
-                .into_iter()
-                .filter(|flag| *flag)
-                .count()
-                > 1
+            && selected_count([self.server, self.window, self.pane]) > 1
         {
             return Err(clap::Error::raw(
                 clap::error::ErrorKind::ArgumentConflict,
@@ -99,18 +96,15 @@ impl From<SetWindowOptionArgs> for SetOptionArgs {
     fn from(args: SetWindowOptionArgs) -> Self {
         Self {
             global: args.global,
-            server: false,
-            window: false,
-            pane: false,
             append: args.append,
             format: args.format,
             only_if_unset: args.only_if_unset,
             quiet: args.quiet,
             unset: args.unset,
-            unset_pane_overrides: false,
             target: args.target,
             option: args.option,
             value: args.value,
+            ..Self::default()
         }
     }
 }
@@ -136,12 +130,7 @@ impl ShowOptionsCommandKind {
 #[derive(Debug, Clone, Args)]
 #[command(
     disable_help_flag = true,
-    group(
-        ArgGroup::new("scope")
-            .required(false)
-            .multiple(false)
-            .args(["global", "target"])
-    )
+    group(ArgGroup::new("scope").args(["global", "target"]))
 )]
 pub(crate) struct SetEnvironmentArgs {
     #[arg(short = 'g', action = ArgAction::SetTrue, group = "scope")]
@@ -162,13 +151,8 @@ pub(crate) struct SetEnvironmentArgs {
 }
 
 /// Parsed arguments of `show-options`, selecting which option scope and entries to print.
-#[derive(Debug, Clone, Args)]
-#[command(group(
-    ArgGroup::new("scope")
-        .required(false)
-        .multiple(false)
-        .args(["server", "window", "pane"])
-))]
+#[derive(Debug, Clone, Default, Args)]
+#[command(group(ArgGroup::new("scope").args(["server", "window", "pane"])))]
 pub(crate) struct ShowOptionsArgs {
     #[arg(short = 'A', action = ArgAction::SetTrue)]
     pub(crate) include_inherited: bool,
@@ -209,16 +193,11 @@ impl From<ShowWindowOptionsArgs> for ShowOptionsArgs {
     /// Widens window-option query arguments into the shared form with the other scopes unset.
     fn from(args: ShowWindowOptionsArgs) -> Self {
         Self {
-            include_inherited: false,
-            include_hooks: false,
             global: args.global,
-            server: false,
-            window: false,
-            pane: false,
-            quiet: false,
             value_only: args.value_only,
             target: args.target,
             name: args.name,
+            ..Self::default()
         }
     }
 }
@@ -227,12 +206,7 @@ impl From<ShowWindowOptionsArgs> for ShowOptionsArgs {
 #[derive(Debug, Clone, Args)]
 #[command(
     disable_help_flag = true,
-    group(
-        ArgGroup::new("scope")
-            .required(false)
-            .multiple(false)
-            .args(["global", "target"])
-    )
+    group(ArgGroup::new("scope").args(["global", "target"]))
 )]
 pub(crate) struct ShowEnvironmentArgs {
     #[arg(short = 'g', action = ArgAction::SetTrue, group = "scope")]
@@ -248,12 +222,7 @@ pub(crate) struct ShowEnvironmentArgs {
 
 /// Parsed arguments of `set-hook`, binding a command to a hook slot in the chosen scope.
 #[derive(Debug, Clone, Args)]
-#[command(group(
-    ArgGroup::new("scope")
-        .required(false)
-        .multiple(true)
-        .args(["global", "target"])
-))]
+#[command(group(ArgGroup::new("scope").multiple(true).args(["global", "target"])))]
 pub(crate) struct SetHookArgs {
     #[arg(short = 'a', action = ArgAction::SetTrue)]
     pub(crate) append: bool,
@@ -276,12 +245,7 @@ pub(crate) struct SetHookArgs {
 
 /// Parsed arguments of `show-hooks`, listing one hook or every hook in the chosen scope.
 #[derive(Debug, Clone, Args)]
-#[command(group(
-    ArgGroup::new("scope")
-        .required(false)
-        .multiple(true)
-        .args(["global", "target"])
-))]
+#[command(group(ArgGroup::new("scope").multiple(true).args(["global", "target"])))]
 pub(crate) struct ShowHooksArgs {
     #[arg(short = 'g', action = ArgAction::SetTrue, group = "scope")]
     pub(crate) global: bool,

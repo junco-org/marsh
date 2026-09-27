@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use marsh_lib::{InitializationGate, InitializationRoute};
 use rmux_core::{
     events::{
         OutputSubscriptionRecord, PaneOutputSubscriptionKey, SubscriptionLimitError,
@@ -12,7 +13,6 @@ use rmux_core::{
 use rmux_proto::{
     PaneOutputSubscriptionId, PaneRawRebaseReason, PaneStreamEndReason, PaneStreamMode,
 };
-use tokio::sync::watch;
 
 use crate::pane_io::PaneOutputReceiver;
 
@@ -35,23 +35,6 @@ pub(in crate::handler) enum OutputSubscriptionAdmissionError {
     Global { limit: usize },
 }
 
-pub(in crate::handler) enum SurfaceDriverRoute {
-    Ready,
-    Initialize { token: u64 },
-    Wait(watch::Receiver<bool>),
-}
-
-pub(in crate::handler) enum RawInitializationRoute {
-    Ready(Arc<CachedRawRebase>),
-    Initialize { token: u64 },
-    Wait(watch::Receiver<bool>),
-}
-
-struct PaneStreamInitialization {
-    token: u64,
-    completion: watch::Sender<bool>,
-}
-
 pub(crate) struct OutputSubscriptionState {
     pub(in crate::handler) registry: SubscriptionRegistry,
     pub(in crate::handler) receivers: HashMap<PaneOutputSubscriptionId, PaneOutputReceiver>,
@@ -59,10 +42,8 @@ pub(crate) struct OutputSubscriptionState {
     pub(in crate::handler) ended_streams: EndedPaneStreams,
     pub(in crate::handler) surface_drivers: HashMap<PaneOutputSubscriptionKey, SurfaceDriver>,
     pub(in crate::handler) raw_rebases: HashMap<PaneOutputSubscriptionKey, Arc<CachedRawRebase>>,
-    surface_initializations: HashMap<PaneOutputSubscriptionKey, PaneStreamInitialization>,
-    next_surface_initialization_token: u64,
-    raw_initializations: HashMap<PaneOutputSubscriptionKey, PaneStreamInitialization>,
-    next_raw_initialization_token: u64,
+    pub(in crate::handler) surface_initializations: InitializationGate<PaneOutputSubscriptionKey>,
+    pub(in crate::handler) raw_initializations: InitializationGate<PaneOutputSubscriptionKey>,
     draining_pane_progress: HashMap<PaneOutputSubscriptionKey, Instant>,
     draining_stream_sources: HashMap<PaneOutputSubscriptionKey, PaneStreamSource>,
 }
@@ -78,10 +59,13 @@ impl std::fmt::Debug for OutputSubscriptionState {
             .field("surface_driver_count", &self.surface_drivers.len())
             .field(
                 "surface_initialization_count",
-                &self.surface_initializations.len(),
+                &self.surface_initializations.pending_count(),
             )
             .field("raw_rebase_count", &self.raw_rebases.len())
-            .field("raw_initialization_count", &self.raw_initializations.len())
+            .field(
+                "raw_initialization_count",
+                &self.raw_initializations.pending_count(),
+            )
             .field("draining_pane_count", &self.draining_pane_progress.len())
             .field(
                 "draining_stream_source_count",
@@ -100,10 +84,8 @@ impl OutputSubscriptionState {
             ended_streams: EndedPaneStreams::new(limits.max_per_connection()),
             surface_drivers: HashMap::new(),
             raw_rebases: HashMap::new(),
-            surface_initializations: HashMap::new(),
-            next_surface_initialization_token: 0,
-            raw_initializations: HashMap::new(),
-            next_raw_initialization_token: 0,
+            surface_initializations: InitializationGate::default(),
+            raw_initializations: InitializationGate::default(),
             draining_pane_progress: HashMap::new(),
             draining_stream_sources: HashMap::new(),
         }
@@ -179,9 +161,9 @@ impl OutputSubscriptionState {
             }
         }
         self.surface_drivers.remove(pane);
-        self.cancel_surface_initialization(pane);
+        self.surface_initializations.cancel(pane);
         self.raw_rebases.remove(pane);
-        self.cancel_raw_initialization(pane);
+        self.raw_initializations.cancel(pane);
         self.draining_pane_progress.remove(pane);
         self.draining_stream_sources.remove(pane);
         removed_any
@@ -199,14 +181,8 @@ impl OutputSubscriptionState {
         if let Some(rebase) = self.raw_rebases.remove(previous) {
             self.raw_rebases.insert(current.clone(), rebase);
         }
-        if let Some(initialization) = self.surface_initializations.remove(previous) {
-            self.surface_initializations
-                .insert(current.clone(), initialization);
-        }
-        if let Some(initialization) = self.raw_initializations.remove(previous) {
-            self.raw_initializations
-                .insert(current.clone(), initialization);
-        }
+        self.surface_initializations.rekey(previous, &current);
+        self.raw_initializations.rekey(previous, &current);
         if let Some(progress) = self.draining_pane_progress.remove(previous) {
             self.draining_pane_progress
                 .insert(current.clone(), progress);
@@ -349,11 +325,11 @@ impl OutputSubscriptionState {
         match mode {
             PaneStreamMode::Raw => {
                 self.raw_rebases.remove(pane);
-                self.cancel_raw_initialization(pane);
+                self.raw_initializations.cancel(pane);
             }
             PaneStreamMode::Surface => {
                 self.surface_drivers.remove(pane);
-                self.cancel_surface_initialization(pane);
+                self.surface_initializations.cancel(pane);
             }
             _ => {}
         }
@@ -362,43 +338,22 @@ impl OutputSubscriptionState {
     pub(in crate::handler) fn surface_driver_route(
         &mut self,
         pane: &PaneOutputSubscriptionKey,
-    ) -> SurfaceDriverRoute {
-        if self.surface_drivers.contains_key(pane) {
-            return SurfaceDriverRoute::Ready;
-        }
-        if let Some(initialization) = self.surface_initializations.get(pane) {
-            return SurfaceDriverRoute::Wait(initialization.completion.subscribe());
-        }
-        self.next_surface_initialization_token =
-            self.next_surface_initialization_token.saturating_add(1);
-        let token = self.next_surface_initialization_token;
-        let (completion, _) = watch::channel(false);
-        self.surface_initializations
-            .insert(pane.clone(), PaneStreamInitialization { token, completion });
-        SurfaceDriverRoute::Initialize { token }
+    ) -> InitializationRoute<()> {
+        let ready = self.surface_drivers.contains_key(pane).then_some(());
+        self.surface_initializations.route(pane, ready)
     }
 
     pub(in crate::handler) fn raw_initialization_route(
         &mut self,
         pane: &PaneOutputSubscriptionKey,
         include_snapshot: bool,
-    ) -> RawInitializationRoute {
-        if let Some(rebase) = self
+    ) -> InitializationRoute<Arc<CachedRawRebase>> {
+        let ready = self
             .raw_rebases
             .get(pane)
             .filter(|rebase| !include_snapshot || rebase.rebase.snapshot.is_some())
-        {
-            return RawInitializationRoute::Ready(Arc::clone(rebase));
-        }
-        if let Some(initialization) = self.raw_initializations.get(pane) {
-            return RawInitializationRoute::Wait(initialization.completion.subscribe());
-        }
-        self.next_raw_initialization_token = self.next_raw_initialization_token.saturating_add(1);
-        let token = self.next_raw_initialization_token;
-        let (completion, _) = watch::channel(false);
-        self.raw_initializations
-            .insert(pane.clone(), PaneStreamInitialization { token, completion });
-        RawInitializationRoute::Initialize { token }
+            .cloned();
+        self.raw_initializations.route(pane, ready)
     }
 
     pub(in crate::handler) fn discard_raw_rebase_if_current(
@@ -412,36 +367,6 @@ impl OutputSubscriptionState {
             .is_some_and(|current| Arc::ptr_eq(current, stale))
         {
             self.raw_rebases.remove(pane);
-        }
-    }
-
-    pub(in crate::handler) fn finish_raw_initialization(&mut self, token: u64) {
-        let pane = self
-            .raw_initializations
-            .iter()
-            .find_map(|(pane, initialization)| {
-                (initialization.token == token).then(|| pane.clone())
-            });
-        let Some(pane) = pane else {
-            return;
-        };
-        if let Some(initialization) = self.raw_initializations.remove(&pane) {
-            let _ = initialization.completion.send(true);
-        }
-    }
-
-    pub(in crate::handler) fn finish_surface_initialization(&mut self, token: u64) {
-        let pane = self
-            .surface_initializations
-            .iter()
-            .find_map(|(pane, initialization)| {
-                (initialization.token == token).then(|| pane.clone())
-            });
-        let Some(pane) = pane else {
-            return;
-        };
-        if let Some(initialization) = self.surface_initializations.remove(&pane) {
-            let _ = initialization.completion.send(true);
         }
     }
 
@@ -477,18 +402,6 @@ impl OutputSubscriptionState {
     ) {
         if let Some(PaneStreamSubscription::Raw(stream)) = self.streams.get_mut(&subscription_id) {
             stream.cancel_rebase(token, reason);
-        }
-    }
-
-    fn cancel_surface_initialization(&mut self, pane: &PaneOutputSubscriptionKey) {
-        if let Some(initialization) = self.surface_initializations.remove(pane) {
-            let _ = initialization.completion.send(true);
-        }
-    }
-
-    fn cancel_raw_initialization(&mut self, pane: &PaneOutputSubscriptionKey) {
-        if let Some(initialization) = self.raw_initializations.remove(pane) {
-            let _ = initialization.completion.send(true);
         }
     }
 
@@ -579,19 +492,19 @@ mod tests {
     async fn one_surface_initializer_wakes_all_waiters_before_re_election() {
         let mut state = OutputSubscriptionState::new(SubscriptionLimits::default());
         let pane = pane();
-        let SurfaceDriverRoute::Initialize { token } = state.surface_driver_route(&pane) else {
+        let InitializationRoute::Initialize { token } = state.surface_driver_route(&pane) else {
             panic!("first caller must initialize");
         };
-        let SurfaceDriverRoute::Wait(mut waiter) = state.surface_driver_route(&pane) else {
+        let InitializationRoute::Wait(mut waiter) = state.surface_driver_route(&pane) else {
             panic!("second caller must wait");
         };
 
-        state.finish_surface_initialization(token);
+        state.surface_initializations.finish(token);
         waiter.changed().await.expect("initializer completion");
         assert!(*waiter.borrow());
         assert!(matches!(
             state.surface_driver_route(&pane),
-            SurfaceDriverRoute::Initialize { .. }
+            InitializationRoute::Initialize { .. }
         ));
     }
 
@@ -601,9 +514,9 @@ mod tests {
         let pane = pane();
         assert!(matches!(
             state.surface_driver_route(&pane),
-            SurfaceDriverRoute::Initialize { .. }
+            InitializationRoute::Initialize { .. }
         ));
-        let SurfaceDriverRoute::Wait(mut waiter) = state.surface_driver_route(&pane) else {
+        let InitializationRoute::Wait(mut waiter) = state.surface_driver_route(&pane) else {
             panic!("second caller must wait");
         };
 
@@ -620,23 +533,34 @@ mod tests {
             SessionName::new("surface-moved").expect("valid session name"),
             previous.pane_id(),
         );
-        let SurfaceDriverRoute::Initialize { token } = state.surface_driver_route(&previous) else {
+        let InitializationRoute::Initialize { token } = state.surface_driver_route(&previous)
+        else {
             panic!("first caller must initialize");
         };
-        let SurfaceDriverRoute::Wait(mut waiter) = state.surface_driver_route(&previous) else {
+        let InitializationRoute::Wait(mut waiter) = state.surface_driver_route(&previous) else {
             panic!("second caller must wait");
         };
 
         state.rekey_pane(&previous, current.clone());
-        state.finish_surface_initialization(token);
+        assert!(matches!(
+            state.surface_driver_route(&current),
+            InitializationRoute::Wait(_)
+        ));
+        state.surface_initializations.finish(token);
 
         waiter
             .changed()
             .await
             .expect("rekeyed initializer completion");
         assert!(*waiter.borrow());
-        assert!(!state.surface_initializations.contains_key(&previous));
-        assert!(!state.surface_initializations.contains_key(&current));
+        assert!(matches!(
+            state.surface_driver_route(&current),
+            InitializationRoute::Initialize { .. }
+        ));
+        assert!(matches!(
+            state.surface_driver_route(&previous),
+            InitializationRoute::Initialize { .. }
+        ));
     }
 
     #[test]

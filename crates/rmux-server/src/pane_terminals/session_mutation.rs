@@ -12,16 +12,11 @@ use super::{
 
 pub(crate) struct SessionTransferSnapshot {
     sessions: SessionStore,
-    options: OptionStore,
     environment: EnvironmentStore,
-    hooks: HookStore,
+    metadata: WindowMutationMetadataSnapshot,
     pane_lifecycle: HashMap<PaneId, PaneLifecycleState>,
     attached_terminal_pixels: HashMap<SessionName, TerminalPixels>,
     dead_panes: HashMap<SessionName, HashMap<PaneId, PaneExitMetadata>>,
-    auto_named_windows: HashSet<(SessionName, u32)>,
-    window_link_groups: HashMap<u64, WindowLinkGroup>,
-    window_link_slots: HashMap<WindowLinkSlot, u64>,
-    window_link_occurrences: HashMap<WindowLinkSlot, super::WindowLinkOccurrenceId>,
     next_window_link_group_id: u64,
     next_window_link_occurrence_id: u64,
     applied_window_resizes: AppliedWindowResizeQueue,
@@ -74,16 +69,11 @@ impl SessionTransferSnapshot {
     pub(crate) fn capture(state: &HandlerState) -> Self {
         Self {
             sessions: state.sessions.clone(),
-            options: state.options.clone(),
             environment: state.environment.clone(),
-            hooks: state.hooks.clone(),
+            metadata: WindowMutationMetadataSnapshot::capture(state),
             pane_lifecycle: state.pane_lifecycle.clone(),
             attached_terminal_pixels: state.attached_terminal_pixels.clone(),
             dead_panes: state.dead_panes.clone(),
-            auto_named_windows: state.auto_named_windows.clone(),
-            window_link_groups: state.window_link_groups.clone(),
-            window_link_slots: state.window_link_slots.clone(),
-            window_link_occurrences: state.window_link_occurrences.clone(),
             next_window_link_group_id: state.next_window_link_group_id,
             next_window_link_occurrence_id: state.next_window_link_occurrence_id,
             applied_window_resizes: state.applied_window_resizes.clone(),
@@ -92,16 +82,11 @@ impl SessionTransferSnapshot {
 
     pub(crate) fn restore(self, state: &mut HandlerState) {
         state.sessions = self.sessions;
-        state.options = self.options;
         state.environment = self.environment;
-        state.hooks = self.hooks;
+        self.metadata.restore(state);
         state.pane_lifecycle = self.pane_lifecycle;
         state.attached_terminal_pixels = self.attached_terminal_pixels;
         state.dead_panes = self.dead_panes;
-        state.auto_named_windows = self.auto_named_windows;
-        state.window_link_groups = self.window_link_groups;
-        state.window_link_slots = self.window_link_slots;
-        state.window_link_occurrences = self.window_link_occurrences;
         state.next_window_link_group_id = self.next_window_link_group_id;
         state.next_window_link_occurrence_id = self.next_window_link_occurrence_id;
         // A rolled-back geometry change owes no notification: restoring the
@@ -112,9 +97,8 @@ impl SessionTransferSnapshot {
 
 /// The metadata a window-slot mutation must restore when it rolls back: the
 /// option/hook stores keyed by window index plus the auto-name and window-link
-/// maps that follow those indices. Deliberately narrower than
-/// [`SessionTransferSnapshot`], which also owns pane state, counters and the
-/// resize queue.
+/// maps that follow those indices. [`SessionTransferSnapshot`] composes it and
+/// also owns pane state, counters and the resize queue.
 pub(in crate::pane_terminals) struct WindowMutationMetadataSnapshot {
     options: OptionStore,
     hooks: HookStore,
@@ -143,6 +127,50 @@ impl WindowMutationMetadataSnapshot {
         state.window_link_slots = self.window_link_slots;
         state.window_link_groups = self.window_link_groups;
         state.window_link_occurrences = self.window_link_occurrences;
+    }
+}
+
+/// `N` named sessions plus [`WindowMutationMetadataSnapshot`], taken before a
+/// window-slot mutation. Not a collection wrapper: the fields are heterogeneous,
+/// and the struct carries the one invariant its callers share — metadata is
+/// captured once at the same point as the sessions and restored only after every
+/// session, which are replaced in array order. Mutations that restore metadata
+/// first, or interleave other stores between sessions, keep their own snapshots.
+pub(in crate::pane_terminals) struct SessionCheckpoint<'a, const N: usize> {
+    sessions: [(&'a SessionName, Session); N],
+    metadata: WindowMutationMetadataSnapshot,
+}
+
+impl<'a, const N: usize> SessionCheckpoint<'a, N> {
+    /// Keeps the caller's already-cloned `sessions` and captures the window
+    /// metadata once, at the caller's pre-mutation point.
+    pub(in crate::pane_terminals) fn capture(
+        state: &HandlerState,
+        sessions: [(&'a SessionName, Session); N],
+    ) -> Self {
+        Self {
+            sessions,
+            metadata: WindowMutationMetadataSnapshot::capture(state),
+        }
+    }
+
+    /// The preserved pre-mutation sessions, in capture order.
+    pub(in crate::pane_terminals) fn sessions(&self) -> &[(&'a SessionName, Session); N] {
+        &self.sessions
+    }
+
+    /// Replaces each named session in array order, then restores the metadata.
+    /// A session that disappeared stops the rollback with that error: earlier
+    /// replacements stay applied and the metadata stays as mutated.
+    pub(in crate::pane_terminals) fn restore(
+        self,
+        state: &mut HandlerState,
+    ) -> Result<(), RmuxError> {
+        for (session_name, session) in self.sessions {
+            state.replace_session(session_name, session)?;
+        }
+        self.metadata.restore(state);
+        Ok(())
     }
 }
 

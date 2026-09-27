@@ -3,8 +3,6 @@ use super::*;
 use rmux_core::PaneGeometry;
 use rmux_proto::{LayoutName, SelectLayoutRequest, SelectLayoutTarget};
 
-const DAEMON_TEST_STACK_SIZE: usize = 8 * 1024 * 1024;
-
 #[derive(Clone, Copy)]
 enum OracleApplication {
     First,
@@ -14,17 +12,14 @@ enum OracleApplication {
 async fn select_layout_fixture(name: &str) -> (RequestHandler, SessionName) {
     let handler = RequestHandler::new();
     let session = session_name(name);
-    create_background_identity_session(&handler, session.clone()).await;
+    handler.create_session(&session).await;
 
-    let split = handler
-        .handle(Request::SplitWindow(SplitWindowRequest {
-            target: SplitWindowTarget::Pane(PaneTarget::with_window(session.clone(), 0, 0)),
+    handler
+        .handle_ok(SplitWindowRequest {
             direction: SplitDirection::Horizontal,
-            before: false,
-            environment: None,
-        }))
+            ..Fixture::fixture(PaneTarget::with_window(session.clone(), 0, 0))
+        })
         .await;
-    assert!(matches!(split, Response::SplitWindow(_)), "{split:?}");
 
     let selected = handler
         .handle(Request::SelectLayout(SelectLayoutRequest {
@@ -125,27 +120,6 @@ fn repeated_command(session: &str, buffer: &str) -> String {
     format!("selectl -nE -t {session}:0 ; set-buffer -b {buffer} ok")
 }
 
-fn run_on_daemon_test_stack<F, Fut>(test: F)
-where
-    F: FnOnce() -> Fut + Send + 'static,
-    Fut: std::future::Future<Output = ()> + 'static,
-{
-    let worker = std::thread::Builder::new()
-        .name("select-layout-flags-test".to_owned())
-        .stack_size(DAEMON_TEST_STACK_SIZE)
-        .spawn(|| {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("select-layout flags test runtime should build");
-            runtime.block_on(test());
-        })
-        .expect("select-layout flags test worker should spawn");
-    if let Err(panic) = worker.join() {
-        std::panic::resume_unwind(panic);
-    }
-}
-
 #[test]
 fn control_select_layout_cluster_advances_and_repeats_without_losing_follow_on() {
     run_on_daemon_test_stack(control_select_layout_cluster_body);
@@ -155,8 +129,9 @@ async fn control_select_layout_cluster_body() {
     let name = "select-layout-control";
     let (handler, session) = select_layout_fixture(name).await;
     let requester_pid = 73_101;
-    let (_control_id, _events) =
-        register_control_for_session(&handler, requester_pid, session.clone()).await;
+    let (_control_id, _events) = handler
+        .register_control_for_test(requester_pid, Some(&session))
+        .await;
 
     for (command, buffer, application) in [
         (
@@ -284,10 +259,7 @@ async fn attached_binding_select_layout_cluster_body() {
     let name = "select-layout-binding";
     let (handler, session) = select_layout_fixture(name).await;
     let requester_pid = 73_102;
-    let (attach_tx, _attach_rx) = tokio::sync::mpsc::unbounded_channel();
-    handler
-        .register_attach(requester_pid, session.clone(), attach_tx)
-        .await;
+    let _attach_rx = handler.attach_client(requester_pid, &session).await;
 
     for (key, command, buffer, application) in [
         (
@@ -340,43 +312,28 @@ async fn run_shell_commands_select_layout_cluster_body() {
             OracleApplication::Repeated,
         ),
     ] {
-        let response = handler
-            .handle(Request::RunShell(Box::new(RunShellRequest {
-                command: command.clone(),
-                arguments: Vec::new(),
-                background: false,
+        handler
+            .handle_ok(RunShellRequest {
                 as_commands: true,
-                show_stderr: false,
-                delay_seconds: None,
-                start_directory: None,
-                target: None,
-                source_depth: None,
-            })))
+                ..Fixture::fixture(command)
+            })
             .await;
-        assert!(
-            matches!(response, Response::RunShell(_)),
-            "{command}: {response:?}"
-        );
         assert_oracle_layout(&handler, &session, application).await;
         assert_buffer(&handler, buffer).await;
     }
 
     let rejected_buffer = "select-layout-run-shell-rejected";
     let response = handler
-        .handle(Request::RunShell(Box::new(RunShellRequest {
-            command: format!(
-                "select-layout -Enx -t {name}:0 ; \
-                 set-buffer -b {rejected_buffer} must-not-run"
-            ),
-            arguments: Vec::new(),
-            background: false,
-            as_commands: true,
-            show_stderr: false,
-            delay_seconds: None,
-            start_directory: None,
-            target: None,
-            source_depth: None,
-        })))
+        .handle(
+            RunShellRequest {
+                as_commands: true,
+                ..Fixture::fixture(format!(
+                    "select-layout -Enx -t {name}:0 ; \
+                     set-buffer -b {rejected_buffer} must-not-run"
+                ))
+            }
+            .into_request(),
+        )
         .await;
     let Response::Error(error) = response else {
         panic!("run-shell -C must surface the invalid select-layout cluster: {response:?}");

@@ -6,12 +6,12 @@ use serde_json::{Value, json};
 use crate::cli_args::{
     BroadcastKeysArgs, ExpectPaneArgs, FindPanesArgs, FindSessionsArgs, LocatorArgs,
 };
-use crate::cli_response::tmux_cli_error_message;
 
+use super::super::target_resolution::connect_cli;
 use super::super::{ExitFailure, list_session_names, resolve_pane_target_spec};
 use super::common::{
-    SCHEMA_VERSION, connect_cli, find_visible_text, matches_json, pane_snapshot, resolve_pane_ref,
-    stable_pane_ref_for_slot, write_json, write_stdout_bytes, write_stdout_line,
+    SCHEMA_VERSION, find_visible_text, matches_json, pane_snapshot, resolve_pane_ref,
+    response_error, stable_pane_ref_for_slot, write_json_line, write_stdout_text,
 };
 
 /// Unit separator between fields of one `find-panes` format record.
@@ -28,7 +28,7 @@ pub(crate) fn run_locator(args: &LocatorArgs, socket_path: &Path) -> Result<i32,
     let snapshot = pane_snapshot(&mut connection, target)?;
     let matches = find_visible_text(&snapshot, &args.get_by_text);
     if args.json {
-        return write_json(&json!({
+        return write_json_line(&json!({
             "schema_version": SCHEMA_VERSION,
             "ok": true,
             "locator": "get-by-text",
@@ -41,10 +41,7 @@ pub(crate) fn run_locator(args: &LocatorArgs, socket_path: &Path) -> Result<i32,
         .map(|found| format!("{}:{}:{}", found.row, found.col, found.text))
         .collect::<Vec<_>>()
         .join("\n");
-    if lines.is_empty() {
-        return write_stdout_bytes(b"");
-    }
-    write_stdout_line(&lines)
+    write_stdout_text(&lines)
 }
 
 /// Runs `expect-pane`, asserting visible, hidden, or exact-count `get-by-text` matches.
@@ -72,7 +69,7 @@ pub(crate) fn run_expect_pane(
     };
     if args.json {
         let exit_code = if ok { 0 } else { 1 };
-        write_json(&json!({
+        write_json_line(&json!({
             "schema_version": SCHEMA_VERSION,
             "ok": ok,
             "assertion": assertion,
@@ -116,7 +113,7 @@ pub(crate) fn run_find_panes(args: &FindPanesArgs, socket_path: &Path) -> Result
     }
     panes.retain(|pane| pane_matches(pane, args));
     if args.json {
-        return write_json(&json!({
+        return write_json_line(&json!({
             "schema_version": SCHEMA_VERSION,
             "ok": true,
             "panes": Value::Array(
@@ -153,10 +150,7 @@ pub(crate) fn run_find_panes(args: &FindPanesArgs, socket_path: &Path) -> Result
         })
         .collect::<Vec<_>>()
         .join("\n");
-    if lines.is_empty() {
-        return write_stdout_bytes(b"");
-    }
-    write_stdout_line(&lines)
+    write_stdout_text(&lines)
 }
 
 /// Runs `find-sessions`, listing session names filtered by exact name or name prefix.
@@ -177,7 +171,7 @@ pub(crate) fn run_find_sessions(
                 .is_none_or(|prefix| name.starts_with(prefix))
     });
     if args.json {
-        return write_json(&json!({
+        return write_json_line(&json!({
             "schema_version": SCHEMA_VERSION,
             "ok": true,
             "sessions": Value::Array(
@@ -188,11 +182,7 @@ pub(crate) fn run_find_sessions(
             ),
         }));
     }
-    let lines = sessions.join("\n");
-    if lines.is_empty() {
-        return write_stdout_bytes(b"");
-    }
-    write_stdout_line(&lines)
+    write_stdout_text(&sessions.join("\n"))
 }
 
 /// Runs `broadcast-keys`, sending the same keys to every resolved pane target at once.
@@ -227,16 +217,10 @@ pub(crate) fn run_broadcast_keys(
                 response.successes.len() + response.failures.len()
             ),
         )),
-        Response::Error(error) => Err(ExitFailure::new(
-            1,
-            tmux_cli_error_message("broadcast-keys", &error.error),
-        )),
-        other => Err(ExitFailure::new(
-            1,
-            format!(
-                "protocol error: unexpected '{}' response for broadcast-keys",
-                other.command_name()
-            ),
+        other => Err(response_error(
+            &other,
+            "broadcast-keys",
+            "for broadcast-keys",
         )),
     }
 }

@@ -27,198 +27,61 @@ use std::future::Future;
 
 const PROBE: &str = "@probe180";
 
-async fn bind(handler: &RequestHandler, table: &str, key: &str, command: &[&str]) {
-    let response = handler
-        .handle(Request::BindKey(Box::new(BindKeyRequest {
-            table_name: table.to_owned(),
-            key: key.to_owned(),
-            note: None,
-            repeat: false,
-            command: Some(command.iter().map(|part| (*part).to_owned()).collect()),
-        })))
-        .await;
-    assert!(matches!(response, Response::BindKey(_)), "{response:?}");
-}
-
 async fn bind_repeating(handler: &RequestHandler, table: &str, key: &str, command: &[&str]) {
-    let response = handler
-        .handle(Request::BindKey(Box::new(BindKeyRequest {
-            table_name: table.to_owned(),
-            key: key.to_owned(),
-            note: None,
+    handler
+        .handle_ok(BindKeyRequest {
             repeat: true,
-            command: Some(command.iter().map(|part| (*part).to_owned()).collect()),
-        })))
+            ..Fixture::fixture((table, key, command.iter().copied()))
+        })
         .await;
-    assert!(matches!(response, Response::BindKey(_)), "{response:?}");
 }
 
 async fn unbind(handler: &RequestHandler, table: &str, key: &str) {
-    let response = handler
-        .handle(Request::UnbindKey(UnbindKeyRequest {
+    handler
+        .handle_ok(UnbindKeyRequest {
             table_name: table.to_owned(),
             key: Some(key.to_owned()),
             all: false,
             quiet: false,
-        }))
+        })
         .await;
-    assert!(matches!(response, Response::UnbindKey(_)), "{response:?}");
-}
-
-/// Read a user option back the way the issue reporter did (`show-options -gv`).
-async fn probe_value(handler: &RequestHandler, name: &str) -> String {
-    let response = handler
-        .handle(Request::ShowOptions(rmux_proto::ShowOptionsRequest {
-            scope: rmux_proto::OptionScopeSelector::SessionGlobal,
-            name: Some(name.to_owned()),
-            value_only: true,
-            include_inherited: false,
-            quiet: true,
-            include_hooks: false,
-        }))
-        .await;
-    let Response::ShowOptions(response) = response else {
-        panic!("expected show-options response, got {response:?}");
-    };
-    String::from_utf8(response.command_output().stdout().to_vec())
-        .expect("option value is utf-8")
-        .trim()
-        .to_owned()
 }
 
 /// Dispatch a key through the client's key table, exactly like `send-keys -K`.
 async fn dispatch_key_table(handler: &RequestHandler, target: &PaneTarget, key: &str) {
-    let response = handler
-        .handle(Request::SendKeysExt(SendKeysExtRequest {
-            target: Some(target.clone()),
-            keys: vec![key.to_owned()],
-            expand_formats: false,
-            hex: false,
-            literal: false,
-            dispatch_key_table: true,
-            copy_mode_command: false,
-            forward_mouse_event: false,
-            reset_terminal: false,
-            repeat_count: None,
-        }))
-        .await;
-    assert!(matches!(response, Response::SendKeys(_)), "{response:?}");
-}
-
-async fn attach(
-    handler: &RequestHandler,
-    requester_pid: u32,
-    session: &rmux_proto::SessionName,
-) -> mpsc::UnboundedReceiver<crate::pane_io::AttachControl> {
-    let (control_tx, control_rx) = mpsc::unbounded_channel();
     handler
-        .register_attach(requester_pid, session.clone(), control_tx)
+        .handle_ok(SendKeysExtRequest::fixture((target, [key])))
         .await;
-    control_rx
-}
-
-async fn enter_copy_mode(handler: &RequestHandler, target: &PaneTarget) {
-    let response = handler
-        .handle(Request::CopyMode(CopyModeRequest {
-            target: Some(target.clone()),
-            page_down: false,
-            exit_on_scroll: false,
-            hide_position: false,
-            mouse_drag_start: false,
-            cancel_mode: false,
-            scrollbar_scroll: false,
-            source: None,
-            page_up: false,
-        }))
-        .await;
-    assert!(matches!(response, Response::CopyMode(_)), "{response:?}");
-}
-
-async fn set_mode_keys(handler: &RequestHandler, session: &rmux_proto::SessionName, value: &str) {
-    let response = handler
-        .handle(Request::SetOption(SetOptionRequest {
-            scope: ScopeSelector::Window(WindowTarget::with_window(session.clone(), 0)),
-            option: OptionName::ModeKeys,
-            value: value.to_owned(),
-            mode: SetOptionMode::Replace,
-        }))
-        .await;
-    assert!(matches!(response, Response::SetOption(_)), "{response:?}");
 }
 
 /// Read the copy cursor row through `#{copy_cursor_y}`, the same surface the
 /// issue reporter used from the command line.
 async fn copy_cursor_y(handler: &RequestHandler, target: &PaneTarget) -> u32 {
-    let listed = handler
-        .handle(Request::ListPanes(Box::new(ListPanesRequest {
-            target: target.session_name().clone(),
-            format: Some("#{copy_cursor_y}".to_owned()),
-            filter: None,
-            sort_order: None,
-            reversed: false,
-            target_window_index: None,
-        })))
-        .await;
-    let output = listed
-        .command_output()
-        .expect("list-panes returns command output");
-    String::from_utf8_lossy(output.stdout())
-        .lines()
-        .next()
+    first_pane_row(handler, target, "#{copy_cursor_y}")
+        .await
         .expect("a pane row is rendered")
-        .trim()
         .parse()
         .expect("copy_cursor_y is numeric")
 }
 
 /// Read how far the copy-mode view is scrolled back.
 async fn scroll_position(handler: &RequestHandler, target: &PaneTarget) -> u32 {
-    let listed = handler
-        .handle(Request::ListPanes(Box::new(ListPanesRequest {
-            target: target.session_name().clone(),
-            format: Some("#{scroll_position}".to_owned()),
-            filter: None,
-            sort_order: None,
-            reversed: false,
-            target_window_index: None,
-        })))
-        .await;
-    let output = listed
-        .command_output()
-        .expect("list-panes returns command output");
-    String::from_utf8_lossy(output.stdout())
-        .lines()
-        .next()
+    first_pane_row(handler, target, "#{scroll_position}")
+        .await
         .expect("a pane row is rendered")
-        .trim()
         .parse()
         .expect("scroll_position is numeric")
 }
 
 /// Fill the pane with scrollback so the copy cursor has somewhere to move.
 async fn fill_transcript(handler: &RequestHandler, target: &PaneTarget) {
-    let transcript = {
-        let state = handler.state.lock().await;
-        state
-            .transcript_handle(target)
-            .expect("pane transcript must exist")
-    };
-    let size = TerminalSize { cols: 80, rows: 24 };
-    let history_limit = transcript
-        .lock()
-        .expect("pane transcript mutex must not be poisoned")
-        .history_limit();
-    let mut screen = rmux_core::Screen::new(size, history_limit);
-    let mut parser = rmux_core::input::InputParser::new();
     let mut content = Vec::new();
     for line in 0..40u32 {
         content.extend_from_slice(format!("line {line}\r\n").as_bytes());
     }
-    parser.parse(&content, &mut screen);
-    transcript
-        .lock()
-        .expect("pane transcript mutex must not be poisoned")
-        .set_screen_for_test(screen);
+    handler
+        .replace_transcript_for_test(target, TerminalSize { cols: 80, rows: 24 }, &content)
+        .await;
 }
 
 // --------------------------------------------------------------------------
@@ -239,7 +102,7 @@ async fn prefix_table_arrow_bindings_run_the_user_command() {
         let requester_pid = std::process::id();
 
         create_send_keys_test_session(&handler, &alpha).await;
-        let _control_rx = attach(&handler, requester_pid, &alpha).await;
+        let _control_rx = handler.attach_client(requester_pid, &alpha).await;
         bind(
             &handler,
             "prefix",
@@ -270,7 +133,7 @@ async fn prefix_table_window_navigation_keys_run_the_user_command() {
         let requester_pid = std::process::id();
 
         create_send_keys_test_session(&handler, &alpha).await;
-        let _control_rx = attach(&handler, requester_pid, &alpha).await;
+        let _control_rx = handler.attach_client(requester_pid, &alpha).await;
         bind(
             &handler,
             "prefix",
@@ -299,7 +162,7 @@ async fn prefix_table_non_arrow_control_binding_is_unchanged() {
     let requester_pid = std::process::id();
 
     create_send_keys_test_session(&handler, &alpha).await;
-    let _control_rx = attach(&handler, requester_pid, &alpha).await;
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
     bind(
         &handler,
         "prefix",
@@ -323,7 +186,7 @@ async fn prefix_table_modified_arrow_bindings_still_resolve() {
         let requester_pid = std::process::id();
 
         create_send_keys_test_session(&handler, &alpha).await;
-        let _control_rx = attach(&handler, requester_pid, &alpha).await;
+        let _control_rx = handler.attach_client(requester_pid, &alpha).await;
         bind(
             &handler,
             "prefix",
@@ -350,70 +213,33 @@ async fn prefix_table_default_arrow_selects_the_pane_in_that_direction() {
     let requester_pid = std::process::id();
 
     create_quiet_input_session(&handler, &alpha).await;
-    let _control_rx = attach(&handler, requester_pid, &alpha).await;
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
 
     let split = handler
-        .handle(Request::SplitWindowExt(Box::new(
-            rmux_proto::SplitWindowExtRequest {
-                target: SplitWindowTarget::Pane(target.clone()),
-                direction: SplitDirection::Vertical,
-                before: false,
-                environment: None,
-                command: Some(quiet_pane_command()),
-                process_command: None,
-                start_directory: None,
-                keep_alive_on_exit: None,
-                detached: false,
-                size: None,
-                preserve_zoom: false,
-                full_size: false,
-                stdin_payload: None,
-            },
-        )))
+        .handle_ok(rmux_proto::SplitWindowExtRequest {
+            command: Some(quiet_command()),
+            ..Fixture::fixture(&target)
+        })
         .await;
-    let Response::SplitWindow(split) = split else {
-        panic!("expected split-window response: {split:?}");
-    };
     handler
         .wait_for_pane_startup_to_finish_for_test(&split.pane)
         .await;
 
     let split = handler
-        .handle(Request::SplitWindowExt(Box::new(
-            rmux_proto::SplitWindowExtRequest {
-                target: SplitWindowTarget::Pane(PaneTarget::new(alpha.clone(), 1)),
-                direction: SplitDirection::Horizontal,
-                before: false,
-                environment: None,
-                command: Some(quiet_pane_command()),
-                process_command: None,
-                start_directory: None,
-                keep_alive_on_exit: None,
-                detached: false,
-                size: None,
-                preserve_zoom: false,
-                full_size: false,
-                stdin_payload: None,
-            },
-        )))
+        .handle_ok(rmux_proto::SplitWindowExtRequest {
+            direction: SplitDirection::Horizontal,
+            command: Some(quiet_command()),
+            ..Fixture::fixture(PaneTarget::new(alpha.clone(), 1))
+        })
         .await;
-    let Response::SplitWindow(split) = split else {
-        panic!("expected split-window response: {split:?}");
-    };
     handler
         .wait_for_pane_startup_to_finish_for_test(&split.pane)
         .await;
 
-    let selected = handler
-        .handle(Request::SelectPane(Box::new(SelectPaneRequest {
-            target: PaneTarget::new(alpha.clone(), 2),
-            title: None,
-            style: None,
-            input_disabled: None,
-            preserve_zoom: false,
-        })))
+    let selected = PaneTarget::new(alpha.clone(), 2);
+    handler
+        .handle_ok(SelectPaneRequest::fixture(&selected))
         .await;
-    assert!(matches!(selected, Response::SelectPane(_)), "{selected:?}");
 
     dispatch_key_table(&handler, &PaneTarget::new(alpha.clone(), 2), "C-b").await;
     dispatch_key_table(&handler, &PaneTarget::new(alpha.clone(), 2), "Up").await;
@@ -444,23 +270,13 @@ async fn prefix_table_unbound_arrow_stays_inert() {
     let requester_pid = std::process::id();
 
     create_quiet_input_session(&handler, &alpha).await;
-    let _control_rx = attach(&handler, requester_pid, &alpha).await;
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
     unbind(&handler, "prefix", "Up").await;
     let capture = RawPaneInputProbe::start(&handler, &alpha, "d1-fresh-prefix", 1).await;
 
     type_live(&handler, requester_pid, b"\x02\x1b[Ax").await;
 
     capture.assert_contents(&handler, b"x").await;
-}
-
-async fn client_key_table(handler: &RequestHandler, requester_pid: u32) -> Option<String> {
-    let active_attach = handler.active_attach.lock().await;
-    active_attach
-        .by_pid
-        .get(&requester_pid)
-        .expect("attached client remains registered")
-        .key_table_name
-        .clone()
 }
 
 #[tokio::test]
@@ -474,48 +290,23 @@ async fn prefix_table_arrow_repeat_semantics_come_from_the_binding() {
     let requester_pid = std::process::id();
 
     create_quiet_input_session(&handler, &alpha).await;
-    let _control_rx = attach(&handler, requester_pid, &alpha).await;
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
 
     // Stack three panes vertically: 0 on top, then 1, then 2.
     for source in [0u32, 1] {
         let split = handler
-            .handle(Request::SplitWindowExt(Box::new(
-                rmux_proto::SplitWindowExtRequest {
-                    target: SplitWindowTarget::Pane(PaneTarget::new(alpha.clone(), source)),
-                    direction: SplitDirection::Vertical,
-                    before: false,
-                    environment: None,
-                    command: Some(quiet_pane_command()),
-                    process_command: None,
-                    start_directory: None,
-                    keep_alive_on_exit: None,
-                    detached: false,
-                    size: None,
-                    preserve_zoom: false,
-                    full_size: false,
-                    stdin_payload: None,
-                },
-            )))
+            .handle_ok(rmux_proto::SplitWindowExtRequest {
+                command: Some(quiet_command()),
+                ..Fixture::fixture(PaneTarget::new(alpha.clone(), source))
+            })
             .await;
-        let Response::SplitWindow(split) = split else {
-            panic!("expected split-window response: {split:?}");
-        };
         handler
             .wait_for_pane_startup_to_finish_for_test(&split.pane)
             .await;
     }
 
     let bottom = PaneTarget::new(alpha.clone(), 2);
-    let selected = handler
-        .handle(Request::SelectPane(Box::new(SelectPaneRequest {
-            target: bottom.clone(),
-            title: None,
-            style: None,
-            input_disabled: None,
-            preserve_zoom: false,
-        })))
-        .await;
-    assert!(matches!(selected, Response::SelectPane(_)), "{selected:?}");
+    handler.handle_ok(SelectPaneRequest::fixture(&bottom)).await;
 
     dispatch_key_table(&handler, &bottom, "C-b").await;
     dispatch_key_table(&handler, &bottom, "Up").await;
@@ -550,7 +341,7 @@ async fn prefix_table_non_repeating_arrow_leaves_the_prefix_table() {
     let requester_pid = std::process::id();
 
     create_send_keys_test_session(&handler, &alpha).await;
-    let _control_rx = attach(&handler, requester_pid, &alpha).await;
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
     bind(
         &handler,
         "prefix",
@@ -578,7 +369,7 @@ async fn prefix_table_repeating_user_binding_repeats() {
     let requester_pid = std::process::id();
 
     create_send_keys_test_session(&handler, &alpha).await;
-    let _control_rx = attach(&handler, requester_pid, &alpha).await;
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
     bind_repeating(
         &handler,
         "prefix",
@@ -606,23 +397,6 @@ async fn prefix_table_repeating_user_binding_repeats() {
     );
 }
 
-async fn set_session_option(
-    handler: &RequestHandler,
-    session: &rmux_proto::SessionName,
-    option: OptionName,
-    value: &str,
-) {
-    let response = handler
-        .handle(Request::SetOption(SetOptionRequest {
-            scope: ScopeSelector::Session(session.clone()),
-            option,
-            value: value.to_owned(),
-            mode: SetOptionMode::Replace,
-        }))
-        .await;
-    assert!(matches!(response, Response::SetOption(_)), "{response:?}");
-}
-
 /// A client whose `prefix Left` repeats, with a repeat window far longer than
 /// the test can take. Dispatch reads `std::time::Instant`, so the long window
 /// is what keeps a slow test from passing through the timeout path instead of
@@ -631,12 +405,17 @@ async fn repeat_window_fixture(
     handler: &RequestHandler,
     alpha: &rmux_proto::SessionName,
     requester_pid: u32,
-) -> mpsc::UnboundedReceiver<crate::pane_io::AttachControl> {
+) -> mpsc::UnboundedReceiver<AttachControl> {
     create_quiet_input_session(handler, alpha).await;
-    let control_rx = attach(handler, requester_pid, alpha).await;
+    let control_rx = handler.attach_client(requester_pid, alpha).await;
     bind_repeating(handler, "prefix", "Left", &["select-pane", "-L"]).await;
-    set_session_option(handler, alpha, OptionName::RepeatTime, "60000").await;
-    set_session_option(handler, alpha, OptionName::InitialRepeatTime, "60000").await;
+    let scope = ScopeSelector::Session(alpha.clone());
+    handler
+        .set_option(scope.clone(), OptionName::RepeatTime, "60000")
+        .await;
+    handler
+        .set_option(scope, OptionName::InitialRepeatTime, "60000")
+        .await;
     control_rx
 }
 
@@ -711,7 +490,10 @@ async fn prefix_repeat_fallback_honors_configured_default_binding_case() {
         &["set-option", "-g", PROBE, "default-hit"],
     )
     .await;
-    set_session_option(&handler, &alpha, OptionName::KeyTable, "d1-default").await;
+    let scope = ScopeSelector::Session(alpha.clone());
+    handler
+        .set_option(scope, OptionName::KeyTable, "d1-default")
+        .await;
     let capture = RawPaneInputProbe::start(&handler, &alpha, "d1-default-binding", 1).await;
 
     type_live(&handler, requester_pid, b"\x02\x1b[Dj!").await;
@@ -758,7 +540,7 @@ async fn copy_mode_arrow_binding_case(mode_keys: &str, table: &str, key: &str, s
     let requester_pid = std::process::id();
 
     create_quiet_input_session(&handler, &alpha).await;
-    let _control_rx = attach(&handler, requester_pid, &alpha).await;
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
     set_mode_keys(&handler, &alpha, mode_keys).await;
     fill_transcript(&handler, &target).await;
 
@@ -770,7 +552,7 @@ async fn copy_mode_arrow_binding_case(mode_keys: &str, table: &str, key: &str, s
         &["set-option", "-g", PROBE, &expected],
     )
     .await;
-    enter_copy_mode(&handler, &target).await;
+    handler.handle_ok(CopyModeRequest::fixture(&target)).await;
     let before = copy_cursor_y(&handler, &target).await;
 
     type_live(&handler, requester_pid, sequence).await;
@@ -810,10 +592,10 @@ async fn copy_mode_default_arrows_still_move_the_copy_cursor() {
         let requester_pid = std::process::id();
 
         create_quiet_input_session(&handler, &alpha).await;
-        let _control_rx = attach(&handler, requester_pid, &alpha).await;
+        let _control_rx = handler.attach_client(requester_pid, &alpha).await;
         set_mode_keys(&handler, &alpha, mode_keys).await;
         fill_transcript(&handler, &target).await;
-        enter_copy_mode(&handler, &target).await;
+        handler.handle_ok(CopyModeRequest::fixture(&target)).await;
 
         let before = copy_cursor_y(&handler, &target).await;
         assert!(before > 0, "{table} needs room to move up");
@@ -842,11 +624,11 @@ async fn copy_mode_unbound_arrow_stays_inert() {
     let requester_pid = std::process::id();
 
     create_quiet_input_session(&handler, &alpha).await;
-    let _control_rx = attach(&handler, requester_pid, &alpha).await;
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
     set_mode_keys(&handler, &alpha, "emacs").await;
     fill_transcript(&handler, &target).await;
     unbind(&handler, "copy-mode", "Up").await;
-    enter_copy_mode(&handler, &target).await;
+    handler.handle_ok(CopyModeRequest::fixture(&target)).await;
 
     let before = copy_cursor_y(&handler, &target).await;
     type_live(&handler, requester_pid, b"\x1b[A").await;
@@ -875,7 +657,7 @@ async fn copy_mode_modified_arrows_still_resolve_from_the_table() {
         let requester_pid = std::process::id();
 
         create_quiet_input_session(&handler, &alpha).await;
-        let _control_rx = attach(&handler, requester_pid, &alpha).await;
+        let _control_rx = handler.attach_client(requester_pid, &alpha).await;
         set_mode_keys(&handler, &alpha, "emacs").await;
         fill_transcript(&handler, &target).await;
 
@@ -887,7 +669,7 @@ async fn copy_mode_modified_arrows_still_resolve_from_the_table() {
             &["set-option", "-g", PROBE, &expected],
         )
         .await;
-        enter_copy_mode(&handler, &target).await;
+        handler.handle_ok(CopyModeRequest::fixture(&target)).await;
 
         type_live(&handler, requester_pid, sequence).await;
 
@@ -909,10 +691,10 @@ async fn copy_mode_default_modified_arrow_still_scrolls_a_half_page() {
     let requester_pid = std::process::id();
 
     create_quiet_input_session(&handler, &alpha).await;
-    let _control_rx = attach(&handler, requester_pid, &alpha).await;
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
     set_mode_keys(&handler, &alpha, "emacs").await;
     fill_transcript(&handler, &target).await;
-    enter_copy_mode(&handler, &target).await;
+    handler.handle_ok(CopyModeRequest::fixture(&target)).await;
 
     let before = scroll_position(&handler, &target).await;
     type_live(&handler, requester_pid, b"\x1b[1;3A").await;
@@ -933,11 +715,11 @@ async fn copy_mode_user_binding_replaces_the_default_motion() {
     let requester_pid = std::process::id();
 
     create_quiet_input_session(&handler, &alpha).await;
-    let _control_rx = attach(&handler, requester_pid, &alpha).await;
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
     set_mode_keys(&handler, &alpha, "emacs").await;
     fill_transcript(&handler, &target).await;
     bind(&handler, "copy-mode", "Down", &["send", "-X", "cursor-up"]).await;
-    enter_copy_mode(&handler, &target).await;
+    handler.handle_ok(CopyModeRequest::fixture(&target)).await;
 
     let before = copy_cursor_y(&handler, &target).await;
     assert!(before > 0, "the copy cursor needs room to move up");
@@ -962,7 +744,7 @@ async fn root_table_arrow_binding_still_resolves() {
     let requester_pid = std::process::id();
 
     create_send_keys_test_session(&handler, &alpha).await;
-    let _control_rx = attach(&handler, requester_pid, &alpha).await;
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
     bind(
         &handler,
         "root",
@@ -986,10 +768,10 @@ async fn copy_mode_default_q_still_cancels_through_the_table() {
     let requester_pid = std::process::id();
 
     create_quiet_input_session(&handler, &alpha).await;
-    let _control_rx = attach(&handler, requester_pid, &alpha).await;
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
     set_mode_keys(&handler, &alpha, "emacs").await;
     fill_transcript(&handler, &target).await;
-    enter_copy_mode(&handler, &target).await;
+    handler.handle_ok(CopyModeRequest::fixture(&target)).await;
 
     type_live(&handler, requester_pid, b"q").await;
 
@@ -1020,25 +802,9 @@ async fn in_copy_mode(handler: &RequestHandler, target: &PaneTarget) -> bool {
 /// Read `#{selection_present}`, which discriminates begin-selection from the
 /// page-down that tmux actually binds to emacs Space.
 async fn selection_present(handler: &RequestHandler, target: &PaneTarget) -> String {
-    let listed = handler
-        .handle(Request::ListPanes(Box::new(ListPanesRequest {
-            target: target.session_name().clone(),
-            format: Some("#{selection_present}".to_owned()),
-            filter: None,
-            sort_order: None,
-            reversed: false,
-            target_window_index: None,
-        })))
-        .await;
-    let output = listed
-        .command_output()
-        .expect("list-panes returns command output");
-    String::from_utf8_lossy(output.stdout())
-        .lines()
-        .next()
+    first_pane_row(handler, target, "#{selection_present}")
+        .await
         .expect("a pane row is rendered")
-        .trim()
-        .to_owned()
 }
 
 /// The keys `attached_copy_mode_input_action` answered before the tables.
@@ -1068,7 +834,7 @@ async fn copy_mode_key_binding_case(mode_keys: &str, table: &str, key: &str, seq
     let requester_pid = std::process::id();
 
     create_quiet_input_session(&handler, &alpha).await;
-    let _control_rx = attach(&handler, requester_pid, &alpha).await;
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
     set_mode_keys(&handler, &alpha, mode_keys).await;
     fill_transcript(&handler, &target).await;
 
@@ -1080,7 +846,7 @@ async fn copy_mode_key_binding_case(mode_keys: &str, table: &str, key: &str, seq
         &["set-option", "-g", PROBE, &expected],
     )
     .await;
-    enter_copy_mode(&handler, &target).await;
+    handler.handle_ok(CopyModeRequest::fixture(&target)).await;
 
     type_live(&handler, requester_pid, sequence).await;
 
@@ -1121,7 +887,7 @@ async fn copy_mode_escape_binding_wins_on_the_bare_escape_path() {
         let requester_pid = std::process::id();
 
         create_quiet_input_session(&handler, &alpha).await;
-        let _control_rx = attach(&handler, requester_pid, &alpha).await;
+        let _control_rx = handler.attach_client(requester_pid, &alpha).await;
         set_mode_keys(&handler, &alpha, mode_keys).await;
         fill_transcript(&handler, &target).await;
         bind(
@@ -1131,7 +897,7 @@ async fn copy_mode_escape_binding_wins_on_the_bare_escape_path() {
             &["set-option", "-g", PROBE, "HIT-Escape"],
         )
         .await;
-        enter_copy_mode(&handler, &target).await;
+        handler.handle_ok(CopyModeRequest::fixture(&target)).await;
 
         let mut pending_input = Vec::new();
         handler
@@ -1173,11 +939,11 @@ async fn copy_mode_unbound_shim_keys_stay_inert() {
         let requester_pid = std::process::id();
 
         create_quiet_input_session(&handler, &alpha).await;
-        let _control_rx = attach(&handler, requester_pid, &alpha).await;
+        let _control_rx = handler.attach_client(requester_pid, &alpha).await;
         set_mode_keys(&handler, &alpha, mode_keys).await;
         fill_transcript(&handler, &target).await;
         unbind(&handler, table, key).await;
-        enter_copy_mode(&handler, &target).await;
+        handler.handle_ok(CopyModeRequest::fixture(&target)).await;
         let before = copy_cursor_y(&handler, &target).await;
 
         type_live(&handler, requester_pid, sequence).await;
@@ -1211,10 +977,10 @@ async fn copy_mode_space_defaults_match_the_measured_tmux_tables() {
         let requester_pid = std::process::id();
 
         create_quiet_input_session(&handler, &alpha).await;
-        let _control_rx = attach(&handler, requester_pid, &alpha).await;
+        let _control_rx = handler.attach_client(requester_pid, &alpha).await;
         set_mode_keys(&handler, &alpha, mode_keys).await;
         fill_transcript(&handler, &target).await;
-        enter_copy_mode(&handler, &target).await;
+        handler.handle_ok(CopyModeRequest::fixture(&target)).await;
 
         type_live(&handler, requester_pid, b" ").await;
 
@@ -1236,10 +1002,10 @@ async fn copy_mode_emacs_c_space_begins_the_selection() {
     let requester_pid = std::process::id();
 
     create_quiet_input_session(&handler, &alpha).await;
-    let _control_rx = attach(&handler, requester_pid, &alpha).await;
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
     set_mode_keys(&handler, &alpha, "emacs").await;
     fill_transcript(&handler, &target).await;
-    enter_copy_mode(&handler, &target).await;
+    handler.handle_ok(CopyModeRequest::fixture(&target)).await;
 
     type_live(&handler, requester_pid, b"\x00").await;
 
@@ -1261,10 +1027,10 @@ async fn copy_mode_vi_escape_clears_the_selection_without_leaving_copy_mode() {
     let requester_pid = std::process::id();
 
     create_quiet_input_session(&handler, &alpha).await;
-    let _control_rx = attach(&handler, requester_pid, &alpha).await;
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
     set_mode_keys(&handler, &alpha, "vi").await;
     fill_transcript(&handler, &target).await;
-    enter_copy_mode(&handler, &target).await;
+    handler.handle_ok(CopyModeRequest::fixture(&target)).await;
 
     let mut pending_input = Vec::new();
     handler
@@ -1292,10 +1058,10 @@ async fn copy_mode_emacs_enter_is_unbound_like_tmux() {
     let requester_pid = std::process::id();
 
     create_quiet_input_session(&handler, &alpha).await;
-    let _control_rx = attach(&handler, requester_pid, &alpha).await;
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
     set_mode_keys(&handler, &alpha, "emacs").await;
     fill_transcript(&handler, &target).await;
-    enter_copy_mode(&handler, &target).await;
+    handler.handle_ok(CopyModeRequest::fixture(&target)).await;
     type_live(&handler, requester_pid, b"\x00").await;
     type_live(&handler, requester_pid, b"\x1b[C").await;
     assert_eq!(
@@ -1327,19 +1093,7 @@ async fn read_only_client_keys_reach_neither_the_table_nor_copy_mode() {
     let requester_pid = std::process::id();
 
     create_quiet_input_session(&handler, &alpha).await;
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
-    {
-        let mut active_attach = handler.active_attach.lock().await;
-        let active = active_attach
-            .by_pid
-            .get_mut(&requester_pid)
-            .expect("read-only attach is active");
-        active.can_write = false;
-        active.flags = active.flags.with_read_only();
-    }
+    let _control_rx = register_read_only_attach(&handler, requester_pid, &alpha).await;
     set_mode_keys(&handler, &alpha, "emacs").await;
     fill_transcript(&handler, &target).await;
     bind(
@@ -1349,7 +1103,7 @@ async fn read_only_client_keys_reach_neither_the_table_nor_copy_mode() {
         &["set-option", "-g", PROBE, "HIT-readonly"],
     )
     .await;
-    enter_copy_mode(&handler, &target).await;
+    handler.handle_ok(CopyModeRequest::fixture(&target)).await;
     let before = copy_cursor_y(&handler, &target).await;
 
     type_live(&handler, requester_pid, b"q").await;
@@ -1382,7 +1136,7 @@ async fn prefix_table_wins_over_copy_mode_for_keys_the_shim_ate() {
     let requester_pid = std::process::id();
 
     create_quiet_input_session(&handler, &alpha).await;
-    let _control_rx = attach(&handler, requester_pid, &alpha).await;
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
     set_mode_keys(&handler, &alpha, "emacs").await;
     fill_transcript(&handler, &target).await;
     bind(
@@ -1392,7 +1146,7 @@ async fn prefix_table_wins_over_copy_mode_for_keys_the_shim_ate() {
         &["set-option", "-g", PROBE, "HIT-prefix-q"],
     )
     .await;
-    enter_copy_mode(&handler, &target).await;
+    handler.handle_ok(CopyModeRequest::fixture(&target)).await;
 
     type_live(&handler, requester_pid, b"\x02").await;
     type_live(&handler, requester_pid, b"q").await;
@@ -1437,10 +1191,10 @@ async fn copy_mode_default_ss3_arrows_still_move_the_copy_cursor() {
     let requester_pid = std::process::id();
 
     create_quiet_input_session(&handler, &alpha).await;
-    let _control_rx = attach(&handler, requester_pid, &alpha).await;
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
     set_mode_keys(&handler, &alpha, "emacs").await;
     fill_transcript(&handler, &target).await;
-    enter_copy_mode(&handler, &target).await;
+    handler.handle_ok(CopyModeRequest::fixture(&target)).await;
 
     let before = copy_cursor_y(&handler, &target).await;
     assert!(before > 0, "the copy cursor needs room to move up");
@@ -1472,25 +1226,17 @@ async fn detached_send_keys_x_ignores_the_key_tables() {
         &["set-option", "-g", PROBE, "HIT-Up"],
     )
     .await;
-    enter_copy_mode(&handler, &target).await;
+    handler.handle_ok(CopyModeRequest::fixture(&target)).await;
 
     let before = copy_cursor_y(&handler, &target).await;
     assert!(before > 0, "the copy cursor needs room to move up");
-    let response = handler
-        .handle(Request::SendKeysExt(SendKeysExtRequest {
-            target: Some(target.clone()),
-            keys: vec!["cursor-up".to_owned()],
-            expand_formats: false,
-            hex: false,
-            literal: false,
+    handler
+        .handle_ok(SendKeysExtRequest {
             dispatch_key_table: false,
             copy_mode_command: true,
-            forward_mouse_event: false,
-            reset_terminal: false,
-            repeat_count: None,
-        }))
+            ..Fixture::fixture((&target, ["cursor-up"]))
+        })
         .await;
-    assert!(matches!(response, Response::SendKeys(_)), "{response:?}");
 
     assert_eq!(
         copy_cursor_y(&handler, &target).await,
@@ -1504,31 +1250,6 @@ async fn detached_send_keys_x_ignores_the_key_tables() {
     );
 }
 
-/// Read `#{pane_mode}` for the first pane of the session.
-async fn pane_mode(handler: &RequestHandler, target: &PaneTarget) -> String {
-    let listed = handler
-        .handle(Request::ListPanes(Box::new(ListPanesRequest {
-            target: target.session_name().clone(),
-            format: Some("#{pane_mode}".to_owned()),
-            filter: None,
-            sort_order: None,
-            reversed: false,
-            target_window_index: None,
-        })))
-        .await;
-    let output = listed
-        .command_output()
-        .expect("list-panes returns command output");
-    // An out-of-mode pane renders an empty `#{pane_mode}`, so an absent row and
-    // an empty row mean the same thing here.
-    String::from_utf8_lossy(output.stdout())
-        .lines()
-        .next()
-        .unwrap_or_default()
-        .trim()
-        .to_owned()
-}
-
 #[tokio::test]
 async fn mode_tree_overlay_still_wins_over_the_copy_mode_table() {
     // The mode-tree branch sits ahead of the pane-target lookup in
@@ -1540,7 +1261,7 @@ async fn mode_tree_overlay_still_wins_over_the_copy_mode_table() {
     let requester_pid = std::process::id();
 
     create_quiet_input_session(&handler, &alpha).await;
-    let _control_rx = attach(&handler, requester_pid, &alpha).await;
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
     bind(
         &handler,
         "copy-mode",

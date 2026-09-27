@@ -5,15 +5,7 @@ async fn send_prefix_reports_the_configured_prefix_key() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
 
-    let created = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name: alpha.clone(),
-            detached: true,
-            size: Some(TerminalSize { cols: 80, rows: 24 }),
-            environment: None,
-        }))
-        .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    handler.create_session(&alpha).await;
 
     let response = handler
         .handle(Request::SendPrefix(SendPrefixRequest {
@@ -33,11 +25,10 @@ async fn bind_key_without_a_command_requires_an_existing_binding() {
 
     let response = handler
         .handle(Request::BindKey(Box::new(BindKeyRequest {
-            table_name: "root".to_owned(),
-            key: "User1000".to_owned(),
             note: Some("missing".to_owned()),
             repeat: true,
             command: None,
+            ..Fixture::fixture(("root", "User1000", std::iter::empty::<&str>()))
         })))
         .await;
 
@@ -48,28 +39,19 @@ async fn bind_key_without_a_command_requires_an_existing_binding() {
 async fn bind_key_without_a_command_updates_note_and_repeat_in_place() {
     let handler = RequestHandler::new();
 
-    let response = handler
-        .handle(Request::BindKey(Box::new(BindKeyRequest {
-            table_name: "prefix".to_owned(),
-            key: "C-b".to_owned(),
+    handler
+        .handle_ok(BindKeyRequest {
             note: Some("updated note".to_owned()),
             repeat: true,
             command: None,
-        })))
+            ..Fixture::fixture(("prefix", "C-b", std::iter::empty::<&str>()))
+        })
         .await;
-    assert!(matches!(response, Response::BindKey(_)));
 
     let listed = handler
         .handle(Request::ListKeys(Box::new(ListKeysRequest {
-            table_name: Some("prefix".to_owned()),
-            first_only: false,
-            notes: false,
-            include_unnoted: true,
-            reversed: false,
             format: Some("#{key_note}|#{key_repeat}|#{key_command}".to_owned()),
-            sort_order: None,
-            prefix: None,
-            key: None,
+            ..list_keys_request(Some("prefix"))
         })))
         .await;
     let Response::ListKeys(response) = listed else {
@@ -88,47 +70,28 @@ async fn bind_key_without_a_command_updates_note_and_repeat_in_place() {
 async fn list_keys_notes_render_effective_prefix_column() {
     let handler = RequestHandler::new();
 
-    let response = handler
-        .handle(Request::SetOption(SetOptionRequest {
-            scope: ScopeSelector::Global,
-            option: OptionName::Prefix,
-            value: "C-a".to_owned(),
-            mode: SetOptionMode::Replace,
-        }))
+    handler
+        .set_option(ScopeSelector::Global, OptionName::Prefix, "C-a")
         .await;
-    assert!(matches!(response, Response::SetOption(_)));
 
     for request in [
         BindKeyRequest {
-            table_name: "prefix".to_owned(),
-            key: "X".to_owned(),
             note: Some("note text".to_owned()),
-            repeat: false,
-            command: Some(vec!["display-message".to_owned(), "hi".to_owned()]),
+            ..Fixture::fixture(("prefix", "X", ["display-message", "hi"]))
         },
         BindKeyRequest {
-            table_name: "root".to_owned(),
-            key: "F12".to_owned(),
             note: Some("root note".to_owned()),
-            repeat: false,
-            command: Some(vec!["display-message".to_owned(), "root".to_owned()]),
+            ..Fixture::fixture(("root", "F12", ["display-message", "root"]))
         },
     ] {
-        let response = handler.handle(Request::BindKey(Box::new(request))).await;
-        assert!(matches!(response, Response::BindKey(_)));
+        handler.handle_ok(request).await;
     }
 
     let listed = handler
         .handle(Request::ListKeys(Box::new(ListKeysRequest {
-            table_name: None,
-            first_only: false,
             notes: true,
             include_unnoted: false,
-            reversed: false,
-            format: None,
-            sort_order: None,
-            prefix: None,
-            key: None,
+            ..list_keys_request(None)
         })))
         .await;
     let Response::ListKeys(response) = listed else {
@@ -140,15 +103,10 @@ async fn list_keys_notes_render_effective_prefix_column() {
 
     let listed = handler
         .handle(Request::ListKeys(Box::new(ListKeysRequest {
-            table_name: None,
-            first_only: false,
             notes: true,
             include_unnoted: false,
-            reversed: false,
-            format: None,
-            sort_order: None,
             prefix: Some("PFX".to_owned()),
-            key: None,
+            ..list_keys_request(None)
         })))
         .await;
     let Response::ListKeys(response) = listed else {
@@ -165,15 +123,8 @@ async fn list_keys_single_key_filter_is_silent_for_explicit_table() {
 
     let listed = handler
         .handle(Request::ListKeys(Box::new(ListKeysRequest {
-            table_name: Some("prefix".to_owned()),
-            first_only: false,
-            notes: false,
-            include_unnoted: true,
-            reversed: false,
-            format: None,
-            sort_order: None,
-            prefix: None,
             key: Some("C-b".to_owned()),
+            ..list_keys_request(Some("prefix"))
         })))
         .await;
     let Response::ListKeys(response) = listed else {
@@ -191,15 +142,8 @@ async fn list_keys_single_key_filter_matches_valid_key_across_tables() {
 
     let listed = handler
         .handle(Request::ListKeys(Box::new(ListKeysRequest {
-            table_name: None,
-            first_only: false,
-            notes: false,
-            include_unnoted: true,
-            reversed: false,
-            format: None,
-            sort_order: None,
-            prefix: None,
             key: Some("C-b".to_owned()),
+            ..list_keys_request(None)
         })))
         .await;
     let Response::ListKeys(response) = listed else {
@@ -228,15 +172,8 @@ async fn list_keys_single_key_filter_errors_when_key_syntax_is_invalid() {
 
     let listed = handler
         .handle(Request::ListKeys(Box::new(ListKeysRequest {
-            table_name: Some("prefix".to_owned()),
-            first_only: false,
-            notes: false,
-            include_unnoted: true,
-            reversed: false,
-            format: None,
-            sort_order: None,
-            prefix: None,
             key: Some("NotAKey".to_owned()),
+            ..list_keys_request(Some("prefix"))
         })))
         .await;
 
@@ -254,15 +191,8 @@ async fn list_keys_rejects_unknown_sort_orders() {
 
     let response = handler
         .handle(Request::ListKeys(Box::new(ListKeysRequest {
-            table_name: None,
-            first_only: false,
-            notes: false,
-            include_unnoted: true,
-            reversed: false,
-            format: None,
             sort_order: Some("bogus".to_owned()),
-            prefix: None,
-            key: None,
+            ..list_keys_request(None)
         })))
         .await;
 
@@ -275,61 +205,30 @@ async fn repeating_non_repeat_lookup_restarts_in_the_default_table() {
     let alpha = session_name("alpha");
     let requester_pid = std::process::id();
 
-    let created = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name: alpha.clone(),
-            detached: true,
-            size: Some(TerminalSize { cols: 80, rows: 24 }),
-            environment: None,
-        }))
-        .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    handler.create_session(&alpha).await;
 
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
 
     for request in [
         BindKeyRequest {
-            table_name: "root".to_owned(),
-            key: "x".to_owned(),
             note: Some("root".to_owned()),
-            repeat: false,
-            command: Some(vec![
-                "set-buffer".to_owned(),
-                "-b".to_owned(),
-                "dispatch-source".to_owned(),
-                "root".to_owned(),
-            ]),
+            ..Fixture::fixture(("root", "x", ["set-buffer", "-b", "dispatch-source", "root"]))
         },
         BindKeyRequest {
-            table_name: "my-table".to_owned(),
-            key: "r".to_owned(),
             note: Some("repeat".to_owned()),
             repeat: true,
-            command: Some(vec![
-                "set-buffer".to_owned(),
-                "-b".to_owned(),
-                "repeat-hit".to_owned(),
-                "yes".to_owned(),
-            ]),
+            ..Fixture::fixture(("my-table", "r", ["set-buffer", "-b", "repeat-hit", "yes"]))
         },
         BindKeyRequest {
-            table_name: "my-table".to_owned(),
-            key: "x".to_owned(),
             note: Some("custom".to_owned()),
-            repeat: false,
-            command: Some(vec![
-                "set-buffer".to_owned(),
-                "-b".to_owned(),
-                "dispatch-source".to_owned(),
-                "custom".to_owned(),
-            ]),
+            ..Fixture::fixture((
+                "my-table",
+                "x",
+                ["set-buffer", "-b", "dispatch-source", "custom"],
+            ))
         },
     ] {
-        let response = handler.handle(Request::BindKey(Box::new(request))).await;
-        assert!(matches!(response, Response::BindKey(_)));
+        handler.handle_ok(request).await;
     }
 
     let switched = handler
@@ -341,18 +240,10 @@ async fn repeating_non_repeat_lookup_restarts_in_the_default_table() {
     assert!(matches!(switched, Response::SwitchClient(_)));
 
     let dispatched = handler
-        .handle(Request::SendKeysExt(SendKeysExtRequest {
-            target: Some(PaneTarget::new(alpha, 0)),
-            keys: vec!["r".to_owned(), "x".to_owned()],
-            expand_formats: false,
-            hex: false,
-            literal: false,
-            dispatch_key_table: true,
-            copy_mode_command: false,
-            forward_mouse_event: false,
-            reset_terminal: false,
-            repeat_count: None,
-        }))
+        .handle(Request::SendKeysExt(SendKeysExtRequest::fixture((
+            PaneTarget::new(alpha, 0),
+            ["r", "x"],
+        ))))
         .await;
     assert_eq!(
         dispatched,
@@ -376,58 +267,29 @@ async fn prefix_timeout_clears_the_prefix_table_without_waiting_for_the_next_key
     let alpha = session_name("alpha");
     let requester_pid = std::process::id();
 
-    let created = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name: alpha.clone(),
-            detached: true,
-            size: Some(TerminalSize { cols: 80, rows: 24 }),
-            environment: None,
-        }))
-        .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    handler.create_session(&alpha).await;
 
-    let configured = handler
-        .handle(Request::SetOption(SetOptionRequest {
-            scope: ScopeSelector::Global,
-            option: OptionName::PrefixTimeout,
-            value: "25".to_owned(),
-            mode: SetOptionMode::Replace,
-        }))
+    handler
+        .set_option(ScopeSelector::Global, OptionName::PrefixTimeout, "25")
         .await;
-    assert!(matches!(configured, Response::SetOption(_)));
 
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
 
     let dispatched = handler
-        .handle(Request::SendKeysExt(SendKeysExtRequest {
-            target: Some(PaneTarget::new(alpha, 0)),
-            keys: vec!["C-b".to_owned()],
-            expand_formats: false,
-            hex: false,
-            literal: false,
-            dispatch_key_table: true,
-            copy_mode_command: false,
-            forward_mouse_event: false,
-            reset_terminal: false,
-            repeat_count: None,
-        }))
+        .handle(Request::SendKeysExt(SendKeysExtRequest::fixture((
+            PaneTarget::new(alpha, 0),
+            ["C-b"],
+        ))))
         .await;
     assert_eq!(
         dispatched,
         Response::SendKeys(SendKeysResponse { key_count: 1 })
     );
 
-    {
-        let active_attach = handler.active_attach.lock().await;
-        let active = active_attach
-            .by_pid
-            .get(&requester_pid)
-            .expect("attached client should remain registered");
-        assert_eq!(active.key_table_name.as_deref(), Some("prefix"));
-    }
+    assert_eq!(
+        client_key_table(&handler, requester_pid).await.as_deref(),
+        Some("prefix")
+    );
 
     sleep(Duration::from_millis(100)).await;
 
@@ -448,46 +310,25 @@ async fn repeat_timeout_clears_custom_key_tables_without_waiting_for_the_next_ke
     let alpha = session_name("alpha");
     let requester_pid = std::process::id();
 
-    let created = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name: alpha.clone(),
-            detached: true,
-            size: Some(TerminalSize { cols: 80, rows: 24 }),
-            environment: None,
-        }))
-        .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    handler.create_session(&alpha).await;
 
-    let configured = handler
-        .handle(Request::SetOption(SetOptionRequest {
-            scope: ScopeSelector::Session(alpha.clone()),
-            option: OptionName::RepeatTime,
-            value: "25".to_owned(),
-            mode: SetOptionMode::Replace,
-        }))
-        .await;
-    assert!(matches!(configured, Response::SetOption(_)));
-
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
+    handler
+        .set_option(
+            ScopeSelector::Session(alpha.clone()),
+            OptionName::RepeatTime,
+            "25",
+        )
         .await;
 
-    let bound = handler
-        .handle(Request::BindKey(Box::new(BindKeyRequest {
-            table_name: "my-table".to_owned(),
-            key: "r".to_owned(),
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
+
+    handler
+        .handle_ok(BindKeyRequest {
             note: Some("repeat".to_owned()),
             repeat: true,
-            command: Some(vec![
-                "set-buffer".to_owned(),
-                "-b".to_owned(),
-                "repeat-hit".to_owned(),
-                "yes".to_owned(),
-            ]),
-        })))
+            ..Fixture::fixture(("my-table", "r", ["set-buffer", "-b", "repeat-hit", "yes"]))
+        })
         .await;
-    assert!(matches!(bound, Response::BindKey(_)));
 
     let switched = handler
         .handle(Request::SwitchClientExt(SwitchClientExtRequest {
@@ -498,18 +339,10 @@ async fn repeat_timeout_clears_custom_key_tables_without_waiting_for_the_next_ke
     assert!(matches!(switched, Response::SwitchClient(_)));
 
     let dispatched = handler
-        .handle(Request::SendKeysExt(SendKeysExtRequest {
-            target: Some(PaneTarget::new(alpha, 0)),
-            keys: vec!["r".to_owned()],
-            expand_formats: false,
-            hex: false,
-            literal: false,
-            dispatch_key_table: true,
-            copy_mode_command: false,
-            forward_mouse_event: false,
-            reset_terminal: false,
-            repeat_count: None,
-        }))
+        .handle(Request::SendKeysExt(SendKeysExtRequest::fixture((
+            PaneTarget::new(alpha, 0),
+            ["r"],
+        ))))
         .await;
     assert_eq!(
         dispatched,
@@ -558,31 +391,19 @@ async fn unbind_key_all_removes_active_bindings_without_dropping_default_tables(
     ));
 
     let listed = handler
-        .handle(Request::ListKeys(Box::new(ListKeysRequest {
-            table_name: Some("prefix".to_owned()),
-            first_only: false,
-            notes: false,
-            include_unnoted: true,
-            reversed: false,
-            format: None,
-            sort_order: None,
-            prefix: None,
-            key: None,
-        })))
+        .handle(Request::ListKeys(Box::new(list_keys_request(Some(
+            "prefix",
+        )))))
         .await;
     let Response::ListKeys(response) = listed else {
         panic!("expected list-keys response");
     };
     assert_eq!(response.match_count, 0);
 
-    let rebound = handler
-        .handle(Request::BindKey(Box::new(BindKeyRequest {
-            table_name: "prefix".to_owned(),
-            key: "User1000".to_owned(),
+    handler
+        .handle_ok(BindKeyRequest {
             note: Some("user".to_owned()),
-            repeat: false,
-            command: Some(vec!["send-prefix".to_owned()]),
-        })))
+            ..Fixture::fixture(("prefix", "User1000", ["send-prefix"]))
+        })
         .await;
-    assert!(matches!(rebound, Response::BindKey(_)));
 }

@@ -6,9 +6,10 @@ use serde_json::{Value, json};
 use crate::cli_args::{PaneSnapshotArgs, SnapshotRegion};
 
 use super::super::ExitFailure;
+use super::super::target_resolution::connect_cli;
 use super::common::{
-    SCHEMA_VERSION, check_disabled, connect_cli, pane_snapshot, resolve_pane_ref,
-    visible_line_from_cells, write_json, write_stdout_line,
+    SCHEMA_VERSION, check_disabled, pane_snapshot, resolve_pane_ref, visible_line_from_cells,
+    write_json_line, write_stdout_line,
 };
 
 /// Runs `pane-snapshot`, printing the requested region as text or as a JSON grid.
@@ -22,7 +23,7 @@ pub(crate) fn run_pane_snapshot(
     let snapshot = pane_snapshot(&mut connection, target)?;
     let view = SnapshotView::new(&snapshot, args.region)?;
     if args.json {
-        return write_json(&snapshot_json(&snapshot, &view, args.style));
+        return write_json_line(&snapshot_json(&snapshot, &view, args.style));
     }
     write_stdout_line(&view.lines.join("\n"))
 }
@@ -155,82 +156,31 @@ fn snapshot_json(
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 mod tests {
-    use rmux_proto::{PaneSnapshotCell, PaneSnapshotCursor, PaneSnapshotResponse};
-
     use crate::cli_args::SnapshotRegion;
 
+    use super::super::common::fixtures::wide_glyph_snapshot;
     use super::SnapshotView;
 
-    fn cell(text: &str, width: u8, padding: bool) -> PaneSnapshotCell {
-        PaneSnapshotCell {
-            text: text.to_owned(),
-            width,
-            padding,
-            attributes: 0,
-            fg: 0,
-            bg: 0,
-            us: 0,
-            link: 0,
-        }
-    }
-
-    fn snapshot() -> PaneSnapshotResponse {
-        PaneSnapshotResponse {
-            cols: 4,
-            rows: 1,
-            cells: vec![
-                cell("A", 1, false),
-                cell("界", 2, false),
-                cell(" ", 0, true),
-                cell("B", 1, false),
-            ],
-            cursor: PaneSnapshotCursor {
-                row: 0,
-                col: 0,
-                visible: false,
-                style: 0,
-            },
-            revision: 1,
-        }
-    }
-
     #[test]
-    fn region_text_uses_terminal_cell_columns_not_character_offsets() {
-        let snapshot = snapshot();
-        let view = SnapshotView::new(
-            &snapshot,
-            Some(SnapshotRegion {
+    fn region_text_uses_terminal_cell_columns_without_leaking_wide_glyphs() {
+        // A region starting on the wide glyph's padding cell must not leak the glyph itself.
+        for (col, cols, expected) in [(1, 3, "界B"), (2, 2, "B")] {
+            let snapshot = wide_glyph_snapshot();
+            let region = SnapshotRegion {
                 row: 0,
-                col: 1,
+                col,
                 rows: 1,
-                cols: 3,
-            }),
-        )
-        .expect("region is valid");
+                cols,
+            };
+            let view = SnapshotView::new(&snapshot, Some(region)).expect("region is valid");
 
-        assert_eq!(view.lines, vec!["界B"]);
-    }
-
-    #[test]
-    fn region_starting_on_wide_padding_does_not_leak_owner_glyph() {
-        let snapshot = snapshot();
-        let view = SnapshotView::new(
-            &snapshot,
-            Some(SnapshotRegion {
-                row: 0,
-                col: 2,
-                rows: 1,
-                cols: 2,
-            }),
-        )
-        .expect("region is valid");
-
-        assert_eq!(view.lines, vec!["B"]);
+            assert_eq!(view.lines, vec![expected], "region at column {col}");
+        }
     }
 
     #[test]
     fn incomplete_snapshot_grid_is_rejected_before_slicing() {
-        let mut snapshot = snapshot();
+        let mut snapshot = wide_glyph_snapshot();
         snapshot.cells.pop();
 
         let Err(error) = SnapshotView::new(&snapshot, None) else {

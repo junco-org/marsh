@@ -9,8 +9,8 @@ use rmux_core::{OptionStore, PaneGeometry, TerminalPassthrough};
 use rmux_proto::{
     encode_attach_message, AttachFrameDecoder, AttachMessage, AttachShellCommand,
     AttachedKeystroke, BindKeyRequest, DisplayMessageExtRequest, KeyDispatched, KillSessionRequest,
-    NewSessionRequest, OptionName, PaneTarget, Request, Response, ScopeSelector, SessionName,
-    SetOptionMode, Target, TerminalSize, WaitForMode, WaitForRequest, DEFAULT_MAX_FRAME_LENGTH,
+    OptionName, PaneTarget, ScopeSelector, SessionName, SetOptionMode, Target, TerminalSize,
+    WaitForMode, WaitForRequest, DEFAULT_MAX_FRAME_LENGTH,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, watch};
@@ -39,8 +39,217 @@ use crate::daemon::ShutdownHandle;
 use crate::handler::RequestHandler;
 use crate::outer_terminal::{OuterTerminal, OuterTerminalContext};
 use crate::renderer::PaneRenderDeltaFrame;
+use crate::test_fixtures::Fixture;
+use crate::test_names::session_name;
 
 mod persistent_overlay;
+
+/// A spawned `forward_attach` whose client end the test drives through `peer`.
+struct AttachForwarder {
+    peer: tokio::net::UnixStream,
+    shutdown: watch::Sender<()>,
+    closing: Arc<AtomicBool>,
+    persistent_overlay_epoch: Arc<AtomicU64>,
+    task: tokio::task::JoinHandle<std::io::Result<()>>,
+}
+
+impl AttachForwarder {
+    /// Forwards `target` over a fresh socket pair, reading its attach controls from `control_rx`.
+    fn spawn(
+        target: AttachTarget,
+        control_rx: mpsc::UnboundedReceiver<AttachControl>,
+        closing: Arc<AtomicBool>,
+        live_input: LiveAttachInputContext,
+        render_stream: bool,
+    ) -> Self {
+        let (stream, peer) = tokio::net::UnixStream::pair().expect("attach stream pair");
+        let (shutdown, shutdown_rx) = watch::channel(());
+        let persistent_overlay_epoch = Arc::new(AtomicU64::new(0));
+        let task = tokio::spawn(forward_attach(
+            stream,
+            target,
+            Vec::new(),
+            shutdown_rx,
+            control_rx,
+            Arc::new(AtomicUsize::new(0)),
+            Arc::clone(&closing),
+            Arc::clone(&persistent_overlay_epoch),
+            live_input,
+            render_stream,
+        ));
+        Self {
+            peer,
+            shutdown,
+            closing,
+            persistent_overlay_epoch,
+            task,
+        }
+    }
+
+    /// Forwards `target` for a client no handler has registered, and answers with the sender of
+    /// its attach controls.
+    fn unregistered(target: AttachTarget) -> (Self, mpsc::UnboundedSender<AttachControl>) {
+        let (control_tx, control_rx) = mpsc::unbounded_channel();
+        let live_input = LiveAttachInputContext::unregistered_for_test(
+            Arc::new(RequestHandler::new()),
+            std::process::id(),
+        );
+        let forwarder = Self::spawn(target, control_rx, Arc::default(), live_input, false);
+        (forwarder, control_tx)
+    }
+
+    /// Reads the initial repaint and asserts it renders `base`.
+    async fn assert_initial_render(&mut self, base: &str) {
+        let initial = read_attach_data_until(&mut self.peer, base.as_bytes()).await;
+        assert!(
+            String::from_utf8_lossy(&initial).contains(base),
+            "initial attach should render the base pane"
+        );
+    }
+
+    /// Requests shutdown and answers with how the forwarder exited.
+    async fn stop(self) -> std::io::Result<()> {
+        self.shutdown.send(()).expect("request attach shutdown");
+        self.task.await.expect("attach task join")
+    }
+
+    /// Requests shutdown and asserts the forwarder exits cleanly.
+    async fn assert_stops_healthy(self) {
+        let result = self.stop().await;
+        assert!(
+            result.is_ok(),
+            "forward_attach should stay healthy: {result:?}"
+        );
+    }
+}
+
+/// The socket-loop state `process_socket_messages` carries from one read to the next.
+struct SocketInput {
+    live_input: LiveAttachInputContext,
+    stream: AttachTransport,
+    decoder: AttachFrameDecoder,
+    pending_input: Vec<u8>,
+    pending_escape_flush: PendingEscapeFlush,
+    active_emit_cache: Option<(u64, rmux_proto::WindowTarget)>,
+    locked: bool,
+}
+
+impl SocketInput {
+    /// Input from `live_input` over a fresh socket pair; answers with the client end too.
+    fn new(live_input: LiveAttachInputContext, locked: bool) -> (Self, tokio::net::UnixStream) {
+        let (stream, peer) = tokio::net::UnixStream::pair().expect("attach stream pair");
+        let input = Self {
+            live_input,
+            stream: AttachTransport::from(stream),
+            decoder: AttachFrameDecoder::new(),
+            pending_input: Vec::new(),
+            pending_escape_flush: PendingEscapeFlush::default(),
+            active_emit_cache: None,
+            locked,
+        };
+        (input, peer)
+    }
+
+    /// Queues `message` as if the client had written it.
+    fn push(&mut self, message: &AttachMessage, label: &str) {
+        self.decoder
+            .push_bytes(&encode_attach_message(message).expect(label));
+    }
+
+    /// Runs the socket loop over the queued frames.
+    async fn process(
+        &mut self,
+        current_target: Option<&mut super::types::OpenAttachTarget>,
+    ) -> std::io::Result<bool> {
+        process_socket_messages(
+            &mut self.decoder,
+            &self.stream,
+            &self.live_input,
+            current_target,
+            PendingAttachInputState::new(&mut self.pending_input, &mut self.pending_escape_flush),
+            &mut self.active_emit_cache,
+            &mut self.locked,
+        )
+        .await
+    }
+
+    /// Re-arms the retained-input deadline for `escape_time` and answers with it.
+    fn sync_escape_time(&mut self, escape_time: Duration) -> Option<Instant> {
+        sync_pending_escape_flush_with_escape_time(
+            &mut self.pending_escape_flush,
+            &self.pending_input,
+            escape_time,
+        );
+        self.pending_escape_flush.deadline()
+    }
+}
+
+/// The attach-loop state `apply_pending_attach_controls` mutates, over a fresh socket pair.
+struct PendingControls {
+    stream: AttachTransport,
+    peer: tokio::net::UnixStream,
+    control_tx: mpsc::UnboundedSender<AttachControl>,
+    control_rx: mpsc::UnboundedReceiver<AttachControl>,
+    control_backlog: AtomicUsize,
+    deferred: VecDeque<AttachControl>,
+    target: super::types::OpenAttachTarget,
+    render_generation: u64,
+    overlay_generation: u64,
+    persistent_overlay: Option<Vec<u8>>,
+    persistent_overlay_visible: bool,
+    persistent_overlay_state_id: Option<u64>,
+    locked: bool,
+}
+
+impl PendingControls {
+    /// Controls for `target`, opened without a render stream.
+    fn new(target: AttachTarget) -> Self {
+        Self::opened(open_attach_target(target, false).expect("open target"))
+    }
+
+    /// Controls for the already opened `target`.
+    fn opened(target: super::types::OpenAttachTarget) -> Self {
+        let (stream, peer) = tokio::net::UnixStream::pair().expect("attach stream pair");
+        let (control_tx, control_rx) = mpsc::unbounded_channel();
+        Self {
+            stream: AttachTransport::from(stream),
+            peer,
+            control_tx,
+            control_rx,
+            control_backlog: AtomicUsize::new(0),
+            deferred: VecDeque::new(),
+            persistent_overlay_state_id: target.persistent_overlay_state_id,
+            target,
+            render_generation: 0,
+            overlay_generation: 0,
+            persistent_overlay: None,
+            persistent_overlay_visible: false,
+            locked: false,
+        }
+    }
+
+    /// Applies the queued controls and answers with what the attach loop does next.
+    async fn apply(
+        &mut self,
+        pending_input: Option<PendingAttachInputState<'_>>,
+    ) -> std::io::Result<PendingAttachAction> {
+        apply_pending_attach_controls(
+            &mut self.deferred,
+            Some(&mut self.control_rx),
+            &self.control_backlog,
+            &mut self.target,
+            &self.stream,
+            &mut self.render_generation,
+            &mut self.overlay_generation,
+            &mut self.persistent_overlay,
+            &mut self.persistent_overlay_visible,
+            &mut self.persistent_overlay_state_id,
+            &mut self.locked,
+            pending_input,
+        )
+        .await
+    }
+}
 
 async fn dispatch_live_attach_data_for_test(
     live_input: LiveAttachInputContext,
@@ -53,45 +262,19 @@ async fn dispatch_live_attach_message_for_test(
     live_input: LiveAttachInputContext,
     message: AttachMessage,
 ) -> std::io::Result<bool> {
-    let (stream, _peer) = tokio::net::UnixStream::pair().expect("attach stream pair");
-    let stream = AttachTransport::from(stream);
-    let mut decoder = AttachFrameDecoder::new();
-    decoder.push_bytes(&encode_attach_message(&message).expect("encode attach input"));
-    let mut pending_input = Vec::new();
-    let mut pending_escape_flush = PendingEscapeFlush::default();
-    let mut active_emit_cache = None;
-    let mut locked = false;
-    process_socket_messages(
-        &mut decoder,
-        &stream,
-        &live_input,
-        None,
-        PendingAttachInputState::new(&mut pending_input, &mut pending_escape_flush),
-        &mut active_emit_cache,
-        &mut locked,
-    )
-    .await
+    let (mut input, _peer) = SocketInput::new(live_input, false);
+    input.push(&message, "encode attach input");
+    input.process(None).await
 }
 
 #[tokio::test]
 async fn forward_attach_resize_during_command_prompt_keeps_exact_identity_alive() {
     let handler = Arc::new(RequestHandler::new());
     let attach_pid = std::process::id();
-    let session_name =
-        SessionName::new("resize-command-prompt-identity").expect("valid session name");
-    let created = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name: session_name.clone(),
-            detached: true,
-            size: Some(TerminalSize { cols: 80, rows: 24 }),
-            environment: None,
-        }))
+    let session_name = handler
+        .create_session("resize-command-prompt-identity")
         .await;
-    assert!(matches!(created, Response::NewSession(_)), "{created:?}");
-    let (control_tx, control_rx) = mpsc::unbounded_channel();
-    handler
-        .register_attach(attach_pid, session_name.clone(), control_tx)
-        .await;
+    let control_rx = handler.attach_client(attach_pid, &session_name).await;
     let identity = handler.active_attach_identity_for_test(attach_pid).await;
 
     let prompt = CommandParser::new()
@@ -102,21 +285,15 @@ async fn forward_attach_resize_during_command_prompt_keeps_exact_identity_alive(
         .await
         .expect("background prompt starts");
 
-    let (shutdown_tx, shutdown_rx) = watch::channel(());
-    let (stream, mut peer) = tokio::net::UnixStream::pair().expect("attach stream pair");
-    let attach_task = tokio::spawn(forward_attach(
-        stream,
+    let mut attach = AttachForwarder::spawn(
         test_attach_target(&session_name, b"BASE", None),
-        Vec::new(),
-        shutdown_rx,
         control_rx,
-        Arc::new(AtomicUsize::new(0)),
-        Arc::new(AtomicBool::new(false)),
-        Arc::new(AtomicU64::new(0)),
+        Arc::default(),
         LiveAttachInputContext::new(Arc::clone(&handler), identity),
         false,
-    ));
-    let _ = read_attach_data_until(&mut peer, b"BASE").await;
+    );
+    let peer = &mut attach.peer;
+    let _ = read_attach_data_until(peer, b"BASE").await;
 
     peer.write_all(
         &encode_attach_message(&AttachMessage::Resize(TerminalSize {
@@ -161,25 +338,11 @@ async fn forward_attach_resize_during_command_prompt_keeps_exact_identity_alive(
         "resize must preserve the exact attach identity"
     );
 
-    shutdown_tx.send(()).expect("request attach shutdown");
-    attach_task
-        .await
-        .expect("attach task join")
-        .expect("attach exits cleanly");
+    attach.stop().await.expect("attach exits cleanly");
 }
 
 async fn create_attach_input_test_session(handler: &RequestHandler, name: &str) -> PaneTarget {
-    let session_name = SessionName::new(name).expect("valid session name");
-    let target = PaneTarget::with_window(session_name.clone(), 0, 0);
-    let created = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name,
-            detached: true,
-            size: Some(TerminalSize { cols: 80, rows: 24 }),
-            environment: None,
-        }))
-        .await;
-    assert!(matches!(created, Response::NewSession(_)), "{created:?}");
+    let target = PaneTarget::with_window(handler.create_session(name).await, 0, 0);
     handler.start_attached_input_capture_for_test(&target).await;
     target
 }
@@ -195,9 +358,8 @@ async fn same_pid_replacement_publishes_while_validated_old_input_is_paused() {
     let handler = Arc::new(RequestHandler::new());
     let alpha = create_attach_input_test_session(&handler, "identity-order-alpha").await;
     let beta = create_attach_input_test_session(&handler, "identity-order-beta").await;
-    let (alpha_control_tx, mut alpha_control_rx) = mpsc::unbounded_channel();
-    handler
-        .register_attach(attach_pid, alpha.session_name().clone(), alpha_control_tx)
+    let mut alpha_control_rx = handler
+        .attach_client(attach_pid, alpha.session_name())
         .await;
     let alpha_input =
         LiveAttachInputContext::current_for_test(Arc::clone(&handler), attach_pid).await;
@@ -229,44 +391,36 @@ async fn same_pid_replacement_publishes_while_validated_old_input_is_paused() {
         input_task.await.expect("input task join").is_err(),
         "A input must fail closed after B publishes"
     );
-    assert_eq!(
-        handler.attached_input_capture_for_test(&alpha).await,
-        Some(Vec::new())
-    );
-    assert_eq!(
-        handler.attached_input_capture_for_test(&beta).await,
-        Some(Vec::new())
-    );
+    for pane in [&alpha, &beta] {
+        assert_eq!(
+            handler.attached_input_capture_for_test(pane).await,
+            Some(Vec::new())
+        );
+    }
 
     // B already owns the PID before A's next frame reaches the socket loop.
     // The early stale check must reject it too.
     let handler = Arc::new(RequestHandler::new());
     let alpha = create_attach_input_test_session(&handler, "identity-stale-alpha").await;
     let beta = create_attach_input_test_session(&handler, "identity-stale-beta").await;
-    let (alpha_control_tx, _alpha_control_rx) = mpsc::unbounded_channel();
-    handler
-        .register_attach(attach_pid, alpha.session_name().clone(), alpha_control_tx)
+    let _alpha_control_rx = handler
+        .attach_client(attach_pid, alpha.session_name())
         .await;
     let stale_alpha_input =
         LiveAttachInputContext::current_for_test(Arc::clone(&handler), attach_pid).await;
-    let (beta_control_tx, _beta_control_rx) = mpsc::unbounded_channel();
-    handler
-        .register_attach(attach_pid, beta.session_name().clone(), beta_control_tx)
-        .await;
+    let _beta_control_rx = handler.attach_client(attach_pid, beta.session_name()).await;
 
     let stale = dispatch_live_attach_data_for_test(stale_alpha_input, b"MUST-NOT-ROUTE").await;
     assert!(
         stale.is_err(),
         "old same-PID socket input must fail closed once B is published"
     );
-    assert_eq!(
-        handler.attached_input_capture_for_test(&alpha).await,
-        Some(Vec::new())
-    );
-    assert_eq!(
-        handler.attached_input_capture_for_test(&beta).await,
-        Some(Vec::new())
-    );
+    for pane in [&alpha, &beta] {
+        assert_eq!(
+            handler.attached_input_capture_for_test(pane).await,
+            Some(Vec::new())
+        );
+    }
 }
 
 #[tokio::test]
@@ -276,20 +430,19 @@ async fn same_pid_replacement_publishes_while_old_binding_waits() {
     let channel = "attach-identity-blocked-binding";
     let alpha = create_attach_input_test_session(&handler, "identity-wait-alpha").await;
     let beta = create_attach_input_test_session(&handler, "identity-wait-beta").await;
-    let bound = handler
-        .handle(Request::BindKey(Box::new(BindKeyRequest {
-            table_name: "identity-wait".to_owned(),
-            key: "x".to_owned(),
-            note: Some("identity-wait".to_owned()),
-            repeat: false,
-            command: Some(vec![format!("wait-for {channel} ; detach-client")]),
-        })))
-        .await;
-    assert!(matches!(bound, Response::BindKey(_)), "{bound:?}");
-
-    let (alpha_control_tx, mut alpha_control_rx) = mpsc::unbounded_channel();
     handler
-        .register_attach(attach_pid, alpha.session_name().clone(), alpha_control_tx)
+        .handle_ok(BindKeyRequest {
+            note: Some("identity-wait".to_owned()),
+            ..Fixture::fixture((
+                "identity-wait",
+                "x",
+                [format!("wait-for {channel} ; detach-client")],
+            ))
+        })
+        .await;
+
+    let mut alpha_control_rx = handler
+        .attach_client(attach_pid, alpha.session_name())
         .await;
     handler
         .set_attached_key_table_for_test(attach_pid, Some("identity-wait".to_owned()))
@@ -310,10 +463,9 @@ async fn same_pid_replacement_publishes_while_old_binding_waits() {
     .await
     .expect("binding reaches wait-for before replacement");
 
-    let (beta_control_tx, mut beta_control_rx) = mpsc::unbounded_channel();
-    tokio::time::timeout(
+    let mut beta_control_rx = tokio::time::timeout(
         Duration::from_secs(2),
-        handler.register_attach(attach_pid, beta.session_name().clone(), beta_control_tx),
+        handler.attach_client(attach_pid, beta.session_name()),
     )
     .await
     .expect("replacement must not wait for the blocked binding");
@@ -331,13 +483,9 @@ async fn same_pid_replacement_publishes_while_old_binding_waits() {
     .await
     .expect("old attach receives Detach");
 
-    let signaled = handler
-        .handle(Request::WaitFor(WaitForRequest {
-            channel: channel.to_owned(),
-            mode: WaitForMode::Signal,
-        }))
+    handler
+        .handle_ok(WaitForRequest::fixture((channel, WaitForMode::Signal)))
         .await;
-    assert!(matches!(signaled, Response::WaitFor(_)), "{signaled:?}");
     let _old_input_result = tokio::time::timeout(Duration::from_secs(2), input_task)
         .await
         .expect("old binding unwinds after signal")
@@ -357,14 +505,12 @@ async fn same_pid_replacement_publishes_while_old_binding_waits() {
             "the old queued binding sent a detach control to its replacement"
         );
     }
-    assert_eq!(
-        handler.attached_input_capture_for_test(&alpha).await,
-        Some(Vec::new())
-    );
-    assert_eq!(
-        handler.attached_input_capture_for_test(&beta).await,
-        Some(Vec::new())
-    );
+    for pane in [&alpha, &beta] {
+        assert_eq!(
+            handler.attached_input_capture_for_test(pane).await,
+            Some(Vec::new())
+        );
+    }
 }
 
 #[tokio::test]
@@ -372,78 +518,39 @@ async fn unlock_flushes_resume_output_before_following_blocking_keystroke() {
     let handler = Arc::new(RequestHandler::new());
     let attach_pid = std::process::id();
     let channel = "attach-unlock-output-barrier";
-    let session_name = SessionName::new("unlock-output-barrier").expect("valid session name");
-    let created = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name: session_name.clone(),
-            detached: true,
-            size: Some(TerminalSize { cols: 80, rows: 24 }),
-            environment: None,
-        }))
-        .await;
-    assert!(matches!(created, Response::NewSession(_)), "{created:?}");
-    let bound = handler
-        .handle(Request::BindKey(Box::new(BindKeyRequest {
-            table_name: "unlock-output-barrier".to_owned(),
-            key: "x".to_owned(),
-            note: Some("unlock output barrier".to_owned()),
-            repeat: false,
-            command: Some(vec![format!("wait-for {channel}")]),
-        })))
-        .await;
-    assert!(matches!(bound, Response::BindKey(_)), "{bound:?}");
-
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
+    let session_name = handler.create_session("unlock-output-barrier").await;
     handler
-        .register_attach(attach_pid, session_name.clone(), control_tx)
+        .handle_ok(BindKeyRequest {
+            note: Some("unlock output barrier".to_owned()),
+            ..Fixture::fixture((
+                "unlock-output-barrier",
+                "x",
+                [format!("wait-for {channel}")],
+            ))
+        })
         .await;
+
+    let _control_rx = handler.attach_client(attach_pid, &session_name).await;
     handler
         .set_attached_key_table_for_test(attach_pid, Some("unlock-output-barrier".to_owned()))
         .await
         .expect("activate blocking test key table");
 
-    let (stream, mut peer) = tokio::net::UnixStream::pair().expect("attach stream pair");
-    let stream = AttachTransport::from(stream);
-    let mut decoder = AttachFrameDecoder::new();
-    let mut coalesced = encode_attach_message(&AttachMessage::Unlock).expect("encode unlock");
-    coalesced.extend_from_slice(
-        &encode_attach_message(&AttachMessage::Keystroke(AttachedKeystroke::new(
-            b"x".to_vec(),
-        )))
-        .expect("encode blocking keystroke"),
-    );
-    decoder.push_bytes(&coalesced);
     let live_input =
         LiveAttachInputContext::current_for_test(Arc::clone(&handler), attach_pid).await;
+    let (mut input, mut peer) = SocketInput::new(live_input, true);
+    input.push(&AttachMessage::Unlock, "encode unlock");
+    input.push(
+        &AttachMessage::Keystroke(AttachedKeystroke::new(b"x".to_vec())),
+        "encode blocking keystroke",
+    );
     let mut current_target =
         open_attach_target(test_attach_target(&session_name, b"RESUMED", None), false)
             .expect("open attach target");
 
     let input_task = tokio::spawn(async move {
-        let mut pending_input = Vec::new();
-        let mut pending_escape_flush = PendingEscapeFlush::default();
-        let mut active_emit_cache = None;
-        let mut locked = true;
-        process_socket_messages(
-            &mut decoder,
-            &stream,
-            &live_input,
-            Some(&mut current_target),
-            PendingAttachInputState::new(&mut pending_input, &mut pending_escape_flush),
-            &mut active_emit_cache,
-            &mut locked,
-        )
-        .await?;
-        process_socket_messages(
-            &mut decoder,
-            &stream,
-            &live_input,
-            Some(&mut current_target),
-            PendingAttachInputState::new(&mut pending_input, &mut pending_escape_flush),
-            &mut active_emit_cache,
-            &mut locked,
-        )
-        .await
+        input.process(Some(&mut current_target)).await?;
+        input.process(Some(&mut current_target)).await
     });
 
     tokio::time::timeout(Duration::from_secs(2), async {
@@ -459,19 +566,13 @@ async fn unlock_flushes_resume_output_before_following_blocking_keystroke() {
     );
     let resume = read_attach_data_until(&mut peer, b"RESUMED").await;
     assert!(
-        resume
-            .windows(b"RESUMED".len())
-            .any(|bytes| bytes == b"RESUMED"),
+        contains_bytes(&resume, b"RESUMED"),
         "unlock must restore the terminal before the following binding completes"
     );
 
-    let signaled = handler
-        .handle(Request::WaitFor(WaitForRequest {
-            channel: channel.to_owned(),
-            mode: WaitForMode::Signal,
-        }))
+    handler
+        .handle_ok(WaitForRequest::fixture((channel, WaitForMode::Signal)))
         .await;
-    assert!(matches!(signaled, Response::WaitFor(_)), "{signaled:?}");
     input_task
         .await
         .expect("input task join")
@@ -561,45 +662,25 @@ fn pending_escape_wrapper_times_only_unterminated_overlong_mouse_input() {
 async fn pending_escape_socket_fixture(
     session: &str,
 ) -> (
-    LiveAttachInputContext,
-    AttachTransport,
+    SocketInput,
     tokio::net::UnixStream,
     mpsc::UnboundedReceiver<AttachControl>,
 ) {
     let handler = Arc::new(RequestHandler::new());
     let attach_pid = std::process::id();
-    let session_name = SessionName::new(session).expect("valid session name");
+    let session_name = handler.create_session(session).await;
     let target = PaneTarget::with_window(session_name.clone(), 0, 0);
-    let created = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name: session_name.clone(),
-            detached: true,
-            size: Some(TerminalSize { cols: 80, rows: 24 }),
-            environment: None,
-        }))
-        .await;
-    assert!(matches!(created, Response::NewSession(_)));
-    let (control_tx, control_rx) = mpsc::unbounded_channel();
-    handler
-        .register_attach(attach_pid, session_name, control_tx)
-        .await;
+    let control_rx = handler.attach_client(attach_pid, session_name).await;
     handler.start_attached_input_capture_for_test(&target).await;
-    let (stream, peer) = tokio::net::UnixStream::pair().expect("attach stream pair");
-
-    (
-        LiveAttachInputContext::current_for_test(handler, attach_pid).await,
-        AttachTransport::from(stream),
-        peer,
-        control_rx,
-    )
+    let live_input = LiveAttachInputContext::current_for_test(handler, attach_pid).await;
+    let (input, peer) = SocketInput::new(live_input, false);
+    (input, peer, control_rx)
 }
 
 struct PendingEscapeSchedulerFixture {
     handler: Arc<RequestHandler>,
     target: PaneTarget,
-    peer: tokio::net::UnixStream,
-    shutdown: watch::Sender<()>,
-    task: tokio::task::JoinHandle<std::io::Result<()>>,
+    attach: AttachForwarder,
 }
 
 async fn current_attach_target(
@@ -632,61 +713,30 @@ impl PendingEscapeSchedulerFixture {
     async fn start(session: &str) -> Self {
         let handler = Arc::new(RequestHandler::new());
         let attach_pid = std::process::id();
-        let session_name = SessionName::new(session).expect("valid session name");
+        let session_name = handler.create_started_session(session).await;
         let target = PaneTarget::with_window(session_name.clone(), 0, 0);
-        let created = handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: session_name.clone(),
-                detached: true,
-                size: Some(TerminalSize { cols: 80, rows: 24 }),
-                environment: None,
-            }))
-            .await;
-        assert!(matches!(created, Response::NewSession(_)), "{created:?}");
         handler
-            .wait_for_pane_startup_to_finish_for_test(&target)
+            .set_option(ScopeSelector::Global, OptionName::EscapeTime, "500")
             .await;
-        let escape_time = handler
-            .handle(Request::SetOption(rmux_proto::SetOptionRequest {
-                scope: rmux_proto::ScopeSelector::Global,
-                option: rmux_proto::OptionName::EscapeTime,
-                value: "500".to_owned(),
-                mode: rmux_proto::SetOptionMode::Replace,
-            }))
-            .await;
-        assert!(
-            matches!(escape_time, Response::SetOption(_)),
-            "{escape_time:?}"
-        );
 
-        let (control_tx, mut control_rx) = mpsc::unbounded_channel();
-        handler
-            .register_attach(attach_pid, session_name.clone(), control_tx)
-            .await;
+        let mut control_rx = handler.attach_client(attach_pid, &session_name).await;
         handler.start_attached_input_capture_for_test(&target).await;
         let initial_target =
             current_attach_target(&handler, attach_pid, &session_name, &mut control_rx).await;
-        let (shutdown, shutdown_rx) = watch::channel(());
-        let (stream, peer) = tokio::net::UnixStream::pair().expect("attach stream pair");
-        let task = tokio::spawn(forward_attach(
-            stream,
+        let live_input =
+            LiveAttachInputContext::current_for_test(Arc::clone(&handler), attach_pid).await;
+        let attach = AttachForwarder::spawn(
             initial_target,
-            Vec::new(),
-            shutdown_rx,
             control_rx,
-            Arc::new(AtomicUsize::new(0)),
-            Arc::new(AtomicBool::new(false)),
-            Arc::new(AtomicU64::new(0)),
-            LiveAttachInputContext::current_for_test(Arc::clone(&handler), attach_pid).await,
+            Arc::default(),
+            live_input,
             false,
-        ));
+        );
 
         Self {
             handler,
             target,
-            peer,
-            shutdown,
-            task,
+            attach,
         }
     }
 
@@ -700,7 +750,8 @@ impl PendingEscapeSchedulerFixture {
             encoded
                 .extend_from_slice(&encode_attach_message(message).expect("encode attach input"));
         }
-        self.peer
+        self.attach
+            .peer
             .write_all(&encoded)
             .await
             .expect("write attach input");
@@ -740,20 +791,19 @@ impl PendingEscapeSchedulerFixture {
                     .await;
                 panic!(
                     "timed out waiting for {label}; capture={captured:?}, attach_finished={}",
-                    self.task.is_finished()
+                    self.attach.task.is_finished()
                 );
             }
         }
     }
 
     async fn finish(self) {
-        self.shutdown.send(()).expect("request attach shutdown");
-        assert!(self.task.await.expect("attach task join").is_ok());
+        assert!(self.attach.stop().await.is_ok());
     }
 
     async fn detach(mut self) {
         self.send(AttachMessage::Data(b"\x02d".to_vec())).await;
-        let result = tokio::time::timeout(Duration::from_secs(2), &mut self.task)
+        let result = tokio::time::timeout(Duration::from_secs(2), &mut self.attach.task)
             .await
             .expect("prefix-d must detach after retained input expires")
             .expect("attach task join");
@@ -762,24 +812,16 @@ impl PendingEscapeSchedulerFixture {
 }
 
 async fn arm_ignored_display_message(fixture: &PendingEscapeSchedulerFixture, duration_ms: u32) {
-    let response = fixture
+    fixture
         .handler
-        .handle(Request::DisplayMessageExt(Box::new(
-            DisplayMessageExtRequest {
-                target: Some(Target::Pane(fixture.target.clone())),
-                print: false,
-                message: Some("ignore input".to_owned()),
-                target_client: Some(std::process::id().to_string()),
-                empty_target_context: false,
-                duration_ms: Some(rmux_proto::DisplayMessageDurationMillis::new(duration_ms)),
-                ignore_input: true,
-            },
-        )))
+        .handle_ok(DisplayMessageExtRequest {
+            target: Some(Target::Pane(fixture.target.clone())),
+            target_client: Some(std::process::id().to_string()),
+            duration_ms: Some(rmux_proto::DisplayMessageDurationMillis::new(duration_ms)),
+            ignore_input: true,
+            ..Fixture::fixture("ignore input")
+        })
         .await;
-    assert!(
-        matches!(response, Response::DisplayMessage(_)),
-        "{response:?}"
-    );
 }
 
 #[tokio::test]
@@ -1089,62 +1131,30 @@ async fn fragmented_apc_control_keeps_the_streaming_idle_deadline() {
 
 #[tokio::test]
 async fn socket_dispatch_rearms_replaced_same_kind_ambiguous_suffix() {
-    let (live_input, stream, _peer, _control_rx) =
+    let (mut input, _peer, _control_rx) =
         pending_escape_socket_fixture("escape-epoch-ambiguous").await;
-    let mut decoder = AttachFrameDecoder::new();
-    let mut pending_input = Vec::new();
-    let mut pending_escape_flush = PendingEscapeFlush::default();
-    let mut active_emit_cache = None;
-    let mut locked = false;
 
-    decoder.push_bytes(
-        &encode_attach_message(&AttachMessage::Data(b"\x1b".to_vec()))
-            .expect("encode initial Escape"),
+    input.push(
+        &AttachMessage::Data(b"\x1b".to_vec()),
+        "encode initial Escape",
     );
-    process_socket_messages(
-        &mut decoder,
-        &stream,
-        &live_input,
-        None,
-        PendingAttachInputState::new(&mut pending_input, &mut pending_escape_flush),
-        &mut active_emit_cache,
-        &mut locked,
-    )
-    .await
-    .expect("retain initial Escape");
-    assert_eq!(pending_input, b"\x1b");
-    sync_pending_escape_flush_with_escape_time(
-        &mut pending_escape_flush,
-        &pending_input,
-        Duration::from_secs(1),
-    );
-    let first_deadline = pending_escape_flush
-        .deadline()
+    input.process(None).await.expect("retain initial Escape");
+    assert_eq!(input.pending_input, b"\x1b");
+    let first_deadline = input
+        .sync_escape_time(Duration::from_secs(1))
         .expect("initial Escape arms a deadline");
 
-    decoder.push_bytes(
-        &encode_attach_message(&AttachMessage::Data(b"x\x1b".to_vec()))
-            .expect("encode replacement Escape"),
+    input.push(
+        &AttachMessage::Data(b"x\x1b".to_vec()),
+        "encode replacement Escape",
     );
-    process_socket_messages(
-        &mut decoder,
-        &stream,
-        &live_input,
-        None,
-        PendingAttachInputState::new(&mut pending_input, &mut pending_escape_flush),
-        &mut active_emit_cache,
-        &mut locked,
-    )
-    .await
-    .expect("consume Meta-x and retain replacement Escape");
-    assert_eq!(pending_input, b"\x1b");
-    sync_pending_escape_flush_with_escape_time(
-        &mut pending_escape_flush,
-        &pending_input,
-        Duration::from_secs(3),
-    );
-    let replacement_deadline = pending_escape_flush
-        .deadline()
+    input
+        .process(None)
+        .await
+        .expect("consume Meta-x and retain replacement Escape");
+    assert_eq!(input.pending_input, b"\x1b");
+    let replacement_deadline = input
+        .sync_escape_time(Duration::from_secs(3))
         .expect("replacement Escape arms a fresh deadline");
 
     assert!(
@@ -1155,42 +1165,26 @@ async fn socket_dispatch_rearms_replaced_same_kind_ambiguous_suffix() {
 
 #[tokio::test]
 async fn socket_dispatch_promotes_coalesced_split_osc_to_streaming() {
-    let (live_input, stream, _peer, _control_rx) =
+    let (mut input, _peer, _control_rx) =
         pending_escape_socket_fixture("escape-meta-osc-provenance").await;
-    let mut decoder = AttachFrameDecoder::new();
-    let mut pending_input = Vec::new();
-    let mut pending_escape_flush = PendingEscapeFlush::default();
-    let mut active_emit_cache = None;
-    let mut locked = false;
-    let mut encoded = encode_attach_message(&AttachMessage::Data(b"A\x1b".to_vec()))
-        .expect("encode initial Meta escape");
-    encoded.extend_from_slice(
-        &encode_attach_message(&AttachMessage::Data(b"]52;c;COALESCED".to_vec()))
-            .expect("encode OSC-like continuation"),
+    input.push(
+        &AttachMessage::Data(b"A\x1b".to_vec()),
+        "encode initial Meta escape",
     );
-    decoder.push_bytes(&encoded);
+    input.push(
+        &AttachMessage::Data(b"]52;c;COALESCED".to_vec()),
+        "encode OSC-like continuation",
+    );
 
-    process_socket_messages(
-        &mut decoder,
-        &stream,
-        &live_input,
-        None,
-        PendingAttachInputState::new(&mut pending_input, &mut pending_escape_flush),
-        &mut active_emit_cache,
-        &mut locked,
-    )
-    .await
-    .expect("retain coalesced OSC-like Meta input");
-    assert_eq!(pending_input, b"\x1b]52;c;COALESCED");
+    input
+        .process(None)
+        .await
+        .expect("retain coalesced OSC-like Meta input");
+    assert_eq!(input.pending_input, b"\x1b]52;c;COALESCED");
 
     let before = Instant::now();
-    sync_pending_escape_flush_with_escape_time(
-        &mut pending_escape_flush,
-        &pending_input,
-        Duration::from_millis(500),
-    );
-    let deadline = pending_escape_flush
-        .deadline()
+    let deadline = input
+        .sync_escape_time(Duration::from_millis(500))
         .expect("coalesced split OSC input must arm");
     assert!(
         deadline >= before + Duration::from_secs(8),
@@ -1200,63 +1194,34 @@ async fn socket_dispatch_promotes_coalesced_split_osc_to_streaming() {
 
 #[tokio::test]
 async fn socket_dispatch_preserves_deadline_for_true_csi_continuation() {
-    let (live_input, stream, _peer, _control_rx) =
+    let (mut input, _peer, _control_rx) =
         pending_escape_socket_fixture("escape-epoch-continuation").await;
-    let mut decoder = AttachFrameDecoder::new();
-    let mut pending_input = Vec::new();
-    let mut pending_escape_flush = PendingEscapeFlush::default();
-    let mut active_emit_cache = None;
-    let mut locked = false;
 
-    decoder.push_bytes(
-        &encode_attach_message(&AttachMessage::Data(b"\x1b[".to_vec()))
-            .expect("encode initial CSI opener"),
+    input.push(
+        &AttachMessage::Data(b"\x1b[".to_vec()),
+        "encode initial CSI opener",
     );
-    process_socket_messages(
-        &mut decoder,
-        &stream,
-        &live_input,
-        None,
-        PendingAttachInputState::new(&mut pending_input, &mut pending_escape_flush),
-        &mut active_emit_cache,
-        &mut locked,
-    )
-    .await
-    .expect("retain initial CSI opener");
-    assert_eq!(pending_input, b"\x1b[");
-    sync_pending_escape_flush_with_escape_time(
-        &mut pending_escape_flush,
-        &pending_input,
-        Duration::from_secs(1),
-    );
-    let original_deadline = pending_escape_flush
-        .deadline()
+    input
+        .process(None)
+        .await
+        .expect("retain initial CSI opener");
+    assert_eq!(input.pending_input, b"\x1b[");
+    let original_deadline = input
+        .sync_escape_time(Duration::from_secs(1))
         .expect("initial CSI opener arms a deadline");
 
-    decoder.push_bytes(
-        &encode_attach_message(&AttachMessage::Data(b"12".to_vec()))
-            .expect("encode continued CSI parameters"),
+    input.push(
+        &AttachMessage::Data(b"12".to_vec()),
+        "encode continued CSI parameters",
     );
-    process_socket_messages(
-        &mut decoder,
-        &stream,
-        &live_input,
-        None,
-        PendingAttachInputState::new(&mut pending_input, &mut pending_escape_flush),
-        &mut active_emit_cache,
-        &mut locked,
-    )
-    .await
-    .expect("retain continued CSI parameters");
-    assert_eq!(pending_input, b"\x1b[12");
-    sync_pending_escape_flush_with_escape_time(
-        &mut pending_escape_flush,
-        &pending_input,
-        Duration::from_secs(30),
-    );
+    input
+        .process(None)
+        .await
+        .expect("retain continued CSI parameters");
+    assert_eq!(input.pending_input, b"\x1b[12");
 
     assert_eq!(
-        pending_escape_flush.deadline(),
+        input.sync_escape_time(Duration::from_secs(30)),
         Some(original_deadline),
         "a true continuation must not turn keyboard escape-time into a sliding deadline"
     );
@@ -1264,68 +1229,39 @@ async fn socket_dispatch_preserves_deadline_for_true_csi_continuation() {
 
 #[tokio::test]
 async fn socket_dispatch_rearms_replaced_same_length_streaming_suffix() {
-    let (live_input, stream, _peer, _control_rx) =
+    let (mut input, _peer, _control_rx) =
         pending_escape_socket_fixture("escape-epoch-streaming").await;
-    let mut decoder = AttachFrameDecoder::new();
-    let mut pending_input = Vec::new();
-    let mut pending_escape_flush = PendingEscapeFlush::default();
-    let mut active_emit_cache = None;
-    let mut locked = false;
     let incomplete_paste = b"\x1b[200~body";
 
-    decoder.push_bytes(
-        &encode_attach_message(&AttachMessage::Data(incomplete_paste.to_vec()))
-            .expect("encode initial incomplete paste"),
+    input.push(
+        &AttachMessage::Data(incomplete_paste.to_vec()),
+        "encode initial incomplete paste",
     );
-    process_socket_messages(
-        &mut decoder,
-        &stream,
-        &live_input,
-        None,
-        PendingAttachInputState::new(&mut pending_input, &mut pending_escape_flush),
-        &mut active_emit_cache,
-        &mut locked,
-    )
-    .await
-    .expect("retain initial incomplete paste");
-    assert_eq!(pending_input, incomplete_paste);
-    sync_pending_escape_flush_with_escape_time(
-        &mut pending_escape_flush,
-        &pending_input,
-        Duration::from_secs(8),
-    );
-    let first_deadline = pending_escape_flush
-        .deadline()
+    input
+        .process(None)
+        .await
+        .expect("retain initial incomplete paste");
+    assert_eq!(input.pending_input, incomplete_paste);
+    let first_deadline = input
+        .sync_escape_time(Duration::from_secs(8))
         .expect("initial paste stream arms a deadline");
 
     let mut replacement = b"\x1b[201~".to_vec();
     replacement.extend_from_slice(incomplete_paste);
-    decoder.push_bytes(
-        &encode_attach_message(&AttachMessage::Data(replacement))
-            .expect("encode completed and replacement paste streams"),
+    input.push(
+        &AttachMessage::Data(replacement),
+        "encode completed and replacement paste streams",
     );
-    process_socket_messages(
-        &mut decoder,
-        &stream,
-        &live_input,
-        None,
-        PendingAttachInputState::new(&mut pending_input, &mut pending_escape_flush),
-        &mut active_emit_cache,
-        &mut locked,
-    )
-    .await
-    .expect("complete first paste and retain replacement stream");
+    input
+        .process(None)
+        .await
+        .expect("complete first paste and retain replacement stream");
     assert_eq!(
-        pending_input, incomplete_paste,
+        input.pending_input, incomplete_paste,
         "the replacement intentionally matches the old kind, length, and contents"
     );
-    sync_pending_escape_flush_with_escape_time(
-        &mut pending_escape_flush,
-        &pending_input,
-        Duration::from_secs(30),
-    );
-    let replacement_deadline = pending_escape_flush
-        .deadline()
+    let replacement_deadline = input
+        .sync_escape_time(Duration::from_secs(30))
         .expect("replacement paste stream arms a fresh deadline");
 
     assert!(
@@ -1338,48 +1274,26 @@ async fn socket_dispatch_rearms_replaced_same_length_streaming_suffix() {
 fn overlay_generation_rejects_stale_clears_after_switches_or_newer_overlays() {
     let mut current_overlay_generation = 0;
 
-    assert!(should_emit_overlay(
-        0,
-        &mut current_overlay_generation,
-        &OverlayFrame::new(Vec::new(), 0, 1)
-    ));
-    assert_eq!(current_overlay_generation, 1);
-
-    assert!(should_emit_overlay(
-        0,
-        &mut current_overlay_generation,
-        &OverlayFrame::new(Vec::new(), 0, 1)
-    ));
-    assert!(should_emit_overlay(
-        0,
-        &mut current_overlay_generation,
-        &OverlayFrame::new(Vec::new(), 0, 2)
-    ));
-
-    assert!(!should_emit_overlay(
-        0,
-        &mut current_overlay_generation,
-        &OverlayFrame::new(Vec::new(), 0, 1)
-    ));
-    assert!(!should_emit_overlay(
-        1,
-        &mut current_overlay_generation,
-        &OverlayFrame::new(Vec::new(), 0, 3)
-    ));
-    assert_eq!(current_overlay_generation, 2);
-
-    assert!(should_emit_overlay(
-        1,
-        &mut current_overlay_generation,
-        &OverlayFrame::new(Vec::new(), 2, 3)
-    ));
-    assert_eq!(current_overlay_generation, 3);
-
-    assert!(!should_emit_overlay(
-        2,
-        &mut current_overlay_generation,
-        &OverlayFrame::new(Vec::new(), 1, 4)
-    ));
+    // (render generation, overlay render generation, overlay generation, emitted, and the
+    // current overlay generation afterwards where the sequence pins it)
+    for (render, overlay_render, overlay, emitted, pinned) in [
+        (0, 0, 1, true, Some(1)),
+        (0, 0, 1, true, None),
+        (0, 0, 2, true, None),
+        (0, 0, 1, false, None),
+        (1, 0, 3, false, Some(2)),
+        (1, 2, 3, true, Some(3)),
+        (2, 1, 4, false, None),
+    ] {
+        let frame = OverlayFrame::new(Vec::new(), overlay_render, overlay);
+        assert_eq!(
+            should_emit_overlay(render, &mut current_overlay_generation, &frame),
+            emitted
+        );
+        if let Some(pinned) = pinned {
+            assert_eq!(current_overlay_generation, pinned);
+        }
+    }
 }
 
 #[test]
@@ -1425,35 +1339,28 @@ fn predicted_local_echo_accepts_printable_prefix_before_enter() {
 
 #[test]
 fn predicted_local_echo_consumes_exact_pty_echo_once() {
-    let alpha = SessionName::new("alpha").expect("valid session name");
+    let alpha = session_name("alpha");
     let mut target =
         open_attach_target(test_attach_target(&alpha, b"", None), false).expect("open target");
 
-    target.predicted_echo.extend(b"xyz");
-    assert_eq!(
-        consume_predicted_echo(&mut target, b"xyz"),
-        PredictedEcho::Consumed
-    );
-    assert!(target.predicted_echo.is_empty());
-
-    target.predicted_echo.extend(b"x");
-    assert_eq!(
-        consume_predicted_echo(&mut target, b"y"),
-        PredictedEcho::Mismatch
-    );
-    assert!(target.predicted_echo.is_empty());
-
-    target.predicted_echo.extend(b"x");
-    assert_eq!(
-        consume_predicted_echo(&mut target, b"xy"),
-        PredictedEcho::Mismatch
-    );
-    assert!(target.predicted_echo.is_empty());
+    for (predicted, echoed, expected) in [
+        (
+            b"xyz".as_slice(),
+            b"xyz".as_slice(),
+            PredictedEcho::Consumed,
+        ),
+        (b"x".as_slice(), b"y".as_slice(), PredictedEcho::Mismatch),
+        (b"x".as_slice(), b"xy".as_slice(), PredictedEcho::Mismatch),
+    ] {
+        target.predicted_echo.extend(predicted);
+        assert_eq!(consume_predicted_echo(&mut target, echoed), expected);
+        assert!(target.predicted_echo.is_empty());
+    }
 }
 
 #[test]
 fn stale_predicted_local_echo_expires_without_pty_echo() {
-    let alpha = SessionName::new("alpha").expect("valid session name");
+    let alpha = session_name("alpha");
     let mut target =
         open_attach_target(test_attach_target(&alpha, b"", None), false).expect("open target");
 
@@ -1469,66 +1376,68 @@ fn stale_predicted_local_echo_expires_without_pty_echo() {
     assert!(target.predicted_echo_started_at.is_none());
 }
 
-#[tokio::test]
-async fn live_render_frame_uses_render_message_for_capable_clients() {
-    let alpha = SessionName::new("alpha").expect("valid session name");
-    let target = test_attach_target(&alpha, b"", None);
+/// Emits `payload` as a live render frame to a render-capable client over a duplex of
+/// `capacity` bytes, and answers with both ends.
+async fn emit_live_render_payload(
+    payload: Vec<u8>,
+    replaceable: bool,
+    capacity: usize,
+    label: &str,
+) -> (AttachTransport, tokio::io::DuplexStream) {
+    let target = test_attach_target(&session_name("alpha"), b"", None);
     let mut target = open_attach_target(target, true).expect("open attach target");
-    let frame = PaneRenderDeltaFrame::new(b"live".to_vec(), None);
-    let (stream, mut peer) = tokio::io::duplex(1024);
+    let frame = PaneRenderDeltaFrame::new(payload, None);
+    let (stream, peer) = tokio::io::duplex(capacity);
     let stream = AttachTransport::from_io(stream);
 
-    super::emit_live_render_frame(&stream, &mut target, &frame, true)
+    super::emit_live_render_frame(&stream, &mut target, &frame, replaceable)
         .await
-        .expect("emit live render frame");
+        .expect(label);
+    (stream, peer)
+}
 
+/// The first message a render-capable client reads once `payload` is emitted as a live render
+/// frame.
+async fn first_live_render_message(payload: &[u8], replaceable: bool) -> Option<AttachMessage> {
+    let (_stream, mut peer) = emit_live_render_payload(
+        payload.to_vec(),
+        replaceable,
+        1024,
+        "emit live render frame",
+    )
+    .await;
     let mut bytes = [0_u8; 128];
     let count = peer.read(&mut bytes).await.expect("read emitted frame");
     let mut decoder = AttachFrameDecoder::new();
     decoder.push_bytes(&bytes[..count]);
+    decoder.next_message().expect("decode emitted frame")
+}
 
+#[tokio::test]
+async fn live_render_frame_uses_render_message_for_capable_clients() {
     assert!(matches!(
-        decoder.next_message().expect("decode emitted frame"),
+        first_live_render_message(b"live", true).await,
         Some(AttachMessage::Render(bytes)) if bytes.ends_with(b"live")
     ));
 }
 
 #[tokio::test]
 async fn live_render_delta_uses_data_message_for_stateful_frames() {
-    let alpha = SessionName::new("alpha").expect("valid session name");
-    let target = test_attach_target(&alpha, b"", None);
-    let mut target = open_attach_target(target, true).expect("open attach target");
-    let frame = PaneRenderDeltaFrame::new(b"delta".to_vec(), None);
-    let (stream, mut peer) = tokio::io::duplex(1024);
-    let stream = AttachTransport::from_io(stream);
-
-    super::emit_live_render_frame(&stream, &mut target, &frame, false)
-        .await
-        .expect("emit live render frame");
-
-    let mut bytes = [0_u8; 128];
-    let count = peer.read(&mut bytes).await.expect("read emitted frame");
-    let mut decoder = AttachFrameDecoder::new();
-    decoder.push_bytes(&bytes[..count]);
-
     assert!(matches!(
-        decoder.next_message().expect("decode emitted frame"),
+        first_live_render_message(b"delta", false).await,
         Some(AttachMessage::Data(bytes)) if bytes.ends_with(b"delta")
     ));
 }
 
 #[tokio::test]
 async fn live_replaceable_repaint_above_payload_ceiling_uses_ordered_data_fragments() {
-    let alpha = SessionName::new("alpha").expect("valid session name");
-    let target = test_attach_target(&alpha, b"", None);
-    let mut target = open_attach_target(target, true).expect("open attach target");
-    let frame = PaneRenderDeltaFrame::new(vec![b'x'; DEFAULT_MAX_FRAME_LENGTH + 1], None);
-    let (stream, mut peer) = tokio::io::duplex(DEFAULT_MAX_FRAME_LENGTH + 64);
-    let stream = AttachTransport::from_io(stream);
-
-    super::emit_live_render_frame(&stream, &mut target, &frame, true)
-        .await
-        .expect("emit oversized live repaint");
+    let (_stream, mut peer) = emit_live_render_payload(
+        vec![b'x'; DEFAULT_MAX_FRAME_LENGTH + 1],
+        true,
+        DEFAULT_MAX_FRAME_LENGTH + 64,
+        "emit oversized live repaint",
+    )
+    .await;
 
     let mut decoder = AttachFrameDecoder::new();
     let mut messages = Vec::new();
@@ -1583,63 +1492,50 @@ async fn pane_output_receiver_reports_lag_and_resumes_from_oldest_retained_event
     assert_eq!(event.bytes(), b"second");
 }
 
+/// Sends `keystroke` through the socket loop of a fresh attach to session alpha and answers
+/// with the first message the client reads back into `ack_bytes` within a second.
+async fn first_keystroke_reply(
+    keystroke: &[u8],
+    locked: bool,
+    [encode_label, process_label]: [&str; 2],
+    ack_bytes: &mut [u8],
+) -> Option<AttachMessage> {
+    let handler = Arc::new(RequestHandler::new());
+    let attach_pid = std::process::id();
+    let session_name = handler.create_session("alpha").await;
+    let _control_rx = handler.attach_client(attach_pid, session_name).await;
+
+    let live_input = LiveAttachInputContext::current_for_test(handler, attach_pid).await;
+    let (mut input, mut peer) = SocketInput::new(live_input, locked);
+    input.push(
+        &AttachMessage::Keystroke(AttachedKeystroke::new(keystroke.to_vec())),
+        encode_label,
+    );
+    input.process(None).await.expect(process_label);
+
+    let bytes_read = tokio::time::timeout(Duration::from_secs(1), peer.read(ack_bytes))
+        .await
+        .expect("ack read should not time out")
+        .expect("read ack");
+    let mut ack_decoder = AttachFrameDecoder::new();
+    ack_decoder.push_bytes(&ack_bytes[..bytes_read]);
+    ack_decoder.next_message().expect("decode ack")
+}
+
 #[tokio::test]
 async fn typed_keystroke_wire_reaches_stub_and_acknowledges() {
     let proof_root =
         std::env::temp_dir().join(format!("rmux-protocol-boundary-{}", std::process::id()));
     std::fs::create_dir_all(&proof_root).expect("create /tmp check root");
 
-    let handler = Arc::new(RequestHandler::new());
-    let attach_pid = std::process::id();
-    let session_name = SessionName::new("alpha").expect("valid session name");
-    let created = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name: session_name.clone(),
-            detached: true,
-            size: Some(TerminalSize { cols: 80, rows: 24 }),
-            environment: None,
-        }))
-        .await;
-    assert!(matches!(created, Response::NewSession(_)));
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    handler
-        .register_attach(attach_pid, session_name, control_tx)
-        .await;
-
-    let (stream, mut peer) = tokio::net::UnixStream::pair().expect("attach stream pair");
-    let stream = AttachTransport::from(stream);
-    let keystroke = AttachedKeystroke::new(b"\x1b[A".to_vec());
-    let encoded = encode_attach_message(&AttachMessage::Keystroke(keystroke))
-        .expect("encode typed keystroke");
-    let mut decoder = AttachFrameDecoder::new();
-    decoder.push_bytes(&encoded);
-    let mut pending_input = Vec::new();
-    let mut pending_escape_flush = PendingEscapeFlush::default();
-    let mut active_emit_cache = None;
-    let mut locked = true;
-    let live_input = LiveAttachInputContext::current_for_test(handler, attach_pid).await;
-
-    process_socket_messages(
-        &mut decoder,
-        &stream,
-        &live_input,
-        None,
-        PendingAttachInputState::new(&mut pending_input, &mut pending_escape_flush),
-        &mut active_emit_cache,
-        &mut locked,
-    )
-    .await
-    .expect("process typed keystroke");
-
-    let mut ack_bytes = [0_u8; 64];
-    let bytes_read = tokio::time::timeout(Duration::from_secs(1), peer.read(&mut ack_bytes))
-        .await
-        .expect("ack read should not time out")
-        .expect("read ack");
-    let mut ack_decoder = AttachFrameDecoder::new();
-    ack_decoder.push_bytes(&ack_bytes[..bytes_read]);
     assert_eq!(
-        ack_decoder.next_message().expect("decode ack"),
+        first_keystroke_reply(
+            b"\x1b[A",
+            true,
+            ["encode typed keystroke", "process typed keystroke"],
+            &mut [0_u8; 64],
+        )
+        .await,
         Some(AttachMessage::KeyDispatched(KeyDispatched::new(3)))
     );
 
@@ -1648,60 +1544,14 @@ async fn typed_keystroke_wire_reaches_stub_and_acknowledges() {
 
 #[tokio::test]
 async fn mouse_keystroke_wire_does_not_error_or_drop_the_attach() {
-    let handler = Arc::new(RequestHandler::new());
-    let attach_pid = std::process::id();
-    let session_name = SessionName::new("alpha").expect("valid session name");
-
-    let created = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name: session_name.clone(),
-            detached: true,
-            size: Some(TerminalSize { cols: 80, rows: 24 }),
-            environment: None,
-        }))
-        .await;
-    assert!(matches!(created, Response::NewSession(_)));
-
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    handler
-        .register_attach(attach_pid, session_name, control_tx)
-        .await;
-
-    let (stream, mut peer) = tokio::net::UnixStream::pair().expect("attach stream pair");
-    let stream = AttachTransport::from(stream);
-    let keystroke = AttachedKeystroke::new(b"\x1b[<0;10;10M".to_vec());
-    let encoded = encode_attach_message(&AttachMessage::Keystroke(keystroke))
-        .expect("encode mouse keystroke");
-    let mut decoder = AttachFrameDecoder::new();
-    decoder.push_bytes(&encoded);
-    let mut pending_input = Vec::new();
-    let mut pending_escape_flush = PendingEscapeFlush::default();
-    let mut active_emit_cache = None;
-    let mut locked = false;
-    let live_input =
-        LiveAttachInputContext::current_for_test(Arc::clone(&handler), attach_pid).await;
-
-    process_socket_messages(
-        &mut decoder,
-        &stream,
-        &live_input,
-        None,
-        PendingAttachInputState::new(&mut pending_input, &mut pending_escape_flush),
-        &mut active_emit_cache,
-        &mut locked,
-    )
-    .await
-    .expect("process mouse keystroke");
-
-    let mut ack_bytes = [0_u8; 128];
-    let bytes_read = tokio::time::timeout(Duration::from_secs(1), peer.read(&mut ack_bytes))
-        .await
-        .expect("ack read should not time out")
-        .expect("read ack");
-    let mut ack_decoder = AttachFrameDecoder::new();
-    ack_decoder.push_bytes(&ack_bytes[..bytes_read]);
     assert_eq!(
-        ack_decoder.next_message().expect("decode ack"),
+        first_keystroke_reply(
+            b"\x1b[<0;10;10M",
+            false,
+            ["encode mouse keystroke", "process mouse keystroke"],
+            &mut [0_u8; 128],
+        )
+        .await,
         Some(AttachMessage::KeyDispatched(KeyDispatched::new(11)))
     );
 }
@@ -1710,22 +1560,9 @@ async fn mouse_keystroke_wire_does_not_error_or_drop_the_attach() {
 async fn data_payload_does_not_trust_an_unversioned_cached_pane_shell() {
     let handler = Arc::new(RequestHandler::new());
     let attach_pid = std::process::id();
-    let session_name = SessionName::new("cached-master").expect("valid session name");
+    let session_name = handler.create_session("cached-master").await;
     let target = PaneTarget::with_window(session_name.clone(), 0, 0);
-
-    let created = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name: session_name.clone(),
-            detached: true,
-            size: Some(TerminalSize { cols: 80, rows: 24 }),
-            environment: None,
-        }))
-        .await;
-    assert!(matches!(created, Response::NewSession(_)));
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    handler
-        .register_attach(attach_pid, session_name.clone(), control_tx)
-        .await;
+    let _control_rx = handler.attach_client(attach_pid, &session_name).await;
     handler.start_attached_input_capture_for_test(&target).await;
 
     // This master has the same logical target spelling but is deliberately
@@ -1733,28 +1570,24 @@ async fn data_payload_does_not_trust_an_unversioned_cached_pane_shell() {
     // switch control is still queued.
     let mut cached_target = open_attach_target(test_attach_target(&session_name, b"", None), false)
         .expect("open stale cached target");
-    let (stream, _peer) = tokio::net::UnixStream::pair().expect("attach stream pair");
-    let stream = AttachTransport::from(stream);
     let live_input =
         LiveAttachInputContext::current_for_test(Arc::clone(&handler), attach_pid).await;
-    let mut pending_input = Vec::new();
-    let mut active_emit_cache = None;
-    let mut locked = false;
+    let (mut input, _peer) = SocketInput::new(live_input, false);
 
     let forwarded = process_attach_data_payload(
-        &live_input,
-        &stream,
+        &input.live_input,
+        &input.stream,
         Some(&mut cached_target),
-        &mut pending_input,
-        &mut active_emit_cache,
-        &mut locked,
+        &mut input.pending_input,
+        &mut input.active_emit_cache,
+        &mut input.locked,
         b"SAFE",
     )
     .await
     .expect("data payload routes through the current handler state");
 
     assert!(forwarded);
-    assert!(pending_input.is_empty());
+    assert!(input.pending_input.is_empty());
     assert_eq!(
         handler.attached_input_capture_for_test(&target).await,
         Some(b"SAFE".to_vec())
@@ -1765,27 +1598,8 @@ async fn data_payload_does_not_trust_an_unversioned_cached_pane_shell() {
 async fn forward_attach_emits_stop_sequence_when_processing_errors() {
     let handler = Arc::new(RequestHandler::new());
     let (stream, mut peer) = tokio::net::UnixStream::pair().expect("attach stream pair");
-    let outer_terminal =
-        OuterTerminal::resolve(&OptionStore::default(), OuterTerminalContext::default());
-    let expected_stop = outer_terminal.attach_stop_sequence();
-    let pane_output = pane_output_channel();
-    let (pane_output_start_sequence, pane_output) = pane_output.subscribe_live_from_now();
-    let target = AttachTarget {
-        session_name: SessionName::new("alpha").expect("valid session name"),
-        live_pane_handover: true,
-        pane_output,
-        pane_output_start_sequence,
-        render_frame: Vec::new(),
-        outer_terminal,
-        client_title: None,
-        cursor_style: 0,
-        active_pane_geometry: PaneGeometry::new(0, 0, 80, 24),
-        raw_passthrough: false,
-        kitty_graphics_passthrough: false,
-        sixel_passthrough: false,
-        persistent_overlay_state_id: None,
-        live_pane: None,
-    };
+    let target = test_attach_target(&session_name("alpha"), b"", None);
+    let expected_stop = target.outer_terminal.attach_stop_sequence();
     let invalid_initial_socket_bytes =
         encode_attach_message(&AttachMessage::Lock("unexpected".to_owned()))
             .expect("encode unexpected lock frame");
@@ -1829,56 +1643,29 @@ async fn forward_attach_emits_stop_sequence_when_processing_errors() {
     }
 
     assert!(
-        collected
-            .windows(expected_stop.len())
-            .any(|window| window == expected_stop),
+        contains_bytes(&collected, &expected_stop),
         "attach stop sequence should be emitted on attach failure"
     );
 }
 
 #[tokio::test]
 async fn detach_control_emits_stop_and_banner_in_one_data_frame() {
-    let alpha = SessionName::new("alpha").expect("valid session name");
-    let (stream, mut peer) = tokio::net::UnixStream::pair().expect("attach stream pair");
-    let stream = AttachTransport::from(stream);
-    let (control_tx, mut control_rx) = mpsc::unbounded_channel();
-    let mut current_target = open_attach_target(test_attach_target(&alpha, b"BASE-A", None), false)
-        .expect("open target");
-    let expected_stop = current_target.outer_terminal.attach_stop_sequence();
-    let mut render_generation = 0_u64;
-    let mut overlay_generation = 0_u64;
-    let mut persistent_overlay = None::<Vec<u8>>;
-    let mut persistent_overlay_visible = false;
-    let mut persistent_overlay_state_id = current_target.persistent_overlay_state_id;
-    let mut locked = false;
-    let mut deferred_controls = VecDeque::new();
+    let mut controls =
+        PendingControls::new(test_attach_target(&session_name("alpha"), b"BASE-A", None));
+    let expected_stop = controls.target.outer_terminal.attach_stop_sequence();
 
-    control_tx
+    controls
+        .control_tx
         .send(AttachControl::Detach)
         .expect("send detach control");
 
-    let control_backlog = AtomicUsize::new(0);
-    let action = apply_pending_attach_controls(
-        &mut deferred_controls,
-        Some(&mut control_rx),
-        &control_backlog,
-        &mut current_target,
-        &stream,
-        &mut render_generation,
-        &mut overlay_generation,
-        &mut persistent_overlay,
-        &mut persistent_overlay_visible,
-        &mut persistent_overlay_state_id,
-        &mut locked,
-        None,
-    )
-    .await
-    .expect("apply pending detach");
+    let action = controls.apply(None).await.expect("apply pending detach");
 
     assert!(matches!(action, PendingAttachAction::Exit(_)));
 
     let mut frame_bytes = [0_u8; 4096];
-    let bytes_read = peer
+    let bytes_read = controls
+        .peer
         .read(&mut frame_bytes)
         .await
         .expect("read detach frame");
@@ -1890,64 +1677,35 @@ async fn detach_control_emits_stop_and_banner_in_one_data_frame() {
     };
 
     assert!(
-        bytes
-            .windows(expected_stop.len())
-            .any(|window| window == expected_stop),
+        contains_bytes(&bytes, &expected_stop),
         "detach data must contain attach-stop before close"
     );
     assert!(
-        bytes
-            .windows(b"[detached (from session alpha)]\r\n".len())
-            .any(|window| window == b"[detached (from session alpha)]\r\n"),
+        contains_bytes(&bytes, b"[detached (from session alpha)]\r\n"),
         "detach data must contain detached banner"
     );
 }
 
 #[tokio::test]
 async fn lock_control_emits_attach_stop_before_transferring_terminal_ownership() {
-    let alpha = SessionName::new("alpha-lock-stop").expect("valid session name");
-    let (stream, mut peer) = tokio::net::UnixStream::pair().expect("attach stream pair");
-    let stream = AttachTransport::from(stream);
-    let (control_tx, mut control_rx) = mpsc::unbounded_channel();
-    let mut current_target =
-        open_attach_target(test_attach_target(&alpha, b"BASE", None), false).expect("open target");
-    let expected_stop = current_target.outer_terminal.attach_stop_sequence();
-    let mut render_generation = 0_u64;
-    let mut overlay_generation = 0_u64;
-    let mut persistent_overlay = None::<Vec<u8>>;
-    let mut persistent_overlay_visible = false;
-    let mut persistent_overlay_state_id = current_target.persistent_overlay_state_id;
-    let mut locked = false;
-    let mut deferred_controls = VecDeque::new();
+    let alpha = session_name("alpha-lock-stop");
+    let mut controls = PendingControls::new(test_attach_target(&alpha, b"BASE", None));
+    let expected_stop = controls.target.outer_terminal.attach_stop_sequence();
     let command = AttachShellCommand::new(
         "lock-command".to_owned(),
         "/bin/sh".to_owned(),
         "/tmp".to_owned(),
     );
-    control_tx
+    controls
+        .control_tx
         .send(AttachControl::LockShellCommand(command.clone()))
         .expect("send lock control");
 
-    let control_backlog = AtomicUsize::new(0);
-    let action = apply_pending_attach_controls(
-        &mut deferred_controls,
-        Some(&mut control_rx),
-        &control_backlog,
-        &mut current_target,
-        &stream,
-        &mut render_generation,
-        &mut overlay_generation,
-        &mut persistent_overlay,
-        &mut persistent_overlay_visible,
-        &mut persistent_overlay_state_id,
-        &mut locked,
-        None,
-    )
-    .await
-    .expect("apply pending lock");
+    let action = controls.apply(None).await.expect("apply pending lock");
     assert!(matches!(action, PendingAttachAction::Continue { .. }));
-    assert!(locked);
+    assert!(controls.locked);
 
+    let peer = &mut controls.peer;
     let messages = tokio::time::timeout(Duration::from_secs(1), async {
         let mut decoder = AttachFrameDecoder::new();
         let mut messages = Vec::new();
@@ -1972,8 +1730,7 @@ async fn lock_control_emits_attach_stop_before_transferring_terminal_ownership()
         );
     };
     assert!(
-        stop.windows(expected_stop.len())
-            .any(|window| window == expected_stop),
+        contains_bytes(stop, &expected_stop),
         "lock must emit the complete attach-stop sequence first"
     );
     assert_eq!(messages[1], AttachMessage::LockShellCommand(command));
@@ -1984,26 +1741,21 @@ fn test_attach_target(
     render_frame: &[u8],
     persistent_overlay_state_id: Option<u64>,
 ) -> AttachTarget {
-    test_attach_target_with_output(
-        session_name,
-        render_frame,
+    AttachTarget {
         persistent_overlay_state_id,
-        pane_output_channel(),
-        false,
-    )
+        ..test_attach_target_with_output(session_name, render_frame, &pane_output_channel(), false)
+    }
 }
 
 fn test_attach_target_with_output(
     session_name: &SessionName,
     render_frame: &[u8],
-    persistent_overlay_state_id: Option<u64>,
-    pane_output: super::types::PaneOutputSender,
+    pane_output: &super::types::PaneOutputSender,
     kitty_graphics_passthrough: bool,
 ) -> AttachTarget {
     test_attach_target_with_protocols(
         session_name,
         render_frame,
-        persistent_overlay_state_id,
         pane_output,
         kitty_graphics_passthrough,
         false,
@@ -2013,8 +1765,7 @@ fn test_attach_target_with_output(
 fn test_attach_target_with_protocols(
     session_name: &SessionName,
     render_frame: &[u8],
-    persistent_overlay_state_id: Option<u64>,
-    pane_output: super::types::PaneOutputSender,
+    pane_output: &super::types::PaneOutputSender,
     kitty_graphics_passthrough: bool,
     sixel_passthrough: bool,
 ) -> AttachTarget {
@@ -2035,47 +1786,76 @@ fn test_attach_target_with_protocols(
         raw_passthrough: kitty_graphics_passthrough || sixel_passthrough,
         kitty_graphics_passthrough,
         sixel_passthrough,
-        persistent_overlay_state_id,
+        persistent_overlay_state_id: None,
         live_pane: None,
     }
 }
 
-fn test_render_only_attach_target(session_name: &SessionName, render_frame: &[u8]) -> AttachTarget {
-    test_render_only_attach_target_with_state(session_name, render_frame, None)
-}
-
-fn test_render_only_attach_target_with_state(
-    session_name: &SessionName,
-    render_frame: &[u8],
-    persistent_overlay_state_id: Option<u64>,
-) -> AttachTarget {
-    let mut target = test_attach_target(session_name, render_frame, persistent_overlay_state_id);
+/// `target` as a plain re-render of the pane: it hands the client no live pane.
+fn render_only(mut target: AttachTarget) -> AttachTarget {
     target.live_pane_handover = false;
     target
 }
 
+fn test_render_only_attach_target(session_name: &SessionName, render_frame: &[u8]) -> AttachTarget {
+    render_only(test_attach_target(session_name, render_frame, None))
+}
+
+/// A render-only refresh fed by `pane_output` that passes Kitty graphics through.
+fn test_render_only_kitty_target(
+    session_name: &SessionName,
+    render_frame: &[u8],
+    pane_output: &super::types::PaneOutputSender,
+) -> AttachTarget {
+    let target = test_attach_target_with_output(session_name, render_frame, pane_output, true);
+    render_only(target)
+}
+
+/// A switch to the attach target `test_attach_target` builds from the same arguments.
+fn switch_control(
+    session_name: &SessionName,
+    render_frame: &[u8],
+    persistent_overlay_state_id: Option<u64>,
+) -> AttachControl {
+    AttachControl::switch(test_attach_target(
+        session_name,
+        render_frame,
+        persistent_overlay_state_id,
+    ))
+}
+
+/// A persistent overlay `frame` for overlay state `state_id`.
+fn persistent_overlay_control(
+    frame: &[u8],
+    render_generation: u64,
+    overlay_generation: u64,
+    state_id: u64,
+) -> AttachControl {
+    AttachControl::Overlay(OverlayFrame::persistent_with_state(
+        frame.to_vec(),
+        render_generation,
+        overlay_generation,
+        state_id,
+    ))
+}
+
 #[test]
 fn live_output_is_preserved_only_for_coalescible_same_source_refreshes() {
-    let session_name = SessionName::new("live-output-source").expect("valid session name");
+    let session_name = session_name("live-output-source");
     let shared_output = pane_output_channel();
-    let mut initial =
-        test_attach_target_with_output(&session_name, b"BASE-A", None, shared_output.clone(), true);
-    initial.live_pane_handover = false;
+    let initial = test_render_only_kitty_target(&session_name, b"BASE-A", &shared_output);
     let current = open_attach_target(initial, false).expect("open initial target");
 
-    let mut same_source =
-        test_attach_target_with_output(&session_name, b"BASE-B", None, shared_output.clone(), true);
-    same_source.live_pane_handover = false;
+    let same_source = test_render_only_kitty_target(&session_name, b"BASE-B", &shared_output);
     assert!(preserves_live_output(&current, &same_source));
 
-    let mut different_source =
-        test_attach_target_with_output(&session_name, b"BASE-C", None, pane_output_channel(), true);
-    different_source.live_pane_handover = false;
+    let different_source =
+        test_render_only_kitty_target(&session_name, b"BASE-C", &pane_output_channel());
     assert!(different_source.is_coalescible_render_refresh());
     assert!(!preserves_live_output(&current, &different_source));
 
     let non_coalescible_same_source =
-        test_attach_target_with_output(&session_name, b"BASE-D", None, shared_output.clone(), true);
+        test_attach_target_with_output(&session_name, b"BASE-D", &shared_output, true);
     assert!(!non_coalescible_same_source.is_coalescible_render_refresh());
     assert!(!preserves_live_output(
         &current,
@@ -2087,8 +1867,7 @@ fn live_output_is_preserved_only_for_coalescible_same_source_refreshes() {
     // passthroughs must survive. Coupling the two predicates would drop them on
     // every title change (issue #182).
     let mut title_carrying =
-        test_attach_target_with_output(&session_name, b"BASE-E", None, shared_output, true);
-    title_carrying.live_pane_handover = false;
+        test_render_only_kitty_target(&session_name, b"BASE-E", &shared_output);
     let terminal = OuterTerminal::resolve(
         &OptionStore::new(),
         OuterTerminalContext::from_pairs(&[("TERM", "tmux-256color")]),
@@ -2112,7 +1891,7 @@ fn live_output_is_preserved_only_for_coalescible_same_source_refreshes() {
 
 #[test]
 fn render_only_switches_coalesce_before_reliable_controls() {
-    let alpha = SessionName::new("alpha").expect("valid session name");
+    let alpha = session_name("alpha");
     let (control_tx, mut control_rx) = mpsc::unbounded_channel();
     let mut deferred_controls = VecDeque::new();
 
@@ -2147,7 +1926,7 @@ fn render_only_switches_coalesce_before_reliable_controls() {
 
 #[test]
 fn sender_side_switch_coalescing_preserves_render_generation_count() {
-    let alpha = SessionName::new("alpha").expect("valid session name");
+    let alpha = session_name("alpha");
     let (control_tx, mut control_rx) = mpsc::unbounded_channel();
     let control_backlog = Arc::new(AtomicUsize::new(0));
     let sender = AttachControlSender::new(
@@ -2185,7 +1964,7 @@ fn sender_side_switch_coalescing_preserves_render_generation_count() {
 
 #[test]
 fn render_only_switch_coalescing_preserves_deferred_control_order() {
-    let alpha = SessionName::new("alpha").expect("valid session name");
+    let alpha = session_name("alpha");
     let (control_tx, mut control_rx) = mpsc::unbounded_channel();
     let mut deferred_controls = VecDeque::from([AttachControl::Refresh]);
 
@@ -2220,44 +1999,16 @@ fn render_only_switch_coalescing_preserves_deferred_control_order() {
 
 #[tokio::test]
 async fn pending_switch_action_reports_target_change_for_status_reschedule() {
-    let alpha = SessionName::new("alpha").expect("valid session name");
-    let beta = SessionName::new("beta").expect("valid session name");
-    let (stream, mut peer) = tokio::net::UnixStream::pair().expect("attach stream pair");
-    let stream = AttachTransport::from(stream);
-    let (control_tx, mut control_rx) = mpsc::unbounded_channel();
-    let mut current_target = open_attach_target(test_attach_target(&alpha, b"BASE-A", None), false)
-        .expect("open target");
-    let mut render_generation = 0_u64;
-    let mut overlay_generation = 0_u64;
-    let mut persistent_overlay = None::<Vec<u8>>;
-    let mut persistent_overlay_visible = false;
-    let mut persistent_overlay_state_id = current_target.persistent_overlay_state_id;
-    let mut locked = false;
-    let mut deferred_controls = VecDeque::new();
+    let alpha = session_name("alpha");
+    let beta = session_name("beta");
+    let mut controls = PendingControls::new(test_attach_target(&alpha, b"BASE-A", None));
 
-    control_tx
-        .send(AttachControl::switch(test_attach_target(
-            &beta, b"BASE-B", None,
-        )))
+    controls
+        .control_tx
+        .send(switch_control(&beta, b"BASE-B", None))
         .expect("send switch control");
 
-    let control_backlog = AtomicUsize::new(0);
-    let action = apply_pending_attach_controls(
-        &mut deferred_controls,
-        Some(&mut control_rx),
-        &control_backlog,
-        &mut current_target,
-        &stream,
-        &mut render_generation,
-        &mut overlay_generation,
-        &mut persistent_overlay,
-        &mut persistent_overlay_visible,
-        &mut persistent_overlay_state_id,
-        &mut locked,
-        None,
-    )
-    .await
-    .expect("apply pending switch");
+    let action = controls.apply(None).await.expect("apply pending switch");
 
     assert!(matches!(
         action,
@@ -2265,8 +2016,8 @@ async fn pending_switch_action_reports_target_change_for_status_reschedule() {
             target_changed: true
         }
     ));
-    assert_eq!(current_target.session_name, beta);
-    let refresh = read_attach_data_until(&mut peer, b"BASE-B").await;
+    assert_eq!(controls.target.session_name, beta);
+    let refresh = read_attach_data_until(&mut controls.peer, b"BASE-B").await;
     assert!(
         String::from_utf8_lossy(&refresh).contains("BASE-B"),
         "switch should render the target frame"
@@ -2275,47 +2026,23 @@ async fn pending_switch_action_reports_target_change_for_status_reschedule() {
 
 #[tokio::test]
 async fn pending_refresh_after_switch_preserves_target_change() {
-    let alpha = SessionName::new("alpha").expect("valid session name");
-    let beta = SessionName::new("beta").expect("valid session name");
-    let (stream, mut peer) = tokio::net::UnixStream::pair().expect("attach stream pair");
-    let stream = AttachTransport::from(stream);
-    let (control_tx, mut control_rx) = mpsc::unbounded_channel();
-    let mut current_target = open_attach_target(test_attach_target(&alpha, b"BASE-A", None), false)
-        .expect("open target");
-    let mut render_generation = 0_u64;
-    let mut overlay_generation = 0_u64;
-    let mut persistent_overlay = None::<Vec<u8>>;
-    let mut persistent_overlay_visible = false;
-    let mut persistent_overlay_state_id = current_target.persistent_overlay_state_id;
-    let mut locked = false;
-    let mut deferred_controls = VecDeque::new();
+    let alpha = session_name("alpha");
+    let beta = session_name("beta");
+    let mut controls = PendingControls::new(test_attach_target(&alpha, b"BASE-A", None));
 
-    control_tx
-        .send(AttachControl::switch(test_attach_target(
-            &beta, b"BASE-B", None,
-        )))
+    controls
+        .control_tx
+        .send(switch_control(&beta, b"BASE-B", None))
         .expect("send switch control");
-    control_tx
+    controls
+        .control_tx
         .send(AttachControl::Refresh)
         .expect("send refresh control");
 
-    let control_backlog = AtomicUsize::new(0);
-    let action = apply_pending_attach_controls(
-        &mut deferred_controls,
-        Some(&mut control_rx),
-        &control_backlog,
-        &mut current_target,
-        &stream,
-        &mut render_generation,
-        &mut overlay_generation,
-        &mut persistent_overlay,
-        &mut persistent_overlay_visible,
-        &mut persistent_overlay_state_id,
-        &mut locked,
-        None,
-    )
-    .await
-    .expect("apply pending switch and refresh");
+    let action = controls
+        .apply(None)
+        .await
+        .expect("apply pending switch and refresh");
 
     assert!(matches!(
         action,
@@ -2323,8 +2050,8 @@ async fn pending_refresh_after_switch_preserves_target_change() {
             target_changed: true
         }
     ));
-    assert_eq!(current_target.session_name, beta);
-    let refresh = read_attach_data_until(&mut peer, b"BASE-B").await;
+    assert_eq!(controls.target.session_name, beta);
+    let refresh = read_attach_data_until(&mut controls.peer, b"BASE-B").await;
     assert!(
         String::from_utf8_lossy(&refresh).contains("BASE-B"),
         "switch should render before the refresh is scheduled"
@@ -2333,52 +2060,28 @@ async fn pending_refresh_after_switch_preserves_target_change() {
 
 #[tokio::test]
 async fn pending_same_pane_switch_preserves_partial_input_and_escape_deadline() {
-    let alpha = SessionName::new("pending-input-refresh").expect("valid session name");
-    let (stream, _peer) = tokio::net::UnixStream::pair().expect("attach stream pair");
-    let stream = AttachTransport::from(stream);
-    let (_control_tx, mut control_rx) = mpsc::unbounded_channel();
+    let alpha = session_name("pending-input-refresh");
     let pane_output = pane_output_channel();
-    let mut current_target = open_attach_target(
-        test_attach_target_with_output(&alpha, b"BASE-A", None, pane_output.clone(), false),
-        false,
-    )
-    .expect("open target");
-    let mut render_generation = 0_u64;
-    let mut overlay_generation = 0_u64;
-    let mut persistent_overlay = None::<Vec<u8>>;
-    let mut persistent_overlay_visible = false;
-    let mut persistent_overlay_state_id = current_target.persistent_overlay_state_id;
-    let mut locked = false;
+    let initial = test_attach_target_with_output(&alpha, b"BASE-A", &pane_output, false);
+    let mut controls = PendingControls::new(initial);
     let mut pending_input = b"\x1b_".to_vec();
     let mut pending_escape_flush = PendingEscapeFlush::default();
     pending_escape_flush.sync(&pending_input, Duration::from_secs(30));
     let original_deadline = pending_escape_flush
         .deadline()
         .expect("Meta-_ should arm the escape deadline");
-    let mut deferred_controls = VecDeque::from([AttachControl::switch(
-        test_attach_target_with_output(&alpha, b"BASE-B", None, pane_output, false),
-    )]);
+    let replacement = test_attach_target_with_output(&alpha, b"BASE-B", &pane_output, false);
+    controls
+        .deferred
+        .push_back(AttachControl::switch(replacement));
 
-    let control_backlog = AtomicUsize::new(0);
-    let action = apply_pending_attach_controls(
-        &mut deferred_controls,
-        Some(&mut control_rx),
-        &control_backlog,
-        &mut current_target,
-        &stream,
-        &mut render_generation,
-        &mut overlay_generation,
-        &mut persistent_overlay,
-        &mut persistent_overlay_visible,
-        &mut persistent_overlay_state_id,
-        &mut locked,
-        Some(PendingAttachInputState::new(
+    let action = controls
+        .apply(Some(PendingAttachInputState::new(
             &mut pending_input,
             &mut pending_escape_flush,
-        )),
-    )
-    .await
-    .expect("apply queued same-pane refresh");
+        )))
+        .await
+        .expect("apply queued same-pane refresh");
 
     assert!(matches!(action, PendingAttachAction::Continue { .. }));
     assert_eq!(pending_input, b"\x1b_");
@@ -2387,45 +2090,22 @@ async fn pending_same_pane_switch_preserves_partial_input_and_escape_deadline() 
 
 #[tokio::test]
 async fn pending_different_pane_switch_clears_partial_input_and_escape_deadline() {
-    let alpha = SessionName::new("pending-input-pane-change").expect("valid session name");
-    let (stream, _peer) = tokio::net::UnixStream::pair().expect("attach stream pair");
-    let stream = AttachTransport::from(stream);
-    let (_control_tx, mut control_rx) = mpsc::unbounded_channel();
-    let mut current_target = open_attach_target(test_attach_target(&alpha, b"BASE-A", None), false)
-        .expect("open target");
-    let mut render_generation = 0_u64;
-    let mut overlay_generation = 0_u64;
-    let mut persistent_overlay = None::<Vec<u8>>;
-    let mut persistent_overlay_visible = false;
-    let mut persistent_overlay_state_id = current_target.persistent_overlay_state_id;
-    let mut locked = false;
+    let alpha = session_name("pending-input-pane-change");
+    let mut controls = PendingControls::new(test_attach_target(&alpha, b"BASE-A", None));
     let mut pending_input = b"\x1b_".to_vec();
     let mut pending_escape_flush = PendingEscapeFlush::default();
     pending_escape_flush.sync(&pending_input, Duration::from_secs(30));
-    let mut deferred_controls = VecDeque::from([AttachControl::switch(test_attach_target(
-        &alpha, b"BASE-B", None,
-    ))]);
+    controls
+        .deferred
+        .push_back(switch_control(&alpha, b"BASE-B", None));
 
-    let control_backlog = AtomicUsize::new(0);
-    apply_pending_attach_controls(
-        &mut deferred_controls,
-        Some(&mut control_rx),
-        &control_backlog,
-        &mut current_target,
-        &stream,
-        &mut render_generation,
-        &mut overlay_generation,
-        &mut persistent_overlay,
-        &mut persistent_overlay_visible,
-        &mut persistent_overlay_state_id,
-        &mut locked,
-        Some(PendingAttachInputState::new(
+    controls
+        .apply(Some(PendingAttachInputState::new(
             &mut pending_input,
             &mut pending_escape_flush,
-        )),
-    )
-    .await
-    .expect("apply queued pane change");
+        )))
+        .await
+        .expect("apply queued pane change");
 
     assert!(pending_input.is_empty());
     assert!(pending_escape_flush.deadline().is_none());
@@ -2444,52 +2124,27 @@ async fn terminal_ownership_controls_clear_partial_input_and_escape_deadline() {
         ),
         ("suspend", AttachControl::Suspend),
     ] {
-        let session_name =
-            SessionName::new(format!("pending-input-{label}")).expect("valid session name");
-        let (stream, _peer) = tokio::net::UnixStream::pair().expect("attach stream pair");
-        let stream = AttachTransport::from(stream);
-        let (_control_tx, mut control_rx) = mpsc::unbounded_channel();
-        let mut current_target =
-            open_attach_target(test_attach_target(&session_name, b"BASE", None), false)
-                .expect("open target");
-        let mut render_generation = 0_u64;
-        let mut overlay_generation = 0_u64;
-        let mut persistent_overlay = None::<Vec<u8>>;
-        let mut persistent_overlay_visible = false;
-        let mut persistent_overlay_state_id = current_target.persistent_overlay_state_id;
-        let mut locked = false;
+        let session_name = session_name(&format!("pending-input-{label}"));
+        let mut controls = PendingControls::new(test_attach_target(&session_name, b"BASE", None));
         let mut pending_input = b"\x1b_".to_vec();
         let mut pending_escape_flush = PendingEscapeFlush::default();
         pending_escape_flush.sync(&pending_input, Duration::from_secs(30));
         assert!(pending_escape_flush.deadline().is_some());
-        let mut deferred_controls = VecDeque::from([control]);
+        controls.deferred.push_back(control);
 
-        let control_backlog = AtomicUsize::new(0);
-        let action = apply_pending_attach_controls(
-            &mut deferred_controls,
-            Some(&mut control_rx),
-            &control_backlog,
-            &mut current_target,
-            &stream,
-            &mut render_generation,
-            &mut overlay_generation,
-            &mut persistent_overlay,
-            &mut persistent_overlay_visible,
-            &mut persistent_overlay_state_id,
-            &mut locked,
-            Some(PendingAttachInputState::new(
+        let action = controls
+            .apply(Some(PendingAttachInputState::new(
                 &mut pending_input,
                 &mut pending_escape_flush,
-            )),
-        )
-        .await
-        .unwrap_or_else(|error| panic!("apply pending {label}: {error}"));
+            )))
+            .await
+            .unwrap_or_else(|error| panic!("apply pending {label}: {error}"));
 
         assert!(
             matches!(action, PendingAttachAction::Continue { .. }),
             "{label} transfers terminal ownership"
         );
-        assert!(locked, "{label} marks the attach as locked");
+        assert!(controls.locked, "{label} marks the attach as locked");
         assert!(pending_input.is_empty(), "{label} drops partial input");
         assert!(
             pending_escape_flush.deadline().is_none(),
@@ -2500,74 +2155,33 @@ async fn terminal_ownership_controls_clear_partial_input_and_escape_deadline() {
 
 #[tokio::test]
 async fn stale_persistent_switches_still_advance_render_generation() {
-    let alpha = SessionName::new("alpha").expect("valid session name");
-    let beta = SessionName::new("beta").expect("valid session name");
-    let (stream, _peer) = tokio::net::UnixStream::pair().expect("attach stream pair");
-    let stream = AttachTransport::from(stream);
-    let (control_tx, mut control_rx) = mpsc::unbounded_channel();
-    let mut current_target =
-        open_attach_target(test_attach_target(&alpha, b"BASE-A", Some(10)), false)
-            .expect("open target");
-    let mut render_generation = 41_u64;
-    let mut overlay_generation = 0_u64;
-    let mut persistent_overlay = None::<Vec<u8>>;
-    let mut persistent_overlay_visible = false;
-    let mut persistent_overlay_state_id = current_target.persistent_overlay_state_id;
-    let mut locked = false;
-    let mut deferred_controls = VecDeque::new();
+    let alpha = session_name("alpha");
+    let beta = session_name("beta");
+    let mut controls = PendingControls::new(test_attach_target(&alpha, b"BASE-A", Some(10)));
+    controls.render_generation = 41;
 
-    control_tx
-        .send(AttachControl::switch(test_attach_target(
-            &beta,
-            b"STALE-B",
-            Some(9),
-        )))
+    controls
+        .control_tx
+        .send(switch_control(&beta, b"STALE-B", Some(9)))
         .expect("send stale switch control");
 
-    let control_backlog = AtomicUsize::new(0);
-    let action = apply_pending_attach_controls(
-        &mut deferred_controls,
-        Some(&mut control_rx),
-        &control_backlog,
-        &mut current_target,
-        &stream,
-        &mut render_generation,
-        &mut overlay_generation,
-        &mut persistent_overlay,
-        &mut persistent_overlay_visible,
-        &mut persistent_overlay_state_id,
-        &mut locked,
-        None,
-    )
-    .await
-    .expect("apply stale pending switch");
+    let action = controls
+        .apply(None)
+        .await
+        .expect("apply stale pending switch");
 
     assert!(matches!(action, PendingAttachAction::Write));
-    assert_eq!(current_target.session_name, alpha);
-    assert_eq!(render_generation, 42);
+    assert_eq!(controls.target.session_name, alpha);
+    assert_eq!(controls.render_generation, 42);
 }
 
 #[tokio::test]
 async fn render_only_switch_forwards_pending_live_passthroughs() {
-    let alpha = SessionName::new("alpha").expect("valid session name");
-    let (stream, mut peer) = tokio::net::UnixStream::pair().expect("attach stream pair");
-    let stream = AttachTransport::from(stream);
-    let (control_tx, mut control_rx) = mpsc::unbounded_channel();
+    let alpha = session_name("alpha");
     let pane_output = pane_output_channel();
-    let mut initial =
-        test_attach_target_with_output(&alpha, b"BASE-A", None, pane_output.clone(), true);
-    initial.live_pane_handover = false;
-    let mut replacement =
-        test_attach_target_with_output(&alpha, b"BASE-B", None, pane_output.clone(), true);
-    replacement.live_pane_handover = false;
-    let mut current_target = open_attach_target(initial, false).expect("open target");
-    let mut render_generation = 0_u64;
-    let mut overlay_generation = 0_u64;
-    let mut persistent_overlay = None::<Vec<u8>>;
-    let mut persistent_overlay_visible = false;
-    let mut persistent_overlay_state_id = current_target.persistent_overlay_state_id;
-    let mut locked = false;
-    let mut deferred_controls = VecDeque::new();
+    let initial = test_render_only_kitty_target(&alpha, b"BASE-A", &pane_output);
+    let mut replacement = test_render_only_kitty_target(&alpha, b"BASE-B", &pane_output);
+    let mut controls = PendingControls::new(initial);
 
     pane_output.send_for_generation_with_passthroughs(
         None,
@@ -2588,66 +2202,67 @@ async fn render_only_switch_forwards_pending_live_passthroughs() {
         )],
     );
     replacement.pane_output_start_sequence = 1;
-    control_tx
+    controls
+        .control_tx
         .send(AttachControl::switch(replacement))
         .expect("send render-only switch");
 
-    let control_backlog = AtomicUsize::new(0);
-    let action = apply_pending_attach_controls(
-        &mut deferred_controls,
-        Some(&mut control_rx),
-        &control_backlog,
-        &mut current_target,
-        &stream,
-        &mut render_generation,
-        &mut overlay_generation,
-        &mut persistent_overlay,
-        &mut persistent_overlay_visible,
-        &mut persistent_overlay_state_id,
-        &mut locked,
-        None,
-    )
-    .await
-    .expect("apply pending switch");
+    let action = controls.apply(None).await.expect("apply pending switch");
 
     assert!(matches!(action, PendingAttachAction::Write));
-    let refresh = read_attach_data_until(&mut peer, b"Gf=100;AAAA").await;
+    let refresh = read_attach_data_until(&mut controls.peer, b"Gf=100;AAAA").await;
     assert!(
         String::from_utf8_lossy(&refresh).contains("BASE-B"),
         "render-only switch should still write the replacement frame"
     );
     assert!(
-        refresh
-            .windows(b"\x1b_Gf=100;AAAA\x1b\\".len())
-            .any(|window| window == b"\x1b_Gf=100;AAAA\x1b\\"),
+        contains_bytes(&refresh, b"\x1b_Gf=100;AAAA\x1b\\"),
         "render-only switch must not drop pending live passthroughs"
     );
     assert!(
-        !refresh
-            .windows(b"\x1b_Gf=100;BBBB\x1b\\".len())
-            .any(|window| window == b"\x1b_Gf=100;BBBB\x1b\\"),
+        !contains_bytes(&refresh, b"\x1b_Gf=100;BBBB\x1b\\"),
         "render-only switch must not duplicate passthroughs covered by the replacement receiver"
     );
 }
 
+/// Where `needle` first occurs in `haystack`.
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    find_bytes(haystack, needle).is_some()
+}
+
+/// Reads one chunk from `peer` and appends the Data/Render payloads it completes to `collected`;
+/// answers with the chunk length, 0 at end of stream.
+async fn read_attach_data(
+    peer: &mut tokio::net::UnixStream,
+    decoder: &mut AttachFrameDecoder,
+    collected: &mut Vec<u8>,
+) -> usize {
+    let mut frame_bytes = [0_u8; 4096];
+    let bytes_read = peer.read(&mut frame_bytes).await.expect("read peer bytes");
+    decoder.push_bytes(&frame_bytes[..bytes_read]);
+    while let Some(message) = decoder.next_message().expect("decode attach frame") {
+        if let AttachMessage::Data(bytes) | AttachMessage::Render(bytes) = message {
+            collected.extend_from_slice(&bytes);
+        }
+    }
+    bytes_read
+}
+
+/// Reads attach data from `peer` until it contains `needle`, failing after a second.
 async fn read_attach_data_until(peer: &mut tokio::net::UnixStream, needle: &[u8]) -> Vec<u8> {
     tokio::time::timeout(Duration::from_secs(1), async {
-        let mut collected = Vec::new();
-        let mut frame_bytes = [0_u8; 4096];
         let mut decoder = AttachFrameDecoder::new();
+        let mut collected = Vec::new();
         loop {
-            let bytes_read = peer.read(&mut frame_bytes).await.expect("read peer bytes");
+            let bytes_read = read_attach_data(peer, &mut decoder, &mut collected).await;
             assert!(bytes_read > 0, "attach stream closed before expected data");
-            decoder.push_bytes(&frame_bytes[..bytes_read]);
-            while let Some(message) = decoder.next_message().expect("decode attach frame") {
-                if let AttachMessage::Data(bytes) | AttachMessage::Render(bytes) = message {
-                    collected.extend_from_slice(&bytes);
-                }
-            }
-            if collected
-                .windows(needle.len())
-                .any(|window| window == needle)
-            {
+            if contains_bytes(&collected, needle) {
                 break collected;
             }
         }
@@ -2656,28 +2271,45 @@ async fn read_attach_data_until(peer: &mut tokio::net::UnixStream, needle: &[u8]
     .expect("timed out waiting for attach data")
 }
 
+/// Reads whatever attach data `peer` receives within `duration`, or until it closes.
+async fn read_attach_data_for(peer: &mut tokio::net::UnixStream, duration: Duration) -> Vec<u8> {
+    let mut decoder = AttachFrameDecoder::new();
+    let mut collected = Vec::new();
+    let deadline = tokio::time::sleep(duration);
+    tokio::pin!(deadline);
+
+    loop {
+        tokio::select! {
+            _ = &mut deadline => break,
+            bytes_read = read_attach_data(peer, &mut decoder, &mut collected) => {
+                if bytes_read == 0 {
+                    break;
+                }
+            }
+        }
+    }
+
+    collected
+}
+
 #[tokio::test]
 async fn initial_attach_repaint_above_two_mib_uses_bounded_ordered_fragments() {
-    let handler = Arc::new(RequestHandler::new());
-    let session_name = SessionName::new("large-initial-repaint").expect("valid session name");
+    let session_name = session_name("large-initial-repaint");
     let repaint = (0..(2 * DEFAULT_MAX_FRAME_LENGTH + 17))
         .map(|index| (index % 251) as u8)
         .collect::<Vec<_>>();
-    let (stream, mut peer) = tokio::net::UnixStream::pair().expect("attach stream pair");
-    let (shutdown_tx, shutdown_rx) = watch::channel(());
     let (_control_tx, control_rx) = mpsc::unbounded_channel();
-    let attach_task = tokio::spawn(forward_attach(
-        stream,
+    let mut attach = AttachForwarder::spawn(
         test_render_only_attach_target(&session_name, &repaint),
-        Vec::new(),
-        shutdown_rx,
         control_rx,
-        Arc::new(AtomicUsize::new(0)),
-        Arc::new(AtomicBool::new(false)),
-        Arc::new(AtomicU64::new(0)),
-        LiveAttachInputContext::unregistered_for_test(handler, std::process::id()),
+        Arc::default(),
+        LiveAttachInputContext::unregistered_for_test(
+            Arc::new(RequestHandler::new()),
+            std::process::id(),
+        ),
         true,
-    ));
+    );
+    let peer = &mut attach.peer;
 
     let mut decoder = AttachFrameDecoder::new();
     let mut reconstructed = Vec::with_capacity(repaint.len());
@@ -2708,9 +2340,10 @@ async fn initial_attach_repaint_above_two_mib_uses_bounded_ordered_fragments() {
     );
     assert_eq!(reconstructed, repaint);
 
-    shutdown_tx.send(()).expect("request attach shutdown");
+    attach.shutdown.send(()).expect("request attach shutdown");
     assert!(
-        attach_task
+        attach
+            .task
             .await
             .expect("attach task joins after shutdown")
             .is_ok(),
@@ -2720,32 +2353,10 @@ async fn initial_attach_repaint_above_two_mib_uses_bounded_ordered_fragments() {
 
 #[tokio::test]
 async fn forward_attach_exited_control_wins_over_closing_shutdown() {
-    let handler = Arc::new(RequestHandler::new());
-    let session_name = SessionName::new("alpha").expect("valid session name");
-    let (stream, mut peer) = tokio::net::UnixStream::pair().expect("attach stream pair");
-    let (shutdown_tx, shutdown_rx) = watch::channel(());
-    let (control_tx, control_rx) = mpsc::unbounded_channel();
-    let closing = Arc::new(AtomicBool::new(false));
-    let live_input = LiveAttachInputContext::unregistered_for_test(handler, std::process::id());
+    let (mut attach, control_tx) =
+        AttachForwarder::unregistered(test_attach_target(&session_name("alpha"), b"BASE-0", None));
 
-    let attach_task = tokio::spawn(forward_attach(
-        stream,
-        test_attach_target(&session_name, b"BASE-0", None),
-        Vec::new(),
-        shutdown_rx,
-        control_rx,
-        Arc::new(AtomicUsize::new(0)),
-        Arc::clone(&closing),
-        Arc::new(AtomicU64::new(0)),
-        live_input,
-        false,
-    ));
-
-    let initial = read_attach_data_until(&mut peer, b"BASE-0").await;
-    assert!(
-        String::from_utf8_lossy(&initial).contains("BASE-0"),
-        "initial attach should render the base pane"
-    );
+    attach.assert_initial_render("BASE-0").await;
 
     control_tx
         .send(AttachControl::Refresh)
@@ -2753,18 +2364,16 @@ async fn forward_attach_exited_control_wins_over_closing_shutdown() {
     control_tx
         .send(AttachControl::Exited)
         .expect("send exited control");
-    closing.store(true, Ordering::SeqCst);
-    shutdown_tx.send(()).expect("request attach shutdown");
+    attach.closing.store(true, Ordering::SeqCst);
+    attach.shutdown.send(()).expect("request attach shutdown");
 
-    let exited = read_attach_data_until(&mut peer, b"[exited]\r\n").await;
+    let exited = read_attach_data_until(&mut attach.peer, b"[exited]\r\n").await;
     assert!(
-        exited
-            .windows(b"[exited]\r\n".len())
-            .any(|window| window == b"[exited]\r\n"),
+        contains_bytes(&exited, b"[exited]\r\n"),
         "exited control must win over the closing shutdown race"
     );
 
-    let result = attach_task.await.expect("attach task join");
+    let result = attach.task.await.expect("attach task join");
     assert!(
         result.is_ok(),
         "forward_attach should exit cleanly: {result:?}"
@@ -2778,28 +2387,19 @@ async fn admitted_attach_input_batch_drains_after_shutdown_admission_closes() {
         create_attach_input_test_session(&handler, "attach-admitted-shutdown-drain").await;
     let session_name = pane_target.session_name().clone();
     let attach_pid = 912_051;
-    let (control_tx, control_rx) = mpsc::unbounded_channel();
-    handler
-        .register_attach(attach_pid, session_name.clone(), control_tx)
-        .await;
+    let control_rx = handler.attach_client(attach_pid, &session_name).await;
     let live_input =
         LiveAttachInputContext::current_for_test(Arc::clone(&handler), attach_pid).await;
     let live_input_identity = live_input.identity;
-    let (stream, mut peer) = tokio::net::UnixStream::pair().expect("attach stream pair");
-    let (shutdown_tx, shutdown_rx) = watch::channel(());
-    let attach_task = tokio::spawn(forward_attach(
-        stream,
+    let mut attach = AttachForwarder::spawn(
         test_attach_target(&session_name, b"BASE-ADMITTED", None),
-        Vec::new(),
-        shutdown_rx,
         control_rx,
-        Arc::new(AtomicUsize::new(0)),
-        Arc::new(AtomicBool::new(false)),
-        Arc::new(AtomicU64::new(0)),
+        Arc::default(),
         live_input,
         false,
-    ));
-    let _ = read_attach_data_until(&mut peer, b"BASE-ADMITTED").await;
+    );
+    let peer = &mut attach.peer;
+    let _ = read_attach_data_until(peer, b"BASE-ADMITTED").await;
     let pause = install_live_attach_input_validation_pause(live_input_identity);
 
     peer.write_all(
@@ -2825,10 +2425,10 @@ async fn admitted_attach_input_batch_drains_after_shutdown_admission_closes() {
         !handler.normal_drain_requests_quiesced(),
         "the admitted attach mutation must remain counted while paused"
     );
-    shutdown_tx.send_replace(());
+    attach.shutdown.send_replace(());
     pause.release.notify_one();
 
-    tokio::time::timeout(Duration::from_secs(2), attach_task)
+    tokio::time::timeout(Duration::from_secs(2), attach.task)
         .await
         .expect("admitted attach batch drains before shutdown")
         .expect("attach task join")
@@ -2854,10 +2454,7 @@ async fn attach_input_ready_after_shutdown_admission_closes_is_rejected() {
         create_attach_input_test_session(&handler, "attach-rejected-after-shutdown").await;
     let session_name = pane_target.session_name().clone();
     let attach_pid = 912_052;
-    let (control_tx, control_rx) = mpsc::unbounded_channel();
-    handler
-        .register_attach(attach_pid, session_name.clone(), control_tx)
-        .await;
+    let control_rx = handler.attach_client(attach_pid, &session_name).await;
     let live_input =
         LiveAttachInputContext::current_for_test(Arc::clone(&handler), attach_pid).await;
     let (stream, _peer) = tokio::net::UnixStream::pair().expect("attach stream pair");
@@ -2899,28 +2496,18 @@ async fn attach_input_ready_after_shutdown_admission_closes_is_rejected() {
 #[tokio::test]
 async fn closing_shutdown_discards_mutating_controls_but_finishes_terminal_exit() {
     let handler = Arc::new(RequestHandler::new());
-    let session_name =
-        SessionName::new("attach-closing-shutdown-barrier").expect("valid session name");
-    let (stream, mut peer) = tokio::net::UnixStream::pair().expect("attach stream pair");
-    let (_shutdown_tx, shutdown_rx) = watch::channel(());
+    let session_name = session_name("attach-closing-shutdown-barrier");
     let (control_tx, control_rx) = mpsc::unbounded_channel();
-    let closing = Arc::new(AtomicBool::new(false));
-
-    let attach_task = tokio::spawn(forward_attach(
-        stream,
+    let mut attach = AttachForwarder::spawn(
         test_attach_target(&session_name, b"BASE-CLOSING", None),
-        Vec::new(),
-        shutdown_rx,
         control_rx,
-        Arc::new(AtomicUsize::new(0)),
-        Arc::clone(&closing),
-        Arc::new(AtomicU64::new(0)),
+        Arc::default(),
         LiveAttachInputContext::unregistered_for_test(Arc::clone(&handler), 912_053),
         false,
-    ));
-    let _ = read_attach_data_until(&mut peer, b"BASE-CLOSING").await;
+    );
+    let _ = read_attach_data_until(&mut attach.peer, b"BASE-CLOSING").await;
 
-    closing.store(true, Ordering::SeqCst);
+    attach.closing.store(true, Ordering::SeqCst);
     handler.close_normal_request_admission();
     control_tx
         .send(AttachControl::Suspend)
@@ -2929,14 +2516,16 @@ async fn closing_shutdown_discards_mutating_controls_but_finishes_terminal_exit(
         .send(AttachControl::Exited)
         .expect("queue terminal attach control");
 
-    tokio::time::timeout(Duration::from_secs(2), attach_task)
+    tokio::time::timeout(Duration::from_secs(2), attach.task)
         .await
         .expect("closing attach finishes terminal transport state")
         .expect("attach task join")
         .expect("attach exits cleanly");
 
     let mut wire = Vec::new();
-    peer.read_to_end(&mut wire)
+    attach
+        .peer
+        .read_to_end(&mut wire)
         .await
         .expect("read completed attach transport");
     let mut decoder = AttachFrameDecoder::new();
@@ -2951,9 +2540,9 @@ async fn closing_shutdown_discards_mutating_controls_but_finishes_terminal_exit(
     );
     assert!(
         messages.iter().any(|message| match message {
-            AttachMessage::Data(bytes) | AttachMessage::Render(bytes) => bytes
-                .windows(b"[exited]\r\n".len())
-                .any(|window| window == b"[exited]\r\n"),
+            AttachMessage::Data(bytes) | AttachMessage::Render(bytes) => {
+                contains_bytes(bytes, b"[exited]\r\n")
+            }
             _ => false,
         }),
         "the non-mutating terminal control must still finish the exit banner"
@@ -2963,21 +2552,10 @@ async fn closing_shutdown_discards_mutating_controls_but_finishes_terminal_exit(
 #[tokio::test]
 async fn last_session_exit_waits_for_attach_wire_drain_before_daemon_shutdown() {
     let handler = Arc::new(RequestHandler::new());
-    let session_name = SessionName::new("attach-drain").expect("valid session name");
-    let created = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name: session_name.clone(),
-            detached: true,
-            size: Some(TerminalSize { cols: 80, rows: 24 }),
-            environment: None,
-        }))
-        .await;
-    assert!(matches!(created, Response::NewSession(_)), "{created:?}");
+    let session_name = handler.create_session("attach-drain").await;
     let (daemon_shutdown, mut daemon_shutdown_rx) = ShutdownHandle::new();
     handler.install_shutdown_handle(daemon_shutdown);
     let forwarder_guard = handler.begin_attach_forwarder();
-    let (stream, mut peer) = tokio::net::UnixStream::pair().expect("attach stream pair");
-    let (_shutdown_tx, shutdown_rx) = watch::channel(());
     let (control_tx, control_rx) = mpsc::unbounded_channel();
     let closing = Arc::new(AtomicBool::new(false));
     let attach_pid = std::process::id();
@@ -2994,29 +2572,18 @@ async fn last_session_exit_waits_for_attach_wire_drain_before_daemon_shutdown() 
     let live_input =
         LiveAttachInputContext::current_for_test(Arc::clone(&handler), attach_pid).await;
 
-    let attach_task = tokio::spawn(forward_attach(
-        stream,
+    let mut attach = AttachForwarder::spawn(
         test_attach_target(&session_name, b"BASE-0", None),
-        Vec::new(),
-        shutdown_rx,
         control_rx,
-        Arc::new(AtomicUsize::new(0)),
         closing,
-        Arc::new(AtomicU64::new(0)),
         live_input,
         false,
-    ));
-    let _ = read_attach_data_until(&mut peer, b"BASE-0").await;
+    );
+    let _ = read_attach_data_until(&mut attach.peer, b"BASE-0").await;
 
-    let killed = handler
-        .handle(Request::KillSession(KillSessionRequest {
-            target: session_name,
-            kill_all_except_target: false,
-            clear_alerts: false,
-            kill_group: false,
-        }))
+    handler
+        .handle_ok(KillSessionRequest::fixture(session_name))
         .await;
-    assert!(matches!(killed, Response::KillSession(_)), "{killed:?}");
     assert!(
         !handler.request_shutdown_if_pending(),
         "exit-empty must wait for the attached exit frame to drain"
@@ -3028,14 +2595,12 @@ async fn last_session_exit_waits_for_attach_wire_drain_before_daemon_shutdown() 
         "daemon shutdown must stay pending while the attach forwarder owns the wire"
     );
 
-    let exited = read_attach_data_until(&mut peer, b"[exited]\r\n").await;
+    let exited = read_attach_data_until(&mut attach.peer, b"[exited]\r\n").await;
     assert!(
-        exited
-            .windows(b"[exited]\r\n".len())
-            .any(|window| window == b"[exited]\r\n"),
+        contains_bytes(&exited, b"[exited]\r\n"),
         "the terminal exit frame must arrive before daemon shutdown"
     );
-    let result = attach_task.await.expect("attach task join");
+    let result = attach.task.await.expect("attach task join");
     assert!(result.is_ok(), "forward_attach should drain: {result:?}");
     handler.finish_attach(attach_pid, attach_id).await;
     drop(forwarder_guard);
@@ -3048,28 +2613,12 @@ async fn last_session_exit_waits_for_attach_wire_drain_before_daemon_shutdown() 
 
 #[tokio::test]
 async fn forward_attach_exited_control_drains_final_output_and_passthrough_before_banner() {
-    let handler = Arc::new(RequestHandler::new());
-    let session_name = SessionName::new("exit-drain").expect("valid session name");
-    let (stream, mut peer) = tokio::net::UnixStream::pair().expect("attach stream pair");
-    let (_shutdown_tx, shutdown_rx) = watch::channel(());
-    let (control_tx, control_rx) = mpsc::unbounded_channel();
+    let session_name = session_name("exit-drain");
     let pane_output = pane_output_channel();
-    let live_input = LiveAttachInputContext::unregistered_for_test(handler, std::process::id());
+    let target = test_attach_target_with_output(&session_name, b"BASE-0", &pane_output, true);
+    let (mut attach, control_tx) = AttachForwarder::unregistered(target);
 
-    let attach_task = tokio::spawn(forward_attach(
-        stream,
-        test_attach_target_with_output(&session_name, b"BASE-0", None, pane_output.clone(), true),
-        Vec::new(),
-        shutdown_rx,
-        control_rx,
-        Arc::new(AtomicUsize::new(0)),
-        Arc::new(AtomicBool::new(false)),
-        Arc::new(AtomicU64::new(0)),
-        live_input,
-        false,
-    ));
-
-    let _initial = read_attach_data_until(&mut peer, b"BASE-0").await;
+    let _initial = read_attach_data_until(&mut attach.peer, b"BASE-0").await;
     let _ = pane_output.send_for_generation_with_passthroughs(
         None,
         b"FINAL_TAIL".to_vec(),
@@ -3084,23 +2633,15 @@ async fn forward_attach_exited_control_drains_final_output_and_passthrough_befor
         .send(AttachControl::Exited)
         .expect("send exited control");
 
-    let exited = read_attach_data_until(&mut peer, b"[exited]\r\n").await;
-    let tail = exited
-        .windows(b"FINAL_TAIL".len())
-        .position(|window| window == b"FINAL_TAIL")
-        .expect("final pane output must be delivered");
-    let passthrough = exited
-        .windows(b"\x1b_Gf=100;TAIL\x1b\\".len())
-        .position(|window| window == b"\x1b_Gf=100;TAIL\x1b\\")
+    let exited = read_attach_data_until(&mut attach.peer, b"[exited]\r\n").await;
+    let tail = find_bytes(&exited, b"FINAL_TAIL").expect("final pane output must be delivered");
+    let passthrough = find_bytes(&exited, b"\x1b_Gf=100;TAIL\x1b\\")
         .expect("final passthrough must be delivered");
-    let banner = exited
-        .windows(b"[exited]\r\n".len())
-        .position(|window| window == b"[exited]\r\n")
-        .expect("exit banner must be delivered");
+    let banner = find_bytes(&exited, b"[exited]\r\n").expect("exit banner must be delivered");
     assert!(tail < banner);
     assert!(passthrough < banner);
 
-    assert!(attach_task.await.expect("attach task join").is_ok());
+    assert!(attach.task.await.expect("attach task join").is_ok());
 }
 
 #[tokio::test]
@@ -3126,21 +2667,15 @@ async fn session_exit_before_input_validation_still_drains_final_output() {
         LiveAttachInputContext::current_for_test(Arc::clone(&handler), attach_pid).await;
     let pause = install_live_attach_input_validation_pause(live_input.identity);
     let pane_output = pane_output_channel();
-    let (stream, mut peer) = tokio::net::UnixStream::pair().expect("attach stream pair");
-    let (_shutdown_tx, shutdown_rx) = watch::channel(());
-    let attach_task = tokio::spawn(forward_attach(
-        stream,
-        test_attach_target_with_output(&session_name, b"BASE-0", None, pane_output.clone(), false),
-        Vec::new(),
-        shutdown_rx,
+    let mut attach = AttachForwarder::spawn(
+        test_attach_target_with_output(&session_name, b"BASE-0", &pane_output, false),
         control_rx,
-        Arc::new(AtomicUsize::new(0)),
         closing,
-        Arc::new(AtomicU64::new(0)),
         live_input,
         false,
-    ));
-    let _initial = read_attach_data_until(&mut peer, b"BASE-0").await;
+    );
+    let peer = &mut attach.peer;
+    let _initial = read_attach_data_until(peer, b"BASE-0").await;
 
     peer.write_all(
         &encode_attach_message(&AttachMessage::Data(b"RACING_INPUT".to_vec()))
@@ -3154,40 +2689,29 @@ async fn session_exit_before_input_validation_still_drains_final_output() {
 
     let _ = pane_output.send_for_generation(None, b"FINAL_AFTER_CLOSE".to_vec());
     let _ = pane_output.send_for_generation(None, Vec::new());
-    let killed = handler
-        .handle(Request::KillSession(KillSessionRequest {
-            target: session_name,
-            kill_all_except_target: false,
-            clear_alerts: false,
-            kill_group: false,
-        }))
+    handler
+        .handle_ok(KillSessionRequest::fixture(session_name))
         .await;
-    assert!(matches!(killed, Response::KillSession(_)), "{killed:?}");
     pause.release.notify_one();
 
-    let exited = read_attach_data_until(&mut peer, b"[exited]\r\n").await;
-    let tail = exited
-        .windows(b"FINAL_AFTER_CLOSE".len())
-        .position(|window| window == b"FINAL_AFTER_CLOSE")
+    let exited = read_attach_data_until(peer, b"[exited]\r\n").await;
+    let tail = find_bytes(&exited, b"FINAL_AFTER_CLOSE")
         .expect("final output must survive the concurrent input close");
-    let banner = exited
-        .windows(b"[exited]\r\n".len())
-        .position(|window| window == b"[exited]\r\n")
-        .expect("exit banner must be delivered");
+    let banner = find_bytes(&exited, b"[exited]\r\n").expect("exit banner must be delivered");
     assert!(tail < banner, "final output must precede the exit banner");
     assert!(
-        attach_task.await.expect("attach task join").is_ok(),
+        attach.task.await.expect("attach task join").is_ok(),
         "terminal close must outrank stale input after it is published"
     );
 }
 
 #[tokio::test]
 async fn finish_attach_exit_forwards_an_already_dequeued_batch_before_banner() {
-    let session_name = SessionName::new("dequeued-exit-drain").expect("valid session name");
+    let session_name = session_name("dequeued-exit-drain");
     let (stream, mut peer) = tokio::net::UnixStream::pair().expect("attach stream pair");
     let stream = AttachTransport::from(stream);
     let mut current_target = open_attach_target(
-        test_attach_target_with_output(&session_name, b"BASE-0", None, pane_output_channel(), true),
+        test_attach_target_with_output(&session_name, b"BASE-0", &pane_output_channel(), true),
         false,
     )
     .expect("open attach target");
@@ -3215,29 +2739,48 @@ async fn finish_attach_exit_forwards_an_already_dequeued_batch_before_banner() {
     .expect("finish attach exit");
 
     let exited = read_attach_data_until(&mut peer, b"[exited]\r\n").await;
-    let tail = exited
-        .windows(b"DEQUEUED_FINAL_TAIL".len())
-        .position(|window| window == b"DEQUEUED_FINAL_TAIL")
+    let tail = find_bytes(&exited, b"DEQUEUED_FINAL_TAIL")
         .expect("the already-dequeued output must be delivered");
-    let passthrough = exited
-        .windows(b"\x1b_Gf=100;DEQUEUED\x1b\\".len())
-        .position(|window| window == b"\x1b_Gf=100;DEQUEUED\x1b\\")
+    let passthrough = find_bytes(&exited, b"\x1b_Gf=100;DEQUEUED\x1b\\")
         .expect("the already-dequeued passthrough must be delivered");
-    let banner = exited
-        .windows(b"[exited]\r\n".len())
-        .position(|window| window == b"[exited]\r\n")
-        .expect("exit banner must be delivered");
+    let banner = find_bytes(&exited, b"[exited]\r\n").expect("exit banner must be delivered");
     assert!(tail < banner);
     assert!(passthrough < banner);
 }
 
+/// Applies the queue of `controls`, which must end the attach, finishes the exit with the batch
+/// the old receiver had already dequeued, and answers with the client's attach data.
+async fn exit_after_queued_controls(
+    mut controls: PendingControls,
+    pending_batch: AttachOutputBatch,
+    [apply_label, exit_message, finish_label]: [&str; 3],
+) -> Vec<u8> {
+    let exit = controls.apply(None).await.expect(apply_label);
+    let PendingAttachAction::Exit(exit) = exit else {
+        panic!("{exit_message}");
+    };
+    let mut deferred_passthroughs = Vec::new();
+    finish_pending_attach_exit_with_batch(
+        exit.reason,
+        &controls.stream,
+        &mut controls.target,
+        &mut deferred_passthroughs,
+        pending_attach_exit_output_batch(
+            exit.drop_pending_output,
+            exit.snapshot_covered_output_before_sequence,
+            pending_batch,
+        ),
+    )
+    .await
+    .expect(finish_label);
+    read_attach_data_until(&mut controls.peer, b"[exited]\r\n").await
+}
+
 #[tokio::test]
 async fn exited_after_same_source_render_switch_does_not_duplicate_dequeued_output() {
-    let session_name = SessionName::new("render-switch-exit-drain").expect("valid session name");
+    let session_name = session_name("render-switch-exit-drain");
     let pane_output = pane_output_channel();
-    let mut initial =
-        test_attach_target_with_output(&session_name, b"BASE-0", None, pane_output.clone(), true);
-    initial.live_pane_handover = false;
+    let initial = test_render_only_kitty_target(&session_name, b"BASE-0", &pane_output);
     let mut current_target = open_attach_target(initial, true).expect("open initial target");
 
     let covered_sequence = pane_output
@@ -3258,14 +2801,7 @@ async fn exited_after_same_source_render_switch_does_not_duplicate_dequeued_outp
         .expect("old receiver dequeues covered output before the switch");
     let pending_batch = collect_attach_output_batch(covered_item, None);
 
-    let mut replacement = test_attach_target_with_output(
-        &session_name,
-        b"COVERED_ONCE",
-        None,
-        pane_output.clone(),
-        true,
-    );
-    replacement.live_pane_handover = false;
+    let replacement = test_render_only_kitty_target(&session_name, b"COVERED_ONCE", &pane_output);
     assert_eq!(
         replacement.pane_output_start_sequence,
         covered_sequence + 1,
@@ -3281,58 +2817,25 @@ async fn exited_after_same_source_render_switch_does_not_duplicate_dequeued_outp
         )],
     );
 
-    let (stream, mut peer) = tokio::net::UnixStream::pair().expect("attach stream pair");
-    let stream = AttachTransport::from(stream);
-    let (control_tx, mut control_rx) = mpsc::unbounded_channel();
-    control_tx
+    let controls = PendingControls::opened(current_target);
+    controls
+        .control_tx
         .send(AttachControl::switch(replacement))
         .expect("queue same-source render refresh");
-    control_tx
+    controls
+        .control_tx
         .send(AttachControl::Exited)
         .expect("queue terminal exit");
-    let mut render_generation = 0_u64;
-    let mut overlay_generation = 0_u64;
-    let mut persistent_overlay = None::<Vec<u8>>;
-    let mut persistent_overlay_visible = false;
-    let mut persistent_overlay_state_id = current_target.persistent_overlay_state_id;
-    let mut locked = false;
-    let mut deferred_controls = VecDeque::new();
-    let control_backlog = AtomicUsize::new(0);
-    let exit = apply_pending_attach_controls(
-        &mut deferred_controls,
-        Some(&mut control_rx),
-        &control_backlog,
-        &mut current_target,
-        &stream,
-        &mut render_generation,
-        &mut overlay_generation,
-        &mut persistent_overlay,
-        &mut persistent_overlay_visible,
-        &mut persistent_overlay_state_id,
-        &mut locked,
-        None,
+    let exited = exit_after_queued_controls(
+        controls,
+        pending_batch,
+        [
+            "apply switch and terminal exit",
+            "switch followed by Exited must terminate the attach",
+            "finish render-refresh exit",
+        ],
     )
-    .await
-    .expect("apply switch and terminal exit");
-    let PendingAttachAction::Exit(exit) = exit else {
-        panic!("switch followed by Exited must terminate the attach");
-    };
-    let mut deferred_passthroughs = Vec::new();
-    finish_pending_attach_exit_with_batch(
-        exit.reason,
-        &stream,
-        &mut current_target,
-        &mut deferred_passthroughs,
-        pending_attach_exit_output_batch(
-            exit.drop_pending_output,
-            exit.snapshot_covered_output_before_sequence,
-            pending_batch,
-        ),
-    )
-    .await
-    .expect("finish render-refresh exit");
-
-    let exited = read_attach_data_until(&mut peer, b"[exited]\r\n").await;
+    .await;
     for marker in [
         b"COVERED_ONCE".as_slice(),
         b"AFTER_SNAPSHOT_ONCE".as_slice(),
@@ -3352,8 +2855,7 @@ async fn exited_after_same_source_render_switch_does_not_duplicate_dequeued_outp
 
 #[tokio::test]
 async fn exited_after_non_coalesced_same_source_switches_forwards_passthroughs_once() {
-    let session_name =
-        SessionName::new("multi-render-switch-exit-drain").expect("valid session name");
+    let session_name = session_name("multi-render-switch-exit-drain");
     let pane_output = pane_output_channel();
     let mut clipboard_options = OptionStore::new();
     clipboard_options
@@ -3380,18 +2882,19 @@ async fn exited_after_non_coalesced_same_source_switches_forwards_passthroughs_o
             TerminalPassthrough::sixel(0, 0, format!("qSIXEL-{suffix}").into_bytes()),
         ]
     };
+    let refresh_target = |render_frame: &[u8]| AttachTarget {
+        outer_terminal: outer_terminal.clone(),
+        ..render_only(test_attach_target_with_protocols(
+            &session_name,
+            render_frame,
+            &pane_output,
+            true,
+            true,
+        ))
+    };
 
-    let mut initial = test_attach_target_with_protocols(
-        &session_name,
-        b"BASE-0",
-        None,
-        pane_output.clone(),
-        true,
-        true,
-    );
-    initial.live_pane_handover = false;
-    initial.outer_terminal = outer_terminal.clone();
-    let mut current_target = open_attach_target(initial, true).expect("open initial target");
+    let mut current_target =
+        open_attach_target(refresh_target(b"BASE-0"), true).expect("open initial target");
 
     let sequence_0 = pane_output
         .send_for_generation_with_passthroughs(
@@ -3400,16 +2903,7 @@ async fn exited_after_non_coalesced_same_source_switches_forwards_passthroughs_o
             passthroughs("0", b"\x1b]52;c;UDA=\x07"),
         )
         .expect("publish first output interval");
-    let mut replacement_1 = test_attach_target_with_protocols(
-        &session_name,
-        b"SNAPSHOT-1",
-        None,
-        pane_output.clone(),
-        true,
-        true,
-    );
-    replacement_1.live_pane_handover = false;
-    replacement_1.outer_terminal = outer_terminal.clone();
+    let replacement_1 = refresh_target(b"SNAPSHOT-1");
     assert_eq!(
         replacement_1.pane_output_start_sequence,
         sequence_0 + 1,
@@ -3423,16 +2917,7 @@ async fn exited_after_non_coalesced_same_source_switches_forwards_passthroughs_o
             passthroughs("1", b"\x1b]52;c;UDE=\x07"),
         )
         .expect("publish middle output interval");
-    let mut replacement_2 = test_attach_target_with_protocols(
-        &session_name,
-        b"SNAPSHOT-2",
-        None,
-        pane_output.clone(),
-        true,
-        true,
-    );
-    replacement_2.live_pane_handover = false;
-    replacement_2.outer_terminal = outer_terminal;
+    let replacement_2 = refresh_target(b"SNAPSHOT-2");
     assert_eq!(
         replacement_2.pane_output_start_sequence,
         sequence_1 + 1,
@@ -3455,65 +2940,34 @@ async fn exited_after_non_coalesced_same_source_switches_forwards_passthroughs_o
     let pending_batch =
         collect_attach_output_batch(first_item, current_target.pane_output.as_mut());
 
-    let (stream, mut peer) = tokio::net::UnixStream::pair().expect("attach stream pair");
-    let stream = AttachTransport::from(stream);
-    let (control_tx, mut control_rx) = mpsc::unbounded_channel();
-    control_tx
+    let controls = PendingControls::opened(current_target);
+    controls
+        .control_tx
         .send(AttachControl::switch(replacement_1))
         .expect("queue first same-source render refresh");
-    control_tx
+    controls
+        .control_tx
         .send(AttachControl::Write(b"INTERLEAVED-CONTROL".to_vec()))
         .expect("separate the render refreshes so they cannot coalesce");
-    control_tx
+    controls
+        .control_tx
         .send(AttachControl::switch(replacement_2))
         .expect("queue second same-source render refresh");
-    control_tx
+    controls
+        .control_tx
         .send(AttachControl::Exited)
         .expect("queue terminal exit");
 
-    let mut render_generation = 0_u64;
-    let mut overlay_generation = 0_u64;
-    let mut persistent_overlay = None::<Vec<u8>>;
-    let mut persistent_overlay_visible = false;
-    let mut persistent_overlay_state_id = current_target.persistent_overlay_state_id;
-    let mut locked = false;
-    let mut deferred_controls = VecDeque::new();
-    let control_backlog = AtomicUsize::new(0);
-    let exit = apply_pending_attach_controls(
-        &mut deferred_controls,
-        Some(&mut control_rx),
-        &control_backlog,
-        &mut current_target,
-        &stream,
-        &mut render_generation,
-        &mut overlay_generation,
-        &mut persistent_overlay,
-        &mut persistent_overlay_visible,
-        &mut persistent_overlay_state_id,
-        &mut locked,
-        None,
+    let exited = exit_after_queued_controls(
+        controls,
+        pending_batch,
+        [
+            "apply two refreshes and terminal exit",
+            "refreshes followed by Exited must terminate the attach",
+            "finish multi-refresh exit",
+        ],
     )
-    .await
-    .expect("apply two refreshes and terminal exit");
-    let PendingAttachAction::Exit(exit) = exit else {
-        panic!("refreshes followed by Exited must terminate the attach");
-    };
-    let mut deferred_passthroughs = Vec::new();
-    finish_pending_attach_exit_with_batch(
-        exit.reason,
-        &stream,
-        &mut current_target,
-        &mut deferred_passthroughs,
-        pending_attach_exit_output_batch(
-            exit.drop_pending_output,
-            exit.snapshot_covered_output_before_sequence,
-            pending_batch,
-        ),
-    )
-    .await
-    .expect("finish multi-refresh exit");
-
-    let exited = read_attach_data_until(&mut peer, b"[exited]\r\n").await;
+    .await;
     for marker in [
         b"RAW-0".as_slice(),
         b"RAW-1".as_slice(),
@@ -3541,71 +2995,32 @@ async fn exited_after_non_coalesced_same_source_switches_forwards_passthroughs_o
 
 #[tokio::test]
 async fn forward_attach_plain_refresh_does_not_clear_the_screen() {
-    let handler = Arc::new(RequestHandler::new());
-    let session_name = SessionName::new("alpha").expect("valid session name");
-    let (stream, mut peer) = tokio::net::UnixStream::pair().expect("attach stream pair");
-    let (shutdown_tx, shutdown_rx) = watch::channel(());
-    let (control_tx, control_rx) = mpsc::unbounded_channel();
-    let closing = Arc::new(AtomicBool::new(false));
-    let live_input = LiveAttachInputContext::unregistered_for_test(handler, std::process::id());
+    let session_name = session_name("alpha");
+    let (mut attach, control_tx) =
+        AttachForwarder::unregistered(test_attach_target(&session_name, b"BASE-0", None));
 
-    let attach_task = tokio::spawn(forward_attach(
-        stream,
-        test_attach_target(&session_name, b"BASE-0", None),
-        Vec::new(),
-        shutdown_rx,
-        control_rx,
-        Arc::new(AtomicUsize::new(0)),
-        closing,
-        Arc::new(AtomicU64::new(0)),
-        live_input,
-        false,
-    ));
-
-    let initial = read_attach_data_until(&mut peer, b"BASE-0").await;
-    assert!(
-        String::from_utf8_lossy(&initial).contains("BASE-0"),
-        "initial attach should render the base pane"
-    );
+    attach.assert_initial_render("BASE-0").await;
 
     control_tx
-        .send(AttachControl::switch(test_attach_target(
-            &session_name,
-            b"BASE-1",
-            None,
-        )))
+        .send(switch_control(&session_name, b"BASE-1", None))
         .expect("send refreshed attach target");
 
-    let refresh = read_attach_data_until(&mut peer, b"BASE-1").await;
+    let refresh = read_attach_data_until(&mut attach.peer, b"BASE-1").await;
     let refresh_text = String::from_utf8_lossy(&refresh);
     assert!(
         !refresh_text.contains("\x1b[2J"),
         "plain pane-output refresh must not clear the whole terminal: {refresh_text:?}"
     );
 
-    shutdown_tx.send(()).expect("request attach shutdown");
-    let result = attach_task.await.expect("attach task join");
-    assert!(
-        result.is_ok(),
-        "forward_attach should stay healthy: {result:?}"
-    );
+    attach.assert_stops_healthy().await;
 }
 
 #[tokio::test]
 async fn forward_attach_select_switch_preserves_fragmented_same_pane_input() {
     let handler = Arc::new(RequestHandler::new());
     let attach_pid = std::process::id();
-    let session_name = SessionName::new("refresh-pending-input").expect("valid session name");
+    let session_name = handler.create_session("refresh-pending-input").await;
     let target = PaneTarget::with_window(session_name.clone(), 0, 0);
-    let created = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name: session_name.clone(),
-            detached: true,
-            size: Some(TerminalSize { cols: 80, rows: 24 }),
-            environment: None,
-        }))
-        .await;
-    assert!(matches!(created, Response::NewSession(_)));
 
     let (control_tx, control_rx) = mpsc::unbounded_channel();
     handler
@@ -3613,25 +3028,14 @@ async fn forward_attach_select_switch_preserves_fragmented_same_pane_input() {
         .await;
     handler.start_attached_input_capture_for_test(&target).await;
 
-    let (shutdown_tx, shutdown_rx) = watch::channel(());
     let pane_output = pane_output_channel();
-    let initial =
-        test_attach_target_with_output(&session_name, b"BASE-0", None, pane_output.clone(), false);
-    let (stream, mut peer) = tokio::net::UnixStream::pair().expect("attach stream pair");
-    let attach_task = tokio::spawn(forward_attach(
-        stream,
-        initial,
-        Vec::new(),
-        shutdown_rx,
-        control_rx,
-        Arc::new(AtomicUsize::new(0)),
-        Arc::new(AtomicBool::new(false)),
-        Arc::new(AtomicU64::new(0)),
-        LiveAttachInputContext::current_for_test(Arc::clone(&handler), attach_pid).await,
-        false,
-    ));
+    let initial = test_attach_target_with_output(&session_name, b"BASE-0", &pane_output, false);
+    let live_input =
+        LiveAttachInputContext::current_for_test(Arc::clone(&handler), attach_pid).await;
+    let mut attach = AttachForwarder::spawn(initial, control_rx, Arc::default(), live_input, false);
+    let peer = &mut attach.peer;
 
-    let _initial = read_attach_data_until(&mut peer, b"BASE-0").await;
+    let _initial = read_attach_data_until(peer, b"BASE-0").await;
     let prefix = b"A\x1b_Gi=7";
     peer.write_all(
         &encode_attach_message(&AttachMessage::Data(prefix.to_vec()))
@@ -3655,12 +3059,11 @@ async fn forward_attach_select_switch_preserves_fragmented_same_pane_input() {
         .send(AttachControl::switch(test_attach_target_with_output(
             &session_name,
             b"BASE-1",
-            None,
-            pane_output,
+            &pane_output,
             false,
         )))
         .expect("send same-pane refresh through the select branch");
-    let _refresh = read_attach_data_until(&mut peer, b"BASE-1").await;
+    let _refresh = read_attach_data_until(peer, b"BASE-1").await;
 
     let suffix = b";OK\x1b\\";
     peer.write_all(
@@ -3681,34 +3084,18 @@ async fn forward_attach_select_switch_preserves_fragmented_same_pane_input() {
     .await
     .expect("same-pane refresh must preserve the fragmented Kitty APC");
 
-    shutdown_tx.send(()).expect("request attach shutdown");
-    assert!(attach_task.await.expect("attach task join").is_ok());
+    assert!(attach.stop().await.is_ok());
 }
 
 #[tokio::test]
 async fn forward_attach_lock_boundary_discards_fragmented_input_before_unlock() {
     let handler = Arc::new(RequestHandler::new());
     let attach_pid = std::process::id();
-    let session_name = SessionName::new("lock-pending-input").expect("valid session name");
+    let session_name = handler.create_session("lock-pending-input").await;
     let target = PaneTarget::with_window(session_name.clone(), 0, 0);
-    let created = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name: session_name.clone(),
-            detached: true,
-            size: Some(TerminalSize { cols: 80, rows: 24 }),
-            environment: None,
-        }))
+    handler
+        .set_option(ScopeSelector::Global, OptionName::EscapeTime, "30000")
         .await;
-    assert!(matches!(created, Response::NewSession(_)));
-    let escape_time = handler
-        .handle(Request::SetOption(rmux_proto::SetOptionRequest {
-            scope: rmux_proto::ScopeSelector::Global,
-            option: rmux_proto::OptionName::EscapeTime,
-            value: "30000".to_owned(),
-            mode: rmux_proto::SetOptionMode::Replace,
-        }))
-        .await;
-    assert!(matches!(escape_time, Response::SetOption(_)));
 
     let (control_tx, control_rx) = mpsc::unbounded_channel();
     handler
@@ -3716,24 +3103,14 @@ async fn forward_attach_lock_boundary_discards_fragmented_input_before_unlock() 
         .await;
     handler.start_attached_input_capture_for_test(&target).await;
 
-    let (shutdown_tx, shutdown_rx) = watch::channel(());
     let initial = test_attach_target(&session_name, b"BASE-0", None);
     let expected_stop = initial.outer_terminal.attach_stop_sequence();
-    let (stream, mut peer) = tokio::net::UnixStream::pair().expect("attach stream pair");
-    let attach_task = tokio::spawn(forward_attach(
-        stream,
-        initial,
-        Vec::new(),
-        shutdown_rx,
-        control_rx,
-        Arc::new(AtomicUsize::new(0)),
-        Arc::new(AtomicBool::new(false)),
-        Arc::new(AtomicU64::new(0)),
-        LiveAttachInputContext::current_for_test(Arc::clone(&handler), attach_pid).await,
-        false,
-    ));
+    let live_input =
+        LiveAttachInputContext::current_for_test(Arc::clone(&handler), attach_pid).await;
+    let mut attach = AttachForwarder::spawn(initial, control_rx, Arc::default(), live_input, false);
+    let peer = &mut attach.peer;
 
-    let _initial = read_attach_data_until(&mut peer, b"BASE-0").await;
+    let _initial = read_attach_data_until(peer, b"BASE-0").await;
     let prefix = b"A\x1b_Gi=7";
     peer.write_all(
         &encode_attach_message(&AttachMessage::Data(prefix.to_vec()))
@@ -3759,7 +3136,7 @@ async fn forward_attach_lock_boundary_discards_fragmented_input_before_unlock() 
             "/tmp".to_owned(),
         )))
         .expect("send lock control");
-    let _stop = read_attach_data_until(&mut peer, &expected_stop).await;
+    let _stop = read_attach_data_until(peer, &expected_stop).await;
 
     peer.write_all(&encode_attach_message(&AttachMessage::Unlock).expect("encode unlock"))
         .await
@@ -3778,10 +3155,7 @@ async fn forward_attach_lock_boundary_discards_fragmented_input_before_unlock() 
                 .attached_input_capture_for_test(&target)
                 .await
                 .expect("input capture remains installed");
-            if captured
-                .windows(b"OWNERSHIP".len())
-                .any(|window| window == b"OWNERSHIP")
-            {
+            if contains_bytes(&captured, b"OWNERSHIP") {
                 break captured;
             }
             tokio::task::yield_now().await;
@@ -3790,54 +3164,25 @@ async fn forward_attach_lock_boundary_discards_fragmented_input_before_unlock() 
     .await
     .expect("post-unlock input should reach the pane");
     assert!(
-        !captured
-            .windows(b"Gi=7".len())
-            .any(|window| window == b"Gi=7"),
+        !contains_bytes(&captured, b"Gi=7"),
         "pre-lock fragmented input must not cross the terminal ownership boundary: {captured:?}"
     );
 
-    shutdown_tx.send(()).expect("request attach shutdown");
-    assert!(attach_task.await.expect("attach task join").is_ok());
+    assert!(attach.stop().await.is_ok());
 }
 
 #[tokio::test]
 async fn forward_attach_preserves_persistent_overlay_across_stateful_switch_refreshes() {
-    let handler = Arc::new(RequestHandler::new());
-    let session_name = SessionName::new("alpha").expect("valid session name");
-    let (stream, mut peer) = tokio::net::UnixStream::pair().expect("attach stream pair");
-    let (shutdown_tx, shutdown_rx) = watch::channel(());
-    let (control_tx, control_rx) = mpsc::unbounded_channel();
-    let closing = Arc::new(AtomicBool::new(false));
-    let live_input = LiveAttachInputContext::unregistered_for_test(handler, std::process::id());
+    let session_name = session_name("alpha");
+    let (mut attach, control_tx) =
+        AttachForwarder::unregistered(test_attach_target(&session_name, b"BASE-0", None));
 
-    let attach_task = tokio::spawn(forward_attach(
-        stream,
-        test_attach_target(&session_name, b"BASE-0", None),
-        Vec::new(),
-        shutdown_rx,
-        control_rx,
-        Arc::new(AtomicUsize::new(0)),
-        closing,
-        Arc::new(AtomicU64::new(0)),
-        live_input,
-        false,
-    ));
-
-    let initial = read_attach_data_until(&mut peer, b"BASE-0").await;
-    assert!(
-        String::from_utf8_lossy(&initial).contains("BASE-0"),
-        "initial attach should render the base pane"
-    );
+    attach.assert_initial_render("BASE-0").await;
 
     control_tx
-        .send(AttachControl::Overlay(OverlayFrame::persistent_with_state(
-            b"MENU-OLD".to_vec(),
-            0,
-            1,
-            7,
-        )))
+        .send(persistent_overlay_control(b"MENU-OLD", 0, 1, 7))
         .expect("send initial persistent overlay");
-    let overlay = read_attach_data_until(&mut peer, b"MENU-OLD").await;
+    let overlay = read_attach_data_until(&mut attach.peer, b"MENU-OLD").await;
     assert!(
         String::from_utf8_lossy(&overlay).contains("MENU-OLD"),
         "persistent overlay should be visible before the refresh"
@@ -3847,14 +3192,10 @@ async fn forward_attach_preserves_persistent_overlay_across_stateful_switch_refr
         .send(AttachControl::AdvancePersistentOverlayState(8))
         .expect("send overlay state advance");
     control_tx
-        .send(AttachControl::switch(test_attach_target(
-            &session_name,
-            b"BASE-1",
-            Some(8),
-        )))
+        .send(switch_control(&session_name, b"BASE-1", Some(8)))
         .expect("send refreshed attach target");
 
-    let refresh = read_attach_data_until(&mut peer, b"MENU-OLD").await;
+    let refresh = read_attach_data_until(&mut attach.peer, b"MENU-OLD").await;
     let refresh_text = String::from_utf8_lossy(&refresh);
     assert!(
             refresh_text.contains("BASE-1") && refresh_text.contains("MENU-OLD"),
@@ -3865,42 +3206,16 @@ async fn forward_attach_preserves_persistent_overlay_across_stateful_switch_refr
             "stateful choose-tree refresh must not clear to the base pane before the replacement overlay: {refresh_text:?}"
         );
 
-    shutdown_tx.send(()).expect("request attach shutdown");
-    let result = attach_task.await.expect("attach task join");
-    assert!(
-        result.is_ok(),
-        "forward_attach should stay healthy: {result:?}"
-    );
+    attach.assert_stops_healthy().await;
 }
 
 #[tokio::test]
 async fn forward_attach_counts_coalesced_switches_before_persistent_overlay() {
-    let handler = Arc::new(RequestHandler::new());
-    let session_name = SessionName::new("alpha").expect("valid session name");
-    let (stream, mut peer) = tokio::net::UnixStream::pair().expect("attach stream pair");
-    let (shutdown_tx, shutdown_rx) = watch::channel(());
-    let (control_tx, control_rx) = mpsc::unbounded_channel();
-    let closing = Arc::new(AtomicBool::new(false));
-    let live_input = LiveAttachInputContext::unregistered_for_test(handler, std::process::id());
+    let session_name = session_name("alpha");
+    let (mut attach, control_tx) =
+        AttachForwarder::unregistered(test_render_only_attach_target(&session_name, b"BASE-0"));
 
-    let attach_task = tokio::spawn(forward_attach(
-        stream,
-        test_render_only_attach_target(&session_name, b"BASE-0"),
-        Vec::new(),
-        shutdown_rx,
-        control_rx,
-        Arc::new(AtomicUsize::new(0)),
-        closing,
-        Arc::new(AtomicU64::new(0)),
-        live_input,
-        false,
-    ));
-
-    let initial = read_attach_data_until(&mut peer, b"BASE-0").await;
-    assert!(
-        String::from_utf8_lossy(&initial).contains("BASE-0"),
-        "initial attach should render the base pane"
-    );
+    attach.assert_initial_render("BASE-0").await;
 
     control_tx
         .send(AttachControl::switch(test_render_only_attach_target(
@@ -3915,116 +3230,56 @@ async fn forward_attach_counts_coalesced_switches_before_persistent_overlay() {
         )))
         .expect("send session mutation refresh");
     control_tx
-        .send(AttachControl::switch(
-            test_render_only_attach_target_with_state(&session_name, b"BASE-3", Some(8)),
-        ))
+        .send(AttachControl::switch(render_only(test_attach_target(
+            &session_name,
+            b"BASE-3",
+            Some(8),
+        ))))
         .expect("send mode-tree switch");
     control_tx
-        .send(AttachControl::Overlay(OverlayFrame::persistent_with_state(
-            b"MENU-NEW".to_vec(),
-            3,
-            1,
-            8,
-        )))
+        .send(persistent_overlay_control(b"MENU-NEW", 3, 1, 8))
         .expect("send mode-tree overlay");
 
-    let refresh = read_attach_data_until(&mut peer, b"MENU-NEW").await;
+    let refresh = read_attach_data_until(&mut attach.peer, b"MENU-NEW").await;
     let refresh_text = String::from_utf8_lossy(&refresh);
     assert!(
         refresh_text.contains("BASE-3") && refresh_text.contains("MENU-NEW"),
         "coalesced switch generation must still match the pending overlay: {refresh_text:?}"
     );
 
-    shutdown_tx.send(()).expect("request attach shutdown");
-    let result = attach_task.await.expect("attach task join");
-    assert!(
-        result.is_ok(),
-        "forward_attach should stay healthy: {result:?}"
-    );
+    attach.assert_stops_healthy().await;
 }
 
 #[tokio::test]
 async fn forward_attach_emits_overlay_control_frames() {
     let handler = Arc::new(RequestHandler::new());
     let attach_pid = std::process::id();
-    let session_name = SessionName::new("alpha").expect("valid session name");
-
-    let created = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name: session_name.clone(),
-            detached: true,
-            size: Some(TerminalSize { cols: 80, rows: 24 }),
-            environment: None,
-        }))
+    let session_name = handler.create_session("alpha").await;
+    handler
+        .handle_ok(rmux_proto::SplitWindowRequest::fixture(&session_name))
         .await;
-    assert!(matches!(created, Response::NewSession(_)));
-    let split = handler
-        .handle(Request::SplitWindow(rmux_proto::SplitWindowRequest {
-            target: rmux_proto::SplitWindowTarget::Session(session_name.clone()),
-            direction: rmux_proto::SplitDirection::Vertical,
-            before: false,
-            environment: None,
-        }))
+    handler
+        .set_option(
+            ScopeSelector::Session(session_name.clone()),
+            OptionName::DisplayPanesTime,
+            "5000",
+        )
         .await;
-    assert!(matches!(split, Response::SplitWindow(_)));
-    let set_option = handler
-        .handle(Request::SetOption(rmux_proto::SetOptionRequest {
-            scope: rmux_proto::ScopeSelector::Session(session_name.clone()),
-            option: rmux_proto::OptionName::DisplayPanesTime,
-            value: "5000".to_owned(),
-            mode: rmux_proto::SetOptionMode::Replace,
-        }))
-        .await;
-    assert!(matches!(set_option, Response::SetOption(_)));
 
     let (control_tx, control_rx) = mpsc::unbounded_channel();
-    let test_control_tx = control_tx.clone();
     handler
-        .register_attach(attach_pid, session_name.clone(), control_tx)
+        .register_attach(attach_pid, session_name.clone(), control_tx.clone())
         .await;
 
-    let pane_output = pane_output_channel();
-    let (pane_output_start_sequence, pane_output) = pane_output.subscribe_live_from_now();
-    let target = AttachTarget {
-        session_name: session_name.clone(),
-        live_pane_handover: true,
-        pane_output,
-        pane_output_start_sequence,
-        render_frame: Vec::new(),
-        outer_terminal: OuterTerminal::resolve(
-            &OptionStore::default(),
-            OuterTerminalContext::default(),
-        ),
-        client_title: None,
-        cursor_style: 0,
-        active_pane_geometry: PaneGeometry::new(0, 0, 80, 24),
-        raw_passthrough: false,
-        kitty_graphics_passthrough: false,
-        sixel_passthrough: false,
-        persistent_overlay_state_id: None,
-        live_pane: None,
-    };
-
-    let (stream, mut peer) = tokio::net::UnixStream::pair().expect("attach stream pair");
-    let (_shutdown_tx, shutdown_rx) = watch::channel(());
-    let closing = Arc::new(AtomicBool::new(false));
     let live_input = LiveAttachInputContext::current_for_test(handler, attach_pid).await;
-
-    let attach_task = tokio::spawn(async move {
-        forward_attach(
-            stream,
-            target,
-            Vec::new(),
-            shutdown_rx,
-            control_rx,
-            Arc::new(AtomicUsize::new(0)),
-            closing,
-            Arc::new(AtomicU64::new(0)),
-            live_input,
-            false,
-        )
-        .await
-    });
+    let mut attach = AttachForwarder::spawn(
+        test_attach_target(&session_name, b"", None),
+        control_rx,
+        Arc::default(),
+        live_input,
+        false,
+    );
+    let peer = &mut attach.peer;
 
     let mut frame_bytes = [0_u8; 4096];
     let mut decoder = AttachFrameDecoder::new();
@@ -4045,7 +3300,7 @@ async fn forward_attach_emits_overlay_control_frames() {
     let overlay_marker = b"\x1b[s\x1b[?25l";
     let overlay_frame =
         OverlayFrame::new(b"\x1b[s\x1b[?25lDISPLAY-PANES\x1b[0m\x1b[u".to_vec(), 0, 1);
-    test_control_tx
+    control_tx
         .send(AttachControl::Overlay(overlay_frame))
         .expect("send overlay control");
     let mut collected = Vec::new();
@@ -4072,24 +3327,19 @@ async fn forward_attach_emits_overlay_control_frames() {
                 _ => {}
             }
         }
-        if collected
-            .windows(overlay_marker.len())
-            .any(|window| window == overlay_marker)
-        {
+        if contains_bytes(&collected, overlay_marker) {
             break;
         }
     }
 
     assert!(
-        collected
-            .windows(overlay_marker.len())
-            .any(|window| window == overlay_marker),
+        contains_bytes(&collected, overlay_marker),
         "overlay control should emit a frame, got: {:?}",
         String::from_utf8_lossy(&collected)
     );
 
     peer.shutdown().await.expect("close client peer");
-    let result = attach_task.await.expect("attach task join");
+    let result = attach.task.await.expect("attach task join");
     assert!(
         result.is_ok(),
         "forward_attach should stay healthy: {result:?}"

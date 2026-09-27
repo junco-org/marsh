@@ -112,7 +112,7 @@ async fn run_shell_foreground_with_timeout(
     }
     // No execution result at all is `1`, the same status a shell reports for a command it could
     // not run. Inventing a signal from it is deliberately not done: nothing observed one.
-    let exit_status = captured.completion.exit_code.unwrap_or(1);
+    let exit_status = captured.completion.exit_code().unwrap_or(1);
     Ok(ShellRunOutput {
         stdout,
         exit_status,
@@ -156,7 +156,7 @@ async fn shell_condition_is_true_with_timeout(
     )
     .await?;
     managed_workload::require_published(&captured)?;
-    Ok(captured.completion.exit_code == Some(0))
+    Ok(captured.completion.exit_code() == Some(0))
 }
 
 /// Admits one helper, waits for it, and ends it on a timeout, a shutdown, or a dropped caller.

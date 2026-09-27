@@ -11,45 +11,26 @@ use crate::pane_state_journal::{
 use rmux_core::{events::SubscriptionLimits, PaneId};
 use rmux_proto::{
     encode_frame, ErrorResponse, KillSessionRequest, KillWindowRequest, LinkWindowRequest,
-    MoveWindowRequest, MoveWindowTarget, NewSessionRequest, NewWindowRequest, OptionScopeSelector,
-    PaneKillRequest, PaneOptionGetRequest, PaneOptionSetRequest, PaneStateClosedReason,
-    PaneStateCursorRequest, PaneStateEventDto, PaneTarget, PaneTargetRef, Request,
-    RespawnPaneRequest, RespawnWindowRequest, Response, RmuxError, SelectPaneRequest, SessionName,
-    SetOptionByNameRequest, SetOptionMode, SourceFileRequest, SplitDirection, SplitWindowRequest,
-    SplitWindowTarget, SubscribePaneStateRequest, TerminalSize, UnlinkWindowRequest, WindowTarget,
+    MoveWindowRequest, NewWindowRequest, OptionScopeSelector, PaneKillRequest,
+    PaneOptionGetRequest, PaneOptionSetRequest, PaneStateClosedReason, PaneStateCursorRequest,
+    PaneStateEventDto, PaneTarget, PaneTargetRef, Request, RespawnPaneRequest,
+    RespawnWindowRequest, Response, RmuxError, SelectPaneRequest, SessionName,
+    SetOptionByNameRequest, SetOptionMode, SourceFileRequest, SplitWindowRequest,
+    SubscribePaneStateRequest, UnlinkWindowRequest, WindowTarget,
 };
 
 #[path = "handler_pane_state_tests/foreground_watch_lifecycle.rs"]
 mod foreground_watch_lifecycle;
 
-use crate::test_names::session_name;
+use crate::test_fixtures::Fixture;
 
 async fn create_session_with_pane(
     handler: &RequestHandler,
     name: &str,
 ) -> (SessionName, PaneTarget, PaneId) {
-    let session = session_name(name);
-    let response = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name: session.clone(),
-            detached: true,
-            size: Some(TerminalSize { cols: 80, rows: 24 }),
-            environment: None,
-        }))
-        .await;
-    assert!(matches!(response, Response::NewSession(_)), "{response:?}");
-
+    let session = handler.create_session(name).await;
     let target = PaneTarget::new(session.clone(), 0);
-    let pane_id = {
-        let state = handler.state.lock().await;
-        state
-            .sessions
-            .session(&session)
-            .and_then(|session| session.window_at(0))
-            .and_then(|window| window.pane(0))
-            .map(|pane| pane.id())
-            .expect("initial pane exists")
-    };
+    let pane_id = pane_id_at(handler, &target).await;
     (session, target, pane_id)
 }
 
@@ -58,33 +39,26 @@ async fn create_window_with_pane(
     session: &SessionName,
     window_index: u32,
 ) -> (PaneTarget, PaneId) {
-    let response = handler
-        .handle(Request::NewWindow(Box::new(NewWindowRequest {
-            target: session.clone(),
-            name: None,
-            detached: true,
-            environment: None,
-            command: None,
-            start_directory: None,
+    handler
+        .create_window(NewWindowRequest {
             target_window_index: Some(window_index),
-            insert_at_target: false,
-            process_command: None,
-        })))
+            ..Fixture::fixture(session)
+        })
         .await;
-    assert!(matches!(response, Response::NewWindow(_)), "{response:?}");
-
     let target = PaneTarget::with_window(session.clone(), window_index, 0);
-    let pane_id = {
-        let state = handler.state.lock().await;
-        state
-            .sessions
-            .session(session)
-            .and_then(|session| session.window_at(window_index))
-            .and_then(|window| window.pane(0))
-            .map(|pane| pane.id())
-            .expect("created window pane exists")
-    };
+    let pane_id = pane_id_at(handler, &target).await;
     (target, pane_id)
+}
+
+async fn pane_id_at(handler: &RequestHandler, target: &PaneTarget) -> PaneId {
+    let state = handler.state.lock().await;
+    state
+        .sessions
+        .session(target.session_name())
+        .and_then(|session| session.window_at(target.window_index()))
+        .and_then(|window| window.pane(target.pane_index()))
+        .map(|pane| pane.id())
+        .expect("target pane exists")
 }
 
 async fn subscribe(
@@ -94,69 +68,17 @@ async fn subscribe(
     include_title: bool,
     include_options: bool,
 ) -> rmux_proto::PaneStateSubscriptionId {
-    match handler
-        .handle_subscribe_pane_state(
+    handler
+        .subscribe_ok(
             connection_id,
             SubscribePaneStateRequest {
-                target: PaneTargetRef::slot(target),
                 include_title,
                 include_options,
-                include_foreground: false,
+                ..Fixture::fixture(target)
             },
         )
         .await
-    {
-        Response::SubscribePaneState(response) => response.subscription_id,
-        response => panic!("subscribe-pane-state failed: {response:?}"),
-    }
-}
-
-async fn read_cursor(
-    handler: &RequestHandler,
-    connection_id: u64,
-    subscription_id: rmux_proto::PaneStateSubscriptionId,
-    after_revision: u64,
-) -> Response {
-    read_cursor_with_max(handler, connection_id, subscription_id, after_revision, 16).await
-}
-
-async fn read_cursor_with_max(
-    handler: &RequestHandler,
-    connection_id: u64,
-    subscription_id: rmux_proto::PaneStateSubscriptionId,
-    after_revision: u64,
-    max_events: u16,
-) -> Response {
-    handler
-        .handle_pane_state_cursor(
-            connection_id,
-            PaneStateCursorRequest {
-                subscription_id,
-                after_revision,
-                wait: false,
-                max_events: Some(max_events),
-            },
-        )
-        .await
-}
-
-async fn read_cursor_waiting(
-    handler: &RequestHandler,
-    connection_id: u64,
-    subscription_id: rmux_proto::PaneStateSubscriptionId,
-    after_revision: u64,
-) -> Response {
-    handler
-        .handle_pane_state_cursor(
-            connection_id,
-            PaneStateCursorRequest {
-                subscription_id,
-                after_revision,
-                wait: true,
-                max_events: Some(16),
-            },
-        )
-        .await
+        .subscription_id
 }
 
 fn expect_single_pane_state_event(response: Response) -> PaneStateEventDto {
@@ -207,7 +129,10 @@ async fn pane_state_cursor_delivers_matching_pane_events_with_global_revisions()
         },
     );
 
-    match read_cursor(&handler, 91, subscription_id, 0).await {
+    match handler
+        .read_pane_state_cursor_for_test(91, subscription_id, 0)
+        .await
+    {
         Response::PaneStateCursor(response) => {
             assert_eq!(response.next_revision, 3);
             assert_eq!(response.events.len(), 2);
@@ -254,7 +179,10 @@ async fn pane_state_cursor_lag_returns_rebased_snapshot() {
         );
     }
 
-    match read_cursor(&handler, 92, subscription_id, 0).await {
+    match handler
+        .read_pane_state_cursor_for_test(92, subscription_id, 0)
+        .await
+    {
         Response::PaneStateLag(response) => {
             assert_eq!(response.subscription_id, subscription_id);
             assert_eq!(response.missed_from_revision, 0);
@@ -282,7 +210,10 @@ async fn pane_state_closed_reason_variants_are_delivered_before_end_of_stream() 
         let subscription_id = subscribe(&handler, 93, target, false, false).await;
         handler.record_pane_state_change(pane_id, Some(1), PaneStateChange::Closed { reason });
 
-        match read_cursor(&handler, 93, subscription_id, 0).await {
+        match handler
+            .read_pane_state_cursor_for_test(93, subscription_id, 0)
+            .await
+        {
             Response::PaneStateCursor(response) => {
                 assert_eq!(response.events.len(), 1);
                 assert!(matches!(
@@ -296,7 +227,10 @@ async fn pane_state_closed_reason_variants_are_delivered_before_end_of_stream() 
             response => panic!("pane-state cursor failed: {response:?}"),
         }
 
-        match read_cursor(&handler, 93, subscription_id, 1).await {
+        match handler
+            .read_pane_state_cursor_for_test(93, subscription_id, 1)
+            .await
+        {
             Response::Error(error) => assert!(matches!(
                 error.error,
                 RmuxError::Server(message) if message == "subscription not found"
@@ -328,7 +262,10 @@ async fn duplicate_closed_for_same_pane_is_suppressed_until_reopened() {
         },
     );
 
-    match read_cursor(&handler, 99, subscription_id, 0).await {
+    match handler
+        .read_pane_state_cursor_for_test(99, subscription_id, 0)
+        .await
+    {
         Response::PaneStateCursor(response) => {
             assert_eq!(response.events.len(), 1);
             assert!(matches!(
@@ -357,13 +294,9 @@ async fn duplicate_closed_for_same_pane_is_suppressed_until_reopened() {
         },
     );
 
-    match read_cursor(
-        &handler,
-        100,
-        reopened_subscription_id,
-        after_reopen_revision,
-    )
-    .await
+    match handler
+        .read_pane_state_cursor_for_test(100, reopened_subscription_id, after_reopen_revision)
+        .await
     {
         Response::PaneStateCursor(response) => {
             assert_eq!(response.events.len(), 1);
@@ -407,7 +340,10 @@ async fn pane_state_late_subscription_after_died_kept_receives_killed_close() {
         },
     );
 
-    match read_cursor(&handler, 106, subscription_id, first_closed_revision).await {
+    match handler
+        .read_pane_state_cursor_for_test(106, subscription_id, first_closed_revision)
+        .await
+    {
         Response::PaneStateCursor(response) => {
             assert_eq!(response.events.len(), 1);
             assert!(matches!(
@@ -437,17 +373,9 @@ async fn respawn_pane_reopens_pane_state_before_future_close() {
         },
     );
 
-    let response = handler
-        .handle(Request::RespawnPane(Box::new(RespawnPaneRequest {
-            target: target.clone(),
-            kill: true,
-            start_directory: None,
-            environment: None,
-            command: None,
-            process_command: None,
-        })))
+    handler
+        .handle_ok(RespawnPaneRequest::fixture(&target))
         .await;
-    assert!(matches!(response, Response::RespawnPane(_)), "{response:?}");
 
     let after_respawn_revision = handler
         .pane_state_journal
@@ -463,7 +391,10 @@ async fn respawn_pane_reopens_pane_state_before_future_close() {
         },
     );
 
-    match read_cursor(&handler, 104, subscription_id, after_respawn_revision).await {
+    match handler
+        .read_pane_state_cursor_for_test(104, subscription_id, after_respawn_revision)
+        .await
+    {
         Response::PaneStateCursor(response) => {
             assert_eq!(response.events.len(), 1);
             assert!(matches!(
@@ -484,7 +415,6 @@ async fn subscription_after_kept_exit_and_respawn_receives_new_generation_events
     let handler = RequestHandler::new();
     let (session, target, pane_id) =
         create_session_with_pane(&handler, "pane-state-respawn-generation").await;
-    handler.wait_for_initial_panes_for_test().await;
 
     let remain_on_exit = handler
         .handle(Request::PaneOptionSet(PaneOptionSetRequest {
@@ -500,14 +430,7 @@ async fn subscription_after_kept_exit_and_respawn_receives_new_generation_events
         "{remain_on_exit:?}"
     );
 
-    let generation = {
-        let mut state = handler.state.lock().await;
-        let generation = state.pane_output_generation_for_target(&target, pane_id);
-        state
-            .mark_pane_dead_without_exit_details(&target)
-            .expect("mark pane dead");
-        generation
-    };
+    let generation = mark_pane_exited(&handler, &target).await;
     handler
         .handle_pane_exit_event(PaneExitEvent::eof_published(
             session,
@@ -516,17 +439,9 @@ async fn subscription_after_kept_exit_and_respawn_receives_new_generation_events
         ))
         .await;
 
-    let response = handler
-        .handle(Request::RespawnPane(Box::new(RespawnPaneRequest {
-            target: target.clone(),
-            kill: true,
-            start_directory: None,
-            environment: None,
-            command: None,
-            process_command: None,
-        })))
+    handler
+        .handle_ok(RespawnPaneRequest::fixture(&target))
         .await;
-    assert!(matches!(response, Response::RespawnPane(_)), "{response:?}");
 
     let subscription_id = subscribe(&handler, 107, target.clone(), false, true).await;
     let after_subscription = handler
@@ -545,7 +460,10 @@ async fn subscription_after_kept_exit_and_respawn_receives_new_generation_events
         .await;
     assert!(matches!(changed, Response::PaneOptionSet(_)), "{changed:?}");
 
-    match read_cursor(&handler, 107, subscription_id, after_subscription).await {
+    match handler
+        .read_pane_state_cursor_for_test(107, subscription_id, after_subscription)
+        .await
+    {
         Response::PaneStateCursor(response) => assert!(matches!(
             response.events.as_slice(),
             [PaneStateEventDto::OptionSet {
@@ -570,19 +488,15 @@ async fn respawn_window_reopens_retained_pane_state_before_future_close() {
         },
     );
 
-    let response = handler
-        .handle(Request::RespawnWindow(Box::new(RespawnWindowRequest {
+    handler
+        .handle_ok(RespawnWindowRequest {
             target: WindowTarget::with_window(session, 0),
             kill: true,
             environment: None,
             command: None,
             start_directory: None,
-        })))
+        })
         .await;
-    assert!(
-        matches!(response, Response::RespawnWindow(_)),
-        "{response:?}"
-    );
 
     let after_respawn_revision = handler
         .pane_state_journal
@@ -598,7 +512,10 @@ async fn respawn_window_reopens_retained_pane_state_before_future_close() {
         },
     );
 
-    match read_cursor(&handler, 105, subscription_id, after_respawn_revision).await {
+    match handler
+        .read_pane_state_cursor_for_test(105, subscription_id, after_respawn_revision)
+        .await
+    {
         Response::PaneStateCursor(response) => {
             assert_eq!(response.events.len(), 1);
             assert!(matches!(
@@ -642,7 +559,18 @@ async fn pane_state_wait_cursor_advances_past_filtered_events_on_timeout() {
         .current_revision();
     assert_eq!(expected_revision, after_revision.saturating_add(1));
 
-    match read_cursor_waiting(&handler, 94, subscription_id, after_revision).await {
+    match handler
+        .handle_pane_state_cursor(
+            94,
+            PaneStateCursorRequest {
+                subscription_id,
+                after_revision,
+                wait: true,
+                max_events: Some(16),
+            },
+        )
+        .await
+    {
         Response::PaneStateCursor(response) => {
             assert!(
                 response.events.is_empty(),
@@ -665,26 +593,19 @@ async fn set_option_by_name_pane_origin_emits_pane_state_option_event() {
         create_session_with_pane(&handler, "pane-state-set-option-origin").await;
     let subscription_id = subscribe(&handler, 980, target.clone(), false, true).await;
 
-    let response = handler
-        .handle(Request::SetOptionByName(Box::new(SetOptionByNameRequest {
-            scope: OptionScopeSelector::Pane(target),
-            name: "@d2.set-option".to_owned(),
-            value: Some("direct".to_owned()),
-            mode: SetOptionMode::Replace,
-            only_if_unset: false,
-            unset: false,
-            unset_pane_overrides: false,
-            format: false,
-            format_target: None,
-        })))
+    handler
+        .set_option_by_name(
+            OptionScopeSelector::Pane(target),
+            "@d2.set-option",
+            "direct",
+        )
         .await;
-    assert!(
-        matches!(response, Response::SetOptionByName(_)),
-        "{response:?}"
-    );
 
-    let event =
-        expect_single_pane_state_event(read_cursor(&handler, 980, subscription_id, 0).await);
+    let event = expect_single_pane_state_event(
+        handler
+            .read_pane_state_cursor_for_test(980, subscription_id, 0)
+            .await,
+    );
     assert!(matches!(
         event,
         PaneStateEventDto::OptionSet {
@@ -718,8 +639,11 @@ async fn pane_option_set_sdk_origin_emits_pane_state_option_event() {
         "{response:?}"
     );
 
-    let event =
-        expect_single_pane_state_event(read_cursor(&handler, 981, subscription_id, 0).await);
+    let event = expect_single_pane_state_event(
+        handler
+            .read_pane_state_cursor_for_test(981, subscription_id, 0)
+            .await,
+    );
     assert!(matches!(
         event,
         PaneStateEventDto::OptionSet {
@@ -813,8 +737,11 @@ async fn pane_option_set_sdk_origin_records_option_event_when_resize_fails() {
         "{response:?}"
     );
 
-    let event =
-        expect_single_pane_state_event(read_cursor(&handler, 984, subscription_id, 0).await);
+    let event = expect_single_pane_state_event(
+        handler
+            .read_pane_state_cursor_for_test(984, subscription_id, 0)
+            .await,
+    );
     assert!(matches!(
         event,
         PaneStateEventDto::OptionSet {
@@ -837,19 +764,18 @@ async fn select_pane_title_origin_emits_pane_state_title_event() {
         .await;
     let subscription_id = subscribe(&handler, 982, target.clone(), true, false).await;
 
-    let response = handler
-        .handle(Request::SelectPane(Box::new(SelectPaneRequest {
-            target,
+    handler
+        .handle_ok(SelectPaneRequest {
             title: Some("selected-title".to_owned()),
-            input_disabled: None,
-            preserve_zoom: false,
-            style: None,
-        })))
+            ..Fixture::fixture(target)
+        })
         .await;
-    assert!(matches!(response, Response::SelectPane(_)), "{response:?}");
 
-    let event =
-        expect_single_pane_state_event(read_cursor(&handler, 982, subscription_id, 0).await);
+    let event = expect_single_pane_state_event(
+        handler
+            .read_pane_state_cursor_for_test(982, subscription_id, 0)
+            .await,
+    );
     assert!(matches!(
         event,
         PaneStateEventDto::TitleChanged {
@@ -871,18 +797,17 @@ async fn oversized_title_history_rebases_to_a_frameable_snapshot() {
     let subscription_id = subscribe(&handler, 985, target.clone(), true, false).await;
 
     let first_title = "a".repeat(PANE_STATE_JOURNAL_BYTE_CAPACITY + 1024);
-    let response = handler
-        .handle(Request::SelectPane(Box::new(SelectPaneRequest {
-            target: target.clone(),
+    handler
+        .handle_ok(SelectPaneRequest {
             title: Some(first_title.clone()),
-            input_disabled: None,
-            preserve_zoom: false,
-            style: None,
-        })))
+            ..Fixture::fixture(&target)
+        })
         .await;
-    assert!(matches!(response, Response::SelectPane(_)), "{response:?}");
 
-    let first_resume = match read_cursor(&handler, 985, subscription_id, 0).await {
+    let first_resume = match handler
+        .read_pane_state_cursor_for_test(985, subscription_id, 0)
+        .await
+    {
         Response::PaneStateLag(response) => {
             assert_eq!(
                 response.snapshot.title.as_deref(),
@@ -896,17 +821,16 @@ async fn oversized_title_history_rebases_to_a_frameable_snapshot() {
     };
 
     let second_title = "b".repeat(PANE_STATE_JOURNAL_BYTE_CAPACITY + 1024);
-    let response = handler
-        .handle(Request::SelectPane(Box::new(SelectPaneRequest {
-            target,
+    handler
+        .handle_ok(SelectPaneRequest {
             title: Some(second_title.clone()),
-            input_disabled: None,
-            preserve_zoom: false,
-            style: None,
-        })))
+            ..Fixture::fixture(target)
+        })
         .await;
-    assert!(matches!(response, Response::SelectPane(_)), "{response:?}");
-    match read_cursor(&handler, 985, subscription_id, first_resume).await {
+    match handler
+        .read_pane_state_cursor_for_test(985, subscription_id, first_resume)
+        .await
+    {
         Response::PaneStateLag(response) => {
             assert_eq!(
                 response.snapshot.title.as_deref(),
@@ -927,34 +851,20 @@ async fn oversized_initial_option_snapshot_fails_without_leaking_subscription() 
     handler
         .wait_for_pane_startup_to_finish_for_test(&target)
         .await;
-    let response = handler
-        .handle(Request::SetOptionByName(Box::new(SetOptionByNameRequest {
-            scope: OptionScopeSelector::Pane(target.clone()),
-            name: "@large-initial".to_owned(),
-            value: Some(
-                "x".repeat(super::pane_state_support::PANE_STATE_SNAPSHOT_OPTION_BYTE_LIMIT + 1),
-            ),
-            mode: SetOptionMode::Replace,
-            only_if_unset: false,
-            unset: false,
-            unset_pane_overrides: false,
-            format: false,
-            format_target: None,
-        })))
+    handler
+        .set_option_by_name(
+            OptionScopeSelector::Pane(target.clone()),
+            "@large-initial",
+            &"x".repeat(super::pane_state_support::PANE_STATE_SNAPSHOT_OPTION_BYTE_LIMIT + 1),
+        )
         .await;
-    assert!(
-        matches!(response, Response::SetOptionByName(_)),
-        "{response:?}"
-    );
 
     let response = handler
         .handle_subscribe_pane_state(
             986,
             SubscribePaneStateRequest {
-                target: PaneTargetRef::slot(target.clone()),
-                include_title: false,
                 include_options: true,
-                include_foreground: false,
+                ..Fixture::fixture(&target)
             },
         )
         .await;
@@ -966,23 +876,17 @@ async fn oversized_initial_option_snapshot_fails_without_leaking_subscription() 
         "{error}"
     );
 
-    let response = handler
-        .handle(Request::SetOptionByName(Box::new(SetOptionByNameRequest {
-            scope: OptionScopeSelector::Pane(target.clone()),
-            name: "@large-initial".to_owned(),
+    handler
+        .handle_ok(SetOptionByNameRequest {
             value: None,
-            mode: SetOptionMode::Replace,
-            only_if_unset: false,
             unset: true,
-            unset_pane_overrides: false,
-            format: false,
-            format_target: None,
-        })))
+            ..Fixture::fixture((
+                OptionScopeSelector::Pane(target.clone()),
+                "@large-initial",
+                "",
+            ))
+        })
         .await;
-    assert!(
-        matches!(response, Response::SetOptionByName(_)),
-        "{response:?}"
-    );
     let _subscription_id = subscribe(&handler, 986, target, false, true).await;
 }
 
@@ -996,25 +900,17 @@ async fn oversized_lag_snapshot_closes_the_subscription_instead_of_looping() {
         .await;
     let subscription_id = subscribe(&handler, 987, target.clone(), false, true).await;
 
-    let response = handler
-        .handle(Request::SetOptionByName(Box::new(SetOptionByNameRequest {
-            scope: OptionScopeSelector::Pane(target),
-            name: "@large-lag".to_owned(),
-            value: Some("y".repeat(PANE_STATE_JOURNAL_BYTE_CAPACITY + 1024)),
-            mode: SetOptionMode::Replace,
-            only_if_unset: false,
-            unset: false,
-            unset_pane_overrides: false,
-            format: false,
-            format_target: None,
-        })))
+    handler
+        .set_option_by_name(
+            OptionScopeSelector::Pane(target),
+            "@large-lag",
+            &"y".repeat(PANE_STATE_JOURNAL_BYTE_CAPACITY + 1024),
+        )
         .await;
-    assert!(
-        matches!(response, Response::SetOptionByName(_)),
-        "{response:?}"
-    );
 
-    let response = read_cursor(&handler, 987, subscription_id, 0).await;
+    let response = handler
+        .read_pane_state_cursor_for_test(987, subscription_id, 0)
+        .await;
     let Response::Error(ErrorResponse { error }) = response else {
         panic!("oversized lag snapshot must fail explicitly: {response:?}");
     };
@@ -1023,7 +919,9 @@ async fn oversized_lag_snapshot_closes_the_subscription_instead_of_looping() {
         "{error}"
     );
 
-    let response = read_cursor(&handler, 987, subscription_id, 0).await;
+    let response = handler
+        .read_pane_state_cursor_for_test(987, subscription_id, 0)
+        .await;
     let Response::Error(ErrorResponse { error }) = response else {
         panic!("failed lag snapshot must close its subscription: {response:?}");
     };
@@ -1049,16 +947,12 @@ async fn select_pane_style_origin_emits_pane_state_option_event() {
         resize_count
     };
 
-    let response = handler
-        .handle(Request::SelectPane(Box::new(SelectPaneRequest {
-            target,
-            title: None,
-            input_disabled: None,
-            preserve_zoom: false,
+    handler
+        .handle_ok(SelectPaneRequest {
             style: Some("fg=red".to_owned()),
-        })))
+            ..Fixture::fixture(target)
+        })
         .await;
-    assert!(matches!(response, Response::SelectPane(_)), "{response:?}");
     assert_eq!(
         handler
             .state
@@ -1069,8 +963,11 @@ async fn select_pane_style_origin_emits_pane_state_option_event() {
         "re-selecting the active pane must not resize its unchanged runtime"
     );
 
-    let event =
-        expect_single_pane_state_event(read_cursor(&handler, 983, subscription_id, 0).await);
+    let event = expect_single_pane_state_event(
+        handler
+            .read_pane_state_cursor_for_test(983, subscription_id, 0)
+            .await,
+    );
     assert!(matches!(
         event,
         PaneStateEventDto::OptionSet {
@@ -1091,22 +988,19 @@ async fn source_file_pane_option_origin_emits_pane_state_option_event() {
     let subscription_id = subscribe(&handler, 984, target.clone(), false, true).await;
     let source = format!("set-option -p -t {target} @d2.source stdin\n");
 
-    let response = handler
-        .handle(Request::SourceFile(Box::new(SourceFileRequest {
-            paths: vec!["-".to_owned()],
-            quiet: false,
-            parse_only: false,
-            verbose: false,
-            expand_paths: false,
+    handler
+        .handle_ok(SourceFileRequest {
             target: Some(target),
-            caller_cwd: None,
             stdin: Some(source),
-        })))
+            ..Fixture::fixture(["-"])
+        })
         .await;
-    assert!(matches!(response, Response::SourceFile(_)), "{response:?}");
 
-    let event =
-        expect_single_pane_state_event(read_cursor(&handler, 984, subscription_id, 0).await);
+    let event = expect_single_pane_state_event(
+        handler
+            .read_pane_state_cursor_for_test(984, subscription_id, 0)
+            .await,
+    );
     assert!(matches!(
         event,
         PaneStateEventDto::OptionSet {
@@ -1151,7 +1045,17 @@ async fn pane_state_revisions_are_strictly_increasing_under_concurrent_recording
             .expect("concurrent pane-state task should finish");
     }
 
-    let response = read_cursor_with_max(&handler, 985, subscription_id, 0, 128).await;
+    let response = handler
+        .handle_pane_state_cursor(
+            985,
+            PaneStateCursorRequest {
+                subscription_id,
+                after_revision: 0,
+                wait: false,
+                max_events: Some(128),
+            },
+        )
+        .await;
     let events = match response {
         Response::PaneStateCursor(response) => response.events,
         response => panic!("pane-state cursor failed: {response:?}"),
@@ -1188,10 +1092,9 @@ async fn pane_state_subscriptions_obey_connection_limits() {
         .handle_subscribe_pane_state(
             98,
             SubscribePaneStateRequest {
-                target: PaneTargetRef::slot(target),
                 include_title: true,
                 include_options: true,
-                include_foreground: false,
+                ..Fixture::fixture(target)
             },
         )
         .await
@@ -1214,15 +1117,9 @@ async fn kill_session_emits_closed_for_pane_state_subscribers() {
         create_session_with_pane(&handler, "pane-state-kill-session").await;
     let subscription_id = subscribe(&handler, 95, target, false, false).await;
 
-    let response = handler
-        .handle(Request::KillSession(KillSessionRequest {
-            target: session,
-            kill_all_except_target: false,
-            clear_alerts: false,
-            kill_group: false,
-        }))
+    handler
+        .handle_ok(KillSessionRequest::fixture(session))
         .await;
-    assert!(matches!(response, Response::KillSession(_)), "{response:?}");
 
     assert_closed_event(&handler, 95, subscription_id, pane_id).await;
 }
@@ -1235,13 +1132,11 @@ async fn kill_window_emits_closed_for_pane_state_subscribers() {
     let (target, pane_id) = create_window_with_pane(&handler, &session, 1).await;
     let subscription_id = subscribe(&handler, 96, target, false, false).await;
 
-    let response = handler
-        .handle(Request::KillWindow(KillWindowRequest {
-            target: WindowTarget::with_window(session, 1),
-            kill_all_others: false,
-        }))
+    handler
+        .handle_ok(KillWindowRequest::fixture(WindowTarget::with_window(
+            session, 1,
+        )))
         .await;
-    assert!(matches!(response, Response::KillWindow(_)), "{response:?}");
 
     assert_closed_event(&handler, 96, subscription_id, pane_id).await;
 }
@@ -1249,46 +1144,19 @@ async fn kill_window_emits_closed_for_pane_state_subscribers() {
 #[tokio::test]
 async fn respawn_window_kill_emits_closed_for_destroyed_pane_state_subscribers() {
     let handler = RequestHandler::new();
-    let (session, _initial_target, _initial_pane_id) =
-        create_session_with_pane(&handler, "pane-state-respawn-window-destroyed").await;
-
-    let split = handler
-        .handle(Request::SplitWindow(SplitWindowRequest {
-            target: SplitWindowTarget::Session(session.clone()),
-            direction: SplitDirection::Vertical,
-            before: false,
-            environment: None,
-        }))
-        .await;
-    let split_target = match split {
-        Response::SplitWindow(response) => response.pane,
-        response => panic!("expected split-window success, got {response:?}"),
-    };
-    let split_pane_id = {
-        let state = handler.state.lock().await;
-        state
-            .sessions
-            .session(&session)
-            .and_then(|session| session.window_at(0))
-            .and_then(|window| window.pane(split_target.pane_index()))
-            .map(|pane| pane.id())
-            .expect("split pane exists")
-    };
+    let (session, split_target, split_pane_id) =
+        create_session_with_split_pane(&handler, "pane-state-respawn-window-destroyed").await;
     let subscription_id = subscribe(&handler, 106, split_target, false, false).await;
 
-    let response = handler
-        .handle(Request::RespawnWindow(Box::new(RespawnWindowRequest {
+    handler
+        .handle_ok(RespawnWindowRequest {
             target: WindowTarget::with_window(session, 0),
             kill: true,
             environment: None,
             command: None,
             start_directory: None,
-        })))
+        })
         .await;
-    assert!(
-        matches!(response, Response::RespawnWindow(_)),
-        "{response:?}"
-    );
 
     assert_closed_event(&handler, 106, subscription_id, split_pane_id).await;
 }
@@ -1302,17 +1170,15 @@ async fn link_window_replacement_emits_closed_for_replaced_pane_state_subscriber
         create_session_with_pane(&handler, "pane-state-link-dest").await;
     let subscription_id = subscribe(&handler, 101, beta_target, false, false).await;
 
-    let response = handler
-        .handle(Request::LinkWindow(LinkWindowRequest {
-            source: WindowTarget::with_window(alpha, 0),
-            target: WindowTarget::with_window(beta, 0),
-            after: false,
-            before: false,
+    handler
+        .handle_ok(LinkWindowRequest {
             kill_destination: true,
-            detached: true,
-        }))
+            ..Fixture::fixture((
+                WindowTarget::with_window(alpha, 0),
+                WindowTarget::with_window(beta, 0),
+            ))
+        })
         .await;
-    assert!(matches!(response, Response::LinkWindow(_)), "{response:?}");
 
     assert_closed_event(&handler, 101, subscription_id, beta_pane_id).await;
 }
@@ -1327,18 +1193,15 @@ async fn move_window_replacement_emits_closed_for_replaced_pane_state_subscriber
         create_session_with_pane(&handler, "pane-state-move-dest").await;
     let subscription_id = subscribe(&handler, 102, beta_target, false, false).await;
 
-    let response = handler
-        .handle(Request::MoveWindow(MoveWindowRequest {
-            source: Some(WindowTarget::with_window(alpha, 1)),
-            target: MoveWindowTarget::Window(WindowTarget::with_window(beta, 0)),
-            renumber: false,
+    handler
+        .handle_ok(MoveWindowRequest {
             kill_destination: true,
-            detached: true,
-            after: false,
-            before: false,
-        }))
+            ..Fixture::fixture((
+                WindowTarget::with_window(alpha, 1),
+                WindowTarget::with_window(beta, 0),
+            ))
+        })
         .await;
-    assert!(matches!(response, Response::MoveWindow(_)), "{response:?}");
 
     assert_closed_event(&handler, 102, subscription_id, beta_pane_id).await;
 }
@@ -1354,33 +1217,31 @@ async fn move_window_replacement_keeps_linked_destination_pane_state_open() {
     let (gamma, _gamma_target, _gamma_pane_id) =
         create_session_with_pane(&handler, "pane-state-move-linked-peer").await;
 
-    let response = handler
-        .handle(Request::LinkWindow(LinkWindowRequest {
-            source: WindowTarget::with_window(beta.clone(), 0),
-            target: WindowTarget::with_window(gamma, 0),
-            after: false,
-            before: false,
+    handler
+        .handle_ok(LinkWindowRequest {
             kill_destination: true,
-            detached: true,
-        }))
+            ..Fixture::fixture((
+                WindowTarget::with_window(beta.clone(), 0),
+                WindowTarget::with_window(gamma, 0),
+            ))
+        })
         .await;
-    assert!(matches!(response, Response::LinkWindow(_)), "{response:?}");
 
     let subscription_id = subscribe(&handler, 107, beta_target, false, false).await;
-    let response = handler
-        .handle(Request::MoveWindow(MoveWindowRequest {
-            source: Some(WindowTarget::with_window(alpha, 1)),
-            target: MoveWindowTarget::Window(WindowTarget::with_window(beta, 0)),
-            renumber: false,
+    handler
+        .handle_ok(MoveWindowRequest {
             kill_destination: true,
-            detached: true,
-            after: false,
-            before: false,
-        }))
+            ..Fixture::fixture((
+                WindowTarget::with_window(alpha, 1),
+                WindowTarget::with_window(beta, 0),
+            ))
+        })
         .await;
-    assert!(matches!(response, Response::MoveWindow(_)), "{response:?}");
 
-    match read_cursor(&handler, 107, subscription_id, 0).await {
+    match handler
+        .read_pane_state_cursor_for_test(107, subscription_id, 0)
+        .await
+    {
         Response::PaneStateCursor(response) => {
             assert!(
                 response.events.is_empty(),
@@ -1400,16 +1261,12 @@ async fn unlink_window_kill_if_last_emits_closed_for_removed_pane_state_subscrib
     let (target, pane_id) = create_window_with_pane(&handler, &session, 1).await;
     let subscription_id = subscribe(&handler, 103, target, false, false).await;
 
-    let response = handler
-        .handle(Request::UnlinkWindow(UnlinkWindowRequest {
+    handler
+        .handle_ok(UnlinkWindowRequest {
             target: WindowTarget::with_window(session, 1),
             kill_if_last: true,
-        }))
+        })
         .await;
-    assert!(
-        matches!(response, Response::UnlinkWindow(_)),
-        "{response:?}"
-    );
 
     assert_closed_event(&handler, 103, subscription_id, pane_id).await;
 }
@@ -1531,42 +1388,18 @@ async fn create_session_with_split_pane(
     handler: &RequestHandler,
     name: &str,
 ) -> (SessionName, PaneTarget, PaneId) {
-    let (session, _target, _pane_id) = create_session_with_pane(handler, name).await;
-    handler.wait_for_initial_panes_for_test().await;
-    let split = handler
-        .handle(Request::SplitWindow(SplitWindowRequest {
-            target: SplitWindowTarget::Session(session.clone()),
-            direction: SplitDirection::Vertical,
-            before: false,
-            environment: None,
-        }))
-        .await;
-    let split_target = match split {
-        Response::SplitWindow(response) => response.pane,
-        response => panic!("expected split-window success, got {response:?}"),
-    };
-    let split_pane_id = {
-        let state = handler.state.lock().await;
-        state
-            .sessions
-            .session(&session)
-            .and_then(|session| session.window_at(0))
-            .and_then(|window| window.pane(split_target.pane_index()))
-            .map(|pane| pane.id())
-            .expect("split pane exists")
-    };
+    let session = handler.create_session(name).await;
+    let split_target = handler
+        .handle_ok(SplitWindowRequest::fixture(&session))
+        .await
+        .pane;
+    let split_pane_id = pane_id_at(handler, &split_target).await;
     (session, split_target, split_pane_id)
 }
 
 async fn mark_pane_exited(handler: &RequestHandler, target: &PaneTarget) -> u64 {
+    let pane_id = pane_id_at(handler, target).await;
     let mut state = handler.state.lock().await;
-    let pane_id = state
-        .sessions
-        .session(target.session_name())
-        .and_then(|session| session.window_at(target.window_index()))
-        .and_then(|window| window.pane(target.pane_index()))
-        .map(|pane| pane.id())
-        .expect("target pane exists");
     let generation = state.pane_output_generation_for_target(target, pane_id);
     state
         .mark_pane_dead_without_exit_details(target)
@@ -1618,7 +1451,10 @@ async fn assert_closed_event_with_reason(
     pane_id: PaneId,
     expected_reason: PaneStateClosedReason,
 ) {
-    match read_cursor(handler, connection_id, subscription_id, 0).await {
+    match handler
+        .read_pane_state_cursor_for_test(connection_id, subscription_id, 0)
+        .await
+    {
         Response::PaneStateCursor(response) => {
             assert_eq!(response.events.len(), 1);
             assert!(

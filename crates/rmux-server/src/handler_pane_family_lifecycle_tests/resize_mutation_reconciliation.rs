@@ -1,27 +1,21 @@
 use super::inactive_winlink_resize::{
-    assert_window_and_pty_size, create_sized_session, link_window, register_sized_attach,
-    select_window, set_window_size_policy, LARGE_SIZE, SMALL_SIZE,
+    assert_window_and_pty_size, register_sized_attach, LARGE_SIZE, SMALL_SIZE,
 };
 use super::RequestHandler;
+use crate::test_fixtures::Fixture;
 use rmux_core::LifecycleEvent;
 use rmux_proto::{
     HookLifecycle, HookName, KillWindowRequest, LinkWindowRequest, NewWindowRequest,
-    OptionScopeSelector, RenameSessionRequest, Request, Response, ScopeSelector, SetHookRequest,
-    SetOptionByNameRequest, SetOptionMode, SwapWindowRequest, WindowTarget,
+    OptionScopeSelector, RenameSessionRequest, Request, Response, ScopeSelector,
+    SelectWindowRequest, SetHookRequest, SetOptionByNameRequest, SwapWindowRequest, WindowTarget,
 };
 
 fn window_size_option_request(scope: OptionScopeSelector, value: &str) -> Request {
-    Request::SetOptionByName(Box::new(SetOptionByNameRequest {
+    Request::SetOptionByName(Box::new(SetOptionByNameRequest::fixture((
         scope,
-        name: "window-size".to_owned(),
-        value: Some(value.to_owned()),
-        mode: SetOptionMode::Replace,
-        only_if_unset: false,
-        unset: false,
-        unset_pane_overrides: false,
-        format: false,
-        format_target: None,
-    }))
+        "window-size",
+        value,
+    ))))
 }
 
 async fn receive_window_resized(
@@ -38,27 +32,6 @@ async fn receive_window_resized(
     }
 }
 
-async fn create_detached_window(
-    handler: &RequestHandler,
-    session_name: &rmux_proto::SessionName,
-    window_index: u32,
-) {
-    let response = handler
-        .handle(Request::NewWindow(Box::new(NewWindowRequest {
-            target: session_name.clone(),
-            name: Some(format!("window-{window_index}")),
-            detached: true,
-            start_directory: None,
-            environment: None,
-            command: None,
-            process_command: None,
-            target_window_index: Some(window_index),
-            insert_at_target: false,
-        })))
-        .await;
-    assert!(matches!(response, Response::NewWindow(_)), "{response:?}");
-}
-
 async fn create_linked_inactive_window_fixture(
     label: &str,
     first_attach_pid: u32,
@@ -70,16 +43,30 @@ async fn create_linked_inactive_window_fixture(
     tokio::sync::mpsc::UnboundedReceiver<crate::pane_io::AttachControl>,
 ) {
     let handler = RequestHandler::new();
-    let source = create_sized_session(&handler, &format!("{label}-source"), LARGE_SIZE).await;
-    let alias = create_sized_session(&handler, &format!("{label}-alias"), LARGE_SIZE).await;
-    create_detached_window(&handler, &source, 1).await;
-    link_window(
-        &handler,
-        WindowTarget::with_window(source.clone(), 1),
-        WindowTarget::with_window(alias.clone(), 1),
-    )
-    .await;
-    select_window(&handler, WindowTarget::with_window(alias.clone(), 1)).await;
+    let source = handler
+        .create_session((format!("{label}-source"), LARGE_SIZE))
+        .await;
+    let alias = handler
+        .create_session((format!("{label}-alias"), LARGE_SIZE))
+        .await;
+    handler
+        .create_window(NewWindowRequest {
+            name: Some("window-1".to_owned()),
+            target_window_index: Some(1),
+            ..Fixture::fixture(&source)
+        })
+        .await;
+    handler
+        .handle_ok(LinkWindowRequest::fixture((
+            WindowTarget::with_window(source.clone(), 1),
+            WindowTarget::with_window(alias.clone(), 1),
+        )))
+        .await;
+    handler
+        .handle_ok(SelectWindowRequest {
+            target: WindowTarget::with_window(alias.clone(), 1),
+        })
+        .await;
     handler.wait_for_initial_panes_for_test().await;
 
     let source_rx = register_sized_attach(&handler, first_attach_pid, &source, SMALL_SIZE).await;
@@ -95,21 +82,28 @@ async fn create_linked_inactive_window_fixture(
 #[tokio::test]
 async fn resize_mutation_kill_window_reconciles_the_new_active_window() {
     let handler = RequestHandler::new();
-    let session = create_sized_session(&handler, "resize-kill-active", LARGE_SIZE).await;
-    create_detached_window(&handler, &session, 1).await;
+    let session = handler
+        .create_session(("resize-kill-active", LARGE_SIZE))
+        .await;
+    handler
+        .create_window(NewWindowRequest {
+            name: Some("window-1".to_owned()),
+            target_window_index: Some(1),
+            ..Fixture::fixture(&session)
+        })
+        .await;
     handler.wait_for_initial_panes_for_test().await;
     let _attach_rx = register_sized_attach(&handler, 8_101, &session, SMALL_SIZE).await;
 
     assert_window_and_pty_size(&handler, &session, 0, SMALL_SIZE).await;
     assert_window_and_pty_size(&handler, &session, 1, LARGE_SIZE).await;
 
-    let response = handler
-        .handle(Request::KillWindow(KillWindowRequest {
-            target: WindowTarget::with_window(session.clone(), 0),
-            kill_all_others: false,
-        }))
+    handler
+        .handle_ok(KillWindowRequest::fixture(WindowTarget::with_window(
+            session.clone(),
+            0,
+        )))
         .await;
-    assert!(matches!(response, Response::KillWindow(_)), "{response:?}");
 
     {
         let state = handler.state.lock().await;
@@ -122,34 +116,47 @@ async fn resize_mutation_kill_window_reconciles_the_new_active_window() {
 #[tokio::test]
 async fn resize_mutation_kill_window_reconciles_each_linked_session_new_active_runtime() {
     let handler = RequestHandler::new();
-    let source = create_sized_session(&handler, "resize-kill-link-source", LARGE_SIZE).await;
-    let alias = create_sized_session(&handler, "resize-kill-link-alias", SMALL_SIZE).await;
-    create_detached_window(&handler, &source, 1).await;
-    link_window(
-        &handler,
-        WindowTarget::with_window(source.clone(), 0),
-        WindowTarget::with_window(alias.clone(), 1),
-    )
-    .await;
-    select_window(&handler, WindowTarget::with_window(alias.clone(), 1)).await;
+    let source = handler
+        .create_session(("resize-kill-link-source", LARGE_SIZE))
+        .await;
+    let alias = handler
+        .create_session(("resize-kill-link-alias", SMALL_SIZE))
+        .await;
+    handler
+        .create_window(NewWindowRequest {
+            name: Some("window-1".to_owned()),
+            target_window_index: Some(1),
+            ..Fixture::fixture(&source)
+        })
+        .await;
+    handler
+        .handle_ok(LinkWindowRequest::fixture((
+            WindowTarget::with_window(source.clone(), 0),
+            WindowTarget::with_window(alias.clone(), 1),
+        )))
+        .await;
+    handler
+        .handle_ok(SelectWindowRequest {
+            target: WindowTarget::with_window(alias.clone(), 1),
+        })
+        .await;
     handler.wait_for_initial_panes_for_test().await;
 
     let _source_rx = register_sized_attach(&handler, 8_151, &source, SMALL_SIZE).await;
     let _alias_rx = register_sized_attach(&handler, 8_152, &alias, LARGE_SIZE).await;
-    set_window_size_policy(&handler, &source, 0, "smallest").await;
+    handler.set_window_size_policy(&source, 0, "smallest").await;
 
     assert_window_and_pty_size(&handler, &source, 0, SMALL_SIZE).await;
     assert_window_and_pty_size(&handler, &alias, 1, SMALL_SIZE).await;
     assert_window_and_pty_size(&handler, &source, 1, LARGE_SIZE).await;
     assert_window_and_pty_size(&handler, &alias, 0, SMALL_SIZE).await;
 
-    let response = handler
-        .handle(Request::KillWindow(KillWindowRequest {
-            target: WindowTarget::with_window(source.clone(), 0),
-            kill_all_others: false,
-        }))
+    handler
+        .handle_ok(KillWindowRequest::fixture(WindowTarget::with_window(
+            source.clone(),
+            0,
+        )))
         .await;
-    assert!(matches!(response, Response::KillWindow(_)), "{response:?}");
 
     {
         let state = handler.state.lock().await;
@@ -178,39 +185,39 @@ async fn resize_mutation_kill_window_reconciles_each_linked_session_new_active_r
 #[tokio::test]
 async fn resize_mutation_link_window_reconciles_previous_active_aggressive_window() {
     let handler = RequestHandler::new();
-    let owner = create_sized_session(&handler, "resize-link-old-owner", LARGE_SIZE).await;
-    let target = create_sized_session(&handler, "resize-link-target", SMALL_SIZE).await;
-    let incoming = create_sized_session(&handler, "resize-link-incoming", LARGE_SIZE).await;
+    let owner = handler
+        .create_session(("resize-link-old-owner", LARGE_SIZE))
+        .await;
+    let target = handler
+        .create_session(("resize-link-target", SMALL_SIZE))
+        .await;
+    let incoming = handler
+        .create_session(("resize-link-incoming", LARGE_SIZE))
+        .await;
 
-    link_window(
-        &handler,
-        WindowTarget::with_window(owner.clone(), 0),
-        WindowTarget::with_window(target.clone(), 1),
-    )
-    .await;
-    select_window(&handler, WindowTarget::with_window(target.clone(), 1)).await;
+    handler
+        .handle_ok(LinkWindowRequest::fixture((
+            WindowTarget::with_window(owner.clone(), 0),
+            WindowTarget::with_window(target.clone(), 1),
+        )))
+        .await;
+    handler
+        .handle_ok(SelectWindowRequest {
+            target: WindowTarget::with_window(target.clone(), 1),
+        })
+        .await;
     handler.wait_for_initial_panes_for_test().await;
 
     let _owner_rx = register_sized_attach(&handler, 8_171, &owner, LARGE_SIZE).await;
     let _target_rx = register_sized_attach(&handler, 8_172, &target, SMALL_SIZE).await;
-    set_window_size_policy(&handler, &owner, 0, "smallest").await;
-    let response = handler
-        .handle(Request::SetOptionByName(Box::new(SetOptionByNameRequest {
-            scope: OptionScopeSelector::Window(WindowTarget::with_window(owner.clone(), 0)),
-            name: "aggressive-resize".to_owned(),
-            value: Some("on".to_owned()),
-            mode: SetOptionMode::Replace,
-            only_if_unset: false,
-            unset: false,
-            unset_pane_overrides: false,
-            format: false,
-            format_target: None,
-        })))
+    handler.set_window_size_policy(&owner, 0, "smallest").await;
+    handler
+        .set_option_by_name(
+            OptionScopeSelector::Window(WindowTarget::with_window(owner.clone(), 0)),
+            "aggressive-resize",
+            "on",
+        )
         .await;
-    assert!(
-        matches!(response, Response::SetOptionByName(_)),
-        "{response:?}"
-    );
     handler
         .reconcile_attached_session_size_and_emit(&owner)
         .await
@@ -218,17 +225,15 @@ async fn resize_mutation_link_window_reconciles_previous_active_aggressive_windo
     assert_window_and_pty_size(&handler, &owner, 0, SMALL_SIZE).await;
     assert_window_and_pty_size(&handler, &target, 1, SMALL_SIZE).await;
 
-    let response = handler
-        .handle(Request::LinkWindow(LinkWindowRequest {
-            source: WindowTarget::with_window(incoming, 0),
-            target: WindowTarget::with_window(target.clone(), 2),
-            after: false,
-            before: false,
-            kill_destination: false,
+    handler
+        .handle_ok(LinkWindowRequest {
             detached: false,
-        }))
+            ..Fixture::fixture((
+                WindowTarget::with_window(incoming, 0),
+                WindowTarget::with_window(target.clone(), 2),
+            ))
+        })
         .await;
-    assert!(matches!(response, Response::LinkWindow(_)), "{response:?}");
 
     {
         let state = handler.state.lock().await;
@@ -250,35 +255,24 @@ async fn resize_mutation_swap_window_reconciles_the_new_active_linked_family() {
     let (handler, source, alias, _source_rx, _alias_rx) =
         create_linked_inactive_window_fixture("resize-swap-active", 8_201).await;
 
-    set_window_size_policy(&handler, &source, 1, "smallest").await;
-    let response = handler
-        .handle(Request::SetOptionByName(Box::new(SetOptionByNameRequest {
-            scope: OptionScopeSelector::Window(WindowTarget::with_window(source.clone(), 1)),
-            name: "aggressive-resize".to_owned(),
-            value: Some("on".to_owned()),
-            mode: SetOptionMode::Replace,
-            only_if_unset: false,
-            unset: false,
-            unset_pane_overrides: false,
-            format: false,
-            format_target: None,
-        })))
+    handler.set_window_size_policy(&source, 1, "smallest").await;
+    handler
+        .set_option_by_name(
+            OptionScopeSelector::Window(WindowTarget::with_window(source.clone(), 1)),
+            "aggressive-resize",
+            "on",
+        )
         .await;
-    assert!(
-        matches!(response, Response::SetOptionByName(_)),
-        "{response:?}"
-    );
     assert_window_and_pty_size(&handler, &source, 1, LARGE_SIZE).await;
     assert_window_and_pty_size(&handler, &alias, 1, LARGE_SIZE).await;
 
-    let response = handler
-        .handle(Request::SwapWindow(SwapWindowRequest {
+    handler
+        .handle_ok(SwapWindowRequest {
             source: WindowTarget::with_window(source.clone(), 0),
             target: WindowTarget::with_window(source.clone(), 1),
             detached: false,
-        }))
+        })
         .await;
-    assert!(matches!(response, Response::SwapWindow(_)), "{response:?}");
 
     {
         let state = handler.state.lock().await;
@@ -306,28 +300,18 @@ async fn resize_mutation_window_options_reconcile_the_exact_linked_family() {
     let (handler, source, alias, _source_rx, _alias_rx) =
         create_linked_inactive_window_fixture("resize-option-exact", 8_301).await;
 
-    set_window_size_policy(&handler, &source, 1, "smallest").await;
+    handler.set_window_size_policy(&source, 1, "smallest").await;
     assert_window_and_pty_size(&handler, &source, 0, SMALL_SIZE).await;
     assert_window_and_pty_size(&handler, &source, 1, SMALL_SIZE).await;
     assert_window_and_pty_size(&handler, &alias, 1, SMALL_SIZE).await;
 
-    let response = handler
-        .handle(Request::SetOptionByName(Box::new(SetOptionByNameRequest {
-            scope: OptionScopeSelector::Window(WindowTarget::with_window(source.clone(), 1)),
-            name: "aggressive-resize".to_owned(),
-            value: Some("on".to_owned()),
-            mode: SetOptionMode::Replace,
-            only_if_unset: false,
-            unset: false,
-            unset_pane_overrides: false,
-            format: false,
-            format_target: None,
-        })))
+    handler
+        .set_option_by_name(
+            OptionScopeSelector::Window(WindowTarget::with_window(source.clone(), 1)),
+            "aggressive-resize",
+            "on",
+        )
         .await;
-    assert!(
-        matches!(response, Response::SetOptionByName(_)),
-        "{response:?}"
-    );
 
     assert_window_and_pty_size(&handler, &source, 0, SMALL_SIZE).await;
     assert_window_and_pty_size(&handler, &source, 1, LARGE_SIZE).await;
@@ -339,7 +323,7 @@ async fn resize_option_reconciliation_follows_a_renamed_session_identity() {
     let (handler, source, alias, _source_rx, _alias_rx) =
         create_linked_inactive_window_fixture("resize-option-rename", 8_351).await;
 
-    set_window_size_policy(&handler, &source, 1, "smallest").await;
+    handler.set_window_size_policy(&source, 1, "smallest").await;
     assert_window_and_pty_size(&handler, &source, 1, SMALL_SIZE).await;
     assert_window_and_pty_size(&handler, &alias, 1, SMALL_SIZE).await;
 
@@ -347,17 +331,11 @@ async fn resize_option_reconciliation_follows_a_renamed_session_identity() {
         .expect("valid renamed session name");
     let state_guard = handler.state.lock().await;
     let mut option_future = Box::pin(handler.handle(Request::SetOptionByName(Box::new(
-        SetOptionByNameRequest {
-            scope: OptionScopeSelector::Window(WindowTarget::with_window(source.clone(), 1)),
-            name: "aggressive-resize".to_owned(),
-            value: Some("on".to_owned()),
-            mode: SetOptionMode::Replace,
-            only_if_unset: false,
-            unset: false,
-            unset_pane_overrides: false,
-            format: false,
-            format_target: None,
-        },
+        SetOptionByNameRequest::fixture((
+            OptionScopeSelector::Window(WindowTarget::with_window(source.clone(), 1)),
+            "aggressive-resize",
+            "on",
+        )),
     ))));
     tokio::select! {
         biased;
@@ -400,24 +378,20 @@ async fn resize_option_reconciliation_retries_a_rename_after_stable_selection() 
     let (handler, source, alias, _source_rx, _alias_rx) =
         create_linked_inactive_window_fixture("resize-option-selected-rename", 8_401).await;
 
-    set_window_size_policy(&handler, &source, 1, "smallest").await;
+    handler.set_window_size_policy(&source, 1, "smallest").await;
     assert_window_and_pty_size(&handler, &source, 1, SMALL_SIZE).await;
     assert_window_and_pty_size(&handler, &alias, 1, SMALL_SIZE).await;
 
     let renamed = rmux_proto::SessionName::new("resize-option-selected-rename-renamed")
         .expect("valid renamed session name");
     let pause = handler.install_attached_size_selection_pause();
-    let set_option = handler.handle(Request::SetOptionByName(Box::new(SetOptionByNameRequest {
-        scope: OptionScopeSelector::Window(WindowTarget::with_window(source.clone(), 1)),
-        name: "aggressive-resize".to_owned(),
-        value: Some("on".to_owned()),
-        mode: SetOptionMode::Replace,
-        only_if_unset: false,
-        unset: false,
-        unset_pane_overrides: false,
-        format: false,
-        format_target: None,
-    })));
+    let set_option = handler.handle(Request::SetOptionByName(Box::new(
+        SetOptionByNameRequest::fixture((
+            OptionScopeSelector::Window(WindowTarget::with_window(source.clone(), 1)),
+            "aggressive-resize",
+            "on",
+        )),
+    )));
     let rename_after_selection = async {
         pause.reached.notified().await;
         let response = handler
@@ -446,21 +420,16 @@ async fn resize_option_reconciliation_retries_a_rename_after_stable_selection() 
 #[tokio::test]
 async fn window_global_resize_reconciliation_follows_a_rename_after_selection() {
     let handler = RequestHandler::new();
-    let session = create_sized_session(&handler, "resize-option-global-rename", LARGE_SIZE).await;
+    let session = handler
+        .create_session(("resize-option-global-rename", LARGE_SIZE))
+        .await;
     handler.wait_for_initial_panes_for_test().await;
     let _small_rx = register_sized_attach(&handler, 8_451, &session, SMALL_SIZE).await;
     let _large_rx = register_sized_attach(&handler, 8_452, &session, LARGE_SIZE).await;
 
-    let response = handler
-        .handle(window_size_option_request(
-            OptionScopeSelector::WindowGlobal,
-            "smallest",
-        ))
+    handler
+        .set_option_by_name(OptionScopeSelector::WindowGlobal, "window-size", "smallest")
         .await;
-    assert!(
-        matches!(response, Response::SetOptionByName(_)),
-        "{response:?}"
-    );
     assert_window_and_pty_size(&handler, &session, 0, SMALL_SIZE).await;
 
     let renamed = rmux_proto::SessionName::new("resize-option-global-renamed")
@@ -496,21 +465,20 @@ async fn window_global_resize_reconciliation_follows_a_rename_after_selection() 
 #[tokio::test]
 async fn session_resize_reconciliation_follows_a_rename_after_selection() {
     let handler = RequestHandler::new();
-    let session = create_sized_session(&handler, "resize-option-session-rename", LARGE_SIZE).await;
+    let session = handler
+        .create_session(("resize-option-session-rename", LARGE_SIZE))
+        .await;
     handler.wait_for_initial_panes_for_test().await;
     let _small_rx = register_sized_attach(&handler, 8_471, &session, SMALL_SIZE).await;
     let _large_rx = register_sized_attach(&handler, 8_472, &session, LARGE_SIZE).await;
 
-    let response = handler
-        .handle(window_size_option_request(
+    handler
+        .set_option_by_name(
             OptionScopeSelector::Session(session.clone()),
+            "window-size",
             "smallest",
-        ))
+        )
         .await;
-    assert!(
-        matches!(response, Response::SetOptionByName(_)),
-        "{response:?}"
-    );
     assert_window_and_pty_size(&handler, &session, 0, SMALL_SIZE).await;
 
     let renamed = rmux_proto::SessionName::new("resize-option-session-renamed")
@@ -546,24 +514,26 @@ async fn session_resize_reconciliation_follows_a_rename_after_selection() {
 #[tokio::test]
 async fn resize_event_keeps_its_exact_identity_across_post_apply_rename() {
     let handler = RequestHandler::new();
-    let session = create_sized_session(&handler, "resize-event-stable", LARGE_SIZE).await;
+    let session = handler
+        .create_session(("resize-event-stable", LARGE_SIZE))
+        .await;
     handler.wait_for_initial_panes_for_test().await;
     let _small_rx = register_sized_attach(&handler, 8_501, &session, SMALL_SIZE).await;
     let _large_rx = register_sized_attach(&handler, 8_502, &session, LARGE_SIZE).await;
-    set_window_size_policy(&handler, &session, 0, "smallest").await;
-
-    let hook_response = handler
-        .handle(Request::SetHook(SetHookRequest {
-            scope: ScopeSelector::Window(WindowTarget::with_window(session.clone(), 0)),
-            hook: HookName::WindowResized,
-            command: "rename-window resize-hook-ran".to_owned(),
-            lifecycle: HookLifecycle::OneShot,
-        }))
+    handler
+        .set_window_size_policy(&session, 0, "smallest")
         .await;
-    assert!(
-        matches!(hook_response, Response::SetHook(_)),
-        "{hook_response:?}"
-    );
+
+    handler
+        .handle_ok(SetHookRequest {
+            lifecycle: HookLifecycle::OneShot,
+            ..Fixture::fixture((
+                ScopeSelector::Window(WindowTarget::with_window(session.clone(), 0)),
+                HookName::WindowResized,
+                "rename-window resize-hook-ran",
+            ))
+        })
+        .await;
     let mut events = handler.subscribe_lifecycle_events();
     let pause = handler.install_window_lifecycle_emit_pause();
     let resize_handler = handler.clone();
@@ -638,16 +608,13 @@ async fn resize_event_keeps_its_exact_identity_across_post_apply_rename() {
         );
     }
 
-    let response = handler
-        .handle(window_size_option_request(
+    handler
+        .set_option_by_name(
             OptionScopeSelector::Window(WindowTarget::with_window(renamed, 0)),
+            "window-size",
             "smallest",
-        ))
+        )
         .await;
-    assert!(
-        matches!(response, Response::SetOptionByName(_)),
-        "{response:?}"
-    );
     let second_event = receive_window_resized(&mut events).await;
     assert!(
         second_event.hooks.is_empty(),
@@ -658,55 +625,47 @@ async fn resize_event_keeps_its_exact_identity_across_post_apply_rename() {
 #[tokio::test]
 async fn hooks_disabled_resize_preserves_the_one_shot_hook() {
     let handler = RequestHandler::new();
-    let session = create_sized_session(&handler, "resize-hook-disabled", LARGE_SIZE).await;
+    let session = handler
+        .create_session(("resize-hook-disabled", LARGE_SIZE))
+        .await;
     handler.wait_for_initial_panes_for_test().await;
     let _small_rx = register_sized_attach(&handler, 8_551, &session, SMALL_SIZE).await;
     let _large_rx = register_sized_attach(&handler, 8_552, &session, LARGE_SIZE).await;
-    set_window_size_policy(&handler, &session, 0, "smallest").await;
+    handler
+        .set_window_size_policy(&session, 0, "smallest")
+        .await;
 
     let target = WindowTarget::with_window(session.clone(), 0);
-    let hook_response = handler
-        .handle(Request::SetHook(SetHookRequest {
-            scope: ScopeSelector::Window(target.clone()),
-            hook: HookName::WindowResized,
-            command: "display-message preserved-one-shot".to_owned(),
+    handler
+        .handle_ok(SetHookRequest {
             lifecycle: HookLifecycle::OneShot,
-        }))
+            ..Fixture::fixture((
+                ScopeSelector::Window(target.clone()),
+                HookName::WindowResized,
+                "display-message preserved-one-shot",
+            ))
+        })
         .await;
-    assert!(
-        matches!(hook_response, Response::SetHook(_)),
-        "{hook_response:?}"
-    );
     let mut events = handler.subscribe_lifecycle_events();
 
-    let response = crate::hook_runtime::with_hook_execution(
+    crate::hook_runtime::with_hook_execution(
         crate::hook_runtime::HookExecutionContext::lifecycle(HookName::WindowResized),
         Vec::new(),
-        async {
-            handler
-                .handle(window_size_option_request(
-                    OptionScopeSelector::Window(target.clone()),
-                    "largest",
-                ))
-                .await
-        },
+        handler.set_option_by_name(
+            OptionScopeSelector::Window(target.clone()),
+            "window-size",
+            "largest",
+        ),
     )
     .await;
-    assert!(
-        matches!(response, Response::SetOptionByName(_)),
-        "{response:?}"
-    );
 
-    let response = handler
-        .handle(window_size_option_request(
+    handler
+        .set_option_by_name(
             OptionScopeSelector::Window(target.clone()),
+            "window-size",
             "smallest",
-        ))
+        )
         .await;
-    assert!(
-        matches!(response, Response::SetOptionByName(_)),
-        "{response:?}"
-    );
     let preserved_event = receive_window_resized(&mut events).await;
     assert_eq!(
         preserved_event.hooks.len(),
@@ -714,16 +673,13 @@ async fn hooks_disabled_resize_preserves_the_one_shot_hook() {
         "hooks-disabled resize must not consume the one-shot hook"
     );
 
-    let response = handler
-        .handle(window_size_option_request(
+    handler
+        .set_option_by_name(
             OptionScopeSelector::Window(target),
+            "window-size",
             "largest",
-        ))
+        )
         .await;
-    assert!(
-        matches!(response, Response::SetOptionByName(_)),
-        "{response:?}"
-    );
     let consumed_event = receive_window_resized(&mut events).await;
     assert!(
         consumed_event.hooks.is_empty(),
@@ -737,17 +693,13 @@ async fn named_resize_capture_guard_preserves_scope_and_lookup_errors() {
     let missing =
         rmux_proto::SessionName::new("resize-capture-missing").expect("valid missing session name");
     let response = handler
-        .handle(Request::SetOptionByName(Box::new(SetOptionByNameRequest {
-            scope: OptionScopeSelector::Session(missing.clone()),
-            name: "@custom".to_owned(),
-            value: Some("value".to_owned()),
-            mode: SetOptionMode::Replace,
-            only_if_unset: false,
-            unset: false,
-            unset_pane_overrides: false,
-            format: false,
-            format_target: None,
-        })))
+        .handle(Request::SetOptionByName(Box::new(
+            SetOptionByNameRequest::fixture((
+                OptionScopeSelector::Session(missing.clone()),
+                "@custom",
+                "value",
+            )),
+        )))
         .await;
     let Response::Error(error) = response else {
         panic!("missing session must fail before option mutation, got {response:?}");
@@ -758,17 +710,13 @@ async fn named_resize_capture_guard_preserves_scope_and_lookup_errors() {
     );
 
     let response = handler
-        .handle(Request::SetOptionByName(Box::new(SetOptionByNameRequest {
-            scope: OptionScopeSelector::WindowGlobal,
-            name: "not-an-option".to_owned(),
-            value: Some("value".to_owned()),
-            mode: SetOptionMode::Replace,
-            only_if_unset: false,
-            unset: false,
-            unset_pane_overrides: false,
-            format: false,
-            format_target: None,
-        })))
+        .handle(Request::SetOptionByName(Box::new(
+            SetOptionByNameRequest::fixture((
+                OptionScopeSelector::WindowGlobal,
+                "not-an-option",
+                "value",
+            )),
+        )))
         .await;
     let Response::Error(error) = response else {
         panic!("invalid option name must fail, got {response:?}");
@@ -778,19 +726,14 @@ async fn named_resize_capture_guard_preserves_scope_and_lookup_errors() {
         "server error: invalid option: not-an-option"
     );
 
-    let session = create_sized_session(&handler, "resize-capture-errors", LARGE_SIZE).await;
+    let session = handler
+        .create_session(("resize-capture-errors", LARGE_SIZE))
+        .await;
     let response = handler
-        .handle(Request::SetOptionByName(Box::new(SetOptionByNameRequest {
-            scope: OptionScopeSelector::Window(WindowTarget::with_window(session, 99)),
-            name: "window-size".to_owned(),
-            value: Some("latest".to_owned()),
-            mode: SetOptionMode::Replace,
-            only_if_unset: false,
-            unset: false,
-            unset_pane_overrides: false,
-            format: false,
-            format_target: None,
-        })))
+        .handle(window_size_option_request(
+            OptionScopeSelector::Window(WindowTarget::with_window(session, 99)),
+            "latest",
+        ))
         .await;
     let Response::Error(error) = response else {
         panic!("missing window must fail before resize capture, got {response:?}");

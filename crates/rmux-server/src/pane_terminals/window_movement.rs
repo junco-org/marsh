@@ -9,7 +9,7 @@ use super::{
     ensure_session_panes_exist, link_window_destination_index, request_target_string,
     session_not_found, window_pane_ids, HandlerState, RemovedWindowHookContext,
 };
-use crate::pane_terminals::session_mutation::WindowMutationMetadataSnapshot;
+use crate::pane_terminals::session_mutation::{SessionCheckpoint, WindowMutationMetadataSnapshot};
 use crate::pane_terminals::{terminate_removed_terminals, MovedWindowResult};
 
 #[path = "window_movement/cross_session.rs"]
@@ -272,12 +272,11 @@ impl HandlerState {
             .session(&session_name)
             .cloned()
             .ok_or_else(|| session_not_found(&session_name))?;
-        let previous_metadata = WindowMutationMetadataSnapshot::capture(self);
+        let checkpoint = SessionCheckpoint::capture(self, [(&session_name, previous_session)]);
 
         let winlink_alert_map = self.reindex_windows_from_base(&session_name)?;
         if let Err(error) = self.resize_terminals(&session_name) {
-            self.replace_session(&session_name, previous_session)?;
-            previous_metadata.restore(self);
+            checkpoint.restore(self)?;
             return Err(error);
         }
 

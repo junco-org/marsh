@@ -1,13 +1,10 @@
 use rmux_proto::{
     BreakPaneRequest, JoinPaneRequest, LinkWindowRequest, MovePaneRequest, MoveWindowRequest,
-    MoveWindowTarget, NewWindowRequest, PaneKillRequest, PaneTargetRef, SplitDirection,
-    SwapPaneRequest, SwapWindowRequest, UnlinkWindowRequest, WindowTarget,
+    NewWindowRequest, PaneKillRequest, PaneTargetRef, SplitWindowRequest, SwapPaneRequest,
+    SwapWindowRequest, UnlinkWindowRequest, WindowTarget,
 };
 
-use crate::handler::pane_group_transfer_tests::{
-    create_grouped_session as create_grouped_transfer_session,
-    create_session as create_transfer_session, split_session as split_transfer_session,
-};
+use crate::test_fixtures::Grouped;
 
 use super::*;
 
@@ -55,33 +52,35 @@ async fn break_rekeys_existing_pane_output_subscription() {
 #[tokio::test]
 async fn swap_between_group_aliases_rekeys_subscription_to_linked_runtime_owner() {
     let handler = RequestHandler::new();
-    let owner = create_transfer_session(&handler, "subscription-group-swap-owner").await;
-    split_transfer_session(&handler, &owner).await;
-    let linked_owner = create_transfer_session(&handler, "subscription-group-swap-linked").await;
-    split_transfer_session(&handler, &linked_owner).await;
-    link_window(
-        &handler,
-        WindowTarget::with_window(linked_owner.clone(), 0),
-        WindowTarget::with_window(owner.clone(), 1),
-        false,
-    )
-    .await;
-    let peer =
-        create_grouped_transfer_session(&handler, "subscription-group-swap-peer", &owner).await;
+    let owner = handler
+        .create_session("subscription-group-swap-owner")
+        .await;
+    handler.handle_ok(SplitWindowRequest::fixture(&owner)).await;
+    let linked_owner = handler
+        .create_session("subscription-group-swap-linked")
+        .await;
+    handler
+        .handle_ok(SplitWindowRequest::fixture(&linked_owner))
+        .await;
+    handler
+        .handle_ok(LinkWindowRequest::fixture((
+            WindowTarget::with_window(linked_owner.clone(), 0),
+            WindowTarget::with_window(owner.clone(), 1),
+        )))
+        .await;
+    let peer = handler
+        .create_session(Grouped("subscription-group-swap-peer", &owner))
+        .await;
     handler.wait_for_initial_panes_for_test().await;
 
     let source = PaneTarget::with_window(owner.clone(), 0, 0);
-    let (subscription_id, pane_id) = subscribe_to_target(&handler, &source).await;
-    let swapped = handler
-        .handle(Request::SwapPane(SwapPaneRequest {
+    let (subscription_id, pane_id) = subscribe_by_id(&handler, CONNECTION_ID, &source).await;
+    handler
+        .handle_ok(SwapPaneRequest::fixture((
             source,
-            target: PaneTarget::with_window(peer, 1, 0),
-            direction: None,
-            detached: true,
-            preserve_zoom: false,
-        }))
+            PaneTarget::with_window(peer, 1, 0),
+        )))
         .await;
-    assert!(matches!(swapped, Response::SwapPane(_)), "{swapped:?}");
 
     assert_window_owner_transfer(
         &handler,
@@ -96,31 +95,33 @@ async fn swap_between_group_aliases_rekeys_subscription_to_linked_runtime_owner(
 #[tokio::test]
 async fn unlink_window_rekeys_subscription_when_runtime_owner_slot_is_removed() {
     let handler = RequestHandler::new();
-    let owner = SessionName::new("subscription-unlink-owner").expect("valid owner");
-    let external = SessionName::new("subscription-unlink-external").expect("valid external");
-    create_session(&handler, &owner).await;
-    create_window(&handler, &owner, 1).await;
-    create_session(&handler, &external).await;
-    link_window(
-        &handler,
-        WindowTarget::with_window(owner.clone(), 0),
-        WindowTarget::with_window(external.clone(), 1),
-        false,
-    )
-    .await;
+    let owner = handler
+        .create_session(Sizeless("subscription-unlink-owner"))
+        .await;
+    handler
+        .create_window(NewWindowRequest {
+            target_window_index: Some(1),
+            ..Fixture::fixture(&owner)
+        })
+        .await;
+    let external = handler
+        .create_session(Sizeless("subscription-unlink-external"))
+        .await;
+    handler
+        .handle_ok(LinkWindowRequest::fixture((
+            WindowTarget::with_window(owner.clone(), 0),
+            WindowTarget::with_window(external.clone(), 1),
+        )))
+        .await;
 
     let source = PaneTarget::with_window(owner.clone(), 0, 0);
-    let (subscription_id, pane_id) = subscribe_to_target(&handler, &source).await;
-    let unlinked = handler
-        .handle(Request::UnlinkWindow(UnlinkWindowRequest {
+    let (subscription_id, pane_id) = subscribe_by_id(&handler, CONNECTION_ID, &source).await;
+    handler
+        .handle_ok(UnlinkWindowRequest {
             target: WindowTarget::with_window(owner, 0),
             kill_if_last: false,
-        }))
+        })
         .await;
-    assert!(
-        matches!(unlinked, Response::UnlinkWindow(_)),
-        "{unlinked:?}"
-    );
 
     assert_window_owner_transfer(
         &handler,
@@ -135,30 +136,39 @@ async fn unlink_window_rekeys_subscription_when_runtime_owner_slot_is_removed() 
 #[tokio::test]
 async fn link_window_k_rekeys_subscription_for_detached_destination_runtime() {
     let handler = RequestHandler::new();
-    let owner = SessionName::new("subscription-link-owner").expect("valid owner");
-    let external = SessionName::new("subscription-link-external").expect("valid external");
-    let replacement = SessionName::new("subscription-link-replacement").expect("valid replacement");
-    create_session(&handler, &owner).await;
-    create_window(&handler, &owner, 1).await;
-    create_session(&handler, &external).await;
-    create_session(&handler, &replacement).await;
-    link_window(
-        &handler,
-        WindowTarget::with_window(owner.clone(), 0),
-        WindowTarget::with_window(external.clone(), 1),
-        false,
-    )
-    .await;
+    let owner = handler
+        .create_session(Sizeless("subscription-link-owner"))
+        .await;
+    handler
+        .create_window(NewWindowRequest {
+            target_window_index: Some(1),
+            ..Fixture::fixture(&owner)
+        })
+        .await;
+    let external = handler
+        .create_session(Sizeless("subscription-link-external"))
+        .await;
+    let replacement = handler
+        .create_session(Sizeless("subscription-link-replacement"))
+        .await;
+    handler
+        .handle_ok(LinkWindowRequest::fixture((
+            WindowTarget::with_window(owner.clone(), 0),
+            WindowTarget::with_window(external.clone(), 1),
+        )))
+        .await;
 
     let source = PaneTarget::with_window(owner.clone(), 0, 0);
-    let (subscription_id, pane_id) = subscribe_to_target(&handler, &source).await;
-    link_window(
-        &handler,
-        WindowTarget::with_window(replacement, 0),
-        WindowTarget::with_window(owner, 0),
-        true,
-    )
-    .await;
+    let (subscription_id, pane_id) = subscribe_by_id(&handler, CONNECTION_ID, &source).await;
+    handler
+        .handle_ok(LinkWindowRequest {
+            kill_destination: true,
+            ..Fixture::fixture((
+                WindowTarget::with_window(replacement, 0),
+                WindowTarget::with_window(owner, 0),
+            ))
+        })
+        .await;
 
     assert_window_owner_transfer(
         &handler,
@@ -173,26 +183,27 @@ async fn link_window_k_rekeys_subscription_for_detached_destination_runtime() {
 #[tokio::test]
 async fn move_window_rekeys_subscription_across_sessions() {
     let handler = RequestHandler::new();
-    let source_name = SessionName::new("subscription-move-window-source").expect("valid source");
-    let target_name = SessionName::new("subscription-move-window-target").expect("valid target");
-    create_session(&handler, &source_name).await;
-    create_window(&handler, &source_name, 1).await;
-    create_session(&handler, &target_name).await;
+    let source_name = handler
+        .create_session(Sizeless("subscription-move-window-source"))
+        .await;
+    handler
+        .create_window(NewWindowRequest {
+            target_window_index: Some(1),
+            ..Fixture::fixture(&source_name)
+        })
+        .await;
+    let target_name = handler
+        .create_session(Sizeless("subscription-move-window-target"))
+        .await;
 
     let source = PaneTarget::with_window(source_name.clone(), 0, 0);
-    let (subscription_id, pane_id) = subscribe_to_target(&handler, &source).await;
-    let moved = handler
-        .handle(Request::MoveWindow(MoveWindowRequest {
-            source: Some(WindowTarget::with_window(source_name, 0)),
-            target: MoveWindowTarget::Window(WindowTarget::with_window(target_name.clone(), 1)),
-            renumber: false,
-            kill_destination: false,
-            detached: true,
-            after: false,
-            before: false,
-        }))
+    let (subscription_id, pane_id) = subscribe_by_id(&handler, CONNECTION_ID, &source).await;
+    handler
+        .handle_ok(MoveWindowRequest::fixture((
+            WindowTarget::with_window(source_name, 0),
+            WindowTarget::with_window(target_name.clone(), 1),
+        )))
         .await;
-    assert!(matches!(moved, Response::MoveWindow(_)), "{moved:?}");
 
     assert_window_owner_transfer(
         &handler,
@@ -207,21 +218,22 @@ async fn move_window_rekeys_subscription_across_sessions() {
 #[tokio::test]
 async fn swap_window_rekeys_subscription_across_sessions() {
     let handler = RequestHandler::new();
-    let source_name = SessionName::new("subscription-swap-window-source").expect("valid source");
-    let target_name = SessionName::new("subscription-swap-window-target").expect("valid target");
-    create_session(&handler, &source_name).await;
-    create_session(&handler, &target_name).await;
+    let source_name = handler
+        .create_session(Sizeless("subscription-swap-window-source"))
+        .await;
+    let target_name = handler
+        .create_session(Sizeless("subscription-swap-window-target"))
+        .await;
 
     let source = PaneTarget::with_window(source_name.clone(), 0, 0);
-    let (subscription_id, pane_id) = subscribe_to_target(&handler, &source).await;
-    let swapped = handler
-        .handle(Request::SwapWindow(SwapWindowRequest {
+    let (subscription_id, pane_id) = subscribe_by_id(&handler, CONNECTION_ID, &source).await;
+    handler
+        .handle_ok(SwapWindowRequest {
             source: WindowTarget::with_window(source_name, 0),
             target: WindowTarget::with_window(target_name.clone(), 0),
             detached: true,
-        }))
+        })
         .await;
-    assert!(matches!(swapped, Response::SwapWindow(_)), "{swapped:?}");
 
     assert_window_owner_transfer(
         &handler,
@@ -239,84 +251,56 @@ async fn assert_subscription_follows_transfer(case: TransferCase) {
         SessionName::new(format!("subscription-{}-source", case.label())).expect("valid source");
     let target_name =
         SessionName::new(format!("subscription-{}-target", case.label())).expect("valid target");
-    create_session(&handler, &source_name).await;
-    create_session(&handler, &target_name).await;
+    handler.create_session(Sizeless(&source_name)).await;
+    handler.create_session(Sizeless(&target_name)).await;
 
     let source_target = PaneTarget::with_window(source_name.clone(), 0, 0);
     let target_target = PaneTarget::with_window(target_name.clone(), 0, 0);
-    let source_pane_id = pane_id_for_target(&handler, &source_target).await;
-    let subscribed = handler
-        .handle_subscribe_pane_output_ref(
-            CONNECTION_ID,
-            SubscribePaneOutputRefRequest {
-                target: PaneTargetRef::by_id(source_name.clone(), source_pane_id),
-                start: PaneOutputSubscriptionStart::Now,
-            },
-        )
-        .await;
-    let Response::SubscribePaneOutput(subscribed) = subscribed else {
-        panic!(
-            "{} subscription should succeed: {subscribed:?}",
-            case.label()
-        );
-    };
+    let (subscription_id, source_pane_id) =
+        subscribe_by_id(&handler, CONNECTION_ID, &source_target).await;
 
     let response = match case {
         TransferCase::Swap => {
             handler
                 .handle(Request::SwapPane(SwapPaneRequest {
-                    source: source_target,
-                    target: target_target,
-                    direction: None,
                     detached: false,
-                    preserve_zoom: false,
+                    ..Fixture::fixture((source_target, target_target))
                 }))
                 .await
         }
         TransferCase::Join => {
             handler
                 .handle(Request::JoinPane(JoinPaneRequest {
-                    source: source_target,
-                    target: target_target,
-                    direction: SplitDirection::Vertical,
                     detached: false,
-                    before: false,
-                    full_size: false,
-                    size: None,
+                    ..Fixture::fixture((source_target, target_target))
                 }))
                 .await
         }
         TransferCase::Move => {
             handler
                 .handle(Request::MovePane(MovePaneRequest {
-                    source: source_target,
-                    target: target_target,
-                    direction: SplitDirection::Vertical,
                     detached: false,
-                    before: false,
-                    full_size: false,
-                    size: None,
+                    ..Fixture::fixture((source_target, target_target))
                 }))
                 .await
         }
         TransferCase::Break => {
             handler
                 .handle(Request::BreakPane(Box::new(BreakPaneRequest {
-                    source: source_target,
-                    target: Some(WindowTarget::with_window(target_name.clone(), 1)),
-                    name: None,
                     detached: false,
-                    after: false,
-                    before: false,
-                    print_target: false,
-                    format: None,
+                    ..Fixture::fixture((
+                        source_target,
+                        WindowTarget::with_window(target_name.clone(), 1),
+                    ))
                 })))
                 .await
         }
     };
     assert_transfer_succeeded(case, &response);
 
-    let moved_target = pane_target_for_id(&handler, &target_name, source_pane_id).await;
+    let moved_target = pane_target_for_id(&handler, &target_name, source_pane_id)
+        .await
+        .expect("moved pane is reachable by stable id");
     let canonical_key = {
         let state = handler.state.lock().await;
         state
@@ -324,7 +308,7 @@ async fn assert_subscription_follows_transfer(case: TransferCase) {
             .expect("moved pane has a canonical output key")
     };
     let registered_key = handler
-        .pane_output_subscription_key_for_test(subscribed.subscription_id)
+        .pane_output_subscription_key_for_test(subscription_id)
         .expect("subscription survives the transfer");
     assert_eq!(
         registered_key,
@@ -347,7 +331,7 @@ async fn assert_subscription_follows_transfer(case: TransferCase) {
         .handle_pane_output_cursor(
             CONNECTION_ID,
             PaneOutputCursorRequest {
-                subscription_id: subscribed.subscription_id,
+                subscription_id,
                 max_events: Some(16),
             },
         )
@@ -375,82 +359,7 @@ async fn assert_subscription_follows_transfer(case: TransferCase) {
         "{} moved pane cleanup should succeed: {killed:?}",
         case.label()
     );
-    assert_killed_subscription_drains_then_expires(
-        &handler,
-        subscribed.subscription_id,
-        case.label(),
-    )
-    .await;
-}
-
-async fn create_session(handler: &RequestHandler, session_name: &SessionName) {
-    let created = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name: session_name.clone(),
-            detached: true,
-            size: None,
-            environment: None,
-        }))
-        .await;
-    assert!(matches!(created, Response::NewSession(_)), "{created:?}");
-    handler.wait_for_initial_panes_for_test().await;
-}
-
-async fn create_window(handler: &RequestHandler, session_name: &SessionName, window_index: u32) {
-    let created = handler
-        .handle(Request::NewWindow(Box::new(NewWindowRequest {
-            target: session_name.clone(),
-            name: None,
-            detached: true,
-            environment: None,
-            command: None,
-            start_directory: None,
-            target_window_index: Some(window_index),
-            insert_at_target: false,
-            process_command: None,
-        })))
-        .await;
-    assert!(matches!(created, Response::NewWindow(_)), "{created:?}");
-    handler.wait_for_initial_panes_for_test().await;
-}
-
-async fn link_window(
-    handler: &RequestHandler,
-    source: WindowTarget,
-    target: WindowTarget,
-    kill_destination: bool,
-) {
-    let linked = handler
-        .handle(Request::LinkWindow(LinkWindowRequest {
-            source,
-            target,
-            after: false,
-            before: false,
-            kill_destination,
-            detached: true,
-        }))
-        .await;
-    assert!(matches!(linked, Response::LinkWindow(_)), "{linked:?}");
-}
-
-async fn subscribe_to_target(
-    handler: &RequestHandler,
-    target: &PaneTarget,
-) -> (rmux_proto::PaneOutputSubscriptionId, PaneId) {
-    let pane_id = pane_id_for_target(handler, target).await;
-    let response = handler
-        .handle_subscribe_pane_output_ref(
-            CONNECTION_ID,
-            SubscribePaneOutputRefRequest {
-                target: PaneTargetRef::by_id(target.session_name().clone(), pane_id),
-                start: PaneOutputSubscriptionStart::Now,
-            },
-        )
-        .await;
-    let Response::SubscribePaneOutput(subscribed) = response else {
-        panic!("subscription should succeed: {response:?}");
-    };
-    (subscribed.subscription_id, pane_id)
+    assert_killed_subscription_drains_then_expires(&handler, subscription_id, case.label()).await;
 }
 
 async fn assert_window_owner_transfer(
@@ -460,7 +369,9 @@ async fn assert_window_owner_transfer(
     destination_session: SessionName,
     label: &str,
 ) {
-    let moved_target = pane_target_for_id(handler, &destination_session, pane_id).await;
+    let moved_target = pane_target_for_id(handler, &destination_session, pane_id)
+        .await
+        .expect("moved pane is reachable by stable id");
     let canonical_key = {
         let state = handler.state.lock().await;
         state
@@ -564,42 +475,6 @@ async fn assert_killed_subscription_drains_then_expires(
         ),
         "{label} drain expiration must clean the rekeyed record: {cursor_after_expiration:?}"
     );
-}
-
-async fn pane_id_for_target(handler: &RequestHandler, target: &PaneTarget) -> PaneId {
-    let state = handler.state.lock().await;
-    state
-        .sessions
-        .session(target.session_name())
-        .and_then(|session| session.window_at(target.window_index()))
-        .and_then(|window| window.pane(target.pane_index()))
-        .map(rmux_core::Pane::id)
-        .expect("pane target exists")
-}
-
-async fn pane_target_for_id(
-    handler: &RequestHandler,
-    session_name: &SessionName,
-    pane_id: PaneId,
-) -> PaneTarget {
-    let state = handler.state.lock().await;
-    let session = state
-        .sessions
-        .session(session_name)
-        .expect("destination session survives");
-    session
-        .windows()
-        .iter()
-        .find_map(|(window_index, window)| {
-            window
-                .panes()
-                .iter()
-                .find(|pane| pane.id() == pane_id)
-                .map(|pane| {
-                    PaneTarget::with_window(session_name.clone(), *window_index, pane.index())
-                })
-        })
-        .expect("moved pane is reachable by stable id")
 }
 
 fn assert_transfer_succeeded(case: TransferCase, response: &Response) {

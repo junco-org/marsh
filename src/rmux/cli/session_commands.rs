@@ -1,17 +1,17 @@
 use std::path::{Path, PathBuf};
 
-use rmux_client::connect;
 use rmux_client::{ClientContext, ClientContextParent, detect_context, detect_parent};
 use rmux_proto::request::{AttachSessionExt2Request, SwitchClientExt3Request};
 use rmux_proto::request::{KillSessionRequest, ListSessionsRequest, NewSessionExtRequest};
-use rmux_proto::{ClientTerminalContext, ErrorResponse, Response};
+use rmux_proto::{ClientTerminalContext, Response};
 
 use super::json_output::{list_sessions_json_format, write_list_sessions_json};
+use super::target_resolution::{connect_cli, response_failure, run_targeted};
 use super::{
     ExitFailure, StartupOptions, build_terminal_size, connect_with_startserver,
-    expect_command_success, optional_client_flags, resolve_current_session_target,
-    resolve_session_target_or_current, resolve_session_target_spec, run_command_resolved,
-    run_payload_command, unexpected_response, write_command_output,
+    expect_command_output, expect_command_success, optional_client_flags,
+    resolve_current_session_target, resolve_session_target_or_current, resolve_session_target_spec,
+    run_payload_command, write_command_output,
 };
 use super::{
     attach_with_connection, current_terminal_size, require_attach_terminal,
@@ -150,8 +150,7 @@ fn reject_existing_session_before_attach_preflight(
             format!("duplicate session: {session_name}"),
         )),
         Response::HasSession(_) => Ok(()),
-        Response::Error(ErrorResponse { error }) => Err(ExitFailure::new(1, error.to_string())),
-        other => Err(unexpected_response("has-session", &other)),
+        other => Err(response_failure("has-session", &other)),
     }
 }
 
@@ -186,8 +185,7 @@ pub(super) fn run_has_session(
     args: &SessionTargetArgs,
     socket_path: &Path,
 ) -> Result<i32, ExitFailure> {
-    let mut connection = connect(socket_path)
-        .map_err(|error| ExitFailure::from_client_connect(socket_path, error))?;
+    let mut connection = connect_cli(socket_path)?;
     let missing_message = args.target.as_ref().map_or_else(
         || "can't find session".to_owned(),
         |target| format!("can't find session: {target}"),
@@ -197,18 +195,10 @@ pub(super) fn run_has_session(
             .map_err(|error| map_has_session_lookup_error(error, target.raw()))?,
         None => resolve_current_session_target(&mut connection)?,
     };
-    let response = connection.has_session(target).map_err(ExitFailure::from)?;
-
-    match response {
-        Response::HasSession(response) => {
-            if response.exists {
-                Ok(0)
-            } else {
-                Err(ExitFailure::new(1, missing_message))
-            }
-        }
-        Response::Error(ErrorResponse { error }) => Err(ExitFailure::new(1, error.to_string())),
-        other => Err(unexpected_response("has-session", &other)),
+    match connection.has_session(target).map_err(ExitFailure::from)? {
+        Response::HasSession(response) if response.exists => Ok(0),
+        Response::HasSession(_) => Err(ExitFailure::new(1, missing_message)),
+        other => Err(response_failure("has-session", &other)),
     }
 }
 
@@ -217,7 +207,7 @@ fn map_has_session_lookup_error(error: ExitFailure, raw_target: &str) -> ExitFai
     if error.message().contains("ambiguous session match") {
         return ExitFailure::new(1, format!("can't find session: {raw_target}"));
     }
-    normalize_session_lookup_error(error, "can't find session: {}")
+    normalize_session_lookup_error(error)
 }
 
 /// Runs `kill-session` against the resolved target, or the current session.
@@ -225,11 +215,10 @@ pub(super) fn run_kill_session(
     args: &KillSessionArgs,
     socket_path: &Path,
 ) -> Result<i32, ExitFailure> {
-    let mut connection = connect(socket_path)
-        .map_err(|error| ExitFailure::from_client_connect(socket_path, error))?;
+    let mut connection = connect_cli(socket_path)?;
     let target =
         resolve_session_target_or_current(&mut connection, args.target.as_ref(), "kill-session")
-            .map_err(map_kill_session_lookup_error)?;
+            .map_err(normalize_session_lookup_error)?;
     let response = connection
         .kill_session(KillSessionRequest {
             target,
@@ -242,19 +231,13 @@ pub(super) fn run_kill_session(
     Ok(0)
 }
 
-/// Normalizes a `kill-session` target lookup failure into tmux's missing-session message.
-fn map_kill_session_lookup_error(error: ExitFailure) -> ExitFailure {
-    normalize_session_lookup_error(error, "can't find session: {}")
-}
-
-/// Rewrites a missing-session failure with `format`, leaving other failures untouched.
-fn normalize_session_lookup_error(error: ExitFailure, format: &str) -> ExitFailure {
+/// Trims a missing-session failure down to tmux's `can't find session: <name>` message.
+fn normalize_session_lookup_error(error: ExitFailure) -> ExitFailure {
     const PREFIX: &str = "can't find session: ";
 
     if let Some((_, session_name)) = error.message().split_once(PREFIX) {
-        return ExitFailure::new(1, format.replace("{}", session_name));
+        return ExitFailure::new(1, format!("{PREFIX}{session_name}"));
     }
-
     error
 }
 
@@ -263,13 +246,12 @@ pub(super) fn run_rename_session(
     args: RenameSessionArgs,
     socket_path: &Path,
 ) -> Result<i32, ExitFailure> {
-    run_command_resolved(socket_path, "rename-session", move |connection| {
-        let target =
-            resolve_session_target_or_current(connection, args.target.as_ref(), "rename-session")?;
-        connection
-            .rename_session(target, args.new_name)
-            .map_err(ExitFailure::from)
-    })
+    run_targeted(
+        socket_path,
+        "rename-session",
+        args.target.as_ref(),
+        |connection, target| connection.rename_session(target, args.new_name),
+    )
 }
 
 /// Runs `list-sessions`, emitting the JSON encoding when `--json` was requested.
@@ -278,8 +260,7 @@ pub(super) fn run_list_sessions(
     socket_path: &Path,
 ) -> Result<i32, ExitFailure> {
     if args.json {
-        let mut connection = connect(socket_path)
-            .map_err(|error| ExitFailure::from_client_connect(socket_path, error))?;
+        let mut connection = connect_cli(socket_path)?;
         let response = connection
             .list_sessions(ListSessionsRequest {
                 format: Some(list_sessions_json_format()),
@@ -288,7 +269,7 @@ pub(super) fn run_list_sessions(
                 reversed: args.reversed,
             })
             .map_err(ExitFailure::from)?;
-        let output = super::expect_command_output(&response, "list-sessions")?;
+        let output = expect_command_output(&response, "list-sessions")?;
         return write_list_sessions_json(output);
     }
 

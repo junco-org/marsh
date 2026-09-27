@@ -2,28 +2,14 @@ use super::*;
 
 use super::super::lock_support::{install_lock_identity_pause, LockIdentityPausePoint};
 
-async fn create_session(handler: &RequestHandler, session: &SessionName) {
-    let response = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name: session.clone(),
-            detached: true,
-            size: Some(TerminalSize { cols: 80, rows: 24 }),
-            environment: None,
-        }))
-        .await;
-    assert!(matches!(response, Response::NewSession(_)), "{response:?}");
-}
-
 async fn set_lock_command(handler: &RequestHandler) {
-    let response = handler
-        .handle(Request::SetOption(SetOptionRequest {
-            scope: ScopeSelector::Global,
-            option: OptionName::LockCommand,
-            value: "lock-identity-probe".to_owned(),
-            mode: SetOptionMode::Replace,
-        }))
+    handler
+        .set_option(
+            ScopeSelector::Global,
+            OptionName::LockCommand,
+            "lock-identity-probe",
+        )
         .await;
-    assert!(matches!(response, Response::SetOption(_)), "{response:?}");
 }
 
 async fn rename_session(
@@ -31,16 +17,12 @@ async fn rename_session(
     current_name: SessionName,
     new_name: SessionName,
 ) {
-    let response = handler
-        .handle(Request::RenameSession(RenameSessionRequest {
+    handler
+        .handle_ok(RenameSessionRequest {
             target: current_name,
             new_name,
-        }))
+        })
         .await;
-    assert!(
-        matches!(response, Response::RenameSession(_)),
-        "{response:?}"
-    );
 }
 
 async fn switch_attached_client(handler: &RequestHandler, attach_pid: u32, target: SessionName) {
@@ -122,7 +104,7 @@ async fn lock_server_does_not_suspend_same_pid_attach_replacement_after_snapshot
     let handler = RequestHandler::new();
     let session = session_name("lock-server-attach-identity");
     let attach_pid = 920_060;
-    create_session(&handler, &session).await;
+    handler.create_session(&session).await;
     set_lock_command(&handler).await;
 
     let (old_tx, _old_rx) = mpsc::unbounded_channel();
@@ -164,7 +146,7 @@ async fn lock_server_follows_exact_session_identity_across_rename() {
     let original_name = session_name("lock-server-before-rename");
     let renamed = session_name("lock-server-after-rename");
     let attach_pid = 920_064;
-    create_session(&handler, &original_name).await;
+    handler.create_session(&original_name).await;
     set_lock_command(&handler).await;
     let (control_tx, mut control_rx) = mpsc::unbounded_channel();
     let attach_id = handler
@@ -208,8 +190,8 @@ async fn lock_server_follows_same_attach_registration_across_session_switch() {
     let alpha = session_name("lock-server-before-switch");
     let beta = session_name("lock-server-after-switch");
     let attach_pid = 920_067;
-    create_session(&handler, &alpha).await;
-    create_session(&handler, &beta).await;
+    handler.create_session(&alpha).await;
+    handler.create_session(&beta).await;
     set_lock_command(&handler).await;
     let (control_tx, mut control_rx) = mpsc::unbounded_channel();
     let attach_id = handler.register_attach(attach_pid, alpha, control_tx).await;
@@ -245,7 +227,7 @@ async fn lock_client_does_not_suspend_same_pid_attach_replacement_after_resoluti
     let handler = RequestHandler::new();
     let session = session_name("lock-client-attach-identity");
     let attach_pid = 920_061;
-    create_session(&handler, &session).await;
+    handler.create_session(&session).await;
     set_lock_command(&handler).await;
 
     let (old_tx, _old_rx) = mpsc::unbounded_channel();
@@ -293,7 +275,7 @@ async fn lock_client_follows_exact_session_identity_across_rename() {
     let original_name = session_name("lock-client-before-rename");
     let renamed = session_name("lock-client-after-rename");
     let attach_pid = 920_065;
-    create_session(&handler, &original_name).await;
+    handler.create_session(&original_name).await;
     set_lock_command(&handler).await;
     let (control_tx, mut control_rx) = mpsc::unbounded_channel();
     let attach_id = handler
@@ -343,8 +325,8 @@ async fn lock_client_follows_same_attach_registration_across_session_switch() {
     let alpha = session_name("lock-client-before-switch");
     let beta = session_name("lock-client-after-switch");
     let attach_pid = 920_068;
-    create_session(&handler, &alpha).await;
-    create_session(&handler, &beta).await;
+    handler.create_session(&alpha).await;
+    handler.create_session(&beta).await;
     set_lock_command(&handler).await;
     let (control_tx, mut control_rx) = mpsc::unbounded_channel();
     let attach_id = handler.register_attach(attach_pid, alpha, control_tx).await;
@@ -386,7 +368,7 @@ async fn lock_session_does_not_suspend_same_pid_attach_replacement_after_snapsho
     let handler = RequestHandler::new();
     let session = session_name("lock-session-attach-identity");
     let attach_pid = 920_062;
-    create_session(&handler, &session).await;
+    handler.create_session(&session).await;
     set_lock_command(&handler).await;
 
     let (old_tx, _old_rx) = mpsc::unbounded_channel();
@@ -432,7 +414,7 @@ async fn lock_session_follows_exact_session_identity_across_rename() {
     let original_name = session_name("lock-session-before-rename");
     let renamed = session_name("lock-session-after-rename");
     let attach_pid = 920_066;
-    create_session(&handler, &original_name).await;
+    handler.create_session(&original_name).await;
     set_lock_command(&handler).await;
     let (control_tx, mut control_rx) = mpsc::unbounded_channel();
     let attach_id = handler
@@ -479,13 +461,10 @@ async fn lock_session_does_not_follow_attach_that_switches_out_of_target_session
     let alpha = session_name("lock-session-before-switch");
     let beta = session_name("lock-session-after-switch");
     let attach_pid = 920_069;
-    create_session(&handler, &alpha).await;
-    create_session(&handler, &beta).await;
+    handler.create_session(&alpha).await;
+    handler.create_session(&beta).await;
     set_lock_command(&handler).await;
-    let (control_tx, mut control_rx) = mpsc::unbounded_channel();
-    handler
-        .register_attach(attach_pid, alpha.clone(), control_tx)
-        .await;
+    let mut control_rx = handler.attach_client(attach_pid, &alpha).await;
 
     let pause = install_lock_identity_pause(LockIdentityPausePoint::SessionClients(alpha.clone()));
     let lock_handler = handler.clone();
@@ -515,17 +494,10 @@ async fn lock_session_does_not_suspend_attach_in_same_name_recreated_session() {
     let session = session_name("lock-session-recreated-identity");
     let keeper = session_name("lock-session-recreated-keeper");
     let replacement_pid = 920_063;
-    create_session(&handler, &session).await;
-    create_session(&handler, &keeper).await;
+    handler.create_session(&session).await;
+    handler.create_session(&keeper).await;
     set_lock_command(&handler).await;
-    let original_session_id = handler
-        .state
-        .lock()
-        .await
-        .sessions
-        .session(&session)
-        .expect("original session exists")
-        .id();
+    let original_session_id = handler.session_id_for_test(&session).await;
 
     let pause = install_lock_identity_pause(LockIdentityPausePoint::Session(session.clone()));
     let lock_handler = handler.clone();
@@ -541,24 +513,11 @@ async fn lock_session_does_not_suspend_attach_in_same_name_recreated_session() {
     tokio::time::timeout(Duration::from_secs(2), pause.wait_until_reached())
         .await
         .expect("lock-session captures the target session identity");
-    let killed = handler
-        .handle(Request::KillSession(KillSessionRequest {
-            target: session.clone(),
-            kill_all_except_target: false,
-            clear_alerts: false,
-            kill_group: false,
-        }))
+    handler
+        .handle_ok(KillSessionRequest::fixture(&session))
         .await;
-    assert!(matches!(killed, Response::KillSession(_)), "{killed:?}");
-    create_session(&handler, &session).await;
-    let replacement_session_id = handler
-        .state
-        .lock()
-        .await
-        .sessions
-        .session(&session)
-        .expect("replacement session exists")
-        .id();
+    handler.create_session(&session).await;
+    let replacement_session_id = handler.session_id_for_test(&session).await;
     assert_ne!(replacement_session_id, original_session_id);
     let (replacement_tx, mut replacement_rx) = mpsc::unbounded_channel();
     let replacement_id = handler

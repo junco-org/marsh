@@ -1,6 +1,7 @@
 use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::time::Instant;
 
+use marsh_lib::InitializationRoute;
 use rmux_proto::{
     ErrorResponse, PaneRawRebaseReason, PaneStreamCursorRequest, PaneStreamEndReason,
     PaneStreamEvent, PaneStreamMode, Response, RmuxError, SubscribePaneStreamRequest,
@@ -10,7 +11,7 @@ use rmux_proto::{
 use crate::pane_terminals::HandlerState;
 
 use super::pane_support::resolve_pane_target_ref;
-use super::subscription_support::{OutputSubscriptionState, SurfaceDriverRoute};
+use super::subscription_support::OutputSubscriptionState;
 use super::RequestHandler;
 
 #[path = "handler/pane_stream_capture.rs"]
@@ -69,7 +70,8 @@ impl Drop for SurfaceInitializationGuard {
         subscriptions
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .finish_surface_initialization(self.token);
+            .surface_initializations
+            .finish(self.token);
     }
 }
 
@@ -271,7 +273,7 @@ impl RequestHandler {
         let surface_initialization = if let Some(mut route) = surface_route {
             loop {
                 match route {
-                    SurfaceDriverRoute::Ready => {
+                    InitializationRoute::Ready(()) => {
                         source = match self.validate_current_surface_admission(source).await {
                             Ok(source) => source,
                             Err(error) => return Response::Error(ErrorResponse { error }),
@@ -286,10 +288,10 @@ impl RequestHandler {
                         }
                         return response;
                     }
-                    SurfaceDriverRoute::Initialize { token } => {
+                    InitializationRoute::Initialize { token } => {
                         break Some(SurfaceInitializationGuard::new(&self.subscriptions, token));
                     }
-                    SurfaceDriverRoute::Wait(mut completion) => {
+                    InitializationRoute::Wait(mut completion) => {
                         let _ = completion.changed().await;
                         let mut subscriptions = self
                             .subscriptions

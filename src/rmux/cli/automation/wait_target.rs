@@ -5,10 +5,12 @@ use rmux_proto::{
 };
 
 use crate::cli_args::TargetSpec;
-use crate::cli_response::tmux_cli_error_message;
 
-use super::super::{ExitFailure, listed_pane_index_matches_target};
-use super::common::{pane_snapshot, resolve_pane_slot};
+use super::super::{ExitFailure, resolve_pane_target_or_current};
+use super::common::{
+    command_error, list_panes_output, pane_snapshot, parse_i32_field, parse_pane_id,
+    protocol_mismatch, slot_row_fields, target_kind_name,
+};
 use super::pane_exit::PaneExitStatus;
 
 const MAX_RENAME_RETRIES: usize = 8;
@@ -67,20 +69,12 @@ impl StableWaitTarget {
                 }
             },
             Response::Error(error) => {
-                return Ok(SessionNameRefresh::Gone(ExitFailure::new(
-                    1,
-                    tmux_cli_error_message(command_name, &error.error),
+                return Ok(SessionNameRefresh::Gone(command_error(
+                    command_name,
+                    &error,
                 )));
             }
-            other => {
-                return Err(ExitFailure::new(
-                    1,
-                    format!(
-                        "protocol error: unexpected '{}' response while refreshing a pane wait",
-                        other.command_name()
-                    ),
-                ));
-            }
+            other => return Err(protocol_mismatch(&other, "while refreshing a pane wait")),
         };
         if session_name == self.session_name {
             return Ok(SessionNameRefresh::Unchanged);
@@ -119,7 +113,7 @@ pub(super) fn resolve(
     target: Option<&TargetSpec>,
     command_name: &'static str,
 ) -> Result<StableWaitTarget, ExitFailure> {
-    let slot = resolve_pane_slot(connection, target, command_name)?;
+    let slot = resolve_pane_target_or_current(connection, target, command_name)?;
     for_slot(connection, &slot, command_name)
 }
 
@@ -188,46 +182,26 @@ fn pane_identity_for_slot(
     target: &PaneTarget,
     command_name: &'static str,
 ) -> Result<(SessionId, PaneId), ExitFailure> {
-    let response = connection
-        .list_panes_in_window(
-            target.session_name().clone(),
-            Some(target.window_index()),
-            Some("#{pane_index}\t#{pane-base-index}\t#{pane_id}\t#{session_id}\n".to_owned()),
-        )
-        .map_err(ExitFailure::from)?;
-    let output = match response {
-        Response::ListPanes(response) => response.output,
-        Response::Error(error) => {
-            return Err(ExitFailure::new(
+    let output = list_panes_output(
+        connection,
+        target.session_name().clone(),
+        Some(target.window_index()),
+        "#{pane_index}\t#{pane-base-index}\t#{pane_id}\t#{session_id}\n".to_owned(),
+        "while resolving pane wait identity",
+    )?
+    .map_err(|error| command_error(command_name, &error))?;
+    let listing = String::from_utf8_lossy(output.stdout());
+    slot_row_fields(&listing, target)
+        .and_then(|mut fields| {
+            let pane_id = fields.next().and_then(parse_pane_id)?;
+            Some((fields.next().and_then(parse_session_id)?, pane_id))
+        })
+        .ok_or_else(|| {
+            ExitFailure::new(
                 1,
-                tmux_cli_error_message(command_name, &error.error),
-            ));
-        }
-        other => return Err(unexpected_response(&other, "resolving pane wait identity")),
-    };
-    let text = String::from_utf8_lossy(output.stdout());
-    for line in text.lines() {
-        let mut fields = line.split('\t');
-        if !listed_pane_index_matches_target(
-            target,
-            fields.next().unwrap_or_default(),
-            fields.next().unwrap_or_default(),
-        ) {
-            continue;
-        }
-        if let Some((pane_id, session_id)) = fields
-            .next()
-            .and_then(parse_pane_id)
-            .zip(fields.next().and_then(parse_session_id))
-        {
-            return Ok((session_id, pane_id));
-        }
-        break;
-    }
-    Err(ExitFailure::new(
-        1,
-        format!("unable to resolve stable pane identity for target {target}"),
-    ))
+                format!("unable to resolve stable pane identity for target {target}"),
+            )
+        })
 }
 
 /// Runs one internal pane exit probe and decodes the pane's liveness and exit status.
@@ -235,20 +209,15 @@ fn query_process_state(
     connection: &mut Connection,
     target: &StableWaitTarget,
 ) -> Result<ProcessLookup, ExitFailure> {
-    let response = connection
-        .list_panes_in_window(
-            target.session_name.clone(),
-            None,
-            Some(encode_internal_pane_exit_probe(
-                target.session_id,
-                target.pane_id,
-            )),
-        )
-        .map_err(ExitFailure::from)?;
-    let output = match response {
-        Response::ListPanes(response) => response.output,
-        Response::Error(_) => return Ok(ProcessLookup::TargetUnavailable),
-        other => return Err(unexpected_response(&other, "reading pane process state")),
+    let Ok(output) = list_panes_output(
+        connection,
+        target.session_name.clone(),
+        None,
+        encode_internal_pane_exit_probe(target.session_id, target.pane_id),
+        "while reading pane process state",
+    )?
+    else {
+        return Ok(ProcessLookup::TargetUnavailable);
     };
     for line in String::from_utf8_lossy(output.stdout()).lines() {
         let mut fields = line.split('\t');
@@ -270,15 +239,6 @@ fn query_process_state(
     Ok(ProcessLookup::TargetUnavailable)
 }
 
-/// Parses a `%`-prefixed pane id such as `%3`.
-fn parse_pane_id(value: &str) -> Option<PaneId> {
-    value
-        .strip_prefix('%')?
-        .parse::<u32>()
-        .ok()
-        .map(PaneId::new)
-}
-
 /// Parses a `$`-prefixed session id such as `$1`.
 fn parse_session_id(value: &str) -> Option<SessionId> {
     value
@@ -286,33 +246,6 @@ fn parse_session_id(value: &str) -> Option<SessionId> {
         .parse::<u32>()
         .ok()
         .map(SessionId::new)
-}
-
-/// Parses an optional probe field as `i32`, treating an empty field as absent.
-fn parse_i32_field(value: Option<&str>) -> Option<i32> {
-    value
-        .filter(|value| !value.is_empty())
-        .and_then(|value| value.parse::<i32>().ok())
-}
-
-/// The human-readable kind word for a resolved `Target`.
-const fn target_kind_name(target: &Target) -> &'static str {
-    match target {
-        Target::Session(_) => "session",
-        Target::Window(_) => "window",
-        Target::Pane(_) => "pane",
-    }
-}
-
-/// Builds the protocol-error failure for a response that does not fit `context`.
-fn unexpected_response(response: &Response, context: &str) -> ExitFailure {
-    ExitFailure::new(
-        1,
-        format!(
-            "protocol error: unexpected '{}' response while {context}",
-            response.command_name()
-        ),
-    )
 }
 
 /// The failure returned when a pane's session kept being renamed past the retry budget.

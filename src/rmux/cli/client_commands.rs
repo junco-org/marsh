@@ -1,5 +1,5 @@
 use std::ffi::OsStr;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use rmux_client::{
     ClientContext, Connection, ControlTransition, connect, detect_context, drive_control_mode,
@@ -13,6 +13,7 @@ use rmux_proto::{ClientTerminalContext, ControlMode, ErrorResponse, Response};
 use super::attach_transport::{
     QueuedAttachSessionResult, attach_with_connection, begin_queued_attach,
 };
+use super::command_runner::rmux_socket_path_from_env;
 use super::json_output::{list_clients_json_format, write_list_clients_json};
 use super::{
     ExitFailure, StartupOptions, connect_with_startserver_outcome, current_terminal_size,
@@ -191,19 +192,8 @@ fn inherited_rmux_socket_matches(socket_path: &Path) -> bool {
 
 /// Compares a raw `RMUX` environment value against `socket_path`, ignoring a missing variable.
 fn inherited_rmux_socket_matches_from_env(rmux: Option<&OsStr>, socket_path: &Path) -> bool {
-    let Some(inherited_socket) = rmux.and_then(rmux_socket_path_from_env) else {
-        return false;
-    };
-    rmux_os::path::socket_paths_match(&inherited_socket, socket_path)
-}
-
-/// Extracts the socket path from an `RMUX` value of the form `path,pid,session`.
-fn rmux_socket_path_from_env(value: &OsStr) -> Option<PathBuf> {
-    let value = value.to_string_lossy();
-    let path = value
-        .split_once(',')
-        .map_or_else(|| value.as_ref(), |(path, _)| path);
-    (!path.is_empty()).then(|| PathBuf::from(path))
+    rmux.and_then(|value| rmux_socket_path_from_env(&value.to_string_lossy()))
+        .is_some_and(|inherited| rmux_os::path::socket_paths_match(&inherited, socket_path))
 }
 
 /// Rejects nested `attach-session` invocations using anything beyond `-E` and a required `-t`.

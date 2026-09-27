@@ -250,10 +250,5 @@ fn completion_empty_subcommand(name: &'static str) -> clap::Command {
         .no_binary_name(true)
         .disable_help_flag(true)
         .disable_help_subcommand(true)
-        .arg(
-            clap::Arg::new("help")
-                .long("help")
-                .action(ArgAction::Help)
-                .help("Print help"),
-        )
+        .arg(help_argument())
 }

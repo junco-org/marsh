@@ -2,7 +2,9 @@ use std::time::Duration;
 
 use clap::{ArgAction, Args};
 
-use super::{TargetSpec, parse_session_name, parse_target_spec};
+use super::targets::parse_session_name;
+use super::validate::{Validate, reject_empty, selected_count, value_error};
+use super::{TargetSpec, parse_target_spec};
 
 /// Shared help text for every flag parsed by [`parse_duration`].
 ///
@@ -38,33 +40,30 @@ pub(crate) struct WaitPaneArgs {
     pub(crate) get_by_text: Option<String>,
 }
 
-impl WaitPaneArgs {
+impl Validate for WaitPaneArgs {
     /// Rejects empty patterns and anything but exactly one wait condition.
-    pub(crate) fn validate(self) -> Result<Self, clap::Error> {
-        let conditions = [
+    fn validate(self, command_name: &'static str) -> Result<Self, clap::Error> {
+        let conditions = selected_count([
             self.text.is_some(),
             self.next_text.is_some(),
             self.visible_text.is_some(),
             self.quiet,
             self.pane_exit,
             self.get_by_text.is_some(),
-        ]
-        .into_iter()
-        .filter(|selected| *selected)
-        .count();
+        ]);
         if conditions != 1 {
             return Err(value_error(
-                "wait-pane",
+                command_name,
                 "exactly one wait condition is required",
             ));
         }
-        reject_empty("wait-pane", "--text", self.text.as_deref())?;
-        reject_empty("wait-pane", "--next-text", self.next_text.as_deref())?;
-        reject_empty("wait-pane", "--visible-text", self.visible_text.as_deref())?;
-        reject_empty("wait-pane", "--get-by-text", self.get_by_text.as_deref())?;
+        reject_empty(command_name, "--text", self.text.as_deref())?;
+        reject_empty(command_name, "--next-text", self.next_text.as_deref())?;
+        reject_empty(command_name, "--visible-text", self.visible_text.as_deref())?;
+        reject_empty(command_name, "--get-by-text", self.get_by_text.as_deref())?;
         if self.stable_for.is_some() && !self.quiet {
             return Err(value_error(
-                "wait-pane",
+                command_name,
                 "--stable-for is valid only with --quiet",
             ));
         }
@@ -105,12 +104,12 @@ pub(crate) struct StreamPaneArgs {
     pub(crate) lines: bool,
 }
 
-impl StreamPaneArgs {
+impl Validate for StreamPaneArgs {
     /// Rejects `--raw` combined with `--lines`, which select different framings.
-    pub(crate) fn validate(self) -> Result<Self, clap::Error> {
+    fn validate(self, command_name: &'static str) -> Result<Self, clap::Error> {
         if self.raw && self.lines {
             return Err(value_error(
-                "stream-pane",
+                command_name,
                 "--raw and --lines are mutually exclusive",
             ));
         }
@@ -131,14 +130,11 @@ pub(crate) struct CollectPaneOutputArgs {
     pub(crate) json: bool,
 }
 
-impl CollectPaneOutputArgs {
+impl Validate for CollectPaneOutputArgs {
     /// Requires `--until-pane-exit`, the only supported collection stop condition.
-    pub(crate) fn validate(self) -> Result<Self, clap::Error> {
+    fn validate(self, command_name: &'static str) -> Result<Self, clap::Error> {
         if !self.until_pane_exit {
-            return Err(value_error(
-                "collect-pane-output",
-                "--until-pane-exit is required",
-            ));
+            return Err(value_error(command_name, "--until-pane-exit is required"));
         }
         Ok(self)
     }
@@ -155,10 +151,10 @@ pub(crate) struct LocatorArgs {
     pub(crate) json: bool,
 }
 
-impl LocatorArgs {
+impl Validate for LocatorArgs {
     /// Rejects an empty `--get-by-text` pattern, which would match everything.
-    pub(crate) fn validate(self) -> Result<Self, clap::Error> {
-        reject_empty("locator", "--get-by-text", Some(&self.get_by_text))?;
+    fn validate(self, command_name: &'static str) -> Result<Self, clap::Error> {
+        reject_empty(command_name, "--get-by-text", Some(&self.get_by_text))?;
         Ok(self)
     }
 }
@@ -180,17 +176,13 @@ pub(crate) struct ExpectPaneArgs {
     pub(crate) json: bool,
 }
 
-impl ExpectPaneArgs {
+impl Validate for ExpectPaneArgs {
     /// Requires a nonempty pattern and exactly one of the three assertions.
-    pub(crate) fn validate(self) -> Result<Self, clap::Error> {
-        reject_empty("expect-pane", "--get-by-text", Some(&self.get_by_text))?;
-        let assertions = [self.visible, self.hidden, self.count.is_some()]
-            .into_iter()
-            .filter(|selected| *selected)
-            .count();
-        if assertions != 1 {
+    fn validate(self, command_name: &'static str) -> Result<Self, clap::Error> {
+        reject_empty(command_name, "--get-by-text", Some(&self.get_by_text))?;
+        if selected_count([self.visible, self.hidden, self.count.is_some()]) != 1 {
             return Err(value_error(
-                "expect-pane",
+                command_name,
                 "exactly one assertion is required",
             ));
         }
@@ -235,20 +227,17 @@ pub(crate) struct BroadcastKeysArgs {
     pub(crate) keys: Vec<String>,
 }
 
-impl BroadcastKeysArgs {
+impl Validate for BroadcastKeysArgs {
     /// Requires at least one `--target` and at least one key to send.
-    pub(crate) fn validate(self) -> Result<Self, clap::Error> {
+    fn validate(self, command_name: &'static str) -> Result<Self, clap::Error> {
         if self.targets.is_empty() {
             return Err(value_error(
-                "broadcast-keys",
+                command_name,
                 "at least one --target is required",
             ));
         }
         if self.keys.is_empty() {
-            return Err(value_error(
-                "broadcast-keys",
-                "at least one key is required",
-            ));
+            return Err(value_error(command_name, "at least one key is required"));
         }
         Ok(self)
     }
@@ -267,11 +256,11 @@ pub(crate) struct WithSessionArgs {
     pub(crate) command: Vec<String>,
 }
 
-impl WithSessionArgs {
+impl Validate for WithSessionArgs {
     /// Requires a child command, since `with-session` exists to run one.
-    pub(crate) fn validate(self) -> Result<Self, clap::Error> {
+    fn validate(self, command_name: &'static str) -> Result<Self, clap::Error> {
         if self.command.is_empty() {
-            return Err(value_error("with-session", "a child command is required"));
+            return Err(value_error(command_name, "a child command is required"));
         }
         Ok(self)
     }
@@ -344,30 +333,8 @@ fn parse_positive_u16(value: &str, field: &str) -> Result<u16, String> {
 
 /// Parses a byte or item count that must be greater than zero.
 fn parse_positive_usize(value: &str) -> Result<usize, String> {
-    let parsed = value
-        .parse::<usize>()
-        .map_err(|_| "value must be a positive integer".to_owned())?;
-    if parsed == 0 {
-        return Err("value must be a positive integer".to_owned());
-    }
-    Ok(parsed)
-}
-
-/// Fails when a supplied flag value is present but empty.
-fn reject_empty(command_name: &str, flag: &str, value: Option<&str>) -> Result<(), clap::Error> {
-    if value.is_some_and(str::is_empty) {
-        return Err(value_error(
-            command_name,
-            format!("{flag} must not be empty"),
-        ));
-    }
-    Ok(())
-}
-
-/// Builds a `clap` value-validation error tagged with the offending command name.
-fn value_error(command_name: &str, message: impl std::fmt::Display) -> clap::Error {
-    clap::Error::raw(
-        clap::error::ErrorKind::ValueValidation,
-        format!("command {command_name}: {message}"),
-    )
+    value
+        .parse::<std::num::NonZeroUsize>()
+        .map(std::num::NonZeroUsize::get)
+        .map_err(|_| "value must be a positive integer".to_owned())
 }

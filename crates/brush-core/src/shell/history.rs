@@ -2,15 +2,21 @@
 
 use std::path::PathBuf;
 
-use crate::{error, openfiles};
+use crate::{error, extensions::ExecutionObserver as _, openfiles};
 
 impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
+    /// Loads the history file, if one is set. A refusal by the observer's
+    /// [`enter_sync`](crate::extensions::ExecutionObserver::enter_sync) is returned as an error
+    /// before the file is touched.
     pub(super) fn load_history(&self) -> Result<Option<crate::history::History>, error::Error> {
         const MAX_FILE_SIZE_FOR_HISTORY_IMPORT: u64 = 1024 * 1024 * 1024; // 1 GiB
 
         let Some(history_path) = self.history_file_path() else {
             return Ok(None);
         };
+
+        // Reading the history file is synchronous host I/O outside any scoped future.
+        let _guard = self.execution_observer.enter_sync()?;
 
         let mut options = std::fs::File::options();
         options.read(true);
@@ -58,6 +64,9 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
             // See if there's *any* time format configured. That triggers writing out
             // timestamps.
             let write_timestamps = self.env.is_set("HISTTIMEFORMAT");
+
+            // Writing the history file is synchronous host I/O outside any scoped future.
+            let _guard = self.execution_observer.enter_sync()?;
 
             // TODO(history): Observe options.append_to_history_file
             history.flush(

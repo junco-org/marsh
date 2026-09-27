@@ -20,8 +20,6 @@ marsh-lib = { path = "../marsh-lib", default-features = false }
 thiserror = "2"
 sha1 = "0.10"
 hex = "0.4"
-
-[target.'cfg(target_os = "linux")'.dependencies]
 btrfsutil = "=0.2.0"
 proc-mounts = "0.3"
 libc = "0.2"

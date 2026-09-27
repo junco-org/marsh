@@ -1,15 +1,15 @@
-use super::pane_group_transfer_tests::{create_grouped_session, create_session, pane_id};
+use super::pane_group_transfer_tests::pane_id;
 use super::RequestHandler;
 use crate::pane_io::{AttachControl, PaneExitEvent};
+use crate::test_fixtures::{Fixture, Grouped};
 use rmux_core::LifecycleEvent;
 use rmux_proto::{
-    BreakPaneRequest, HookLifecycle, HookName, KillPaneRequest, KillSessionRequest,
-    LinkWindowRequest, NewWindowRequest, PaneKillRequest, PaneOutputCursorRequest,
-    PaneOutputSubscriptionStart, PaneTarget, PaneTargetRef, Request, Response, ScopeSelector,
-    SessionName, SetHookRequest, SubscribePaneOutputRefRequest, WindowTarget,
+    BreakPaneRequest, HookName, KillPaneRequest, KillSessionRequest, LinkWindowRequest,
+    NewWindowRequest, PaneKillRequest, PaneOutputCursorRequest, PaneTarget, PaneTargetRef, Request,
+    Response, ScopeSelector, SessionName, SetHookRequest, SubscribePaneOutputRefRequest,
+    WindowTarget,
 };
 use std::time::Duration;
-use tokio::sync::mpsc;
 
 #[path = "handler_pane_family_lifecycle_tests/inactive_winlink_resize.rs"]
 mod inactive_winlink_resize;
@@ -63,18 +63,6 @@ pub(super) async fn pause_before_pane_kill_subscription_rekey(session_name: &Ses
     }
 }
 
-async fn set_global_hook(handler: &RequestHandler, hook: HookName, command: &'static str) {
-    let response = handler
-        .handle(Request::SetHook(SetHookRequest {
-            scope: ScopeSelector::Global,
-            hook,
-            command: command.to_owned(),
-            lifecycle: HookLifecycle::Persistent,
-        }))
-        .await;
-    assert!(matches!(response, Response::SetHook(_)), "{response:?}");
-}
-
 async fn install_family_hooks(handler: &RequestHandler) {
     for (hook, command) in [
         (HookName::PaneExited, "display-message family-pane-exited"),
@@ -87,7 +75,13 @@ async fn install_family_hooks(handler: &RequestHandler) {
             "display-message family-session-closed",
         ),
     ] {
-        set_global_hook(handler, hook, command).await;
+        handler
+            .handle_ok(SetHookRequest::fixture((
+                ScopeSelector::Global,
+                hook,
+                command,
+            )))
+            .await;
     }
 }
 
@@ -142,10 +136,11 @@ async fn create_grouped_last_pane_family(
     handler: &RequestHandler,
     label: &str,
 ) -> (SessionName, SessionName, SessionName, rmux_core::PaneId) {
-    let keeper = create_session(handler, &format!("{label}-keeper")).await;
-    let owner = create_session(handler, &format!("{label}-owner")).await;
-    let peer = create_grouped_session(handler, &format!("{label}-peer"), &owner).await;
-    handler.wait_for_initial_panes_for_test().await;
+    let keeper = handler.create_session(format!("{label}-keeper")).await;
+    let owner = handler.create_session(format!("{label}-owner")).await;
+    let peer = handler
+        .create_session(Grouped(format!("{label}-peer"), &owner))
+        .await;
     let family_pane_id = {
         let state = handler.state.lock().await;
         assert_eq!(state.window_linked_session_count(&owner, 0), 2);
@@ -171,13 +166,12 @@ async fn direct_grouped_last_pane_kill_matches_tmux_3_7b_family_lifecycle() {
     install_family_hooks(&handler).await;
     let mut events = handler.subscribe_lifecycle_events();
 
-    let response = handler
-        .handle(Request::KillPane(KillPaneRequest {
+    handler
+        .handle_ok(KillPaneRequest {
             target: PaneTarget::with_window(owner.clone(), 0, 0),
             kill_all_except: false,
-        }))
+        })
         .await;
-    assert!(matches!(response, Response::KillPane(_)), "{response:?}");
 
     assert_lifecycle_batch(&mut events, &grouped_kill_order(&owner, &peer));
     let state = handler.state.lock().await;
@@ -223,18 +217,13 @@ async fn pane_id_grouped_last_pane_with_real_winlink_preserves_surviving_family(
     let handler = RequestHandler::new();
     let (_keeper, owner, peer, family_pane_id) =
         create_grouped_last_pane_family(&handler, "pane-id-linked-group").await;
-    let linked_survivor = create_session(&handler, "pane-id-linked-survivor").await;
-    let linked = handler
-        .handle(Request::LinkWindow(LinkWindowRequest {
-            source: WindowTarget::with_window(owner.clone(), 0),
-            target: WindowTarget::with_window(linked_survivor.clone(), 1),
-            after: false,
-            before: false,
-            kill_destination: false,
-            detached: true,
-        }))
+    let linked_survivor = handler.create_session("pane-id-linked-survivor").await;
+    handler
+        .handle_ok(LinkWindowRequest::fixture((
+            WindowTarget::with_window(owner.clone(), 0),
+            WindowTarget::with_window(linked_survivor.clone(), 1),
+        )))
         .await;
-    assert!(matches!(linked, Response::LinkWindow(_)), "{linked:?}");
 
     let response = handler
         .handle(Request::PaneKill(PaneKillRequest {
@@ -262,18 +251,15 @@ async fn pane_id_grouped_runtime_owner_with_real_winlink_transfers_surviving_fam
     let handler = RequestHandler::new();
     let (_keeper, owner, peer, family_pane_id) =
         create_grouped_last_pane_family(&handler, "pane-id-linked-owner").await;
-    let linked_survivor = create_session(&handler, "pane-id-linked-owner-survivor").await;
-    let linked = handler
-        .handle(Request::LinkWindow(LinkWindowRequest {
-            source: WindowTarget::with_window(owner.clone(), 0),
-            target: WindowTarget::with_window(linked_survivor.clone(), 1),
-            after: false,
-            before: false,
-            kill_destination: false,
-            detached: true,
-        }))
+    let linked_survivor = handler
+        .create_session("pane-id-linked-owner-survivor")
         .await;
-    assert!(matches!(linked, Response::LinkWindow(_)), "{linked:?}");
+    handler
+        .handle_ok(LinkWindowRequest::fixture((
+            WindowTarget::with_window(owner.clone(), 0),
+            WindowTarget::with_window(linked_survivor.clone(), 1),
+        )))
+        .await;
 
     let response = handler
         .handle(Request::PaneKill(PaneKillRequest {
@@ -299,19 +285,14 @@ async fn pane_id_grouped_runtime_owner_with_real_winlink_transfers_surviving_fam
 #[tokio::test]
 async fn pane_id_duplicate_winlink_removes_only_the_resolved_alias() {
     let handler = RequestHandler::new();
-    let source = create_session(&handler, "pane-id-duplicate-alias").await;
-    let _keeper = create_session(&handler, "pane-id-duplicate-keeper").await;
-    let linked = handler
-        .handle(Request::LinkWindow(LinkWindowRequest {
-            source: WindowTarget::with_window(source.clone(), 0),
-            target: WindowTarget::with_window(source.clone(), 1),
-            after: false,
-            before: false,
-            kill_destination: false,
-            detached: true,
-        }))
+    let source = handler.create_session("pane-id-duplicate-alias").await;
+    let _keeper = handler.create_session("pane-id-duplicate-keeper").await;
+    handler
+        .handle_ok(LinkWindowRequest::fixture((
+            WindowTarget::with_window(source.clone(), 0),
+            WindowTarget::with_window(source.clone(), 1),
+        )))
         .await;
-    assert!(matches!(linked, Response::LinkWindow(_)), "{linked:?}");
     let pane_id = {
         let state = handler.state.lock().await;
         pane_id(&state, &source, 0, 0)
@@ -340,17 +321,11 @@ async fn pane_id_grouped_alias_removal_preserves_live_output_subscription() {
         create_grouped_last_pane_family(&handler, "pane-id-subscription").await;
     let connection_id = 4242;
     let subscribed = handler
-        .handle_subscribe_pane_output_ref(
+        .subscribe_ok(
             connection_id,
-            SubscribePaneOutputRefRequest {
-                target: PaneTargetRef::by_id(owner.clone(), family_pane_id),
-                start: PaneOutputSubscriptionStart::Now,
-            },
+            SubscribePaneOutputRefRequest::fixture((&owner, family_pane_id)),
         )
         .await;
-    let Response::SubscribePaneOutput(subscribed) = subscribed else {
-        panic!("live grouped pane should accept subscription: {subscribed:?}");
-    };
 
     let response = handler
         .handle(Request::PaneKill(PaneKillRequest {
@@ -382,17 +357,11 @@ async fn pane_id_runtime_owner_alias_removal_rekeys_live_output_subscription() {
         create_grouped_last_pane_family(&handler, "pane-id-owner-subscription").await;
     let connection_id = 4243;
     let subscribed = handler
-        .handle_subscribe_pane_output_ref(
+        .subscribe_ok(
             connection_id,
-            SubscribePaneOutputRefRequest {
-                target: PaneTargetRef::by_id(owner.clone(), family_pane_id),
-                start: PaneOutputSubscriptionStart::Now,
-            },
+            SubscribePaneOutputRefRequest::fixture((&owner, family_pane_id)),
         )
         .await;
-    let Response::SubscribePaneOutput(subscribed) = subscribed else {
-        panic!("live grouped pane should accept subscription: {subscribed:?}");
-    };
 
     let removed_owner = handler
         .handle(Request::PaneKill(PaneKillRequest {
@@ -474,19 +443,15 @@ async fn pane_id_owner_rekey_commits_before_following_owner_transfer() {
     let handler = RequestHandler::new();
     let (_keeper, owner, peer, family_pane_id) =
         create_grouped_last_pane_family(&handler, "pane-id-rekey-order").await;
-    let survivor = create_grouped_session(&handler, "pane-id-rekey-order-survivor", &owner).await;
+    let survivor = handler
+        .create_session(Grouped("pane-id-rekey-order-survivor", &owner))
+        .await;
     let subscribed = handler
-        .handle_subscribe_pane_output_ref(
+        .subscribe_ok(
             4245,
-            SubscribePaneOutputRefRequest {
-                target: PaneTargetRef::by_id(owner.clone(), family_pane_id),
-                start: PaneOutputSubscriptionStart::Now,
-            },
+            SubscribePaneOutputRefRequest::fixture((&owner, family_pane_id)),
         )
         .await;
-    let Response::SubscribePaneOutput(subscribed) = subscribed else {
-        panic!("live grouped pane should accept subscription: {subscribed:?}");
-    };
 
     let pause = install_pane_kill_subscription_rekey_pause(owner.clone());
     let pane_kill_handler = handler.clone();
@@ -507,12 +472,9 @@ async fn pane_id_owner_rekey_commits_before_following_owner_transfer() {
     let next_transfer_peer = peer.clone();
     let next_transfer = tokio::spawn(async move {
         next_transfer_handler
-            .handle(Request::KillSession(KillSessionRequest {
-                target: next_transfer_peer,
-                kill_all_except_target: false,
-                clear_alerts: false,
-                kill_group: false,
-            }))
+            .handle(Request::KillSession(KillSessionRequest::fixture(
+                next_transfer_peer,
+            )))
             .await
     });
     tokio::task::yield_now().await;
@@ -552,35 +514,23 @@ async fn pane_id_owner_rekey_commits_before_following_owner_transfer() {
 #[tokio::test]
 async fn pane_id_grouped_multiwindow_refreshes_mutated_owner() {
     let handler = RequestHandler::new();
-    let owner = create_session(&handler, "pane-id-multi-owner").await;
-    let new_window = handler
-        .handle(Request::NewWindow(Box::new(NewWindowRequest {
-            target: owner.clone(),
-            name: None,
-            detached: true,
-            start_directory: None,
-            environment: None,
-            command: None,
-            process_command: None,
+    let owner = handler.create_session("pane-id-multi-owner").await;
+    handler
+        .create_window(NewWindowRequest {
             target_window_index: Some(1),
-            insert_at_target: false,
-        })))
+            ..Fixture::fixture(&owner)
+        })
         .await;
-    assert!(
-        matches!(new_window, Response::NewWindow(_)),
-        "{new_window:?}"
-    );
-    let peer = create_grouped_session(&handler, "pane-id-multi-peer", &owner).await;
+    let peer = handler
+        .create_session(Grouped("pane-id-multi-peer", &owner))
+        .await;
     handler.wait_for_initial_panes_for_test().await;
     let closing_pane_id = {
         let state = handler.state.lock().await;
         pane_id(&state, &peer, 0, 0)
     };
 
-    let (control_tx, mut control_rx) = mpsc::unbounded_channel();
-    handler
-        .register_attach(4343, owner.clone(), control_tx)
-        .await;
+    let mut control_rx = handler.attach_client(4343, &owner).await;
     while tokio::time::timeout(Duration::from_millis(500), control_rx.recv())
         .await
         .is_ok()
@@ -604,32 +554,26 @@ async fn pane_id_grouped_multiwindow_refreshes_mutated_owner() {
 #[tokio::test]
 async fn duplicate_alias_last_pane_kill_removes_the_complete_link_family() {
     let handler = RequestHandler::new();
-    let source = create_session(&handler, "duplicate-last-pane-kill").await;
-    let keeper = create_session(&handler, "duplicate-last-pane-keeper").await;
-    let linked = handler
-        .handle(Request::LinkWindow(LinkWindowRequest {
-            source: WindowTarget::with_window(source.clone(), 0),
-            target: WindowTarget::with_window(source.clone(), 1),
-            after: false,
-            before: false,
-            kill_destination: false,
-            detached: true,
-        }))
+    let source = handler.create_session("duplicate-last-pane-kill").await;
+    let keeper = handler.create_session("duplicate-last-pane-keeper").await;
+    handler
+        .handle_ok(LinkWindowRequest::fixture((
+            WindowTarget::with_window(source.clone(), 0),
+            WindowTarget::with_window(source.clone(), 1),
+        )))
         .await;
-    assert!(matches!(linked, Response::LinkWindow(_)), "{linked:?}");
     {
         let state = handler.state.lock().await;
         assert_eq!(state.window_link_count(&source, 0), 2);
         assert_eq!(state.window_linked_session_count(&source, 0), 1);
     }
 
-    let response = handler
-        .handle(Request::KillPane(KillPaneRequest {
+    handler
+        .handle_ok(KillPaneRequest {
             target: PaneTarget::with_window(source.clone(), 0, 0),
             kill_all_except: false,
-        }))
+        })
         .await;
-    assert!(matches!(response, Response::KillPane(_)), "{response:?}");
 
     let state = handler.state.lock().await;
     assert!(state.sessions.session(&source).is_none());
@@ -639,38 +583,28 @@ async fn duplicate_alias_last_pane_kill_removes_the_complete_link_family() {
 #[tokio::test]
 async fn duplicate_alias_last_pane_break_moves_one_alias_and_preserves_the_linked_peer() {
     let handler = RequestHandler::new();
-    let source = create_session(&handler, "duplicate-last-pane-break").await;
-    let destination = create_session(&handler, "duplicate-last-pane-destination").await;
-    let linked = handler
-        .handle(Request::LinkWindow(LinkWindowRequest {
-            source: WindowTarget::with_window(source.clone(), 0),
-            target: WindowTarget::with_window(source.clone(), 1),
-            after: false,
-            before: false,
-            kill_destination: false,
-            detached: true,
-        }))
+    let source = handler.create_session("duplicate-last-pane-break").await;
+    let destination = handler
+        .create_session("duplicate-last-pane-destination")
         .await;
-    assert!(matches!(linked, Response::LinkWindow(_)), "{linked:?}");
+    handler
+        .handle_ok(LinkWindowRequest::fixture((
+            WindowTarget::with_window(source.clone(), 0),
+            WindowTarget::with_window(source.clone(), 1),
+        )))
+        .await;
     let source_pane_id = {
         let state = handler.state.lock().await;
         pane_id(&state, &source, 0, 0)
     };
     let mut events = handler.subscribe_lifecycle_events();
 
-    let response = handler
-        .handle(Request::BreakPane(Box::new(BreakPaneRequest {
-            source: PaneTarget::with_window(source.clone(), 0, 0),
-            target: Some(WindowTarget::with_window(destination.clone(), 1)),
-            name: None,
-            detached: true,
-            after: false,
-            before: false,
-            print_target: false,
-            format: None,
-        })))
+    handler
+        .handle_ok(BreakPaneRequest::fixture((
+            PaneTarget::with_window(source.clone(), 0, 0),
+            WindowTarget::with_window(destination.clone(), 1),
+        )))
         .await;
-    assert!(matches!(response, Response::BreakPane(_)), "{response:?}");
 
     let state = handler.state.lock().await;
     let source_session = state
@@ -741,8 +675,8 @@ async fn natural_grouped_last_pane_exit_matches_tmux_3_7b_family_lifecycle() {
 #[tokio::test]
 async fn natural_single_last_pane_exit_preserves_existing_lifecycle_order() {
     let handler = RequestHandler::new();
-    let source = create_session(&handler, "natural-single-source").await;
-    let keeper = create_session(&handler, "natural-single-keeper").await;
+    let source = handler.create_session("natural-single-source").await;
+    let keeper = handler.create_session("natural-single-keeper").await;
     handler.wait_for_initial_panes_for_test().await;
     install_family_hooks(&handler).await;
     let mut events = handler.subscribe_lifecycle_events();
@@ -780,19 +714,14 @@ async fn natural_single_last_pane_exit_preserves_existing_lifecycle_order() {
 #[tokio::test]
 async fn natural_linked_last_pane_exit_emits_each_tmux_3_7b_window_unlinked_hook() {
     let handler = RequestHandler::new();
-    let source = create_session(&handler, "natural-linked-source").await;
-    let survivor = create_session(&handler, "natural-linked-survivor").await;
-    let linked = handler
-        .handle(Request::LinkWindow(LinkWindowRequest {
-            source: WindowTarget::with_window(source.clone(), 0),
-            target: WindowTarget::with_window(survivor.clone(), 1),
-            after: false,
-            before: false,
-            kill_destination: false,
-            detached: true,
-        }))
+    let source = handler.create_session("natural-linked-source").await;
+    let survivor = handler.create_session("natural-linked-survivor").await;
+    handler
+        .handle_ok(LinkWindowRequest::fixture((
+            WindowTarget::with_window(source.clone(), 0),
+            WindowTarget::with_window(survivor.clone(), 1),
+        )))
         .await;
-    assert!(matches!(linked, Response::LinkWindow(_)), "{linked:?}");
     handler.wait_for_initial_panes_for_test().await;
     install_family_hooks(&handler).await;
     let mut events = handler.subscribe_lifecycle_events();

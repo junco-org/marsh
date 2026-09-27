@@ -1,69 +1,58 @@
 use super::*;
+use rmux_proto::WaitForMode;
 
 #[test]
 fn display_message_accepts_print_target_and_hyphen_prefixed_format_text_after_separator() {
-    let cli = parse_args(&[
-        "display-message",
-        "-p",
-        "-t",
-        "alpha:0.1",
-        "--",
-        "-#{session_name}",
-    ])
-    .unwrap();
-
-    match cli.command.expect("parsed command") {
-        super::super::Command::DisplayMessage(args) => {
-            assert!(args.print);
-            assert_eq!(args.target.expect("target"), "alpha:0.1");
-            assert_eq!(args.message, vec!["-#{session_name}"]);
-        }
-        _ => panic!("expected DisplayMessage command"),
-    }
+    let args = parse_command!(
+        DisplayMessage,
+        [
+            "display-message",
+            "-p",
+            "-t",
+            "alpha:0.1",
+            "--",
+            "-#{session_name}",
+        ]
+    );
+    assert!(args.print);
+    assert_eq!(args.target.as_deref(), Some("alpha:0.1"));
+    assert_eq!(args.message, vec!["-#{session_name}"]);
 }
 
 #[test]
 fn display_message_single_value_flags_follow_tmux_last_wins() {
-    let cli = parse_args(&[
-        "display-message",
-        "-p",
-        "-t",
-        "alpha:0.0",
-        "-F",
-        "#{pane_id}",
-        "-F",
-        "#{session_name}",
-    ])
-    .unwrap();
-
-    match cli.command.expect("parsed command") {
-        super::super::Command::DisplayMessage(args) => {
-            assert!(args.print);
-            assert_eq!(args.format.as_deref(), Some("#{session_name}"));
-        }
-        _ => panic!("expected DisplayMessage command"),
-    }
+    let args = parse_command!(
+        DisplayMessage,
+        [
+            "display-message",
+            "-p",
+            "-t",
+            "alpha:0.0",
+            "-F",
+            "#{pane_id}",
+            "-F",
+            "#{session_name}",
+        ]
+    );
+    assert!(args.print);
+    assert_eq!(args.format.as_deref(), Some("#{session_name}"));
 }
 
 #[test]
 fn display_message_accepts_target_client_without_treating_it_as_message() {
-    let cli = parse_args(&["display-message", "-c", "123", "-p", "hello"]).unwrap();
-
-    match cli.command.expect("parsed command") {
-        super::super::Command::DisplayMessage(args) => {
-            assert_eq!(args.target_client.as_deref(), Some("123"));
-            assert!(args.print);
-            assert_eq!(args.message, vec!["hello"]);
-        }
-        _ => panic!("expected DisplayMessage command"),
-    }
+    let args = parse_command!(
+        DisplayMessage,
+        ["display-message", "-c", "123", "-p", "hello"]
+    );
+    assert_eq!(args.target_client.as_deref(), Some("123"));
+    assert!(args.print);
+    assert_eq!(args.message, vec!["hello"]);
 }
 
 #[test]
 fn display_message_rejects_multiple_message_arguments() {
-    let error = parse_args(&["display-message", "a", "b", "c"]).unwrap_err();
-
-    assert_eq!(error.kind(), clap::error::ErrorKind::TooManyValues);
+    let error = parse_error(&["display-message", "a", "b", "c"]);
+    assert_eq!(error.kind(), ErrorKind::TooManyValues);
     assert!(
         error
             .to_string()
@@ -73,15 +62,10 @@ fn display_message_rejects_multiple_message_arguments() {
 
 #[test]
 fn display_message_accepts_tmux_delay_and_ignore_input_flags() {
-    let cli = parse_args(&["display-message", "-d0", "-pN", "hello"]).unwrap();
-    match cli.command.expect("parsed command") {
-        super::super::Command::DisplayMessage(args) => {
-            assert_eq!(args.delay.as_deref(), Some("0"));
-            assert!(args.print);
-            assert!(args.ignore_input);
-        }
-        _ => panic!("expected DisplayMessage command"),
-    }
+    let args = parse_command!(DisplayMessage, ["display-message", "-d0", "-pN", "hello"]);
+    assert_eq!(args.delay.as_deref(), Some("0"));
+    assert!(args.print);
+    assert!(args.ignore_input);
 }
 
 #[test]
@@ -92,8 +76,8 @@ fn display_message_rejects_invalid_tmux_delays() {
         ("1 ", "delay invalid"),
         ("1.0", "delay invalid"),
     ] {
-        let error = parse_args(&["display-message", "-d", delay, "-p", "hello"]).unwrap_err();
-        assert_eq!(error.kind(), clap::error::ErrorKind::InvalidValue);
+        let error = parse_error(&["display-message", "-d", delay, "-p", "hello"]);
+        assert_eq!(error.kind(), ErrorKind::InvalidValue);
         assert!(
             error.to_string().contains(expected),
             "unexpected error for {delay:?}: {error}"
@@ -102,15 +86,22 @@ fn display_message_rejects_invalid_tmux_delays() {
 }
 
 #[test]
-fn display_message_rejects_unknown_flags_before_message() {
-    let error = parse_args(&["display-message", "-Q", "hello"]).unwrap_err();
-
-    assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
-    assert!(
-        error
-            .to_string()
-            .contains("command display-message: unknown flag -Q")
-    );
+fn script_commands_reject_unknown_flags_before_positionals() {
+    for (argv, flag) in [
+        (&["display-message", "-Q", "hello"][..], "-Q"),
+        (&["if-shell", "-Q", "true", "display-message ok"][..], "-Q"),
+        (&["run-shell", "-b", "-printf", "ok"][..], "-p"),
+        (&["source-file", "-N", "/tmp/missing.conf"][..], "-N"),
+    ] {
+        let error = parse_error(argv);
+        assert_eq!(error.kind(), ErrorKind::UnknownArgument, "{argv:?}");
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("command {}: unknown flag {flag}", argv[0])),
+            "unexpected error for {argv:?}: {error}"
+        );
+    }
 }
 
 #[test]
@@ -126,509 +117,328 @@ fn display_message_json_rejects_queued_only_modes() {
             vec!["display-message", "--json", compact_flags.as_str()],
             vec!["display-message", compact_flags.as_str(), "--json"],
         ] {
-            let error = parse_args(&arguments).expect_err("JSON mode conflict must fail");
-            assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+            assert_eq!(
+                parse_error(&arguments).kind(),
+                ErrorKind::ArgumentConflict,
+                "{arguments:?}"
+            );
         }
     }
 }
 
 #[test]
 fn display_message_json_keeps_supported_selectors_and_format() {
-    let cli = parse_args(&[
-        "display-message",
-        "--json",
-        "-C",
-        "-c",
-        "client",
-        "-t",
-        "alpha:0.1",
-        "-F",
-        "#{pane_id}",
-    ])
-    .expect("supported JSON display-message options");
-
-    let super::super::Command::DisplayMessage(args) = cli.command.expect("display-message command")
-    else {
-        panic!("expected display-message command");
-    };
+    let args = parse_command!(
+        DisplayMessage,
+        [
+            "display-message",
+            "--json",
+            "-C",
+            "-c",
+            "client",
+            "-t",
+            "alpha:0.1",
+            "-F",
+            "#{pane_id}",
+        ]
+    );
     assert!(args.json);
     assert!(args.no_freeze);
     assert_eq!(args.target_client.as_deref(), Some("client"));
-    assert_eq!(args.target.expect("target"), "alpha:0.1");
+    assert_eq!(args.target.as_deref(), Some("alpha:0.1"));
     assert_eq!(args.format.as_deref(), Some("#{pane_id}"));
 }
 
 #[test]
-fn if_shell_rejects_unknown_flags_before_condition() {
-    let error = parse_args(&["if-shell", "-Q", "true", "display-message ok"]).unwrap_err();
-
-    assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
-    assert!(
-        error
-            .to_string()
-            .contains("command if-shell: unknown flag -Q")
-    );
-}
-
-#[test]
-fn run_shell_rejects_unknown_flags_before_shell_text() {
-    let error = parse_args(&["run-shell", "-b", "-printf", "ok"]).unwrap_err();
-
-    assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
-    assert!(
-        error
-            .to_string()
-            .contains("command run-shell: unknown flag -p")
-    );
-}
-
-#[test]
 fn run_shell_accepts_stderr_output_and_positional_arguments() {
-    let cli = parse_args(&["run-shell", "-CE", "set-buffer -b out #{1}-#{2}", "a", "b"]).unwrap();
-
-    match cli.command.expect("parsed command") {
-        super::super::Command::RunShell(args) => {
-            assert!(args.as_commands);
-            assert!(args.show_stderr);
-            assert_eq!(args.command, vec!["set-buffer -b out #{1}-#{2}", "a", "b"]);
-        }
-        _ => panic!("expected RunShell command"),
-    }
+    let args = parse_command!(
+        RunShell,
+        ["run-shell", "-CE", "set-buffer -b out #{1}-#{2}", "a", "b"]
+    );
+    assert!(args.as_commands);
+    assert!(args.show_stderr);
+    assert_eq!(args.command, vec!["set-buffer -b out #{1}-#{2}", "a", "b"]);
 }
 
 #[test]
 fn run_shell_accepts_hyphen_prefixed_shell_text_after_separator() {
-    let cli = parse_args(&["run-shell", "-b", "--", "-printf", "ok"]).unwrap();
-
-    match cli.command.expect("parsed command") {
-        super::super::Command::RunShell(args) => {
-            assert!(args.background);
-            assert_eq!(args.command, vec!["-printf", "ok"]);
-        }
-        _ => panic!("expected RunShell command"),
-    }
+    let args = parse_command!(RunShell, ["run-shell", "-b", "--", "-printf", "ok"]);
+    assert!(args.background);
+    assert_eq!(args.command, vec!["-printf", "ok"]);
 }
 
 #[test]
 fn run_shell_preserves_hyphenated_subcommand_arguments_after_first_token() {
-    let cli = parse_args(&[
-        "run-shell",
-        "env",
-        "-C",
-        "/tmp/example path",
-        "touch",
-        "name with spaces",
-    ])
-    .unwrap();
-
-    match cli.command.expect("parsed command") {
-        super::super::Command::RunShell(args) => {
-            assert!(!args.as_commands);
-            assert_eq!(
-                args.command,
-                vec![
-                    "env",
-                    "-C",
-                    "/tmp/example path",
-                    "touch",
-                    "name with spaces",
-                ]
-            );
-        }
-        _ => panic!("expected RunShell command"),
-    }
-}
-
-#[test]
-fn source_file_accepts_flags_target_and_hyphen_path() {
-    let cli = parse_args(&["source", "-F", "-n", "-q", "-v", "-t", "alpha:0.1", "-"]).unwrap();
-
-    match cli.command.expect("parsed command") {
-        super::super::Command::SourceFile(args) => {
-            assert!(args.expand_paths);
-            assert!(args.parse_only);
-            assert!(args.quiet);
-            assert!(args.verbose);
-            assert_eq!(args.target.expect("target").to_string(), "alpha:0.1");
-            assert_eq!(args.paths, vec!["-"]);
-        }
-        _ => panic!("expected SourceFile command"),
-    }
-}
-
-#[test]
-fn source_file_rejects_unknown_flags_before_paths() {
-    let error = parse_args(&["source-file", "-N", "/tmp/missing.conf"]).unwrap_err();
-
-    assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
-    assert!(
-        error
-            .to_string()
-            .contains("command source-file: unknown flag -N")
+    let args = parse_command!(
+        RunShell,
+        [
+            "run-shell",
+            "env",
+            "-C",
+            "/tmp/example path",
+            "touch",
+            "name with spaces",
+        ]
+    );
+    assert!(!args.as_commands);
+    assert_eq!(
+        args.command,
+        vec![
+            "env",
+            "-C",
+            "/tmp/example path",
+            "touch",
+            "name with spaces",
+        ]
     );
 }
 
 #[test]
-fn source_file_accepts_hyphen_prefixed_path_after_separator() {
-    let cli = parse_args(&["source-file", "--", "-N"]).unwrap();
+fn source_file_accepts_flags_target_and_hyphen_path() {
+    let args = parse_command!(
+        SourceFile,
+        ["source", "-F", "-n", "-q", "-v", "-t", "alpha:0.1", "-"]
+    );
+    assert!(args.expand_paths);
+    assert!(args.parse_only);
+    assert!(args.quiet);
+    assert!(args.verbose);
+    assert_eq!(target_text(args.target.as_ref()), "alpha:0.1");
+    assert_eq!(args.paths, vec!["-"]);
+}
 
-    match cli.command.expect("parsed command") {
-        super::super::Command::SourceFile(args) => {
-            assert_eq!(args.paths, vec!["-N"]);
-        }
-        _ => panic!("expected SourceFile command"),
-    }
+#[test]
+fn source_file_accepts_hyphen_prefixed_path_after_separator() {
+    let args = parse_command!(SourceFile, ["source-file", "--", "-N"]);
+    assert_eq!(args.paths, vec!["-N"]);
 }
 
 #[test]
 fn set_buffer_and_show_aliases_accept_tmux_short_forms() {
-    let cli = parse_args(&["setb", "-b", "named", "payload"]).unwrap();
-    match cli.command.expect("parsed command") {
-        super::super::Command::SetBuffer(args) => {
-            assert_eq!(args.name.as_deref(), Some("named"));
-            assert_eq!(args.content.as_deref(), Some("payload"));
-        }
-        _ => panic!("expected SetBuffer command"),
-    }
+    let args = parse_command!(SetBuffer, ["setb", "-b", "named", "payload"]);
+    assert_eq!(args.name.as_deref(), Some("named"));
+    assert_eq!(args.content.as_deref(), Some("payload"));
 
-    let cli = parse_args(&["showb", "-b", "named"]).unwrap();
-    match cli.command.expect("parsed command") {
-        super::super::Command::ShowBuffer(args) => assert_eq!(args.name.as_deref(), Some("named")),
-        _ => panic!("expected ShowBuffer command"),
-    }
+    let args = parse_command!(ShowBuffer, ["showb", "-b", "named"]);
+    assert_eq!(args.name.as_deref(), Some("named"));
 
-    let cli = parse_args(&["showenv", "-t", "alpha"]).unwrap();
-    match cli.command.expect("parsed command") {
-        super::super::Command::ShowEnvironment(args) => {
-            assert_eq!(args.target.expect("target").to_string(), "alpha");
-            assert!(!args.global);
-        }
-        _ => panic!("expected ShowEnvironment command"),
-    }
+    let args = parse_command!(ShowEnvironment, ["showenv", "-t", "alpha"]);
+    assert_eq!(target_text(args.target.as_ref()), "alpha");
+    assert!(!args.global);
 
-    let cli = parse_args(&["show", "-gqv"]).unwrap();
-    match cli.command.expect("parsed command") {
-        super::super::Command::ShowOptions(args) => {
-            assert!(args.global);
-            assert!(args.quiet);
-            assert!(args.value_only);
-            assert_eq!(args.target, None);
-        }
-        _ => panic!("expected ShowOptions command"),
-    }
+    let args = parse_command!(ShowOptions, ["show", "-gqv"]);
+    assert!(args.global);
+    assert!(args.quiet);
+    assert!(args.value_only);
+    assert_eq!(args.target, None);
 
     assert!(parse_args(&["show-window-options", "-gqv", "pane-border-style"]).is_err());
 }
 
 #[test]
 fn set_buffer_accepts_target_and_rename_with_trailing_content() {
-    let cli = parse_args(&["set-buffer", "-t", "/dev/pts/8", "payload"]).unwrap();
-    match cli.command.expect("parsed command") {
-        super::super::Command::SetBuffer(args) => {
-            assert_eq!(args.target_client.as_deref(), Some("/dev/pts/8"));
-            assert_eq!(args.content.as_deref(), Some("payload"));
-        }
-        _ => panic!("expected SetBuffer command"),
-    }
+    let args = parse_command!(SetBuffer, ["set-buffer", "-t", "/dev/pts/8", "payload"]);
+    assert_eq!(args.target_client.as_deref(), Some("/dev/pts/8"));
+    assert_eq!(args.content.as_deref(), Some("payload"));
 
-    let cli = parse_args(&["set-buffer", "-b", "src", "-n", "dst", "ignored"]).unwrap();
-    match cli.command.expect("parsed command") {
-        super::super::Command::SetBuffer(args) => {
-            assert_eq!(args.name.as_deref(), Some("src"));
-            assert_eq!(args.new_name.as_deref(), Some("dst"));
-            assert_eq!(args.content.as_deref(), Some("ignored"));
-        }
-        _ => panic!("expected SetBuffer command"),
-    }
+    let args = parse_command!(
+        SetBuffer,
+        ["set-buffer", "-b", "src", "-n", "dst", "ignored"]
+    );
+    assert_eq!(args.name.as_deref(), Some("src"));
+    assert_eq!(args.new_name.as_deref(), Some("dst"));
+    assert_eq!(args.content.as_deref(), Some("ignored"));
 }
 
 #[test]
 fn load_buffer_accepts_target_client() {
-    let cli = parse_args(&["load-buffer", "-w", "-t", "/dev/pts/9", "/tmp/input"]).unwrap();
-
-    match cli.command.expect("parsed command") {
-        super::super::Command::LoadBuffer(args) => {
-            assert!(args.set_clipboard);
-            assert_eq!(args.target_client.as_deref(), Some("/dev/pts/9"));
-            assert_eq!(args.path, "/tmp/input");
-        }
-        _ => panic!("expected LoadBuffer command"),
-    }
+    let args = parse_command!(
+        LoadBuffer,
+        ["load-buffer", "-w", "-t", "/dev/pts/9", "/tmp/input"]
+    );
+    assert!(args.set_clipboard);
+    assert_eq!(args.target_client.as_deref(), Some("/dev/pts/9"));
+    assert_eq!(args.path, "/tmp/input");
 }
 
 #[test]
 fn buffer_commands_accept_compact_hidden_tmux_flags() {
-    let cli = parse_args(&["load-buffer", "-wbclip", "/tmp/input"]).unwrap();
-    match cli.command.expect("parsed command") {
-        super::super::Command::LoadBuffer(args) => {
-            assert!(args.set_clipboard);
-            assert_eq!(args.name.as_deref(), Some("clip"));
-            assert_eq!(args.path, "/tmp/input");
-        }
-        other => panic!("expected load-buffer command, got {other:?}"),
-    }
+    let args = parse_command!(LoadBuffer, ["load-buffer", "-wbclip", "/tmp/input"]);
+    assert!(args.set_clipboard);
+    assert_eq!(args.name.as_deref(), Some("clip"));
+    assert_eq!(args.path, "/tmp/input");
 
-    let cli = parse_args(&["list-buffers", "-rF#{buffer_name}"]).unwrap();
-    match cli.command.expect("parsed command") {
-        super::super::Command::ListBuffers(args) => {
-            assert!(args.reversed);
-            assert_eq!(args.format.as_deref(), Some("#{buffer_name}"));
-        }
-        other => panic!("expected list-buffers command, got {other:?}"),
-    }
+    let args = parse_command!(ListBuffers, ["list-buffers", "-rF#{buffer_name}"]);
+    assert!(args.reversed);
+    assert_eq!(args.format.as_deref(), Some("#{buffer_name}"));
 }
 
 #[test]
 fn set_buffer_requires_double_dash_for_hyphen_prefixed_content() {
     assert!(parse_args(&["set-buffer", "-b", "named", "-world"]).is_err());
 
-    let cli = parse_args(&["set-buffer", "-b", "named", "--", "-world"]).unwrap();
-    match cli.command.expect("parsed command") {
-        super::super::Command::SetBuffer(args) => {
-            assert_eq!(args.name.as_deref(), Some("named"));
-            assert_eq!(args.content.as_deref(), Some("-world"));
-        }
-        _ => panic!("expected SetBuffer command"),
-    }
+    let args = parse_command!(SetBuffer, ["set-buffer", "-b", "named", "--", "-world"]);
+    assert_eq!(args.name.as_deref(), Some("named"));
+    assert_eq!(args.content.as_deref(), Some("-world"));
 }
 
 #[test]
 fn if_shell_accepts_format_mode_target_and_optional_else_command() {
-    let cli = parse_args(&[
-        "if-shell",
-        "-F",
-        "-t",
-        "alpha:0.1",
-        "#{pane_active}",
-        "set-buffer yes",
-        "set-buffer no",
-    ])
-    .unwrap();
-
-    match cli.command.expect("parsed command") {
-        super::super::Command::IfShell(args) => {
-            assert!(args.format_mode);
-            assert_eq!(args.target.expect("target").to_string(), "alpha:0.1");
-            assert_eq!(args.condition, "#{pane_active}");
-            assert_eq!(args.then_command, "set-buffer yes");
-            assert_eq!(args.else_command.as_deref(), Some("set-buffer no"));
-            assert_eq!(
-                args.queue_command,
-                "if-shell -F -t alpha:0.1 \"#{pane_active}\" \"set-buffer yes\" \"set-buffer no\""
-            );
-        }
-        _ => panic!("expected IfShell command"),
-    }
+    let args = parse_command!(
+        IfShell,
+        [
+            "if-shell",
+            "-F",
+            "-t",
+            "alpha:0.1",
+            "#{pane_active}",
+            "set-buffer yes",
+            "set-buffer no",
+        ]
+    );
+    assert!(args.format_mode);
+    assert_eq!(target_text(args.target.as_ref()), "alpha:0.1");
+    assert_eq!(args.condition, "#{pane_active}");
+    assert_eq!(args.then_command, "set-buffer yes");
+    assert_eq!(args.else_command.as_deref(), Some("set-buffer no"));
+    assert_eq!(
+        args.queue_command,
+        "if-shell -F -t alpha:0.1 \"#{pane_active}\" \"set-buffer yes\" \"set-buffer no\""
+    );
 }
 
 #[test]
 fn if_shell_preserves_runtime_resolved_target_syntax() {
     for target in ["alph", "alpha*", "=alpha:", "$1", "@2", "%3", "{mouse}"] {
-        let cli = parse_args(&[
-            "if-shell",
-            "-F",
-            "-t",
-            target,
-            "#{pane_active}",
-            "set-buffer yes",
-        ])
-        .unwrap_or_else(|error| panic!("target {target:?} should parse: {error}"));
-
-        match cli.command.expect("parsed command") {
-            super::super::Command::IfShell(args) => {
-                assert_eq!(args.target.expect("target").raw(), target);
-            }
-            _ => panic!("expected IfShell command"),
-        }
+        let args = parse_command!(
+            IfShell,
+            [
+                "if-shell",
+                "-F",
+                "-t",
+                target,
+                "#{pane_active}",
+                "set-buffer yes",
+            ]
+        );
+        assert_eq!(args.target.expect("target").raw(), target, "{target:?}");
     }
 }
 
 #[test]
 fn if_shell_preserves_mouse_target_for_server_queue() {
-    let cli = parse_args(&[
-        "if-shell",
-        "-F",
-        "-t",
-        "{mouse}",
-        "1",
-        "display-message -p ok",
-    ])
-    .expect("mouse target should parse");
-
-    match cli.command.expect("parsed command") {
-        super::super::Command::IfShell(args) => {
-            assert_eq!(args.target.expect("target").raw(), "{mouse}");
-        }
-        _ => panic!("expected IfShell command"),
-    }
+    let args = parse_command!(
+        IfShell,
+        [
+            "if-shell",
+            "-F",
+            "-t",
+            "{mouse}",
+            "1",
+            "display-message -p ok",
+        ]
+    );
+    assert_eq!(args.target.expect("target").raw(), "{mouse}");
 }
 
 #[test]
 fn set_hook_accepts_target_scope_and_indexed_hook() {
-    let cli = parse_args(&["set-hook", "-t", "alpha", "client-attached[2]", "true"]).unwrap();
-
-    match cli.command.expect("parsed command") {
-        super::super::Command::SetHook(args) => {
-            assert_eq!(args.target.expect("target").to_string(), "alpha");
-            assert_eq!(args.hook.hook, rmux_proto::HookName::ClientAttached);
-            assert_eq!(args.hook.index, Some(2));
-            assert_eq!(args.command.as_deref(), Some("true"));
-        }
-        _ => panic!("expected SetHook command"),
-    }
+    let args = parse_command!(
+        SetHook,
+        ["set-hook", "-t", "alpha", "client-attached[2]", "true"]
+    );
+    assert_eq!(target_text(args.target.as_ref()), "alpha");
+    assert_eq!(args.hook.hook, rmux_proto::HookName::ClientAttached);
+    assert_eq!(args.hook.index, Some(2));
+    assert_eq!(args.command.as_deref(), Some("true"));
 }
 
 #[test]
 fn show_hooks_accepts_global_and_target_scope_flags() {
-    let cli = parse_args(&["show-hooks", "-g", "client-attached"]).unwrap();
-    match cli.command.expect("parsed command") {
-        super::super::Command::ShowHooks(args) => {
-            assert!(args.global);
-            assert_eq!(args.hook, Some(rmux_proto::HookName::ClientAttached));
-            assert_eq!(args.target, None);
-        }
-        _ => panic!("expected ShowHooks command"),
-    }
+    let args = parse_command!(ShowHooks, ["show-hooks", "-g", "client-attached"]);
+    assert!(args.global);
+    assert_eq!(args.hook, Some(rmux_proto::HookName::ClientAttached));
+    assert_eq!(args.target, None);
 
-    let cli = parse_args(&["show-hooks", "-p", "-t", "alpha:0.1", "client-attached"]).unwrap();
-    match cli.command.expect("parsed command") {
-        super::super::Command::ShowHooks(args) => {
-            assert!(args.pane);
-            assert_eq!(args.target.expect("target").to_string(), "alpha:0.1");
-            assert_eq!(args.hook, Some(rmux_proto::HookName::ClientAttached));
-        }
-        _ => panic!("expected ShowHooks command"),
-    }
+    let args = parse_command!(
+        ShowHooks,
+        ["show-hooks", "-p", "-t", "alpha:0.1", "client-attached"]
+    );
+    assert!(args.pane);
+    assert_eq!(target_text(args.target.as_ref()), "alpha:0.1");
+    assert_eq!(args.hook, Some(rmux_proto::HookName::ClientAttached));
 }
 
 #[test]
-fn wait_for_accepts_all_modes() {
-    for (flag, expected) in [
-        ("-S", rmux_proto::WaitForMode::Signal),
-        ("-L", rmux_proto::WaitForMode::Lock),
-        ("-U", rmux_proto::WaitForMode::Unlock),
+fn wait_for_and_wait_alias_accept_all_modes() {
+    for (argv, mode) in [
+        (&["wait-for", "-S", "channel"][..], WaitForMode::Signal),
+        (&["wait-for", "-L", "channel"][..], WaitForMode::Lock),
+        (&["wait-for", "-U", "channel"][..], WaitForMode::Unlock),
+        (&["wait-for", "channel"][..], WaitForMode::Wait),
+        (&["wait", "-L", "channel"][..], WaitForMode::Lock),
     ] {
-        let cli = parse_args(&["wait-for", flag, "channel"]).unwrap();
-        match cli.command.expect("parsed command") {
-            super::super::Command::WaitFor(args) => assert_eq!(args.mode(), expected),
-            _ => panic!("expected WaitFor command"),
-        }
-    }
-
-    let cli = parse_args(&["wait-for", "channel"]).unwrap();
-    match cli.command.expect("parsed command") {
-        super::super::Command::WaitFor(args) => {
-            assert_eq!(args.mode(), rmux_proto::WaitForMode::Wait);
-        }
-        _ => panic!("expected WaitFor command"),
+        let args = parse_command!(WaitFor, argv);
+        assert_eq!(args.channel, "channel", "{argv:?}");
+        assert_eq!(args.mode(), mode, "{argv:?}");
     }
 }
 
 #[test]
-fn link_window_accepts_tmux_position_and_target_flags() {
-    let cli = parse_args(&[
-        "link-window",
-        "-a",
-        "-d",
-        "-k",
-        "-s",
-        "alpha:0",
-        "-t",
-        "beta:1",
-    ])
-    .unwrap();
-
-    match cli.command.expect("parsed command") {
-        super::super::Command::LinkWindow(args) => {
-            assert!(args.after);
-            assert!(!args.before);
-            assert!(args.detached);
-            assert!(args.kill_target);
-            assert_eq!(args.source.as_ref().expect("source").to_string(), "alpha:0");
-            assert_eq!(target_text(args.target.as_ref()), "beta:1");
-        }
-        _ => panic!("expected LinkWindow command"),
-    }
-
-    let cli = parse_args(&["link-window", "-b", "-s", "alpha:0", "-t", "beta:1"]).unwrap();
-
-    match cli.command.expect("parsed command") {
-        super::super::Command::LinkWindow(args) => {
-            assert!(!args.after);
-            assert!(args.before);
-            assert!(!args.detached);
-            assert!(!args.kill_target);
-            assert_eq!(args.source.as_ref().expect("source").to_string(), "alpha:0");
-            assert_eq!(target_text(args.target.as_ref()), "beta:1");
-        }
-        _ => panic!("expected LinkWindow command"),
-    }
-}
-
-#[test]
-fn link_window_accepts_implicit_source() {
-    let cli = parse_args(&["link-window", "-t", "beta:1"]).unwrap();
-
-    match cli.command.expect("parsed command") {
-        super::super::Command::LinkWindow(args) => {
-            assert!(args.source.is_none());
-            assert_eq!(target_text(args.target.as_ref()), "beta:1");
-        }
-        _ => panic!("expected LinkWindow command"),
+fn link_window_and_aliases_accept_position_flags_and_optional_source() {
+    // Flags are [after, before, detached, kill_target].
+    for (argv, flags, source) in [
+        (
+            &[
+                "link-window",
+                "-a",
+                "-d",
+                "-k",
+                "-s",
+                "alpha:0",
+                "-t",
+                "beta:1",
+            ][..],
+            [true, false, true, true],
+            Some("alpha:0"),
+        ),
+        (
+            &["link-window", "-b", "-s", "alpha:0", "-t", "beta:1"][..],
+            [false, true, false, false],
+            Some("alpha:0"),
+        ),
+        (&["link-window", "-t", "beta:1"][..], [false; 4], None),
+        (
+            &["link", "-s", "alpha:0", "-t", "beta:1"][..],
+            [false; 4],
+            Some("alpha:0"),
+        ),
+        (
+            &["linkw", "-s", "alpha:0", "-t", "beta:1"][..],
+            [false; 4],
+            Some("alpha:0"),
+        ),
+    ] {
+        let args = parse_command!(LinkWindow, argv);
+        let actual = [args.after, args.before, args.detached, args.kill_target];
+        assert_eq!(actual, flags, "{argv:?}");
+        assert_eq!(
+            args.source.as_ref().map(TargetSpec::raw),
+            source,
+            "{argv:?}"
+        );
+        assert_eq!(target_text(args.target.as_ref()), "beta:1", "{argv:?}");
     }
 }
 
 #[test]
-fn unlink_window_accepts_target_and_kill_if_last_flag() {
-    let cli = parse_args(&["unlink-window", "-k", "-t", "alpha:0"]).unwrap();
-
-    match cli.command.expect("parsed command") {
-        super::super::Command::UnlinkWindow(args) => {
-            assert!(args.kill_if_last);
-            assert_eq!(target_text(args.target.as_ref()), "alpha:0");
-        }
-        _ => panic!("expected UnlinkWindow command"),
-    }
-}
-
-#[test]
-fn link_and_unlink_window_aliases_dispatch_to_the_window_commands() {
-    let cli = parse_args(&["link", "-s", "alpha:0", "-t", "beta:1"]).unwrap();
-    match cli.command.expect("parsed command") {
-        super::super::Command::LinkWindow(args) => {
-            assert_eq!(args.source.as_ref().expect("source").to_string(), "alpha:0");
-            assert_eq!(target_text(args.target.as_ref()), "beta:1");
-        }
-        _ => panic!("expected LinkWindow command"),
-    }
-
-    let cli = parse_args(&["linkw", "-s", "alpha:0", "-t", "beta:1"]).unwrap();
-    match cli.command.expect("parsed command") {
-        super::super::Command::LinkWindow(args) => {
-            assert_eq!(args.source.as_ref().expect("source").to_string(), "alpha:0");
-            assert_eq!(target_text(args.target.as_ref()), "beta:1");
-        }
-        _ => panic!("expected LinkWindow command"),
-    }
-
-    let cli = parse_args(&["unlinkw", "-t", "alpha:0"]).unwrap();
-    match cli.command.expect("parsed command") {
-        super::super::Command::UnlinkWindow(args) => {
-            assert_eq!(target_text(args.target.as_ref()), "alpha:0");
-            assert!(!args.kill_if_last);
-        }
-        _ => panic!("expected UnlinkWindow command"),
-    }
-}
-
-#[test]
-fn wait_alias_accepts_lock_mode() {
-    let cli = parse_args(&["wait", "-L", "channel"]).unwrap();
-    match cli.command.expect("parsed command") {
-        super::super::Command::WaitFor(args) => {
-            assert_eq!(args.channel, "channel");
-            assert_eq!(args.mode(), rmux_proto::WaitForMode::Lock);
-        }
-        _ => panic!("expected WaitFor command"),
+fn unlink_window_and_alias_accept_target_and_kill_if_last_flag() {
+    for (argv, kill_if_last) in [
+        (&["unlink-window", "-k", "-t", "alpha:0"][..], true),
+        (&["unlinkw", "-t", "alpha:0"][..], false),
+    ] {
+        let args = parse_command!(UnlinkWindow, argv);
+        assert_eq!(args.kill_if_last, kill_if_last, "{argv:?}");
+        assert_eq!(target_text(args.target.as_ref()), "alpha:0", "{argv:?}");
     }
 }

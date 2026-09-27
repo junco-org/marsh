@@ -11,7 +11,7 @@
 //! pays for the projection only.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 /// An append-only log of `R`, plus the id series its producer stamps records with.
 ///
@@ -55,10 +55,7 @@ impl<R> Recorder<R> {
 
     /// Appends one record.
     pub fn push(&self, record: R) {
-        self.records
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push(record);
+        self.log().push(record);
     }
 
     /// Reads the appended records in place and returns whatever `read` made of them.
@@ -68,10 +65,7 @@ impl<R> Recorder<R> {
     /// computation over the slice: no I/O, no signalling, no reentry into this recorder, and no
     /// application callback. Nothing borrowed from the slice can escape, because `U` is owned.
     pub fn with_records<U>(&self, read: impl FnOnce(&[R]) -> U) -> U {
-        let records = self.records.lock().unwrap_or_else(PoisonError::into_inner);
-        let projection = read(&records);
-        drop(records);
-        projection
+        read(&self.log())
     }
 
     /// Every record appended so far, in append order.
@@ -82,6 +76,11 @@ impl<R> Recorder<R> {
         R: Clone,
     {
         self.with_records(<[R]>::to_vec)
+    }
+
+    /// The log, locked, with poisoning recovered for the reason the type documents.
+    fn log(&self) -> MutexGuard<'_, Vec<R>> {
+        self.records.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 

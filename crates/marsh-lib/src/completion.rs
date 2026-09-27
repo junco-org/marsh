@@ -85,6 +85,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::sync::watch;
 
     /// A verdict that cannot be cloned: waiters share it or they do not get it.
     #[derive(Debug, PartialEq, Eq)]
@@ -99,6 +100,9 @@ mod tests {
         Lost(String),
     }
 
+    /// The completion every test publishes on.
+    type State = WaitState<Verdict, TestError>;
+
     /// The single-use factory the loop may consume only on its way out: it owns a value that
     /// cannot be copied, so moving it on a continuing iteration would not compile.
     fn lost_factory() -> impl FnOnce() -> TestError {
@@ -108,8 +112,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_waiter_attached_before_the_result_resolves_to_it() {
-        let (tx, rx) = tokio::sync::watch::channel(WaitState::<Verdict, TestError>::Pending);
-        let mut waiter = rx.clone();
+        let (tx, mut waiter) = watch::channel(State::Pending);
         let wait =
             tokio::spawn(async move { wait_for_completion(&mut waiter, lost_factory()).await });
         tokio::task::yield_now().await;
@@ -128,11 +131,10 @@ mod tests {
 
     #[tokio::test]
     async fn late_waiters_share_the_published_value() {
-        let (tx, rx) = tokio::sync::watch::channel(WaitState::<Verdict, TestError>::Pending);
+        let (tx, mut first) = watch::channel(State::Pending);
         tx.send_replace(WaitState::Done(Arc::new(Verdict(3))));
 
-        let mut first = rx.clone();
-        let mut second = rx.clone();
+        let mut second = first.clone();
         let first = wait_for_completion(&mut first, lost_factory())
             .await
             .expect("first");
@@ -146,8 +148,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_published_failure_is_the_producer_s_own() {
-        let (tx, rx) = tokio::sync::watch::channel(WaitState::<Verdict, TestError>::Pending);
-        let mut waiter = rx.clone();
+        let (tx, mut waiter) = watch::channel(State::Pending);
         tx.send_replace(WaitState::Failed(TestError::Refused));
 
         let error = wait_for_completion(&mut waiter, lost_factory())
@@ -158,8 +159,7 @@ mod tests {
 
     #[tokio::test]
     async fn losing_the_producer_while_pending_consults_the_factory() {
-        let (tx, rx) = tokio::sync::watch::channel(WaitState::<Verdict, TestError>::Pending);
-        let mut waiter = rx.clone();
+        let (tx, mut waiter) = watch::channel(State::Pending);
         let wait =
             tokio::spawn(async move { wait_for_completion(&mut waiter, lost_factory()).await });
         tokio::task::yield_now().await;
@@ -173,18 +173,14 @@ mod tests {
 
     #[tokio::test]
     async fn a_terminal_state_outlives_its_producer() {
-        let (done_tx, done_rx) =
-            tokio::sync::watch::channel(WaitState::<Verdict, TestError>::Pending);
+        let (done_tx, mut done) = watch::channel(State::Pending);
         done_tx.send_replace(WaitState::Done(Arc::new(Verdict(11))));
         drop(done_tx);
 
-        let (failed_tx, failed_rx) =
-            tokio::sync::watch::channel(WaitState::<Verdict, TestError>::Pending);
+        let (failed_tx, mut failed) = watch::channel(State::Pending);
         failed_tx.send_replace(WaitState::Failed(TestError::Refused));
         drop(failed_tx);
 
-        let mut done = done_rx;
-        let mut failed = failed_rx;
         assert_eq!(
             *wait_for_completion(&mut done, lost_factory())
                 .await

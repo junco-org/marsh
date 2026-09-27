@@ -90,24 +90,6 @@ pub fn resolve(base: &Path, path: &str) -> PathBuf {
     out
 }
 
-/// The path components of `path` below `root`, or `None` when `path` is not under `root`.
-///
-/// Only `Component::Normal` parts survive. Callers apply their own predicate to the result: what
-/// counts as "names nothing" differs between a repository (the worktree root and `.git/`) and a
-/// snapshot (only the root itself).
-pub fn relative_segments(root: &Path, path: &Path) -> Option<Vec<String>> {
-    let relative = path.strip_prefix(root).ok()?;
-    Some(
-        relative
-            .components()
-            .filter_map(|component| match component {
-                Component::Normal(part) => Some(part.to_string_lossy().into_owned()),
-                _ => None,
-            })
-            .collect(),
-    )
-}
-
 /// How one global option before the subcommand is spelled.
 enum Global {
     /// A switch that is the whole word.
@@ -160,6 +142,24 @@ fn global_option(arg: &str) -> Global {
     }
 }
 
+/// Each global option in `globals`, with the next word when that is the value it takes.
+pub(crate) fn global_options<S: AsRef<str>>(
+    globals: &[S],
+) -> impl Iterator<Item = (&str, Option<&str>)> {
+    let mut words = globals.iter().map(AsRef::as_ref);
+    std::iter::from_fn(move || {
+        let word = words.next()?;
+        Some((
+            word,
+            if matches!(global_option(word), Global::Value) {
+                words.next()
+            } else {
+                None
+            },
+        ))
+    })
+}
+
 /// Classifies a git command line, `argv[0]` included.
 ///
 /// Never fails: a line git would refuse is still a line git will run, and what it would do is the
@@ -171,46 +171,27 @@ fn global_option(arg: &str) -> Global {
 pub fn parse<S: AsRef<str>>(argv: &[S]) -> GitInvocation<'_, S> {
     let args = argv.get(1..).unwrap_or(&[]);
     let mut index = 0;
-    while let Some(arg) = args.get(index).map(AsRef::as_ref) {
+    // The requested action, the word that names it, and where the words after that word begin.
+    let (action, subcommand, rest) = loop {
+        // A bare `git` prints its help.
+        let Some(arg) = args.get(index).map(AsRef::as_ref) else {
+            break (None, None, index);
+        };
         if !arg.starts_with('-') {
-            break;
+            break (classify(arg, &args[index + 1..]), Some(arg), index + 1);
         }
         match global_option(arg) {
             Global::Flag => index += 1,
             Global::Value if index + 1 < args.len() => index += 2,
-            Global::Informational => {
-                return GitInvocation {
-                    action: None,
-                    subcommand: Some(arg),
-                    global_args: &args[..index],
-                    command_args: &args[index + 1..],
-                };
-            }
-            Global::Value | Global::Unknown => {
-                return GitInvocation {
-                    action: Some(GitAction::Edit),
-                    subcommand: None,
-                    global_args: &args[..index],
-                    command_args: &args[index..],
-                };
-            }
+            Global::Informational => break (None, Some(arg), index + 1),
+            Global::Value | Global::Unknown => break (Some(GitAction::Edit), None, index),
         }
-    }
-    let Some(subcommand) = args.get(index).map(AsRef::as_ref) else {
-        // A bare `git` prints its help.
-        return GitInvocation {
-            action: None,
-            subcommand: None,
-            global_args: args,
-            command_args: &[],
-        };
     };
-    let command_args = &args[index + 1..];
     GitInvocation {
-        action: classify(subcommand, command_args),
-        subcommand: Some(subcommand),
+        action,
+        subcommand,
         global_args: &args[..index],
-        command_args,
+        command_args: &args[rest..],
     }
 }
 
@@ -225,38 +206,27 @@ fn classify<S: AsRef<str>>(subcommand: &str, args: &[S]) -> Option<GitAction> {
         "init" | "branch" | "tag" | "fetch" | "push" | "backfill" | "help" | "version" => None,
         "clone" => {
             let scan = scan(args, &CLONE);
-            let no_checkout = scan.last_switch(Some('n'), "no-checkout") == Some(true)
-                && scan.last_switch(None, "checkout") != Some(true);
+            let no_checkout = scan.has(Some('n'), "no-checkout") && !scan.has(None, "checkout");
             if scan.has(None, "bare") || scan.has(None, "mirror") || no_checkout {
                 None
             } else {
                 Some(GitAction::Checkout)
             }
         }
-        "mv" | "rm" => {
-            let grammar = if subcommand == "mv" { &MV } else { &RM };
-            if scan(args, grammar).has(Some('n'), "dry-run") {
-                Some(GitAction::Diff)
-            } else {
-                Some(GitAction::Delete)
-            }
-        }
-        "clean" => {
-            if scan(args, &CLEAN).has(Some('n'), "dry-run") {
-                Some(GitAction::Diff)
-            } else {
-                Some(GitAction::Clean)
-            }
-        }
+        "mv" => Some(unless_dry_run(args, &MV, GitAction::Delete)),
+        "rm" => Some(unless_dry_run(args, &RM, GitAction::Delete)),
+        "clean" => Some(unless_dry_run(args, &CLEAN, GitAction::Clean)),
         "restore" => {
             let scan = scan(args, &RESTORE);
-            let staged = scan.last_switch(Some('S'), "staged") == Some(true);
-            let worktree = scan.last_switch(Some('W'), "worktree") == Some(true);
-            if staged && !worktree {
-                Some(GitAction::Unstage)
+            let (staged, worktree) = (
+                scan.has(Some('S'), "staged"),
+                scan.has(Some('W'), "worktree"),
+            );
+            Some(if staged && !worktree {
+                GitAction::Unstage
             } else {
-                Some(GitAction::Checkout)
-            }
+                GitAction::Checkout
+            })
         }
         "reset" => reset_mode(&scan(args, &RESET)),
         "commit" => Some(GitAction::Commit {
@@ -296,25 +266,36 @@ fn classify<S: AsRef<str>>(subcommand: &str, args: &[S]) -> Option<GitAction> {
 fn reset_mode(scan: &Scan<'_>) -> Option<GitAction> {
     let mut mode = Some(GitAction::Unstage);
     for option in &scan.options {
-        let Opt::Long {
-            name,
-            negated: false,
-            ..
-        } = option
-        else {
-            if matches!(option, Opt::Short('p', _)) {
-                mode = Some(GitAction::Unstage);
-            }
-            continue;
-        };
-        match *name {
-            "soft" => mode = None,
-            "mixed" | "patch" => mode = Some(GitAction::Unstage),
-            "hard" | "merge" | "keep" => mode = Some(GitAction::Checkout),
+        match option {
+            Opt::Short('p', _)
+            | Opt::Long {
+                name: "mixed" | "patch",
+                negated: false,
+                ..
+            } => mode = Some(GitAction::Unstage),
+            Opt::Long {
+                name: "soft",
+                negated: false,
+                ..
+            } => mode = None,
+            Opt::Long {
+                name: "hard" | "merge" | "keep",
+                negated: false,
+                ..
+            } => mode = Some(GitAction::Checkout),
             _ => {}
         }
     }
     mode
+}
+
+/// `action`, unless the line is a dry run (`-n`/`--dry-run`), which only reports what it would do.
+fn unless_dry_run<S: AsRef<str>>(args: &[S], grammar: &Grammar, action: GitAction) -> GitAction {
+    if scan(args, grammar).has(Some('n'), "dry-run") {
+        GitAction::Diff
+    } else {
+        action
+    }
 }
 
 /// `Checkout`, unless one of `quits` — an ending that leaves the worktree alone — was given.
@@ -640,19 +621,13 @@ pub(crate) struct Scan<'a> {
 }
 
 impl Scan<'_> {
-    /// Whether the option was given, in either spelling, and not negated.
+    /// Whether the option was given, in either spelling, and not negated by a later `--no-` form.
     pub(crate) fn has(&self, short: Option<char>, long: &str) -> bool {
-        self.last_switch(short, long) == Some(true)
-    }
-
-    /// The last setting of a switch: `Some(true)` for its last plain spelling, `Some(false)` for
-    /// a `--no-` form given after it, `None` when the line never mentions it.
-    pub(crate) fn last_switch(&self, short: Option<char>, long: &str) -> Option<bool> {
         self.options.iter().rev().find_map(|option| match option {
             Opt::Short(letter, _) if Some(*letter) == short => Some(true),
             Opt::Long { name, negated, .. } if *name == long => Some(!negated),
             _ => None,
-        })
+        }) == Some(true)
     }
 
     /// The value of the last occurrence of a value option, in either spelling.
@@ -751,25 +726,6 @@ mod tests {
         GitAction::Commit {
             message: message.map(str::to_string),
         }
-    }
-
-    /// The three callers differ only in what they reject afterwards, so the split has to be exact.
-    #[test]
-    fn relative_segments_names_every_normal_component_below_the_root() {
-        let root = Path::new("/work");
-        assert_eq!(
-            relative_segments(root, Path::new("/work/foo1/src/a.txt")),
-            Some(vec![
-                "foo1".to_string(),
-                "src".to_string(),
-                "a.txt".to_string()
-            ])
-        );
-        assert_eq!(
-            relative_segments(root, Path::new("/work")),
-            Some(Vec::new())
-        );
-        assert_eq!(relative_segments(root, Path::new("/elsewhere/a.txt")), None);
     }
 
     /// Every subcommand git 2.55 advertises, and the four other names the builtin has always
@@ -966,38 +922,49 @@ mod tests {
 
     #[test]
     fn multiple_messages_are_joined_as_paragraphs() {
-        assert_eq!(
-            parse(&["git", "commit", "-m", "one", "-m", "two", "--", "a.txt"]).action,
-            Some(commit(Some("one\n\ntwo")))
-        );
-        assert_eq!(
-            parse(&["git", "commit", "-mshort"]).action,
-            Some(commit(Some("short"))),
-            "the attached form is the same message"
-        );
-        assert_eq!(
-            parse(&["git", "commit", "--message=long"]).action,
-            Some(commit(Some("long")))
-        );
-        assert_eq!(
-            parse(&["git", "commit", "--mess", "abbreviated"]).action,
-            Some(commit(Some("abbreviated")))
-        );
-        assert_eq!(
-            parse(&["git", "commit", "-am", "all"]).action,
-            Some(commit(Some("all"))),
-            "-m clustered after a switch"
-        );
-        assert_eq!(
-            parse(&["git", "commit", "-m", "--", "p"]).action,
-            Some(commit(Some("--"))),
-            "`--` after -m is that option's value"
-        );
-        assert_eq!(
-            parse(&["git", "commit", "-m", ""]).action,
-            Some(commit(Some(""))),
-            "an empty message is a message"
-        );
+        for (argv, message, why) in [
+            (
+                &["git", "commit", "-m", "one", "-m", "two", "--", "a.txt"][..],
+                "one\n\ntwo",
+                "paragraphs",
+            ),
+            (
+                &["git", "commit", "-mshort"][..],
+                "short",
+                "the attached form is the same message",
+            ),
+            (
+                &["git", "commit", "--message=long"][..],
+                "long",
+                "the long form",
+            ),
+            (
+                &["git", "commit", "--mess", "abbreviated"][..],
+                "abbreviated",
+                "an abbreviation",
+            ),
+            (
+                &["git", "commit", "-am", "all"][..],
+                "all",
+                "-m clustered after a switch",
+            ),
+            (
+                &["git", "commit", "-m", "--", "p"][..],
+                "--",
+                "`--` after -m is that option's value",
+            ),
+            (
+                &["git", "commit", "-m", ""][..],
+                "",
+                "an empty message is a message",
+            ),
+        ] {
+            assert_eq!(
+                parse(argv).action,
+                Some(commit(Some(message))),
+                "{why}: {argv:?}"
+            );
+        }
     }
 
     /// A message that is not on the command line is not a message the classification can know;
@@ -1071,16 +1038,6 @@ mod tests {
             resolve(base, "/etc/passwd"),
             Path::new("/etc/passwd"),
             "an absolute pathspec ignores the working directory"
-        );
-    }
-
-    /// The callers decide what a segment list means, so a component that is not a name must never
-    /// reach them as one.
-    #[test]
-    fn relative_segments_drops_components_that_are_not_names() {
-        assert_eq!(
-            relative_segments(Path::new("/work"), Path::new("/work/../etc/passwd")),
-            Some(vec!["etc".to_string(), "passwd".to_string()]),
         );
     }
 }

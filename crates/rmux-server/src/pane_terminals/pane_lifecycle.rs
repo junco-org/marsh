@@ -1655,7 +1655,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use marsh_core::shellmux::{JobView, Sandbox, SnapshotUid};
+    use marsh_core::shellmux::{JobView, Principal, Sandbox};
     use rmux_proto::{
         CapturePaneRequest, LinkWindowRequest, ListPanesRequest, NewSessionRequest,
         NewWindowRequest, Request, Response, SelectPaneRequest, SplitDirection, SplitWindowRequest,
@@ -1752,7 +1752,7 @@ mod tests {
     /// makes "the replacement" unambiguous without consulting an index.
     async fn wait_for_pane_job(
         io: &ShellIo,
-        excluded: Option<&SnapshotUid>,
+        excluded: Option<&Principal>,
     ) -> (JobView, SessionName, PaneId, u64) {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         loop {

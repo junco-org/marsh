@@ -1,15 +1,9 @@
-//! Infrastructure failures of the multiplexer.
-//!
-//! `MuxError` is reserved for the mux *breaking*: a job directory that names nothing, a name two
-//! jobs would answer to, a terminal that refused an ioctl, a seed that could not be leased. Domain
-//! outcomes — a line whose capabilities were denied, a line that lost a race — are **not** errors;
-//! they are [`Outcome`](crate::Outcome) variants, because they are answers the gate computed
-//! successfully.
+//! Mux admission, terminal and lifecycle failures. Command verdicts are ordinary Shell errors.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::MarshError;
+use crate::ShellError;
 use crate::shellmux::ids::ShellId;
 
 /// Infrastructure failure raised by the mux.
@@ -18,7 +12,7 @@ pub enum MuxError {
     /// The shell layer failed: seed discovery, the lease, a snapshot, a publication, the shell
     /// itself.
     #[error(transparent)]
-    Marsh(#[from] MarshError),
+    Marsh(#[from] ShellError),
     /// A job directory escapes the seed or names nothing in it.
     #[error("{path} cannot be used as a job directory: {reason}")]
     SandboxDir {
@@ -88,15 +82,6 @@ pub enum MuxError {
     /// The mux is shutting down and admits no new work.
     #[error("the shell multiplexer is shutting down")]
     ShuttingDown,
-    /// An approved publication failed; the seed needs its log replayed before anything else runs.
-    #[error(
-        "an approved publication failed and has not been recovered; reopen the seed to replay \
-         its write-ahead log"
-    )]
-    RecoveryRequired,
-    /// A command context was asked to start native work after its command stopped admitting it.
-    #[error("command {0} is finalizing and admits no further work")]
-    CommandFinalizing(crate::shellmux::CommandId),
     /// A failure that had to be observed in more than one place.
     ///
     /// A job whose construction fails reports that failure to its caller, to the receipt of the
@@ -117,6 +102,6 @@ impl From<brush_core::Error> for MuxError {
     /// A shell failure travels as the shell layer's own error, so a caller matching on
     /// [`MuxError::Marsh`] sees every shell failure in one place.
     fn from(error: brush_core::Error) -> Self {
-        Self::Marsh(MarshError::Shell(error))
+        Self::Marsh(ShellError::from(error))
     }
 }

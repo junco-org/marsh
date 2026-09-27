@@ -71,9 +71,11 @@ impl Host {
                         rows: ROWS,
                         cols: COLS,
                     },
-                    filesystem,
                     tokio::runtime::Handle::current(),
                     socket,
+                    |profile, frontend| {
+                        marsh_core::test_support::mux(profile, frontend, filesystem)
+                    },
                 )
                 .expect("open the test engine");
                 tokio::spawn(drain(events, seen));
@@ -120,8 +122,20 @@ impl Host {
         self.output()
     }
 
-    /// Releases the core, so the seed's snapshots are reclaimed before the scratch tree goes.
-    fn finish(&self) {
+    /// Checks that the `echo marsh` line which concluded with `exit_code` ran on this host and
+    /// that its bytes arrived (`delivered` says why they must have), then releases the core, so
+    /// the seed's snapshots are reclaimed before the scratch tree goes.
+    fn finish_after_echo(&self, exit_code: Option<i32>, delivered: &str) {
+        assert_eq!(
+            exit_code,
+            Some(0),
+            "the command ran to completion on the host's runtime"
+        );
+        assert_eq!(
+            self.await_output(b"marsh\n"),
+            b"marsh\n".to_vec(),
+            "{delivered}"
+        );
         self.runtime
             .block_on(self.io.shutdown())
             .expect("shut the host down");
@@ -190,7 +204,6 @@ fn pipes() -> SpawnOptions {
 /// One line, admitted normally.
 fn line() -> CommandOptions {
     CommandOptions {
-        on_finish: None,
         close_on_finish: false,
         on_accept: None,
     }
@@ -248,18 +261,10 @@ fn a_job_admitted_from_another_runtime_belongs_to_this_host() {
         .runtime
         .block_on(command.wait())
         .expect("the line reached a verdict");
-    assert_eq!(
-        completion.exit_code,
-        Some(0),
-        "the command ran to completion on the host's runtime"
+    host.finish_after_echo(
+        completion.exit_code(),
+        "the shell's pipe pumps survived the caller's runtime and delivered its bytes",
     );
-    assert_eq!(
-        host.await_output(b"marsh\n"),
-        b"marsh\n".to_vec(),
-        "the shell's pipe pumps survived the caller's runtime and delivered its bytes"
-    );
-
-    host.finish();
 }
 
 #[test]
@@ -288,16 +293,8 @@ fn a_job_admitted_from_a_thread_with_no_runtime_belongs_to_this_host() {
         .expect("the caller thread finished")
         .expect("the line reached a verdict");
 
-    assert_eq!(
-        completion.exit_code,
-        Some(0),
-        "the command ran to completion on the host's runtime"
+    host.finish_after_echo(
+        completion.exit_code(),
+        "the shell's pipe pumps delivered its bytes",
     );
-    assert_eq!(
-        host.await_output(b"marsh\n"),
-        b"marsh\n".to_vec(),
-        "the shell's pipe pumps delivered its bytes"
-    );
-
-    host.finish();
 }

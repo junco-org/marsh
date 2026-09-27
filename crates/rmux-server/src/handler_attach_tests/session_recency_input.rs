@@ -99,7 +99,7 @@ async fn interaction_fixture(
 ) -> (RequestHandler, mpsc::UnboundedReceiver<AttachControl>) {
     let handler = RequestHandler::new();
     let control_rx = create_quiet_attached_session(&handler, attach_pid, &session_name(USED)).await;
-    create_quiet_session(&handler, &session_name(SPARE)).await;
+    handler.create_session(Quiet(SPARE)).await;
     pin_public_seconds(&handler).await;
     assert_eq!(
         default_session(&handler).await,
@@ -158,7 +158,7 @@ async fn a_locally_consumed_mode_key_advances_targetless_session_recency() {
     );
 
     // Only now is the rival created, so copy mode itself cannot be the cause.
-    create_quiet_session(&handler, &session_name(SPARE)).await;
+    handler.create_session(Quiet(SPARE)).await;
     pin_public_seconds(&handler).await;
     assert_eq!(default_session(&handler).await, session_name(SPARE));
 
@@ -195,8 +195,16 @@ async fn successful_pane_input_advances_targetless_session_recency() {
 async fn synchronized_pane_input_advances_the_session_at_the_admission_boundary() {
     let attach_pid = std::process::id();
     let (handler, _control_rx) = interaction_fixture(attach_pid).await;
-    split_used_window(&handler).await;
-    set_synchronize_panes(&handler).await;
+    handler
+        .handle_ok(SplitWindowRequest::fixture(session_name(USED)))
+        .await;
+    handler
+        .set_option(
+            ScopeSelector::Window(WindowTarget::with_window(session_name(USED), 0)),
+            OptionName::SynchronizePanes,
+            "on",
+        )
+        .await;
     // Splitting is window bookkeeping rather than client interaction, so the
     // rival must still be winning when the one synchronized input arrives.
     pin_public_seconds(&handler).await;
@@ -216,24 +224,17 @@ async fn synchronized_pane_input_advances_the_session_at_the_admission_boundary(
 async fn switching_a_client_advances_the_target_session_recency() {
     let attach_pid = std::process::id();
     let handler = RequestHandler::new();
-    create_quiet_session(&handler, &session_name(USED)).await;
-    create_quiet_session(&handler, &session_name(SPARE)).await;
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    handler
-        .register_attach(attach_pid, session_name(SPARE), control_tx)
-        .await;
+    handler.create_session(Quiet(USED)).await;
+    handler.create_session(Quiet(SPARE)).await;
+    let _control_rx = handler.attach_client(attach_pid, SPARE).await;
     pin_public_seconds(&handler).await;
     assert_eq!(default_session(&handler).await, session_name(SPARE));
 
-    let switched = handler
-        .handle(Request::SwitchClient(SwitchClientRequest {
+    handler
+        .handle_ok(SwitchClientRequest {
             target: session_name(USED),
-        }))
+        })
         .await;
-    assert!(
-        matches!(switched, Response::SwitchClient(_)),
-        "{switched:?}"
-    );
     pin_public_seconds(&handler).await;
 
     // tmux 3.7b updates session activity when a client switches into a
@@ -261,7 +262,7 @@ async fn read_only_fixture(
     attach_pid: u32,
 ) -> (RequestHandler, mpsc::UnboundedReceiver<AttachControl>) {
     let handler = RequestHandler::new();
-    create_quiet_session(&handler, &session_name(USED)).await;
+    handler.create_session(Quiet(USED)).await;
     let (control_tx, control_rx) = mpsc::unbounded_channel();
     handler
         .register_attach_with_closing(
@@ -273,7 +274,7 @@ async fn read_only_fixture(
             crate::client_flags::ClientFlags::READONLY,
         )
         .await;
-    create_quiet_session(&handler, &session_name(SPARE)).await;
+    handler.create_session(Quiet(SPARE)).await;
     (handler, control_rx)
 }
 
@@ -313,7 +314,7 @@ async fn input_from_a_vanished_attach_does_not_advance_targetless_session_recenc
 async fn input_must_not_advance_a_same_name_session_recreated_under_the_client() {
     let attach_pid = std::process::id();
     let (handler, _control_rx) = interaction_fixture(attach_pid).await;
-    let original_id = session_id(&handler, USED).await;
+    let original_id = handler.session_id_for_test(USED).await;
 
     // Destroy and recreate the attached name. The attach record still carries
     // the destroyed session's id, so its input belongs to a lifetime that no
@@ -330,7 +331,7 @@ async fn input_must_not_advance_a_same_name_session_recreated_under_the_client()
             .expect("replacement session creation succeeds");
     }
     assert_ne!(
-        session_id(&handler, USED).await,
+        handler.session_id_for_test(USED).await,
         original_id,
         "the recreated session must be a new identity"
     );
@@ -354,8 +355,8 @@ async fn input_must_not_advance_a_same_name_session_recreated_under_the_client()
 async fn a_live_attach_registration_credits_the_session_it_attached_to() {
     let attach_pid = std::process::id();
     let handler = RequestHandler::new();
-    create_quiet_session(&handler, &session_name(USED)).await;
-    create_quiet_session(&handler, &session_name(SPARE)).await;
+    handler.create_session(Quiet(USED)).await;
+    handler.create_session(Quiet(SPARE)).await;
     pin_public_seconds(&handler).await;
     assert_eq!(
         default_session(&handler).await,
@@ -363,10 +364,7 @@ async fn a_live_attach_registration_credits_the_session_it_attached_to() {
         "the fixture must start with the session nobody attached to winning"
     );
 
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    handler
-        .register_attach(attach_pid, session_name(USED), control_tx)
-        .await;
+    let _control_rx = handler.attach_client(attach_pid, USED).await;
     pin_public_seconds(&handler).await;
 
     // Attaching is use. The identity guard the two fixtures below exercise has
@@ -381,9 +379,9 @@ async fn a_live_attach_registration_credits_the_session_it_attached_to() {
 async fn attach_registration_must_not_credit_a_same_name_replacement_session() {
     let attach_pid = std::process::id();
     let handler = Arc::new(RequestHandler::new());
-    create_quiet_session(&handler, &session_name(USED)).await;
-    create_quiet_session(&handler, &session_name(SPARE)).await;
-    let original_id = session_id(&handler, USED).await;
+    handler.create_session(Quiet(USED)).await;
+    handler.create_session(Quiet(SPARE)).await;
+    let original_id = handler.session_id_for_test(USED).await;
 
     // Registration publishes the attach, releases the state lock, and only then
     // credits the session. Park it inside exactly that window.
@@ -413,7 +411,7 @@ async fn attach_registration_must_not_credit_a_same_name_replacement_session() {
             .expect("replacement session creation succeeds");
     }
     assert_ne!(
-        session_id(&handler, USED).await,
+        handler.session_id_for_test(USED).await,
         original_id,
         "the replacement session must be a new identity"
     );
@@ -434,8 +432,8 @@ async fn attach_registration_must_not_credit_a_same_name_replacement_session() {
 async fn attach_registration_must_not_credit_a_client_that_finished_first() {
     let attach_pid = std::process::id();
     let handler = Arc::new(RequestHandler::new());
-    create_quiet_session(&handler, &session_name(USED)).await;
-    create_quiet_session(&handler, &session_name(SPARE)).await;
+    handler.create_session(Quiet(USED)).await;
+    handler.create_session(Quiet(SPARE)).await;
 
     let pause = handler.install_attach_registration_activity_pause();
     let (control_tx, _control_rx) = mpsc::unbounded_channel();
@@ -476,9 +474,9 @@ async fn attach_registration_must_not_credit_a_client_that_finished_first() {
 async fn attach_registration_credit_follows_a_rename_of_the_same_session_lifetime() {
     let attach_pid = std::process::id();
     let handler = Arc::new(RequestHandler::new());
-    create_quiet_session(&handler, &session_name(USED)).await;
-    create_quiet_session(&handler, &session_name(SPARE)).await;
-    let attached_id = session_id(&handler, USED).await;
+    handler.create_session(Quiet(USED)).await;
+    handler.create_session(Quiet(SPARE)).await;
+    let attached_id = handler.session_id_for_test(USED).await;
 
     let pause = handler.install_attach_registration_activity_pause();
     let (control_tx, _control_rx) = mpsc::unbounded_channel();
@@ -496,18 +494,14 @@ async fn attach_registration_credit_follows_a_rename_of_the_same_session_lifetim
     // lifetime and the attach both survive; only the key it is stored under
     // moves, which is the one thing the captured name can no longer follow.
     let renamed = session_name(RENAMED_USED);
-    let response = handler
-        .handle(Request::RenameSession(RenameSessionRequest {
+    handler
+        .handle_ok(RenameSessionRequest {
             target: session_name(USED),
             new_name: renamed.clone(),
-        }))
+        })
         .await;
-    assert!(
-        matches!(response, Response::RenameSession(_)),
-        "{response:?}"
-    );
     assert_eq!(
-        session_id(&handler, RENAMED_USED).await,
+        handler.session_id_for_test(RENAMED_USED).await,
         attached_id,
         "renaming must preserve the attached session's identity"
     );
@@ -527,12 +521,12 @@ async fn attach_registration_credit_follows_a_rename_of_the_same_session_lifetim
 async fn detaching_does_not_advance_targetless_session_recency() {
     let attach_pid = std::process::id();
     let handler = RequestHandler::new();
-    create_quiet_session(&handler, &session_name(USED)).await;
+    handler.create_session(Quiet(USED)).await;
     let (control_tx, _control_rx) = mpsc::unbounded_channel();
     let attach_id = handler
         .register_attach(attach_pid, session_name(USED), control_tx)
         .await;
-    create_quiet_session(&handler, &session_name(SPARE)).await;
+    handler.create_session(Quiet(SPARE)).await;
     pin_public_seconds(&handler).await;
     assert_eq!(default_session(&handler).await, session_name(SPARE));
 
@@ -546,18 +540,17 @@ async fn detaching_does_not_advance_targetless_session_recency() {
 #[tokio::test]
 async fn explicit_send_keys_to_a_detached_session_does_not_advance_its_recency() {
     let handler = RequestHandler::new();
-    create_quiet_session(&handler, &session_name(USED)).await;
-    create_quiet_session(&handler, &session_name(SPARE)).await;
+    handler.create_session(Quiet(USED)).await;
+    handler.create_session(Quiet(SPARE)).await;
     pin_public_seconds(&handler).await;
     assert_eq!(default_session(&handler).await, session_name(SPARE));
 
-    let response = handler
-        .handle(Request::SendKeys(SendKeysRequest {
+    handler
+        .handle_ok(SendKeysRequest {
             target: PaneTarget::new(session_name(USED), 0),
             keys: vec!["x".to_owned()],
-        }))
+        })
         .await;
-    assert!(matches!(response, Response::SendKeys(_)), "{response:?}");
     pin_public_seconds(&handler).await;
 
     // tmux 3.7b measured: `send-keys` to a detached session left its
@@ -637,17 +630,6 @@ async fn rendered_session_activity(handler: &RequestHandler, name: &str) -> i64 
         .expect("#{session_activity} renders whole seconds")
 }
 
-async fn session_id(handler: &RequestHandler, name: &str) -> rmux_proto::SessionId {
-    handler
-        .state
-        .lock()
-        .await
-        .sessions
-        .session(&session_name(name))
-        .expect("session exists")
-        .id()
-}
-
 /// Marks `SPARE` as used through the ordinary attach path.
 async fn touch_spare(handler: &RequestHandler) {
     handler
@@ -658,28 +640,4 @@ async fn touch_spare(handler: &RequestHandler) {
         .session_mut(&session_name(SPARE))
         .expect("spare session exists")
         .touch_attached();
-}
-
-async fn split_used_window(handler: &RequestHandler) {
-    let response = handler
-        .handle(Request::SplitWindow(SplitWindowRequest {
-            target: SplitWindowTarget::Session(session_name(USED)),
-            direction: rmux_proto::SplitDirection::Vertical,
-            before: false,
-            environment: None,
-        }))
-        .await;
-    assert!(matches!(response, Response::SplitWindow(_)), "{response:?}");
-}
-
-async fn set_synchronize_panes(handler: &RequestHandler) {
-    let response = handler
-        .handle(Request::SetOption(SetOptionRequest {
-            scope: ScopeSelector::Window(WindowTarget::with_window(session_name(USED), 0)),
-            option: OptionName::SynchronizePanes,
-            value: "on".to_owned(),
-            mode: SetOptionMode::Replace,
-        }))
-        .await;
-    assert!(matches!(response, Response::SetOption(_)), "{response:?}");
 }

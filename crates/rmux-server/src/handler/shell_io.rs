@@ -21,8 +21,8 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use marsh_core::shellmux::{CommandCompletion, JobEnd, MuxError, OutputChannel, Sandbox, ShellId};
-use marsh_core::Outcome;
+use marsh_core::shellmux::{CommandCompletion, JobEnd, OutputChannel, Sandbox, ShellId};
+use marsh_core::{ExecutionResult, ShellError, ShellErrorKind};
 use rmux_core::LifecycleEvent;
 use rmux_proto::{ProcessCommand, RmuxError, SessionName, WindowTarget};
 
@@ -442,12 +442,12 @@ impl RequestHandler {
             completion.shell.id.as_str(),
             completion.shell.uid.as_str(),
             &completion.command,
-            verdict_label(completion.outcome.as_ref()),
+            verdict_label(completion.result.as_ref()),
         );
         tracing::info!(
             shell = completion.shell.id.as_str(),
-            verdict = verdict_label(completion.outcome.as_ref()),
-            exit_code = completion.exit_code,
+            verdict = verdict_label(completion.result.as_ref()),
+            exit_code = completion.exit_code(),
             "shell command completed without publication"
         );
     }
@@ -830,7 +830,7 @@ fn gated_pane_status(end: &JobEnd) -> Option<i32> {
     let Some(completion) = end.completion.as_ref() else {
         return Some(0);
     };
-    if let Some(code) = completion.exit_code {
+    if let Some(code) = completion.exit_code() {
         if code != 0 {
             return Some(code);
         }
@@ -846,13 +846,18 @@ fn gated_pane_status(end: &JobEnd) -> Option<i32> {
 ///
 /// The five outcomes stay distinct: flattening "refused", "someone else won the path" and "thrown
 /// away unchecked" into one word would lose exactly the distinction an operator is looking for.
-const fn verdict_label(outcome: &Result<Outcome, MuxError>) -> &'static str {
-    match outcome {
-        Ok(Outcome::Published { .. }) => "published",
-        Ok(Outcome::Denied { .. }) => "denied",
-        Ok(Outcome::Discarded) => "discarded",
-        Ok(Outcome::Detached) => "detached",
-        Err(_) => "failed",
+fn verdict_label(result: &Result<ExecutionResult, ShellError>) -> &'static str {
+    match result {
+        Ok(_) => "published",
+        Err(error) => match error.kind() {
+            ShellErrorKind::Denied { .. } => "denied",
+            ShellErrorKind::Stale { .. } => "stale",
+            ShellErrorKind::Interrupted => "interrupted",
+            ShellErrorKind::Unsupported => "unsupported",
+            ShellErrorKind::Busy => "busy",
+            ShellErrorKind::Closed => "closed",
+            ShellErrorKind::Infrastructure => "failed",
+        },
     }
 }
 

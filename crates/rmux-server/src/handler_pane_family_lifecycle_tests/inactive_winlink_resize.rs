@@ -1,10 +1,10 @@
 use super::RequestHandler;
 use crate::pane_io::AttachControl;
+use crate::test_fixtures::Fixture;
 use rmux_proto::{
-    KillPaneRequest, KillSessionRequest, LinkWindowRequest, MoveWindowRequest, MoveWindowTarget,
-    NewSessionRequest, NewWindowRequest, OptionName, PaneKillRequest, PaneTarget, PaneTargetRef,
-    Request, Response, ScopeSelector, SelectWindowRequest, SessionName, SetOptionMode,
-    SetOptionRequest, TerminalSize, UnlinkWindowRequest, WindowTarget,
+    KillPaneRequest, KillSessionRequest, LinkWindowRequest, MoveWindowRequest, NewWindowRequest,
+    PaneKillRequest, PaneTarget, PaneTargetRef, Request, Response, SelectWindowRequest,
+    SessionName, TerminalSize, UnlinkWindowRequest, WindowTarget,
 };
 use tokio::sync::mpsc;
 
@@ -28,82 +28,13 @@ enum InactiveAliasRemoval {
     KillSession,
 }
 
-pub(super) async fn create_sized_session(
-    handler: &RequestHandler,
-    name: &str,
-    size: TerminalSize,
-) -> SessionName {
-    let session_name = SessionName::new(name).expect("valid test session name");
-    let response = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name: session_name.clone(),
-            detached: true,
-            size: Some(size),
-            environment: None,
-        }))
-        .await;
-    assert!(matches!(response, Response::NewSession(_)), "{response:?}");
-    session_name
-}
-
-pub(super) async fn link_window(
-    handler: &RequestHandler,
-    source: WindowTarget,
-    target: WindowTarget,
-) {
-    let response = handler
-        .handle(Request::LinkWindow(LinkWindowRequest {
-            source,
-            target,
-            after: false,
-            before: false,
-            kill_destination: false,
-            detached: true,
-        }))
-        .await;
-    assert!(matches!(response, Response::LinkWindow(_)), "{response:?}");
-}
-
-pub(super) async fn select_window(handler: &RequestHandler, target: WindowTarget) {
-    let response = handler
-        .handle(Request::SelectWindow(SelectWindowRequest { target }))
-        .await;
-    assert!(
-        matches!(response, Response::SelectWindow(_)),
-        "{response:?}"
-    );
-}
-
-pub(super) async fn set_window_size_policy(
-    handler: &RequestHandler,
-    session_name: &SessionName,
-    window_index: u32,
-    policy: &str,
-) {
-    let response = handler
-        .handle(Request::SetOption(SetOptionRequest {
-            scope: ScopeSelector::Window(WindowTarget::with_window(
-                session_name.clone(),
-                window_index,
-            )),
-            option: OptionName::WindowSize,
-            value: policy.to_owned(),
-            mode: SetOptionMode::Replace,
-        }))
-        .await;
-    assert!(matches!(response, Response::SetOption(_)), "{response:?}");
-}
-
 pub(super) async fn register_sized_attach(
     handler: &RequestHandler,
     attach_pid: u32,
     session_name: &SessionName,
     content_size: TerminalSize,
 ) -> mpsc::UnboundedReceiver<AttachControl> {
-    let (control_tx, control_rx) = mpsc::unbounded_channel();
-    handler
-        .register_attach(attach_pid, session_name.clone(), control_tx)
-        .await;
+    let control_rx = handler.attach_client(attach_pid, session_name).await;
     let terminal_size = TerminalSize {
         cols: content_size.cols,
         rows: content_size.rows.saturating_add(1),
@@ -146,43 +77,48 @@ async fn assert_destroyed_shared_active_window_preserves_inactive_winlink_runtim
     first_pid: u32,
 ) {
     let handler = RequestHandler::new();
-    let source =
-        create_sized_session(&handler, &format!("{label}-source"), scenario.shared_size).await;
-    let other =
-        create_sized_session(&handler, &format!("{label}-other"), scenario.shared_size).await;
-
-    link_window(
-        &handler,
-        WindowTarget::with_window(source.clone(), 0),
-        WindowTarget::with_window(other.clone(), 1),
-    )
-    .await;
-    let created = handler
-        .handle(Request::NewWindow(Box::new(NewWindowRequest {
-            target: source.clone(),
-            name: Some("temporary-shared-active".to_owned()),
-            detached: true,
-            start_directory: None,
-            environment: None,
-            command: None,
-            process_command: None,
-            target_window_index: Some(1),
-            insert_at_target: false,
-        })))
+    let source = handler
+        .create_session((format!("{label}-source"), scenario.shared_size))
         .await;
-    assert!(matches!(created, Response::NewWindow(_)), "{created:?}");
-    link_window(
-        &handler,
-        WindowTarget::with_window(source.clone(), 1),
-        WindowTarget::with_window(other.clone(), 2),
-    )
-    .await;
-    select_window(&handler, WindowTarget::with_window(source.clone(), 1)).await;
-    select_window(&handler, WindowTarget::with_window(other.clone(), 2)).await;
+    let other = handler
+        .create_session((format!("{label}-other"), scenario.shared_size))
+        .await;
+
+    handler
+        .handle_ok(LinkWindowRequest::fixture((
+            WindowTarget::with_window(source.clone(), 0),
+            WindowTarget::with_window(other.clone(), 1),
+        )))
+        .await;
+    handler
+        .create_window(NewWindowRequest {
+            name: Some("temporary-shared-active".to_owned()),
+            target_window_index: Some(1),
+            ..Fixture::fixture(&source)
+        })
+        .await;
+    handler
+        .handle_ok(LinkWindowRequest::fixture((
+            WindowTarget::with_window(source.clone(), 1),
+            WindowTarget::with_window(other.clone(), 2),
+        )))
+        .await;
+    handler
+        .handle_ok(SelectWindowRequest {
+            target: WindowTarget::with_window(source.clone(), 1),
+        })
+        .await;
+    handler
+        .handle_ok(SelectWindowRequest {
+            target: WindowTarget::with_window(other.clone(), 2),
+        })
+        .await;
     handler.wait_for_initial_panes_for_test().await;
 
     for (session_name, window_index) in [(&source, 0), (&other, 1), (&source, 1), (&other, 2)] {
-        set_window_size_policy(&handler, session_name, window_index, scenario.policy).await;
+        handler
+            .set_window_size_policy(session_name, window_index, scenario.policy)
+            .await;
     }
 
     let _source_rx =
@@ -191,13 +127,12 @@ async fn assert_destroyed_shared_active_window_preserves_inactive_winlink_runtim
         register_sized_attach(&handler, first_pid + 1, &other, scenario.other_size).await;
     assert_window_and_pty_size(&handler, &source, 0, scenario.shared_size).await;
 
-    let response = handler
-        .handle(Request::KillPane(KillPaneRequest {
+    handler
+        .handle_ok(KillPaneRequest {
             target: PaneTarget::with_window(source.clone(), 1, 0),
             kill_all_except: false,
-        }))
+        })
         .await;
-    assert!(matches!(response, Response::KillPane(_)), "{response:?}");
 
     {
         let state = handler.state.lock().await;
@@ -227,35 +162,34 @@ async fn assert_inactive_alias_removal_reconciles_surviving_window(
     first_pid: u32,
 ) {
     let handler = RequestHandler::new();
-    let source =
-        create_sized_session(&handler, &format!("{label}-source"), scenario.shared_size).await;
-    let survivor =
-        create_sized_session(&handler, &format!("{label}-survivor"), scenario.shared_size).await;
-    let created = handler
-        .handle(Request::NewWindow(Box::new(NewWindowRequest {
-            target: source.clone(),
-            name: Some("inactive-shared-window".to_owned()),
-            detached: true,
-            start_directory: None,
-            environment: None,
-            command: None,
-            process_command: None,
-            target_window_index: Some(1),
-            insert_at_target: false,
-        })))
+    let source = handler
+        .create_session((format!("{label}-source"), scenario.shared_size))
         .await;
-    assert!(matches!(created, Response::NewWindow(_)), "{created:?}");
-    link_window(
-        &handler,
-        WindowTarget::with_window(source.clone(), 1),
-        WindowTarget::with_window(survivor.clone(), 1),
-    )
-    .await;
+    let survivor = handler
+        .create_session((format!("{label}-survivor"), scenario.shared_size))
+        .await;
+    handler
+        .create_window(NewWindowRequest {
+            name: Some("inactive-shared-window".to_owned()),
+            target_window_index: Some(1),
+            ..Fixture::fixture(&source)
+        })
+        .await;
+    handler
+        .handle_ok(LinkWindowRequest::fixture((
+            WindowTarget::with_window(source.clone(), 1),
+            WindowTarget::with_window(survivor.clone(), 1),
+        )))
+        .await;
     handler.wait_for_initial_panes_for_test().await;
 
     for session_name in [&source, &survivor] {
-        set_window_size_policy(&handler, session_name, 0, "manual").await;
-        set_window_size_policy(&handler, session_name, 1, scenario.policy).await;
+        handler
+            .set_window_size_policy(session_name, 0, "manual")
+            .await;
+        handler
+            .set_window_size_policy(session_name, 1, scenario.policy)
+            .await;
     }
     let _source_rx =
         register_sized_attach(&handler, first_pid, &source, scenario.shared_size).await;
@@ -301,12 +235,7 @@ async fn assert_inactive_alias_removal_reconciles_surviving_window(
         }
         InactiveAliasRemoval::KillSession => {
             handler
-                .handle(Request::KillSession(KillSessionRequest {
-                    target: source.clone(),
-                    kill_all_except_target: false,
-                    clear_alerts: false,
-                    kill_group: false,
-                }))
+                .handle(Request::KillSession(KillSessionRequest::fixture(&source)))
                 .await
         }
     };
@@ -338,41 +267,40 @@ async fn assert_link_window_reconciles_new_inactive_alias(
     first_pid: u32,
 ) {
     let handler = RequestHandler::new();
-    let source =
-        create_sized_session(&handler, &format!("{label}-source"), scenario.shared_size).await;
-    let target =
-        create_sized_session(&handler, &format!("{label}-target"), scenario.other_size).await;
-    let created = handler
-        .handle(Request::NewWindow(Box::new(NewWindowRequest {
-            target: source.clone(),
-            name: Some("linked-after-attach".to_owned()),
-            detached: true,
-            start_directory: None,
-            environment: None,
-            command: None,
-            process_command: None,
-            target_window_index: Some(1),
-            insert_at_target: false,
-        })))
+    let source = handler
+        .create_session((format!("{label}-source"), scenario.shared_size))
         .await;
-    assert!(matches!(created, Response::NewWindow(_)), "{created:?}");
+    let target = handler
+        .create_session((format!("{label}-target"), scenario.other_size))
+        .await;
+    handler
+        .create_window(NewWindowRequest {
+            name: Some("linked-after-attach".to_owned()),
+            target_window_index: Some(1),
+            ..Fixture::fixture(&source)
+        })
+        .await;
     handler.wait_for_initial_panes_for_test().await;
     for session_name in [&source, &target] {
-        set_window_size_policy(&handler, session_name, 0, "manual").await;
+        handler
+            .set_window_size_policy(session_name, 0, "manual")
+            .await;
     }
-    set_window_size_policy(&handler, &source, 1, scenario.policy).await;
+    handler
+        .set_window_size_policy(&source, 1, scenario.policy)
+        .await;
     let _source_rx =
         register_sized_attach(&handler, first_pid, &source, scenario.shared_size).await;
     let _target_rx =
         register_sized_attach(&handler, first_pid + 1, &target, scenario.other_size).await;
     assert_window_and_pty_size(&handler, &source, 1, scenario.shared_size).await;
 
-    link_window(
-        &handler,
-        WindowTarget::with_window(source.clone(), 1),
-        WindowTarget::with_window(target.clone(), 1),
-    )
-    .await;
+    handler
+        .handle_ok(LinkWindowRequest::fixture((
+            WindowTarget::with_window(source.clone(), 1),
+            WindowTarget::with_window(target.clone(), 1),
+        )))
+        .await;
 
     assert_window_and_pty_size(&handler, &source, 1, scenario.other_size).await;
     assert_window_and_pty_size(&handler, &target, 1, scenario.other_size).await;
@@ -384,40 +312,37 @@ async fn assert_move_window_reconciles_changed_inactive_alias_family(
     first_pid: u32,
 ) {
     let handler = RequestHandler::new();
-    let source =
-        create_sized_session(&handler, &format!("{label}-source"), scenario.shared_size).await;
-    let peer = create_sized_session(&handler, &format!("{label}-peer"), scenario.other_size).await;
-    let destination = create_sized_session(
-        &handler,
-        &format!("{label}-destination"),
-        scenario.other_size,
-    )
-    .await;
-    let created = handler
-        .handle(Request::NewWindow(Box::new(NewWindowRequest {
-            target: source.clone(),
-            name: Some("moved-after-attach".to_owned()),
-            detached: true,
-            start_directory: None,
-            environment: None,
-            command: None,
-            process_command: None,
-            target_window_index: Some(1),
-            insert_at_target: false,
-        })))
+    let source = handler
+        .create_session((format!("{label}-source"), scenario.shared_size))
         .await;
-    assert!(matches!(created, Response::NewWindow(_)), "{created:?}");
-    link_window(
-        &handler,
-        WindowTarget::with_window(source.clone(), 1),
-        WindowTarget::with_window(peer.clone(), 1),
-    )
-    .await;
+    let peer = handler
+        .create_session((format!("{label}-peer"), scenario.other_size))
+        .await;
+    let destination = handler
+        .create_session((format!("{label}-destination"), scenario.other_size))
+        .await;
+    handler
+        .create_window(NewWindowRequest {
+            name: Some("moved-after-attach".to_owned()),
+            target_window_index: Some(1),
+            ..Fixture::fixture(&source)
+        })
+        .await;
+    handler
+        .handle_ok(LinkWindowRequest::fixture((
+            WindowTarget::with_window(source.clone(), 1),
+            WindowTarget::with_window(peer.clone(), 1),
+        )))
+        .await;
     handler.wait_for_initial_panes_for_test().await;
     for session_name in [&source, &peer, &destination] {
-        set_window_size_policy(&handler, session_name, 0, "manual").await;
+        handler
+            .set_window_size_policy(session_name, 0, "manual")
+            .await;
     }
-    set_window_size_policy(&handler, &source, 1, scenario.policy).await;
+    handler
+        .set_window_size_policy(&source, 1, scenario.policy)
+        .await;
     let _source_rx =
         register_sized_attach(&handler, first_pid, &source, scenario.shared_size).await;
     let _peer_rx = register_sized_attach(&handler, first_pid + 1, &peer, scenario.other_size).await;
@@ -425,18 +350,12 @@ async fn assert_move_window_reconciles_changed_inactive_alias_family(
         register_sized_attach(&handler, first_pid + 2, &destination, scenario.other_size).await;
     assert_window_and_pty_size(&handler, &source, 1, scenario.shared_size).await;
 
-    let response = handler
-        .handle(Request::MoveWindow(MoveWindowRequest {
-            source: Some(WindowTarget::with_window(source.clone(), 1)),
-            target: MoveWindowTarget::Window(WindowTarget::with_window(destination.clone(), 1)),
-            renumber: false,
-            kill_destination: false,
-            detached: true,
-            after: false,
-            before: false,
-        }))
+    handler
+        .handle_ok(MoveWindowRequest::fixture((
+            WindowTarget::with_window(source.clone(), 1),
+            WindowTarget::with_window(destination.clone(), 1),
+        )))
         .await;
-    assert!(matches!(response, Response::MoveWindow(_)), "{response:?}");
 
     assert_window_and_pty_size(&handler, &peer, 1, scenario.other_size).await;
     assert_window_and_pty_size(&handler, &destination, 1, scenario.other_size).await;

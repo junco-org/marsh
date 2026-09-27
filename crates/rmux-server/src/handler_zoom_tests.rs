@@ -1,5 +1,3 @@
-use tokio::sync::mpsc;
-
 use super::RequestHandler;
 use crate::control_notifications::{
     collect_control_notifications, ControlClientSnapshot, PreparedControlNotification,
@@ -7,30 +5,19 @@ use crate::control_notifications::{
 use crate::pane_io::AttachControl;
 use rmux_core::LifecycleEvent;
 use rmux_proto::{
-    DisplayMessageRequest, DisplayPanesRequest, DisplayPanesResponse, NewSessionRequest,
-    NewWindowRequest, PaneTarget, Request, ResizePaneAdjustment, ResizePaneRequest, Response,
-    SelectWindowRequest, SplitDirection, SplitWindowRequest, SplitWindowTarget, Target,
-    TerminalSize, WindowTarget,
+    DisplayPanesRequest, DisplayPanesResponse, NewWindowRequest, PaneTarget, Request,
+    ResizePaneAdjustment, ResizePaneRequest, Response, SelectWindowRequest, SplitDirection,
+    SplitWindowRequest, TerminalSize, WindowTarget,
 };
 
+use crate::test_fixtures::Fixture;
 use crate::test_names::session_name;
 
 async fn rendered_window_layouts(handler: &RequestHandler, target: PaneTarget) -> (String, String) {
-    let response = handler
-        .handle(Request::DisplayMessage(DisplayMessageRequest {
-            target: Some(Target::Pane(target)),
-            print: true,
-            message: Some("#{window_layout}|#{window_visible_layout}".to_owned()),
-            empty_target_context: false,
-        }))
+    let output = handler
+        .display_print(target, "#{window_layout}|#{window_visible_layout}")
         .await;
-    let Response::DisplayMessage(response) = response else {
-        panic!("expected display-message response");
-    };
-    let output = response
-        .command_output()
-        .expect("display-message -p returns output");
-    let rendered = std::str::from_utf8(output.stdout())
+    let rendered = std::str::from_utf8(&output)
         .expect("layout output is utf-8")
         .trim_end();
     let (layout, visible_layout) = rendered
@@ -61,28 +48,13 @@ async fn resize_pane_zoom_toggles_the_target_window() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
 
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: alpha.clone(),
-                detached: true,
-                size: Some(TerminalSize { cols: 80, rows: 24 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
-    assert!(matches!(
-        handler
-            .handle(Request::SplitWindow(SplitWindowRequest {
-                target: SplitWindowTarget::Session(alpha.clone()),
-                direction: SplitDirection::Horizontal,
-                before: false,
-                environment: None,
-            }))
-            .await,
-        Response::SplitWindow(_)
-    ));
+    handler.create_session(&alpha).await;
+    handler
+        .handle_ok(SplitWindowRequest {
+            direction: SplitDirection::Horizontal,
+            ..Fixture::fixture(&alpha)
+        })
+        .await;
 
     let response = handler
         .handle(Request::ResizePane(ResizePaneRequest {
@@ -118,32 +90,19 @@ async fn visible_layout_and_layout_change_follow_zoom_for_inactive_windows() {
     let window_target = WindowTarget::with_window(alpha.clone(), 0);
     let pane_target = PaneTarget::with_window(alpha.clone(), 0, 0);
 
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: alpha.clone(),
-                detached: true,
-                size: Some(TerminalSize { cols: 80, rows: 24 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
+    handler.create_session(&alpha).await;
 
     let (single_layout, single_visible_layout) =
         rendered_window_layouts(&handler, pane_target.clone()).await;
     assert_eq!(single_layout, "b25d,80x24,0,0,0");
     assert_eq!(single_visible_layout, single_layout);
 
-    assert!(matches!(
-        handler
-            .handle(Request::ResizePane(ResizePaneRequest {
-                target: pane_target.clone(),
-                adjustment: ResizePaneAdjustment::Zoom,
-            }))
-            .await,
-        Response::ResizePane(_)
-    ));
+    handler
+        .handle_ok(ResizePaneRequest {
+            target: pane_target.clone(),
+            adjustment: ResizePaneAdjustment::Zoom,
+        })
+        .await;
     assert!(
         !handler
             .state
@@ -157,30 +116,17 @@ async fn visible_layout_and_layout_change_follow_zoom_for_inactive_windows() {
         "tmux does not zoom a single-pane window"
     );
 
-    assert!(matches!(
-        handler
-            .handle(Request::SplitWindow(SplitWindowRequest {
-                target: SplitWindowTarget::Session(alpha.clone()),
-                direction: SplitDirection::Vertical,
-                before: false,
-                environment: None,
-            }))
-            .await,
-        Response::SplitWindow(_)
-    ));
+    handler.handle_ok(SplitWindowRequest::fixture(&alpha)).await;
     let (split_layout, split_visible_layout) =
         rendered_window_layouts(&handler, pane_target.clone()).await;
     assert_eq!(split_visible_layout, split_layout);
 
-    assert!(matches!(
-        handler
-            .handle(Request::ResizePane(ResizePaneRequest {
-                target: pane_target.clone(),
-                adjustment: ResizePaneAdjustment::Zoom,
-            }))
-            .await,
-        Response::ResizePane(_)
-    ));
+    handler
+        .handle_ok(ResizePaneRequest {
+            target: pane_target.clone(),
+            adjustment: ResizePaneAdjustment::Zoom,
+        })
+        .await;
     let (zoomed_layout, zoomed_visible_layout) =
         rendered_window_layouts(&handler, pane_target.clone()).await;
     assert_eq!(zoomed_layout, split_layout);
@@ -188,46 +134,21 @@ async fn visible_layout_and_layout_change_follow_zoom_for_inactive_windows() {
 
     let notification = layout_change_notification(&handler, &window_target).await;
     assert_eq!(notification.pid, 73);
-    let window_id = {
-        let state = handler.state.lock().await;
-        state
-            .sessions
-            .session(&alpha)
-            .expect("session exists")
-            .window_at(0)
-            .expect("window 0 exists")
-            .id()
-            .as_u32()
-    };
+    let window_id = handler.window_id_for_test(&window_target).await.as_u32();
     assert_eq!(
         notification.line,
         format!("%layout-change @{window_id} {split_layout} b25d,80x24,0,0,0 *Z")
     );
 
     let new_window = handler
-        .handle(Request::NewWindow(Box::new(NewWindowRequest {
-            target: alpha.clone(),
+        .create_window(NewWindowRequest {
             name: Some("active".to_owned()),
-            detached: true,
-            start_directory: None,
-            environment: None,
-            command: None,
-            process_command: None,
-            target_window_index: None,
-            insert_at_target: false,
-        })))
+            ..Fixture::fixture(&alpha)
+        })
         .await;
-    let Response::NewWindow(new_window) = new_window else {
-        panic!("expected new-window response");
-    };
-    assert!(matches!(
-        handler
-            .handle(Request::SelectWindow(SelectWindowRequest {
-                target: new_window.target,
-            }))
-            .await,
-        Response::SelectWindow(_)
-    ));
+    handler
+        .handle_ok(SelectWindowRequest { target: new_window })
+        .await;
 
     let (inactive_layout, inactive_visible_layout) =
         rendered_window_layouts(&handler, pane_target.clone()).await;
@@ -240,15 +161,12 @@ async fn visible_layout_and_layout_change_follow_zoom_for_inactive_windows() {
         format!("%layout-change @{window_id} {split_layout} b25d,80x24,0,0,0 -Z")
     );
 
-    assert!(matches!(
-        handler
-            .handle(Request::ResizePane(ResizePaneRequest {
-                target: pane_target.clone(),
-                adjustment: ResizePaneAdjustment::Zoom,
-            }))
-            .await,
-        Response::ResizePane(_)
-    ));
+    handler
+        .handle_ok(ResizePaneRequest {
+            target: pane_target.clone(),
+            adjustment: ResizePaneAdjustment::Zoom,
+        })
+        .await;
     let (unzoomed_layout, unzoomed_visible_layout) =
         rendered_window_layouts(&handler, pane_target).await;
     assert_eq!(unzoomed_layout, split_layout);
@@ -265,31 +183,17 @@ async fn visible_layout_and_layout_change_follow_zoom_for_inactive_windows() {
 async fn display_panes_sends_overlay_to_attached_session_without_waiting_for_clear() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    let (control_tx, mut control_rx) = mpsc::unbounded_channel();
 
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: alpha.clone(),
-                detached: true,
-                size: Some(TerminalSize { cols: 8, rows: 4 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
-    assert!(matches!(
-        handler
-            .handle(Request::SplitWindow(SplitWindowRequest {
-                target: SplitWindowTarget::Session(alpha.clone()),
-                direction: SplitDirection::Horizontal,
-                before: false,
-                environment: None,
-            }))
-            .await,
-        Response::SplitWindow(_)
-    ));
-    handler.register_attach(42, alpha.clone(), control_tx).await;
+    handler
+        .create_session((&alpha, TerminalSize::new(8, 4)))
+        .await;
+    handler
+        .handle_ok(SplitWindowRequest {
+            direction: SplitDirection::Horizontal,
+            ..Fixture::fixture(&alpha)
+        })
+        .await;
+    let mut control_rx = handler.attach_client(42, &alpha).await;
 
     let response = handler
         .handle(Request::DisplayPanes(Box::new(DisplayPanesRequest {
@@ -337,7 +241,6 @@ async fn display_panes_sends_overlay_to_attached_session_without_waiting_for_cle
 async fn display_panes_counts_only_labels_that_were_rendered() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    let (control_tx, mut control_rx) = mpsc::unbounded_channel();
 
     {
         let mut state = handler.state.lock().await;
@@ -357,7 +260,7 @@ async fn display_panes_counts_only_labels_that_were_rendered() {
             .expect("session exists")
             .resize_terminal(TerminalSize { cols: 3, rows: 1 });
     }
-    handler.register_attach(43, alpha.clone(), control_tx).await;
+    let mut control_rx = handler.attach_client(43, &alpha).await;
 
     let response = handler
         .handle(Request::DisplayPanes(Box::new(DisplayPanesRequest {

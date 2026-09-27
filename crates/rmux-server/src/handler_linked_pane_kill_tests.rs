@@ -1,69 +1,24 @@
 use super::RequestHandler;
 use rmux_core::PaneId;
 use rmux_proto::{
-    ErrorResponse, KillPaneRequest, LinkWindowRequest, NewSessionRequest, NewWindowRequest,
-    OptionName, PaneTarget, Request, Response, RmuxError, ScopeSelector, SessionName,
-    SetOptionMode, SplitDirection, SplitWindowRequest, SplitWindowTarget, Target, TerminalSize,
-    WindowTarget,
+    ErrorResponse, KillPaneRequest, LinkWindowRequest, NewWindowRequest, OptionName, PaneTarget,
+    Request, Response, RmuxError, ScopeSelector, SessionName, SetOptionMode, SplitWindowRequest,
+    Target, WindowTarget,
 };
 
-use crate::test_names::session_name;
+use crate::test_fixtures::Fixture;
 
-async fn create_session(handler: &RequestHandler, value: &str) -> SessionName {
-    let session = session_name(value);
-    let response = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name: session.clone(),
-            detached: true,
-            size: Some(TerminalSize { cols: 80, rows: 24 }),
-            environment: None,
-        }))
-        .await;
-    assert!(matches!(response, Response::NewSession(_)), "{response:?}");
-    session
-}
-
-async fn split(handler: &RequestHandler, session: &SessionName) {
-    let response = handler
-        .handle(Request::SplitWindow(SplitWindowRequest {
-            target: SplitWindowTarget::Session(session.clone()),
-            direction: SplitDirection::Vertical,
-            before: false,
-            environment: None,
-        }))
-        .await;
-    assert!(matches!(response, Response::SplitWindow(_)), "{response:?}");
-}
-
-async fn create_window(handler: &RequestHandler, session: &SessionName, index: u32) {
-    let response = handler
-        .handle(Request::NewWindow(Box::new(NewWindowRequest {
-            target: session.clone(),
-            name: None,
-            detached: true,
-            environment: None,
-            command: None,
-            start_directory: None,
-            target_window_index: Some(index),
-            insert_at_target: false,
-            process_command: None,
-        })))
-        .await;
-    assert!(matches!(response, Response::NewWindow(_)), "{response:?}");
-}
-
+/// Links `owner:0` over `alias:0`, replacing the alias's own window 0.
 async fn link_window(handler: &RequestHandler, owner: &SessionName, alias: &SessionName) {
-    let response = handler
-        .handle(Request::LinkWindow(LinkWindowRequest {
-            source: WindowTarget::with_window(owner.clone(), 0),
-            target: WindowTarget::with_window(alias.clone(), 0),
-            after: false,
-            before: false,
+    handler
+        .handle_ok(LinkWindowRequest {
             kill_destination: true,
-            detached: true,
-        }))
+            ..Fixture::fixture((
+                WindowTarget::with_window(owner.clone(), 0),
+                WindowTarget::with_window(alias.clone(), 0),
+            ))
+        })
         .await;
-    assert!(matches!(response, Response::LinkWindow(_)), "{response:?}");
 }
 
 fn pane_ids(state: &crate::pane_terminals::HandlerState, session: &SessionName) -> Vec<PaneId> {
@@ -82,23 +37,21 @@ fn pane_ids(state: &crate::pane_terminals::HandlerState, session: &SessionName) 
 #[tokio::test]
 async fn linked_pane_kill_from_alias_updates_owner_and_alias() {
     let handler = RequestHandler::new();
-    let owner = create_session(&handler, "linked-kill-owner").await;
-    split(&handler, &owner).await;
-    let alias = create_session(&handler, "linked-kill-alias").await;
+    let owner = handler.create_session("linked-kill-owner").await;
+    handler.handle_ok(SplitWindowRequest::fixture(&owner)).await;
+    let alias = handler.create_session("linked-kill-alias").await;
     link_window(&handler, &owner, &alias).await;
-    handler.wait_for_initial_panes_for_test().await;
 
     let removed_pane_id = {
         let state = handler.state.lock().await;
         pane_ids(&state, &owner)[1]
     };
-    let response = handler
-        .handle(Request::KillPane(KillPaneRequest {
+    handler
+        .handle_ok(KillPaneRequest {
             target: PaneTarget::with_window(alias.clone(), 0, 1),
             kill_all_except: false,
-        }))
+        })
         .await;
-    assert!(matches!(response, Response::KillPane(_)), "{response:?}");
 
     let state = handler.state.lock().await;
     let owner_ids = pane_ids(&state, &owner);
@@ -113,24 +66,22 @@ async fn linked_pane_kill_from_alias_updates_owner_and_alias() {
 #[tokio::test]
 async fn linked_pane_kill_all_except_from_owner_updates_every_alias() {
     let handler = RequestHandler::new();
-    let owner = create_session(&handler, "linked-kill-all-owner").await;
-    split(&handler, &owner).await;
-    split(&handler, &owner).await;
-    let alias = create_session(&handler, "linked-kill-all-alias").await;
+    let owner = handler.create_session("linked-kill-all-owner").await;
+    handler.handle_ok(SplitWindowRequest::fixture(&owner)).await;
+    handler.handle_ok(SplitWindowRequest::fixture(&owner)).await;
+    let alias = handler.create_session("linked-kill-all-alias").await;
     link_window(&handler, &owner, &alias).await;
-    handler.wait_for_initial_panes_for_test().await;
 
     let kept_pane_id = {
         let state = handler.state.lock().await;
         pane_ids(&state, &owner)[1]
     };
-    let response = handler
-        .handle(Request::KillPane(KillPaneRequest {
+    handler
+        .handle_ok(KillPaneRequest {
             target: PaneTarget::with_window(owner.clone(), 0, 1),
             kill_all_except: true,
-        }))
+        })
         .await;
-    assert!(matches!(response, Response::KillPane(_)), "{response:?}");
 
     let state = handler.state.lock().await;
     assert_eq!(pane_ids(&state, &owner), vec![kept_pane_id]);
@@ -143,11 +94,10 @@ async fn linked_pane_kill_all_except_from_owner_updates_every_alias() {
 #[tokio::test]
 async fn linked_alias_kill_resize_rollback_restores_shared_runtime() {
     let handler = RequestHandler::new();
-    let owner = create_session(&handler, "linked-rollback-owner").await;
-    split(&handler, &owner).await;
-    let alias = create_session(&handler, "linked-rollback-alias").await;
+    let owner = handler.create_session("linked-rollback-owner").await;
+    handler.handle_ok(SplitWindowRequest::fixture(&owner)).await;
+    let alias = handler.create_session("linked-rollback-alias").await;
     link_window(&handler, &owner, &alias).await;
-    handler.wait_for_initial_panes_for_test().await;
 
     let (pane_id, pane_instance) = {
         let mut state = handler.state.lock().await;
@@ -204,20 +154,28 @@ async fn linked_alias_kill_resize_rollback_restores_shared_runtime() {
 #[tokio::test]
 async fn linked_last_pane_kill_removes_shared_window_from_all_surviving_sessions() {
     let handler = RequestHandler::new();
-    let owner = create_session(&handler, "linked-last-owner").await;
-    create_window(&handler, &owner, 1).await;
-    let alias = create_session(&handler, "linked-last-alias").await;
-    create_window(&handler, &alias, 1).await;
+    let owner = handler.create_session("linked-last-owner").await;
+    handler
+        .create_window(NewWindowRequest {
+            target_window_index: Some(1),
+            ..Fixture::fixture(&owner)
+        })
+        .await;
+    let alias = handler.create_session("linked-last-alias").await;
+    handler
+        .create_window(NewWindowRequest {
+            target_window_index: Some(1),
+            ..Fixture::fixture(&alias)
+        })
+        .await;
     link_window(&handler, &owner, &alias).await;
-    handler.wait_for_initial_panes_for_test().await;
 
-    let response = handler
-        .handle(Request::KillPane(KillPaneRequest {
+    handler
+        .handle_ok(KillPaneRequest {
             target: PaneTarget::with_window(alias.clone(), 0, 0),
             kill_all_except: false,
-        }))
+        })
         .await;
-    assert!(matches!(response, Response::KillPane(_)), "{response:?}");
 
     let state = handler.state.lock().await;
     for session_name in [&owner, &alias] {
@@ -233,19 +191,22 @@ async fn linked_last_pane_kill_removes_shared_window_from_all_surviving_sessions
 #[tokio::test]
 async fn linked_last_pane_kill_destroys_only_alias_with_no_surviving_window() {
     let handler = RequestHandler::new();
-    let owner = create_session(&handler, "linked-last-owner-survivor").await;
-    create_window(&handler, &owner, 1).await;
-    let alias = create_session(&handler, "linked-last-only-alias").await;
+    let owner = handler.create_session("linked-last-owner-survivor").await;
+    handler
+        .create_window(NewWindowRequest {
+            target_window_index: Some(1),
+            ..Fixture::fixture(&owner)
+        })
+        .await;
+    let alias = handler.create_session("linked-last-only-alias").await;
     link_window(&handler, &owner, &alias).await;
-    handler.wait_for_initial_panes_for_test().await;
 
-    let response = handler
-        .handle(Request::KillPane(KillPaneRequest {
+    handler
+        .handle_ok(KillPaneRequest {
             target: PaneTarget::with_window(alias.clone(), 0, 0),
             kill_all_except: false,
-        }))
+        })
         .await;
-    assert!(matches!(response, Response::KillPane(_)), "{response:?}");
 
     let state = handler.state.lock().await;
     assert!(state.sessions.session(&alias).is_none());
@@ -261,13 +222,27 @@ async fn linked_last_pane_kill_destroys_only_alias_with_no_surviving_window() {
 #[tokio::test]
 async fn linked_last_pane_kill_metadata_collision_restores_aliases_and_runtime() {
     let handler = RequestHandler::new();
-    let owner = create_session(&handler, "linked-metadata-owner").await;
-    create_window(&handler, &owner, 2).await;
-    create_window(&handler, &owner, 3).await;
-    let alias = create_session(&handler, "linked-metadata-alias").await;
-    create_window(&handler, &alias, 2).await;
+    let owner = handler.create_session("linked-metadata-owner").await;
+    handler
+        .create_window(NewWindowRequest {
+            target_window_index: Some(2),
+            ..Fixture::fixture(&owner)
+        })
+        .await;
+    handler
+        .create_window(NewWindowRequest {
+            target_window_index: Some(3),
+            ..Fixture::fixture(&owner)
+        })
+        .await;
+    let alias = handler.create_session("linked-metadata-alias").await;
+    handler
+        .create_window(NewWindowRequest {
+            target_window_index: Some(2),
+            ..Fixture::fixture(&alias)
+        })
+        .await;
     link_window(&handler, &owner, &alias).await;
-    handler.wait_for_initial_panes_for_test().await;
 
     let mut state = handler.state.lock().await;
     for (option, value) in [

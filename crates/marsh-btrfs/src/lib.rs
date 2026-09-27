@@ -14,6 +14,16 @@
 //!
 //! Everything here is btrfs, so everything here is Linux: the subvolume ioctls exist nowhere else.
 
+/// Asserts that the [`Error`] `$error` matches `$pattern` — an `if` guard included — and prints
+/// it when it does not. Defined before the modules so every test module can use it.
+#[cfg(test)]
+macro_rules! assert_error {
+    ($error:expr, $($pattern:tt)+) => {{
+        let error = &$error;
+        assert!(matches!(error, $($pattern)+), "got {error:?}");
+    }};
+}
+
 mod error;
 #[cfg(feature = "fake")]
 pub mod fake;
@@ -22,4 +32,4 @@ pub mod snapshot;
 
 pub use error::Error;
 pub use persistence::{PersistenceLayer, STATE_DIR, short_id};
-pub use snapshot::{LibBtrfs, Subvolumes, delete_subvolume, snapshot};
+pub use snapshot::{LibBtrfs, Subvolumes, delete_subvolume, snapshot, snapshot_readonly};

@@ -1,8 +1,10 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
+use marsh_lib::{extend_occurrence_map, group_keys_by_value};
 use rmux_core::PaneId;
 use rmux_proto::{PaneTarget, RmuxError, SessionName};
 
+use super::super::super::window_indices::window_ids_by_index;
 use super::super::super::{
     HandlerState, PaneExitMetadata, PaneLifecycleState, SessionTransferSnapshot,
 };
@@ -159,50 +161,30 @@ pub(super) fn transfer_family_session_names(
     session_names
 }
 
-pub(in crate::pane_terminals::pane_transfer) fn window_ids_by_index(
-    state: &HandlerState,
-    session_name: &SessionName,
-) -> Result<BTreeMap<u32, u32>, RmuxError> {
-    let session = state
-        .sessions
-        .session(session_name)
-        .ok_or_else(|| super::super::super::session_not_found(session_name))?;
-    Ok(session
-        .windows()
-        .iter()
-        .map(|(window_index, window)| (*window_index, window.id().as_u32()))
-        .collect())
-}
-
 pub(in crate::pane_terminals::pane_transfer) fn inserted_window_index_map(
     state: &HandlerState,
     session_name: &SessionName,
     before: &BTreeMap<u32, u32>,
     inserted_window_index: u32,
 ) -> Result<BTreeMap<u32, u32>, RmuxError> {
-    let mut after = window_ids_by_index(state, session_name)?;
+    let session = state
+        .sessions
+        .session(session_name)
+        .ok_or_else(|| super::super::super::session_not_found(session_name))?;
+    let mut after = window_ids_by_index(session);
     let _ = after.remove(&inserted_window_index);
-    let old_by_id = window_indexes_by_id(before);
-    let new_by_id = window_indexes_by_id(&after);
     let mut index_map = BTreeMap::new();
-    for (window_id, old_indexes) in old_by_id {
-        let new_indexes = new_by_id.get(&window_id).cloned().unwrap_or_default();
-        if old_indexes.len() != new_indexes.len() {
-            return Err(RmuxError::Server(format!(
+    extend_occurrence_map(
+        &mut index_map,
+        group_keys_by_value(before.iter().map(|(&index, &id)| (index, id))),
+        group_keys_by_value(after),
+        |window_id| {
+            RmuxError::Server(format!(
                 "window @{window_id} occurrence count changed during cross-session break-pane"
-            )));
-        }
-        index_map.extend(old_indexes.into_iter().zip(new_indexes));
-    }
+            ))
+        },
+    )?;
     Ok(index_map)
-}
-
-fn window_indexes_by_id(indexes: &BTreeMap<u32, u32>) -> BTreeMap<u32, Vec<u32>> {
-    let mut by_id = BTreeMap::<u32, Vec<u32>>::new();
-    for (window_index, window_id) in indexes {
-        by_id.entry(*window_id).or_default().push(*window_index);
-    }
-    by_id
 }
 
 pub(in crate::pane_terminals::pane_transfer) fn sync_pane_lifecycle_for_sessions(

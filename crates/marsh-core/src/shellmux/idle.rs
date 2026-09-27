@@ -16,10 +16,12 @@
 //! be set on the shell's standard input too, and a launched program would start getting `EAGAIN`
 //! from its own keyboard.
 
-use std::os::fd::{AsFd as _, BorrowedFd, OwnedFd};
+use std::os::fd::{AsFd as _, AsRawFd as _, BorrowedFd, OwnedFd};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 
+use nix::errno::Errno;
+use tokio::io::Interest;
 use tokio::io::unix::AsyncFd;
 
 use crate::shellmux::error::MuxError;
@@ -252,7 +254,7 @@ impl IdleTerminal {
     /// Fails when the peer descriptor cannot be opened, when its attributes cannot be read or
     /// applied, or when it cannot be registered with the reactor.
     pub(crate) fn grant(master: BorrowedFd<'_>, state: Arc<LeaseState>) -> std::io::Result<Self> {
-        let fd = crate::shellmux::pty::open_peer(master)?;
+        let fd = crate::shellmux::pty::open_peer(master, libc::O_NONBLOCK)?;
         let saved = get_attributes(fd.as_fd())?;
 
         let mut raw = saved;
@@ -282,35 +284,17 @@ impl IdleTerminal {
     ///
     /// Fails with whatever the read reported, other than `EINTR`, which is retried.
     pub async fn read(&self, buffer: &mut [u8]) -> std::io::Result<Option<usize>> {
-        loop {
-            if self.state.level() >= REVOKED_RUN {
-                return Ok(None);
-            }
-            // Registered before the readiness wait, so a revocation landing between them still
-            // wakes this rather than leaving the prompt blocked on a terminal nobody will write.
-            let revoked = self.state.signal.notified();
-            let Some(fd) = self.fd.as_ref() else {
-                return Ok(Some(0));
-            };
-            let ready = tokio::select! {
-                ready = fd.readable() => ready?,
-                () = revoked => continue,
-            };
-            let mut ready = ready;
-            let attempt = ready.try_io(|inner| match nix::unistd::read(inner.get_ref(), buffer) {
+        self.when_ready(
+            Interest::READABLE,
+            REVOKED_RUN,
+            || Ok(Some(0)),
+            |fd| match nix::unistd::read(fd, &mut *buffer) {
                 // A slave whose master is gone reports `EIO`; that is this stream's end of file.
-                Err(nix::errno::Errno::EIO) => Ok(0),
-                other => other.map_err(std::io::Error::from),
-            });
-            match attempt {
-                Ok(Ok(count)) => return Ok(Some(count)),
-                // Retried by the outer loop rather than here, so an interrupted read returns to
-                // the revocation check instead of waiting on a terminal nobody will write to.
-                Ok(Err(error)) if error.kind() == std::io::ErrorKind::Interrupted => {}
-                Ok(Err(error)) => return Err(error),
-                Err(_would_block) => {}
-            }
-        }
+                Err(Errno::EIO) => Ok(0),
+                other => other,
+            },
+        )
+        .await
     }
 
     /// Writes every byte of `bytes` into the terminal, as the slave side.
@@ -329,37 +313,50 @@ impl IdleTerminal {
     pub async fn write_all(&self, bytes: &[u8]) -> std::io::Result<()> {
         let mut written = 0;
         while written < bytes.len() {
-            if self.state.level() >= REVOKED_CLOSE {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::BrokenPipe,
-                    "idle terminal lease was revoked",
-                ));
+            let released = || Err(broken("idle terminal lease has been released"));
+            let count = self.when_ready(Interest::WRITABLE, REVOKED_CLOSE, released, move |fd| {
+                nix::unistd::write(fd, &bytes[written..])
+            });
+            written += count
+                .await?
+                .ok_or_else(|| broken("idle terminal lease was revoked"))?;
+        }
+        Ok(())
+    }
+
+    /// Runs `call` once the leased descriptor is ready for `interest`, or answers `None` as soon
+    /// as the revocation level reaches `limit`, and `released()` once the descriptor is gone.
+    ///
+    /// The revocation wait is registered before the readiness wait, so a revocation landing
+    /// between them still wakes this rather than leaving the prompt blocked on a terminal nobody
+    /// will write to. An interrupted call returns to the revocation check rather than spinning
+    /// inside the readiness callback.
+    async fn when_ready<T>(
+        &self,
+        interest: Interest,
+        limit: u8,
+        released: impl FnOnce() -> std::io::Result<Option<T>>,
+        mut call: impl FnMut(&OwnedFd) -> nix::Result<T>,
+    ) -> std::io::Result<Option<T>> {
+        loop {
+            if self.state.level() >= limit {
+                return Ok(None);
             }
             let revoked = self.state.signal.notified();
             let Some(fd) = self.fd.as_ref() else {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::BrokenPipe,
-                    "idle terminal lease has been released",
-                ));
+                return released();
             };
-            let ready = tokio::select! {
-                ready = fd.writable() => ready?,
+            let mut ready = tokio::select! {
+                ready = fd.ready(interest) => ready?,
                 () = revoked => continue,
             };
-            let mut ready = ready;
-            let attempt = ready.try_io(|inner| {
-                nix::unistd::write(inner.get_ref(), &bytes[written..]).map_err(std::io::Error::from)
-            });
-            match attempt {
-                Ok(Ok(count)) => written += count,
-                // Retried by the outer loop, so an interrupted write returns to the revocation
-                // check rather than spinning inside the readiness callback.
+            match ready.try_io(|inner| call(inner.get_ref()).map_err(std::io::Error::from)) {
+                Ok(Ok(value)) => return Ok(Some(value)),
                 Ok(Err(error)) if error.kind() == std::io::ErrorKind::Interrupted => {}
                 Ok(Err(error)) => return Err(error),
                 Err(_would_block) => {}
             }
         }
-        Ok(())
     }
 
     /// This terminal's current size.
@@ -371,12 +368,10 @@ impl IdleTerminal {
     ///
     /// Fails when the kernel rejects `TIOCGWINSZ`.
     pub fn geometry(&self) -> std::io::Result<TerminalGeometry> {
-        let fd = self.fd.as_ref().ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::BrokenPipe,
-                "idle terminal lease has been released",
-            )
-        })?;
+        let fd = self
+            .fd
+            .as_ref()
+            .ok_or_else(|| broken("idle terminal lease has been released"))?;
         let (rows, cols) = crate::shellmux::pty::terminal_size(fd.get_ref().as_fd())?;
         Ok(TerminalGeometry { rows, cols })
     }
@@ -408,6 +403,11 @@ impl Drop for IdleTerminal {
     }
 }
 
+/// A broken pipe: the lease has no surface left for the bytes.
+fn broken(reason: &'static str) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::BrokenPipe, reason)
+}
+
 /// Reads a terminal's current attributes.
 ///
 /// # Errors
@@ -418,9 +418,7 @@ fn get_attributes(fd: BorrowedFd<'_>) -> std::io::Result<libc::termios> {
     // when the call reported success.
     let mut attributes = unsafe { std::mem::zeroed::<libc::termios>() };
     // SAFETY: `tcgetattr` receives an open descriptor and a writable record of the right type.
-    if unsafe { libc::tcgetattr(std::os::fd::AsRawFd::as_raw_fd(&fd), &raw mut attributes) } != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
+    Errno::result(unsafe { libc::tcgetattr(fd.as_raw_fd(), &raw mut attributes) })?;
     Ok(attributes)
 }
 
@@ -436,32 +434,23 @@ fn get_attributes(fd: BorrowedFd<'_>) -> std::io::Result<libc::termios> {
 fn set_attributes(fd: BorrowedFd<'_>, attributes: &libc::termios) -> std::io::Result<()> {
     // SAFETY: `tcsetattr` receives an open descriptor, a flag it defines, and a readable record of
     // the right type.
-    if unsafe {
+    Errno::result(unsafe {
         libc::tcsetattr(
-            std::os::fd::AsRawFd::as_raw_fd(&fd),
+            fd.as_raw_fd(),
             libc::TCSANOW,
             std::ptr::from_ref(attributes),
         )
-    } != 0
-    {
-        return Err(std::io::Error::last_os_error());
-    }
+    })?;
     Ok(())
 }
 
 #[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 #[cfg(test)]
 mod tests {
-    use std::pin::Pin;
-    use std::task::Poll;
-    use std::time::Duration;
-
     use nix::sys::termios::FlowArg;
 
     use super::*;
-
-    /// How long a test may wait on the kernel before it is a failure rather than a hang.
-    const LIMIT: Duration = Duration::from_secs(5);
+    use crate::shellmux::testing::{LIMIT, poll_once};
 
     /// One private terminal and a lease on it.
     ///
@@ -491,12 +480,6 @@ mod tests {
             state,
             lease,
         }
-    }
-
-    /// Polls `future` exactly once and leaves it alive, so a caller can establish that it is
-    /// waiting without consuming it.
-    async fn poll_once<F: Future>(mut future: Pin<&mut F>) -> Poll<F::Output> {
-        std::future::poll_fn(|cx| Poll::Ready(future.as_mut().poll(cx))).await
     }
 
     /// The lease's own descriptor, for the test's direct syscalls.

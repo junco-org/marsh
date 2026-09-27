@@ -22,17 +22,7 @@ async fn client_identity_fixture(
     pid_offset: u32,
 ) -> ClientIdentityFixture {
     let session_name = SessionName::new(label).expect("valid session");
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: session_name.clone(),
-                detached: true,
-                size: Some(TerminalSize { cols: 80, rows: 24 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
+    handler.create_session(&session_name).await;
 
     let host_pid = std::process::id().saturating_add(pid_offset);
     let victim_pid = host_pid.saturating_add(1);
@@ -45,20 +35,7 @@ async fn client_identity_fixture(
         .register_attach(victim_pid, session_name.clone(), victim_tx)
         .await;
 
-    let parsed = CommandParser::new()
-        .parse_arguments(["choose-client"])
-        .expect("choose-client parses");
-    let command = RequestHandler::parse_mode_tree_queue_command(parsed.commands()[0].clone())
-        .expect("mode-tree command parses")
-        .expect("mode-tree command recognized");
-    handler
-        .execute_queued_mode_tree(
-            host_pid,
-            command,
-            &QueueExecutionContext::without_caller_cwd(),
-        )
-        .await
-        .expect("choose-client opens");
+    open_mode_tree(handler, host_pid, &["choose-client"]).await;
 
     ClientIdentityFixture {
         session_name,
@@ -73,28 +50,17 @@ async fn client_identity_fixture(
 }
 
 async fn select_stale_client(handler: &RequestHandler, fixture: &ClientIdentityFixture) {
-    handler
-        .active_attach
-        .lock()
-        .await
-        .by_pid
-        .get_mut(&fixture.host_pid)
-        .and_then(|active| active.mode_tree.as_mut())
-        .expect("host choose-client remains active")
-        .selected_id = Some(fixture.victim_item_id.clone());
+    with_mode_tree(handler, fixture.host_pid, |mode| {
+        mode.selected_id = Some(fixture.victim_item_id.clone());
+    })
+    .await;
 }
 
 async fn tag_stale_client(handler: &RequestHandler, fixture: &ClientIdentityFixture) {
-    handler
-        .active_attach
-        .lock()
-        .await
-        .by_pid
-        .get_mut(&fixture.host_pid)
-        .and_then(|active| active.mode_tree.as_mut())
-        .expect("host choose-client remains active")
-        .tagged
-        .insert(fixture.victim_item_id.clone());
+    with_mode_tree(handler, fixture.host_pid, |mode| {
+        mode.tagged.insert(fixture.victim_item_id.clone());
+    })
+    .await;
 }
 
 async fn reconnect_victim(
@@ -145,22 +111,6 @@ async fn assert_reconnected_client_survives(
             "stale choose-client action sent Detach to the replacement"
         );
     }
-}
-
-async fn wait_for_mode_tree_overlay(
-    control_rx: &mut mpsc::UnboundedReceiver<crate::pane_io::AttachControl>,
-) {
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        loop {
-            match control_rx.recv().await {
-                Some(crate::pane_io::AttachControl::Overlay(_)) => break,
-                Some(_) => {}
-                None => panic!("choose-client host control channel closed before overlay refresh"),
-            }
-        }
-    })
-    .await
-    .expect("deferred choose-client action refreshes the mode-tree overlay");
 }
 
 #[tokio::test]
@@ -216,20 +166,7 @@ async fn choose_client_detach_revalidates_requester_at_target_send_lock() {
             replacement_tx,
         )
         .await;
-    let parsed = CommandParser::new()
-        .parse_arguments(["choose-client"])
-        .expect("choose-client parses");
-    let command = RequestHandler::parse_mode_tree_queue_command(parsed.commands()[0].clone())
-        .expect("mode-tree command parses")
-        .expect("mode-tree command recognized");
-    handler
-        .execute_queued_mode_tree(
-            fixture.host_pid,
-            command,
-            &QueueExecutionContext::without_caller_cwd(),
-        )
-        .await
-        .expect("replacement choose-client opens");
+    open_mode_tree(&handler, fixture.host_pid, &["choose-client"]).await;
     pause.release.notify_one();
 
     assert!(
@@ -289,13 +226,8 @@ async fn choose_client_control_detach_revalidates_requester_at_control_lock() {
         .await
         .expect("control session set succeeds");
 
-    let (replacement_tx, _replacement_rx) = mpsc::unbounded_channel();
-    handler
-        .register_attach(
-            fixture.host_pid,
-            fixture.session_name.clone(),
-            replacement_tx,
-        )
+    let _replacement_rx = handler
+        .attach_client(fixture.host_pid, &fixture.session_name)
         .await;
 
     assert!(handler
@@ -327,16 +259,7 @@ async fn choose_client_stale_tag_does_not_detach_reconnected_pid() {
     )
     .await;
     assert!(
-        handler
-            .active_attach
-            .lock()
-            .await
-            .by_pid
-            .get(&fixture.host_pid)
-            .and_then(|active| active.mode_tree.as_ref())
-            .expect("host choose-client remains active")
-            .tagged
-            .is_empty(),
+        with_mode_tree(&handler, fixture.host_pid, |mode| mode.tagged.is_empty()).await,
         "the stale tag is pruned so it cannot block a later fallback"
     );
 }
@@ -360,16 +283,7 @@ async fn choose_client_stale_tag_key_action_is_a_no_op_before_fallback() {
     )
     .await;
     assert!(
-        handler
-            .active_attach
-            .lock()
-            .await
-            .by_pid
-            .get(&fixture.host_pid)
-            .and_then(|active| active.mode_tree.as_ref())
-            .expect("host choose-client remains active")
-            .tagged
-            .is_empty(),
+        with_mode_tree(&handler, fixture.host_pid, |mode| mode.tagged.is_empty()).await,
         "the stale tag is pruned for the next explicit action"
     );
 
@@ -432,13 +346,7 @@ async fn choose_client_confirmation_uses_captured_attach_identity() {
     );
 
     let (replacement_attach_id, mut replacement_rx) = reconnect_victim(&handler, &fixture).await;
-    while fixture.host_rx.try_recv().is_ok() {}
-
-    handler
-        .handle_attached_live_input_for_test(fixture.host_pid, b"y")
-        .await
-        .expect("live confirmation input succeeds");
-    wait_for_mode_tree_overlay(&mut fixture.host_rx).await;
+    confirm_prompt_and_wait_for_action(&handler, fixture.host_pid, &mut fixture.host_rx).await;
 
     assert_reconnected_client_survives(
         &handler,

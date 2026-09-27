@@ -68,6 +68,10 @@ pub struct Shell<SE: extensions::ShellExtensions = extensions::DefaultShellExten
     )]
     external_command_spawner: SE::ExternalCommandSpawner,
 
+    /// Injected observer of the work the shell runs and schedules.
+    #[cfg_attr(feature = "serde", serde(skip, default = "default_execution_observer"))]
+    execution_observer: SE::ExecutionObserver,
+
     /// Trap handler configuration for the shell.
     traps: crate::traps::TrapHandlerConfig,
 
@@ -157,6 +161,7 @@ impl<SE: extensions::ShellExtensions> Clone for Shell<SE> {
         Self {
             error_formatter: self.error_formatter.clone(),
             external_command_spawner: self.external_command_spawner.clone(),
+            execution_observer: self.execution_observer.clone(),
             traps: self.traps.clone(),
             open_files: self.open_files.clone(),
             working_dir: self.working_dir.clone(),
@@ -221,6 +226,7 @@ impl<SE: extensions::ShellExtensions> Shell<SE> {
         let mut shell = Self {
             error_formatter: options.error_formatter,
             external_command_spawner: options.external_command_spawner,
+            execution_observer: options.execution_observer,
             open_files: openfiles::OpenFiles::new(),
             options: runtime_options,
             name: options.shell_name,
@@ -358,6 +364,12 @@ impl<SE: extensions::ShellExtensions> Shell<SE> {
     /// The spawner every external command of this shell is started through.
     pub const fn external_command_spawner(&self) -> &SE::ExternalCommandSpawner {
         &self.external_command_spawner
+    }
+
+    /// The observer every builtin, scoped entry point and scheduled task of this shell runs
+    /// under.
+    pub const fn execution_observer(&self) -> &SE::ExecutionObserver {
+        &self.execution_observer
     }
 
     pub(crate) const fn last_exit_status_change_count(&self) -> usize {
@@ -566,4 +578,9 @@ fn default_error_formatter<EF: extensions::ErrorFormatter>() -> EF {
 #[cfg(feature = "serde")]
 fn default_external_command_spawner<ECS: extensions::ExternalCommandSpawner>() -> ECS {
     ECS::default()
+}
+
+#[cfg(feature = "serde")]
+fn default_execution_observer<EO: extensions::ExecutionObserver>() -> EO {
+    EO::default()
 }

@@ -1,6 +1,7 @@
 use super::*;
 use crate::client_names::control_client_name;
-use crate::control::{ControlServerEvent, CONTROL_SERVER_EVENT_CAPACITY};
+use crate::control::ControlServerEvent;
+use crate::test_fixtures::{Fixture, Sizeless};
 use rmux_core::LifecycleEvent;
 
 #[tokio::test]
@@ -9,15 +10,7 @@ async fn attached_client_flags_keep_tmux_order_for_extended_flag_sets() {
     let requester_pid = std::process::id();
     let alpha = session_name("alpha");
 
-    let created = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name: alpha.clone(),
-            detached: true,
-            size: None,
-            environment: None,
-        }))
-        .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    handler.create_session(Sizeless(&alpha)).await;
 
     let (control_tx, _control_rx) = mpsc::unbounded_channel();
     let _attach_id = handler
@@ -66,37 +59,11 @@ async fn control_client_flags_keep_tmux_order_for_extended_flag_sets() {
     let requester_pid = std::process::id();
     let alpha = session_name("alpha");
 
-    let created = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name: alpha.clone(),
-            detached: true,
-            size: None,
-            environment: None,
-        }))
-        .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    handler.create_session(Sizeless(&alpha)).await;
 
-    let (event_tx, _event_rx) = mpsc::channel(CONTROL_SERVER_EVENT_CAPACITY);
-    let _control_id = handler
-        .register_control_with_closing(
-            requester_pid,
-            ControlModeUpgrade {
-                initial_command_count: 0,
-                mode: ControlMode::Plain,
-                terminal_context: crate::outer_terminal::OuterTerminalContext::default()
-                    .with_client_terminal(&rmux_proto::ClientTerminalContext {
-                        terminal_features: Vec::new(),
-                        utf8: true,
-                    }),
-            },
-            event_tx,
-            Arc::new(AtomicBool::new(false)),
-        )
+    let (_control_id, _event_rx) = handler
+        .register_utf8_control_for_test(requester_pid, Some(&alpha))
         .await;
-    handler
-        .set_control_session(requester_pid, Some(alpha))
-        .await
-        .expect("set control session");
 
     {
         let mut active_control = handler.active_control.lock().await;
@@ -126,34 +93,10 @@ async fn refresh_client_control_size_resizes_real_control_session() {
     let requester_pid = std::process::id();
     let alpha = session_name("alpha");
 
-    let created = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name: alpha.clone(),
-            detached: true,
-            size: Some(TerminalSize { cols: 80, rows: 24 }),
-            environment: None,
-        }))
-        .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    handler.create_session(&alpha).await;
 
-    let (event_tx, mut event_rx) = mpsc::channel(CONTROL_SERVER_EVENT_CAPACITY);
-    let _control_id = handler
-        .register_control_with_closing(
-            requester_pid,
-            ControlModeUpgrade {
-                initial_command_count: 0,
-                mode: ControlMode::Plain,
-                terminal_context: crate::outer_terminal::OuterTerminalContext::default(),
-            },
-            event_tx,
-            Arc::new(AtomicBool::new(false)),
-        )
-        .await;
-    handler
-        .set_control_session(requester_pid, Some(alpha.clone()))
-        .await
-        .expect("set control session");
-    while event_rx.try_recv().is_ok() {}
+    let (_control_id, mut event_rx) =
+        register_control_test_client(&handler, requester_pid, &alpha).await;
     assert_eq!(
         control_client_geometry(&handler, requester_pid).await,
         (80, None)
@@ -168,37 +111,15 @@ async fn refresh_client_control_size_resizes_real_control_session() {
         .dispatch(
             requester_pid,
             Request::RefreshClient(Box::new(rmux_proto::request::RefreshClientRequest {
-                target_client: None,
-                adjustment: None,
-                clear_pan: false,
-                pan_left: false,
-                pan_right: false,
-                pan_up: false,
-                pan_down: false,
-                status_only: false,
-                clipboard_query: false,
-                flags: None,
-                flags_alias: None,
-                subscriptions: Vec::new(),
-                subscriptions_format: Vec::new(),
                 control_size: Some("101x31".to_owned()),
-                colour_report: None,
+                ..Fixture::fixture(None)
             })),
         )
         .await
         .response;
-    loop {
-        match lifecycle_events.try_recv() {
-            Ok(event) => handler.dispatch_lifecycle_hook(event).await,
-            Err(
-                tokio::sync::broadcast::error::TryRecvError::Empty
-                | tokio::sync::broadcast::error::TryRecvError::Closed,
-            ) => break,
-            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(skipped)) => {
-                panic!("lifecycle events lagged during test: {skipped}");
-            }
-        }
-    }
+    handler
+        .drain_lifecycle_hooks_for_test(&mut lifecycle_events)
+        .await;
 
     assert!(matches!(response, Response::RefreshClient(_)));
     let state = handler.state.lock().await;
@@ -229,17 +150,11 @@ async fn refresh_client_control_size_resizes_real_control_session() {
         "list-clients should expose the width reported by -C and no control-client height"
     );
 
-    let response = handler
-        .handle(Request::DisplayMessage(DisplayMessageRequest {
-            target: Some(Target::Session(alpha.clone())),
-            print: true,
-            message: Some("#{client_width}|#{client_height}".to_owned()),
-            empty_target_context: false,
-        }))
-        .await;
     assert_eq!(
-        response.command_output().map(|output| output.stdout()),
-        Some(b"101|\n".as_slice()),
+        handler
+            .display_print(&alpha, "#{client_width}|#{client_height}")
+            .await,
+        b"101|\n",
         "display-message should use the control client's refreshed geometry"
     );
 
@@ -265,15 +180,13 @@ async fn refresh_client_control_size_resizes_real_control_session() {
     );
 
     while event_rx.try_recv().is_ok() {}
-    let response = handler
-        .handle(Request::DisplayMessage(DisplayMessageRequest {
+    handler
+        .handle_ok(DisplayMessageRequest {
             target: Some(Target::Session(alpha)),
             print: false,
-            message: Some("#{client_width}|#{client_height}".to_owned()),
-            empty_target_context: false,
-        }))
+            ..Fixture::fixture("#{client_width}|#{client_height}")
+        })
         .await;
-    assert!(matches!(response, Response::DisplayMessage(_)));
     let event = tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
         .await
         .expect("display-message notification arrives")
@@ -288,22 +201,8 @@ async fn refresh_client_control_size_resizes_real_control_session() {
 async fn list_clients_hides_a_control_client_without_a_session() {
     let handler = RequestHandler::new();
     let requester_pid = std::process::id();
-    let (event_tx, _event_rx) = mpsc::channel(CONTROL_SERVER_EVENT_CAPACITY);
-    let _control_id = handler
-        .register_control_with_closing(
-            requester_pid,
-            ControlModeUpgrade {
-                initial_command_count: 0,
-                mode: ControlMode::Plain,
-                terminal_context: crate::outer_terminal::OuterTerminalContext::default()
-                    .with_client_terminal(&rmux_proto::ClientTerminalContext {
-                        terminal_features: Vec::new(),
-                        utf8: true,
-                    }),
-            },
-            event_tx,
-            Arc::new(AtomicBool::new(false)),
-        )
+    let (_control_id, _event_rx) = handler
+        .register_utf8_control_for_test(requester_pid, None)
         .await;
 
     {
@@ -330,12 +229,12 @@ async fn list_clients_hides_a_control_client_without_a_session() {
         "tmux 3.7b omits clients that have no session"
     );
 
-    let mut request = refresh_client_request(requester_pid);
-    request.control_size = Some("91x20".to_owned());
-    let response = handler
-        .handle(Request::RefreshClient(Box::new(request)))
+    handler
+        .handle_ok(rmux_proto::request::RefreshClientRequest {
+            control_size: Some("91x20".to_owned()),
+            ..Fixture::fixture(Some(requester_pid.to_string()))
+        })
         .await;
-    assert!(matches!(response, Response::RefreshClient(_)));
     assert_eq!(
         control_client_geometry(&handler, requester_pid).await,
         (91, None)
@@ -355,23 +254,16 @@ async fn refresh_client_control_size_rolls_back_geometry_when_session_resize_fai
     let handler = RequestHandler::new();
     let requester_pid = 91_347;
     let alpha = session_name("control-size-rollback");
-    let response = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name: alpha.clone(),
-            detached: true,
-            size: Some(TerminalSize { cols: 80, rows: 24 }),
-            environment: None,
-        }))
-        .await;
-    assert!(matches!(response, Response::NewSession(_)));
-    handler.wait_for_initial_panes_for_test().await;
+    handler.create_session(&alpha).await;
     let (_control_id, _event_rx) =
         register_control_test_client(&handler, requester_pid, &alpha).await;
 
     handler.state.lock().await.fail_next_resize_for_test();
 
-    let mut request = refresh_client_request(requester_pid);
-    request.control_size = Some("101x31".to_owned());
+    let request = rmux_proto::request::RefreshClientRequest {
+        control_size: Some("101x31".to_owned()),
+        ..Fixture::fixture(Some(requester_pid.to_string()))
+    };
     let response = handler
         .handle(Request::RefreshClient(Box::new(request)))
         .await;
@@ -403,40 +295,14 @@ async fn detach_client_target_session_detaches_control_clients() {
     let beta = session_name("beta");
 
     for session_name in [&alpha, &beta] {
-        let response = handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: session_name.clone(),
-                detached: true,
-                size: None,
-                environment: None,
-            }))
-            .await;
-        assert!(matches!(response, Response::NewSession(_)));
+        handler.create_session(Sizeless(session_name)).await;
     }
 
     let mut event_receivers = Vec::new();
     for (pid, session_name) in [(101, &alpha), (102, &alpha), (201, &beta)] {
-        let (event_tx, event_rx) = mpsc::channel(CONTROL_SERVER_EVENT_CAPACITY);
-        let _control_id = handler
-            .register_control_with_closing(
-                pid,
-                ControlModeUpgrade {
-                    initial_command_count: 0,
-                    mode: ControlMode::Plain,
-                    terminal_context: crate::outer_terminal::OuterTerminalContext::default()
-                        .with_client_terminal(&rmux_proto::ClientTerminalContext {
-                            terminal_features: Vec::new(),
-                            utf8: true,
-                        }),
-                },
-                event_tx,
-                Arc::new(AtomicBool::new(false)),
-            )
+        let (_control_id, event_rx) = handler
+            .register_utf8_control_for_test(pid, Some(session_name))
             .await;
-        handler
-            .set_control_session(pid, Some(session_name.clone()))
-            .await
-            .expect("control session set");
         event_receivers.push(event_rx);
     }
 
@@ -469,15 +335,7 @@ async fn detach_client_target_session_preserves_reregistered_attached_client() {
     let beta = session_name("detach-target-generation-beta");
 
     for session_name in [&alpha, &beta] {
-        let response = handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: session_name.clone(),
-                detached: true,
-                size: None,
-                environment: None,
-            }))
-            .await;
-        assert!(matches!(response, Response::NewSession(_)), "{response:?}");
+        handler.create_session(Sizeless(session_name)).await;
     }
 
     let attach_pid = 91_347;
@@ -537,21 +395,10 @@ async fn detach_client_target_session_preserves_reregistered_attached_client() {
 async fn detach_client_target_session_preserves_control_registered_after_snapshot() {
     let handler = RequestHandler::new();
     let alpha = session_name("detach-target-late-control-alpha");
-    let created = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name: alpha.clone(),
-            detached: true,
-            size: None,
-            environment: None,
-        }))
-        .await;
-    assert!(matches!(created, Response::NewSession(_)), "{created:?}");
+    handler.create_session(Sizeless(&alpha)).await;
 
     let attach_pid = 91_349;
-    let (attach_tx, _attach_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(attach_pid, alpha.clone(), attach_tx)
-        .await;
+    let _attach_rx = handler.attach_client(attach_pid, &alpha).await;
     let pause = super::super::attach_support::install_attach_control_identity_pause(attach_pid);
     let detach_handler = handler.clone();
     let detach_alpha = alpha.clone();
@@ -600,29 +447,11 @@ async fn detach_client_target_session_preserves_control_registered_after_snapsho
 async fn detach_client_target_session_preserves_control_on_recreated_session() {
     let handler = RequestHandler::new();
     let alpha = session_name("detach-target-recreated-control-alpha");
-    let created = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name: alpha.clone(),
-            detached: true,
-            size: None,
-            environment: None,
-        }))
-        .await;
-    assert!(matches!(created, Response::NewSession(_)), "{created:?}");
-    let old_session_id = handler
-        .state
-        .lock()
-        .await
-        .sessions
-        .session(&alpha)
-        .expect("old session exists")
-        .id();
+    handler.create_session(Sizeless(&alpha)).await;
+    let old_session_id = handler.session_id_for_test(&alpha).await;
 
     let attach_pid = 91_351;
-    let (attach_tx, _attach_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(attach_pid, alpha.clone(), attach_tx)
-        .await;
+    let _attach_rx = handler.attach_client(attach_pid, &alpha).await;
     let old_control_pid = 91_352;
     let (_old_control_id, _old_control_rx) =
         register_control_test_client(&handler, old_control_pid, &alpha).await;
@@ -646,35 +475,9 @@ async fn detach_client_target_session_preserves_control_on_recreated_session() {
     tokio::time::timeout(Duration::from_secs(1), pause.reached.notified())
         .await
         .expect("detach reaches the attach identity check");
-    let killed = handler
-        .handle(Request::KillSession(KillSessionRequest {
-            target: alpha.clone(),
-            kill_all_except_target: false,
-            clear_alerts: false,
-            kill_group: false,
-        }))
-        .await;
-    assert!(matches!(killed, Response::KillSession(_)), "{killed:?}");
-    let recreated = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name: alpha.clone(),
-            detached: true,
-            size: None,
-            environment: None,
-        }))
-        .await;
-    assert!(
-        matches!(recreated, Response::NewSession(_)),
-        "{recreated:?}"
-    );
-    let new_session_id = handler
-        .state
-        .lock()
-        .await
-        .sessions
-        .session(&alpha)
-        .expect("recreated session exists")
-        .id();
+    handler.handle_ok(KillSessionRequest::fixture(&alpha)).await;
+    handler.create_session(Sizeless(&alpha)).await;
+    let new_session_id = handler.session_id_for_test(&alpha).await;
     assert_ne!(new_session_id, old_session_id);
     let new_control_pid = 91_353;
     let (new_control_id, mut new_control_rx) =
@@ -707,29 +510,11 @@ async fn detach_client_target_session_tracks_a_renamed_session_identity() {
     let handler = RequestHandler::new();
     let alpha = session_name("detach-target-rename-alpha");
     let beta = session_name("detach-target-rename-beta");
-    let created = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name: alpha.clone(),
-            detached: true,
-            size: None,
-            environment: None,
-        }))
-        .await;
-    assert!(matches!(created, Response::NewSession(_)), "{created:?}");
-    let session_id = handler
-        .state
-        .lock()
-        .await
-        .sessions
-        .session(&alpha)
-        .expect("session exists")
-        .id();
+    handler.create_session(Sizeless(&alpha)).await;
+    let session_id = handler.session_id_for_test(&alpha).await;
 
     let attach_pid = 91_354;
-    let (attach_tx, _attach_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(attach_pid, alpha.clone(), attach_tx)
-        .await;
+    let _attach_rx = handler.attach_client(attach_pid, &alpha).await;
     let control_pid = 91_355;
     let (control_id, mut control_rx) =
         register_control_test_client(&handler, control_pid, &alpha).await;
@@ -754,13 +539,12 @@ async fn detach_client_target_session_tracks_a_renamed_session_identity() {
     tokio::time::timeout(Duration::from_secs(1), pause.reached.notified())
         .await
         .expect("detach reaches the attach identity check");
-    let renamed = handler
-        .handle(Request::RenameSession(RenameSessionRequest {
+    handler
+        .handle_ok(RenameSessionRequest {
             target: alpha,
             new_name: beta.clone(),
-        }))
+        })
         .await;
-    assert!(matches!(renamed, Response::RenameSession(_)), "{renamed:?}");
     pause.release.notify_one();
 
     assert_eq!(
@@ -793,15 +577,7 @@ async fn managed_client_actions_fail_closed_when_a_pid_is_reregistered() {
     let alpha = session_name("managed-client-generation-alpha");
     let beta = session_name("managed-client-generation-beta");
     for session_name in [&alpha, &beta] {
-        let response = handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: session_name.clone(),
-                detached: true,
-                size: None,
-                environment: None,
-            }))
-            .await;
-        assert!(matches!(response, Response::NewSession(_)), "{response:?}");
+        handler.create_session(Sizeless(session_name)).await;
     }
 
     let control_pid = 91_348;
@@ -851,8 +627,10 @@ async fn managed_client_actions_fail_closed_when_a_pid_is_reregistered() {
     let pause = super::super::client_support::install_managed_client_resolution_pause(control_pid);
     let refresh_handler = handler.clone();
     let refresh = tokio::spawn(async move {
-        let mut request = refresh_client_request(control_pid);
-        request.control_size = Some("101x31".to_owned());
+        let request = rmux_proto::request::RefreshClientRequest {
+            control_size: Some("101x31".to_owned()),
+            ..Fixture::fixture(Some(control_pid.to_string()))
+        };
         refresh_handler
             .handle(Request::RefreshClient(Box::new(request)))
             .await
@@ -930,9 +708,9 @@ async fn managed_client_actions_fail_closed_when_a_pid_is_reregistered() {
     let refresh_handler = handler.clone();
     let refresh = tokio::spawn(async move {
         refresh_handler
-            .handle(Request::RefreshClient(Box::new(refresh_client_request(
-                attach_pid,
-            ))))
+            .handle(Request::RefreshClient(Box::new(
+                rmux_proto::request::RefreshClientRequest::fixture(Some(attach_pid.to_string())),
+            )))
             .await
     });
     tokio::time::timeout(Duration::from_secs(1), pause.reached.notified())
@@ -1012,45 +790,11 @@ async fn managed_client_actions_fail_closed_when_a_pid_is_reregistered() {
     );
 }
 
-async fn register_control_test_client(
-    handler: &RequestHandler,
-    control_pid: u32,
-    session_name: &SessionName,
-) -> (u64, mpsc::Receiver<ControlServerEvent>) {
-    let (event_tx, mut event_rx) = mpsc::channel(CONTROL_SERVER_EVENT_CAPACITY);
-    let control_id = handler
-        .register_control_with_closing(
-            control_pid,
-            ControlModeUpgrade {
-                initial_command_count: 0,
-                mode: ControlMode::Plain,
-                terminal_context: crate::outer_terminal::OuterTerminalContext::default(),
-            },
-            event_tx,
-            Arc::new(AtomicBool::new(false)),
-        )
-        .await;
-    handler
-        .set_control_session(control_pid, Some(session_name.clone()))
-        .await
-        .expect("set control session");
-    while event_rx.try_recv().is_ok() {}
-    (control_id, event_rx)
-}
-
 #[tokio::test]
 async fn list_clients_control_name_round_trips_through_client_targeting() {
     let handler = RequestHandler::new();
     let alpha = session_name("control-client-name");
-    let created = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name: alpha.clone(),
-            detached: true,
-            size: None,
-            environment: None,
-        }))
-        .await;
-    assert!(matches!(created, Response::NewSession(_)), "{created:?}");
+    handler.create_session(Sizeless(&alpha)).await;
     let control_pid = 91_401;
     let (control_id, _events) = register_control_test_client(&handler, control_pid, &alpha).await;
     let name = format!("client-{control_pid}");
@@ -1091,26 +835,6 @@ async fn list_clients_control_name_round_trips_through_client_targeting() {
             .expect("display-message target resolves"),
         Some(resolved)
     );
-}
-
-fn refresh_client_request(target_pid: u32) -> rmux_proto::request::RefreshClientRequest {
-    rmux_proto::request::RefreshClientRequest {
-        target_client: Some(target_pid.to_string()),
-        adjustment: None,
-        clear_pan: false,
-        pan_left: false,
-        pan_right: false,
-        pan_up: false,
-        pan_down: false,
-        status_only: false,
-        clipboard_query: false,
-        flags: None,
-        flags_alias: None,
-        subscriptions: Vec::new(),
-        subscriptions_format: Vec::new(),
-        control_size: None,
-        colour_report: None,
-    }
 }
 
 async fn control_client_geometry(handler: &RequestHandler, control_pid: u32) -> (u16, Option<u16>) {
@@ -1157,32 +881,10 @@ async fn control_mode_attach_session_tracks_the_control_clients_session() {
     let requester_pid = 301;
     let alpha = session_name("alpha");
 
-    let response = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name: alpha.clone(),
-            detached: true,
-            size: None,
-            environment: None,
-        }))
-        .await;
-    assert!(matches!(response, Response::NewSession(_)));
+    handler.create_session(Sizeless(&alpha)).await;
 
-    let (event_tx, _event_rx) = mpsc::channel(CONTROL_SERVER_EVENT_CAPACITY);
-    let _control_id = handler
-        .register_control_with_closing(
-            requester_pid,
-            ControlModeUpgrade {
-                initial_command_count: 0,
-                mode: ControlMode::Plain,
-                terminal_context: crate::outer_terminal::OuterTerminalContext::default()
-                    .with_client_terminal(&rmux_proto::ClientTerminalContext {
-                        terminal_features: Vec::new(),
-                        utf8: true,
-                    }),
-            },
-            event_tx,
-            Arc::new(AtomicBool::new(false)),
-        )
+    let (_control_id, _event_rx) = handler
+        .register_utf8_control_for_test(requester_pid, None)
         .await;
 
     let commands = parse_command_string("attach-session -t $0").expect("command parses");
@@ -1207,20 +909,9 @@ async fn list_clients_exposes_pid_and_tty_format_variables_for_attached_clients(
     let requester_pid = std::process::id();
     let alpha = session_name("alpha");
 
-    let created = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name: alpha.clone(),
-            detached: true,
-            size: None,
-            environment: None,
-        }))
-        .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    handler.create_session(Sizeless(&alpha)).await;
 
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
     let config_files = "/tmp/rmux-list-clients.conf";
     handler
         .state
@@ -1262,20 +953,9 @@ async fn list_clients_exposes_effective_attached_key_table_and_prefix_state() {
     let requester_pid = std::process::id();
     let alpha = session_name("alpha");
 
-    let created = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name: alpha.clone(),
-            detached: true,
-            size: None,
-            environment: None,
-        }))
-        .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    handler.create_session(Sizeless(&alpha)).await;
 
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
 
     assert_eq!(
         list_client_prefix_state(&handler).await,
@@ -1283,15 +963,9 @@ async fn list_clients_exposes_effective_attached_key_table_and_prefix_state() {
         "idle attached clients should report the root key table"
     );
 
-    let response = handler
-        .handle(Request::SetOption(SetOptionRequest {
-            scope: ScopeSelector::Session(alpha),
-            option: OptionName::KeyTable,
-            value: "off".to_owned(),
-            mode: SetOptionMode::Replace,
-        }))
+    handler
+        .set_option(ScopeSelector::Session(alpha), OptionName::KeyTable, "off")
         .await;
-    assert!(matches!(response, Response::SetOption(_)));
     assert_eq!(
         list_client_prefix_state(&handler).await,
         "0|off\n",
@@ -1345,16 +1019,7 @@ async fn list_client_prefix_state(handler: &RequestHandler) -> String {
 #[tokio::test]
 async fn attach_session_returns_an_upgrade_response_for_existing_sessions() {
     let handler = RequestHandler::new();
-    let created = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name: session_name("alpha"),
-            detached: true,
-            size: None,
-
-            environment: None,
-        }))
-        .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    handler.create_session(Sizeless("alpha")).await;
 
     assert_eq!(
         handler
@@ -1371,16 +1036,7 @@ async fn attach_session_returns_an_upgrade_response_for_existing_sessions() {
 #[tokio::test]
 async fn attach_session_dispatch_populates_the_upgrade_field() {
     let handler = RequestHandler::new();
-    let created = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name: session_name("alpha"),
-            detached: true,
-            size: None,
-
-            environment: None,
-        }))
-        .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    handler.create_session(Sizeless("alpha")).await;
 
     let outcome = handler
         .dispatch(
@@ -1429,16 +1085,7 @@ async fn attach_session_to_missing_session_returns_session_not_found() {
 #[tokio::test]
 async fn switch_client_requires_an_attached_client() {
     let handler = RequestHandler::new();
-    let created = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name: session_name("alpha"),
-            detached: true,
-            size: None,
-
-            environment: None,
-        }))
-        .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    handler.create_session(Sizeless("alpha")).await;
 
     assert_eq!(
         handler

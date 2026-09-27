@@ -4,38 +4,13 @@ use super::super::scripting_support::QueueExecutionContext;
 use super::super::test_support::spawn_accounted_attach_control_drain;
 use super::super::RequestHandler;
 use rmux_proto::{
-    KillSessionRequest, LinkWindowRequest, NewSessionRequest, NewWindowRequest, PaneTarget,
-    Request, RespawnPaneRequest, Response, SessionName, Target, TerminalSize, UnlinkWindowRequest,
-    WindowTarget,
+    KillSessionRequest, LinkWindowRequest, NewWindowRequest, PaneTarget, RespawnPaneRequest,
+    Target, UnlinkWindowRequest, WindowTarget,
 };
-use tokio::sync::mpsc;
 use tokio::time::{timeout, Duration};
 
+use crate::test_fixtures::Fixture;
 use crate::test_names::session_name;
-
-async fn create_session(handler: &RequestHandler, name: &SessionName) {
-    let response = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name: name.clone(),
-            detached: true,
-            size: Some(TerminalSize { cols: 80, rows: 24 }),
-            environment: None,
-        }))
-        .await;
-    assert!(matches!(response, Response::NewSession(_)), "{response:?}");
-}
-
-async fn attach(
-    handler: &RequestHandler,
-    pid: u32,
-    session: &SessionName,
-) -> mpsc::UnboundedReceiver<crate::pane_io::AttachControl> {
-    let (control_tx, control_rx) = mpsc::unbounded_channel();
-    handler
-        .register_attach(pid, session.clone(), control_tx)
-        .await;
-    control_rx
-}
 
 async fn execute_overlay(
     handler: &RequestHandler,
@@ -49,23 +24,6 @@ async fn execute_overlay(
         .map(|_| ())
 }
 
-async fn link_window(
-    handler: &RequestHandler,
-    owner: &SessionName,
-    alias: &SessionName,
-) -> Response {
-    handler
-        .handle(Request::LinkWindow(LinkWindowRequest {
-            source: WindowTarget::with_window(owner.clone(), 0),
-            target: WindowTarget::with_window(alias.clone(), 0),
-            after: false,
-            before: false,
-            kill_destination: true,
-            detached: true,
-        }))
-        .await
-}
-
 #[tokio::test]
 async fn client_selector_and_explicit_pane_target_keep_distinct_identities() {
     let handler = RequestHandler::new();
@@ -73,10 +31,10 @@ async fn client_selector_and_explicit_pane_target_keep_distinct_identities() {
     let beta = session_name("overlay-selector-beta");
     let alpha_pid = 971_001;
     let beta_pid = 971_002;
-    create_session(&handler, &alpha).await;
-    create_session(&handler, &beta).await;
-    let _alpha_rx = attach(&handler, alpha_pid, &alpha).await;
-    let _beta_rx = attach(&handler, beta_pid, &beta).await;
+    handler.create_session(&alpha).await;
+    handler.create_session(&beta).await;
+    let _alpha_rx = handler.attach_client(alpha_pid, &alpha).await;
+    let _beta_rx = handler.attach_client(beta_pid, &beta).await;
 
     execute_overlay(
         &handler,
@@ -124,8 +82,8 @@ async fn same_pid_replacement_during_client_resolution_cannot_receive_menu() {
     let handler = RequestHandler::new();
     let alpha = session_name("overlay-client-aba");
     let pid = 971_011;
-    create_session(&handler, &alpha).await;
-    let _old_rx = attach(&handler, pid, &alpha).await;
+    handler.create_session(&alpha).await;
+    let _old_rx = handler.attach_client(pid, &alpha).await;
     let pause = install_managed_client_resolution_pause(pid);
     let parsed = handler
         .parse_control_commands(&format!(
@@ -143,7 +101,7 @@ async fn same_pid_replacement_during_client_resolution_cannot_receive_menu() {
         .await
         .expect("client resolution pauses");
 
-    let _replacement_rx = attach(&handler, pid, &alpha).await;
+    let _replacement_rx = handler.attach_client(pid, &alpha).await;
     pause.release.notify_one();
     let result = timeout(Duration::from_secs(2), task)
         .await
@@ -160,13 +118,13 @@ async fn menu_action_is_discarded_after_target_pane_respawn() {
     let handler = RequestHandler::new();
     let alpha = session_name("overlay-pane-respawn");
     let pid = 971_021;
-    create_session(&handler, &alpha).await;
+    handler.create_session(&alpha).await;
     // The respawn below refreshes this attached session, and a simulated
     // transport that never reads its controls saturates the client's bounded
     // control backlog. Production then closes and removes the overloaded
     // client, so the stale-menu question could never be asked. Service the
     // transport with the same accounting a real client performs.
-    let control_rx = attach(&handler, pid, &alpha).await;
+    let control_rx = handler.attach_client(pid, &alpha).await;
     let control_drain = spawn_accounted_attach_control_drain(&handler, pid, control_rx).await;
     let client_identity = handler.active_attach_identity_for_test(pid).await;
     let menu_command =
@@ -175,17 +133,12 @@ async fn menu_action_is_discarded_after_target_pane_respawn() {
         .await
         .expect("menu opens");
 
-    let response = handler
-        .handle(Request::RespawnPane(Box::new(RespawnPaneRequest {
-            target: PaneTarget::with_window(alpha.clone(), 0, 0),
-            kill: true,
-            start_directory: None,
-            environment: None,
+    handler
+        .handle_ok(RespawnPaneRequest {
             command: Some(vec![crate::test_shell::stdin_discard_command()]),
-            process_command: None,
-        })))
+            ..Fixture::fixture(PaneTarget::with_window(alpha.clone(), 0, 0))
+        })
         .await;
-    assert!(matches!(response, Response::RespawnPane(_)), "{response:?}");
     assert!(
         handler.current_live_attach_input(client_identity).await,
         "the respawn must not disconnect the serviced client"
@@ -247,25 +200,22 @@ async fn popup_is_discarded_after_same_window_is_unlinked_and_relinked() {
     let alias = session_name("overlay-relink-alias");
     let pid = 971_031;
     for session in [&host, &owner, &alias] {
-        create_session(&handler, session).await;
+        handler.create_session(session).await;
     }
-    let _control_rx = attach(&handler, pid, &host).await;
-    let extra = handler
-        .handle(Request::NewWindow(Box::new(NewWindowRequest {
-            target: alias.clone(),
-            name: None,
-            detached: true,
-            start_directory: None,
-            environment: None,
-            command: None,
-            process_command: None,
+    let _control_rx = handler.attach_client(pid, &host).await;
+    handler
+        .create_window(NewWindowRequest {
             target_window_index: Some(1),
-            insert_at_target: false,
-        })))
+            ..Fixture::fixture(&alias)
+        })
         .await;
-    assert!(matches!(extra, Response::NewWindow(_)), "{extra:?}");
-    let relinked = link_window(&handler, &owner, &alias).await;
-    assert!(matches!(relinked, Response::LinkWindow(_)), "{relinked:?}");
+    let owner_window = WindowTarget::with_window(owner.clone(), 0);
+    handler
+        .handle_ok(LinkWindowRequest {
+            kill_destination: true,
+            ..Fixture::fixture((&owner_window, WindowTarget::with_window(alias.clone(), 0)))
+        })
+        .await;
     execute_overlay(
         &handler,
         pid,
@@ -274,27 +224,18 @@ async fn popup_is_discarded_after_same_window_is_unlinked_and_relinked() {
     .await
     .expect("popup opens on linked pane");
 
-    let unlinked = handler
-        .handle(Request::UnlinkWindow(UnlinkWindowRequest {
+    handler
+        .handle_ok(UnlinkWindowRequest {
             target: WindowTarget::with_window(alias.clone(), 0),
             kill_if_last: false,
-        }))
+        })
         .await;
-    assert!(
-        matches!(unlinked, Response::UnlinkWindow(_)),
-        "{unlinked:?}"
-    );
-    let relinked = handler
-        .handle(Request::LinkWindow(LinkWindowRequest {
-            source: WindowTarget::with_window(owner.clone(), 0),
-            target: WindowTarget::with_window(alias.clone(), 1),
-            after: false,
+    handler
+        .handle_ok(LinkWindowRequest {
             before: true,
-            kill_destination: false,
-            detached: true,
-        }))
+            ..Fixture::fixture((&owner_window, WindowTarget::with_window(alias.clone(), 1)))
+        })
         .await;
-    assert!(matches!(relinked, Response::LinkWindow(_)), "{relinked:?}");
 
     let mut pending = Vec::new();
     let outcome = handler
@@ -314,9 +255,9 @@ async fn overlay_command_context_rejects_a_same_name_session_replacement_after_v
     let host = session_name("overlay-command-host");
     let target = session_name("overlay-command-target");
     let pid = 971_041;
-    create_session(&handler, &host).await;
-    create_session(&handler, &target).await;
-    let _control_rx = attach(&handler, pid, &host).await;
+    handler.create_session(&host).await;
+    handler.create_session(&target).await;
+    let _control_rx = handler.attach_client(pid, &host).await;
     let client = handler.active_attach_identity_for_test(pid).await;
     let target = Target::Session(target);
     let identity = {
@@ -336,16 +277,10 @@ async fn overlay_command_context_rejects_a_same_name_session_replacement_after_v
         identity.command_context(QueueExecutionContext::without_caller_cwd(), target.clone());
 
     let target_name = target.session_name().clone();
-    let killed = handler
-        .handle(Request::KillSession(KillSessionRequest {
-            target: target_name.clone(),
-            kill_all_except_target: false,
-            clear_alerts: false,
-            kill_group: false,
-        }))
+    handler
+        .handle_ok(KillSessionRequest::fixture(&target_name))
         .await;
-    assert!(matches!(killed, Response::KillSession(_)), "{killed:?}");
-    create_session(&handler, &target_name).await;
+    handler.create_session(&target_name).await;
 
     let commands = handler
         .parse_control_commands("set-buffer -b overlay-command-aba fired")

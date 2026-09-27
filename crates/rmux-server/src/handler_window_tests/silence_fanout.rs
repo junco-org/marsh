@@ -1,19 +1,5 @@
 use super::*;
 
-async fn link_alias(handler: &RequestHandler, source: WindowTarget, destination: WindowTarget) {
-    let response = handler
-        .handle(Request::LinkWindow(LinkWindowRequest {
-            source,
-            target: destination,
-            after: false,
-            before: false,
-            kill_destination: false,
-            detached: true,
-        }))
-        .await;
-    assert!(matches!(response, Response::LinkWindow(_)), "{response:?}");
-}
-
 fn timer_snapshot(handler: &RequestHandler, target: &WindowTarget) -> (u64, tokio::time::Instant) {
     handler
         .silence_timer_snapshot_for_test(target)
@@ -56,23 +42,9 @@ async fn create_destination_group(
     owner_name: &str,
     peer_name: &str,
 ) -> (SessionName, SessionName) {
-    let owner = session_name(owner_name);
-    let peer = session_name(peer_name);
-    create_session(handler, owner.as_str()).await;
-    create_grouped_session(handler, peer.as_str(), &owner).await;
+    let owner = create_session(handler, owner_name).await;
+    let peer = create_grouped_session(handler, peer_name, &owner).await;
     (owner, peer)
-}
-
-async fn set_session_monitor_silence(handler: &RequestHandler, session: &SessionName, value: &str) {
-    let response = handler
-        .handle(Request::SetOption(SetOptionRequest {
-            scope: ScopeSelector::Session(session.clone()),
-            option: OptionName::MonitorSilence,
-            value: value.to_owned(),
-            mode: SetOptionMode::Replace,
-        }))
-        .await;
-    assert!(matches!(response, Response::SetOption(_)), "{response:?}");
 }
 
 async fn expire_session_window_zero(handler: &RequestHandler, session: &SessionName) {
@@ -88,27 +60,22 @@ async fn expire_session_window_zero(handler: &RequestHandler, session: &SessionN
 #[tokio::test]
 async fn new_group_peer_arms_fresh_when_matching_source_alias_is_unmonitored() {
     let handler = RequestHandler::new();
-    let owner = session_name("new-peer-unmonitored-owner");
-    create_session(&handler, owner.as_str()).await;
-    handler.wait_for_initial_panes_for_test().await;
+    let owner = create_session(&handler, "new-peer-unmonitored-owner").await;
     enable_global_monitor_silence(&handler).await;
 
-    let response = handler
-        .handle(Request::SetOption(SetOptionRequest {
-            scope: ScopeSelector::Session(owner.clone()),
-            option: OptionName::MonitorSilence,
-            value: "0".to_owned(),
-            mode: SetOptionMode::Replace,
-        }))
+    handler
+        .set_option(
+            ScopeSelector::Session(owner.clone()),
+            OptionName::MonitorSilence,
+            "0",
+        )
         .await;
-    assert!(matches!(response, Response::SetOption(_)), "{response:?}");
     assert_eq!(
         handler.silence_timer_snapshot_for_test(&WindowTarget::with_window(owner.clone(), 0)),
         None
     );
 
-    let peer = session_name("new-peer-unmonitored-peer");
-    create_grouped_session(&handler, peer.as_str(), &owner).await;
+    let peer = create_grouped_session(&handler, "new-peer-unmonitored-peer", &owner).await;
     assert!(
         handler
             .silence_timer_snapshot_for_test(&WindowTarget::with_window(peer, 0))
@@ -122,23 +89,31 @@ async fn assert_new_group_peer_uses_requested_template_silence_state(
     template_is_expired: bool,
 ) {
     let handler = RequestHandler::new();
-    let first = session_name(&format!("a-{label}"));
-    let template = session_name(&format!("b-{label}"));
-    let created = session_name(&format!("c-{label}"));
-    create_session(&handler, first.as_str()).await;
-    create_grouped_session(&handler, template.as_str(), &first).await;
-    handler.wait_for_initial_panes_for_test().await;
+    let first = create_session(&handler, format!("a-{label}")).await;
+    let template = create_grouped_session(&handler, format!("b-{label}"), &first).await;
     enable_global_monitor_silence(&handler).await;
 
     if template_is_expired {
-        set_session_monitor_silence(&handler, &first, "0").await;
+        handler
+            .set_option(
+                ScopeSelector::Session(first.clone()),
+                OptionName::MonitorSilence,
+                "0",
+            )
+            .await;
         expire_session_window_zero(&handler, &template).await;
     } else {
         expire_session_window_zero(&handler, &first).await;
-        set_session_monitor_silence(&handler, &template, "0").await;
+        handler
+            .set_option(
+                ScopeSelector::Session(template.clone()),
+                OptionName::MonitorSilence,
+                "0",
+            )
+            .await;
     }
 
-    create_grouped_session(&handler, created.as_str(), &template).await;
+    let created = create_grouped_session(&handler, format!("c-{label}"), &template).await;
     let created_target = WindowTarget::with_window(created.clone(), 0);
     assert_eq!(
         handler
@@ -170,20 +145,19 @@ async fn new_group_peer_prefers_requested_template_over_alphabetical_group_membe
 #[tokio::test]
 async fn link_window_fans_out_source_silence_deadline_only_to_new_group_aliases() {
     let handler = RequestHandler::new();
-    let source_session = session_name("link-fanout-source");
-    let external_session = session_name("link-fanout-external");
-    create_session(&handler, source_session.as_str()).await;
-    create_session(&handler, external_session.as_str()).await;
+    let source_session = create_session(&handler, "link-fanout-source").await;
+    let external_session = create_session(&handler, "link-fanout-external").await;
     let source = WindowTarget::with_window(source_session, 0);
     let external = WindowTarget::with_window(external_session, 1);
-    link_alias(&handler, source.clone(), external.clone()).await;
+    handler
+        .handle_ok(LinkWindowRequest::fixture((&source, &external)))
+        .await;
     let (owner, peer) = create_destination_group(
         &handler,
         "link-fanout-destination-owner",
         "link-fanout-destination-peer",
     )
     .await;
-    handler.wait_for_initial_panes_for_test().await;
     enable_global_monitor_silence(&handler).await;
 
     let source_before = settled_timer_snapshot(&handler, &source).await;
@@ -205,7 +179,9 @@ async fn link_window_fans_out_source_silence_deadline_only_to_new_group_aliases(
 
     let owner_destination = WindowTarget::with_window(owner, 1);
     let peer_destination = WindowTarget::with_window(peer, 1);
-    link_alias(&handler, source.clone(), owner_destination.clone()).await;
+    handler
+        .handle_ok(LinkWindowRequest::fixture((&source, &owner_destination)))
+        .await;
 
     assert_eq!(timer_snapshot(&handler, &source), source_before);
     assert_eq!(timer_snapshot(&handler, &external), external_before);
@@ -229,12 +205,10 @@ async fn link_window_fans_out_source_silence_deadline_only_to_new_group_aliases(
 #[tokio::test]
 async fn link_window_kill_clears_replaced_group_alerts_before_deadline_fanout() {
     let handler = RequestHandler::new();
-    let source_session = session_name("link-kill-alert-source");
-    create_session(&handler, source_session.as_str()).await;
+    let source_session = create_session(&handler, "link-kill-alert-source").await;
     let source = WindowTarget::with_window(source_session, 0);
     let (owner, peer) =
         create_destination_group(&handler, "link-kill-alert-owner", "link-kill-alert-peer").await;
-    handler.wait_for_initial_panes_for_test().await;
     enable_global_monitor_silence(&handler).await;
     let source_before = settled_timer_snapshot(&handler, &source).await;
     let stale_flags = rmux_core::WINLINK_ALERTFLAGS;
@@ -249,17 +223,12 @@ async fn link_window_kill_clears_replaced_group_alerts_before_deadline_fanout() 
         }
     }
 
-    let response = handler
-        .handle(Request::LinkWindow(LinkWindowRequest {
-            source,
-            target: WindowTarget::with_window(owner.clone(), 0),
-            after: false,
-            before: false,
+    handler
+        .handle_ok(LinkWindowRequest {
             kill_destination: true,
-            detached: true,
-        }))
+            ..Fixture::fixture((source, WindowTarget::with_window(owner.clone(), 0)))
+        })
         .await;
-    assert!(matches!(response, Response::LinkWindow(_)), "{response:?}");
 
     let state = handler.state.lock().await;
     for session_name in [owner, peer] {
@@ -284,8 +253,7 @@ async fn link_window_kill_clears_replaced_group_alerts_before_deadline_fanout() 
 #[tokio::test]
 async fn link_window_fans_out_expired_silence_state_without_rearming_group_aliases() {
     let handler = RequestHandler::new();
-    let source_session = session_name("link-expired-fanout-source");
-    create_session(&handler, source_session.as_str()).await;
+    let source_session = create_session(&handler, "link-expired-fanout-source").await;
     let source = WindowTarget::with_window(source_session, 0);
     let (owner, peer) = create_destination_group(
         &handler,
@@ -293,7 +261,6 @@ async fn link_window_fans_out_expired_silence_state_without_rearming_group_alias
         "link-expired-fanout-peer",
     )
     .await;
-    handler.wait_for_initial_panes_for_test().await;
     enable_global_monitor_silence(&handler).await;
 
     let identity = handler
@@ -306,7 +273,9 @@ async fn link_window_fans_out_expired_silence_state_without_rearming_group_alias
 
     let owner_destination = WindowTarget::with_window(owner, 1);
     let peer_destination = WindowTarget::with_window(peer, 1);
-    link_alias(&handler, source, owner_destination.clone()).await;
+    handler
+        .handle_ok(LinkWindowRequest::fixture((source, &owner_destination)))
+        .await;
 
     let state = handler.state.lock().await;
     for destination in [owner_destination, peer_destination] {
@@ -330,20 +299,19 @@ async fn link_window_fans_out_expired_silence_state_without_rearming_group_alias
 #[tokio::test]
 async fn move_window_fans_out_source_silence_deadline_without_touching_external_alias() {
     let handler = RequestHandler::new();
-    let source_session = session_name("move-fanout-source");
-    let external_session = session_name("move-fanout-external");
-    create_session(&handler, source_session.as_str()).await;
-    create_session(&handler, external_session.as_str()).await;
+    let source_session = create_session(&handler, "move-fanout-source").await;
+    let external_session = create_session(&handler, "move-fanout-external").await;
     let source = WindowTarget::with_window(source_session, 0);
     let external = WindowTarget::with_window(external_session, 1);
-    link_alias(&handler, source.clone(), external.clone()).await;
+    handler
+        .handle_ok(LinkWindowRequest::fixture((&source, &external)))
+        .await;
     let (owner, peer) = create_destination_group(
         &handler,
         "move-fanout-destination-owner",
         "move-fanout-destination-peer",
     )
     .await;
-    handler.wait_for_initial_panes_for_test().await;
     enable_global_monitor_silence(&handler).await;
 
     let source_before = settled_timer_snapshot(&handler, &source).await;
@@ -365,18 +333,9 @@ async fn move_window_fans_out_source_silence_deadline_without_touching_external_
     let owner_destination = WindowTarget::with_window(owner.clone(), 1);
     let peer_destination = WindowTarget::with_window(peer, 1);
 
-    let response = handler
-        .handle(Request::MoveWindow(MoveWindowRequest {
-            source: Some(source.clone()),
-            target: MoveWindowTarget::Window(owner_destination.clone()),
-            renumber: false,
-            kill_destination: false,
-            detached: true,
-            after: false,
-            before: false,
-        }))
+    handler
+        .handle_ok(MoveWindowRequest::fixture((&source, &owner_destination)))
         .await;
-    assert!(matches!(response, Response::MoveWindow(_)), "{response:?}");
 
     assert_eq!(handler.silence_timer_snapshot_for_test(&source), None);
     assert_eq!(timer_snapshot(&handler, &external), external_before);
@@ -400,12 +359,9 @@ async fn move_window_fans_out_source_silence_deadline_without_touching_external_
 #[tokio::test]
 async fn move_window_fanout_never_overwrites_a_represented_group_peer_deadline() {
     let handler = RequestHandler::new();
-    let owner = session_name("move-represented-deadline-owner");
-    let peer = session_name("move-represented-deadline-peer");
-    create_session(&handler, owner.as_str()).await;
+    let owner = create_session(&handler, "move-represented-deadline-owner").await;
     insert_window(&handler, &owner, 1).await;
-    create_grouped_session(&handler, peer.as_str(), &owner).await;
-    handler.wait_for_initial_panes_for_test().await;
+    let peer = create_grouped_session(&handler, "move-represented-deadline-peer", &owner).await;
     enable_global_monitor_silence(&handler).await;
 
     let owner_source = WindowTarget::with_window(owner.clone(), 0);
@@ -421,18 +377,12 @@ async fn move_window_fanout_never_overwrites_a_represented_group_peer_deadline()
         "represented aliases need distinct natural deadlines to prove the peer wins"
     );
 
-    let response = handler
-        .handle(Request::MoveWindow(MoveWindowRequest {
-            source: Some(owner_source),
-            target: MoveWindowTarget::Window(WindowTarget::with_window(owner.clone(), 2)),
-            renumber: false,
-            kill_destination: false,
-            detached: true,
-            after: false,
-            before: false,
-        }))
+    handler
+        .handle_ok(MoveWindowRequest::fixture((
+            owner_source,
+            WindowTarget::with_window(owner.clone(), 2),
+        )))
         .await;
-    assert!(matches!(response, Response::MoveWindow(_)), "{response:?}");
 
     assert_eq!(
         timer_snapshot(&handler, &WindowTarget::with_window(owner, 2)).1,
@@ -456,15 +406,14 @@ async fn move_window_fanout_never_overwrites_a_represented_group_peer_deadline()
 #[tokio::test]
 async fn swap_window_fans_out_each_addressed_deadline_without_touching_external_links() {
     let handler = RequestHandler::new();
-    let source_session = session_name("swap-fanout-source");
-    let source_external_session = session_name("swap-fanout-source-external");
-    let target_external_session = session_name("swap-fanout-target-external");
-    create_session(&handler, source_session.as_str()).await;
-    create_session(&handler, source_external_session.as_str()).await;
-    create_session(&handler, target_external_session.as_str()).await;
+    let source_session = create_session(&handler, "swap-fanout-source").await;
+    let source_external_session = create_session(&handler, "swap-fanout-source-external").await;
+    let target_external_session = create_session(&handler, "swap-fanout-target-external").await;
     let source = WindowTarget::with_window(source_session, 0);
     let source_external = WindowTarget::with_window(source_external_session, 1);
-    link_alias(&handler, source.clone(), source_external.clone()).await;
+    handler
+        .handle_ok(LinkWindowRequest::fixture((&source, &source_external)))
+        .await;
     let (owner, peer) = create_destination_group(
         &handler,
         "swap-fanout-destination-owner",
@@ -473,8 +422,12 @@ async fn swap_window_fans_out_each_addressed_deadline_without_touching_external_
     .await;
     let owner_target = WindowTarget::with_window(owner.clone(), 0);
     let target_external = WindowTarget::with_window(target_external_session, 1);
-    link_alias(&handler, owner_target.clone(), target_external.clone()).await;
-    handler.wait_for_initial_panes_for_test().await;
+    handler
+        .handle_ok(LinkWindowRequest::fixture((
+            &owner_target,
+            &target_external,
+        )))
+        .await;
     enable_global_monitor_silence(&handler).await;
 
     let source_before = settled_timer_snapshot(&handler, &source).await;
@@ -501,14 +454,13 @@ async fn swap_window_fans_out_each_addressed_deadline_without_touching_external_
         );
     }
 
-    let response = handler
-        .handle(Request::SwapWindow(SwapWindowRequest {
+    handler
+        .handle_ok(SwapWindowRequest {
             source: source.clone(),
             target: owner_target.clone(),
             detached: true,
-        }))
+        })
         .await;
-    assert!(matches!(response, Response::SwapWindow(_)), "{response:?}");
 
     assert_eq!(timer_snapshot(&handler, &source).1, owner_before.1);
     assert_eq!(timer_snapshot(&handler, &owner_target).1, source_before.1);

@@ -1,32 +1,149 @@
-use super::{CursorScope, OuterTerminal, OuterTerminalContext};
+use super::{
+    ClientPathUpdate, ClientTitleState, ClientTitleUpdate, CursorScope, OuterTerminal,
+    OuterTerminalContext, RenderedClientTitle,
+};
+use rmux_core::input::mode::{MODE_MOUSE_ALL, MODE_MOUSE_BUTTON};
 use rmux_core::{OptionStore, Session};
-use rmux_proto::{ClientTerminalContext, OptionName, ScopeSelector, SetOptionMode, TerminalSize};
+use rmux_proto::{
+    ClientTerminalContext, OptionName, ScopeSelector, SetOptionMode, TerminalSize, WindowTarget,
+};
 
+use crate::test_fixtures::option_store;
 use crate::test_names::session_name;
-
-fn make_session() -> Session {
-    Session::new(session_name("alpha"), TerminalSize { cols: 80, rows: 24 })
-}
 
 const MOUSE_ENABLE_SEQUENCE: &str = "\u{1b}[?1006h\u{1b}[?1000h\u{1b}[?1002h";
 const MOUSE_DISABLE_SEQUENCE: &str = "\u{1b}[?1002l\u{1b}[?1000l\u{1b}[?1006l";
+const MOUSE_ENABLE_PARTS: [&str; 4] = [
+    "\u{1b}[?1006h",
+    "\u{1b}[?1002h",
+    "\u{1b}[?1000h",
+    MOUSE_ENABLE_SEQUENCE,
+];
+const MOUSE_DISABLE_PARTS: [&str; 4] = [
+    "\u{1b}[?1000l",
+    "\u{1b}[?1002l",
+    "\u{1b}[?1006l",
+    MOUSE_DISABLE_SEQUENCE,
+];
+const TITLE_PANE_PATH: &str = "file:///tmp/project";
+
+fn resolve_term(options: &OptionStore, term: &str) -> OuterTerminal {
+    OuterTerminal::resolve(options, OuterTerminalContext::from_pairs(&[("TERM", term)]))
+}
+
+fn xterm_with<'a>(
+    settings: impl IntoIterator<Item = (OptionName, &'a str, SetOptionMode)>,
+) -> OuterTerminal {
+    let settings = settings
+        .into_iter()
+        .map(|(option, value, mode)| (ScopeSelector::Global, option, value, mode));
+    resolve_term(&option_store(settings), "xterm-256color")
+}
+
+fn xterm_context() -> OuterTerminalContext {
+    OuterTerminalContext::from_pairs(&[("TERM", "xterm-256color")])
+}
+
+fn mouse_client_context() -> OuterTerminalContext {
+    OuterTerminalContext::default().with_client_terminal(&ClientTerminalContext {
+        terminal_features: vec!["mouse".to_owned()],
+        utf8: true,
+    })
+}
+
+fn resolve_alpha(options: &OptionStore, context: OuterTerminalContext) -> OuterTerminal {
+    OuterTerminal::resolve_for_session(options, Some(&session_name("alpha")), context)
+}
+
+fn utf8(bytes: Vec<u8>) -> String {
+    String::from_utf8(bytes).expect("utf8")
+}
+
+fn assert_contains_all(haystack: &str, needles: &[&str]) {
+    for needle in needles {
+        assert!(
+            haystack.contains(needle),
+            "{needle:?} missing from {haystack:?}"
+        );
+    }
+}
+
+/// The options and outer terminal behind a title render.
+struct TitleFixture {
+    options: OptionStore,
+    terminal: OuterTerminal,
+}
+
+impl TitleFixture {
+    /// A terminal advertising both the title and OSC 7 templates, so what a render
+    /// records is what it would really put on the wire.
+    fn capable() -> Self {
+        Self::capable_with(|_| {})
+    }
+
+    fn capable_with(configure: impl FnOnce(&mut OptionStore)) -> Self {
+        let mut options = option_store([(
+            ScopeSelector::Global,
+            OptionName::TerminalFeatures,
+            "tmux*:osc7",
+            SetOptionMode::Append,
+        )]);
+        configure(&mut options);
+        let terminal = resolve_term(&options, "tmux-256color");
+        Self { options, terminal }
+    }
+
+    /// No TERM at all: the issue #182 case, where no terminal family and no XT flag
+    /// supply a title capability.
+    fn incapable() -> Self {
+        let options = OptionStore::new();
+        let terminal = OuterTerminal::resolve(&options, OuterTerminalContext::default());
+        Self { options, terminal }
+    }
+
+    fn prelude(&self, update: ClientTitleUpdate<'_>) -> String {
+        let session = Session::new(session_name("alpha"), TerminalSize { cols: 80, rows: 24 });
+        utf8(
+            self.terminal
+                .render_prelude(&session, &self.options, CursorScope::Pane, update),
+        )
+    }
+
+    fn commit(&self, update: ClientTitleUpdate<'_>) -> RenderedClientTitle {
+        update
+            .rendered_by(&self.terminal)
+            .expect("set-titles on commits")
+    }
+}
+
+fn title_update<'a>(
+    resolved: Option<&'a str>,
+    path: &'a str,
+    previous: Option<&'a ClientTitleState>,
+) -> ClientTitleUpdate<'a> {
+    ClientTitleUpdate {
+        resolved,
+        path: ClientPathUpdate::Reported(path),
+        previous,
+    }
+}
+
+fn shown_title(title: &str) -> ClientTitleState {
+    ClientTitleState {
+        title: Some(title.to_owned()),
+        path: Some(TITLE_PANE_PATH.to_owned()),
+    }
+}
 
 #[test]
 fn terminal_features_match_globs_and_case_insensitive_feature_names() {
-    let mut options = OptionStore::new();
-    options
-        .set(
-            ScopeSelector::Global,
-            OptionName::TerminalFeatures,
-            "xterm-kitty*:ClIpBoArD:EXTKEYS".to_owned(),
-            SetOptionMode::Append,
-        )
-        .expect("terminal-features append succeeds");
-
-    let terminal = OuterTerminal::resolve(
-        &options,
-        OuterTerminalContext::from_pairs(&[("TERM", "xterm-kitty")]),
-    );
+    let options = option_store([(
+        ScopeSelector::Global,
+        OptionName::TerminalFeatures,
+        "xterm-kitty*:ClIpBoArD:EXTKEYS",
+        SetOptionMode::Append,
+    )]);
+    let terminal = resolve_term(&options, "xterm-kitty");
 
     assert!(terminal.features_string().contains("clipboard"));
     assert!(terminal.features_string().contains("extkeys"));
@@ -34,10 +151,7 @@ fn terminal_features_match_globs_and_case_insensitive_feature_names() {
 
 #[test]
 fn xterm_kitty_enables_kitty_graphics_feature() {
-    let terminal = OuterTerminal::resolve(
-        &OptionStore::default(),
-        OuterTerminalContext::from_pairs(&[("TERM", "xterm-kitty")]),
-    );
+    let terminal = resolve_term(&OptionStore::default(), "xterm-kitty");
 
     assert!(terminal.supports_kitty_graphics());
     assert!(terminal.features_string().contains("kitty-graphics"));
@@ -82,40 +196,24 @@ fn known_sixel_terminals_enable_sixel_feature() {
 
 #[test]
 fn terminal_features_can_enable_sixel_for_other_terms() {
-    let mut options = OptionStore::new();
-    options
-        .set(
-            ScopeSelector::Global,
-            OptionName::TerminalFeatures,
-            "xterm*:sixel".to_owned(),
-            SetOptionMode::Append,
-        )
-        .expect("terminal-features append succeeds");
-
-    let terminal = OuterTerminal::resolve(
-        &options,
-        OuterTerminalContext::from_pairs(&[("TERM", "xterm-256color")]),
-    );
+    let terminal = xterm_with([(
+        OptionName::TerminalFeatures,
+        "xterm*:sixel",
+        SetOptionMode::Append,
+    )]);
 
     assert!(terminal.supports_sixel());
 }
 
 #[test]
 fn terminal_overrides_apply_legacy_tc_xt_and_ax_flags() {
-    let mut options = OptionStore::new();
-    options
-        .set(
-            ScopeSelector::Global,
-            OptionName::TerminalOverrides,
-            "linux*:Tc:XT:AX@".to_owned(),
-            SetOptionMode::Append,
-        )
-        .expect("terminal-overrides append succeeds");
-
-    let terminal = OuterTerminal::resolve(
-        &options,
-        OuterTerminalContext::from_pairs(&[("TERM", "linux")]),
-    );
+    let options = option_store([(
+        ScopeSelector::Global,
+        OptionName::TerminalOverrides,
+        "linux*:Tc:XT:AX@",
+        SetOptionMode::Append,
+    )]);
+    let terminal = resolve_term(&options, "linux");
 
     let features = terminal.features_string();
     assert!(features.contains("RGB"));
@@ -126,92 +224,62 @@ fn terminal_overrides_apply_legacy_tc_xt_and_ax_flags() {
 
 #[test]
 fn attach_sequences_follow_focus_and_extended_key_options() {
-    let mut options = OptionStore::new();
-    options
-        .set(
+    let options = option_store([
+        (
             ScopeSelector::Global,
             OptionName::FocusEvents,
-            "on".to_owned(),
+            "on",
             SetOptionMode::Replace,
-        )
-        .expect("focus-events set succeeds");
-    options
-        .set(
+        ),
+        (
             ScopeSelector::Global,
             OptionName::ExtendedKeys,
-            "always".to_owned(),
+            "always",
             SetOptionMode::Replace,
-        )
-        .expect("extended-keys set succeeds");
-    options
-        .set(
+        ),
+        (
             ScopeSelector::Global,
             OptionName::Mouse,
-            "on".to_owned(),
+            "on",
             SetOptionMode::Replace,
-        )
-        .expect("mouse set succeeds");
-
-    let terminal = OuterTerminal::resolve_for_session(
+        ),
+    ]);
+    let terminal = resolve_alpha(
         &options,
-        Some(&session_name("alpha")),
         OuterTerminalContext::from_pairs(&[("TERM", "xterm-256color"), ("COLORTERM", "truecolor")]),
     );
 
-    let start = String::from_utf8(terminal.attach_start_sequence()).expect("utf8");
-    let stop = String::from_utf8(terminal.attach_stop_sequence()).expect("utf8");
+    let start = utf8(terminal.attach_start_sequence());
+    let stop = utf8(terminal.attach_stop_sequence());
 
     assert!(start.starts_with("\u{1b}[?1049h\u{1b}[22;0;0t\u{1b}[0m\u{1b}[?25l\u{1b}[H\u{1b}[2J"));
-    assert!(start.contains("\u{1b}[22;0;0t"));
-    assert!(start.contains("\u{1b}[?2004h"));
-    assert!(start.contains("\u{1b}[?1006h"));
-    assert!(start.contains("\u{1b}[?1002h"));
-    assert!(start.contains("\u{1b}[?1000h"));
-    assert!(start.contains(MOUSE_ENABLE_SEQUENCE));
-    assert!(start.contains("\u{1b}[?1004h"));
-    assert!(start.contains("\u{1b}[>4;2m"));
-    assert!(stop.contains("\u{1b}[?2004l"));
-    assert!(stop.contains("\u{1b}[?1000l"));
-    assert!(stop.contains("\u{1b}[?1002l"));
-    assert!(stop.contains("\u{1b}[?1006l"));
-    assert!(stop.contains(MOUSE_DISABLE_SEQUENCE));
-    assert!(stop.contains("\u{1b}[?1004l"));
-    assert!(stop.contains("\u{1b}[>4m"));
+    assert_contains_all(
+        &start,
+        &[
+            "\u{1b}[22;0;0t",
+            "\u{1b}[?2004h",
+            "\u{1b}[?1004h",
+            "\u{1b}[>4;2m",
+        ],
+    );
+    assert_contains_all(&start, &MOUSE_ENABLE_PARTS);
+    assert_contains_all(&stop, &["\u{1b}[?2004l", "\u{1b}[?1004l", "\u{1b}[>4m"]);
+    assert_contains_all(&stop, &MOUSE_DISABLE_PARTS);
     assert!(stop.ends_with("\u{1b}[?1049l\u{1b}[23;0;0t"));
 }
 
 #[test]
 fn client_mouse_feature_enables_mouse_attach_sequences_when_mouse_option_is_on() {
-    let mut options = OptionStore::new();
-    options
-        .set(
-            ScopeSelector::Global,
-            OptionName::Mouse,
-            "on".to_owned(),
-            SetOptionMode::Replace,
-        )
-        .expect("mouse set succeeds");
+    let options = option_store([(
+        ScopeSelector::Global,
+        OptionName::Mouse,
+        "on",
+        SetOptionMode::Replace,
+    )]);
+    let terminal = resolve_alpha(&options, mouse_client_context());
 
-    let terminal = OuterTerminal::resolve_for_session(
-        &options,
-        Some(&session_name("alpha")),
-        OuterTerminalContext::default().with_client_terminal(&ClientTerminalContext {
-            terminal_features: vec!["mouse".to_owned()],
-            utf8: true,
-        }),
-    );
-
-    let start = String::from_utf8(terminal.attach_start_sequence()).expect("utf8");
-    let stop = String::from_utf8(terminal.attach_stop_sequence()).expect("utf8");
-
-    assert!(start.contains("\u{1b}[?1006h"));
-    assert!(start.contains("\u{1b}[?1002h"));
-    assert!(start.contains("\u{1b}[?1000h"));
-    assert!(start.contains(MOUSE_ENABLE_SEQUENCE));
-    assert!(stop.contains("\u{1b}[?1000l"));
-    assert!(stop.contains("\u{1b}[?1002l"));
-    assert!(stop.contains("\u{1b}[?1006l"));
-    assert!(stop.contains(MOUSE_DISABLE_SEQUENCE));
+    assert_contains_all(&utf8(terminal.attach_start_sequence()), &MOUSE_ENABLE_PARTS);
+    assert_contains_all(&utf8(terminal.attach_stop_sequence()), &MOUSE_DISABLE_PARTS);
 }
 
 #[test]
@@ -219,17 +287,10 @@ fn active_pane_mouse_tracking_enables_outer_mouse_with_mouse_option_off() {
     // Issue #93: tmux enables outer mouse reporting when the `mouse` option
     // is on OR the active pane's application requested a tracking mode, so
     // vim/htop over SSH must get mouse events with `mouse off`.
-    let terminal = OuterTerminal::resolve_for_session(
-        &OptionStore::new(),
-        Some(&session_name("alpha")),
-        OuterTerminalContext::default().with_client_terminal(&ClientTerminalContext {
-            terminal_features: vec!["mouse".to_owned()],
-            utf8: true,
-        }),
-    )
-    .with_active_pane_mouse_mode(rmux_core::input::mode::MODE_MOUSE_BUTTON);
+    let terminal = resolve_alpha(&OptionStore::new(), mouse_client_context())
+        .with_active_pane_mouse_mode(MODE_MOUSE_BUTTON);
 
-    let start = String::from_utf8(terminal.attach_start_sequence()).expect("utf8");
+    let start = utf8(terminal.attach_start_sequence());
     assert!(
         start.contains(MOUSE_ENABLE_SEQUENCE),
         "pane-driven tracking must enable outer mouse despite mouse=off"
@@ -238,17 +299,10 @@ fn active_pane_mouse_tracking_enables_outer_mouse_with_mouse_option_off() {
 
 #[test]
 fn without_option_or_pane_tracking_outer_mouse_stays_disabled() {
-    let terminal = OuterTerminal::resolve_for_session(
-        &OptionStore::new(),
-        Some(&session_name("alpha")),
-        OuterTerminalContext::default().with_client_terminal(&ClientTerminalContext {
-            terminal_features: vec!["mouse".to_owned()],
-            utf8: true,
-        }),
-    )
-    .with_active_pane_mouse_mode(0);
+    let terminal =
+        resolve_alpha(&OptionStore::new(), mouse_client_context()).with_active_pane_mouse_mode(0);
 
-    let start = String::from_utf8(terminal.attach_start_sequence()).expect("utf8");
+    let start = utf8(terminal.attach_start_sequence());
     assert!(
         !start.contains("\u{1b}[?1000h"),
         "no option and no pane tracking must not enable outer mouse"
@@ -257,31 +311,17 @@ fn without_option_or_pane_tracking_outer_mouse_stays_disabled() {
 
 #[test]
 fn transition_disables_outer_mouse_when_the_pane_stops_tracking() {
-    let context = || {
-        OuterTerminalContext::default().with_client_terminal(&ClientTerminalContext {
-            terminal_features: vec!["mouse".to_owned()],
-            utf8: true,
-        })
-    };
-    let tracking = OuterTerminal::resolve_for_session(
-        &OptionStore::new(),
-        Some(&session_name("alpha")),
-        context(),
-    )
-    .with_active_pane_mouse_mode(rmux_core::input::mode::MODE_MOUSE_BUTTON);
-    let idle = OuterTerminal::resolve_for_session(
-        &OptionStore::new(),
-        Some(&session_name("alpha")),
-        context(),
-    )
-    .with_active_pane_mouse_mode(0);
+    let tracking = resolve_alpha(&OptionStore::new(), mouse_client_context())
+        .with_active_pane_mouse_mode(MODE_MOUSE_BUTTON);
+    let idle =
+        resolve_alpha(&OptionStore::new(), mouse_client_context()).with_active_pane_mouse_mode(0);
 
-    let enable = String::from_utf8(tracking.transition_sequence_from(&idle)).expect("utf8");
+    let enable = utf8(tracking.transition_sequence_from(&idle));
     assert!(
         enable.contains(MOUSE_ENABLE_SEQUENCE),
         "pane starting to track must enable outer mouse on refresh"
     );
-    let disable = String::from_utf8(idle.transition_sequence_from(&tracking)).expect("utf8");
+    let disable = utf8(idle.transition_sequence_from(&tracking));
     assert!(
         disable.contains(MOUSE_DISABLE_SEQUENCE),
         "pane resetting its tracking mode must disable outer mouse on refresh"
@@ -290,45 +330,28 @@ fn transition_disables_outer_mouse_when_the_pane_stops_tracking() {
 
 #[test]
 fn active_pane_all_motion_tracking_preserves_decset_1003() {
-    let terminal = OuterTerminal::resolve_for_session(
-        &OptionStore::new(),
-        Some(&session_name("alpha")),
-        OuterTerminalContext::default().with_client_terminal(&ClientTerminalContext {
-            terminal_features: vec!["mouse".to_owned()],
-            utf8: true,
-        }),
-    )
-    .with_active_pane_mouse_mode(rmux_core::input::mode::MODE_MOUSE_ALL);
+    let terminal = resolve_alpha(&OptionStore::new(), mouse_client_context())
+        .with_active_pane_mouse_mode(MODE_MOUSE_ALL);
 
-    let start = String::from_utf8(terminal.attach_start_sequence()).expect("utf8");
+    let start = utf8(terminal.attach_start_sequence());
     assert!(start.contains("\u{1b}[?1003h"));
     assert!(!start.contains("\u{1b}[?1002h"));
 
-    let stop = String::from_utf8(terminal.attach_stop_sequence()).expect("utf8");
+    let stop = utf8(terminal.attach_stop_sequence());
     assert!(stop.contains("\u{1b}[?1003l"));
 }
 
 #[test]
 fn focus_follows_mouse_option_upgrades_mouse_tracking_to_all_motion() {
-    let context = || {
-        OuterTerminalContext::default().with_client_terminal(&ClientTerminalContext {
-            terminal_features: vec!["mouse".to_owned()],
-            utf8: true,
-        })
-    };
-    let mut options = OptionStore::new();
-    options
-        .set(
-            ScopeSelector::Global,
-            OptionName::FocusFollowsMouse,
-            "on".to_owned(),
-            SetOptionMode::Replace,
-        )
-        .expect("focus-follows-mouse set succeeds");
+    let mut options = option_store([(
+        ScopeSelector::Global,
+        OptionName::FocusFollowsMouse,
+        "on",
+        SetOptionMode::Replace,
+    )]);
 
-    let mouse_off =
-        OuterTerminal::resolve_for_session(&options, Some(&session_name("alpha")), context());
-    let off_start = String::from_utf8(mouse_off.attach_start_sequence()).expect("utf8");
+    let mouse_off = resolve_alpha(&options, mouse_client_context());
+    let off_start = utf8(mouse_off.attach_start_sequence());
     assert!(!off_start.contains("\u{1b}[?1003h"));
 
     options
@@ -338,10 +361,9 @@ fn focus_follows_mouse_option_upgrades_mouse_tracking_to_all_motion() {
             "on".to_owned(),
             SetOptionMode::Replace,
         )
-        .expect("mouse set succeeds");
-    let mouse_on =
-        OuterTerminal::resolve_for_session(&options, Some(&session_name("alpha")), context());
-    let on_start = String::from_utf8(mouse_on.attach_start_sequence()).expect("utf8");
+        .expect("global option set succeeds");
+    let mouse_on = resolve_alpha(&options, mouse_client_context());
+    let on_start = utf8(mouse_on.attach_start_sequence());
     assert!(on_start.contains("\u{1b}[?1003h"));
     assert!(!on_start.contains("\u{1b}[?1002h"));
 
@@ -352,10 +374,9 @@ fn focus_follows_mouse_option_upgrades_mouse_tracking_to_all_motion() {
             "off".to_owned(),
             SetOptionMode::Replace,
         )
-        .expect("focus-follows-mouse unset succeeds");
-    let button_tracking =
-        OuterTerminal::resolve_for_session(&options, Some(&session_name("alpha")), context());
-    let button_start = String::from_utf8(button_tracking.attach_start_sequence()).expect("utf8");
+        .expect("global option set succeeds");
+    let button_tracking = resolve_alpha(&options, mouse_client_context());
+    let button_start = utf8(button_tracking.attach_start_sequence());
     assert!(button_start.contains("\u{1b}[?1002h"));
     assert!(!button_start.contains("\u{1b}[?1003h"));
 }
@@ -366,29 +387,18 @@ fn focus_follows_mouse_option_upgrades_mouse_tracking_to_all_motion() {
 /// advertises `title` and `osc7`.
 #[test]
 fn render_prelude_without_resolved_title_writes_neither_title_nor_path() {
-    let mut options = title_capable_options();
-    options
-        .set(
-            ScopeSelector::Window(rmux_proto::WindowTarget::with_window(
-                session_name("alpha"),
-                0,
-            )),
-            OptionName::CursorColour,
-            "red".to_owned(),
-            SetOptionMode::Replace,
-        )
-        .expect("cursor colour set succeeds");
+    let fixture = TitleFixture::capable_with(|options| {
+        options
+            .set(
+                ScopeSelector::Window(WindowTarget::with_window(session_name("alpha"), 0)),
+                OptionName::CursorColour,
+                "red".to_owned(),
+                SetOptionMode::Replace,
+            )
+            .expect("cursor colour set succeeds");
+    });
 
-    let terminal = title_capable_terminal(&options);
-    let prelude = render_title_prelude(
-        &terminal,
-        &options,
-        super::ClientTitleUpdate {
-            resolved: None,
-            path: super::ClientPathUpdate::Reported(TITLE_PANE_PATH),
-            previous: None,
-        },
-    );
+    let prelude = fixture.prelude(title_update(None, TITLE_PANE_PATH, None));
 
     assert!(
         !prelude.contains("\u{1b}]0;"),
@@ -406,18 +416,8 @@ fn render_prelude_without_resolved_title_writes_neither_title_nor_path() {
 /// title (issue #182), and it unlocks the neighbouring OSC 7 path.
 #[test]
 fn render_prelude_writes_resolved_title_and_path() {
-    let options = title_capable_options();
-    let terminal = title_capable_terminal(&options);
-
-    let prelude = render_title_prelude(
-        &terminal,
-        &options,
-        super::ClientTitleUpdate {
-            resolved: Some("RMUXTEST alpha:0"),
-            path: super::ClientPathUpdate::Reported(TITLE_PANE_PATH),
-            previous: None,
-        },
-    );
+    let update = title_update(Some("RMUXTEST alpha:0"), TITLE_PANE_PATH, None);
+    let prelude = TitleFixture::capable().prelude(update);
 
     assert!(prelude.contains("\u{1b}]0;RMUXTEST alpha:0\u{7}"));
     assert!(prelude.contains("\u{1b}]7;file:///tmp/project\u{7}"));
@@ -429,36 +429,24 @@ fn render_prelude_writes_resolved_title_and_path() {
 /// redraws with exactly one OSC 0 and one OSC 7 on the wire.
 #[test]
 fn render_prelude_skips_an_unchanged_title_and_path() {
-    let options = title_capable_options();
-    let terminal = title_capable_terminal(&options);
-    let shown = super::ClientTitleState {
-        title: Some("RMUXTEST alpha:0".to_owned()),
-        path: Some(TITLE_PANE_PATH.to_owned()),
-    };
+    let fixture = TitleFixture::capable();
+    let shown = shown_title("RMUXTEST alpha:0");
 
-    let prelude = render_title_prelude(
-        &terminal,
-        &options,
-        super::ClientTitleUpdate {
-            resolved: Some("RMUXTEST alpha:0"),
-            path: super::ClientPathUpdate::Reported(TITLE_PANE_PATH),
-            previous: Some(&shown),
-        },
-    );
+    let prelude = fixture.prelude(title_update(
+        Some("RMUXTEST alpha:0"),
+        TITLE_PANE_PATH,
+        Some(&shown),
+    ));
     assert!(
         !prelude.contains("\u{1b}]0;") && !prelude.contains("\u{1b}]7;"),
         "unchanged title and path must not be re-emitted, got {prelude:?}"
     );
 
-    let changed = render_title_prelude(
-        &terminal,
-        &options,
-        super::ClientTitleUpdate {
-            resolved: Some("RMUXTEST alpha:1"),
-            path: super::ClientPathUpdate::Reported("file:///tmp/other"),
-            previous: Some(&shown),
-        },
-    );
+    let changed = fixture.prelude(title_update(
+        Some("RMUXTEST alpha:1"),
+        "file:///tmp/other",
+        Some(&shown),
+    ));
     assert!(changed.contains("\u{1b}]0;RMUXTEST alpha:1\u{7}"));
     assert!(changed.contains("\u{1b}]7;file:///tmp/other\u{7}"));
 }
@@ -469,18 +457,8 @@ fn render_prelude_skips_an_unchanged_title_and_path() {
 /// payload reaches the terminal.
 #[test]
 fn render_prelude_neutralises_control_characters_in_the_title() {
-    let options = title_capable_options();
-    let terminal = title_capable_terminal(&options);
-
-    let prelude = render_title_prelude(
-        &terminal,
-        &options,
-        super::ClientTitleUpdate {
-            resolved: Some("A\u{1b}]0;INJECT\u{7}B\tC"),
-            path: super::ClientPathUpdate::Reported(TITLE_PANE_PATH),
-            previous: None,
-        },
-    );
+    let update = title_update(Some("A\u{1b}]0;INJECT\u{7}B\tC"), TITLE_PANE_PATH, None);
+    let prelude = TitleFixture::capable().prelude(update);
 
     let title = prelude
         .split_once("\u{1b}]0;")
@@ -504,30 +482,21 @@ fn render_prelude_neutralises_control_characters_in_the_title() {
 /// value is still remembered, matching tmux assigning `c->title` regardless.
 #[test]
 fn render_prelude_leaves_a_title_incapable_terminal_alone() {
-    let options = OptionStore::new();
-    let terminal = OuterTerminal::resolve(
-        &options,
-        // No TERM at all: the issue #182 case, where no terminal family and no
-        // XT flag supply a title capability.
-        OuterTerminalContext::default(),
-    );
+    let fixture = TitleFixture::incapable();
     assert!(
-        !terminal.features_string().contains("title"),
+        !fixture.terminal.features_string().contains("title"),
         "fixture must not advertise the title capability"
     );
 
-    let update = super::ClientTitleUpdate {
-        resolved: Some("RMUXTEST alpha:0"),
-        path: super::ClientPathUpdate::Reported(TITLE_PANE_PATH),
-        previous: None,
-    };
-    let prelude = render_title_prelude(&terminal, &options, update);
+    let update = title_update(Some("RMUXTEST alpha:0"), TITLE_PANE_PATH, None);
+    let prelude = fixture.prelude(update);
 
     assert!(
         !prelude.contains("\u{1b}]0;") && !prelude.contains("RMUXTEST"),
         "a title-incapable terminal must receive no title, got {prelude:?}"
     );
-    let rendered = terminal
+    let rendered = fixture
+        .terminal
         .rendered_client_title(update)
         .expect("set-titles on commits");
     assert_eq!(
@@ -549,27 +518,19 @@ fn render_prelude_leaves_a_title_incapable_terminal_alone() {
 /// emits exactly one title across an on -> off -> on toggle).
 #[test]
 fn a_suppressed_title_commits_nothing_and_keeps_the_previous_path() {
-    let shown = super::ClientTitleState {
-        title: Some("STABLE".to_owned()),
-        path: Some(TITLE_PANE_PATH.to_owned()),
-    };
-    assert!(super::ClientTitleUpdate {
-        resolved: None,
-        path: super::ClientPathUpdate::Reported("file:///tmp/other"),
-        previous: Some(&shown),
-    }
-    .rendered_by(&title_capable_outer_terminal())
-    .is_none());
+    let fixture = TitleFixture::capable();
+    let shown = shown_title("STABLE");
+    assert!(title_update(None, "file:///tmp/other", Some(&shown))
+        .rendered_by(&fixture.terminal)
+        .is_none());
 
     // A render that resolves a title but reads no pane path keeps the path the
     // client was already given rather than forgetting it, and writes nothing.
-    let rendered = super::ClientTitleUpdate {
+    let rendered = fixture.commit(ClientTitleUpdate {
         resolved: Some("STABLE"),
-        path: super::ClientPathUpdate::Unread,
+        path: ClientPathUpdate::Unread,
         previous: Some(&shown),
-    }
-    .rendered_by(&title_capable_outer_terminal())
-    .expect("set-titles on commits");
+    });
     assert_eq!(rendered.state(), &shown);
     assert!(
         !rendered.wrote(),
@@ -582,26 +543,17 @@ fn a_suppressed_title_commits_nothing_and_keeps_the_previous_path() {
 /// outer terminal on the previous title with nothing left to correct it.
 #[test]
 fn a_title_carrying_render_is_not_a_replaceable_refresh() {
-    let shown = super::ClientTitleState {
-        title: Some("STABLE".to_owned()),
-        path: Some(TITLE_PANE_PATH.to_owned()),
-    };
-    let wrote = super::ClientTitleUpdate {
-        resolved: Some("CHANGED"),
-        path: super::ClientPathUpdate::Reported(TITLE_PANE_PATH),
-        previous: Some(&shown),
-    }
-    .rendered_by(&title_capable_outer_terminal())
-    .expect("set-titles on commits");
+    let fixture = TitleFixture::capable();
+    let shown = shown_title("STABLE");
+
+    let wrote = fixture.commit(title_update(Some("CHANGED"), TITLE_PANE_PATH, Some(&shown)));
     assert!(wrote.wrote(), "a changed title puts OSC 0 in the frame");
 
-    let path_only = super::ClientTitleUpdate {
-        resolved: Some("STABLE"),
-        path: super::ClientPathUpdate::Reported("file:///tmp/other"),
-        previous: Some(&shown),
-    }
-    .rendered_by(&title_capable_outer_terminal())
-    .expect("set-titles on commits");
+    let path_only = fixture.commit(title_update(
+        Some("STABLE"),
+        "file:///tmp/other",
+        Some(&shown),
+    ));
     assert!(path_only.wrote(), "a changed path alone still writes OSC 7");
 }
 
@@ -613,18 +565,10 @@ fn a_title_carrying_render_is_not_a_replaceable_refresh() {
 /// that value would be skipped — the stale title of issue #182.
 #[test]
 fn a_render_that_wrote_nothing_commits_nothing() {
-    let shown = super::ClientTitleState {
-        title: Some("STABLE".to_owned()),
-        path: Some(TITLE_PANE_PATH.to_owned()),
-    };
+    let fixture = TitleFixture::capable();
+    let shown = shown_title("STABLE");
 
-    let deduplicated = super::ClientTitleUpdate {
-        resolved: Some("STABLE"),
-        path: super::ClientPathUpdate::Reported(TITLE_PANE_PATH),
-        previous: Some(&shown),
-    }
-    .rendered_by(&title_capable_outer_terminal())
-    .expect("set-titles on commits");
+    let deduplicated = fixture.commit(title_update(Some("STABLE"), TITLE_PANE_PATH, Some(&shown)));
     assert!(!deduplicated.wrote());
     assert_eq!(
         deduplicated.committed(),
@@ -632,83 +576,26 @@ fn a_render_that_wrote_nothing_commits_nothing() {
         "a fully deduplicated render must not overwrite the remembered title"
     );
 
-    let wrote = super::ClientTitleUpdate {
-        resolved: Some("CHANGED"),
-        path: super::ClientPathUpdate::Reported(TITLE_PANE_PATH),
-        previous: Some(&shown),
-    }
-    .rendered_by(&title_capable_outer_terminal())
-    .expect("set-titles on commits");
+    let changed = title_update(Some("CHANGED"), TITLE_PANE_PATH, Some(&shown));
+    let wrote = fixture.commit(changed);
     assert_eq!(
-        wrote.committed().and_then(super::ClientTitleState::title),
+        wrote.committed().and_then(ClientTitleState::title),
         Some("CHANGED"),
         "a render that wrote OSC 0 commits what the terminal now shows"
     );
 
     // A terminal that cannot write the sequence commits nothing either: it was
     // never told, so the next render must still consider the title pending.
-    let incapable = super::ClientTitleUpdate {
-        resolved: Some("CHANGED"),
-        path: super::ClientPathUpdate::Reported(TITLE_PANE_PATH),
-        previous: Some(&shown),
-    }
-    .rendered_by(&title_incapable_outer_terminal())
-    .expect("set-titles on commits");
+    let incapable = TitleFixture::incapable().commit(changed);
     assert_eq!(incapable.committed(), None);
-}
-
-const TITLE_PANE_PATH: &str = "file:///tmp/project";
-
-fn title_capable_options() -> OptionStore {
-    let mut options = OptionStore::new();
-    options
-        .set(
-            ScopeSelector::Global,
-            OptionName::TerminalFeatures,
-            "tmux*:osc7".to_owned(),
-            SetOptionMode::Append,
-        )
-        .expect("terminal-features append succeeds");
-    options
-}
-
-fn title_capable_terminal(options: &OptionStore) -> OuterTerminal {
-    OuterTerminal::resolve(
-        options,
-        OuterTerminalContext::from_pairs(&[("TERM", "tmux-256color")]),
-    )
-}
-
-/// A terminal advertising both the title and OSC 7 templates, so what a render
-/// records is what it would really put on the wire.
-fn title_capable_outer_terminal() -> OuterTerminal {
-    title_capable_terminal(&title_capable_options())
-}
-
-/// No TERM at all: the issue #182 case, where no terminal family and no XT flag
-/// supply a title capability.
-fn title_incapable_outer_terminal() -> OuterTerminal {
-    OuterTerminal::resolve(&OptionStore::new(), OuterTerminalContext::default())
-}
-
-fn render_title_prelude(
-    terminal: &OuterTerminal,
-    options: &OptionStore,
-    update: super::ClientTitleUpdate<'_>,
-) -> String {
-    String::from_utf8(terminal.render_prelude(&make_session(), options, CursorScope::Pane, update))
-        .expect("utf8")
 }
 
 #[test]
 fn attach_start_queries_client_theme_reports() {
-    let terminal = OuterTerminal::resolve(
-        &OptionStore::new(),
-        OuterTerminalContext::from_pairs(&[("TERM", "xterm-256color")]),
-    );
+    let terminal = xterm_with([]);
 
-    let start = String::from_utf8(terminal.attach_start_sequence()).expect("utf8");
-    let stop = String::from_utf8(terminal.attach_stop_sequence()).expect("utf8");
+    let start = utf8(terminal.attach_start_sequence());
+    let stop = utf8(terminal.attach_stop_sequence());
 
     assert!(start.contains("\u{1b}[?2031h"));
     assert!(start.contains("\u{1b}[?996n"));
@@ -717,20 +604,14 @@ fn attach_start_queries_client_theme_reports() {
 
 #[test]
 fn cursor_style_transition_preserves_terminal_default_on_initial_default_attach() {
-    let terminal = OuterTerminal::resolve(
-        &OptionStore::new(),
-        OuterTerminalContext::from_pairs(&[("TERM", "xterm-256color")]),
-    );
+    let terminal = xterm_with([]);
 
     assert_eq!(terminal.render_cursor_style_transition(None, 0), None);
 }
 
 #[test]
 fn cursor_style_transition_resets_only_when_leaving_an_explicit_style() {
-    let terminal = OuterTerminal::resolve(
-        &OptionStore::new(),
-        OuterTerminalContext::from_pairs(&[("TERM", "xterm-256color")]),
-    );
+    let terminal = xterm_with([]);
 
     assert_eq!(
         terminal.render_cursor_style_transition(Some(6), 0),
@@ -745,25 +626,12 @@ fn cursor_style_transition_resets_only_when_leaving_an_explicit_style() {
 
 #[test]
 fn clipboard_encoding_honours_feature_and_set_clipboard_option() {
-    let mut enabled_options = OptionStore::new();
-    enabled_options
-        .set(
-            ScopeSelector::Global,
-            OptionName::SetClipboard,
-            "external".to_owned(),
-            SetOptionMode::Replace,
-        )
-        .expect("set-clipboard set succeeds");
-    let enabled = OuterTerminal::resolve(
-        &enabled_options,
-        OuterTerminalContext::from_pairs(&[("TERM", "xterm-256color")]),
-    );
-    let encoded = String::from_utf8(
+    let enabled = xterm_with([(OptionName::SetClipboard, "external", SetOptionMode::Replace)]);
+    let encoded = utf8(
         enabled
             .encode_forced_clipboard_set(b"hi")
             .expect("clipboard write is available"),
-    )
-    .expect("utf8");
+    );
     assert_eq!(encoded, "\u{1b}]52;;aGk=\u{7}");
     // Under `external` an application's inbound OSC 52 is NOT relayed to the
     // outer terminal: tmux gates that path on set-clipboard == on only
@@ -774,82 +642,41 @@ fn clipboard_encoding_honours_feature_and_set_clipboard_option() {
     // under `external` (window-copy.c gates them on set-clipboard != 0).
     assert!(enabled.encode_clipboard_set(b"hi").is_some());
 
-    let mut on_options = OptionStore::new();
-    on_options
-        .set(
-            ScopeSelector::Global,
-            OptionName::SetClipboard,
-            "on".to_owned(),
-            SetOptionMode::Replace,
-        )
-        .expect("set-clipboard set succeeds");
-    let on = OuterTerminal::resolve(
-        &on_options,
-        OuterTerminalContext::from_pairs(&[("TERM", "xterm-256color")]),
-    );
+    let on = xterm_with([(OptionName::SetClipboard, "on", SetOptionMode::Replace)]);
     // `on` is the opt-in that relays inbound application OSC 52 to the outer.
     assert!(on.clipboard_passthrough_enabled());
 
-    let mut disabled_options = OptionStore::new();
-    disabled_options
-        .set(
-            ScopeSelector::Global,
-            OptionName::SetClipboard,
-            "off".to_owned(),
-            SetOptionMode::Replace,
-        )
-        .expect("set-clipboard set succeeds");
-    let disabled = OuterTerminal::resolve(
-        &disabled_options,
-        OuterTerminalContext::from_pairs(&[("TERM", "xterm-256color")]),
-    );
+    let disabled = xterm_with([(OptionName::SetClipboard, "off", SetOptionMode::Replace)]);
     assert!(!disabled.clipboard_passthrough_enabled());
     assert!(disabled.encode_forced_clipboard_set(b"hi").is_some());
 }
 
 #[test]
 fn sync_wrapper_brackets_render_frames_when_supported() {
-    let mut options = OptionStore::new();
-    options
-        .set(
-            ScopeSelector::Global,
-            OptionName::TerminalFeatures,
-            "xterm*:sync".to_owned(),
-            SetOptionMode::Append,
-        )
-        .expect("terminal-features append succeeds");
-    let terminal = OuterTerminal::resolve(
-        &options,
-        OuterTerminalContext::from_pairs(&[("TERM", "xterm-256color")]),
-    );
+    let terminal = xterm_with([(
+        OptionName::TerminalFeatures,
+        "xterm*:sync",
+        SetOptionMode::Append,
+    )]);
 
-    let wrapped = String::from_utf8(terminal.wrap_render_frame(b"frame")).expect("utf8");
+    let wrapped = utf8(terminal.wrap_render_frame(b"frame"));
     assert_eq!(wrapped, "\u{1b}[?2026hframe\u{1b}[?2026l");
 }
 
 #[test]
 fn terminal_override_can_disable_sync_wrapper_after_feature_match() {
-    let mut options = OptionStore::new();
-    options
-        .set(
-            ScopeSelector::Global,
+    let terminal = xterm_with([
+        (
             OptionName::TerminalFeatures,
-            "xterm*:sync".to_owned(),
+            "xterm*:sync",
             SetOptionMode::Append,
-        )
-        .expect("terminal-features append succeeds");
-    options
-        .set(
-            ScopeSelector::Global,
+        ),
+        (
             OptionName::TerminalOverrides,
-            "xterm*:Sync@".to_owned(),
+            "xterm*:Sync@",
             SetOptionMode::Append,
-        )
-        .expect("terminal-overrides append succeeds");
-    let terminal = OuterTerminal::resolve(
-        &options,
-        OuterTerminalContext::from_pairs(&[("TERM", "xterm-256color")]),
-    );
+        ),
+    ]);
 
     assert_eq!(terminal.wrap_render_frame(b"frame"), b"frame");
     assert!(!terminal
@@ -860,55 +687,47 @@ fn terminal_override_can_disable_sync_wrapper_after_feature_match() {
 
 #[test]
 fn decode_capability_string_handles_octal_escapes() {
-    assert_eq!(
-        super::decode_capability_string("\\033[H"),
-        "\x1b[H",
-        "\\033 should decode to ESC"
-    );
-    assert_eq!(
-        super::decode_capability_string("\\007"),
-        "\x07",
-        "\\007 should decode to BEL"
-    );
-    assert_eq!(
-        super::decode_capability_string("\\0"),
-        "\x00",
-        "\\0 alone should decode to NUL"
-    );
+    for (encoded, decoded, message) in [
+        ("\\033[H", "\x1b[H", "\\033 should decode to ESC"),
+        ("\\007", "\x07", "\\007 should decode to BEL"),
+        ("\\0", "\x00", "\\0 alone should decode to NUL"),
+    ] {
+        assert_eq!(
+            super::decode_capability_string(encoded),
+            decoded,
+            "{message}"
+        );
+    }
 }
 
 #[test]
 fn decode_capability_string_handles_vis_escapes() {
-    assert_eq!(
-        super::decode_capability_string("\\s"),
-        " ",
-        "\\s should decode to space"
-    );
-    assert_eq!(
-        super::decode_capability_string("\\v"),
-        "\x0b",
-        "\\v should decode to vertical tab"
-    );
-    assert_eq!(
-        super::decode_capability_string("\\^C"),
-        "\x03",
-        "\\^C should decode to ctrl-C"
-    );
-    assert_eq!(
-        super::decode_capability_string("\\^?"),
-        "\x7f",
-        "\\^? should decode to DEL"
-    );
+    for (encoded, decoded, message) in [
+        ("\\s", " ", "\\s should decode to space"),
+        ("\\v", "\x0b", "\\v should decode to vertical tab"),
+        ("\\^C", "\x03", "\\^C should decode to ctrl-C"),
+        ("\\^?", "\x7f", "\\^? should decode to DEL"),
+    ] {
+        assert_eq!(
+            super::decode_capability_string(encoded),
+            decoded,
+            "{message}"
+        );
+    }
 }
 
 #[test]
 fn decode_capability_string_preserves_existing_escapes() {
-    assert_eq!(super::decode_capability_string("\\E[H"), "\x1b[H");
-    assert_eq!(super::decode_capability_string("\\e[H"), "\x1b[H");
-    assert_eq!(super::decode_capability_string("\\n"), "\n");
-    assert_eq!(super::decode_capability_string("\\\\"), "\\");
-    assert_eq!(super::decode_capability_string("\\:"), ":");
-    assert_eq!(super::decode_capability_string("\\"), "\\");
+    for (encoded, decoded) in [
+        ("\\E[H", "\x1b[H"),
+        ("\\e[H", "\x1b[H"),
+        ("\\n", "\n"),
+        ("\\\\", "\\"),
+        ("\\:", ":"),
+        ("\\", "\\"),
+    ] {
+        assert_eq!(super::decode_capability_string(encoded), decoded);
+    }
 }
 
 #[test]
@@ -921,20 +740,13 @@ fn decode_capability_string_with_mixed_octal_and_text() {
 
 #[test]
 fn override_with_octal_encoded_value_resolves_correctly() {
-    let mut options = OptionStore::new();
-    options
-        .set(
-            ScopeSelector::Global,
-            OptionName::TerminalOverrides,
-            "dumb*:Ss=\\033[%p1%d q".to_owned(),
-            SetOptionMode::Append,
-        )
-        .expect("terminal-overrides append succeeds");
-
-    let terminal = OuterTerminal::resolve(
-        &options,
-        OuterTerminalContext::from_pairs(&[("TERM", "dumb")]),
-    );
+    let options = option_store([(
+        ScopeSelector::Global,
+        OptionName::TerminalOverrides,
+        "dumb*:Ss=\\033[%p1%d q",
+        SetOptionMode::Append,
+    )]);
+    let terminal = resolve_term(&options, "dumb");
 
     let style = terminal
         .render_cursor_style(2)
@@ -944,14 +756,13 @@ fn override_with_octal_encoded_value_resolves_correctly() {
 
 #[test]
 fn split_override_segments_handles_escaped_colons_and_empty_segments() {
-    let segments = super::split_override_segments("a::b:c");
-    assert_eq!(segments, vec!["a:b", "c"]);
-
-    let segments = super::split_override_segments("pattern:");
-    assert_eq!(segments, vec!["pattern", ""]);
-
-    let segments = super::split_override_segments("");
-    assert_eq!(segments, vec![""]);
+    for (entry, expected) in [
+        ("a::b:c", vec!["a:b", "c"]),
+        ("pattern:", vec!["pattern", ""]),
+        ("", vec![""]),
+    ] {
+        assert_eq!(super::split_override_segments(entry), expected);
+    }
 }
 
 #[test]
@@ -963,19 +774,11 @@ fn empty_term_skips_feature_and_override_matching() {
 
 #[test]
 fn sync_wrapper_passes_through_empty_frames() {
-    let mut options = OptionStore::new();
-    options
-        .set(
-            ScopeSelector::Global,
-            OptionName::TerminalFeatures,
-            "xterm*:sync".to_owned(),
-            SetOptionMode::Append,
-        )
-        .expect("terminal-features append succeeds");
-    let terminal = OuterTerminal::resolve(
-        &options,
-        OuterTerminalContext::from_pairs(&[("TERM", "xterm-256color")]),
-    );
+    let terminal = xterm_with([(
+        OptionName::TerminalFeatures,
+        "xterm*:sync",
+        SetOptionMode::Append,
+    )]);
     let wrapped = terminal.wrap_render_frame(b"");
     assert!(wrapped.is_empty());
 }
@@ -990,30 +793,22 @@ fn sanitize_osc_payload_strips_bel_and_esc() {
 
 #[test]
 fn base64_encoding_edge_cases() {
-    assert_eq!(super::encode_base64(b""), "");
-    assert_eq!(super::encode_base64(b"f"), "Zg==");
-    assert_eq!(super::encode_base64(b"fo"), "Zm8=");
-    assert_eq!(super::encode_base64(b"foo"), "Zm9v");
-    assert_eq!(super::encode_base64(b"foob"), "Zm9vYg==");
-    assert_eq!(super::encode_base64(b"fooba"), "Zm9vYmE=");
-    assert_eq!(super::encode_base64(b"foobar"), "Zm9vYmFy");
+    for (input, expected) in [
+        ("", ""),
+        ("f", "Zg=="),
+        ("fo", "Zm8="),
+        ("foo", "Zm9v"),
+        ("foob", "Zm9vYg=="),
+        ("fooba", "Zm9vYmE="),
+        ("foobar", "Zm9vYmFy"),
+    ] {
+        assert_eq!(super::encode_base64(input.as_bytes()), expected);
+    }
 }
 
 #[test]
 fn clipboard_encoding_rejects_empty_bytes() {
-    let mut options = OptionStore::new();
-    options
-        .set(
-            ScopeSelector::Global,
-            OptionName::SetClipboard,
-            "on".to_owned(),
-            SetOptionMode::Replace,
-        )
-        .expect("set-clipboard set succeeds");
-    let terminal = OuterTerminal::resolve(
-        &options,
-        OuterTerminalContext::from_pairs(&[("TERM", "xterm-256color")]),
-    );
+    let terminal = xterm_with([(OptionName::SetClipboard, "on", SetOptionMode::Replace)]);
     assert!(terminal.encode_forced_clipboard_set(b"").is_none());
 }
 
@@ -1026,36 +821,20 @@ fn colour_to_rgb_none_default_terminal_return_none() {
 
 #[test]
 fn colour_to_rgb_256_palette_boundaries() {
-    // Index 0 = basic black
-    assert_eq!(
-        super::colour_to_rgb(super::COLOUR_FLAG_256),
-        Some((0, 0, 0))
-    );
-    // Index 15 = basic bright white
-    assert_eq!(
-        super::colour_to_rgb(super::COLOUR_FLAG_256 | 15),
-        Some((255, 255, 255))
-    );
-    // Index 16 = first cube colour (black)
-    assert_eq!(
-        super::colour_to_rgb(super::COLOUR_FLAG_256 | 16),
-        Some((0, 0, 0))
-    );
-    // Index 231 = last cube colour (white)
-    assert_eq!(
-        super::colour_to_rgb(super::COLOUR_FLAG_256 | 231),
-        Some((255, 255, 255))
-    );
-    // Index 232 = first greyscale
-    assert_eq!(
-        super::colour_to_rgb(super::COLOUR_FLAG_256 | 232),
-        Some((8, 8, 8))
-    );
-    // Index 255 = last greyscale
-    assert_eq!(
-        super::colour_to_rgb(super::COLOUR_FLAG_256 | 255),
-        Some((238, 238, 238))
-    );
+    for (index, rgb) in [
+        (0, (0, 0, 0)),         // basic black
+        (15, (255, 255, 255)),  // basic bright white
+        (16, (0, 0, 0)),        // first cube colour (black)
+        (231, (255, 255, 255)), // last cube colour (white)
+        (232, (8, 8, 8)),       // first greyscale
+        (255, (238, 238, 238)), // last greyscale
+    ] {
+        assert_eq!(
+            super::colour_to_rgb(super::COLOUR_FLAG_256 | index),
+            Some(rgb),
+            "index {index}"
+        );
+    }
 }
 
 #[test]
@@ -1068,120 +847,75 @@ fn colour_to_rgb_bright_ansi_colours() {
 
 #[test]
 fn transition_sequence_emits_disable_then_enable_on_change() {
-    let mut options = OptionStore::new();
-    options
-        .set(
-            ScopeSelector::Global,
-            OptionName::FocusEvents,
-            "on".to_owned(),
-            SetOptionMode::Replace,
-        )
-        .expect("focus-events set succeeds");
-
-    let with_focus = OuterTerminal::resolve_for_session(
-        &options,
-        Some(&session_name("alpha")),
-        OuterTerminalContext::from_pairs(&[("TERM", "xterm-256color")]),
-    );
-    let without_focus = OuterTerminal::resolve_for_session(
-        &OptionStore::new(),
-        Some(&session_name("alpha")),
-        OuterTerminalContext::from_pairs(&[("TERM", "xterm-256color")]),
-    );
+    let options = option_store([(
+        ScopeSelector::Global,
+        OptionName::FocusEvents,
+        "on",
+        SetOptionMode::Replace,
+    )]);
+    let with_focus = resolve_alpha(&options, xterm_context());
+    let without_focus = resolve_alpha(&OptionStore::new(), xterm_context());
 
     // Transition from focus-enabled to focus-disabled should emit disable.
-    let seq = String::from_utf8(without_focus.transition_sequence_from(&with_focus)).expect("utf8");
+    let seq = utf8(without_focus.transition_sequence_from(&with_focus));
     assert!(seq.contains("\u{1b}[?1004l"));
 
     // Transition from focus-disabled to focus-enabled should emit enable.
-    let seq = String::from_utf8(with_focus.transition_sequence_from(&without_focus)).expect("utf8");
+    let seq = utf8(with_focus.transition_sequence_from(&without_focus));
     assert!(seq.contains("\u{1b}[?1004h"));
 }
 
 #[test]
 fn transition_sequence_toggles_mouse_reporting_with_session_scope() {
-    let mut options = OptionStore::new();
-    options
-        .set(
-            ScopeSelector::Global,
-            OptionName::Mouse,
-            "on".to_owned(),
-            SetOptionMode::Replace,
-        )
-        .expect("mouse set succeeds");
+    let options = option_store([(
+        ScopeSelector::Global,
+        OptionName::Mouse,
+        "on",
+        SetOptionMode::Replace,
+    )]);
+    let enabled = resolve_alpha(&options, xterm_context());
+    let disabled = resolve_alpha(&OptionStore::new(), xterm_context());
 
-    let enabled = OuterTerminal::resolve_for_session(
-        &options,
-        Some(&session_name("alpha")),
-        OuterTerminalContext::from_pairs(&[("TERM", "xterm-256color")]),
-    );
-    let disabled = OuterTerminal::resolve_for_session(
-        &OptionStore::new(),
-        Some(&session_name("alpha")),
-        OuterTerminalContext::from_pairs(&[("TERM", "xterm-256color")]),
-    );
+    let seq = utf8(disabled.transition_sequence_from(&enabled));
+    assert_contains_all(&seq, &MOUSE_DISABLE_PARTS);
 
-    let seq = String::from_utf8(disabled.transition_sequence_from(&enabled)).expect("utf8");
-    assert!(seq.contains("\u{1b}[?1000l"));
-    assert!(seq.contains("\u{1b}[?1002l"));
-    assert!(seq.contains("\u{1b}[?1006l"));
-    assert!(seq.contains(MOUSE_DISABLE_SEQUENCE));
-
-    let seq = String::from_utf8(enabled.transition_sequence_from(&disabled)).expect("utf8");
-    assert!(seq.contains("\u{1b}[?1006h"));
-    assert!(seq.contains("\u{1b}[?1002h"));
-    assert!(seq.contains("\u{1b}[?1000h"));
-    assert!(seq.contains(MOUSE_ENABLE_SEQUENCE));
+    let seq = utf8(enabled.transition_sequence_from(&disabled));
+    assert_contains_all(&seq, &MOUSE_ENABLE_PARTS);
 }
 
 #[test]
 fn parse_capability_override_edge_cases() {
-    // Bare name (no = or @)
-    let (name, value, remove) = super::parse_capability_override("Tc").unwrap();
-    assert_eq!(name, "Tc");
-    assert!(value.is_none());
-    assert!(!remove);
-
-    // Remove with @
-    let (name, value, remove) = super::parse_capability_override("AX@").unwrap();
-    assert_eq!(name, "AX");
-    assert!(value.is_none());
-    assert!(remove);
-
-    // Value with =
-    let (name, value, remove) = super::parse_capability_override("Ss=\\E[q").unwrap();
-    assert_eq!(name, "Ss");
-    assert_eq!(value, Some("\\E[q"));
-    assert!(!remove);
+    for (spec, expected_name, expected_value, expected_remove) in [
+        // Bare name (no = or @)
+        ("Tc", "Tc", None, false),
+        // Remove with @
+        ("AX@", "AX", None, true),
+        // Value with =
+        ("Ss=\\E[q", "Ss", Some("\\E[q"), false),
+        // Whitespace trimmed
+        ("  Tc  ", "Tc", None, false),
+    ] {
+        let (name, value, remove) = super::parse_capability_override(spec).unwrap();
+        assert_eq!(name, expected_name, "{spec:?}");
+        assert_eq!(value, expected_value, "{spec:?}");
+        assert_eq!(remove, expected_remove, "{spec:?}");
+    }
 
     // Empty string
     assert!(super::parse_capability_override("").is_none());
-
-    // Whitespace trimmed
-    let (name, value, remove) = super::parse_capability_override("  Tc  ").unwrap();
-    assert_eq!(name, "Tc");
-    assert!(value.is_none());
-    assert!(!remove);
 }
 
 #[test]
 fn override_removal_wins_over_xt_reintroduction() {
     // XT triggers bpaste/focus/title, but if an explicit Enbp@ override
     // removes bpaste, the second override pass must honour the removal.
-    let mut options = OptionStore::new();
-    options
-        .set(
-            ScopeSelector::Global,
-            OptionName::TerminalOverrides,
-            "custom*:XT:Enbp@:Dsbp@".to_owned(),
-            SetOptionMode::Append,
-        )
-        .expect("terminal-overrides append succeeds");
-
-    let terminal = OuterTerminal::resolve(
-        &options,
-        OuterTerminalContext::from_pairs(&[("TERM", "custom-term")]),
-    );
+    let options = option_store([(
+        ScopeSelector::Global,
+        OptionName::TerminalOverrides,
+        "custom*:XT:Enbp@:Dsbp@",
+        SetOptionMode::Append,
+    )]);
+    let terminal = resolve_term(&options, "custom-term");
 
     let features = terminal.features_string();
     // XT should enable focus and title.
@@ -1199,20 +933,13 @@ fn override_removal_wins_over_tc_rgb() {
     // Tc triggers RGB, but if AX@ removes default_colours, RGB should
     // still be set (Tc only controls RGB, not AX). Verify Tc works and
     // AX@ is independent.
-    let mut options = OptionStore::new();
-    options
-        .set(
-            ScopeSelector::Global,
-            OptionName::TerminalOverrides,
-            "plain*:Tc:AX@".to_owned(),
-            SetOptionMode::Append,
-        )
-        .expect("terminal-overrides append succeeds");
-
-    let terminal = OuterTerminal::resolve(
-        &options,
-        OuterTerminalContext::from_pairs(&[("TERM", "plain-term")]),
-    );
+    let options = option_store([(
+        ScopeSelector::Global,
+        OptionName::TerminalOverrides,
+        "plain*:Tc:AX@",
+        SetOptionMode::Append,
+    )]);
+    let terminal = resolve_term(&options, "plain-term");
 
     let features = terminal.features_string();
     assert!(features.contains("RGB"), "Tc should enable RGB");

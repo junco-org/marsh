@@ -1,6 +1,7 @@
+use super::lifecycle::kill_window;
 use super::*;
 use crate::pane_io::PaneExitEvent;
-use rmux_proto::{OptionScopeSelector, PaneKillRequest, SetHookRequest, SetOptionByNameRequest};
+use rmux_proto::{OptionScopeSelector, PaneKillRequest, SetHookRequest};
 
 const RENUMBER_MARKER: &str = "@renumber-metadata";
 
@@ -26,50 +27,40 @@ async fn set_renumber_metadata(
     marker: &str,
     hook_command: &str,
 ) {
-    let option = handler
-        .handle(Request::SetOptionByName(Box::new(SetOptionByNameRequest {
-            scope: OptionScopeSelector::Window(target.clone()),
-            name: RENUMBER_MARKER.to_owned(),
-            value: Some(marker.to_owned()),
-            mode: SetOptionMode::Replace,
-            only_if_unset: false,
-            unset: false,
-            unset_pane_overrides: false,
-            format: false,
-            format_target: None,
-        })))
+    handler
+        .set_option_by_name(
+            OptionScopeSelector::Window(target.clone()),
+            RENUMBER_MARKER,
+            marker,
+        )
         .await;
-    assert!(matches!(option, Response::SetOptionByName(_)), "{option:?}");
+    handler
+        .handle_ok(SetHookRequest::fixture((
+            ScopeSelector::Window(target),
+            HookName::WindowLayoutChanged,
+            hook_command,
+        )))
+        .await;
+}
 
-    let hook = handler
-        .handle(Request::SetHook(SetHookRequest {
-            scope: ScopeSelector::Window(target),
-            hook: HookName::WindowLayoutChanged,
-            command: hook_command.to_owned(),
-            lifecycle: HookLifecycle::Persistent,
-        }))
+async fn enable_renumber_windows(handler: &RequestHandler, session: &SessionName) {
+    handler
+        .set_option(
+            ScopeSelector::Session(session.clone()),
+            OptionName::RenumberWindows,
+            "on",
+        )
         .await;
-    assert!(matches!(hook, Response::SetHook(_)), "{hook:?}");
 }
 
 async fn renumber_metadata_fixture(
     handler: &RequestHandler,
     label: &str,
 ) -> RenumberMetadataFixture {
-    let session_name = session_name(label);
-    create_session(handler, session_name.as_str()).await;
+    let session_name = create_session(handler, label).await;
     insert_window(handler, &session_name, 1).await;
     insert_window(handler, &session_name, 2).await;
-
-    let set_renumber = handler
-        .handle(Request::SetOption(SetOptionRequest {
-            scope: ScopeSelector::Session(session_name.clone()),
-            option: OptionName::RenumberWindows,
-            value: "on".to_owned(),
-            mode: SetOptionMode::Replace,
-        }))
-        .await;
-    assert!(matches!(set_renumber, Response::SetOption(_)));
+    enable_renumber_windows(handler, &session_name).await;
 
     set_renumber_metadata(
         handler,
@@ -85,13 +76,12 @@ async fn renumber_metadata_fixture(
         "display-message survivor-hook",
     )
     .await;
-    let renamed = handler
-        .handle(Request::RenameWindow(RenameWindowRequest {
+    handler
+        .handle_ok(RenameWindowRequest {
             target: WindowTarget::with_window(session_name.clone(), 2),
             name: "surviving-name".to_owned(),
-        }))
+        })
         .await;
-    assert!(matches!(renamed, Response::RenameWindow(_)), "{renamed:?}");
 
     let state = handler.state.lock().await;
     let session = state
@@ -168,33 +158,14 @@ async fn assert_surviving_renumber_metadata(
 #[tokio::test]
 async fn kill_window_renumbers_when_session_option_is_enabled() {
     let handler = RequestHandler::new();
-    let alpha = session_name("alpha");
-    create_session(&handler, "alpha").await;
+    let alpha = create_session(&handler, "alpha").await;
     insert_window(&handler, &alpha, 1).await;
     insert_window(&handler, &alpha, 2).await;
-
-    let set_renumber = handler
-        .handle(Request::SetOption(SetOptionRequest {
-            scope: ScopeSelector::Session(alpha.clone()),
-            option: OptionName::RenumberWindows,
-            value: "on".to_owned(),
-            mode: SetOptionMode::Replace,
-        }))
-        .await;
-    assert!(matches!(set_renumber, Response::SetOption(_)));
-
-    let response = handler
-        .handle(Request::KillWindow(KillWindowRequest {
-            target: WindowTarget::with_window(alpha.clone(), 1),
-            kill_all_others: false,
-        }))
-        .await;
+    enable_renumber_windows(&handler, &alpha).await;
 
     assert_eq!(
-        response,
-        Response::KillWindow(rmux_proto::KillWindowResponse {
-            target: WindowTarget::with_window(alpha.clone(), 0),
-        })
+        kill_window(&handler, &alpha, 1).await,
+        WindowTarget::with_window(alpha.clone(), 0)
     );
 
     let state = handler.state.lock().await;
@@ -214,28 +185,17 @@ async fn kill_last_pane_renumbers_when_session_option_is_enabled() {
     // tmux 3.7b, measured on 2026-07-26: killing the only pane in window 1
     // closes that window and renumbers the surviving 0/2 slots to 0/1.
     let handler = RequestHandler::new();
-    let alpha = session_name("kill-pane-renumber");
-    create_session(&handler, alpha.as_str()).await;
+    let alpha = create_session(&handler, "kill-pane-renumber").await;
     insert_window(&handler, &alpha, 1).await;
     insert_window(&handler, &alpha, 2).await;
+    enable_renumber_windows(&handler, &alpha).await;
 
-    let set_renumber = handler
-        .handle(Request::SetOption(SetOptionRequest {
-            scope: ScopeSelector::Session(alpha.clone()),
-            option: OptionName::RenumberWindows,
-            value: "on".to_owned(),
-            mode: SetOptionMode::Replace,
-        }))
-        .await;
-    assert!(matches!(set_renumber, Response::SetOption(_)));
-
-    let response = handler
-        .handle(Request::KillPane(KillPaneRequest {
+    handler
+        .handle_ok(KillPaneRequest {
             target: PaneTarget::with_window(alpha.clone(), 1, 0),
             kill_all_except: false,
-        }))
+        })
         .await;
-    assert!(matches!(response, Response::KillPane(_)), "{response:?}");
 
     let state = handler.state.lock().await;
     let session = state.sessions.session(&alpha).expect("session survives");
@@ -250,13 +210,12 @@ async fn kill_last_pane_discards_removed_metadata_before_renumbering_survivor() 
     let handler = RequestHandler::new();
     let fixture = renumber_metadata_fixture(&handler, "kill-pane-renumber-metadata").await;
 
-    let response = handler
-        .handle(Request::KillPane(KillPaneRequest {
+    handler
+        .handle_ok(KillPaneRequest {
             target: fixture.removed_pane.clone(),
             kill_all_except: false,
-        }))
+        })
         .await;
-    assert!(matches!(response, Response::KillPane(_)), "{response:?}");
 
     assert_surviving_renumber_metadata(&handler, &fixture).await;
 }
@@ -302,43 +261,27 @@ async fn natural_last_pane_exit_preserves_surviving_metadata_when_window_is_renu
 #[tokio::test]
 async fn kill_last_linked_pane_renumbers_each_surviving_session() {
     let handler = RequestHandler::new();
-    let owner = session_name("kill-linked-pane-renumber-owner");
-    let alias = session_name("kill-linked-pane-renumber-alias");
-    create_session(&handler, owner.as_str()).await;
+    let owner = create_session(&handler, "kill-linked-pane-renumber-owner").await;
     insert_window(&handler, &owner, 1).await;
     insert_window(&handler, &owner, 2).await;
-    create_session(&handler, alias.as_str()).await;
+    let alias = create_session(&handler, "kill-linked-pane-renumber-alias").await;
 
-    let linked = handler
-        .handle(Request::LinkWindow(LinkWindowRequest {
-            source: WindowTarget::with_window(owner.clone(), 1),
-            target: WindowTarget::with_window(alias.clone(), 9),
-            after: false,
-            before: false,
-            kill_destination: false,
-            detached: true,
-        }))
+    handler
+        .handle_ok(LinkWindowRequest::fixture((
+            WindowTarget::with_window(owner.clone(), 1),
+            WindowTarget::with_window(alias.clone(), 9),
+        )))
         .await;
-    assert!(matches!(linked, Response::LinkWindow(_)), "{linked:?}");
     for session_name in [&owner, &alias] {
-        let response = handler
-            .handle(Request::SetOption(SetOptionRequest {
-                scope: ScopeSelector::Session(session_name.clone()),
-                option: OptionName::RenumberWindows,
-                value: "on".to_owned(),
-                mode: SetOptionMode::Replace,
-            }))
-            .await;
-        assert!(matches!(response, Response::SetOption(_)), "{response:?}");
+        enable_renumber_windows(&handler, session_name).await;
     }
 
-    let response = handler
-        .handle(Request::KillPane(KillPaneRequest {
+    handler
+        .handle_ok(KillPaneRequest {
             target: PaneTarget::with_window(owner.clone(), 1, 0),
             kill_all_except: false,
-        }))
+        })
         .await;
-    assert!(matches!(response, Response::KillPane(_)), "{response:?}");
 
     let state = handler.state.lock().await;
     assert_eq!(
@@ -381,22 +324,13 @@ async fn active_low_window_removals_select_oracle_stable_fallback_after_renumber
     .enumerate()
     {
         let handler = RequestHandler::new();
-        let alpha = session_name(&format!("oracle-fallback-{case_index}"));
-        create_session(&handler, alpha.as_str()).await;
+        let alpha = create_session(&handler, format!("oracle-fallback-{case_index}")).await;
         handler
             .wait_for_pane_startup_to_finish_for_test(&PaneTarget::with_window(alpha.clone(), 0, 0))
             .await;
         insert_window(&handler, &alpha, 1).await;
         insert_window(&handler, &alpha, 2).await;
-        let set_renumber = handler
-            .handle(Request::SetOption(SetOptionRequest {
-                scope: ScopeSelector::Session(alpha.clone()),
-                option: OptionName::RenumberWindows,
-                value: "on".to_owned(),
-                mode: SetOptionMode::Replace,
-            }))
-            .await;
-        assert!(matches!(set_renumber, Response::SetOption(_)));
+        enable_renumber_windows(&handler, &alpha).await;
 
         let (removed_pane_id, expected_window_id) = {
             let state = handler.state.lock().await;
@@ -435,10 +369,9 @@ async fn active_low_window_removals_select_oracle_stable_fallback_after_renumber
             ),
             OracleActiveWindowRemoval::KillWindow => Some(
                 handler
-                    .handle(Request::KillWindow(KillWindowRequest {
-                        target: WindowTarget::with_window(alpha.clone(), 0),
-                        kill_all_others: false,
-                    }))
+                    .handle(Request::KillWindow(KillWindowRequest::fixture(
+                        WindowTarget::with_window(alpha.clone(), 0),
+                    )))
                     .await,
             ),
             OracleActiveWindowRemoval::UnlinkWindowKill => Some(
@@ -495,34 +428,19 @@ async fn active_low_window_removals_select_oracle_stable_fallback_after_renumber
 #[tokio::test]
 async fn linked_and_grouped_removal_preserves_each_oracle_window_identity() {
     let handler = RequestHandler::new();
-    let owner = session_name("oracle-linked-owner");
-    let linked_peer = session_name("oracle-linked-peer");
-    create_session(&handler, owner.as_str()).await;
+    let owner = create_session(&handler, "oracle-linked-owner").await;
     insert_window(&handler, &owner, 1).await;
     insert_window(&handler, &owner, 2).await;
-    create_session(&handler, linked_peer.as_str()).await;
+    let linked_peer = create_session(&handler, "oracle-linked-peer").await;
     insert_window(&handler, &linked_peer, 1).await;
-    let linked = handler
-        .handle(Request::LinkWindow(LinkWindowRequest {
-            source: WindowTarget::with_window(owner.clone(), 0),
-            target: WindowTarget::with_window(linked_peer.clone(), 9),
-            after: false,
-            before: false,
-            kill_destination: false,
-            detached: true,
-        }))
+    handler
+        .handle_ok(LinkWindowRequest::fixture((
+            WindowTarget::with_window(owner.clone(), 0),
+            WindowTarget::with_window(linked_peer.clone(), 9),
+        )))
         .await;
-    assert!(matches!(linked, Response::LinkWindow(_)), "{linked:?}");
     for session in [&owner, &linked_peer] {
-        let response = handler
-            .handle(Request::SetOption(SetOptionRequest {
-                scope: ScopeSelector::Session(session.clone()),
-                option: OptionName::RenumberWindows,
-                value: "on".to_owned(),
-                mode: SetOptionMode::Replace,
-            }))
-            .await;
-        assert!(matches!(response, Response::SetOption(_)), "{response:?}");
+        enable_renumber_windows(&handler, session).await;
     }
     let (removed_pane_id, expected_owner_id, linked_peer_active_id) = {
         let state = handler.state.lock().await;
@@ -575,12 +493,11 @@ async fn linked_and_grouped_removal_preserves_each_oracle_window_identity() {
     }
 
     let grouped_handler = RequestHandler::new();
-    let grouped_owner = session_name("oracle-group-owner");
-    let grouped_peer = session_name("oracle-group-peer");
-    create_session(&grouped_handler, grouped_owner.as_str()).await;
+    let grouped_owner = create_session(&grouped_handler, "oracle-group-owner").await;
     insert_window(&grouped_handler, &grouped_owner, 1).await;
     insert_window(&grouped_handler, &grouped_owner, 2).await;
-    create_grouped_session(&grouped_handler, grouped_peer.as_str(), &grouped_owner).await;
+    let grouped_peer =
+        create_grouped_session(&grouped_handler, "oracle-group-peer", &grouped_owner).await;
     let (grouped_pane_id, expected_grouped_id) = {
         let state = grouped_handler.state.lock().await;
         let session = state

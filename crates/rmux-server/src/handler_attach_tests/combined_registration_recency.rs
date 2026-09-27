@@ -12,10 +12,8 @@
 
 use super::*;
 
-use super::switch_frame_geometry::{
-    register_declared_attach, set_window_size_policy, window_content_size,
-};
-use rmux_core::SessionRecency;
+use super::sizeless_geometry::{attached_client_size_is_inferred, register_sizeless_attach};
+use super::switch_frame_geometry::{attach_generation_id, window_content_size};
 
 // This module's own pid block, distinct from every sibling module's.
 const SIZELESS_PID: u32 = 94_301;
@@ -40,17 +38,6 @@ const HIGH_SEQUENCE_SIZE: TerminalSize = TerminalSize {
     rows: 50,
 };
 
-async fn session_recency(handler: &RequestHandler, session: &SessionName) -> SessionRecency {
-    handler
-        .state
-        .lock()
-        .await
-        .sessions
-        .session(session)
-        .expect("session exists")
-        .recency()
-}
-
 async fn attached_size_sequence(handler: &RequestHandler, attach_pid: u32) -> u64 {
     handler
         .active_attach
@@ -60,52 +47,6 @@ async fn attached_size_sequence(handler: &RequestHandler, attach_pid: u32) -> u6
         .get(&attach_pid)
         .expect("the attached client is registered")
         .size_sequence
-}
-
-async fn attached_size_is_inferred(handler: &RequestHandler, attach_pid: u32) -> bool {
-    handler
-        .active_attach
-        .lock()
-        .await
-        .by_pid
-        .get(&attach_pid)
-        .expect("the attached client is registered")
-        .client_size_is_inferred()
-}
-
-async fn attached_generation_id(handler: &RequestHandler, attach_pid: u32) -> u64 {
-    handler
-        .active_attach
-        .lock()
-        .await
-        .by_pid
-        .get(&attach_pid)
-        .expect("the attached client is registered")
-        .id
-}
-
-async fn create_detached_session(handler: &RequestHandler, session: &SessionName) {
-    let created = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name: session.clone(),
-            detached: true,
-            size: Some(ANCHOR_SIZE),
-            environment: None,
-        }))
-        .await;
-    assert!(matches!(created, Response::NewSession(_)), "{created:?}");
-}
-
-async fn set_session_status(handler: &RequestHandler, session: &SessionName, value: &str) {
-    let response = handler
-        .handle(Request::SetOption(SetOptionRequest {
-            scope: ScopeSelector::Session(session.clone()),
-            option: OptionName::Status,
-            value: value.to_owned(),
-            mode: SetOptionMode::Replace,
-        }))
-        .await;
-    assert!(matches!(response, Response::SetOption(_)), "{response:?}");
 }
 
 async fn pin_public_times(handler: &RequestHandler, sessions: &[&SessionName]) {
@@ -132,39 +73,16 @@ async fn pin_public_times(handler: &RequestHandler, sessions: &[&SessionName]) {
 async fn promoting_an_inferred_client_size_does_not_touch_session_recency() {
     let handler = RequestHandler::new();
     let session = session_name("combined-promotion");
-    create_detached_session(&handler, &session).await;
+    handler.create_session((&session, ANCHOR_SIZE)).await;
     // A status line makes outer terminal geometry and content geometry differ,
     // which is the whole reason the inferred anchor is typed in the first place.
-    set_session_status(&handler, &session, "2").await;
+    handler.set_session_status(&session, "2").await;
 
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let uid = current_owner_uid();
-    handler
-        .register_attach_with_access(
-            SIZELESS_PID,
-            session.clone(),
-            None,
-            AttachRegistration {
-                control_tx,
-                control_backlog: Arc::new(AtomicUsize::new(0)),
-                closing: Arc::new(AtomicBool::new(false)),
-                persistent_overlay_epoch: Arc::new(AtomicU64::new(0)),
-                terminal_context: OuterTerminalContext::default(),
-                client_title: None,
-                flags: super::super::attach_support::ClientFlags::default(),
-                render_stream: false,
-                uid,
-                user: rmux_os::identity::UserIdentity::Uid(uid),
-                can_write: true,
-                // No declared geometry: this is the sizeless client M9 anchors.
-                client_size: None,
-            },
-        )
-        .await
-        .expect("sizeless attach registration succeeds");
+    // No declared geometry: this is the sizeless client M9 anchors.
+    let _control_rx = register_sizeless_attach(&handler, SIZELESS_PID, &session).await;
 
     assert!(
-        attached_size_is_inferred(&handler, SIZELESS_PID).await,
+        attached_client_size_is_inferred(&handler, SIZELESS_PID).await,
         "a client that declared no size must be anchored, not trusted"
     );
     let sequence_before = attached_size_sequence(&handler, SIZELESS_PID).await;
@@ -178,7 +96,7 @@ async fn promoting_an_inferred_client_size_does_not_touch_session_recency() {
         .expect("promoting resize succeeds");
 
     assert!(
-        !attached_size_is_inferred(&handler, SIZELESS_PID).await,
+        !attached_client_size_is_inferred(&handler, SIZELESS_PID).await,
         "a real resize leaves no inferred provenance behind"
     );
     assert!(
@@ -207,8 +125,8 @@ async fn registration_credits_recency_once_across_a_concurrent_same_pid_replacem
     let handler = Arc::new(RequestHandler::new());
     let used = session_name("combined-used");
     let rival = session_name("combined-rival");
-    create_detached_session(&handler, &used).await;
-    create_detached_session(&handler, &rival).await;
+    handler.create_session((&used, ANCHOR_SIZE)).await;
+    handler.create_session((&rival, ANCHOR_SIZE)).await;
 
     // Park the first registration on M39's own credit seam, after publication
     // and before the credit.
@@ -228,9 +146,9 @@ async fn registration_credits_recency_once_across_a_concurrent_same_pid_replacem
     // The same pid re-registers as a brand-new generation with a legitimate
     // declared vote. This is the replacement the stale registration must not
     // speak for.
-    let _replacement_rx =
-        register_declared_attach(&handler, STALE_PID, &used, HIGH_SEQUENCE_SIZE).await;
-    let replacement_generation = attached_generation_id(&handler, STALE_PID).await;
+    let (_, _replacement_rx) =
+        register_sized_attach(&handler, STALE_PID, &used, HIGH_SEQUENCE_SIZE).await;
+    let replacement_generation = attach_generation_id(&handler, STALE_PID).await;
     let replacement_sequence = attached_size_sequence(&handler, STALE_PID).await;
 
     // Attaching to the rival makes it the most recently used session. It also
@@ -238,7 +156,8 @@ async fn registration_credits_recency_once_across_a_concurrent_same_pid_replacem
     // prefers an unattached session over a more recent one, so leaving the
     // rival unattached would let it win on that preference alone and the
     // assertion below would hold whatever the credit did.
-    let _rival_rx = register_declared_attach(&handler, RIVAL_PID, &rival, LOW_SEQUENCE_SIZE).await;
+    let (_, _rival_rx) =
+        register_sized_attach(&handler, RIVAL_PID, &rival, LOW_SEQUENCE_SIZE).await;
     // Pin every public second so only the recency token can order the answer.
     pin_public_times(&handler, &[&used, &rival]).await;
 
@@ -258,7 +177,7 @@ async fn registration_credits_recency_once_across_a_concurrent_same_pid_replacem
          fire and push its session back to the front"
     );
     assert_eq!(
-        attached_generation_id(&handler, STALE_PID).await,
+        attach_generation_id(&handler, STALE_PID).await,
         replacement_generation,
         "the replacement must still own the pid"
     );
@@ -295,16 +214,16 @@ async fn destroy_rehome_orders_clients_by_captured_size_sequence_and_sessions_by
     let older = session_name("combined-a-older");
     let newer = session_name("combined-z-newer");
     for session in [&doomed, &older, &newer] {
-        create_detached_session(&handler, session).await;
+        handler.create_session((session, ANCHOR_SIZE)).await;
         // No status line, so a client's outer terminal geometry and the
         // window's content geometry are the same number and the assertion below
         // reads as the client that owns the window.
-        set_session_status(&handler, session, "off").await;
+        handler.set_session_status(session, "off").await;
     }
-    set_window_size_policy(&handler, &newer, 0, "latest").await;
+    handler.set_window_size_policy(&newer, 0, "latest").await;
     // `off` is the "do not detach, switch to the most recently used session"
     // policy, which is the one that ranks survivors by recency.
-    set_detach_on_destroy(&handler, &doomed, "off").await;
+    handler.set_detach_on_destroy_for_test(&doomed, "off").await;
 
     // `newer` is the most recently used survivor, by token alone.
     {
@@ -320,10 +239,10 @@ async fn destroy_rehome_orders_clients_by_captured_size_sequence_and_sessions_by
     pin_public_times(&handler, &[&doomed, &older, &newer]).await;
 
     // Registered first, so this client holds the *lower* attach id.
-    let mut first_rx =
-        register_declared_attach(&handler, FIRST_REHOME_PID, &doomed, HIGH_SEQUENCE_SIZE).await;
-    let mut second_rx =
-        register_declared_attach(&handler, SECOND_REHOME_PID, &doomed, LOW_SEQUENCE_SIZE).await;
+    let (_, mut first_rx) =
+        register_sized_attach(&handler, FIRST_REHOME_PID, &doomed, HIGH_SEQUENCE_SIZE).await;
+    let (_, mut second_rx) =
+        register_sized_attach(&handler, SECOND_REHOME_PID, &doomed, LOW_SEQUENCE_SIZE).await;
 
     // A switch to the session the client is already on still renews its sizing
     // order, which is how each client gets a `size_sequence` assigned by a real
@@ -354,15 +273,7 @@ async fn destroy_rehome_orders_clients_by_captured_size_sequence_and_sessions_by
     drain_attach_controls(&mut first_rx);
     drain_attach_controls(&mut second_rx);
 
-    let killed = handler
-        .handle(Request::KillSession(KillSessionRequest {
-            target: doomed.clone(),
-            kill_all_except_target: false,
-            clear_alerts: false,
-            kill_group: false,
-        }))
-        .await;
-    assert!(matches!(killed, Response::KillSession(_)), "{killed:?}");
+    handler.handle_ok(KillSessionRequest::fixture(doomed)).await;
 
     // Sessions ranked by recency: both clients land on the survivor that was
     // used last, not the one that sorts first or was created first.
@@ -383,19 +294,4 @@ async fn destroy_rehome_orders_clients_by_captured_size_sequence_and_sessions_by
         HIGH_SEQUENCE_SIZE,
         "the rehome order must follow the captured sizing order, not the attach ids"
     );
-}
-
-async fn set_detach_on_destroy(handler: &RequestHandler, session: &SessionName, value: &str) {
-    handler
-        .state
-        .lock()
-        .await
-        .options
-        .set(
-            ScopeSelector::Session(session.clone()),
-            OptionName::DetachOnDestroy,
-            value.to_owned(),
-            SetOptionMode::Replace,
-        )
-        .expect("detach-on-destroy policy is valid");
 }

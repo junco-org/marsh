@@ -5,14 +5,14 @@ use std::time::{Duration, Instant};
 mod common;
 
 use common::{
-    session_name, start_server, tty_size, wait_for_socket_removal, ClientConnection, TestHarness,
-    PTY_TEST_LOCK,
+    session_name, start_server, tty_size, wait_for_socket_removal, ClientConnection, Fixture,
+    TestHarness, PTY_TEST_LOCK,
 };
 use rmux_proto::{
     HasSessionRequest, KillPaneRequest, LayoutName, ListPanesRequest, NewSessionExtRequest,
-    NewSessionRequest, NewWindowRequest, PaneTarget, ProcessCommand, Request, ResizePaneAdjustment,
-    Response, SelectLayoutRequest, SelectLayoutTarget, SelectPaneRequest, SelectWindowRequest,
-    SessionName, SplitWindowRequest, SplitWindowTarget, TerminalSize, WindowTarget,
+    NewWindowRequest, PaneTarget, ProcessCommand, Request, ResizePaneAdjustment, Response,
+    SelectLayoutRequest, SelectLayoutTarget, SelectPaneRequest, SelectWindowRequest, SessionName,
+    SplitDirection, SplitWindowRequest, TerminalSize, WindowTarget,
 };
 
 #[tokio::test(flavor = "multi_thread")]
@@ -25,12 +25,7 @@ async fn pane_management_requests_round_trip_through_the_socket() -> Result<(), 
     let session = session_name("alpha");
 
     let missing_split = client
-        .send_request(&Request::SplitWindow(SplitWindowRequest {
-            target: SplitWindowTarget::Session(session_name("missing")),
-            direction: rmux_proto::SplitDirection::Vertical,
-            before: false,
-            environment: None,
-        }))
+        .send(SplitWindowRequest::fixture(session_name("missing")))
         .await?;
     assert_eq!(
         missing_split,
@@ -39,18 +34,15 @@ async fn pane_management_requests_round_trip_through_the_socket() -> Result<(), 
         })
     );
 
-    let created = client
-        .send_request(&Request::NewSession(NewSessionRequest {
-            session_name: session.clone(),
-            detached: true,
-            size: Some(TerminalSize {
+    client
+        .create_session((
+            &session,
+            TerminalSize {
                 cols: 200,
                 rows: 50,
-            }),
-            environment: None,
-        }))
+            },
+        ))
         .await?;
-    assert!(matches!(created, Response::NewSession(_)));
 
     let select_layout_window = client
         .send_request(&Request::SelectLayout(SelectLayoutRequest {
@@ -81,14 +73,7 @@ async fn pane_management_requests_round_trip_through_the_socket() -> Result<(), 
         })
     );
 
-    let first_split = client
-        .send_request(&Request::SplitWindow(SplitWindowRequest {
-            target: SplitWindowTarget::Session(session.clone()),
-            direction: rmux_proto::SplitDirection::Vertical,
-            before: false,
-            environment: None,
-        }))
-        .await?;
+    let first_split = client.send(SplitWindowRequest::fixture(&session)).await?;
     assert_eq!(
         first_split,
         Response::SplitWindow(rmux_proto::SplitWindowResponse {
@@ -97,12 +82,10 @@ async fn pane_management_requests_round_trip_through_the_socket() -> Result<(), 
     );
 
     let second_split = client
-        .send_request(&Request::SplitWindow(SplitWindowRequest {
-            target: SplitWindowTarget::Pane(PaneTarget::new(session.clone(), 0)),
-            direction: rmux_proto::SplitDirection::Vertical,
-            before: false,
-            environment: None,
-        }))
+        .send(SplitWindowRequest::fixture(PaneTarget::new(
+            session.clone(),
+            0,
+        )))
         .await?;
     assert_eq!(
         second_split,
@@ -139,13 +122,7 @@ async fn pane_management_requests_round_trip_through_the_socket() -> Result<(), 
     );
 
     let selected = client
-        .send_request(&Request::SelectPane(Box::new(SelectPaneRequest {
-            target: PaneTarget::new(session, 2),
-            title: None,
-            style: None,
-            input_disabled: None,
-            preserve_zoom: false,
-        })))
+        .send(SelectPaneRequest::fixture(PaneTarget::new(session, 2)))
         .await?;
     assert_eq!(
         selected,
@@ -168,26 +145,21 @@ async fn horizontal_split_and_kill_pane_round_trip_through_the_socket() -> Resul
     let mut client = ClientConnection::connect(&socket_path).await?;
     let session = session_name("beta");
 
-    let created = client
-        .send_request(&Request::NewSession(NewSessionRequest {
-            session_name: session.clone(),
-            detached: true,
-            size: Some(TerminalSize {
+    client
+        .create_session((
+            &session,
+            TerminalSize {
                 cols: 120,
                 rows: 40,
-            }),
-            environment: None,
-        }))
+            },
+        ))
         .await?;
-    assert!(matches!(created, Response::NewSession(_)));
 
     let horizontal_split = client
-        .send_request(&Request::SplitWindow(SplitWindowRequest {
-            target: SplitWindowTarget::Session(session.clone()),
-            direction: rmux_proto::SplitDirection::Horizontal,
-            before: false,
-            environment: None,
-        }))
+        .send(SplitWindowRequest {
+            direction: SplitDirection::Horizontal,
+            ..Fixture::fixture(&session)
+        })
         .await?;
     assert_eq!(
         horizontal_split,
@@ -210,14 +182,7 @@ async fn horizontal_split_and_kill_pane_round_trip_through_the_socket() -> Resul
         })
     );
 
-    let retried_split = client
-        .send_request(&Request::SplitWindow(SplitWindowRequest {
-            target: SplitWindowTarget::Session(session.clone()),
-            direction: rmux_proto::SplitDirection::Vertical,
-            before: false,
-            environment: None,
-        }))
-        .await?;
+    let retried_split = client.send(SplitWindowRequest::fixture(&session)).await?;
     assert_eq!(
         retried_split,
         Response::SplitWindow(rmux_proto::SplitWindowResponse {
@@ -239,27 +204,22 @@ async fn select_layout_even_layouts_resize_panes_through_the_socket() -> Result<
     let mut client = ClientConnection::connect(&socket_path).await?;
     let session = session_name("even");
 
-    let created = client
-        .send_request(&Request::NewSession(NewSessionRequest {
-            session_name: session.clone(),
-            detached: true,
-            size: Some(TerminalSize {
+    client
+        .create_session((
+            &session,
+            TerminalSize {
                 cols: 100,
                 rows: 40,
-            }),
-            environment: None,
-        }))
+            },
+        ))
         .await?;
-    assert!(matches!(created, Response::NewSession(_)));
 
     for expected_pane in [1, 1] {
         let split = client
-            .send_request(&Request::SplitWindow(SplitWindowRequest {
-                target: SplitWindowTarget::Pane(PaneTarget::new(session.clone(), 0)),
-                direction: rmux_proto::SplitDirection::Vertical,
-                before: false,
-                environment: None,
-            }))
+            .send(SplitWindowRequest::fixture(PaneTarget::new(
+                session.clone(),
+                0,
+            )))
             .await?;
         assert_eq!(
             split,
@@ -361,14 +321,10 @@ async fn wait_for_session_pane_ttys(
 
     while Instant::now() < deadline {
         let listed = client
-            .send_request(&Request::ListPanes(Box::new(ListPanesRequest {
-                target: session.clone(),
-                format: Some("#{pane_index}:#{pane_tty}".to_owned()),
-                filter: None,
-                sort_order: None,
-                reversed: false,
-                target_window_index: None,
-            })))
+            .send(ListPanesRequest::fixture((
+                session,
+                "#{pane_index}:#{pane_tty}",
+            )))
             .await?;
         let output = listed
             .command_output()
@@ -442,31 +398,21 @@ async fn killing_the_last_pane_destroys_the_window_and_session_targets_fall_back
     let mut client = ClientConnection::connect(&socket_path).await?;
     let session = session_name("gamma");
 
-    let created = client
-        .send_request(&Request::NewSession(NewSessionRequest {
-            session_name: session.clone(),
-            detached: true,
-            size: Some(TerminalSize {
+    client
+        .create_session((
+            &session,
+            TerminalSize {
                 cols: 120,
                 rows: 40,
-            }),
-            environment: None,
-        }))
+            },
+        ))
         .await?;
-    assert!(matches!(created, Response::NewSession(_)));
 
     let created_window = client
-        .send_request(&Request::NewWindow(Box::new(NewWindowRequest {
-            target: session.clone(),
+        .send(NewWindowRequest {
             name: Some("scratch".to_owned()),
-            detached: true,
-            start_directory: None,
-            environment: None,
-            command: None,
-            process_command: None,
-            target_window_index: None,
-            insert_at_target: false,
-        })))
+            ..Fixture::fixture(&session)
+        })
         .await?;
     assert_eq!(
         created_window,
@@ -501,14 +447,7 @@ async fn killing_the_last_pane_destroys_the_window_and_session_targets_fall_back
         })
     );
 
-    let split = client
-        .send_request(&Request::SplitWindow(SplitWindowRequest {
-            target: SplitWindowTarget::Session(session.clone()),
-            direction: rmux_proto::SplitDirection::Vertical,
-            before: false,
-            environment: None,
-        }))
-        .await?;
+    let split = client.send(SplitWindowRequest::fixture(&session)).await?;
     assert_eq!(
         split,
         Response::SplitWindow(rmux_proto::SplitWindowResponse {
@@ -530,15 +469,7 @@ async fn killing_the_last_pane_in_the_only_window_removes_the_session_over_the_s
     let mut client = ClientConnection::connect(&socket_path).await?;
     let session = session_name("alpha");
 
-    let created = client
-        .send_request(&Request::NewSession(NewSessionRequest {
-            session_name: session.clone(),
-            detached: true,
-            size: Some(TerminalSize { cols: 80, rows: 24 }),
-            environment: None,
-        }))
-        .await?;
-    assert!(matches!(created, Response::NewSession(_)));
+    client.create_session(&session).await?;
 
     let killed = client
         .send_request(&Request::KillPane(KillPaneRequest {
@@ -568,43 +499,19 @@ async fn pty_eof_before_child_exit_eventually_removes_the_session() -> Result<()
     let handle = start_server(&harness).await?;
     let mut client = ClientConnection::connect(&socket_path).await?;
 
-    let keeper = client
-        .send_request(&Request::NewSession(NewSessionRequest {
-            session_name: session_name("keeper"),
-            detached: true,
-            size: Some(TerminalSize { cols: 80, rows: 24 }),
-            environment: None,
-        }))
-        .await?;
-    assert!(matches!(keeper, Response::NewSession(_)));
+    client.create_session("keeper").await?;
 
     let delayed = session_name("delayed-exit");
-    let created = client
-        .send_request(&Request::NewSessionExt(Box::new(NewSessionExtRequest {
-            session_name: Some(delayed.clone()),
-            working_directory: None,
-            detached: true,
-            size: Some(TerminalSize { cols: 80, rows: 24 }),
-            environment: None,
-            group_target: None,
-            attach_if_exists: false,
-            detach_other_clients: false,
-            kill_other_clients: false,
-            flags: None,
-            window_name: None,
-            print_session_info: false,
-            print_format: None,
-            command: None,
+    client
+        .create_session(NewSessionExtRequest {
             process_command: Some(ProcessCommand::Argv(vec![
                 "/bin/sh".to_owned(),
                 "-c".to_owned(),
                 "printf x; exec sleep 1 </dev/null >/dev/null 2>&1".to_owned(),
             ])),
-            client_environment: None,
-            skip_environment_update: false,
-        })))
+            ..Fixture::fixture(&delayed)
+        })
         .await?;
-    assert!(matches!(created, Response::NewSession(_)));
 
     let deadline = Instant::now() + Duration::from_secs(3);
     loop {

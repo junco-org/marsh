@@ -1,3 +1,4 @@
+use marsh_lib::InitializationRoute;
 use rmux_proto::{
     KillSessionRequest, PaneSnapshotCell, PaneStreamEndReason, PaneStreamEvent, PaneStreamMode,
     Request, Response, TerminalSize,
@@ -6,6 +7,7 @@ use rmux_proto::{
 use crate::pane_recovery::{
     MAX_RECOVERY_SURFACE_CELLS, MAX_SURFACE_FRAME_BYTES, MIN_SURFACE_CELL_ENCODED_BYTES,
 };
+use crate::test_fixtures::Fixture;
 
 use super::surface_test_support::*;
 use super::{cursor, subscribe, test_pane, CONNECTION_ID};
@@ -322,7 +324,7 @@ async fn waiting_surface_peer_rechecks_p_plus_one_after_driver_becomes_ready() {
     };
     let initialization_token = {
         let mut subscriptions = handler.subscriptions.lock().expect("subscription registry");
-        let super::super::SurfaceDriverRoute::Initialize { token } =
+        let InitializationRoute::Initialize { token } =
             subscriptions.surface_driver_route(&source.key)
         else {
             panic!("test must own the first Surface initialization");
@@ -407,7 +409,8 @@ async fn waiting_surface_peer_rechecks_p_plus_one_after_driver_becomes_ready() {
         .subscriptions
         .lock()
         .expect("subscription registry")
-        .finish_surface_initialization(initialization_token);
+        .surface_initializations
+        .finish(initialization_token);
 
     let response = peer.await.expect("waiting Surface peer task");
     assert_surface_budget_error(&response);
@@ -548,12 +551,9 @@ async fn short_raw_sibling_destruction_releases_both_streams_and_surface_driver(
         );
 
         let response = handler
-            .handle(Request::KillSession(KillSessionRequest {
-                target: target.session_name().clone(),
-                kill_all_except_target: false,
-                clear_alerts: false,
-                kill_group: false,
-            }))
+            .handle(Request::KillSession(KillSessionRequest::fixture(
+                target.session_name(),
+            )))
             .await;
         assert!(
             matches!(response, Response::KillSession(_)),

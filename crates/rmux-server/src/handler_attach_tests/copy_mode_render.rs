@@ -7,13 +7,13 @@ async fn attached_copy_mode_renders_mark_regular_and_current_match_styles() {
     let alpha = session_name("alpha");
     let mut control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
     let target = PaneTarget::new(alpha.clone(), 0);
-    replace_transcript_contents(
-        &handler,
-        &target,
-        TerminalSize { cols: 40, rows: 6 },
-        b"needle-one\r\nplain\r\nneedle-two\r\n",
-    )
-    .await;
+    handler
+        .replace_transcript_for_test(
+            &target,
+            TerminalSize { cols: 40, rows: 6 },
+            b"needle-one\r\nplain\r\nneedle-two\r\n",
+        )
+        .await;
     for (option, value) in [
         (OptionName::CopyModeMarkStyle, "bg=colour17,fg=colour231"),
         (OptionName::CopyModeMatchStyle, "bg=colour18,fg=colour231"),
@@ -22,36 +22,17 @@ async fn attached_copy_mode_renders_mark_regular_and_current_match_styles() {
             "bg=colour19,fg=colour231",
         ),
     ] {
-        assert!(matches!(
-            handler
-                .handle(Request::SetOption(SetOptionRequest {
-                    scope: ScopeSelector::Window(WindowTarget::with_window(alpha.clone(), 0)),
-                    option,
-                    value: value.to_owned(),
-                    mode: SetOptionMode::Replace,
-                }))
-                .await,
-            Response::SetOption(_)
-        ));
+        handler
+            .set_option(
+                ScopeSelector::Window(WindowTarget::with_window(alpha.clone(), 0)),
+                option,
+                value,
+            )
+            .await;
     }
     drain_attach_controls(&mut control_rx);
 
-    assert!(matches!(
-        handler
-            .handle(Request::CopyMode(CopyModeRequest {
-                target: Some(target.clone()),
-                page_down: false,
-                exit_on_scroll: false,
-                hide_position: false,
-                mouse_drag_start: false,
-                cancel_mode: false,
-                scrollbar_scroll: false,
-                source: None,
-                page_up: false,
-            }))
-            .await,
-        Response::CopyMode(_)
-    ));
+    handler.handle_ok(CopyModeRequest::fixture(&target)).await;
     let _ = recv_render_frame(&mut control_rx, "copy-mode initial refresh").await;
     drain_attach_controls(&mut control_rx);
 
@@ -93,59 +74,31 @@ async fn attached_copy_mode_u_attach_render_matches_mode_capture_source() {
     let alpha = session_name("alpha");
     let mut control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
     let target = PaneTarget::new(alpha.clone(), 0);
-    replace_transcript_contents(
-        &handler,
-        &target,
-        TerminalSize { cols: 40, rows: 6 },
-        b"mode-render-01\r\nmode-render-02\r\nmode-render-03\r\nmode-render-04\r\nmode-render-05\r\nmode-render-06\r\nmode-render-07\r\nmode-render-08\r\n",
-    )
-    .await;
+    handler
+        .replace_transcript_for_test(
+            &target,
+            TerminalSize { cols: 40, rows: 6 },
+            b"mode-render-01\r\nmode-render-02\r\nmode-render-03\r\nmode-render-04\r\nmode-render-05\r\nmode-render-06\r\nmode-render-07\r\nmode-render-08\r\n",
+        )
+        .await;
     drain_attach_controls(&mut control_rx);
 
-    assert!(matches!(
-        handler
-            .handle(Request::CopyMode(CopyModeRequest {
-                target: Some(target.clone()),
-                page_down: false,
-                exit_on_scroll: false,
-                hide_position: false,
-                mouse_drag_start: false,
-                cancel_mode: false,
-                scrollbar_scroll: false,
-                source: None,
-                page_up: true,
-            }))
-            .await,
-        Response::CopyMode(_)
-    ));
+    handler
+        .handle_ok(CopyModeRequest {
+            page_up: true,
+            ..Fixture::fixture(&target)
+        })
+        .await;
 
     let frame = recv_render_frame(&mut control_rx, "copy-mode -u refresh").await;
     let mode_capture = {
-        let response = handler
-            .handle(Request::CapturePane(Box::new(CapturePaneRequest {
-                target,
-                start: None,
-                end: None,
-                print: true,
-                buffer_name: None,
-                alternate: false,
-                escape_ansi: false,
-                escape_sequences: false,
-                include_format: false,
-                hyperlinks: false,
-                line_numbers: false,
-                join_wrapped: false,
+        let output = handler
+            .handle_ok(CapturePaneRequest {
                 use_mode_screen: true,
-                preserve_trailing_spaces: false,
-                do_not_trim_spaces: false,
-                pending_input: false,
-                quiet: false,
-                start_is_absolute: false,
-                end_is_absolute: false,
-            })))
-            .await;
-        let output = response
-            .command_output()
+                ..Fixture::fixture(target)
+            })
+            .await
+            .output
             .expect("capture-pane -p -M should return command output");
         String::from_utf8(output.stdout().to_vec()).expect("mode capture stdout is utf-8")
     };
@@ -166,42 +119,19 @@ async fn attached_copy_mode_clipped_cursor_marker_wins_over_position_badge() {
     let alpha = session_name("copy-line-marker");
     let mut control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
     let target = PaneTarget::new(alpha.clone(), 0);
-    replace_transcript_contents(
-        &handler,
-        &target,
-        TerminalSize { cols: 80, rows: 24 },
-        b"\x1b[1;80H",
-    )
-    .await;
-    assert!(matches!(
-        handler
-            .handle(Request::SetOption(SetOptionRequest {
-                scope: ScopeSelector::Window(WindowTarget::with_window(alpha.clone(), 0)),
-                option: OptionName::CopyModeLineNumbers,
-                value: "absolute".to_owned(),
-                mode: SetOptionMode::Replace,
-            }))
-            .await,
-        Response::SetOption(_)
-    ));
+    handler
+        .replace_transcript_for_test(&target, TerminalSize { cols: 80, rows: 24 }, b"\x1b[1;80H")
+        .await;
+    handler
+        .set_option(
+            ScopeSelector::Window(WindowTarget::with_window(alpha.clone(), 0)),
+            OptionName::CopyModeLineNumbers,
+            "absolute",
+        )
+        .await;
     drain_attach_controls(&mut control_rx);
 
-    assert!(matches!(
-        handler
-            .handle(Request::CopyMode(CopyModeRequest {
-                target: Some(target),
-                page_down: false,
-                exit_on_scroll: false,
-                hide_position: false,
-                mouse_drag_start: false,
-                cancel_mode: false,
-                scrollbar_scroll: false,
-                source: None,
-                page_up: false,
-            }))
-            .await,
-        Response::CopyMode(_)
-    ));
+    handler.handle_ok(CopyModeRequest::fixture(target)).await;
     let frame = recv_render_frame(&mut control_rx, "line-number marker refresh").await;
     let rendered = {
         let mut screen = Screen::new(TerminalSize { cols: 80, rows: 24 }, 0);
@@ -226,35 +156,21 @@ async fn attached_copy_mode_hide_and_toggle_position_control_the_badge() {
     let alpha = session_name("copy-position-hidden");
     let mut control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
     let target = PaneTarget::new(alpha.clone(), 0);
-    assert!(matches!(
-        handler
-            .handle(Request::SetOption(SetOptionRequest {
-                scope: ScopeSelector::Window(WindowTarget::with_window(alpha.clone(), 0)),
-                option: OptionName::CopyModePositionFormat,
-                value: "POSITION-VISIBLE".to_owned(),
-                mode: SetOptionMode::Replace,
-            }))
-            .await,
-        Response::SetOption(_)
-    ));
+    handler
+        .set_option(
+            ScopeSelector::Window(WindowTarget::with_window(alpha.clone(), 0)),
+            OptionName::CopyModePositionFormat,
+            "POSITION-VISIBLE",
+        )
+        .await;
     drain_attach_controls(&mut control_rx);
 
-    assert!(matches!(
-        handler
-            .handle(Request::CopyMode(CopyModeRequest {
-                target: Some(target.clone()),
-                page_down: false,
-                exit_on_scroll: false,
-                hide_position: true,
-                mouse_drag_start: false,
-                cancel_mode: false,
-                scrollbar_scroll: false,
-                source: None,
-                page_up: false,
-            }))
-            .await,
-        Response::CopyMode(_)
-    ));
+    handler
+        .handle_ok(CopyModeRequest {
+            hide_position: true,
+            ..Fixture::fixture(&target)
+        })
+        .await;
     let hidden = recv_render_frame(&mut control_rx, "hidden position refresh").await;
     assert!(
         !hidden.contains("POSITION-VISIBLE"),
@@ -284,13 +200,13 @@ async fn attached_mouse_drag_copy_mode_refresh_keeps_prompt_visible() {
     let alpha = session_name("alpha");
     let mut control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
     let target = PaneTarget::new(alpha.clone(), 0);
-    replace_transcript_contents(
-        &handler,
-        &target,
-        TerminalSize { cols: 80, rows: 24 },
-        b"\x1b[1m\x1b[32mtester@RMUXHOST\x1b[0m:\x1b[1m\x1b[34m~\x1b[0m$ ",
-    )
-    .await;
+    handler
+        .replace_transcript_for_test(
+            &target,
+            TerminalSize { cols: 80, rows: 24 },
+            b"\x1b[1m\x1b[32mtester@RMUXHOST\x1b[0m:\x1b[1m\x1b[34m~\x1b[0m$ ",
+        )
+        .await;
     drain_attach_controls(&mut control_rx);
 
     let (window_id, pane_id) = {
@@ -329,50 +245,22 @@ async fn attached_mouse_drag_copy_mode_refresh_keeps_prompt_visible() {
     });
     drop(active_attach);
 
-    assert!(matches!(
-        handler
-            .handle(Request::CopyMode(CopyModeRequest {
-                target: Some(target.clone()),
-                page_down: false,
-                exit_on_scroll: false,
-                hide_position: false,
-                mouse_drag_start: true,
-                cancel_mode: false,
-                scrollbar_scroll: false,
-                source: None,
-                page_up: false,
-            }))
-            .await,
-        Response::CopyMode(_)
-    ));
+    handler
+        .handle_ok(CopyModeRequest {
+            mouse_drag_start: true,
+            ..Fixture::fixture(&target)
+        })
+        .await;
 
     let frame = recv_render_frame(&mut control_rx, "copy-mode mouse refresh").await;
     let mode_capture = {
-        let response = handler
-            .handle(Request::CapturePane(Box::new(CapturePaneRequest {
-                target: target.clone(),
-                start: None,
-                end: None,
-                print: true,
-                buffer_name: None,
-                alternate: false,
-                escape_ansi: false,
-                escape_sequences: false,
-                include_format: false,
-                hyperlinks: false,
-                line_numbers: false,
-                join_wrapped: false,
+        let output = handler
+            .handle_ok(CapturePaneRequest {
                 use_mode_screen: true,
-                preserve_trailing_spaces: false,
-                do_not_trim_spaces: false,
-                pending_input: false,
-                quiet: false,
-                start_is_absolute: false,
-                end_is_absolute: false,
-            })))
-            .await;
-        let output = response
-            .command_output()
+                ..Fixture::fixture(&target)
+            })
+            .await
+            .output
             .expect("capture-pane -p -M should return command output");
         String::from_utf8(output.stdout().to_vec()).expect("mode capture stdout is utf-8")
     };
@@ -421,45 +309,21 @@ async fn attached_copy_mode_unhandled_key_falls_back_to_prefix_table() {
     let requester_pid = std::process::id();
     let alpha = session_name("alpha");
     let _control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
-    assert!(matches!(
-        handler
-            .handle(Request::SplitWindow(SplitWindowRequest {
-                target: SplitWindowTarget::Session(alpha.clone()),
-                direction: rmux_proto::SplitDirection::Horizontal,
-                before: false,
-                environment: None,
-            }))
-            .await,
-        Response::SplitWindow(_)
-    ));
-    assert!(matches!(
-        handler
-            .handle(Request::SelectPane(Box::new(SelectPaneRequest {
-                target: PaneTarget::new(alpha.clone(), 0),
-                title: None,
-                style: None,
-                input_disabled: None,
-                preserve_zoom: false,
-            })))
-            .await,
-        Response::SelectPane(_)
-    ));
-    assert!(matches!(
-        handler
-            .handle(Request::CopyMode(CopyModeRequest {
-                target: Some(PaneTarget::new(alpha.clone(), 0)),
-                page_down: false,
-                exit_on_scroll: false,
-                hide_position: false,
-                mouse_drag_start: false,
-                cancel_mode: false,
-                scrollbar_scroll: false,
-                source: None,
-                page_up: false,
-            }))
-            .await,
-        Response::CopyMode(_)
-    ));
+    handler
+        .handle_ok(SplitWindowRequest {
+            direction: rmux_proto::SplitDirection::Horizontal,
+            ..Fixture::fixture(&alpha)
+        })
+        .await;
+    handler
+        .handle_ok(SelectPaneRequest::fixture(PaneTarget::new(
+            alpha.clone(),
+            0,
+        )))
+        .await;
+    handler
+        .handle_ok(CopyModeRequest::fixture(PaneTarget::new(alpha.clone(), 0)))
+        .await;
 
     handler
         .handle_attached_live_input_for_test(requester_pid, b"\x02o")

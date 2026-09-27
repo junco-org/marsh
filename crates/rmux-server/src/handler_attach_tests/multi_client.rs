@@ -1,116 +1,57 @@
 use super::*;
 use crate::client_names::attached_client_name;
+use rmux_proto::{HookName, RefreshClientRequest};
 
 #[tokio::test]
 async fn attached_resize_emits_client_resized_hook_with_client_context() {
     let handler = RequestHandler::new();
     let session = session_name("resize-hook");
-    create_session_with_size(
-        &handler,
-        session.clone(),
-        TerminalSize {
-            cols: 100,
-            rows: 30,
-        },
-    )
-    .await;
-    let (_attach_id, _rx) = register_sized_attach(
-        &handler,
-        101,
-        &session,
-        TerminalSize {
-            cols: 100,
-            rows: 30,
-        },
-    )
-    .await;
-
-    let hooked = handler
-        .handle(Request::SetHookMutation(
-            rmux_proto::SetHookMutationRequest {
-                scope: ScopeSelector::Global,
-                hook: rmux_proto::HookName::ClientResized,
-                command: Some(
-                    format!(
-                        "if-shell -F '#{{==:#{{hook_client}}:#{{hook_session_name}},{}:resize-hook}}' 'set-buffer -b client-resized ok' 'set-buffer -b client-resized bad'",
-                        attached_client_name(101)
-                    ),
-                ),
-                lifecycle: rmux_proto::HookLifecycle::Persistent,
-                append: false,
-                unset: false,
-                run_immediately: false,
-                index: None,
-            },
-        ))
+    handler
+        .create_session((&session, TerminalSize::new(100, 30)))
         .await;
-    assert!(matches!(hooked, Response::SetHook(_)), "{hooked:?}");
+    let (_attach_id, _rx) =
+        register_sized_attach(&handler, 101, &session, TerminalSize::new(100, 30)).await;
+
+    handler
+        .set_global_hook(
+            HookName::ClientResized,
+            &format!(
+                "if-shell -F '#{{==:#{{hook_client}}:#{{hook_session_name}},{}:resize-hook}}' 'set-buffer -b client-resized ok' 'set-buffer -b client-resized bad'",
+                attached_client_name(101)
+            ),
+        )
+        .await;
 
     let mut lifecycle_events = handler.subscribe_lifecycle_events();
     handler
-        .handle_attached_resize(
-            101,
-            TerminalSize {
-                cols: 132,
-                rows: 37,
-            },
-        )
+        .handle_attached_resize(101, TerminalSize::new(132, 37))
         .await
         .expect("client resize succeeds");
     drain_lifecycle_events(&handler, &mut lifecycle_events).await;
 
-    wait_for_named_buffer(&handler, "client-resized", b"ok").await;
+    handler.wait_for_buffer("client-resized", "ok").await;
 }
 
 #[tokio::test]
 async fn attached_resize_does_not_emit_client_resized_hook_when_size_is_unchanged() {
     let handler = RequestHandler::new();
     let session = session_name("resize-hook-noop");
-    create_session_with_size(
-        &handler,
-        session.clone(),
-        TerminalSize {
-            cols: 100,
-            rows: 30,
-        },
-    )
-    .await;
-    let (_attach_id, _rx) = register_sized_attach(
-        &handler,
-        101,
-        &session,
-        TerminalSize {
-            cols: 100,
-            rows: 30,
-        },
-    )
-    .await;
-
-    let hooked = handler
-        .handle(Request::SetHookMutation(
-            rmux_proto::SetHookMutationRequest {
-                scope: ScopeSelector::Global,
-                hook: rmux_proto::HookName::ClientResized,
-                command: Some("set-buffer -b client-resized-noop bad".to_owned()),
-                lifecycle: rmux_proto::HookLifecycle::Persistent,
-                append: false,
-                unset: false,
-                run_immediately: false,
-                index: None,
-            },
-        ))
+    handler
+        .create_session((&session, TerminalSize::new(100, 30)))
         .await;
-    assert!(matches!(hooked, Response::SetHook(_)), "{hooked:?}");
+    let (_attach_id, _rx) =
+        register_sized_attach(&handler, 101, &session, TerminalSize::new(100, 30)).await;
+
+    handler
+        .set_global_hook(
+            HookName::ClientResized,
+            "set-buffer -b client-resized-noop bad",
+        )
+        .await;
 
     let mut lifecycle_events = handler.subscribe_lifecycle_events();
     handler
-        .handle_attached_resize(
-            101,
-            TerminalSize {
-                cols: 100,
-                rows: 30,
-            },
-        )
+        .handle_attached_resize(101, TerminalSize::new(100, 30))
         .await
         .expect("unchanged client resize succeeds");
     drain_lifecycle_events(&handler, &mut lifecycle_events).await;
@@ -133,84 +74,57 @@ async fn attached_resize_does_not_emit_client_resized_hook_when_size_is_unchange
 async fn window_size_policy_reconciles_attached_client_sizes() {
     let handler = RequestHandler::new();
     let session = session_name("resize-policy");
-    create_session_with_size(
-        &handler,
-        session.clone(),
-        TerminalSize {
-            cols: 100,
-            rows: 30,
-        },
-    )
-    .await;
+    handler
+        .create_session((&session, TerminalSize::new(100, 30)))
+        .await;
 
-    let (_large_id, _large_rx) = register_sized_attach(
-        &handler,
-        101,
-        &session,
-        TerminalSize {
-            cols: 120,
-            rows: 40,
-        },
-    )
-    .await;
+    let (_large_id, _large_rx) =
+        register_sized_attach(&handler, 101, &session, TerminalSize::new(120, 40)).await;
     assert_eq!(
         attached_session_size(&handler, &session).await,
-        content_size_for_default_status(TerminalSize {
-            cols: 120,
-            rows: 40
-        }),
+        content_size_for_default_status(TerminalSize::new(120, 40)),
         "default latest policy should use the most recently attached client"
     );
 
     let (_small_id, _small_rx) =
-        register_sized_attach(&handler, 202, &session, TerminalSize { cols: 80, rows: 20 }).await;
+        register_sized_attach(&handler, 202, &session, TerminalSize::new(80, 20)).await;
     assert_eq!(
         attached_session_size(&handler, &session).await,
-        content_size_for_default_status(TerminalSize { cols: 80, rows: 20 }),
+        content_size_for_default_status(TerminalSize::new(80, 20)),
         "latest policy should follow the newest attach"
     );
 
-    set_window_size_policy(&handler, &session, "largest").await;
+    handler.set_window_size_policy(&session, 0, "largest").await;
     assert_eq!(
         attached_session_size(&handler, &session).await,
-        content_size_for_default_status(TerminalSize {
-            cols: 120,
-            rows: 40
-        }),
+        content_size_for_default_status(TerminalSize::new(120, 40)),
         "largest policy must select the largest live attached client"
     );
 
-    set_window_size_policy(&handler, &session, "smallest").await;
+    handler
+        .set_window_size_policy(&session, 0, "smallest")
+        .await;
     assert_eq!(
         attached_session_size(&handler, &session).await,
-        content_size_for_default_status(TerminalSize { cols: 80, rows: 20 }),
+        content_size_for_default_status(TerminalSize::new(80, 20)),
         "smallest policy must select the smallest live attached client"
     );
 
-    set_window_size_policy(&handler, &session, "manual").await;
+    handler.set_window_size_policy(&session, 0, "manual").await;
     handler
-        .handle_attached_resize(
-            101,
-            TerminalSize {
-                cols: 140,
-                rows: 45,
-            },
-        )
+        .handle_attached_resize(101, TerminalSize::new(140, 45))
         .await
         .expect("manual client resize is accepted");
     assert_eq!(
         attached_session_size(&handler, &session).await,
-        content_size_for_default_status(TerminalSize { cols: 80, rows: 20 }),
+        content_size_for_default_status(TerminalSize::new(80, 20)),
         "manual policy must not auto-resize the window"
     );
 
-    set_window_size_policy(&handler, &session, "latest").await;
+    handler.set_window_size_policy(&session, 0, "latest").await;
     assert_eq!(
         attached_session_size(&handler, &session).await,
-        content_size_for_default_status(TerminalSize {
-            cols: 140,
-            rows: 45
-        }),
+        content_size_for_default_status(TerminalSize::new(140, 45)),
         "latest policy should use the most recently resized client"
     );
 }
@@ -219,35 +133,18 @@ async fn window_size_policy_reconciles_attached_client_sizes() {
 async fn refresh_client_ignore_size_transitions_reconcile_largest_policy() {
     let handler = RequestHandler::new();
     let session = session_name("refresh-ignore-size-largest");
-    create_session_with_size(
-        &handler,
-        session.clone(),
-        TerminalSize {
-            cols: 100,
-            rows: 30,
-        },
-    )
-    .await;
+    handler
+        .create_session((&session, TerminalSize::new(100, 30)))
+        .await;
 
-    let (_large_id, _large_rx) = register_sized_attach(
-        &handler,
-        101,
-        &session,
-        TerminalSize {
-            cols: 120,
-            rows: 40,
-        },
-    )
-    .await;
+    let (_large_id, _large_rx) =
+        register_sized_attach(&handler, 101, &session, TerminalSize::new(120, 40)).await;
     let (_small_id, _small_rx) =
-        register_sized_attach(&handler, 202, &session, TerminalSize { cols: 80, rows: 20 }).await;
-    set_window_size_policy(&handler, &session, "largest").await;
+        register_sized_attach(&handler, 202, &session, TerminalSize::new(80, 20)).await;
+    handler.set_window_size_policy(&session, 0, "largest").await;
     assert_eq!(
         attached_session_size(&handler, &session).await,
-        content_size_for_default_status(TerminalSize {
-            cols: 120,
-            rows: 40
-        })
+        content_size_for_default_status(TerminalSize::new(120, 40))
     );
 
     let ignored = handler
@@ -256,7 +153,7 @@ async fn refresh_client_ignore_size_transitions_reconcile_largest_policy() {
     assert!(matches!(ignored, Response::RefreshClient(_)), "{ignored:?}");
     assert_eq!(
         attached_session_size(&handler, &session).await,
-        content_size_for_default_status(TerminalSize { cols: 80, rows: 20 }),
+        content_size_for_default_status(TerminalSize::new(80, 20)),
         "adding ignore-size must immediately remove the client from largest-policy candidates"
     );
 
@@ -273,10 +170,7 @@ async fn refresh_client_ignore_size_transitions_reconcile_largest_policy() {
     );
     assert_eq!(
         attached_session_size(&handler, &session).await,
-        content_size_for_default_status(TerminalSize {
-            cols: 120,
-            rows: 40
-        }),
+        content_size_for_default_status(TerminalSize::new(120, 40)),
         "removing ignore-size through the -F alias must restore the client as a candidate"
     );
 }
@@ -286,30 +180,18 @@ async fn refresh_client_ignore_size_reconcile_preserves_same_pid_replacement_ide
     let handler = RequestHandler::new();
     let alpha = session_name("refresh-ignore-size-race-alpha");
     let beta = session_name("refresh-ignore-size-race-beta");
-    create_session_with_size(
-        &handler,
-        alpha.clone(),
-        TerminalSize {
-            cols: 100,
-            rows: 30,
-        },
-    )
-    .await;
-    create_session_with_size(&handler, beta.clone(), TerminalSize { cols: 90, rows: 25 }).await;
+    handler
+        .create_session((&alpha, TerminalSize::new(100, 30)))
+        .await;
+    handler
+        .create_session((&beta, TerminalSize::new(90, 25)))
+        .await;
 
-    let (original_id, _original_rx) = register_sized_attach(
-        &handler,
-        303,
-        &alpha,
-        TerminalSize {
-            cols: 120,
-            rows: 40,
-        },
-    )
-    .await;
+    let (original_id, _original_rx) =
+        register_sized_attach(&handler, 303, &alpha, TerminalSize::new(120, 40)).await;
     let (_small_id, _small_rx) =
-        register_sized_attach(&handler, 404, &alpha, TerminalSize { cols: 80, rows: 20 }).await;
-    set_window_size_policy(&handler, &alpha, "largest").await;
+        register_sized_attach(&handler, 404, &alpha, TerminalSize::new(80, 20)).await;
+    handler.set_window_size_policy(&alpha, 0, "largest").await;
 
     let pause = handler.install_attached_size_selection_pause();
     let refresh_handler = handler.clone();
@@ -323,7 +205,7 @@ async fn refresh_client_ignore_size_reconcile_preserves_same_pid_replacement_ide
         .expect("refresh-client reaches identity-safe size selection");
 
     let (replacement_id, _replacement_rx) =
-        register_sized_attach(&handler, 303, &beta, TerminalSize { cols: 95, rows: 26 }).await;
+        register_sized_attach(&handler, 303, &beta, TerminalSize::new(95, 26)).await;
     assert_ne!(replacement_id, original_id);
     pause.release.notify_one();
 
@@ -333,12 +215,12 @@ async fn refresh_client_ignore_size_reconcile_preserves_same_pid_replacement_ide
     ));
     assert_eq!(
         attached_session_size(&handler, &alpha).await,
-        content_size_for_default_status(TerminalSize { cols: 80, rows: 20 }),
+        content_size_for_default_status(TerminalSize::new(80, 20)),
         "the original session must reconcile after its large client is replaced"
     );
     assert_eq!(
         attached_session_size(&handler, &beta).await,
-        content_size_for_default_status(TerminalSize { cols: 95, rows: 26 }),
+        content_size_for_default_status(TerminalSize::new(95, 26)),
         "the stale refresh must never resize the replacement client's session"
     );
     let active_attach = handler.active_attach.lock().await;
@@ -348,52 +230,35 @@ async fn refresh_client_ignore_size_reconcile_preserves_same_pid_replacement_ide
         .expect("same-pid replacement survives");
     assert_eq!(replacement.id, replacement_id);
     assert_eq!(replacement.session_name, beta);
-    assert!(!replacement
-        .flags
-        .contains(super::super::attach_support::ClientFlags::IGNORESIZE));
+    assert!(!replacement.flags.contains(ClientFlags::IGNORESIZE));
 }
 
 #[tokio::test]
 async fn largest_and_smallest_window_size_policies_compose_dimensions_like_tmux() {
     let handler = RequestHandler::new();
     let session = session_name("resize-policy-dimensions");
-    create_session_with_size(
-        &handler,
-        session.clone(),
-        TerminalSize {
-            cols: 100,
-            rows: 30,
-        },
-    )
-    .await;
+    handler
+        .create_session((&session, TerminalSize::new(100, 30)))
+        .await;
 
-    let (_wide_id, _wide_rx) = register_sized_attach(
-        &handler,
-        101,
-        &session,
-        TerminalSize {
-            cols: 120,
-            rows: 20,
-        },
-    )
-    .await;
+    let (_wide_id, _wide_rx) =
+        register_sized_attach(&handler, 101, &session, TerminalSize::new(120, 20)).await;
     let (_tall_id, _tall_rx) =
-        register_sized_attach(&handler, 202, &session, TerminalSize { cols: 80, rows: 50 }).await;
+        register_sized_attach(&handler, 202, &session, TerminalSize::new(80, 50)).await;
 
-    set_window_size_policy(&handler, &session, "largest").await;
+    handler.set_window_size_policy(&session, 0, "largest").await;
     assert_eq!(
         attached_session_size(&handler, &session).await,
-        content_size_for_default_status(TerminalSize {
-            cols: 120,
-            rows: 50
-        }),
+        content_size_for_default_status(TerminalSize::new(120, 50)),
         "largest policy must take the maximum width and maximum height independently"
     );
 
-    set_window_size_policy(&handler, &session, "smallest").await;
+    handler
+        .set_window_size_policy(&session, 0, "smallest")
+        .await;
     assert_eq!(
         attached_session_size(&handler, &session).await,
-        content_size_for_default_status(TerminalSize { cols: 80, rows: 20 }),
+        content_size_for_default_status(TerminalSize::new(80, 20)),
         "smallest policy must take the minimum width and minimum height independently"
     );
 }
@@ -402,90 +267,60 @@ async fn largest_and_smallest_window_size_policies_compose_dimensions_like_tmux(
 async fn attach_session_initial_client_size_respects_window_size_policy() {
     let handler = RequestHandler::new();
     let session = session_name("attach-resize-policy");
-    create_session_with_size(
-        &handler,
-        session.clone(),
-        TerminalSize {
-            cols: 100,
-            rows: 30,
-        },
-    )
-    .await;
-    let (_large_id, _large_rx) = register_sized_attach(
-        &handler,
-        101,
-        &session,
-        TerminalSize {
-            cols: 160,
-            rows: 40,
-        },
-    )
-    .await;
+    handler
+        .create_session((&session, TerminalSize::new(100, 30)))
+        .await;
+    let (_large_id, _large_rx) =
+        register_sized_attach(&handler, 101, &session, TerminalSize::new(160, 40)).await;
 
-    set_window_size_policy(&handler, &session, "largest").await;
+    handler.set_window_size_policy(&session, 0, "largest").await;
     let outcome = handler
         .dispatch(
             202,
-            attach_session_request(&session, TerminalSize { cols: 72, rows: 18 }),
+            attach_session_request(&session, TerminalSize::new(72, 18)),
         )
         .await;
     assert!(matches!(outcome.response, Response::AttachSession(_)));
     assert!(outcome.attach.is_some());
     assert_eq!(
         attached_session_size(&handler, &session).await,
-        content_size_for_default_status(TerminalSize {
-            cols: 160,
-            rows: 40
-        }),
+        content_size_for_default_status(TerminalSize::new(160, 40)),
         "initial attach must not shrink a largest-policy window below the largest live client"
     );
 
-    set_window_size_policy(&handler, &session, "smallest").await;
+    handler
+        .set_window_size_policy(&session, 0, "smallest")
+        .await;
     let outcome = handler
         .dispatch(
             303,
-            attach_session_request(&session, TerminalSize { cols: 72, rows: 18 }),
+            attach_session_request(&session, TerminalSize::new(72, 18)),
         )
         .await;
     assert!(matches!(outcome.response, Response::AttachSession(_)));
     assert!(outcome.attach.is_some());
     assert_eq!(
         attached_session_size(&handler, &session).await,
-        content_size_for_default_status(TerminalSize { cols: 72, rows: 18 }),
+        content_size_for_default_status(TerminalSize::new(72, 18)),
         "initial attach must be considered by smallest-policy selection"
     );
 
     let manual = session_name("attach-resize-manual");
-    create_session_with_size(
-        &handler,
-        manual.clone(),
-        TerminalSize {
-            cols: 100,
-            rows: 30,
-        },
-    )
-    .await;
-    set_window_size_policy(&handler, &manual, "manual").await;
+    handler
+        .create_session((&manual, TerminalSize::new(100, 30)))
+        .await;
+    handler.set_window_size_policy(&manual, 0, "manual").await;
     let outcome = handler
         .dispatch(
             404,
-            attach_session_request(
-                &manual,
-                TerminalSize {
-                    cols: 132,
-                    rows: 37,
-                },
-            ),
+            attach_session_request(&manual, TerminalSize::new(132, 37)),
         )
         .await;
     assert!(matches!(outcome.response, Response::AttachSession(_)));
     assert!(outcome.attach.is_some());
     assert_eq!(
         attached_session_size(&handler, &manual).await,
-        TerminalSize {
-            cols: 100,
-            rows: 30
-        },
+        TerminalSize::new(100, 30),
         "manual policy must ignore the initial attach client size"
     );
 }
@@ -495,31 +330,17 @@ async fn latest_window_size_recovers_when_small_client_finishes() {
     let handler = RequestHandler::new();
     let mut events = handler.subscribe_lifecycle_events();
     let session = session_name("resize-finish");
-    create_session_with_size(
-        &handler,
-        session.clone(),
-        TerminalSize {
-            cols: 100,
-            rows: 30,
-        },
-    )
-    .await;
+    handler
+        .create_session((&session, TerminalSize::new(100, 30)))
+        .await;
 
-    let (_large_id, _large_rx) = register_sized_attach(
-        &handler,
-        101,
-        &session,
-        TerminalSize {
-            cols: 160,
-            rows: 40,
-        },
-    )
-    .await;
+    let (_large_id, _large_rx) =
+        register_sized_attach(&handler, 101, &session, TerminalSize::new(160, 40)).await;
     let (small_id, _small_rx) =
-        register_sized_attach(&handler, 202, &session, TerminalSize { cols: 72, rows: 18 }).await;
+        register_sized_attach(&handler, 202, &session, TerminalSize::new(72, 18)).await;
     assert_eq!(
         attached_session_size(&handler, &session).await,
-        content_size_for_default_status(TerminalSize { cols: 72, rows: 18 })
+        content_size_for_default_status(TerminalSize::new(72, 18))
     );
 
     handler.finish_attach(202, small_id).await;
@@ -527,10 +348,7 @@ async fn latest_window_size_recovers_when_small_client_finishes() {
     wait_for_client_detached_event(&mut events, &attached_client_name(202)).await;
     assert_eq!(
         attached_session_size(&handler, &session).await,
-        content_size_for_default_status(TerminalSize {
-            cols: 160,
-            rows: 40
-        }),
+        content_size_for_default_status(TerminalSize::new(160, 40)),
         "latest policy must fall back to the remaining latest live client"
     );
 }
@@ -540,31 +358,17 @@ async fn refresh_prunes_dead_attach_and_recomputes_latest_size() {
     let handler = RequestHandler::new();
     let mut events = handler.subscribe_lifecycle_events();
     let session = session_name("resize-stale");
-    create_session_with_size(
-        &handler,
-        session.clone(),
-        TerminalSize {
-            cols: 100,
-            rows: 30,
-        },
-    )
-    .await;
+    handler
+        .create_session((&session, TerminalSize::new(100, 30)))
+        .await;
 
-    let (_large_id, _large_rx) = register_sized_attach(
-        &handler,
-        101,
-        &session,
-        TerminalSize {
-            cols: 160,
-            rows: 40,
-        },
-    )
-    .await;
+    let (_large_id, _large_rx) =
+        register_sized_attach(&handler, 101, &session, TerminalSize::new(160, 40)).await;
     let (_small_id, small_rx) =
-        register_sized_attach(&handler, 202, &session, TerminalSize { cols: 72, rows: 18 }).await;
+        register_sized_attach(&handler, 202, &session, TerminalSize::new(72, 18)).await;
     assert_eq!(
         attached_session_size(&handler, &session).await,
-        content_size_for_default_status(TerminalSize { cols: 72, rows: 18 })
+        content_size_for_default_status(TerminalSize::new(72, 18))
     );
 
     drop(small_rx);
@@ -577,10 +381,7 @@ async fn refresh_prunes_dead_attach_and_recomputes_latest_size() {
     );
     assert_eq!(
         attached_session_size(&handler, &session).await,
-        content_size_for_default_status(TerminalSize {
-            cols: 160,
-            rows: 40
-        }),
+        content_size_for_default_status(TerminalSize::new(160, 40)),
         "stale smallest client must not keep the window stuck small"
     );
 }
@@ -590,31 +391,17 @@ async fn targeted_refresh_prunes_dead_attach_and_recomputes_latest_size() {
     let handler = RequestHandler::new();
     let mut events = handler.subscribe_lifecycle_events();
     let session = session_name("resize-stale-targeted");
-    create_session_with_size(
-        &handler,
-        session.clone(),
-        TerminalSize {
-            cols: 100,
-            rows: 30,
-        },
-    )
-    .await;
+    handler
+        .create_session((&session, TerminalSize::new(100, 30)))
+        .await;
 
-    let (_large_id, _large_rx) = register_sized_attach(
-        &handler,
-        101,
-        &session,
-        TerminalSize {
-            cols: 160,
-            rows: 40,
-        },
-    )
-    .await;
+    let (_large_id, _large_rx) =
+        register_sized_attach(&handler, 101, &session, TerminalSize::new(160, 40)).await;
     let (_small_id, small_rx) =
-        register_sized_attach(&handler, 202, &session, TerminalSize { cols: 72, rows: 18 }).await;
+        register_sized_attach(&handler, 202, &session, TerminalSize::new(72, 18)).await;
     assert_eq!(
         attached_session_size(&handler, &session).await,
-        content_size_for_default_status(TerminalSize { cols: 72, rows: 18 })
+        content_size_for_default_status(TerminalSize::new(72, 18))
     );
 
     drop(small_rx);
@@ -627,10 +414,7 @@ async fn targeted_refresh_prunes_dead_attach_and_recomputes_latest_size() {
     );
     assert_eq!(
         attached_session_size(&handler, &session).await,
-        content_size_for_default_status(TerminalSize {
-            cols: 160,
-            rows: 40
-        }),
+        content_size_for_default_status(TerminalSize::new(160, 40)),
         "targeted refresh must not leave latest policy stuck on the stale client size"
     );
 }
@@ -640,31 +424,17 @@ async fn targeted_base_refresh_prunes_dead_attach_and_recomputes_latest_size() {
     let handler = RequestHandler::new();
     let mut events = handler.subscribe_lifecycle_events();
     let session = session_name("resize-stale-base");
-    create_session_with_size(
-        &handler,
-        session.clone(),
-        TerminalSize {
-            cols: 100,
-            rows: 30,
-        },
-    )
-    .await;
+    handler
+        .create_session((&session, TerminalSize::new(100, 30)))
+        .await;
 
-    let (_large_id, _large_rx) = register_sized_attach(
-        &handler,
-        101,
-        &session,
-        TerminalSize {
-            cols: 160,
-            rows: 40,
-        },
-    )
-    .await;
+    let (_large_id, _large_rx) =
+        register_sized_attach(&handler, 101, &session, TerminalSize::new(160, 40)).await;
     let (_small_id, small_rx) =
-        register_sized_attach(&handler, 202, &session, TerminalSize { cols: 72, rows: 18 }).await;
+        register_sized_attach(&handler, 202, &session, TerminalSize::new(72, 18)).await;
     assert_eq!(
         attached_session_size(&handler, &session).await,
-        content_size_for_default_status(TerminalSize { cols: 72, rows: 18 })
+        content_size_for_default_status(TerminalSize::new(72, 18))
     );
 
     drop(small_rx);
@@ -679,10 +449,7 @@ async fn targeted_base_refresh_prunes_dead_attach_and_recomputes_latest_size() {
     );
     assert_eq!(
         attached_session_size(&handler, &session).await,
-        content_size_for_default_status(TerminalSize {
-            cols: 160,
-            rows: 40
-        }),
+        content_size_for_default_status(TerminalSize::new(160, 40)),
         "targeted base refresh must not leave latest policy stuck on the stale client size"
     );
 }
@@ -691,45 +458,28 @@ async fn targeted_base_refresh_prunes_dead_attach_and_recomputes_latest_size() {
 async fn ignore_size_clients_update_their_render_size_without_resizing_session() {
     let handler = RequestHandler::new();
     let session = session_name("resize-ignore");
-    create_session_with_size(
-        &handler,
-        session.clone(),
-        TerminalSize {
-            cols: 100,
-            rows: 30,
-        },
-    )
-    .await;
+    handler
+        .create_session((&session, TerminalSize::new(100, 30)))
+        .await;
 
-    let (_large_id, _large_rx) = register_sized_attach(
-        &handler,
-        101,
-        &session,
-        TerminalSize {
-            cols: 160,
-            rows: 40,
-        },
-    )
-    .await;
+    let (_large_id, _large_rx) =
+        register_sized_attach(&handler, 101, &session, TerminalSize::new(160, 40)).await;
     let (_ignored_id, _ignored_rx) = register_sized_attach_with_flags(
         &handler,
         202,
         &session,
-        TerminalSize { cols: 90, rows: 22 },
-        super::super::attach_support::ClientFlags::IGNORESIZE,
+        TerminalSize::new(90, 22),
+        ClientFlags::IGNORESIZE,
     )
     .await;
     assert_eq!(
         attached_session_size(&handler, &session).await,
-        content_size_for_default_status(TerminalSize {
-            cols: 160,
-            rows: 40
-        }),
+        content_size_for_default_status(TerminalSize::new(160, 40)),
         "ignore-size attach must not become the latest window-size candidate"
     );
 
     handler
-        .handle_attached_resize(202, TerminalSize { cols: 72, rows: 18 })
+        .handle_attached_resize(202, TerminalSize::new(72, 18))
         .await
         .expect("ignore-size client resize still updates client metadata");
 
@@ -739,14 +489,11 @@ async fn ignore_size_clients_update_their_render_size_without_resizing_session()
             .by_pid
             .get(&202)
             .expect("ignore-size client remains attached");
-        assert_eq!(ignored.client_size, TerminalSize { cols: 72, rows: 18 });
+        assert_eq!(ignored.client_size, TerminalSize::new(72, 18));
     }
     assert_eq!(
         attached_session_size(&handler, &session).await,
-        content_size_for_default_status(TerminalSize {
-            cols: 160,
-            rows: 40
-        }),
+        content_size_for_default_status(TerminalSize::new(160, 40)),
         "ignore-size client resize must not resize the session"
     );
 }
@@ -755,44 +502,26 @@ async fn ignore_size_clients_update_their_render_size_without_resizing_session()
 async fn read_only_initial_attach_size_is_not_a_window_size_candidate() {
     let handler = RequestHandler::new();
     let session = session_name("attach-readonly-size");
-    create_session_with_size(
-        &handler,
-        session.clone(),
-        TerminalSize {
-            cols: 100,
-            rows: 30,
-        },
-    )
-    .await;
+    handler
+        .create_session((&session, TerminalSize::new(100, 30)))
+        .await;
 
-    let (_large_id, _large_rx) = register_sized_attach(
-        &handler,
-        101,
-        &session,
-        TerminalSize {
-            cols: 160,
-            rows: 40,
-        },
-    )
-    .await;
+    let (_large_id, _large_rx) =
+        register_sized_attach(&handler, 101, &session, TerminalSize::new(160, 40)).await;
     let outcome = handler
         .dispatch(
             202,
-            attach_session_request_with_read_only(
-                &session,
-                TerminalSize { cols: 72, rows: 18 },
-                true,
-            ),
+            Request::AttachSessionExt2(Box::new(AttachSessionExt2Request {
+                read_only: true,
+                ..attach_session_ext2(&session, TerminalSize::new(72, 18))
+            })),
         )
         .await;
     assert!(matches!(outcome.response, Response::AttachSession(_)));
     assert!(outcome.attach.is_some());
     assert_eq!(
         attached_session_size(&handler, &session).await,
-        content_size_for_default_status(TerminalSize {
-            cols: 160,
-            rows: 40
-        }),
+        content_size_for_default_status(TerminalSize::new(160, 40)),
         "read-only implies ignore-size and must not shrink the session during attach"
     );
 }
@@ -802,31 +531,17 @@ async fn detach_client_recomputes_window_size_before_detached_event() {
     let handler = RequestHandler::new();
     let mut events = handler.subscribe_lifecycle_events();
     let session = session_name("resize-detach-command");
-    create_session_with_size(
-        &handler,
-        session.clone(),
-        TerminalSize {
-            cols: 100,
-            rows: 30,
-        },
-    )
-    .await;
+    handler
+        .create_session((&session, TerminalSize::new(100, 30)))
+        .await;
 
-    let (_large_id, _large_rx) = register_sized_attach(
-        &handler,
-        101,
-        &session,
-        TerminalSize {
-            cols: 160,
-            rows: 40,
-        },
-    )
-    .await;
+    let (_large_id, _large_rx) =
+        register_sized_attach(&handler, 101, &session, TerminalSize::new(160, 40)).await;
     let (_small_id, mut small_rx) =
-        register_sized_attach(&handler, 202, &session, TerminalSize { cols: 72, rows: 18 }).await;
+        register_sized_attach(&handler, 202, &session, TerminalSize::new(72, 18)).await;
     assert_eq!(
         attached_session_size(&handler, &session).await,
-        content_size_for_default_status(TerminalSize { cols: 72, rows: 18 })
+        content_size_for_default_status(TerminalSize::new(72, 18))
     );
 
     let response = handler
@@ -849,10 +564,7 @@ async fn detach_client_recomputes_window_size_before_detached_event() {
     wait_for_client_detached_event(&mut events, &attached_client_name(202)).await;
     assert_eq!(
         attached_session_size(&handler, &session).await,
-        content_size_for_default_status(TerminalSize {
-            cols: 160,
-            rows: 40
-        }),
+        content_size_for_default_status(TerminalSize::new(160, 40)),
         "closing detached clients must be excluded from latest-policy resize selection immediately"
     );
 }
@@ -862,84 +574,57 @@ async fn aggressive_resize_tracks_only_linked_windows_that_are_current() {
     let handler = RequestHandler::new();
     let alpha = session_name("aggr-alpha");
     let beta = session_name("aggr-beta");
-    create_session_with_size(
-        &handler,
-        alpha.clone(),
-        TerminalSize {
-            cols: 100,
-            rows: 30,
-        },
-    )
-    .await;
-    create_session_with_size(
-        &handler,
-        beta.clone(),
-        TerminalSize {
-            cols: 100,
-            rows: 30,
-        },
-    )
-    .await;
-    assert!(matches!(
-        handler
-            .handle(Request::LinkWindow(LinkWindowRequest {
-                source: WindowTarget::with_window(alpha.clone(), 0),
-                target: WindowTarget::with_window(beta.clone(), 1),
-                after: false,
-                before: false,
-                kill_destination: false,
-                detached: false,
-            }))
-            .await,
-        Response::LinkWindow(_)
-    ));
-    assert!(matches!(
-        handler
-            .handle(Request::SelectWindow(SelectWindowRequest {
-                target: WindowTarget::with_window(beta.clone(), 1),
-            }))
-            .await,
-        Response::SelectWindow(_)
-    ));
-    let (_alpha_id, _alpha_rx) = register_sized_attach(
-        &handler,
-        101,
-        &alpha,
-        TerminalSize {
-            cols: 160,
-            rows: 40,
-        },
-    )
-    .await;
+    handler
+        .create_session((&alpha, TerminalSize::new(100, 30)))
+        .await;
+    handler
+        .create_session((&beta, TerminalSize::new(100, 30)))
+        .await;
+    handler
+        .handle_ok(LinkWindowRequest {
+            detached: false,
+            ..Fixture::fixture((
+                WindowTarget::with_window(alpha.clone(), 0),
+                WindowTarget::with_window(beta.clone(), 1),
+            ))
+        })
+        .await;
+    handler
+        .handle_ok(SelectWindowRequest {
+            target: WindowTarget::with_window(beta.clone(), 1),
+        })
+        .await;
+    let (_alpha_id, _alpha_rx) =
+        register_sized_attach(&handler, 101, &alpha, TerminalSize::new(160, 40)).await;
     let (_beta_id, _beta_rx) =
-        register_sized_attach(&handler, 202, &beta, TerminalSize { cols: 72, rows: 18 }).await;
+        register_sized_attach(&handler, 202, &beta, TerminalSize::new(72, 18)).await;
 
-    set_window_size_policy(&handler, &alpha, "smallest").await;
-    set_window_option(&handler, &alpha, OptionName::AggressiveResize, "on").await;
+    handler.set_window_size_policy(&alpha, 0, "smallest").await;
+    handler
+        .set_option(
+            ScopeSelector::Window(WindowTarget::with_window(alpha.clone(), 0)),
+            OptionName::AggressiveResize,
+            "on",
+        )
+        .await;
     handler
         .reconcile_attached_session_size_and_emit(&alpha)
         .await
         .expect("aggressive linked current sessions reconcile");
     assert_eq!(
         attached_session_size(&handler, &alpha).await,
-        content_size_for_default_status(TerminalSize { cols: 72, rows: 18 }),
+        content_size_for_default_status(TerminalSize::new(72, 18)),
         "aggressive-resize must include other sessions where the linked window is current"
     );
 
-    assert!(matches!(
-        handler
-            .handle(Request::SelectWindow(SelectWindowRequest {
-                target: WindowTarget::with_window(beta.clone(), 0),
-            }))
-            .await,
-        Response::SelectWindow(_)
-    ));
+    handler
+        .handle_ok(SelectWindowRequest {
+            target: WindowTarget::with_window(beta.clone(), 0),
+        })
+        .await;
     assert_eq!(
         attached_session_size(&handler, &alpha).await,
-        content_size_for_default_status(TerminalSize {
-            cols: 160,
-            rows: 40
-        }),
+        content_size_for_default_status(TerminalSize::new(160, 40)),
         "selecting away from the linked window must recompute affected aggressive-resize sessions"
     );
 }
@@ -954,26 +639,12 @@ async fn different_requester_pids_reject_ambiguous_cross_process_attach_control(
     let beta = session_name("beta");
     let gamma = session_name("gamma");
 
-    for session_name in [alpha.clone(), beta.clone(), gamma.clone()] {
-        let created = handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name,
-                detached: true,
-                size: Some(TerminalSize { cols: 80, rows: 24 }),
-                environment: None,
-            }))
-            .await;
-        assert!(matches!(created, Response::NewSession(_)));
+    for session in [&alpha, &beta, &gamma] {
+        handler.create_session(session).await;
     }
 
-    let (first_tx, mut first_rx) = mpsc::unbounded_channel();
-    let _first_attach_id = handler
-        .register_attach(first_owner_pid, alpha, first_tx)
-        .await;
-    let (second_tx, mut second_rx) = mpsc::unbounded_channel();
-    let _second_attach_id = handler
-        .register_attach(second_owner_pid, beta, second_tx)
-        .await;
+    let mut first_rx = handler.attach_client(first_owner_pid, alpha).await;
+    let mut second_rx = handler.attach_client(second_owner_pid, beta).await;
 
     let switched = handler
         .dispatch(
@@ -1017,20 +688,11 @@ async fn attach_session_without_target_prefers_an_unattached_session() {
     let alpha = session_name("alpha");
     let beta = session_name("beta");
 
-    for session_name in [alpha.clone(), beta.clone()] {
-        let created = handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name,
-                detached: true,
-                size: Some(TerminalSize { cols: 80, rows: 24 }),
-                environment: None,
-            }))
-            .await;
-        assert!(matches!(created, Response::NewSession(_)));
+    for session in [&alpha, &beta] {
+        handler.create_session(session).await;
     }
 
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler.register_attach(101, alpha, control_tx).await;
+    let _control_rx = handler.attach_client(101, alpha).await;
 
     let outcome = handler
         .dispatch(
@@ -1059,16 +721,8 @@ async fn attach_session_without_target_prefers_the_most_recent_unattached_sessio
     let alpha = session_name("alpha");
     let beta = session_name("beta");
 
-    for session_name in [alpha.clone(), beta.clone()] {
-        let created = handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name,
-                detached: true,
-                size: Some(TerminalSize { cols: 80, rows: 24 }),
-                environment: None,
-            }))
-            .await;
-        assert!(matches!(created, Response::NewSession(_)));
+    for session in [&alpha, &beta] {
+        handler.create_session(session).await;
     }
 
     sleep(Duration::from_secs(1)).await;
@@ -1104,22 +758,11 @@ async fn switch_client_last_session_recalls_the_previous_session() {
     let alpha = session_name("alpha");
     let beta = session_name("beta");
 
-    for session_name in [alpha.clone(), beta.clone()] {
-        let created = handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name,
-                detached: true,
-                size: Some(TerminalSize { cols: 80, rows: 24 }),
-                environment: None,
-            }))
-            .await;
-        assert!(matches!(created, Response::NewSession(_)));
+    for session in [&alpha, &beta] {
+        handler.create_session(session).await;
     }
 
-    let (control_tx, mut control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
+    let mut control_rx = handler.attach_client(requester_pid, &alpha).await;
 
     let switched = handler
         .dispatch(
@@ -1185,22 +828,11 @@ async fn kill_session_clears_attached_last_session_references() {
     let alpha = session_name("alpha");
     let beta = session_name("beta");
 
-    for session_name in [alpha.clone(), beta.clone()] {
-        let created = handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name,
-                detached: true,
-                size: Some(TerminalSize { cols: 80, rows: 24 }),
-                environment: None,
-            }))
-            .await;
-        assert!(matches!(created, Response::NewSession(_)));
+    for session in [&alpha, &beta] {
+        handler.create_session(session).await;
     }
 
-    let (control_tx, mut control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
+    let mut control_rx = handler.attach_client(requester_pid, &alpha).await;
 
     let switched = handler
         .dispatch(
@@ -1241,12 +873,7 @@ async fn kill_session_clears_attached_last_session_references() {
     }
 
     let response = handler
-        .handle(Request::KillSession(KillSessionRequest {
-            target: alpha,
-            kill_all_except_target: false,
-            clear_alerts: false,
-            kill_group: false,
-        }))
+        .handle(Request::KillSession(KillSessionRequest::fixture(alpha)))
         .await;
     assert_eq!(
         response,
@@ -1268,48 +895,25 @@ async fn kill_session_detach_on_destroy_off_switches_every_attached_client() {
     let gamma = session_name("destroy-switch-gamma");
     let beta = session_name("destroy-switch-beta");
     let alpha = session_name("destroy-switch-alpha");
-    for session in [gamma.clone(), beta.clone(), alpha.clone()] {
-        create_session_with_size(&handler, session, TerminalSize { cols: 80, rows: 24 }).await;
+    for session in [&gamma, &beta, &alpha] {
+        handler.create_session(session).await;
     }
-    let response = handler
-        .handle(Request::SetOption(SetOptionRequest {
-            scope: ScopeSelector::Session(alpha.clone()),
-            option: OptionName::DetachOnDestroy,
-            value: "off".to_owned(),
-            mode: SetOptionMode::Replace,
-        }))
+    handler
+        .set_option(
+            ScopeSelector::Session(alpha.clone()),
+            OptionName::DetachOnDestroy,
+            "off",
+        )
         .await;
-    assert!(matches!(response, Response::SetOption(_)), "{response:?}");
 
-    let (_, mut first_rx) = register_sized_attach(
-        &handler,
-        91_801,
-        &alpha,
-        TerminalSize { cols: 90, rows: 30 },
-    )
-    .await;
-    let (_, mut second_rx) = register_sized_attach(
-        &handler,
-        91_802,
-        &alpha,
-        TerminalSize {
-            cols: 100,
-            rows: 35,
-        },
-    )
-    .await;
+    let (_, mut first_rx) =
+        register_sized_attach(&handler, 91_801, &alpha, TerminalSize::new(90, 30)).await;
+    let (_, mut second_rx) =
+        register_sized_attach(&handler, 91_802, &alpha, TerminalSize::new(100, 35)).await;
     while first_rx.try_recv().is_ok() {}
     while second_rx.try_recv().is_ok() {}
 
-    let response = handler
-        .handle(Request::KillSession(KillSessionRequest {
-            target: alpha.clone(),
-            kill_all_except_target: false,
-            clear_alerts: false,
-            kill_group: false,
-        }))
-        .await;
-    assert!(matches!(response, Response::KillSession(_)), "{response:?}");
+    handler.handle_ok(KillSessionRequest::fixture(&alpha)).await;
 
     for (receiver, label) in [(&mut first_rx, "first"), (&mut second_rx, "second")] {
         let target = recv_switch_target(receiver, label).await;
@@ -1332,28 +936,20 @@ async fn no_detach_on_destroy_client_flag_overrides_default_detach() {
     let handler = RequestHandler::new();
     let beta = session_name("destroy-flag-beta");
     let alpha = session_name("destroy-flag-alpha");
-    for session in [beta.clone(), alpha.clone()] {
-        create_session_with_size(&handler, session, TerminalSize { cols: 80, rows: 24 }).await;
+    for session in [&beta, &alpha] {
+        handler.create_session(session).await;
     }
     let (_, mut control_rx) = register_sized_attach_with_flags(
         &handler,
         91_803,
         &alpha,
-        TerminalSize { cols: 90, rows: 30 },
-        super::super::attach_support::ClientFlags::NO_DETACH_ON_DESTROY,
+        TerminalSize::new(90, 30),
+        ClientFlags::NO_DETACH_ON_DESTROY,
     )
     .await;
     while control_rx.try_recv().is_ok() {}
 
-    let response = handler
-        .handle(Request::KillSession(KillSessionRequest {
-            target: alpha,
-            kill_all_except_target: false,
-            clear_alerts: false,
-            kill_group: false,
-        }))
-        .await;
-    assert!(matches!(response, Response::KillSession(_)), "{response:?}");
+    handler.handle_ok(KillSessionRequest::fixture(alpha)).await;
     let target = recv_switch_target(&mut control_rx, "no-detach client flag").await;
     assert_eq!(target.session_name, beta);
 }
@@ -1364,67 +960,33 @@ async fn destroy_switch_target_name_reuse_fails_closed() {
     let gamma = session_name("destroy-reuse-gamma");
     let beta = session_name("destroy-reuse-beta");
     let alpha = session_name("destroy-reuse-alpha");
-    for session in [gamma, beta.clone(), alpha.clone()] {
-        create_session_with_size(&handler, session, TerminalSize { cols: 80, rows: 24 }).await;
+    for session in [&gamma, &beta, &alpha] {
+        handler.create_session(session).await;
     }
-    let response = handler
-        .handle(Request::SetOption(SetOptionRequest {
-            scope: ScopeSelector::Session(alpha.clone()),
-            option: OptionName::DetachOnDestroy,
-            value: "off".to_owned(),
-            mode: SetOptionMode::Replace,
-        }))
+    handler
+        .set_option(
+            ScopeSelector::Session(alpha.clone()),
+            OptionName::DetachOnDestroy,
+            "off",
+        )
         .await;
-    assert!(matches!(response, Response::SetOption(_)), "{response:?}");
-    let (_, mut control_rx) = register_sized_attach(
-        &handler,
-        91_804,
-        &alpha,
-        TerminalSize { cols: 90, rows: 30 },
-    )
-    .await;
+    let (_, mut control_rx) =
+        register_sized_attach(&handler, 91_804, &alpha, TerminalSize::new(90, 30)).await;
     while control_rx.try_recv().is_ok() {}
 
-    let original_beta_id = handler
-        .state
-        .lock()
-        .await
-        .sessions
-        .session(&beta)
-        .expect("original beta exists")
-        .id();
+    let original_beta_id = handler.session_id_for_test(&beta).await;
     let pause = handler.install_attached_size_selection_pause();
     let kill_handler = handler.clone();
     let kill_alpha = tokio::spawn(async move {
         kill_handler
-            .handle(Request::KillSession(KillSessionRequest {
-                target: alpha,
-                kill_all_except_target: false,
-                clear_alerts: false,
-                kill_group: false,
-            }))
+            .handle(Request::KillSession(KillSessionRequest::fixture(alpha)))
             .await
     });
     pause.reached.notified().await;
 
-    let response = handler
-        .handle(Request::KillSession(KillSessionRequest {
-            target: beta.clone(),
-            kill_all_except_target: false,
-            clear_alerts: false,
-            kill_group: false,
-        }))
-        .await;
-    assert!(matches!(response, Response::KillSession(_)), "{response:?}");
-    create_session_with_size(&handler, beta.clone(), TerminalSize { cols: 80, rows: 24 }).await;
-    let replacement_beta_id = handler
-        .state
-        .lock()
-        .await
-        .sessions
-        .session(&beta)
-        .expect("replacement beta exists")
-        .id();
+    handler.handle_ok(KillSessionRequest::fixture(&beta)).await;
+    handler.create_session(&beta).await;
+    let replacement_beta_id = handler.session_id_for_test(&beta).await;
     assert_ne!(replacement_beta_id, original_beta_id);
 
     pause.release.notify_one();
@@ -1448,37 +1010,25 @@ async fn concurrent_manual_switch_wins_over_destroy_switch() {
     let gamma = session_name("destroy-race-gamma");
     let beta = session_name("destroy-race-beta");
     let alpha = session_name("destroy-race-alpha");
-    for session in [gamma.clone(), beta, alpha.clone()] {
-        create_session_with_size(&handler, session, TerminalSize { cols: 80, rows: 24 }).await;
+    for session in [&gamma, &beta, &alpha] {
+        handler.create_session(session).await;
     }
-    let response = handler
-        .handle(Request::SetOption(SetOptionRequest {
-            scope: ScopeSelector::Session(alpha.clone()),
-            option: OptionName::DetachOnDestroy,
-            value: "off".to_owned(),
-            mode: SetOptionMode::Replace,
-        }))
+    handler
+        .set_option(
+            ScopeSelector::Session(alpha.clone()),
+            OptionName::DetachOnDestroy,
+            "off",
+        )
         .await;
-    assert!(matches!(response, Response::SetOption(_)), "{response:?}");
-    let (_, mut control_rx) = register_sized_attach(
-        &handler,
-        91_805,
-        &alpha,
-        TerminalSize { cols: 90, rows: 30 },
-    )
-    .await;
+    let (_, mut control_rx) =
+        register_sized_attach(&handler, 91_805, &alpha, TerminalSize::new(90, 30)).await;
     while control_rx.try_recv().is_ok() {}
 
     let pause = handler.install_attached_size_selection_pause();
     let kill_handler = handler.clone();
     let kill_alpha = tokio::spawn(async move {
         kill_handler
-            .handle(Request::KillSession(KillSessionRequest {
-                target: alpha,
-                kill_all_except_target: false,
-                clear_alerts: false,
-                kill_group: false,
-            }))
+            .handle(Request::KillSession(KillSessionRequest::fixture(alpha)))
             .await
     });
     pause.reached.notified().await;
@@ -1529,141 +1079,15 @@ async fn concurrent_manual_switch_wins_over_destroy_switch() {
     assert!(!active.closing.load(Ordering::SeqCst));
 }
 
-async fn create_session_with_size(
-    handler: &RequestHandler,
-    session: SessionName,
-    size: TerminalSize,
-) {
-    let created = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name: session,
-            detached: true,
-            size: Some(size),
-            environment: None,
-        }))
-        .await;
-    assert!(matches!(created, Response::NewSession(_)));
-}
-
-async fn register_sized_attach(
-    handler: &RequestHandler,
-    requester_pid: u32,
-    session: &SessionName,
-    size: TerminalSize,
-) -> (u64, mpsc::UnboundedReceiver<AttachControl>) {
-    register_sized_attach_with_flags(
-        handler,
-        requester_pid,
-        session,
-        size,
-        super::super::attach_support::ClientFlags::default(),
-    )
-    .await
-}
-
-async fn register_sized_attach_with_flags(
-    handler: &RequestHandler,
-    requester_pid: u32,
-    session: &SessionName,
-    size: TerminalSize,
-    flags: super::super::attach_support::ClientFlags,
-) -> (u64, mpsc::UnboundedReceiver<AttachControl>) {
-    let (control_tx, control_rx) = mpsc::unbounded_channel();
-    let uid = current_owner_uid();
-    let attach_id = handler
-        .register_attach_with_access(
-            requester_pid,
-            session.clone(),
-            None,
-            AttachRegistration {
-                control_tx,
-                control_backlog: Arc::new(AtomicUsize::new(0)),
-                closing: Arc::new(AtomicBool::new(false)),
-                persistent_overlay_epoch: Arc::new(AtomicU64::new(0)),
-                terminal_context: OuterTerminalContext::default(),
-                client_title: None,
-                flags,
-                render_stream: false,
-                uid,
-                user: rmux_os::identity::UserIdentity::Uid(uid),
-                can_write: true,
-                client_size: Some(size),
-            },
-        )
-        .await
-        .expect("attach registration succeeds");
-    handler
-        .handle_attached_resize(requester_pid, size)
-        .await
-        .expect("initial attached client size is accepted");
-    (attach_id, control_rx)
-}
-
 fn refresh_client_flags_request(
     target_pid: u32,
     flags: Option<&str>,
     flags_alias: Option<&str>,
 ) -> Request {
-    Request::RefreshClient(Box::new(rmux_proto::request::RefreshClientRequest {
-        target_client: Some(target_pid.to_string()),
-        adjustment: None,
-        clear_pan: false,
-        pan_left: false,
-        pan_right: false,
-        pan_up: false,
-        pan_down: false,
-        status_only: false,
-        clipboard_query: false,
+    Request::RefreshClient(Box::new(RefreshClientRequest {
         flags: flags.map(str::to_owned),
         flags_alias: flags_alias.map(str::to_owned),
-        subscriptions: Vec::new(),
-        subscriptions_format: Vec::new(),
-        control_size: None,
-        colour_report: None,
-    }))
-}
-
-async fn set_window_size_policy(handler: &RequestHandler, session: &SessionName, value: &str) {
-    set_window_option(handler, session, OptionName::WindowSize, value).await;
-}
-
-async fn set_window_option(
-    handler: &RequestHandler,
-    session: &SessionName,
-    option: OptionName,
-    value: &str,
-) {
-    let response = handler
-        .handle(Request::SetOption(SetOptionRequest {
-            scope: ScopeSelector::Window(WindowTarget::with_window(session.clone(), 0)),
-            option,
-            value: value.to_owned(),
-            mode: SetOptionMode::Replace,
-        }))
-        .await;
-    assert!(matches!(response, Response::SetOption(_)), "{response:?}");
-}
-
-fn attach_session_request(session: &SessionName, client_size: TerminalSize) -> Request {
-    attach_session_request_with_read_only(session, client_size, false)
-}
-
-fn attach_session_request_with_read_only(
-    session: &SessionName,
-    client_size: TerminalSize,
-    read_only: bool,
-) -> Request {
-    Request::AttachSessionExt2(Box::new(AttachSessionExt2Request {
-        target: Some(session.clone()),
-        target_spec: Some(session.to_string()),
-        detach_other_clients: false,
-        kill_other_clients: false,
-        read_only,
-        skip_environment_update: false,
-        flags: None,
-        working_directory: None,
-        client_terminal: rmux_proto::ClientTerminalContext::default(),
-        client_size: Some(client_size),
+        ..Fixture::fixture(Some(target_pid.to_string()))
     }))
 }
 
@@ -1704,28 +1128,6 @@ async fn wait_for_client_detached_event(
     })
     .await
     .expect("timed out waiting for client-detached event");
-}
-
-async fn wait_for_named_buffer(handler: &RequestHandler, name: &str, expected: &[u8]) {
-    let deadline = tokio::time::Instant::now() + ATTACH_LIFECYCLE_TIMEOUT;
-    loop {
-        let maybe_content = {
-            let state = handler.state.lock().await;
-            state
-                .buffers
-                .show(Some(name))
-                .ok()
-                .map(|(_, content)| content.to_vec())
-        };
-        if maybe_content.as_deref() == Some(expected) {
-            return;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "timed out waiting for buffer {name:?} to contain {expected:?}; got {maybe_content:?}"
-        );
-        sleep(Duration::from_millis(25)).await;
-    }
 }
 
 async fn drain_lifecycle_events(

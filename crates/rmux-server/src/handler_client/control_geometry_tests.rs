@@ -1,18 +1,15 @@
 use super::*;
 
-use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
-use std::time::Duration;
-
 use rmux_core::command_parser::CommandParser;
 use rmux_proto::{
-    ControlMode, DetachClientRequest, KillSessionRequest, NewSessionRequest, NewWindowRequest,
-    OptionName, Request, Response, ScopeSelector, SessionName, SetOptionMode, SetOptionRequest,
-    SwitchClientRequest, TerminalSize, WindowTarget,
+    DetachClientRequest, KillSessionRequest, NewWindowRequest, OptionName, RefreshClientRequest,
+    Request, Response, ScopeSelector, SessionName, SwitchClientRequest, TerminalSize, WindowTarget,
 };
 use tokio::sync::mpsc;
 
-use crate::control::{ControlModeUpgrade, ControlServerEvent, CONTROL_SERVER_EVENT_CAPACITY};
+use crate::test_fixtures::{
+    collect_control_notifications_through, settle_control_notifications, Fixture,
+};
 
 const INITIAL_SIZE: TerminalSize = TerminalSize { cols: 80, rows: 24 };
 const TARGET_SIZE: TerminalSize = TerminalSize { cols: 60, rows: 15 };
@@ -22,9 +19,6 @@ const CONTROL_SIZE: TerminalSize = TerminalSize {
 };
 const SOURCE_ATTACHED_SIZE: TerminalSize = TerminalSize { cols: 70, rows: 20 };
 const TARGET_ATTACHED_SIZE: TerminalSize = TerminalSize { cols: 90, rows: 30 };
-const CONTROL_NOTIFICATION_TIMEOUT: Duration = Duration::from_secs(5);
-const CONTROL_NOTIFICATION_SETTLE: Duration = Duration::from_millis(250);
-const CONTROL_NOTIFICATION_POLL: Duration = Duration::from_millis(25);
 
 const fn attached_content_size(terminal_size: TerminalSize) -> TerminalSize {
     TerminalSize {
@@ -48,31 +42,28 @@ async fn refresh_client_control_size_echoes_each_window_once_like_tmux37() {
     for (policy_index, policy) in ["latest", "manual"].into_iter().enumerate() {
         let handler = RequestHandler::new();
         let session = session_name(&format!("control-refresh-echo-{policy}"));
-        create_session(&handler, session.clone(), INITIAL_SIZE).await;
-        let created = handler
-            .handle(Request::NewWindow(Box::new(NewWindowRequest {
-                target: session.clone(),
+        handler.create_session((&session, INITIAL_SIZE)).await;
+        handler
+            .create_window(NewWindowRequest {
                 name: Some("second".to_owned()),
-                detached: true,
-                start_directory: None,
-                environment: None,
-                command: None,
-                process_command: None,
                 target_window_index: Some(1),
-                insert_at_target: false,
-            })))
+                ..Fixture::fixture(&session)
+            })
             .await;
-        assert!(matches!(created, Response::NewWindow(_)), "{created:?}");
         for window_index in [0, 1] {
-            set_window_size_policy_for_window(&handler, &session, window_index, policy).await;
+            handler
+                .set_window_size_policy(&session, window_index, policy)
+                .await;
         }
 
         let control_pid = 92_180 + policy_index as u32 * 2;
         let observer_pid = control_pid + 1;
-        let (_control_id, mut control_events) =
-            register_control_client_with_id(&handler, control_pid, &session).await;
-        let (_observer_id, mut observer_events) =
-            register_control_client_with_id(&handler, observer_pid, &session).await;
+        let (_control_id, mut control_events) = handler
+            .register_control_for_test(control_pid, Some(&session))
+            .await;
+        let (_observer_id, mut observer_events) = handler
+            .register_control_for_test(observer_pid, Some(&session))
+            .await;
         let _ = settle_control_notifications(&mut control_events).await;
         let _ = settle_control_notifications(&mut observer_events).await;
         let expected_window_ids = window_ids(&handler, &session).await;
@@ -89,15 +80,9 @@ async fn refresh_client_control_size_echoes_each_window_once_like_tmux37() {
                 rows: 41,
             },
         ] {
-            let response = handler
-                .handle(Request::RefreshClient(Box::new(
-                    refresh_client_size_request(control_pid, declared_size),
-                )))
+            handler
+                .handle_ok(refresh_client_size_request(control_pid, declared_size))
                 .await;
-            assert!(
-                matches!(response, Response::RefreshClient(_)),
-                "{response:?}"
-            );
 
             for (label, events) in [
                 ("issuing client", &mut control_events),
@@ -143,8 +128,8 @@ async fn refresh_client_control_size_respects_window_size_policy_like_tmux37() {
     {
         let handler = RequestHandler::new();
         let session = session_name(&format!("control-refresh-{policy}"));
-        create_session(&handler, session.clone(), INITIAL_SIZE).await;
-        set_window_size_policy(&handler, &session, policy).await;
+        handler.create_session((&session, INITIAL_SIZE)).await;
+        handler.set_window_size_policy(&session, 0, policy).await;
         let (_attach_id, _attach_events) = register_attached_client(
             &handler,
             92_200 + index as u32,
@@ -153,25 +138,19 @@ async fn refresh_client_control_size_respects_window_size_policy_like_tmux37() {
         )
         .await;
         let requester_pid = std::process::id();
-        let (_control_id, _events) =
-            register_control_client_with_id(&handler, requester_pid, &session).await;
-
-        let response = handler
-            .handle(Request::RefreshClient(Box::new(
-                refresh_client_size_request(requester_pid, CONTROL_SIZE),
-            )))
+        let (_control_id, _events) = handler
+            .register_control_for_test(requester_pid, Some(&session))
             .await;
 
-        assert!(
-            matches!(response, Response::RefreshClient(_)),
-            "{response:?}"
-        );
+        handler
+            .handle_ok(refresh_client_size_request(requester_pid, CONTROL_SIZE))
+            .await;
         assert_eq!(
             control_client_size(&handler, requester_pid).await,
             CONTROL_SIZE
         );
         assert_eq!(
-            session_size(&handler, &session).await,
+            handler.active_window_size_for_test(&session).await,
             expected_size,
             "{policy}"
         );
@@ -185,60 +164,47 @@ async fn older_control_resize_keeps_the_latest_client_order_like_tmux37() {
     // without making it the newest window-size candidate.
     let handler = RequestHandler::new();
     let session = session_name("control-latest-resize-order");
-    create_session(&handler, session.clone(), INITIAL_SIZE).await;
-    set_window_size_policy(&handler, &session, "latest").await;
+    handler.create_session((&session, INITIAL_SIZE)).await;
+    handler.set_window_size_policy(&session, 0, "latest").await;
     let older_pid = 92_280;
     let latest_pid = older_pid + 1;
-    let (_older_id, _older_events) =
-        register_control_client_with_id(&handler, older_pid, &session).await;
+    let (_older_id, _older_events) = handler
+        .register_control_for_test(older_pid, Some(&session))
+        .await;
     let older_size = TerminalSize {
         cols: 100,
         rows: 40,
     };
-    let response = handler
-        .handle(Request::RefreshClient(Box::new(
-            refresh_client_size_request(older_pid, older_size),
-        )))
+    handler
+        .handle_ok(refresh_client_size_request(older_pid, older_size))
         .await;
-    assert!(
-        matches!(response, Response::RefreshClient(_)),
-        "{response:?}"
-    );
 
-    let (_latest_id, _latest_events) =
-        register_control_client_with_id(&handler, latest_pid, &session).await;
-    let latest_size = TerminalSize { cols: 60, rows: 20 };
-    let response = handler
-        .handle(Request::RefreshClient(Box::new(
-            refresh_client_size_request(latest_pid, latest_size),
-        )))
+    let (_latest_id, _latest_events) = handler
+        .register_control_for_test(latest_pid, Some(&session))
         .await;
-    assert!(
-        matches!(response, Response::RefreshClient(_)),
-        "{response:?}"
+    let latest_size = TerminalSize { cols: 60, rows: 20 };
+    handler
+        .handle_ok(refresh_client_size_request(latest_pid, latest_size))
+        .await;
+    assert_eq!(
+        handler.active_window_size_for_test(&session).await,
+        latest_size
     );
-    assert_eq!(session_size(&handler, &session).await, latest_size);
 
     let resized_older = TerminalSize {
         cols: 101,
         rows: 41,
     };
-    let response = handler
-        .handle(Request::RefreshClient(Box::new(
-            refresh_client_size_request(older_pid, resized_older),
-        )))
+    handler
+        .handle_ok(refresh_client_size_request(older_pid, resized_older))
         .await;
-    assert!(
-        matches!(response, Response::RefreshClient(_)),
-        "{response:?}"
-    );
     assert_eq!(
         control_client_size(&handler, older_pid).await,
         resized_older,
         "the older control still records its new geometry"
     );
     assert_eq!(
-        session_size(&handler, &session).await,
+        handler.active_window_size_for_test(&session).await,
         latest_size,
         "resizing an older control must not steal latest-client ordering"
     );
@@ -251,19 +217,14 @@ async fn switch_control_client_reapplies_reported_size_like_tmux37() {
     // 90x30 attached geometry for smallest, and no resize for manual.
     let handler = RequestHandler::new();
     let source = session_name("control-switch-source");
-    create_session(&handler, source.clone(), INITIAL_SIZE).await;
+    handler.create_session((&source, INITIAL_SIZE)).await;
     let requester_pid = std::process::id();
-    let (_control_id, _events) =
-        register_control_client_with_id(&handler, requester_pid, &source).await;
-    let refreshed = handler
-        .handle(Request::RefreshClient(Box::new(
-            refresh_client_size_request(requester_pid, CONTROL_SIZE),
-        )))
+    let (_control_id, _events) = handler
+        .register_control_for_test(requester_pid, Some(&source))
         .await;
-    assert!(
-        matches!(refreshed, Response::RefreshClient(_)),
-        "{refreshed:?}"
-    );
+    handler
+        .handle_ok(refresh_client_size_request(requester_pid, CONTROL_SIZE))
+        .await;
 
     for (index, (policy, expected_size)) in [
         ("latest", CONTROL_SIZE),
@@ -275,8 +236,8 @@ async fn switch_control_client_reapplies_reported_size_like_tmux37() {
     .enumerate()
     {
         let target = session_name(&format!("control-switch-{policy}"));
-        create_session(&handler, target.clone(), TARGET_SIZE).await;
-        set_window_size_policy(&handler, &target, policy).await;
+        handler.create_session((&target, TARGET_SIZE)).await;
+        handler.set_window_size_policy(&target, 0, policy).await;
         let (_attach_id, _attach_events) = register_attached_client(
             &handler,
             92_300 + index as u32,
@@ -285,18 +246,13 @@ async fn switch_control_client_reapplies_reported_size_like_tmux37() {
         )
         .await;
 
-        let response = handler
-            .handle(Request::SwitchClient(SwitchClientRequest {
+        handler
+            .handle_ok(SwitchClientRequest {
                 target: target.clone(),
-            }))
+            })
             .await;
-
-        assert!(
-            matches!(response, Response::SwitchClient(_)),
-            "{response:?}"
-        );
         assert_eq!(
-            session_size(&handler, &target).await,
+            handler.active_window_size_for_test(&target).await,
             expected_size,
             "{policy}"
         );
@@ -308,35 +264,34 @@ async fn new_session_attach_existing_reconciles_control_geometry_like_tmux37() {
     let handler = RequestHandler::new();
     let source = session_name("control-new-session-attach-source");
     let target = session_name("control-new-session-attach-target");
-    create_session(&handler, source.clone(), INITIAL_SIZE).await;
-    create_session(&handler, target.clone(), TARGET_SIZE).await;
-    set_window_size_policy(&handler, &source, "largest").await;
-    set_window_size_policy(&handler, &target, "largest").await;
+    handler.create_session((&source, INITIAL_SIZE)).await;
+    handler.create_session((&target, TARGET_SIZE)).await;
+    handler.set_window_size_policy(&source, 0, "largest").await;
+    handler.set_window_size_policy(&target, 0, "largest").await;
 
     let switching_pid = 92_350;
     let surviving_pid = switching_pid + 1;
-    let (switching_id, mut switching_events) =
-        register_control_client_with_id(&handler, switching_pid, &source).await;
-    let (_surviving_id, mut surviving_events) =
-        register_control_client_with_id(&handler, surviving_pid, &source).await;
+    let (switching_id, mut switching_events) = handler
+        .register_control_for_test(switching_pid, Some(&source))
+        .await;
+    let (_surviving_id, mut surviving_events) = handler
+        .register_control_for_test(surviving_pid, Some(&source))
+        .await;
     for (pid, size) in [
         (switching_pid, CONTROL_SIZE),
         (surviving_pid, SOURCE_ATTACHED_SIZE),
     ] {
-        let response = handler
-            .handle(Request::RefreshClient(Box::new(
-                refresh_client_size_request(pid, size),
-            )))
+        handler
+            .handle_ok(refresh_client_size_request(pid, size))
             .await;
-        assert!(
-            matches!(response, Response::RefreshClient(_)),
-            "{response:?}"
-        );
     }
-    assert_eq!(session_size(&handler, &source).await, CONTROL_SIZE);
+    assert_eq!(
+        handler.active_window_size_for_test(&source).await,
+        CONTROL_SIZE
+    );
     let source_layout_prefix = format!(
         "%layout-change @{} ",
-        active_window_id(&handler, &source).await
+        handler.active_window_id_for_test(&source).await
     );
     settle_control_notifications(&mut switching_events).await;
     settle_control_notifications(&mut surviving_events).await;
@@ -350,12 +305,12 @@ async fn new_session_attach_existing_reconciles_control_geometry_like_tmux37() {
 
     assert!(result.error.is_none(), "{:?}", result.error);
     assert_eq!(
-        session_size(&handler, &source).await,
+        handler.active_window_size_for_test(&source).await,
         SOURCE_ATTACHED_SIZE,
         "the source must fall back to its surviving control client"
     );
     assert_eq!(
-        session_size(&handler, &target).await,
+        handler.active_window_size_for_test(&target).await,
         CONTROL_SIZE,
         "the destination must adopt the arriving control client's size"
     );
@@ -386,29 +341,25 @@ async fn control_clients_share_largest_and_smallest_size_candidates_like_tmux37(
     {
         let handler = RequestHandler::new();
         let session = session_name(&format!("control-multi-{policy}"));
-        create_session(&handler, session.clone(), INITIAL_SIZE).await;
-        set_window_size_policy(&handler, &session, policy).await;
+        handler.create_session((&session, INITIAL_SIZE)).await;
+        handler.set_window_size_policy(&session, 0, policy).await;
         let first_pid = 92_400 + index as u32 * 2;
         let second_pid = first_pid + 1;
-        let (_first_id, _first_events) =
-            register_control_client_with_id(&handler, first_pid, &session).await;
-        let (_second_id, _second_events) =
-            register_control_client_with_id(&handler, second_pid, &session).await;
+        let (_first_id, _first_events) = handler
+            .register_control_for_test(first_pid, Some(&session))
+            .await;
+        let (_second_id, _second_events) = handler
+            .register_control_for_test(second_pid, Some(&session))
+            .await;
 
         for (pid, size) in [(first_pid, first_size), (second_pid, second_size)] {
-            let response = handler
-                .handle(Request::RefreshClient(Box::new(
-                    refresh_client_size_request(pid, size),
-                )))
+            handler
+                .handle_ok(refresh_client_size_request(pid, size))
                 .await;
-            assert!(
-                matches!(response, Response::RefreshClient(_)),
-                "{response:?}"
-            );
         }
 
         assert_eq!(
-            session_size(&handler, &session).await,
+            handler.active_window_size_for_test(&session).await,
             expected_size,
             "{policy}"
         );
@@ -437,8 +388,8 @@ async fn undeclared_control_client_never_shrinks_an_attached_session_like_tmux37
     {
         let handler = RequestHandler::new();
         let session = session_name(&format!("control-undeclared-attached-{policy}"));
-        create_session(&handler, session.clone(), INITIAL_SIZE).await;
-        set_window_size_policy(&handler, &session, policy).await;
+        handler.create_session((&session, INITIAL_SIZE)).await;
+        handler.set_window_size_policy(&session, 0, policy).await;
         let attach_pid = 92_700 + index as u32 * 2;
         let control_pid = attach_pid + 1;
         let (_attach_id, _attach_events) =
@@ -453,20 +404,21 @@ async fn undeclared_control_client_never_shrinks_an_attached_session_like_tmux37
             attached_content_size(CONTROL_SIZE)
         };
         assert_eq!(
-            session_size(&handler, &session).await,
+            handler.active_window_size_for_test(&session).await,
             expected_size,
             "{policy} before the control client arrives"
         );
 
-        let (_control_id, _control_events) =
-            register_control_client_with_id(&handler, control_pid, &session).await;
+        let (_control_id, _control_events) = handler
+            .register_control_for_test(control_pid, Some(&session))
+            .await;
         handler
             .reconcile_attached_session_size_and_emit(&session)
             .await
             .expect("a control arrival reconciles the session geometry");
 
         assert_eq!(
-            session_size(&handler, &session).await,
+            handler.active_window_size_for_test(&session).await,
             expected_size,
             "{policy}: a control client that never ran refresh-client -C must not resize"
         );
@@ -487,18 +439,19 @@ async fn undeclared_control_client_alone_never_resizes_the_session_like_tmux37()
     {
         let handler = RequestHandler::new();
         let session = session_name(&format!("control-undeclared-alone-{policy}"));
-        create_session(&handler, session.clone(), CONTROL_SIZE).await;
-        set_window_size_policy(&handler, &session, policy).await;
+        handler.create_session((&session, CONTROL_SIZE)).await;
+        handler.set_window_size_policy(&session, 0, policy).await;
         let control_pid = 92_720 + index as u32;
-        let (_control_id, _control_events) =
-            register_control_client_with_id(&handler, control_pid, &session).await;
+        let (_control_id, _control_events) = handler
+            .register_control_for_test(control_pid, Some(&session))
+            .await;
         handler
             .reconcile_attached_session_size_and_emit(&session)
             .await
             .expect("a control arrival reconciles the session geometry");
 
         assert_eq!(
-            session_size(&handler, &session).await,
+            handler.active_window_size_for_test(&session).await,
             CONTROL_SIZE,
             "{policy}: the session keeps its own geometry, the control client owns none"
         );
@@ -517,13 +470,14 @@ async fn undeclared_control_client_switch_never_resizes_the_target_like_tmux37()
     {
         let handler = RequestHandler::new();
         let source = session_name(&format!("control-undeclared-switch-source-{policy}"));
-        create_session(&handler, source.clone(), INITIAL_SIZE).await;
-        let (_control_id, _control_events) =
-            register_control_client_with_id(&handler, std::process::id(), &source).await;
+        handler.create_session((&source, INITIAL_SIZE)).await;
+        let (_control_id, _control_events) = handler
+            .register_control_for_test(std::process::id(), Some(&source))
+            .await;
 
         let target = session_name(&format!("control-undeclared-switch-target-{policy}"));
-        create_session(&handler, target.clone(), INITIAL_SIZE).await;
-        set_window_size_policy(&handler, &target, policy).await;
+        handler.create_session((&target, INITIAL_SIZE)).await;
+        handler.set_window_size_policy(&target, 0, policy).await;
         let (_attach_id, _attach_events) =
             register_attached_client(&handler, 92_740 + index as u32, &target, CONTROL_SIZE).await;
         handler
@@ -536,18 +490,14 @@ async fn undeclared_control_client_switch_never_resizes_the_target_like_tmux37()
             attached_content_size(CONTROL_SIZE)
         };
 
-        let response = handler
-            .handle(Request::SwitchClient(SwitchClientRequest {
+        handler
+            .handle_ok(SwitchClientRequest {
                 target: target.clone(),
-            }))
+            })
             .await;
-        assert!(
-            matches!(response, Response::SwitchClient(_)),
-            "{response:?}"
-        );
 
         assert_eq!(
-            session_size(&handler, &target).await,
+            handler.active_window_size_for_test(&target).await,
             expected_size,
             "{policy}: switching an undeclared control client must not resize the target"
         );
@@ -559,10 +509,10 @@ async fn switching_control_client_reconciles_the_source_session_geometry() {
     let handler = RequestHandler::new();
     let source = session_name("control-switch-reconcile-source");
     let target = session_name("control-switch-reconcile-target");
-    create_session(&handler, source.clone(), INITIAL_SIZE).await;
-    create_session(&handler, target.clone(), TARGET_SIZE).await;
-    set_window_size_policy(&handler, &source, "largest").await;
-    set_window_size_policy(&handler, &target, "largest").await;
+    handler.create_session((&source, INITIAL_SIZE)).await;
+    handler.create_session((&target, TARGET_SIZE)).await;
+    handler.set_window_size_policy(&source, 0, "largest").await;
+    handler.set_window_size_policy(&target, 0, "largest").await;
 
     let switching_pid = std::process::id();
     let surviving_pid = switching_pid.saturating_add(1);
@@ -571,39 +521,39 @@ async fn switching_control_client_reconciles_the_source_session_geometry() {
         rows: 41,
     };
     let surviving_size = TerminalSize { cols: 60, rows: 20 };
-    let (_switching_id, _switching_events) =
-        register_control_client_with_id(&handler, switching_pid, &source).await;
-    let (_surviving_id, _surviving_events) =
-        register_control_client_with_id(&handler, surviving_pid, &source).await;
+    let (_switching_id, _switching_events) = handler
+        .register_control_for_test(switching_pid, Some(&source))
+        .await;
+    let (_surviving_id, _surviving_events) = handler
+        .register_control_for_test(surviving_pid, Some(&source))
+        .await;
 
     for (pid, size) in [
         (switching_pid, switching_size),
         (surviving_pid, surviving_size),
     ] {
-        let response = handler
-            .handle(Request::RefreshClient(Box::new(
-                refresh_client_size_request(pid, size),
-            )))
+        handler
+            .handle_ok(refresh_client_size_request(pid, size))
             .await;
-        assert!(
-            matches!(response, Response::RefreshClient(_)),
-            "{response:?}"
-        );
     }
-    assert_eq!(session_size(&handler, &source).await, switching_size);
-
-    let response = handler
-        .handle(Request::SwitchClient(SwitchClientRequest {
-            target: target.clone(),
-        }))
-        .await;
-
-    assert!(
-        matches!(response, Response::SwitchClient(_)),
-        "{response:?}"
+    assert_eq!(
+        handler.active_window_size_for_test(&source).await,
+        switching_size
     );
-    assert_eq!(session_size(&handler, &source).await, surviving_size);
-    assert_eq!(session_size(&handler, &target).await, switching_size);
+
+    handler
+        .handle_ok(SwitchClientRequest {
+            target: target.clone(),
+        })
+        .await;
+    assert_eq!(
+        handler.active_window_size_for_test(&source).await,
+        surviving_size
+    );
+    assert_eq!(
+        handler.active_window_size_for_test(&target).await,
+        switching_size
+    );
 }
 
 #[tokio::test]
@@ -620,10 +570,10 @@ async fn switching_control_client_notifies_the_source_session_layout_change_like
     let handler = RequestHandler::new();
     let source = session_name("control-switch-notify-source");
     let target = session_name("control-switch-notify-target");
-    create_session(&handler, source.clone(), INITIAL_SIZE).await;
-    create_session(&handler, target.clone(), TARGET_SIZE).await;
-    set_window_size_policy(&handler, &source, "largest").await;
-    set_window_size_policy(&handler, &target, "largest").await;
+    handler.create_session((&source, INITIAL_SIZE)).await;
+    handler.create_session((&target, TARGET_SIZE)).await;
+    handler.set_window_size_policy(&source, 0, "largest").await;
+    handler.set_window_size_policy(&target, 0, "largest").await;
 
     let switching_pid = std::process::id();
     let surviving_pid = switching_pid.saturating_add(1);
@@ -632,44 +582,41 @@ async fn switching_control_client_notifies_the_source_session_layout_change_like
         rows: 41,
     };
     let surviving_size = TerminalSize { cols: 60, rows: 20 };
-    let (_switching_id, mut switching_events) =
-        register_control_client_with_id(&handler, switching_pid, &source).await;
-    let (_surviving_id, mut surviving_events) =
-        register_control_client_with_id(&handler, surviving_pid, &source).await;
+    let (_switching_id, mut switching_events) = handler
+        .register_control_for_test(switching_pid, Some(&source))
+        .await;
+    let (_surviving_id, mut surviving_events) = handler
+        .register_control_for_test(surviving_pid, Some(&source))
+        .await;
 
     for (pid, size) in [
         (switching_pid, switching_size),
         (surviving_pid, surviving_size),
     ] {
-        let response = handler
-            .handle(Request::RefreshClient(Box::new(
-                refresh_client_size_request(pid, size),
-            )))
+        handler
+            .handle_ok(refresh_client_size_request(pid, size))
             .await;
-        assert!(
-            matches!(response, Response::RefreshClient(_)),
-            "{response:?}"
-        );
     }
-    assert_eq!(session_size(&handler, &source).await, switching_size);
-    let source_window_id = active_window_id(&handler, &source).await;
+    assert_eq!(
+        handler.active_window_size_for_test(&source).await,
+        switching_size
+    );
+    let source_window_id = handler.active_window_id_for_test(&source).await;
     let source_layout_prefix = format!("%layout-change @{source_window_id} ");
     // The setup resizes publish asynchronously; wait for the streams to go
     // quiet so nothing from them is mistaken for a post-switch notification.
     settle_control_notifications(&mut switching_events).await;
     settle_control_notifications(&mut surviving_events).await;
 
-    let response = handler
-        .handle(Request::SwitchClient(SwitchClientRequest {
+    handler
+        .handle_ok(SwitchClientRequest {
             target: target.clone(),
-        }))
+        })
         .await;
-
-    assert!(
-        matches!(response, Response::SwitchClient(_)),
-        "{response:?}"
+    assert_eq!(
+        handler.active_window_size_for_test(&source).await,
+        surviving_size
     );
-    assert_eq!(session_size(&handler, &source).await, surviving_size);
 
     let surviving_lines =
         collect_control_notifications_through(&mut surviving_events, &source_layout_prefix).await;
@@ -692,7 +639,7 @@ async fn switching_control_client_notifies_the_source_session_layout_change_like
         "tmux 3.7b reports the client move before the layout it causes: {surviving_lines:?}"
     );
 
-    let target_window_id = active_window_id(&handler, &target).await;
+    let target_window_id = handler.active_window_id_for_test(&target).await;
     let target_layout_prefix = format!("%layout-change @{target_window_id} ");
     let switching_lines =
         collect_control_notifications_through(&mut switching_events, &target_layout_prefix).await;
@@ -730,10 +677,10 @@ async fn switching_attached_client_notifies_the_source_session_layout_change_lik
     let handler = RequestHandler::new();
     let source = session_name("attach-switch-notify-source");
     let target = session_name("attach-switch-notify-target");
-    create_session(&handler, source.clone(), INITIAL_SIZE).await;
-    create_session(&handler, target.clone(), TARGET_SIZE).await;
-    set_window_size_policy(&handler, &source, "largest").await;
-    set_window_size_policy(&handler, &target, "largest").await;
+    handler.create_session((&source, INITIAL_SIZE)).await;
+    handler.create_session((&target, TARGET_SIZE)).await;
+    handler.set_window_size_policy(&source, 0, "largest").await;
+    handler.set_window_size_policy(&target, 0, "largest").await;
 
     let switching_pid = std::process::id();
     let surviving_pid = switching_pid.saturating_add(1);
@@ -744,37 +691,27 @@ async fn switching_attached_client_notifies_the_source_session_layout_change_lik
     let surviving_size = TerminalSize { cols: 60, rows: 20 };
     let (_attach_id, _attach_events) =
         register_attached_client(&handler, switching_pid, &source, switching_size).await;
-    let (_surviving_id, mut surviving_events) =
-        register_control_client_with_id(&handler, surviving_pid, &source).await;
-    let response = handler
-        .handle(Request::RefreshClient(Box::new(
-            refresh_client_size_request(surviving_pid, surviving_size),
-        )))
+    let (_surviving_id, mut surviving_events) = handler
+        .register_control_for_test(surviving_pid, Some(&source))
         .await;
-    assert!(
-        matches!(response, Response::RefreshClient(_)),
-        "{response:?}"
-    );
+    handler
+        .handle_ok(refresh_client_size_request(surviving_pid, surviving_size))
+        .await;
     assert_eq!(
-        session_size(&handler, &source).await,
+        handler.active_window_size_for_test(&source).await,
         attached_content_size(switching_size)
     );
-    let source_window_id = active_window_id(&handler, &source).await;
+    let source_window_id = handler.active_window_id_for_test(&source).await;
     let source_layout_prefix = format!("%layout-change @{source_window_id} ");
     settle_control_notifications(&mut surviving_events).await;
 
-    let response = handler
-        .handle(Request::SwitchClient(SwitchClientRequest {
+    handler
+        .handle_ok(SwitchClientRequest {
             target: target.clone(),
-        }))
+        })
         .await;
-
-    assert!(
-        matches!(response, Response::SwitchClient(_)),
-        "{response:?}"
-    );
     assert_eq!(
-        session_size(&handler, &source).await,
+        handler.active_window_size_for_test(&source).await,
         surviving_size,
         "the source session must fall back to its surviving control client's geometry"
     );
@@ -820,8 +757,8 @@ async fn assert_switch_notifies_the_destination_layout_change(
     target: &SessionName,
     switch: impl AsyncFnOnce(&RequestHandler) -> Response,
 ) {
-    set_window_size_policy(handler, source, "largest").await;
-    set_window_size_policy(handler, target, "largest").await;
+    handler.set_window_size_policy(source, 0, "largest").await;
+    handler.set_window_size_policy(target, 0, "largest").await;
 
     let switching_pid = std::process::id();
     let destination_pid = switching_pid.saturating_add(3);
@@ -832,19 +769,20 @@ async fn assert_switch_notifies_the_destination_layout_change(
     let destination_size = TerminalSize { cols: 60, rows: 20 };
     let (_attach_id, _attach_events) =
         register_attached_client(handler, switching_pid, source, switching_size).await;
-    let (_destination_id, mut destination_events) =
-        register_control_client_with_id(handler, destination_pid, target).await;
-    let response = handler
-        .handle(Request::RefreshClient(Box::new(
-            refresh_client_size_request(destination_pid, destination_size),
-        )))
+    let (_destination_id, mut destination_events) = handler
+        .register_control_for_test(destination_pid, Some(target))
         .await;
-    assert!(
-        matches!(response, Response::RefreshClient(_)),
-        "{response:?}"
+    handler
+        .handle_ok(refresh_client_size_request(
+            destination_pid,
+            destination_size,
+        ))
+        .await;
+    assert_eq!(
+        handler.active_window_size_for_test(target).await,
+        destination_size
     );
-    assert_eq!(session_size(handler, target).await, destination_size);
-    let target_window_id = active_window_id(handler, target).await;
+    let target_window_id = handler.active_window_id_for_test(target).await;
     let target_layout_prefix = format!("%layout-change @{target_window_id} ");
     settle_control_notifications(&mut destination_events).await;
 
@@ -854,7 +792,7 @@ async fn assert_switch_notifies_the_destination_layout_change(
         "the switch must succeed: {response:?}"
     );
     assert_eq!(
-        session_size(handler, target).await,
+        handler.active_window_size_for_test(target).await,
         attached_content_size(switching_size),
         "the destination window must grow to the arriving client's geometry"
     );
@@ -894,8 +832,8 @@ async fn switching_attached_client_notifies_the_destination_session_layout_chang
     let handler = RequestHandler::new();
     let source = session_name("attach-switch-dest-source");
     let target = session_name("attach-switch-dest-target");
-    create_session(&handler, source.clone(), INITIAL_SIZE).await;
-    create_session(&handler, target.clone(), TARGET_SIZE).await;
+    handler.create_session((&source, INITIAL_SIZE)).await;
+    handler.create_session((&target, TARGET_SIZE)).await;
     let switch_target = target.clone();
     assert_switch_notifies_the_destination_layout_change(
         &handler,
@@ -920,8 +858,8 @@ async fn attach_session_from_an_attached_client_notifies_the_destination_layout_
     let handler = RequestHandler::new();
     let source = session_name("attach-reattach-dest-source");
     let target = session_name("attach-reattach-dest-target");
-    create_session(&handler, source.clone(), INITIAL_SIZE).await;
-    create_session(&handler, target.clone(), TARGET_SIZE).await;
+    handler.create_session((&source, INITIAL_SIZE)).await;
+    handler.create_session((&target, TARGET_SIZE)).await;
     let attach_target = target.clone();
     assert_switch_notifies_the_destination_layout_change(
         &handler,
@@ -949,8 +887,8 @@ async fn attaching_client_notifies_the_destination_session_layout_change_like_tm
     // `%layout-change @0 aefd,101x40,0,0,0 ...`.
     let handler = RequestHandler::new();
     let target = session_name("attach-arrival-dest");
-    create_session(&handler, target.clone(), TARGET_SIZE).await;
-    set_window_size_policy(&handler, &target, "largest").await;
+    handler.create_session((&target, TARGET_SIZE)).await;
+    handler.set_window_size_policy(&target, 0, "largest").await;
 
     let control_pid = std::process::id().saturating_add(5);
     let control_size = TerminalSize { cols: 60, rows: 20 };
@@ -958,19 +896,17 @@ async fn attaching_client_notifies_the_destination_session_layout_change_like_tm
         cols: 101,
         rows: 41,
     };
-    let (_control_id, mut control_events) =
-        register_control_client_with_id(&handler, control_pid, &target).await;
-    let response = handler
-        .handle(Request::RefreshClient(Box::new(
-            refresh_client_size_request(control_pid, control_size),
-        )))
+    let (_control_id, mut control_events) = handler
+        .register_control_for_test(control_pid, Some(&target))
         .await;
-    assert!(
-        matches!(response, Response::RefreshClient(_)),
-        "{response:?}"
+    handler
+        .handle_ok(refresh_client_size_request(control_pid, control_size))
+        .await;
+    assert_eq!(
+        handler.active_window_size_for_test(&target).await,
+        control_size
     );
-    assert_eq!(session_size(&handler, &target).await, control_size);
-    let target_window_id = active_window_id(&handler, &target).await;
+    let target_window_id = handler.active_window_id_for_test(&target).await;
     let target_layout_prefix = format!("%layout-change @{target_window_id} ");
     settle_control_notifications(&mut control_events).await;
 
@@ -995,7 +931,7 @@ async fn attaching_client_notifies_the_destination_session_layout_change_like_tm
         "{response:?}"
     );
     assert_eq!(
-        session_size(&handler, &target).await,
+        handler.active_window_size_for_test(&target).await,
         attached_content_size(arriving_size),
         "the attached window must grow to the arriving client's geometry"
     );
@@ -1042,8 +978,8 @@ async fn attached_client_departure_notifies_the_surviving_control_layout_change_
     // causes on the next server loop.
     let handler = RequestHandler::new();
     let session = session_name("attach-departure-notify");
-    create_session(&handler, session.clone(), INITIAL_SIZE).await;
-    set_window_size_policy(&handler, &session, "largest").await;
+    handler.create_session((&session, INITIAL_SIZE)).await;
+    handler.set_window_size_policy(&session, 0, "largest").await;
 
     let departing_pid = std::process::id();
     let surviving_pid = departing_pid.saturating_add(1);
@@ -1054,31 +990,26 @@ async fn attached_client_departure_notifies_the_surviving_control_layout_change_
     let surviving_size = TerminalSize { cols: 60, rows: 20 };
     let (attach_id, _attach_events) =
         register_attached_client(&handler, departing_pid, &session, departing_size).await;
-    let (_control_id, mut control_events) =
-        register_control_client_with_id(&handler, surviving_pid, &session).await;
-    let response = handler
-        .handle(Request::RefreshClient(Box::new(
-            refresh_client_size_request(surviving_pid, surviving_size),
-        )))
+    let (_control_id, mut control_events) = handler
+        .register_control_for_test(surviving_pid, Some(&session))
         .await;
-    assert!(
-        matches!(response, Response::RefreshClient(_)),
-        "{response:?}"
-    );
+    handler
+        .handle_ok(refresh_client_size_request(surviving_pid, surviving_size))
+        .await;
     assert_eq!(
-        session_size(&handler, &session).await,
+        handler.active_window_size_for_test(&session).await,
         attached_content_size(departing_size)
     );
     let layout_prefix = format!(
         "%layout-change @{} ",
-        active_window_id(&handler, &session).await
+        handler.active_window_id_for_test(&session).await
     );
     settle_control_notifications(&mut control_events).await;
 
     handler.finish_attach(departing_pid, attach_id).await;
 
     assert_eq!(
-        session_size(&handler, &session).await,
+        handler.active_window_size_for_test(&session).await,
         surviving_size,
         "the session must fall back to its surviving control client's geometry"
     );
@@ -1113,8 +1044,8 @@ async fn detach_client_notifies_the_surviving_control_layout_change_like_tmux37(
     // the client is actually lost.
     let handler = RequestHandler::new();
     let session = session_name("detach-client-notify");
-    create_session(&handler, session.clone(), INITIAL_SIZE).await;
-    set_window_size_policy(&handler, &session, "largest").await;
+    handler.create_session((&session, INITIAL_SIZE)).await;
+    handler.set_window_size_policy(&session, 0, "largest").await;
 
     let detaching_pid = std::process::id();
     let surviving_pid = detaching_pid.saturating_add(1);
@@ -1125,24 +1056,19 @@ async fn detach_client_notifies_the_surviving_control_layout_change_like_tmux37(
     let surviving_size = TerminalSize { cols: 60, rows: 20 };
     let (_attach_id, _attach_events) =
         register_attached_client(&handler, detaching_pid, &session, detaching_size).await;
-    let (_control_id, mut control_events) =
-        register_control_client_with_id(&handler, surviving_pid, &session).await;
-    let response = handler
-        .handle(Request::RefreshClient(Box::new(
-            refresh_client_size_request(surviving_pid, surviving_size),
-        )))
+    let (_control_id, mut control_events) = handler
+        .register_control_for_test(surviving_pid, Some(&session))
         .await;
-    assert!(
-        matches!(response, Response::RefreshClient(_)),
-        "{response:?}"
-    );
+    handler
+        .handle_ok(refresh_client_size_request(surviving_pid, surviving_size))
+        .await;
     assert_eq!(
-        session_size(&handler, &session).await,
+        handler.active_window_size_for_test(&session).await,
         attached_content_size(detaching_size)
     );
     let layout_prefix = format!(
         "%layout-change @{} ",
-        active_window_id(&handler, &session).await
+        handler.active_window_id_for_test(&session).await
     );
     settle_control_notifications(&mut control_events).await;
 
@@ -1158,7 +1084,7 @@ async fn detach_client_notifies_the_surviving_control_layout_change_like_tmux37(
     );
 
     assert_eq!(
-        session_size(&handler, &session).await,
+        handler.active_window_size_for_test(&session).await,
         surviving_size,
         "the session must fall back to its surviving control client's geometry"
     );
@@ -1187,26 +1113,24 @@ async fn window_keyed_reconcile_notifies_control_clients_like_tmux37() {
     // reaches the same 60x20 geometry).
     let handler = RequestHandler::new();
     let session = session_name("window-reconcile-notify");
-    create_session(&handler, session.clone(), INITIAL_SIZE).await;
-    set_window_size_policy(&handler, &session, "largest").await;
+    handler.create_session((&session, INITIAL_SIZE)).await;
+    handler.set_window_size_policy(&session, 0, "largest").await;
 
     let control_pid = std::process::id();
     let control_size = TerminalSize { cols: 60, rows: 20 };
-    let (_control_id, mut control_events) =
-        register_control_client_with_id(&handler, control_pid, &session).await;
-    let response = handler
-        .handle(Request::RefreshClient(Box::new(
-            refresh_client_size_request(control_pid, control_size),
-        )))
+    let (_control_id, mut control_events) = handler
+        .register_control_for_test(control_pid, Some(&session))
         .await;
-    assert!(
-        matches!(response, Response::RefreshClient(_)),
-        "{response:?}"
+    handler
+        .handle_ok(refresh_client_size_request(control_pid, control_size))
+        .await;
+    assert_eq!(
+        handler.active_window_size_for_test(&session).await,
+        control_size
     );
-    assert_eq!(session_size(&handler, &session).await, control_size);
     let layout_prefix = format!(
         "%layout-change @{} ",
-        active_window_id(&handler, &session).await
+        handler.active_window_id_for_test(&session).await
     );
 
     // Stand in for the departed client whose geometry the window still carries.
@@ -1227,7 +1151,10 @@ async fn window_keyed_reconcile_notifies_control_clients_like_tmux37() {
         .await
         .expect("the window reconcile succeeds");
 
-    assert_eq!(session_size(&handler, &session).await, control_size);
+    assert_eq!(
+        handler.active_window_size_for_test(&session).await,
+        control_size
+    );
     let lines = collect_control_notifications_through(&mut control_events, &layout_prefix).await;
     let layout = lines
         .iter()
@@ -1245,44 +1172,36 @@ async fn destroyed_control_session_rehome_reconciles_target_geometry_like_tmux37
     let handler = RequestHandler::new();
     let target = session_name("control-destroy-rehome-target");
     let source = session_name("control-destroy-rehome-source");
-    create_session(
-        &handler,
-        target.clone(),
-        TerminalSize { cols: 60, rows: 20 },
-    )
-    .await;
-    create_session(&handler, source.clone(), INITIAL_SIZE).await;
-    set_window_size_policy(&handler, &target, "latest").await;
-    set_detach_on_destroy(&handler, &source, "off").await;
+    handler
+        .create_session((&target, TerminalSize { cols: 60, rows: 20 }))
+        .await;
+    handler.create_session((&source, INITIAL_SIZE)).await;
+    handler.set_window_size_policy(&target, 0, "latest").await;
+    handler
+        .set_option(
+            ScopeSelector::Session(source.clone()),
+            OptionName::DetachOnDestroy,
+            "off",
+        )
+        .await;
 
     let requester_pid = std::process::id();
-    let (_control_id, _control_events) =
-        register_control_client_with_id(&handler, requester_pid, &source).await;
+    let (_control_id, _control_events) = handler
+        .register_control_for_test(requester_pid, Some(&source))
+        .await;
     let control_size = TerminalSize {
         cols: 101,
         rows: 41,
     };
-    let refreshed = handler
-        .handle(Request::RefreshClient(Box::new(
-            refresh_client_size_request(requester_pid, control_size),
-        )))
+    handler
+        .handle_ok(refresh_client_size_request(requester_pid, control_size))
         .await;
-    assert!(
-        matches!(refreshed, Response::RefreshClient(_)),
-        "{refreshed:?}"
+
+    handler.handle_ok(KillSessionRequest::fixture(source)).await;
+    assert_eq!(
+        handler.active_window_size_for_test(&target).await,
+        control_size
     );
-
-    let killed = handler
-        .handle(Request::KillSession(KillSessionRequest {
-            target: source,
-            kill_all_except_target: false,
-            clear_alerts: false,
-            kill_group: false,
-        }))
-        .await;
-
-    assert!(matches!(killed, Response::KillSession(_)), "{killed:?}");
-    assert_eq!(session_size(&handler, &target).await, control_size);
     let active_control = handler.active_control.lock().await;
     assert_eq!(
         active_control
@@ -1308,11 +1227,17 @@ async fn destroyed_session_rehome_notifies_the_attached_destination_layout_chang
     let handler = RequestHandler::new();
     let keep = session_name("rehome-dest-keep");
     let doomed = session_name("rehome-dest-doomed");
-    create_session(&handler, keep.clone(), TARGET_SIZE).await;
-    create_session(&handler, doomed.clone(), INITIAL_SIZE).await;
-    set_window_size_policy(&handler, &keep, "largest").await;
-    set_window_size_policy(&handler, &doomed, "largest").await;
-    set_detach_on_destroy(&handler, &doomed, "off").await;
+    handler.create_session((&keep, TARGET_SIZE)).await;
+    handler.create_session((&doomed, INITIAL_SIZE)).await;
+    handler.set_window_size_policy(&keep, 0, "largest").await;
+    handler.set_window_size_policy(&doomed, 0, "largest").await;
+    handler
+        .set_option(
+            ScopeSelector::Session(doomed.clone()),
+            OptionName::DetachOnDestroy,
+            "off",
+        )
+        .await;
 
     let attach_pid = std::process::id().saturating_add(7);
     let control_pid = attach_pid.saturating_add(1);
@@ -1323,33 +1248,23 @@ async fn destroyed_session_rehome_notifies_the_attached_destination_layout_chang
     let destination_size = TerminalSize { cols: 60, rows: 20 };
     let (_attach_id, _attach_events) =
         register_attached_client(&handler, attach_pid, &doomed, rehomed_size).await;
-    let (_control_id, mut control_events) =
-        register_control_client_with_id(&handler, control_pid, &keep).await;
-    let response = handler
-        .handle(Request::RefreshClient(Box::new(
-            refresh_client_size_request(control_pid, destination_size),
-        )))
+    let (_control_id, mut control_events) = handler
+        .register_control_for_test(control_pid, Some(&keep))
         .await;
-    assert!(
-        matches!(response, Response::RefreshClient(_)),
-        "{response:?}"
+    handler
+        .handle_ok(refresh_client_size_request(control_pid, destination_size))
+        .await;
+    assert_eq!(
+        handler.active_window_size_for_test(&keep).await,
+        destination_size
     );
-    assert_eq!(session_size(&handler, &keep).await, destination_size);
-    let keep_window_id = active_window_id(&handler, &keep).await;
+    let keep_window_id = handler.active_window_id_for_test(&keep).await;
     let keep_layout_prefix = format!("%layout-change @{keep_window_id} ");
     settle_control_notifications(&mut control_events).await;
 
-    let killed = handler
-        .handle(Request::KillSession(KillSessionRequest {
-            target: doomed,
-            kill_all_except_target: false,
-            clear_alerts: false,
-            kill_group: false,
-        }))
-        .await;
-    assert!(matches!(killed, Response::KillSession(_)), "{killed:?}");
+    handler.handle_ok(KillSessionRequest::fixture(doomed)).await;
     assert_eq!(
-        session_size(&handler, &keep).await,
+        handler.active_window_size_for_test(&keep).await,
         attached_content_size(rehomed_size),
         "the rehome destination must grow to the arriving client's geometry"
     );
@@ -1396,21 +1311,16 @@ async fn attached_arrival_and_departure_keep_control_geometry_in_every_automatic
     {
         let handler = RequestHandler::new();
         let session = session_name(&format!("control-attach-{policy}"));
-        create_session(&handler, session.clone(), INITIAL_SIZE).await;
-        set_window_size_policy(&handler, &session, policy).await;
+        handler.create_session((&session, INITIAL_SIZE)).await;
+        handler.set_window_size_policy(&session, 0, policy).await;
         let control_pid = 92_500 + index as u32 * 2;
         let attach_pid = control_pid + 1;
-        let (_control_id, _control_events) =
-            register_control_client_with_id(&handler, control_pid, &session).await;
-        let refreshed = handler
-            .handle(Request::RefreshClient(Box::new(
-                refresh_client_size_request(control_pid, control_size),
-            )))
+        let (_control_id, _control_events) = handler
+            .register_control_for_test(control_pid, Some(&session))
             .await;
-        assert!(
-            matches!(refreshed, Response::RefreshClient(_)),
-            "{refreshed:?}"
-        );
+        handler
+            .handle_ok(refresh_client_size_request(control_pid, control_size))
+            .await;
 
         let (attach_id, _attach_events) =
             register_attached_client(&handler, attach_pid, &session, attach_size).await;
@@ -1419,14 +1329,14 @@ async fn attached_arrival_and_departure_keep_control_geometry_in_every_automatic
             .await
             .expect("ordinary attach arrival reconciles mixed client geometry");
         assert_eq!(
-            session_size(&handler, &session).await,
+            handler.active_window_size_for_test(&session).await,
             attached_size,
             "{policy} after ordinary attach"
         );
 
         handler.finish_attach(attach_pid, attach_id).await;
         assert_eq!(
-            session_size(&handler, &session).await,
+            handler.active_window_size_for_test(&session).await,
             control_size,
             "{policy} after ordinary detach"
         );
@@ -1447,24 +1357,20 @@ async fn control_departure_reconciles_surviving_control_geometry() {
     {
         let handler = RequestHandler::new();
         let session = session_name(&format!("control-depart-{policy}"));
-        create_session(&handler, session.clone(), INITIAL_SIZE).await;
-        set_window_size_policy(&handler, &session, policy).await;
+        handler.create_session((&session, INITIAL_SIZE)).await;
+        handler.set_window_size_policy(&session, 0, policy).await;
         let first_pid = 92_600 + index as u32 * 2;
         let second_pid = first_pid + 1;
-        let (first_id, _first_events) =
-            register_control_client_with_id(&handler, first_pid, &session).await;
-        let (second_id, _second_events) =
-            register_control_client_with_id(&handler, second_pid, &session).await;
+        let (first_id, _first_events) = handler
+            .register_control_for_test(first_pid, Some(&session))
+            .await;
+        let (second_id, _second_events) = handler
+            .register_control_for_test(second_pid, Some(&session))
+            .await;
         for (pid, size) in [(first_pid, first_size), (second_pid, second_size)] {
-            let response = handler
-                .handle(Request::RefreshClient(Box::new(
-                    refresh_client_size_request(pid, size),
-                )))
+            handler
+                .handle_ok(refresh_client_size_request(pid, size))
                 .await;
-            assert!(
-                matches!(response, Response::RefreshClient(_)),
-                "{response:?}"
-            );
         }
 
         let (removed_pid, removed_id) = if removed_first {
@@ -1474,7 +1380,7 @@ async fn control_departure_reconciles_surviving_control_geometry() {
         };
         handler.finish_control(removed_pid, removed_id).await;
         assert_eq!(
-            session_size(&handler, &session).await,
+            handler.active_window_size_for_test(&session).await,
             expected_size,
             "{policy} after control departure"
         );
@@ -1485,19 +1391,14 @@ async fn control_departure_reconciles_surviving_control_geometry() {
 async fn window_size_option_reconciliation_includes_control_candidates() {
     let handler = RequestHandler::new();
     let session = session_name("control-option-reconcile");
-    create_session(&handler, session.clone(), INITIAL_SIZE).await;
+    handler.create_session((&session, INITIAL_SIZE)).await;
     let control_pid = 92_650;
-    let (_control_id, _control_events) =
-        register_control_client_with_id(&handler, control_pid, &session).await;
-    let refreshed = handler
-        .handle(Request::RefreshClient(Box::new(
-            refresh_client_size_request(control_pid, CONTROL_SIZE),
-        )))
+    let (_control_id, _control_events) = handler
+        .register_control_for_test(control_pid, Some(&session))
         .await;
-    assert!(
-        matches!(refreshed, Response::RefreshClient(_)),
-        "{refreshed:?}"
-    );
+    handler
+        .handle_ok(refresh_client_size_request(control_pid, CONTROL_SIZE))
+        .await;
     let (_attach_id, _attach_events) =
         register_attached_client(&handler, 92_651, &session, TARGET_SIZE).await;
 
@@ -1506,9 +1407,9 @@ async fn window_size_option_reconciliation_includes_control_candidates() {
         ("smallest", attached_content_size(TARGET_SIZE)),
         ("latest", attached_content_size(TARGET_SIZE)),
     ] {
-        set_window_size_policy(&handler, &session, policy).await;
+        handler.set_window_size_policy(&session, 0, policy).await;
         assert_eq!(
-            session_size(&handler, &session).await,
+            handler.active_window_size_for_test(&session).await,
             expected_size,
             "{policy} option reconciliation"
         );
@@ -1519,22 +1420,17 @@ async fn window_size_option_reconciliation_includes_control_candidates() {
 async fn control_resize_racing_reconcile_cannot_apply_a_stale_geometry() {
     let handler = RequestHandler::new();
     let session = session_name("control-resize-selection-race");
-    create_session(&handler, session.clone(), INITIAL_SIZE).await;
-    set_window_size_policy(&handler, &session, "largest").await;
+    handler.create_session((&session, INITIAL_SIZE)).await;
+    handler.set_window_size_policy(&session, 0, "largest").await;
     let (_attach_id, _attach_events) =
         register_attached_client(&handler, 92_700, &session, INITIAL_SIZE).await;
     let control_pid = 92_701;
-    let (_control_id, _control_events) =
-        register_control_client_with_id(&handler, control_pid, &session).await;
-    let refreshed = handler
-        .handle(Request::RefreshClient(Box::new(
-            refresh_client_size_request(control_pid, CONTROL_SIZE),
-        )))
+    let (_control_id, _control_events) = handler
+        .register_control_for_test(control_pid, Some(&session))
         .await;
-    assert!(
-        matches!(refreshed, Response::RefreshClient(_)),
-        "{refreshed:?}"
-    );
+    handler
+        .handle_ok(refresh_client_size_request(control_pid, CONTROL_SIZE))
+        .await;
 
     let pause = handler.install_attached_size_selection_pause();
     let reconcile_handler = handler.clone();
@@ -1550,15 +1446,9 @@ async fn control_resize_racing_reconcile_cannot_apply_a_stale_geometry() {
         cols: 120,
         rows: 45,
     };
-    let refreshed = handler
-        .handle(Request::RefreshClient(Box::new(
-            refresh_client_size_request(control_pid, newest_size),
-        )))
+    handler
+        .handle_ok(refresh_client_size_request(control_pid, newest_size))
         .await;
-    assert!(
-        matches!(refreshed, Response::RefreshClient(_)),
-        "{refreshed:?}"
-    );
     pause.release.notify_one();
 
     reconcile
@@ -1566,7 +1456,7 @@ async fn control_resize_racing_reconcile_cannot_apply_a_stale_geometry() {
         .expect("reconcile task joins")
         .expect("reconcile succeeds");
     assert_eq!(
-        session_size(&handler, &session).await,
+        handler.active_window_size_for_test(&session).await,
         newest_size,
         "a selection predating the control resize must be retried"
     );
@@ -1596,9 +1486,10 @@ async fn assert_queued_command_publishes_a_pending_window_resize(
 ) {
     let handler = RequestHandler::new();
     let session = session_name(&format!("queued-resize-backstop-{session_suffix}"));
-    create_session(&handler, session.clone(), INITIAL_SIZE).await;
-    let (_control_id, mut events) =
-        register_control_client_with_id(&handler, control_pid, &session).await;
+    handler.create_session((&session, INITIAL_SIZE)).await;
+    let (_control_id, mut events) = handler
+        .register_control_for_test(control_pid, Some(&session))
+        .await;
     let _ = settle_control_notifications(&mut events).await;
 
     // A geometry write that reached the chokepoint without publishing at its
@@ -1676,14 +1567,7 @@ async fn an_identity_checked_dispatch_publishes_a_pending_applied_window_resize(
         "identity",
         92_820,
         async |handler: &RequestHandler, control_pid: u32, session: SessionName| {
-            let session_id = handler
-                .state
-                .lock()
-                .await
-                .sessions
-                .session(&session)
-                .expect("session remains present")
-                .id();
+            let session_id = handler.session_id_for_test(&session).await;
             let response = crate::handler::dispatch_with_expected_session_identity(
                 handler,
                 control_pid,
@@ -1700,76 +1584,6 @@ async fn an_identity_checked_dispatch_publishes_a_pending_applied_window_resize(
 
 use crate::test_names::session_name;
 
-async fn create_session(handler: &RequestHandler, session: SessionName, size: TerminalSize) {
-    let response = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name: session,
-            detached: true,
-            size: Some(size),
-            environment: None,
-        }))
-        .await;
-    assert!(matches!(response, Response::NewSession(_)), "{response:?}");
-}
-
-async fn set_window_size_policy(handler: &RequestHandler, session: &SessionName, policy: &str) {
-    set_window_size_policy_for_window(handler, session, 0, policy).await;
-}
-
-async fn set_window_size_policy_for_window(
-    handler: &RequestHandler,
-    session: &SessionName,
-    window_index: u32,
-    policy: &str,
-) {
-    let response = handler
-        .handle(Request::SetOption(SetOptionRequest {
-            scope: ScopeSelector::Window(WindowTarget::with_window(session.clone(), window_index)),
-            option: OptionName::WindowSize,
-            value: policy.to_owned(),
-            mode: SetOptionMode::Replace,
-        }))
-        .await;
-    assert!(matches!(response, Response::SetOption(_)), "{response:?}");
-}
-
-async fn set_detach_on_destroy(handler: &RequestHandler, session: &SessionName, value: &str) {
-    let response = handler
-        .handle(Request::SetOption(SetOptionRequest {
-            scope: ScopeSelector::Session(session.clone()),
-            option: OptionName::DetachOnDestroy,
-            value: value.to_owned(),
-            mode: SetOptionMode::Replace,
-        }))
-        .await;
-    assert!(matches!(response, Response::SetOption(_)), "{response:?}");
-}
-
-async fn register_control_client_with_id(
-    handler: &RequestHandler,
-    requester_pid: u32,
-    session: &SessionName,
-) -> (u64, mpsc::Receiver<ControlServerEvent>) {
-    let (event_tx, event_rx) = mpsc::channel(CONTROL_SERVER_EVENT_CAPACITY);
-    let control_id = handler
-        .register_control_with_closing(
-            requester_pid,
-            ControlModeUpgrade {
-                initial_command_count: 0,
-                mode: ControlMode::Plain,
-                terminal_context: crate::outer_terminal::OuterTerminalContext::default(),
-            },
-            event_tx,
-            Arc::new(AtomicBool::new(false)),
-        )
-        .await;
-    handler
-        .set_control_session(requester_pid, Some(session.clone()))
-        .await
-        .expect("set control session");
-    (control_id, event_rx)
-}
-
 async fn register_attached_client(
     handler: &RequestHandler,
     requester_pid: u32,
@@ -1780,39 +1594,16 @@ async fn register_attached_client(
     let attach_id = handler
         .register_attach(requester_pid, session.clone(), control_tx)
         .await;
-    let mut active_attach = handler.active_attach.lock().await;
-    let size_sequence = handler.next_client_size_sequence();
-    let active = active_attach
-        .by_pid
-        .get_mut(&requester_pid)
-        .expect("attached client remains registered");
-    active.set_declared_client_size(size);
-    active.size_sequence = size_sequence;
-    drop(active_attach);
-    handler.bump_active_attach_epoch();
+    handler
+        .declare_client_size_for_test(requester_pid, size)
+        .await;
     (attach_id, control_rx)
 }
 
-fn refresh_client_size_request(
-    requester_pid: u32,
-    size: TerminalSize,
-) -> rmux_proto::request::RefreshClientRequest {
-    rmux_proto::request::RefreshClientRequest {
-        target_client: Some(requester_pid.to_string()),
-        adjustment: None,
-        clear_pan: false,
-        pan_left: false,
-        pan_right: false,
-        pan_up: false,
-        pan_down: false,
-        status_only: false,
-        clipboard_query: false,
-        flags: None,
-        flags_alias: None,
-        subscriptions: Vec::new(),
-        subscriptions_format: Vec::new(),
+fn refresh_client_size_request(requester_pid: u32, size: TerminalSize) -> RefreshClientRequest {
+    RefreshClientRequest {
         control_size: Some(format!("{}x{}", size.cols, size.rows)),
-        colour_report: None,
+        ..Fixture::fixture(Some(requester_pid.to_string()))
     }
 }
 
@@ -1842,31 +1633,6 @@ async fn force_window_size(
             session.resize_window(window_index, size)
         })
         .expect("test window resize succeeds");
-}
-
-async fn session_size(handler: &RequestHandler, session: &SessionName) -> TerminalSize {
-    handler
-        .state
-        .lock()
-        .await
-        .sessions
-        .session(session)
-        .expect("session remains present")
-        .window()
-        .size()
-}
-
-async fn active_window_id(handler: &RequestHandler, session: &SessionName) -> u32 {
-    handler
-        .state
-        .lock()
-        .await
-        .sessions
-        .session(session)
-        .expect("session remains present")
-        .window()
-        .id()
-        .as_u32()
 }
 
 async fn window_ids(handler: &RequestHandler, session: &SessionName) -> Vec<u32> {
@@ -1913,50 +1679,4 @@ fn layout_change_geometry(line: &str) -> Option<String> {
         .nth(2)
         .and_then(|layout| layout.split(',').nth(1))
         .map(ToOwned::to_owned)
-}
-
-/// Collects the notifications in delivery order up to and including the first
-/// line starting with `prefix`, so a test can assert on their relative order.
-async fn collect_control_notifications_through(
-    events: &mut mpsc::Receiver<ControlServerEvent>,
-    prefix: &str,
-) -> Vec<String> {
-    let deadline = tokio::time::Instant::now() + CONTROL_NOTIFICATION_TIMEOUT;
-    let mut lines = Vec::new();
-    while tokio::time::Instant::now() < deadline {
-        match tokio::time::timeout(CONTROL_NOTIFICATION_POLL, events.recv()).await {
-            Ok(Some(ControlServerEvent::Notification(line))) => {
-                let matched = line.starts_with(prefix);
-                lines.push(line);
-                if matched {
-                    return lines;
-                }
-            }
-            Ok(Some(_)) | Err(_) => continue,
-            Ok(None) => break,
-        }
-    }
-    lines
-}
-
-/// Collects everything the client receives until its stream stays quiet for
-/// [`CONTROL_NOTIFICATION_SETTLE`].
-async fn settle_control_notifications(
-    events: &mut mpsc::Receiver<ControlServerEvent>,
-) -> Vec<String> {
-    let mut deadline = tokio::time::Instant::now() + CONTROL_NOTIFICATION_SETTLE;
-    let mut lines = Vec::new();
-    while tokio::time::Instant::now() < deadline {
-        match tokio::time::timeout(CONTROL_NOTIFICATION_POLL, events.recv()).await {
-            Ok(Some(event)) => {
-                deadline = tokio::time::Instant::now() + CONTROL_NOTIFICATION_SETTLE;
-                if let ControlServerEvent::Notification(line) = event {
-                    lines.push(line);
-                }
-            }
-            Ok(None) => break,
-            Err(_) => continue,
-        }
-    }
-    lines
 }

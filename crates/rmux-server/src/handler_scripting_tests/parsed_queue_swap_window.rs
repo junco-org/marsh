@@ -29,19 +29,14 @@ async fn parsed_queue_accepts_tmux_swap_window_flag_clusters() {
 #[tokio::test]
 async fn parsed_queue_does_not_expand_the_swap_window_flag_surface() {
     let handler = RequestHandler::new();
-    let alpha = session_name("alpha");
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: alpha.clone(),
-                detached: true,
-                size: Some(TerminalSize { cols: 80, rows: 24 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
-    create_named_window(&handler, &alpha, "one", 1).await;
+    let alpha = handler.create_session("alpha").await;
+    handler
+        .create_window(NewWindowRequest {
+            name: Some("one".to_owned()),
+            target_window_index: Some(1),
+            ..Fixture::fixture(&alpha)
+        })
+        .await;
 
     let parsed = CommandParser::new()
         .parse("swap-window -ad -s alpha:0 -t alpha:1")
@@ -66,35 +61,30 @@ struct SwapClusterCase {
 
 async fn assert_parsed_swap_cluster(case: SwapClusterCase) {
     let handler = RequestHandler::new();
-    let session_name = session_name(case.session);
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: session_name.clone(),
-                detached: true,
-                size: Some(TerminalSize { cols: 80, rows: 24 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
+    let session_name = handler.create_session(case.session).await;
 
-    create_named_window(&handler, &session_name, "one", 1).await;
+    handler
+        .create_window(NewWindowRequest {
+            name: Some("one".to_owned()),
+            target_window_index: Some(1),
+            ..Fixture::fixture(&session_name)
+        })
+        .await;
     if case.add_d_window {
-        create_named_window(&handler, &session_name, "d", 2).await;
+        handler
+            .create_window(NewWindowRequest {
+                name: Some("d".to_owned()),
+                target_window_index: Some(2),
+                ..Fixture::fixture(&session_name)
+            })
+            .await;
     }
 
     let parsed = CommandParser::new()
         .parse(case.command)
         .unwrap_or_else(|error| panic!("{} should tokenize: {error}", case.command));
     handler
-        .execute_parsed_commands(
-            std::process::id(),
-            parsed,
-            QueueExecutionContext::without_caller_cwd().with_current_target(Some(Target::Pane(
-                PaneTarget::with_window(session_name.clone(), 0, 0),
-            ))),
-        )
+        .execute_parsed_commands(std::process::id(), parsed, pane_context(&session_name, 0))
         .await
         .unwrap_or_else(|error| panic!("{} should execute: {error}", case.command));
 
@@ -109,28 +99,4 @@ async fn assert_parsed_swap_cluster(case: SwapClusterCase) {
         .map(|window| window.name().expect("named fixture window"))
         .collect::<Vec<_>>();
     assert_eq!(names, case.expected_names, "{}", case.command);
-}
-
-async fn create_named_window(
-    handler: &RequestHandler,
-    session_name: &SessionName,
-    name: &str,
-    index: u32,
-) {
-    assert!(matches!(
-        handler
-            .handle(Request::NewWindow(Box::new(NewWindowRequest {
-                target: session_name.clone(),
-                name: Some(name.to_owned()),
-                detached: true,
-                start_directory: None,
-                environment: None,
-                command: None,
-                process_command: None,
-                target_window_index: Some(index),
-                insert_at_target: false,
-            })))
-            .await,
-        Response::NewWindow(_)
-    ));
 }

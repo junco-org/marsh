@@ -8,10 +8,7 @@ async fn live_attach_kitty_graphics_apc_passes_through_unchanged_when_chunked() 
 
     create_send_keys_test_session(&handler, &alpha).await;
 
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
 
     let expected = b"\x1b_Gi=7;OK\x1b\\";
     let capture = RawPaneInputProbe::start(
@@ -53,10 +50,7 @@ async fn live_attach_meta_underscore_forwards_unchanged_after_escape_timeout() {
 
     create_send_keys_test_session(&handler, &alpha).await;
 
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
 
     let expected = b"\x1b_x";
     let capture = RawPaneInputProbe::start(
@@ -99,25 +93,14 @@ async fn live_attach_meta_underscore_dispatches_root_binding_after_escape_timeou
     let requester_pid = std::process::id();
 
     create_send_keys_test_session(&handler, &alpha).await;
-    let rebound = handler
-        .handle(Request::BindKey(Box::new(BindKeyRequest {
-            table_name: "root".to_owned(),
-            key: "M-_".to_owned(),
+    handler
+        .handle_ok(BindKeyRequest {
             note: Some("timed-out meta underscore".to_owned()),
-            repeat: false,
-            command: Some(vec![
-                "send-keys".to_owned(),
-                "-l".to_owned(),
-                "B".to_owned(),
-            ]),
-        })))
+            ..Fixture::fixture(("root", "M-_", ["send-keys", "-l", "B"]))
+        })
         .await;
-    assert!(matches!(rebound, Response::BindKey(_)), "{rebound:?}");
 
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
     let capture =
         RawPaneInputProbe::start(&handler, &alpha, "live-attach-meta-underscore-binding", 1).await;
 
@@ -152,25 +135,14 @@ async fn meta_underscore_then_typed_g_flushes_binding_and_unblocks_input() {
     let requester_pid = std::process::id();
 
     create_send_keys_test_session(&handler, &alpha).await;
-    let rebound = handler
-        .handle(Request::BindKey(Box::new(BindKeyRequest {
-            table_name: "root".to_owned(),
-            key: "M-_".to_owned(),
-            note: None,
-            repeat: false,
-            command: Some(vec![
-                "set-buffer".to_owned(),
-                "-b".to_owned(),
-                "apc-flushed".to_owned(),
-                "ok".to_owned(),
-            ]),
-        })))
-        .await;
-    assert!(matches!(rebound, Response::BindKey(_)), "{rebound:?}");
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
+    bind(
+        &handler,
+        "root",
+        "M-_",
+        &["set-buffer", "-b", "apc-flushed", "ok"],
+    )
+    .await;
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
     let capture = RawPaneInputProbe::start(&handler, &alpha, "meta-underscore-typed-g", 0).await;
 
     let mut pending_input = Vec::new();
@@ -210,10 +182,7 @@ async fn live_attach_meta_underscore_timeout_respects_read_only_transition() {
     let requester_pid = std::process::id();
 
     create_send_keys_test_session(&handler, &alpha).await;
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
     let capture = RawPaneInputProbe::start(&handler, &alpha, "read-only-meta-underscore", 0).await;
 
     let mut pending_input = Vec::new();
@@ -253,10 +222,7 @@ async fn live_attach_terminal_response_is_consumed_when_chunked() {
 
     create_send_keys_test_session(&handler, &alpha).await;
 
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
 
     let capture =
         RawPaneInputProbe::start(&handler, &alpha, "live-attach-terminal-response", 0).await;
@@ -286,10 +252,7 @@ async fn live_attach_cursor_position_response_is_forwarded_when_chunked() {
 
     create_send_keys_test_session(&handler, &alpha).await;
 
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
 
     let expected = b"\x1b[12;34R";
     let capture = RawPaneInputProbe::start(
@@ -325,10 +288,7 @@ async fn live_attach_decrpm_response_is_consumed() {
 
     create_send_keys_test_session(&handler, &alpha).await;
 
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
 
     let capture = RawPaneInputProbe::start(&handler, &alpha, "live-attach-decrpm", 0).await;
 
@@ -349,10 +309,7 @@ async fn live_attach_osc_sequences_are_consumed_at_attach_boundary() {
 
     create_send_keys_test_session(&handler, &alpha).await;
 
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
 
     let capture = RawPaneInputProbe::start(&handler, &alpha, "live-attach-osc-response", 0).await;
 
@@ -383,16 +340,8 @@ async fn live_attach_correlated_palette_responses_reach_the_pane_with_bel_or_st(
     let requester_pid = std::process::id();
 
     create_send_keys_test_session(&handler, &alpha).await;
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
-    {
-        let mut state = handler.state.lock().await;
-        state
-            .append_bytes_to_pane_transcript_for_test(&alpha, 0, 0, b"\x1b]4;0;?;7;?\x07")
-            .expect("pane emits two palette queries");
-    }
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
+    append_pane_output(&handler, &alpha, b"\x1b]4;0;?;7;?\x07").await;
 
     let bel = b"\x1b]4;0;rgb:0000/1111/ffff\x07";
     let st = b"\x1b]4;7;rgb:1111/2222/3333\x1b\\";
@@ -440,16 +389,8 @@ async fn live_attach_palette_response_rejects_unsolicited_mismatched_and_duplica
     let requester_pid = std::process::id();
 
     create_send_keys_test_session(&handler, &alpha).await;
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
-    {
-        let mut state = handler.state.lock().await;
-        state
-            .append_bytes_to_pane_transcript_for_test(&alpha, 0, 0, b"\x1b]4;7;?\x1b\\")
-            .expect("pane emits palette query for index 7");
-    }
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
+    append_pane_output(&handler, &alpha, b"\x1b]4;7;?\x1b\\").await;
 
     let expected = b"\x1b]4;7;rgb:1111/2222/3333\x07";
     let capture = RawPaneInputProbe::start(
@@ -493,28 +434,11 @@ async fn live_attach_palette_response_is_correlated_to_the_current_pane() {
     let requester_pid = std::process::id();
 
     create_send_keys_test_session(&handler, &alpha).await;
-    let split = handler
-        .handle(Request::SplitWindow(SplitWindowRequest {
-            target: SplitWindowTarget::Session(alpha.clone()),
-            direction: SplitDirection::Horizontal,
-            before: false,
-            environment: None,
-        }))
-        .await;
-    assert!(matches!(split, Response::SplitWindow(_)), "{split:?}");
+    split_window_horizontally(&handler, &alpha).await;
 
     let first = PaneTarget::with_window(alpha.clone(), 0, 0);
     let second = PaneTarget::with_window(alpha.clone(), 0, 1);
-    let selected = handler
-        .handle(Request::SelectPane(Box::new(SelectPaneRequest {
-            target: first.clone(),
-            title: None,
-            style: None,
-            input_disabled: None,
-            preserve_zoom: false,
-        })))
-        .await;
-    assert!(matches!(selected, Response::SelectPane(_)), "{selected:?}");
+    handler.handle_ok(SelectPaneRequest::fixture(&first)).await;
     {
         let mut state = handler.state.lock().await;
         state
@@ -524,36 +448,15 @@ async fn live_attach_palette_response_is_correlated_to_the_current_pane() {
         state.start_pane_input_capture_for_test(&second);
     }
 
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
     let response = b"\x1b]4;7;rgb:1111/2222/3333\x1b\\";
-    let selected = handler
-        .handle(Request::SelectPane(Box::new(SelectPaneRequest {
-            target: second.clone(),
-            title: None,
-            style: None,
-            input_disabled: None,
-            preserve_zoom: false,
-        })))
-        .await;
-    assert!(matches!(selected, Response::SelectPane(_)), "{selected:?}");
+    handler.handle_ok(SelectPaneRequest::fixture(&second)).await;
     handler
         .handle_attached_live_input_for_test(requester_pid, response)
         .await
         .expect("response on wrong pane is safely consumed");
 
-    let selected = handler
-        .handle(Request::SelectPane(Box::new(SelectPaneRequest {
-            target: first.clone(),
-            title: None,
-            style: None,
-            input_disabled: None,
-            preserve_zoom: false,
-        })))
-        .await;
-    assert!(matches!(selected, Response::SelectPane(_)), "{selected:?}");
+    handler.handle_ok(SelectPaneRequest::fixture(&first)).await;
     handler
         .handle_attached_live_input_for_test(requester_pid, response)
         .await
@@ -577,11 +480,7 @@ async fn concurrent_palette_responses_consume_exactly_one_query_slot() {
     create_send_keys_test_session(&handler, &alpha).await;
     let mut control_receivers = Vec::new();
     for requester_pid in [first_pid, second_pid] {
-        let (control_tx, control_rx) = mpsc::unbounded_channel();
-        let _attach_id = handler
-            .register_attach(requester_pid, alpha.clone(), control_tx)
-            .await;
-        control_receivers.push(control_rx);
+        control_receivers.push(handler.attach_client(requester_pid, &alpha).await);
     }
     let target = PaneTarget::new(alpha.clone(), 0);
     {
@@ -620,10 +519,7 @@ async fn ambiguous_alt_right_bracket_is_forwarded_after_escape_timeout() {
     let requester_pid = std::process::id();
 
     create_send_keys_test_session(&handler, &alpha).await;
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
     let capture = RawPaneInputProbe::start(&handler, &alpha, "live-alt-right-bracket", 0).await;
 
     let mut pending_input = Vec::new();
@@ -649,25 +545,14 @@ async fn alt_right_bracket_binding_fires_after_escape_timeout_and_unblocks_input
     let requester_pid = std::process::id();
 
     create_send_keys_test_session(&handler, &alpha).await;
-    let bound = handler
-        .handle(Request::BindKey(Box::new(BindKeyRequest {
-            table_name: "root".to_owned(),
-            key: "M-]".to_owned(),
-            note: None,
-            repeat: false,
-            command: Some(vec![
-                "set-buffer".to_owned(),
-                "-b".to_owned(),
-                "flushed".to_owned(),
-                "ok".to_owned(),
-            ]),
-        })))
-        .await;
-    assert!(matches!(bound, Response::BindKey(_)), "{bound:?}");
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
+    bind(
+        &handler,
+        "root",
+        "M-]",
+        &["set-buffer", "-b", "flushed", "ok"],
+    )
+    .await;
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
     let capture =
         RawPaneInputProbe::start(&handler, &alpha, "live-alt-right-bracket-binding", 0).await;
 
@@ -713,25 +598,14 @@ async fn ambiguous_alt_right_bracket_dispatches_root_binding_after_escape_timeou
     let requester_pid = std::process::id();
 
     create_send_keys_test_session(&handler, &alpha).await;
-    let rebound = handler
-        .handle(Request::BindKey(Box::new(BindKeyRequest {
-            table_name: "root".to_owned(),
-            key: "M-]".to_owned(),
+    handler
+        .handle_ok(BindKeyRequest {
             note: Some("timed-out meta right bracket".to_owned()),
-            repeat: false,
-            command: Some(vec![
-                "send-keys".to_owned(),
-                "-l".to_owned(),
-                "R".to_owned(),
-            ]),
-        })))
+            ..Fixture::fixture(("root", "M-]", ["send-keys", "-l", "R"]))
+        })
         .await;
-    assert!(matches!(rebound, Response::BindKey(_)), "{rebound:?}");
 
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
     let capture =
         RawPaneInputProbe::start(&handler, &alpha, "live-alt-right-bracket-root-binding", 1).await;
 

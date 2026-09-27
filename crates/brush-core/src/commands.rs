@@ -15,7 +15,7 @@ use sys::commands::{CommandExt, CommandFdInjectionExt, CommandFgControlExt};
 use crate::{
     ErrorKind, ExecutionControlFlow, ExecutionExitCode, ExecutionParameters, ExecutionResult,
     Shell, ShellFd, builtins, commands, env, error, escape,
-    extensions::{self, ExternalCommandSpawner as _, ShellExtensions},
+    extensions::{self, ExecutionObserver as _, ExternalCommandSpawner as _, ShellExtensions},
     functions,
     interp::{self, Execute, ProcessGroupPolicy},
     openfiles::{self, OpenFile, OpenFiles},
@@ -432,16 +432,14 @@ impl<'a, SE: extensions::ShellExtensions> SimpleCommand<'a, SE> {
         builtin: builtins::Registration<SE>,
     ) -> Result<ExecutionSpawnResult, error::Error> {
         match self.shell {
-            ShellForCommand::OwnedShell { target, .. } => {
-                Ok(Self::execute_via_builtin_in_owned_shell(
-                    *target,
-                    self.params,
-                    builtin,
-                    self.command_name,
-                    self.args,
-                    self.process_group_id,
-                ))
-            }
+            ShellForCommand::OwnedShell { target, .. } => Self::execute_via_builtin_in_owned_shell(
+                *target,
+                self.params,
+                builtin,
+                self.command_name,
+                self.args,
+                self.process_group_id,
+            ),
             ShellForCommand::ParentShell(..) => {
                 self.execute_via_builtin_in_parent_shell(builtin).await
             }
@@ -455,9 +453,13 @@ impl<'a, SE: extensions::ShellExtensions> SimpleCommand<'a, SE> {
         command_name: String,
         args: Vec<CommandArg>,
         process_group_id: Option<i32>,
-    ) -> ExecutionSpawnResult {
+    ) -> Result<ExecutionSpawnResult, error::Error> {
         let last_arg = Self::take_last_arg(&args);
-        let join_handle = tokio::task::spawn_blocking(move || {
+
+        // A pipeline stage's builtin runs on a blocking thread scheduled by the observer; a
+        // refusal fails the pipeline rather than running the stage unobserved.
+        let observer = shell.execution_observer().clone();
+        let join_handle = observer.spawn_blocking_task(move || {
             let cmd_context = ExecutionContext {
                 shell: &mut shell,
                 command_name,
@@ -472,9 +474,9 @@ impl<'a, SE: extensions::ShellExtensions> SimpleCommand<'a, SE> {
             shell.update_last_arg_variable(last_arg);
 
             result
-        });
+        })?;
 
-        ExecutionSpawnResult::StartedTask(join_handle)
+        Ok(ExecutionSpawnResult::StartedTask(join_handle))
     }
 
     async fn execute_via_builtin_in_parent_shell(
@@ -696,7 +698,17 @@ async fn execute_builtin_command<SE: extensions::ShellExtensions>(
     // In POSIX mode, special builtins that return errors are to be treated as fatal.
     let mark_errors_fatal = builtin.special_builtin && context.shell.options().posix_mode;
 
-    match (builtin.execute_func)(context, args).await {
+    // The observer brackets the whole invocation: the registration's execute function is only
+    // called from within `run_builtin`, so its synchronous prefix and every poll of the future
+    // it returns are covered.
+    let observer = context.shell.execution_observer().clone();
+    let token = observer.begin_builtin(&context.command_name, &args, context.shell.working_dir());
+    let execute_func = builtin.execute_func;
+
+    match observer
+        .run_builtin(token, move || execute_func(context, args))
+        .await
+    {
         Ok(result) => Ok(result),
         Err(e) => {
             // Broken pipe errors should silently return the appropriate exit code
@@ -790,7 +802,11 @@ pub(crate) async fn invoke_command_in_subshell_and_get_output(
 
     let mut async_reader = sys::async_pipe::AsyncPipeReader::new(reader)?;
 
-    let cmd_join_handle = tokio::spawn(run_substitution_command(subshell, params, s));
+    // The substitution runs as a task scheduled by the observer; a refusal fails the
+    // expansion rather than running the command unobserved.
+    let cmd_join_handle = shell
+        .execution_observer()
+        .spawn_task(run_substitution_command(subshell, params, s))?;
 
     let output_str = async_reader.read_to_string().await?;
 

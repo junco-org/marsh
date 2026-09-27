@@ -32,42 +32,13 @@ fn tree_item_keys_bind_to_stable_identities() {
 
 #[test]
 fn toggle_tag_does_not_tag_no_tag_items() {
-    let mut items = BTreeMap::new();
-    items.insert(
-        "header".to_owned(),
+    let build = tree_build(vec![
         ModeTreeItem {
-            id: "header".to_owned(),
-            parent: None,
-            children: vec!["child".to_owned()],
-            depth: 0,
-            line: String::new(),
-            search_text: String::new(),
-            preview: Vec::new(),
             no_tag: true,
-            action: ModeTreeAction::None,
+            ..tree_item("header", None, &["child"], 0)
         },
-    );
-    items.insert(
-        "child".to_owned(),
-        ModeTreeItem {
-            id: "child".to_owned(),
-            parent: Some("header".to_owned()),
-            children: Vec::new(),
-            depth: 1,
-            line: String::new(),
-            search_text: String::new(),
-            preview: Vec::new(),
-            no_tag: false,
-            action: ModeTreeAction::None,
-        },
-    );
-    let build = ModeTreeBuild {
-        items,
-        roots: vec!["header".to_owned()],
-        order: vec!["header".to_owned(), "child".to_owned()],
-        visible: vec!["header".to_owned(), "child".to_owned()],
-        no_matches: false,
-    };
+        tree_item("child", Some("header"), &[], 1),
+    ]);
     let mut mode = test_mode(10);
     mode.selected_id = Some("header".to_owned());
     toggle_tag(&mut mode, &build);
@@ -76,64 +47,11 @@ fn toggle_tag_does_not_tag_no_tag_items() {
 
 #[test]
 fn toggle_tag_untags_ancestors_and_descendants() {
-    let mut items = BTreeMap::new();
-    items.insert(
-        "parent".to_owned(),
-        ModeTreeItem {
-            id: "parent".to_owned(),
-            parent: None,
-            children: vec!["child".to_owned()],
-            depth: 0,
-            line: String::new(),
-            search_text: String::new(),
-            preview: Vec::new(),
-            no_tag: false,
-            action: ModeTreeAction::None,
-        },
-    );
-    items.insert(
-        "child".to_owned(),
-        ModeTreeItem {
-            id: "child".to_owned(),
-            parent: Some("parent".to_owned()),
-            children: vec!["grandchild".to_owned()],
-            depth: 1,
-            line: String::new(),
-            search_text: String::new(),
-            preview: Vec::new(),
-            no_tag: false,
-            action: ModeTreeAction::None,
-        },
-    );
-    items.insert(
-        "grandchild".to_owned(),
-        ModeTreeItem {
-            id: "grandchild".to_owned(),
-            parent: Some("child".to_owned()),
-            children: Vec::new(),
-            depth: 2,
-            line: String::new(),
-            search_text: String::new(),
-            preview: Vec::new(),
-            no_tag: false,
-            action: ModeTreeAction::None,
-        },
-    );
-    let build = ModeTreeBuild {
-        items,
-        roots: vec!["parent".to_owned()],
-        order: vec![
-            "parent".to_owned(),
-            "child".to_owned(),
-            "grandchild".to_owned(),
-        ],
-        visible: vec![
-            "parent".to_owned(),
-            "child".to_owned(),
-            "grandchild".to_owned(),
-        ],
-        no_matches: false,
-    };
+    let build = tree_build(vec![
+        tree_item("parent", None, &["child"], 0),
+        tree_item("child", Some("parent"), &["grandchild"], 1),
+        tree_item("grandchild", Some("child"), &[], 2),
+    ]);
     let mut mode = test_mode(10);
     mode.tagged.insert("parent".to_owned());
     mode.tagged.insert("grandchild".to_owned());
@@ -205,10 +123,7 @@ fn search_backward_wraps_around() {
 
 #[test]
 fn parse_choose_tree_with_s_flag() {
-    let parsed = CommandParser::new()
-        .parse_one_group("choose-tree -s")
-        .expect("parses");
-    let mode = RequestHandler::parse_mode_tree_queue_command(parsed.commands()[0].clone())
+    let mode = parse_mode_tree_source("choose-tree -s")
         .expect("ok")
         .expect("recognized");
     assert_eq!(mode.tree_depth, TreeDepth::Session);
@@ -216,10 +131,7 @@ fn parse_choose_tree_with_s_flag() {
 
 #[test]
 fn parse_choose_tree_with_w_flag() {
-    let parsed = CommandParser::new()
-        .parse_one_group("choose-tree -w")
-        .expect("parses");
-    let mode = RequestHandler::parse_mode_tree_queue_command(parsed.commands()[0].clone())
+    let mode = parse_mode_tree_source("choose-tree -w")
         .expect("ok")
         .expect("recognized");
     assert_eq!(mode.tree_depth, TreeDepth::Window);
@@ -227,28 +139,17 @@ fn parse_choose_tree_with_w_flag() {
 
 #[test]
 fn parse_choose_tree_rejects_invalid_sort_order() {
-    let parsed = CommandParser::new()
-        .parse_one_group("choose-tree -O size")
-        .expect("parses");
-    let err = RequestHandler::parse_mode_tree_queue_command(parsed.commands()[0].clone());
-    assert!(err.is_err());
+    assert!(parse_mode_tree_source("choose-tree -O size").is_err());
 }
 
 #[test]
 fn parse_choose_tree_rejects_unknown_flag() {
-    let parsed = CommandParser::new()
-        .parse_one_group("choose-tree -Q")
-        .expect("parses");
-    let err = RequestHandler::parse_mode_tree_queue_command(parsed.commands()[0].clone());
-    assert!(err.is_err());
+    assert!(parse_mode_tree_source("choose-tree -Q").is_err());
 }
 
 #[test]
 fn parse_customize_mode_ignores_template_argument() {
-    let parsed = CommandParser::new()
-        .parse_one_group("customize-mode")
-        .expect("parses");
-    let mode = RequestHandler::parse_mode_tree_queue_command(parsed.commands()[0].clone())
+    let mode = parse_mode_tree_source("customize-mode")
         .expect("ok")
         .expect("recognized");
     assert!(mode.template.is_none());
@@ -257,10 +158,7 @@ fn parse_customize_mode_ignores_template_argument() {
 
 #[test]
 fn n_flag_single_disables_preview() {
-    let parsed = CommandParser::new()
-        .parse_one_group("choose-buffer -N")
-        .expect("parses");
-    let mode = RequestHandler::parse_mode_tree_queue_command(parsed.commands()[0].clone())
+    let mode = parse_mode_tree_source("choose-buffer -N")
         .expect("ok")
         .expect("recognized");
     assert_eq!(mode.preview_mode, PreviewMode::Off);
@@ -268,10 +166,7 @@ fn n_flag_single_disables_preview() {
 
 #[test]
 fn n_flag_double_enables_big_preview() {
-    let parsed = CommandParser::new()
-        .parse_one_group("choose-buffer -NN")
-        .expect("parses");
-    let mode = RequestHandler::parse_mode_tree_queue_command(parsed.commands()[0].clone())
+    let mode = parse_mode_tree_source("choose-buffer -NN")
         .expect("ok")
         .expect("recognized");
     assert_eq!(mode.preview_mode, PreviewMode::Big);
@@ -306,76 +201,34 @@ fn current_and_tagged_tree_kill_prompts_match_tmux_text() {
     mode.tagged.insert("pane".to_owned());
     mode.tagged.insert("session".to_owned());
 
-    let build = ModeTreeBuild {
-        items: BTreeMap::from([
-            (
-                "session".to_owned(),
-                ModeTreeItem {
-                    id: "session".to_owned(),
-                    parent: None,
-                    children: vec!["window".to_owned()],
-                    depth: 0,
-                    line: String::new(),
-                    search_text: String::new(),
-                    preview: Vec::new(),
-                    no_tag: false,
-                    action: ModeTreeAction::session_tree_target(
-                        SessionName::new("alpha").expect("valid session"),
-                        rmux_proto::SessionId::new(1),
-                    ),
-                },
+    let alpha = || SessionName::new("alpha").expect("valid session");
+    let build = tree_build(vec![
+        ModeTreeItem {
+            action: ModeTreeAction::session_tree_target(alpha(), rmux_proto::SessionId::new(1)),
+            ..tree_item("session", None, &["window"], 0)
+        },
+        ModeTreeItem {
+            action: ModeTreeAction::window_tree_target(
+                alpha(),
+                rmux_proto::SessionId::new(1),
+                3,
+                rmux_proto::WindowId::new(7),
+                crate::pane_terminals::WindowLinkOccurrenceId::new_for_test(13),
             ),
-            (
-                "window".to_owned(),
-                ModeTreeItem {
-                    id: "window".to_owned(),
-                    parent: Some("session".to_owned()),
-                    children: vec!["pane".to_owned()],
-                    depth: 1,
-                    line: String::new(),
-                    search_text: String::new(),
-                    preview: Vec::new(),
-                    no_tag: false,
-                    action: ModeTreeAction::window_tree_target(
-                        SessionName::new("alpha").expect("valid session"),
-                        rmux_proto::SessionId::new(1),
-                        3,
-                        rmux_proto::WindowId::new(7),
-                        crate::pane_terminals::WindowLinkOccurrenceId::new_for_test(13),
-                    ),
-                },
+            ..tree_item("window", Some("session"), &["pane"], 1)
+        },
+        ModeTreeItem {
+            action: ModeTreeAction::pane_tree_target(
+                rmux_proto::PaneTarget::with_window(alpha(), 3, 1),
+                rmux_proto::SessionId::new(1),
+                rmux_proto::WindowId::new(7),
+                crate::pane_terminals::WindowLinkOccurrenceId::new_for_test(13),
+                rmux_proto::PaneId::new(42),
+                7,
             ),
-            (
-                "pane".to_owned(),
-                ModeTreeItem {
-                    id: "pane".to_owned(),
-                    parent: Some("window".to_owned()),
-                    children: Vec::new(),
-                    depth: 2,
-                    line: String::new(),
-                    search_text: String::new(),
-                    preview: Vec::new(),
-                    no_tag: false,
-                    action: ModeTreeAction::pane_tree_target(
-                        rmux_proto::PaneTarget::with_window(
-                            SessionName::new("alpha").expect("valid session"),
-                            3,
-                            1,
-                        ),
-                        rmux_proto::SessionId::new(1),
-                        rmux_proto::WindowId::new(7),
-                        crate::pane_terminals::WindowLinkOccurrenceId::new_for_test(13),
-                        rmux_proto::PaneId::new(42),
-                        7,
-                    ),
-                },
-            ),
-        ]),
-        roots: vec!["session".to_owned()],
-        order: vec!["session".to_owned(), "window".to_owned(), "pane".to_owned()],
-        visible: vec!["session".to_owned(), "window".to_owned(), "pane".to_owned()],
-        no_matches: false,
-    };
+            ..tree_item("pane", Some("window"), &[], 2)
+        },
+    ]);
 
     assert_eq!(
         current_tree_kill_prompt(&mode, &build).as_deref(),

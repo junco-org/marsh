@@ -4,6 +4,12 @@ use super::super::mode_tree_model::{
     ChooseTreeTarget, ModeTreeActionIdentity, ModeTreeDeferredAction,
 };
 use crate::handler::prompt_support::PromptInputEvent;
+use rmux_proto::{
+    CopyModeRequest, DeleteBufferRequest, HookName, KillSessionRequest, KillWindowRequest,
+    LinkWindowRequest, MoveWindowRequest, NewWindowRequest, RefreshClientRequest,
+    RenameSessionRequest, ResizePaneRequest, RespawnPaneRequest, RotateWindowRequest,
+    SetBufferRequest, SetHookRequest, WindowTarget,
+};
 
 async fn choose_buffer_action_fixture(
     label: &str,
@@ -15,66 +21,21 @@ async fn choose_buffer_action_fixture(
 ) {
     let handler = RequestHandler::new();
     let session_name = SessionName::new(label).expect("valid session");
-    create_mode_tree_test_session(&handler, &session_name).await;
+    handler.create_session(&session_name).await;
     for (name, content) in [
         ("stale", b"old".to_vec()),
         ("delete-me", b"delete".to_vec()),
         ("keep", b"safe".to_vec()),
     ] {
-        let response = handler
-            .handle(Request::SetBuffer(Box::new(rmux_proto::SetBufferRequest {
-                name: Some(name.to_owned()),
-                content,
-                append: false,
-                new_name: None,
-                set_clipboard: false,
-                target_client: None,
-            })))
+        handler
+            .handle_ok(SetBufferRequest::fixture((name, content)))
             .await;
-        assert!(matches!(response, Response::SetBuffer(_)), "{response:?}");
     }
 
     let attach_pid = std::process::id().saturating_add(attach_pid_offset);
-    let (control_tx, control_rx) = mpsc::unbounded_channel();
-    handler
-        .register_attach(attach_pid, session_name, control_tx)
-        .await;
-    open_choose_buffer(&handler, attach_pid).await;
+    let control_rx = handler.attach_client(attach_pid, session_name).await;
+    open_mode_tree(&handler, attach_pid, &["choose-buffer"]).await;
     (handler, attach_pid, control_rx)
-}
-
-async fn open_choose_buffer(handler: &RequestHandler, attach_pid: u32) {
-    let parsed = CommandParser::new()
-        .parse_arguments(["choose-buffer"])
-        .expect("choose-buffer parses");
-    let command = RequestHandler::parse_mode_tree_queue_command(parsed.commands()[0].clone())
-        .expect("mode-tree command parses")
-        .expect("mode-tree command recognized");
-    handler
-        .execute_queued_mode_tree(
-            attach_pid,
-            command,
-            &QueueExecutionContext::without_caller_cwd(),
-        )
-        .await
-        .expect("choose-buffer opens");
-}
-
-async fn open_customize_mode(handler: &RequestHandler, attach_pid: u32) {
-    let parsed = CommandParser::new()
-        .parse_arguments(["customize-mode"])
-        .expect("customize-mode parses");
-    let command = RequestHandler::parse_mode_tree_queue_command(parsed.commands()[0].clone())
-        .expect("mode-tree command parses")
-        .expect("mode-tree command recognized");
-    handler
-        .execute_queued_mode_tree(
-            attach_pid,
-            command,
-            &QueueExecutionContext::without_caller_cwd(),
-        )
-        .await
-        .expect("customize-mode opens");
 }
 
 async fn zoomed_choose_tree_fixture(
@@ -88,41 +49,16 @@ async fn zoomed_choose_tree_fixture(
 ) {
     let handler = RequestHandler::new();
     let session_name = SessionName::new(label).expect("valid session");
-    create_mode_tree_test_session(&handler, &session_name).await;
-    assert!(matches!(
-        handler
-            .handle(Request::SplitWindow(SplitWindowRequest {
-                target: SplitWindowTarget::Pane(PaneTarget::with_window(
-                    session_name.clone(),
-                    0,
-                    0,
-                )),
-                direction: SplitDirection::Horizontal,
-                before: false,
-                environment: None,
-            }))
-            .await,
-        Response::SplitWindow(_)
-    ));
-    let attach_pid = std::process::id().saturating_add(attach_pid_offset);
-    let (control_tx, control_rx) = mpsc::unbounded_channel();
+    handler.create_session(&session_name).await;
     handler
-        .register_attach(attach_pid, session_name.clone(), control_tx)
+        .handle_ok(SplitWindowRequest {
+            direction: SplitDirection::Horizontal,
+            ..Fixture::fixture(PaneTarget::with_window(session_name.clone(), 0, 0))
+        })
         .await;
-    let parsed = CommandParser::new()
-        .parse_arguments(["choose-tree", "-Z"])
-        .expect("choose-tree -Z parses");
-    let command = RequestHandler::parse_mode_tree_queue_command(parsed.commands()[0].clone())
-        .expect("mode-tree command parses")
-        .expect("mode-tree command recognized");
-    handler
-        .execute_queued_mode_tree(
-            attach_pid,
-            command,
-            &QueueExecutionContext::without_caller_cwd(),
-        )
-        .await
-        .expect("zoomed choose-tree opens");
+    let attach_pid = std::process::id().saturating_add(attach_pid_offset);
+    let control_rx = handler.attach_client(attach_pid, &session_name).await;
+    open_mode_tree(&handler, attach_pid, &["choose-tree", "-Z"]).await;
     assert!(
         handler
             .state
@@ -135,27 +71,6 @@ async fn zoomed_choose_tree_fixture(
         "choose-tree -Z zooms the host window"
     );
     (handler, session_name, attach_pid, control_rx)
-}
-
-async fn set_global_option(handler: &RequestHandler, option: OptionName, value: &str) {
-    assert!(matches!(
-        handler
-            .handle(Request::SetOption(SetOptionRequest {
-                scope: ScopeSelector::Global,
-                option,
-                value: value.to_owned(),
-                mode: SetOptionMode::Replace,
-            }))
-            .await,
-        Response::SetOption(_)
-    ));
-}
-
-fn frame_visits_row(frame: &[u8], row: u16) -> bool {
-    let cursor = format!("\x1b[{row};1H");
-    frame
-        .windows(cursor.len())
-        .any(|window| window == cursor.as_bytes())
 }
 
 fn mouse_event_at_row(y: u16) -> crate::input_keys::MouseForwardEvent {
@@ -187,46 +102,21 @@ async fn mode_tree_build_and_mouse_use_the_host_split_geometry() {
     // evicted part-way through — which is what the "choose-buffer remains active" failure was
     // actually reporting: not a dismissed mode tree, a removed client.
     let _drain = tokio::spawn(async move { while control_rx.recv().await.is_some() {} });
-    assert!(matches!(
-        handler
-            .handle(Request::SplitWindow(SplitWindowRequest {
-                target: SplitWindowTarget::Pane(PaneTarget::with_window(
-                    session_name.clone(),
-                    0,
-                    0,
-                )),
-                direction: SplitDirection::Horizontal,
-                before: false,
-                environment: None,
-            }))
-            .await,
-        Response::SplitWindow(_)
-    ));
+    handler
+        .handle_ok(SplitWindowRequest {
+            direction: SplitDirection::Horizontal,
+            ..Fixture::fixture(PaneTarget::with_window(session_name.clone(), 0, 0))
+        })
+        .await;
 
-    assert!(matches!(
-        handler
-            .handle(Request::SplitWindow(SplitWindowRequest {
-                target: SplitWindowTarget::Pane(PaneTarget::with_window(
-                    session_name.clone(),
-                    0,
-                    0,
-                )),
-                direction: SplitDirection::Vertical,
-                before: false,
-                environment: None,
-            }))
-            .await,
-        Response::SplitWindow(_)
-    ));
+    handler
+        .handle_ok(SplitWindowRequest {
+            direction: SplitDirection::Vertical,
+            ..Fixture::fixture(PaneTarget::with_window(session_name.clone(), 0, 0))
+        })
+        .await;
 
-    let mut mode = handler
-        .active_attach
-        .lock()
-        .await
-        .by_pid
-        .get(&attach_pid)
-        .and_then(|active| active.mode_tree.clone())
-        .expect("choose-buffer remains active");
+    let mut mode = with_mode_tree(&handler, attach_pid, |mode| mode.clone()).await;
     mode.preview_mode = PreviewMode::Off;
     mode.scroll = 0;
     mode.selected_id = None;
@@ -274,16 +164,11 @@ async fn mode_tree_reserves_numeric_status_at_top_and_bottom() {
     let label = "choose-buffer-multi-line-status";
     let session_name = SessionName::new(label).expect("valid session");
     let (handler, attach_pid, _control_rx) = choose_buffer_action_fixture(label, 79).await;
-    set_global_option(&handler, OptionName::Status, "3").await;
+    handler
+        .set_option(ScopeSelector::Global, OptionName::Status, "3")
+        .await;
 
-    let mut mode = handler
-        .active_attach
-        .lock()
-        .await
-        .by_pid
-        .get(&attach_pid)
-        .and_then(|active| active.mode_tree.clone())
-        .expect("choose-buffer remains active");
+    let mut mode = with_mode_tree(&handler, attach_pid, |mode| mode.clone()).await;
     mode.preview_mode = PreviewMode::Off;
     let build = handler
         .build_mode_tree(&mut mode, attach_pid)
@@ -312,7 +197,9 @@ async fn mode_tree_reserves_numeric_status_at_top_and_bottom() {
     assert!(frame_visits_row(&clear, 21));
     assert!(!frame_visits_row(&clear, 22));
 
-    set_global_option(&handler, OptionName::StatusPosition, "top").await;
+    handler
+        .set_option(ScopeSelector::Global, OptionName::StatusPosition, "top")
+        .await;
     let overlay = {
         let state = handler.state.lock().await;
         render_mode_tree_overlay(&state, &mode, &build)
@@ -338,31 +225,23 @@ async fn mode_tree_reserves_numeric_status_at_top_and_bottom() {
 async fn mode_tree_mouse_uses_content_rows_below_top_status() {
     let label = "choose-buffer-top-status-mouse";
     let (handler, attach_pid, _control_rx) = choose_buffer_action_fixture(label, 80).await;
-    set_global_option(&handler, OptionName::Status, "3").await;
-    set_global_option(&handler, OptionName::StatusPosition, "top").await;
+    handler
+        .set_option(ScopeSelector::Global, OptionName::Status, "3")
+        .await;
+    handler
+        .set_option(ScopeSelector::Global, OptionName::StatusPosition, "top")
+        .await;
 
     for index in 0..24 {
-        let response = handler
-            .handle(Request::SetBuffer(Box::new(rmux_proto::SetBufferRequest {
-                name: Some(format!("mouse-row-{index:02}")),
-                content: vec![u8::try_from(index).expect("test index fits in u8")],
-                append: false,
-                new_name: None,
-                set_clipboard: false,
-                target_client: None,
-            })))
+        handler
+            .handle_ok(SetBufferRequest::fixture((
+                format!("mouse-row-{index:02}"),
+                vec![u8::try_from(index).expect("test index fits in u8")],
+            )))
             .await;
-        assert!(matches!(response, Response::SetBuffer(_)), "{response:?}");
     }
 
-    let mut mode = handler
-        .active_attach
-        .lock()
-        .await
-        .by_pid
-        .get(&attach_pid)
-        .and_then(|active| active.mode_tree.clone())
-        .expect("choose-buffer remains active");
+    let mut mode = with_mode_tree(&handler, attach_pid, |mode| mode.clone()).await;
     mode.preview_mode = PreviewMode::Off;
     mode.scroll = 0;
     mode.selected_id = None;
@@ -415,31 +294,18 @@ async fn mode_tree_mouse_uses_content_rows_below_top_status() {
     );
 }
 
-async fn delete_stale_buffer(handler: &RequestHandler) {
-    let response = handler
-        .handle(Request::DeleteBuffer(rmux_proto::DeleteBufferRequest {
-            name: Some("stale".to_owned()),
-        }))
-        .await;
-    assert!(
-        matches!(response, Response::DeleteBuffer(_)),
-        "{response:?}"
-    );
-}
-
 async fn replace_stale_buffer(handler: &RequestHandler) {
-    delete_stale_buffer(handler).await;
-    let response = handler
-        .handle(Request::SetBuffer(Box::new(rmux_proto::SetBufferRequest {
+    handler
+        .handle_ok(DeleteBufferRequest {
             name: Some("stale".to_owned()),
-            content: b"replacement".to_vec(),
-            append: false,
-            new_name: None,
-            set_clipboard: false,
-            target_client: None,
-        })))
+        })
         .await;
-    assert!(matches!(response, Response::SetBuffer(_)), "{response:?}");
+    handler
+        .handle_ok(SetBufferRequest::fixture((
+            "stale",
+            b"replacement".to_vec(),
+        )))
+        .await;
 }
 
 async fn choose_buffer_item_id(
@@ -447,14 +313,7 @@ async fn choose_buffer_item_id(
     attach_pid: u32,
     buffer_name: &str,
 ) -> String {
-    let mut mode = handler
-        .active_attach
-        .lock()
-        .await
-        .by_pid
-        .get(&attach_pid)
-        .and_then(|active| active.mode_tree.clone())
-        .expect("choose-buffer remains active");
+    let mut mode = with_mode_tree(handler, attach_pid, |mode| mode.clone()).await;
     handler
         .build_mode_tree(&mut mode, attach_pid)
         .await
@@ -514,7 +373,7 @@ async fn choose_buffer_accept_rejects_a_reconnected_host_before_paste() {
         .register_attach(attach_pid, session_name, replacement_tx)
         .await;
     assert_ne!(replacement_attach_id, old_identity.attach_id());
-    open_choose_buffer(&handler, attach_pid).await;
+    open_mode_tree(&handler, attach_pid, &["choose-buffer"]).await;
     let replacement_state_id = handler
         .active_attach
         .lock()
@@ -598,7 +457,7 @@ async fn choose_buffer_p_key_rejects_a_same_pid_reconnect_before_paste() {
         .register_attach(attach_pid, session_name, replacement_tx)
         .await;
     assert_ne!(replacement_attach_id, old_attach_id);
-    open_choose_buffer(&handler, attach_pid).await;
+    open_mode_tree(&handler, attach_pid, &["choose-buffer"]).await;
     let replacement_state_id = handler
         .active_attach
         .lock()
@@ -680,7 +539,7 @@ async fn choose_buffer_d_key_rejects_a_same_pid_reconnect_before_delete() {
         .register_attach(attach_pid, session_name, replacement_tx)
         .await;
     assert_ne!(replacement_attach_id, old_attach_id);
-    open_choose_buffer(&handler, attach_pid).await;
+    open_mode_tree(&handler, attach_pid, &["choose-buffer"]).await;
     let replacement_state_id = handler
         .active_attach
         .lock()
@@ -747,7 +606,7 @@ async fn choose_buffer_stale_host_identity_cannot_dismiss_a_replacement_tree() {
     let replacement_attach_id = handler
         .register_attach(attach_pid, session_name, replacement_tx)
         .await;
-    open_choose_buffer(&handler, attach_pid).await;
+    open_mode_tree(&handler, attach_pid, &["choose-buffer"]).await;
 
     assert!(handler
         .dismiss_mode_tree_with_refresh_for_action_identity(old_identity)
@@ -812,16 +671,11 @@ async fn choose_buffer_delete_does_not_fall_back_after_all_tags_go_stale() {
         choose_buffer_action_fixture("choose-buffer-stale-tag", 72).await;
     let stale_id = choose_buffer_item_id(&handler, attach_pid, "stale").await;
     let keep_id = choose_buffer_item_id(&handler, attach_pid, "keep").await;
-    {
-        let mut active_attach = handler.active_attach.lock().await;
-        let mode = active_attach
-            .by_pid
-            .get_mut(&attach_pid)
-            .and_then(|active| active.mode_tree.as_mut())
-            .expect("choose-buffer remains active");
+    with_mode_tree(&handler, attach_pid, |mode| {
         mode.selected_id = Some(keep_id);
         mode.tagged.insert(stale_id);
-    }
+    })
+    .await;
     replace_stale_buffer(&handler).await;
 
     handler
@@ -850,15 +704,10 @@ async fn choose_buffer_paste_delete_does_not_fall_back_after_selection_goes_stal
     let (handler, attach_pid, _control_rx) =
         choose_buffer_action_fixture("choose-buffer-stale-selection", 73).await;
     let stale_id = choose_buffer_item_id(&handler, attach_pid, "stale").await;
-    handler
-        .active_attach
-        .lock()
-        .await
-        .by_pid
-        .get_mut(&attach_pid)
-        .and_then(|active| active.mode_tree.as_mut())
-        .expect("choose-buffer remains active")
-        .selected_id = Some(stale_id);
+    with_mode_tree(&handler, attach_pid, |mode| {
+        mode.selected_id = Some(stale_id)
+    })
+    .await;
     replace_stale_buffer(&handler).await;
 
     handler
@@ -889,17 +738,12 @@ async fn choose_buffer_confirmation_uses_captured_buffer_instances() {
     let stale_id = choose_buffer_item_id(&handler, attach_pid, "stale").await;
     let delete_id = choose_buffer_item_id(&handler, attach_pid, "delete-me").await;
     let keep_id = choose_buffer_item_id(&handler, attach_pid, "keep").await;
-    {
-        let mut active_attach = handler.active_attach.lock().await;
-        let mode = active_attach
-            .by_pid
-            .get_mut(&attach_pid)
-            .and_then(|active| active.mode_tree.as_mut())
-            .expect("choose-buffer remains active");
+    with_mode_tree(&handler, attach_pid, |mode| {
         mode.selected_id = Some(keep_id);
         mode.tagged.insert(stale_id);
         mode.tagged.insert(delete_id);
-    }
+    })
+    .await;
     handler
         .handle_attached_live_input_for_test(attach_pid, b"x")
         .await
@@ -942,39 +786,20 @@ async fn choose_buffer_confirmation_uses_captured_buffer_instances() {
 async fn choose_tree_kill_pane_drains_after_kill_pane_inline_hook() {
     let handler = RequestHandler::new();
     let alpha = SessionName::new("choose-tree-after-kill").expect("valid session");
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: alpha.clone(),
-                detached: true,
-                size: Some(TerminalSize { cols: 80, rows: 24 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
-    assert!(matches!(
-        handler
-            .handle(Request::SplitWindow(rmux_proto::SplitWindowRequest {
-                target: rmux_proto::SplitWindowTarget::Session(alpha.clone()),
-                direction: rmux_proto::SplitDirection::Horizontal,
-                before: false,
-                environment: None,
-            }))
-            .await,
-        Response::SplitWindow(_)
-    ));
-    assert!(matches!(
-        handler
-            .handle(Request::SetHook(rmux_proto::SetHookRequest {
-                scope: rmux_proto::ScopeSelector::Global,
-                hook: rmux_proto::HookName::AfterKillPane,
-                command: "set-buffer -b tree-after-kill fired".to_owned(),
-                lifecycle: rmux_proto::HookLifecycle::Persistent,
-            }))
-            .await,
-        Response::SetHook(_)
-    ));
+    handler.create_session(&alpha).await;
+    handler
+        .handle_ok(SplitWindowRequest {
+            direction: SplitDirection::Horizontal,
+            ..Fixture::fixture(&alpha)
+        })
+        .await;
+    handler
+        .handle_ok(SetHookRequest::fixture((
+            ScopeSelector::Global,
+            HookName::AfterKillPane,
+            "set-buffer -b tree-after-kill fired",
+        )))
+        .await;
     let (session_id, window_id, window_occurrence_id, pane_id, pane_output_generation) = {
         let mut state = handler.state.lock().await;
         state.ensure_live_window_link_occurrences();
@@ -1018,19 +843,14 @@ async fn choose_tree_kill_pane_drains_after_kill_pane_inline_hook() {
 async fn choose_tree_tagged_pane_kills_follow_stable_ids_after_renumbering() {
     let handler = RequestHandler::new();
     let alpha = SessionName::new("choose-tree-tagged-stable-panes").expect("valid session");
-    create_mode_tree_test_session(&handler, &alpha).await;
+    handler.create_session(&alpha).await;
     for _ in 0..2 {
-        assert!(matches!(
-            handler
-                .handle(Request::SplitWindow(rmux_proto::SplitWindowRequest {
-                    target: rmux_proto::SplitWindowTarget::Session(alpha.clone()),
-                    direction: rmux_proto::SplitDirection::Horizontal,
-                    before: false,
-                    environment: None,
-                }))
-                .await,
-            Response::SplitWindow(_)
-        ));
+        handler
+            .handle_ok(SplitWindowRequest {
+                direction: SplitDirection::Horizontal,
+                ..Fixture::fixture(&alpha)
+            })
+            .await;
     }
 
     let (session_id, window_id, window_occurrence_id, pane_targets, surviving_pane_id) = {
@@ -1102,39 +922,22 @@ async fn choose_tree_tagged_link_aliases_do_not_abort_later_distinct_kills() {
     let beta = SessionName::new("choose-tree-link-beta").expect("valid session");
     let gamma = SessionName::new("choose-tree-link-gamma").expect("valid session");
     for session in [&alpha, &beta, &gamma] {
-        create_mode_tree_test_session(&handler, session).await;
+        handler.create_session(session).await;
     }
     for session in [&alpha, &gamma] {
-        assert!(matches!(
-            handler
-                .handle(Request::NewWindow(Box::new(rmux_proto::NewWindowRequest {
-                    target: session.clone(),
-                    name: None,
-                    detached: true,
-                    environment: None,
-                    command: None,
-                    process_command: None,
-                    start_directory: None,
-                    target_window_index: Some(1),
-                    insert_at_target: false,
-                })))
-                .await,
-            Response::NewWindow(_)
-        ));
-    }
-    assert!(matches!(
         handler
-            .handle(Request::LinkWindow(rmux_proto::LinkWindowRequest {
-                source: rmux_proto::WindowTarget::with_window(alpha.clone(), 0),
-                target: rmux_proto::WindowTarget::with_window(beta.clone(), 1),
-                after: false,
-                before: false,
-                kill_destination: false,
-                detached: true,
-            }))
-            .await,
-        Response::LinkWindow(_)
-    ));
+            .create_window(NewWindowRequest {
+                target_window_index: Some(1),
+                ..Fixture::fixture(session)
+            })
+            .await;
+    }
+    handler
+        .handle_ok(LinkWindowRequest::fixture((
+            WindowTarget::with_window(alpha.clone(), 0),
+            WindowTarget::with_window(beta.clone(), 1),
+        )))
+        .await;
 
     let actions = {
         let mut state = handler.state.lock().await;
@@ -1193,37 +996,13 @@ async fn choose_tree_tagged_link_aliases_do_not_abort_later_distinct_kills() {
 async fn choose_tree_stale_session_action_fails_closed_after_name_reuse() {
     let handler = RequestHandler::new();
     let alpha = SessionName::new("choose-tree-session-aba").expect("valid session");
-    create_mode_tree_test_session(&handler, &alpha).await;
-    let old_session_id = handler
-        .state
-        .lock()
-        .await
-        .sessions
-        .session(&alpha)
-        .expect("old session exists")
-        .id();
+    handler.create_session(&alpha).await;
+    let old_session_id = handler.session_id_for_test(&alpha).await;
     let stale_action = ModeTreeAction::session_tree_target(alpha.clone(), old_session_id);
 
-    assert!(matches!(
-        handler
-            .handle(Request::KillSession(rmux_proto::KillSessionRequest {
-                target: alpha.clone(),
-                kill_all_except_target: false,
-                clear_alerts: false,
-                kill_group: false,
-            }))
-            .await,
-        Response::KillSession(_)
-    ));
-    create_mode_tree_test_session(&handler, &alpha).await;
-    let replacement_session_id = handler
-        .state
-        .lock()
-        .await
-        .sessions
-        .session(&alpha)
-        .expect("replacement session exists")
-        .id();
+    handler.handle_ok(KillSessionRequest::fixture(&alpha)).await;
+    handler.create_session(&alpha).await;
+    let replacement_session_id = handler.session_id_for_test(&alpha).await;
     assert_ne!(replacement_session_id, old_session_id);
 
     let error = handler
@@ -1248,46 +1027,18 @@ async fn choose_tree_tagged_kill_skips_stale_identity_and_finishes_live_batch() 
     let handler = RequestHandler::new();
     let stale_name = SessionName::new("a-choose-tree-stale-batch").expect("valid session");
     let live_name = SessionName::new("z-choose-tree-live-batch").expect("valid session");
-    create_mode_tree_test_session(&handler, &stale_name).await;
-    create_mode_tree_test_session(&handler, &live_name).await;
-    let (stale_id, live_id) = {
-        let state = handler.state.lock().await;
-        (
-            state
-                .sessions
-                .session(&stale_name)
-                .expect("stale target exists")
-                .id(),
-            state
-                .sessions
-                .session(&live_name)
-                .expect("live target exists")
-                .id(),
-        )
-    };
+    handler.create_session(&stale_name).await;
+    handler.create_session(&live_name).await;
+    let stale_id = handler.session_id_for_test(&stale_name).await;
+    let live_id = handler.session_id_for_test(&live_name).await;
     let stale_action = ModeTreeAction::session_tree_target(stale_name.clone(), stale_id);
     let live_action = ModeTreeAction::session_tree_target(live_name.clone(), live_id);
 
-    assert!(matches!(
-        handler
-            .handle(Request::KillSession(rmux_proto::KillSessionRequest {
-                target: stale_name.clone(),
-                kill_all_except_target: false,
-                clear_alerts: false,
-                kill_group: false,
-            }))
-            .await,
-        Response::KillSession(_)
-    ));
-    create_mode_tree_test_session(&handler, &stale_name).await;
-    let replacement_id = handler
-        .state
-        .lock()
-        .await
-        .sessions
-        .session(&stale_name)
-        .expect("replacement session exists")
-        .id();
+    handler
+        .handle_ok(KillSessionRequest::fixture(&stale_name))
+        .await;
+    handler.create_session(&stale_name).await;
+    let replacement_id = handler.session_id_for_test(&stale_name).await;
     assert_ne!(replacement_id, stale_id);
 
     handler
@@ -1317,64 +1068,21 @@ async fn choose_tree_kill_current_does_not_fall_back_after_session_aba() {
     let handler = RequestHandler::new();
     let host = SessionName::new("choose-tree-aba-host").expect("valid session");
     let alpha = SessionName::new("choose-tree-aba-target").expect("valid session");
-    create_mode_tree_test_session(&handler, &host).await;
-    create_mode_tree_test_session(&handler, &alpha).await;
-    let old_session_id = handler
-        .state
-        .lock()
-        .await
-        .sessions
-        .session(&alpha)
-        .expect("old target exists")
-        .id();
+    handler.create_session(&host).await;
+    handler.create_session(&alpha).await;
+    let old_session_id = handler.session_id_for_test(&alpha).await;
 
     let attach_pid = std::process::id().saturating_add(41);
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    handler.register_attach(attach_pid, host, control_tx).await;
-    let parsed = CommandParser::new()
-        .parse_arguments(["choose-tree", "-s"])
-        .expect("choose-tree parses");
-    let command = RequestHandler::parse_mode_tree_queue_command(parsed.commands()[0].clone())
-        .expect("mode-tree command parses")
-        .expect("mode-tree command recognized");
-    handler
-        .execute_queued_mode_tree(
-            attach_pid,
-            command,
-            &QueueExecutionContext::without_caller_cwd(),
-        )
-        .await
-        .expect("mode-tree opens");
-    handler
-        .active_attach
-        .lock()
-        .await
-        .by_pid
-        .get_mut(&attach_pid)
-        .and_then(|active| active.mode_tree.as_mut())
-        .expect("mode-tree remains active")
-        .selected_id = Some(session_item_id(old_session_id));
+    let _control_rx = handler.attach_client(attach_pid, host).await;
+    open_mode_tree(&handler, attach_pid, &["choose-tree", "-s"]).await;
+    with_mode_tree(&handler, attach_pid, |mode| {
+        mode.selected_id = Some(session_item_id(old_session_id));
+    })
+    .await;
 
-    assert!(matches!(
-        handler
-            .handle(Request::KillSession(rmux_proto::KillSessionRequest {
-                target: alpha.clone(),
-                kill_all_except_target: false,
-                clear_alerts: false,
-                kill_group: false,
-            }))
-            .await,
-        Response::KillSession(_)
-    ));
-    create_mode_tree_test_session(&handler, &alpha).await;
-    let replacement_session_id = handler
-        .state
-        .lock()
-        .await
-        .sessions
-        .session(&alpha)
-        .expect("replacement target exists")
-        .id();
+    handler.handle_ok(KillSessionRequest::fixture(&alpha)).await;
+    handler.create_session(&alpha).await;
+    let replacement_session_id = handler.session_id_for_test(&alpha).await;
     assert_ne!(replacement_session_id, old_session_id);
 
     handler
@@ -1397,8 +1105,13 @@ async fn choose_tree_kill_current_does_not_fall_back_after_session_aba() {
 async fn choose_tree_stale_window_action_fails_closed_after_index_reuse() {
     let handler = RequestHandler::new();
     let alpha = SessionName::new("choose-tree-window-aba").expect("valid session");
-    create_mode_tree_test_session(&handler, &alpha).await;
-    create_mode_tree_test_window(&handler, &alpha, 1).await;
+    handler.create_session(&alpha).await;
+    handler
+        .create_window(NewWindowRequest {
+            target_window_index: Some(1),
+            ..Fixture::fixture(&alpha)
+        })
+        .await;
     let (session_id, old_window_id, old_window_occurrence_id) = {
         let mut state = handler.state.lock().await;
         state.ensure_live_window_link_occurrences();
@@ -1419,25 +1132,21 @@ async fn choose_tree_stale_window_action_fails_closed_after_index_reuse() {
         old_window_occurrence_id,
     );
 
-    assert!(matches!(
-        handler
-            .handle(Request::KillWindow(rmux_proto::KillWindowRequest {
-                target: rmux_proto::WindowTarget::with_window(alpha.clone(), 1),
-                kill_all_others: false,
-            }))
-            .await,
-        Response::KillWindow(_)
-    ));
-    create_mode_tree_test_window(&handler, &alpha, 1).await;
+    handler
+        .handle_ok(KillWindowRequest::fixture(WindowTarget::with_window(
+            alpha.clone(),
+            1,
+        )))
+        .await;
+    handler
+        .create_window(NewWindowRequest {
+            target_window_index: Some(1),
+            ..Fixture::fixture(&alpha)
+        })
+        .await;
     let replacement_window_id = handler
-        .state
-        .lock()
-        .await
-        .sessions
-        .session(&alpha)
-        .and_then(|session| session.window_at(1))
-        .expect("replacement window exists")
-        .id();
+        .window_id_for_test(&WindowTarget::with_window(alpha.clone(), 1))
+        .await;
     assert_ne!(replacement_window_id, old_window_id);
 
     let error = handler
@@ -1461,104 +1170,32 @@ async fn choose_tree_stale_window_action_fails_closed_after_index_reuse() {
     );
 }
 
-async fn create_mode_tree_test_session(handler: &RequestHandler, session_name: &SessionName) {
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: session_name.clone(),
-                detached: true,
-                size: Some(TerminalSize { cols: 80, rows: 24 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
-}
-
-async fn mode_tree_test_pane_cols(handler: &RequestHandler, session_name: &SessionName) -> u16 {
-    let state = handler.state.lock().await;
-    state
-        .pane_terminal_size(session_name, 0, 0)
-        .expect("pane size")
-        .cols
-}
-
-async fn create_mode_tree_test_window(
-    handler: &RequestHandler,
-    session_name: &SessionName,
-    window_index: u32,
-) {
-    assert!(matches!(
-        handler
-            .handle(Request::NewWindow(Box::new(rmux_proto::NewWindowRequest {
-                target: session_name.clone(),
-                name: None,
-                detached: true,
-                environment: None,
-                command: None,
-                process_command: None,
-                start_directory: None,
-                target_window_index: Some(window_index),
-                insert_at_target: false,
-            })))
-            .await,
-        Response::NewWindow(_)
-    ));
-}
-
 #[tokio::test]
 async fn rename_session_rekeys_active_choose_tree_host_before_refresh() {
     let handler = RequestHandler::new();
     let original = SessionName::new("choose-tree-rename-original").expect("valid session");
     let renamed = SessionName::new("choose-tree-rename-renamed").expect("valid session");
-    create_mode_tree_test_session(&handler, &original).await;
+    handler.create_session(&original).await;
 
     let attach_pid = std::process::id().saturating_add(652);
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    handler
-        .register_attach(attach_pid, original.clone(), control_tx)
-        .await;
-    let parsed = CommandParser::new()
-        .parse_arguments(["choose-tree", "-s"])
-        .expect("choose-tree parses");
-    let command = RequestHandler::parse_mode_tree_queue_command(parsed.commands()[0].clone())
-        .expect("mode-tree command parses")
-        .expect("mode-tree command recognized");
-    handler
-        .execute_queued_mode_tree(
-            attach_pid,
-            command,
-            &QueueExecutionContext::without_caller_cwd(),
-        )
-        .await
-        .expect("choose-tree opens");
-    let stable_selected_id = {
-        let mut active_attach = handler.active_attach.lock().await;
-        let mode = active_attach
-            .by_pid
-            .get_mut(&attach_pid)
-            .expect("attached choose-tree client")
-            .mode_tree
-            .as_mut()
-            .expect("choose-tree is active");
+    let _control_rx = handler.attach_client(attach_pid, &original).await;
+    open_mode_tree(&handler, attach_pid, &["choose-tree", "-s"]).await;
+    let stable_selected_id = with_mode_tree(&handler, attach_pid, |mode| {
         let selected_id = mode
             .selected_id
             .clone()
             .expect("choose-tree selects a stable identity row");
         mode.tagged.insert(selected_id.clone());
         selected_id
-    };
+    })
+    .await;
 
-    let response = handler
-        .handle(Request::RenameSession(rmux_proto::RenameSessionRequest {
+    handler
+        .handle_ok(RenameSessionRequest {
             target: original,
             new_name: renamed.clone(),
-        }))
+        })
         .await;
-    assert!(
-        matches!(response, Response::RenameSession(_)),
-        "{response:?}"
-    );
 
     {
         let active_attach = handler.active_attach.lock().await;
@@ -1613,53 +1250,13 @@ async fn rename_session_rekeys_active_choose_tree_host_before_refresh() {
 async fn refresh_client_replays_active_mode_tree_after_base_switch() {
     let handler = RequestHandler::new();
     let session = SessionName::new("refresh-client-mode-tree").expect("valid session");
-    create_mode_tree_test_session(&handler, &session).await;
+    handler.create_session(&session).await;
     let attach_pid = std::process::id();
-    let (control_tx, mut control_rx) = mpsc::unbounded_channel();
-    handler
-        .register_attach(attach_pid, session, control_tx)
-        .await;
-    let parsed = CommandParser::new()
-        .parse_arguments(["choose-tree", "-s"])
-        .expect("choose-tree parses");
-    let command = RequestHandler::parse_mode_tree_queue_command(parsed.commands()[0].clone())
-        .expect("mode-tree command parses")
-        .expect("mode-tree command recognized");
-    handler
-        .execute_queued_mode_tree(
-            attach_pid,
-            command,
-            &QueueExecutionContext::without_caller_cwd(),
-        )
-        .await
-        .expect("choose-tree opens");
+    let mut control_rx = handler.attach_client(attach_pid, session).await;
+    open_mode_tree(&handler, attach_pid, &["choose-tree", "-s"]).await;
     while control_rx.try_recv().is_ok() {}
 
-    let response = handler
-        .handle(Request::RefreshClient(Box::new(
-            rmux_proto::request::RefreshClientRequest {
-                target_client: None,
-                adjustment: None,
-                clear_pan: false,
-                pan_left: false,
-                pan_right: false,
-                pan_up: false,
-                pan_down: false,
-                status_only: false,
-                clipboard_query: false,
-                flags: None,
-                flags_alias: None,
-                subscriptions: Vec::new(),
-                subscriptions_format: Vec::new(),
-                control_size: None,
-                colour_report: None,
-            },
-        )))
-        .await;
-    assert!(
-        matches!(response, Response::RefreshClient(_)),
-        "{response:?}"
-    );
+    handler.handle_ok(RefreshClientRequest::fixture(None)).await;
 
     let mut saw_switch = false;
     let mut replayed_tree = None;
@@ -1697,8 +1294,13 @@ async fn choose_tree_identity_guard_fixture(
 ) {
     let handler = RequestHandler::new();
     let session_name = SessionName::new(label).expect("valid session");
-    create_mode_tree_test_session(&handler, &session_name).await;
-    create_mode_tree_test_window(&handler, &session_name, 1).await;
+    handler.create_session(&session_name).await;
+    handler
+        .create_window(NewWindowRequest {
+            target_window_index: Some(1),
+            ..Fixture::fixture(&session_name)
+        })
+        .await;
     let (session_id, window_id, window_occurrence_id) = {
         let mut state = handler.state.lock().await;
         state.ensure_live_window_link_occurrences();
@@ -1719,20 +1321,7 @@ async fn choose_tree_identity_guard_fixture(
     let attach_id = handler
         .register_attach(attach_pid, session_name.clone(), control_tx)
         .await;
-    let parsed = CommandParser::new()
-        .parse_arguments(["choose-tree", "-w"])
-        .expect("choose-tree parses");
-    let command = RequestHandler::parse_mode_tree_queue_command(parsed.commands()[0].clone())
-        .expect("mode-tree command parses")
-        .expect("mode-tree command recognized");
-    handler
-        .execute_queued_mode_tree(
-            attach_pid,
-            command,
-            &QueueExecutionContext::without_caller_cwd(),
-        )
-        .await
-        .expect("choose-tree opens");
+    open_mode_tree(&handler, attach_pid, &["choose-tree", "-w"]).await;
     let action_identity = {
         let active_attach = handler.active_attach.lock().await;
         let active = active_attach
@@ -1765,16 +1354,9 @@ async fn choose_tree_session_switch_resizes_the_target_for_the_attached_client()
     let handler = RequestHandler::new();
     let host = SessionName::new("choose-tree-resize-host").expect("valid session");
     let target = SessionName::new("choose-tree-resize-target").expect("valid session");
-    create_mode_tree_test_session(&handler, &host).await;
-    create_mode_tree_test_session(&handler, &target).await;
-    let target_session_id = handler
-        .state
-        .lock()
-        .await
-        .sessions
-        .session(&target)
-        .expect("target session exists")
-        .id();
+    handler.create_session(&host).await;
+    handler.create_session(&target).await;
+    let target_session_id = handler.session_id_for_test(&target).await;
 
     let attach_pid = std::process::id().saturating_add(654);
     let (control_tx, mut control_rx) = mpsc::unbounded_channel();
@@ -1791,20 +1373,7 @@ async fn choose_tree_session_switch_resizes_the_target_for_the_attached_client()
         .expect("attached client resize succeeds");
     while control_rx.try_recv().is_ok() {}
 
-    let parsed = CommandParser::new()
-        .parse_arguments(["choose-tree", "-s"])
-        .expect("choose-tree parses");
-    let command = RequestHandler::parse_mode_tree_queue_command(parsed.commands()[0].clone())
-        .expect("mode-tree command parses")
-        .expect("mode-tree command recognized");
-    handler
-        .execute_queued_mode_tree(
-            attach_pid,
-            command,
-            &QueueExecutionContext::without_caller_cwd(),
-        )
-        .await
-        .expect("choose-tree opens");
+    open_mode_tree(&handler, attach_pid, &["choose-tree", "-s"]).await;
     let action_identity = {
         let active_attach = handler.active_attach.lock().await;
         let active = active_attach
@@ -1847,14 +1416,7 @@ async fn choose_tree_session_switch_resizes_the_target_for_the_attached_client()
 async fn choose_tree_stale_mode_tree_generation_cannot_select_or_dismiss() {
     let (handler, attach_pid, stale_identity, target, mut control_rx) =
         choose_tree_identity_guard_fixture("choose-tree-stale-host-state", 652).await;
-    let replacement_mode = handler
-        .active_attach
-        .lock()
-        .await
-        .by_pid
-        .get(&attach_pid)
-        .and_then(|active| active.mode_tree.clone())
-        .expect("choose-tree remains active");
+    let replacement_mode = with_mode_tree(&handler, attach_pid, |mode| mode.clone()).await;
     handler
         .store_mode_tree_state(attach_pid, replacement_mode)
         .await
@@ -1959,36 +1521,16 @@ async fn choose_tree_default_switch_rejects_a_reconnected_host_at_the_commit_loc
     let handler = RequestHandler::new();
     let host = SessionName::new("choose-tree-host-generation-alpha").expect("valid session");
     let target = SessionName::new("choose-tree-host-generation-beta").expect("valid session");
-    create_mode_tree_test_session(&handler, &host).await;
-    create_mode_tree_test_session(&handler, &target).await;
-    let target_session_id = handler
-        .state
-        .lock()
-        .await
-        .sessions
-        .session(&target)
-        .expect("target session exists")
-        .id();
+    handler.create_session(&host).await;
+    handler.create_session(&target).await;
+    let target_session_id = handler.session_id_for_test(&target).await;
 
     let attach_pid = std::process::id().saturating_add(651);
     let (old_tx, _old_rx) = mpsc::unbounded_channel();
     let old_attach_id = handler
         .register_attach(attach_pid, host.clone(), old_tx)
         .await;
-    let parsed = CommandParser::new()
-        .parse_arguments(["choose-tree", "-s"])
-        .expect("choose-tree parses");
-    let command = RequestHandler::parse_mode_tree_queue_command(parsed.commands()[0].clone())
-        .expect("mode-tree command parses")
-        .expect("mode-tree command recognized");
-    handler
-        .execute_queued_mode_tree(
-            attach_pid,
-            command,
-            &QueueExecutionContext::without_caller_cwd(),
-        )
-        .await
-        .expect("choose-tree opens");
+    open_mode_tree(&handler, attach_pid, &["choose-tree", "-s"]).await;
     let old_action_identity = {
         let active_attach = handler.active_attach.lock().await;
         let active = active_attach
@@ -2054,38 +1596,16 @@ async fn choose_tree_zw_runs_direct_command_only_on_accept() {
     let attach_pid = std::process::id();
     let alpha = SessionName::new("alpha").expect("valid session");
 
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: alpha.clone(),
-                detached: true,
-                size: Some(TerminalSize { cols: 80, rows: 24 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
+    handler.create_session(&alpha).await;
 
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let _ = handler
-        .register_attach(attach_pid, alpha.clone(), control_tx)
-        .await;
+    let _control_rx = handler.attach_client(attach_pid, &alpha).await;
 
-    let parsed = CommandParser::new()
-        .parse_arguments(["choose-tree", "-Zw", "set-buffer", "-b", "chosen", "%%"])
-        .expect("choose-tree parses");
-    let command = RequestHandler::parse_mode_tree_queue_command(parsed.commands()[0].clone())
-        .expect("mode-tree command parses")
-        .expect("mode-tree command recognized");
-
-    handler
-        .execute_queued_mode_tree(
-            attach_pid,
-            command,
-            &QueueExecutionContext::without_caller_cwd(),
-        )
-        .await
-        .expect("overlay opens");
+    open_mode_tree(
+        &handler,
+        attach_pid,
+        &["choose-tree", "-Zw", "set-buffer", "-b", "chosen", "%%"],
+    )
+    .await;
 
     {
         let state = handler.state.lock().await;
@@ -2113,42 +1633,14 @@ async fn choose_client_from_unattached_request_activates_mode_tree_on_all_attach
     let handler = RequestHandler::new();
     let alpha = SessionName::new("alpha").expect("valid session");
 
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: alpha.clone(),
-                detached: true,
-                size: Some(TerminalSize { cols: 80, rows: 24 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
+    handler.create_session(&alpha).await;
 
-    let (first_tx, mut first_rx) = mpsc::unbounded_channel();
-    let (second_tx, mut second_rx) = mpsc::unbounded_channel();
     let first_pid = std::process::id();
     let second_pid = first_pid.saturating_add(1);
-    let _ = handler
-        .register_attach(first_pid, alpha.clone(), first_tx)
-        .await;
-    let _ = handler.register_attach(second_pid, alpha, second_tx).await;
+    let mut first_rx = handler.attach_client(first_pid, &alpha).await;
+    let mut second_rx = handler.attach_client(second_pid, alpha).await;
 
-    let parsed = CommandParser::new()
-        .parse_arguments(["choose-client"])
-        .expect("choose-client parses");
-    let command = RequestHandler::parse_mode_tree_queue_command(parsed.commands()[0].clone())
-        .expect("mode-tree command parses")
-        .expect("mode-tree command recognized");
-
-    handler
-        .execute_queued_mode_tree(
-            first_pid.saturating_add(10),
-            command,
-            &QueueExecutionContext::without_caller_cwd(),
-        )
-        .await
-        .expect("overlay opens");
+    open_mode_tree(&handler, first_pid.saturating_add(10), &["choose-client"]).await;
 
     let active_attach = handler.active_attach.lock().await;
     assert!(active_attach
@@ -2207,49 +1699,20 @@ async fn mode_tree_commands_without_attached_client_mark_target_pane_mode() {
     ] {
         let handler = RequestHandler::new();
         let alpha = SessionName::new("alpha").expect("valid session");
-        assert!(matches!(
-            handler
-                .handle(Request::NewSession(NewSessionRequest {
-                    session_name: alpha.clone(),
-                    detached: true,
-                    size: Some(TerminalSize { cols: 80, rows: 24 }),
-                    environment: None,
-                }))
-                .await,
-            Response::NewSession(_)
-        ));
+        handler.create_session(&alpha).await;
 
         if needs_buffer {
-            assert!(matches!(
-                handler
-                    .handle(Request::SetBuffer(Box::new(rmux_proto::SetBufferRequest {
-                        name: Some("buf".to_owned()),
-                        content: b"hello".to_vec(),
-                        append: false,
-                        new_name: None,
-                        set_clipboard: false,
-                        target_client: None,
-                    })))
-                    .await,
-                Response::SetBuffer(_)
-            ));
+            handler
+                .handle_ok(SetBufferRequest::fixture(("buf", b"hello".to_vec())))
+                .await;
         }
 
-        let parsed = CommandParser::new()
-            .parse_arguments(command.split_whitespace())
-            .expect("mode command parses");
-        let command = RequestHandler::parse_mode_tree_queue_command(parsed.commands()[0].clone())
-            .expect("mode-tree command parses")
-            .expect("mode-tree command recognized");
-
-        handler
-            .execute_queued_mode_tree(
-                std::process::id().saturating_add(10),
-                command,
-                &QueueExecutionContext::without_caller_cwd(),
-            )
-            .await
-            .expect("detached mode command succeeds");
+        open_mode_tree(
+            &handler,
+            std::process::id().saturating_add(10),
+            &command.split_whitespace().collect::<Vec<_>>(),
+        )
+        .await;
 
         let target = rmux_proto::PaneTarget::with_window(alpha, 0, 0);
         let state = handler.state.lock().await;
@@ -2267,17 +1730,9 @@ async fn mode_tree_temporarily_hides_modal_scrollbar_and_restores_copy_mode_geom
     let handler = RequestHandler::new();
     let alpha = SessionName::new("mode-tree-modal-stack").expect("valid session");
     let target = rmux_proto::PaneTarget::with_window(alpha.clone(), 0, 0);
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: alpha.clone(),
-                detached: true,
-                size: Some(TerminalSize { cols: 20, rows: 8 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
+    handler
+        .create_session((&alpha, TerminalSize::new(20, 8)))
+        .await;
     for (scope, option, value) in [
         (
             ScopeSelector::Session(alpha.clone()),
@@ -2295,56 +1750,23 @@ async fn mode_tree_temporarily_hides_modal_scrollbar_and_restores_copy_mode_geom
             "width=2,pad=1",
         ),
     ] {
-        assert!(matches!(
-            handler
-                .handle(Request::SetOption(SetOptionRequest {
-                    scope,
-                    option,
-                    value: value.to_owned(),
-                    mode: SetOptionMode::Replace,
-                }))
-                .await,
-            Response::SetOption(_)
-        ));
+        handler.set_option(scope, option, value).await;
     }
-    assert!(matches!(
-        handler
-            .handle(Request::CopyMode(rmux_proto::CopyModeRequest {
-                target: Some(target.clone()),
-                page_down: false,
-                exit_on_scroll: false,
-                hide_position: false,
-                mouse_drag_start: false,
-                cancel_mode: false,
-                scrollbar_scroll: false,
-                source: None,
-                page_up: false,
-            }))
-            .await,
-        Response::CopyMode(_)
-    ));
+    handler.handle_ok(CopyModeRequest::fixture(&target)).await;
 
-    assert_eq!(mode_tree_test_pane_cols(&handler, &alpha).await, 17);
+    assert_eq!(handler.pane_terminal_size_for_test(&target).await.cols, 17);
 
-    let parsed = CommandParser::new()
-        .parse_arguments(["choose-tree", "-t", "mode-tree-modal-stack:0.0"])
-        .expect("choose-tree parses");
-    let command = RequestHandler::parse_mode_tree_queue_command(parsed.commands()[0].clone())
-        .expect("mode-tree command parses")
-        .expect("mode-tree command recognized");
-    handler
-        .execute_queued_mode_tree(
-            std::process::id().saturating_add(11),
-            command,
-            &QueueExecutionContext::without_caller_cwd(),
-        )
-        .await
-        .expect("detached choose-tree opens");
+    open_mode_tree(
+        &handler,
+        std::process::id().saturating_add(11),
+        &["choose-tree", "-t", "mode-tree-modal-stack:0.0"],
+    )
+    .await;
 
     // Oracle tmux 3.7b: mode-tree becomes the top mode, hides the modal
     // scrollbar and expands the PTY; dismissing it restores copy-mode and the
     // scrollbar reservation.
-    assert_eq!(mode_tree_test_pane_cols(&handler, &alpha).await, 20);
+    assert_eq!(handler.pane_terminal_size_for_test(&target).await.cols, 20);
     assert_eq!(
         handler
             .state
@@ -2362,7 +1784,7 @@ async fn mode_tree_temporarily_hides_modal_scrollbar_and_restores_copy_mode_geom
         .clear_mode_tree_for_target(&target)
         .await
         .expect("mode-tree clears"));
-    assert_eq!(mode_tree_test_pane_cols(&handler, &alpha).await, 17);
+    assert_eq!(handler.pane_terminal_size_for_test(&target).await.cols, 17);
     let state = handler.state.lock().await;
     assert!(state
         .pane_copy_mode_summary(&alpha, rmux_core::PaneId::new(0))
@@ -2375,36 +1797,11 @@ async fn choose_tree_zw_defers_parse_errors_until_accept() {
     let attach_pid = std::process::id();
     let alpha = SessionName::new("alpha").expect("valid session");
 
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: alpha.clone(),
-                detached: true,
-                size: Some(TerminalSize { cols: 80, rows: 24 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
+    handler.create_session(&alpha).await;
 
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let _ = handler.register_attach(attach_pid, alpha, control_tx).await;
+    let _control_rx = handler.attach_client(attach_pid, alpha).await;
 
-    let parsed = CommandParser::new()
-        .parse_arguments(["choose-tree", "-Zw", "{"])
-        .expect("choose-tree parses");
-    let command = RequestHandler::parse_mode_tree_queue_command(parsed.commands()[0].clone())
-        .expect("mode-tree command parses")
-        .expect("mode-tree command recognized");
-
-    handler
-        .execute_queued_mode_tree(
-            attach_pid,
-            command,
-            &QueueExecutionContext::without_caller_cwd(),
-        )
-        .await
-        .expect("overlay opens despite invalid direct command");
+    open_mode_tree(&handler, attach_pid, &["choose-tree", "-Zw", "{"]).await;
 
     let err = handler
         .accept_mode_tree_selection(attach_pid)
@@ -2440,7 +1837,7 @@ async fn mode_tree_navigation_rejects_a_same_pid_replacement_tree() {
     let replacement_attach_id = handler
         .register_attach(attach_pid, session_name, replacement_tx)
         .await;
-    open_choose_buffer(&handler, attach_pid).await;
+    open_mode_tree(&handler, attach_pid, &["choose-buffer"]).await;
     let (replacement_state_id, replacement_selection) = {
         let active_attach = handler.active_attach.lock().await;
         let replacement = &active_attach.by_pid[&attach_pid];
@@ -2485,7 +1882,7 @@ async fn mode_tree_prompt_callback_rejects_a_same_pid_replacement_tree() {
     let replacement_attach_id = handler
         .register_attach(attach_pid, session_name, replacement_tx)
         .await;
-    open_choose_buffer(&handler, attach_pid).await;
+    open_mode_tree(&handler, attach_pid, &["choose-buffer"]).await;
     let replacement_state_id =
         handler.active_attach.lock().await.by_pid[&attach_pid].mode_tree_state_id;
 
@@ -2517,24 +1914,17 @@ async fn customize_unset_revalidates_requester_at_option_mutation_lock() {
 
     let handler = RequestHandler::new();
     let session_name = SessionName::new("customize-option-requester-aba").expect("valid session");
-    create_mode_tree_test_session(&handler, &session_name).await;
-    assert!(matches!(
-        handler
-            .handle(Request::SetOption(SetOptionRequest {
-                scope: ScopeSelector::Session(session_name.clone()),
-                option: OptionName::Status,
-                value: "off".to_owned(),
-                mode: SetOptionMode::Replace,
-            }))
-            .await,
-        Response::SetOption(_)
-    ));
-    let attach_pid = std::process::id().saturating_add(907);
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
+    handler.create_session(&session_name).await;
     handler
-        .register_attach(attach_pid, session_name.clone(), control_tx)
+        .set_option(
+            ScopeSelector::Session(session_name.clone()),
+            OptionName::Status,
+            "off",
+        )
         .await;
-    open_customize_mode(&handler, attach_pid).await;
+    let attach_pid = std::process::id().saturating_add(907);
+    let _control_rx = handler.attach_client(attach_pid, &session_name).await;
+    open_mode_tree(&handler, attach_pid, &["customize-mode"]).await;
     let identity = handler
         .current_mode_tree_action_identity(attach_pid)
         .await
@@ -2562,15 +1952,10 @@ async fn customize_unset_revalidates_requester_at_option_mutation_lock() {
             .map(|item| item.id.clone())
             .expect("session status option is listed")
     };
-    handler
-        .active_attach
-        .lock()
-        .await
-        .by_pid
-        .get_mut(&attach_pid)
-        .and_then(|active| active.mode_tree.as_mut())
-        .expect("customize tree remains active")
-        .selected_id = Some(selected_id);
+    with_mode_tree(&handler, attach_pid, |mode| {
+        mode.selected_id = Some(selected_id)
+    })
+    .await;
 
     let pause = install_mode_tree_identity_pause(ModeTreeIdentityPausePoint::Mutation(attach_pid));
     let action_handler = handler.clone();
@@ -2583,11 +1968,8 @@ async fn customize_unset_revalidates_requester_at_option_mutation_lock() {
         .await
         .expect("customize unset reaches its final identity check");
 
-    let (replacement_tx, _replacement_rx) = mpsc::unbounded_channel();
-    handler
-        .register_attach(attach_pid, session_name.clone(), replacement_tx)
-        .await;
-    open_customize_mode(&handler, attach_pid).await;
+    let _replacement_rx = handler.attach_client(attach_pid, &session_name).await;
+    open_mode_tree(&handler, attach_pid, &["customize-mode"]).await;
     pause.release.notify_one();
 
     assert!(
@@ -2610,23 +1992,17 @@ async fn customize_unset_revalidates_requester_at_option_mutation_lock() {
 async fn customize_key_mutations_reject_a_replaced_requester() {
     let handler = RequestHandler::new();
     let session_name = SessionName::new("customize-key-requester-aba").expect("valid session");
-    create_mode_tree_test_session(&handler, &session_name).await;
+    handler.create_session(&session_name).await;
     let attach_pid = std::process::id().saturating_add(908);
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    handler
-        .register_attach(attach_pid, session_name.clone(), control_tx)
-        .await;
-    open_customize_mode(&handler, attach_pid).await;
+    let _control_rx = handler.attach_client(attach_pid, &session_name).await;
+    open_mode_tree(&handler, attach_pid, &["customize-mode"]).await;
     let stale_identity = handler
         .current_mode_tree_action_identity(attach_pid)
         .await
         .expect("original customize identity");
 
-    let (replacement_tx, _replacement_rx) = mpsc::unbounded_channel();
-    handler
-        .register_attach(attach_pid, session_name, replacement_tx)
-        .await;
-    open_customize_mode(&handler, attach_pid).await;
+    let _replacement_rx = handler.attach_client(attach_pid, session_name).await;
+    open_mode_tree(&handler, attach_pid, &["customize-mode"]).await;
 
     let bind = handler
         .handle_bind_key_for_mode_tree(
@@ -2716,11 +2092,8 @@ async fn confirmed_mode_tree_action_rejects_a_same_pid_replacement() {
         .await
         .expect("deferred action reaches its identity commit");
 
-    let (replacement_tx, _replacement_rx) = mpsc::unbounded_channel();
-    handler
-        .register_attach(attach_pid, session_name, replacement_tx)
-        .await;
-    open_choose_buffer(&handler, attach_pid).await;
+    let _replacement_rx = handler.attach_client(attach_pid, session_name).await;
+    open_mode_tree(&handler, attach_pid, &["choose-buffer"]).await;
     pause.release.notify_one();
 
     assert!(
@@ -2743,19 +2116,7 @@ async fn mode_tree_dismisses_after_host_respawn_and_restores_zoom() {
         zoomed_choose_tree_fixture(label, 904).await;
     let target = PaneTarget::with_window(session_name.clone(), 0, 1);
 
-    let response = handler
-        .handle(Request::RespawnPane(Box::new(
-            rmux_proto::RespawnPaneRequest {
-                target,
-                kill: true,
-                start_directory: None,
-                environment: None,
-                command: None,
-                process_command: None,
-            },
-        )))
-        .await;
-    assert!(matches!(response, Response::RespawnPane(_)), "{response:?}");
+    handler.handle_ok(RespawnPaneRequest::fixture(target)).await;
 
     assert!(handler
         .handle_mode_tree_key_event(attach_pid, PromptInputEvent::Char('q'))
@@ -2796,14 +2157,10 @@ async fn mode_tree_dismisses_after_host_relink_and_restores_zoom() {
             .expect("host window exists")
             .id();
         state
-            .link_window(rmux_proto::LinkWindowRequest {
-                source: rmux_proto::WindowTarget::with_window(session_name.clone(), 0),
-                target: rmux_proto::WindowTarget::with_window(session_name.clone(), 2),
-                after: false,
-                before: false,
-                kill_destination: false,
-                detached: true,
-            })
+            .link_window(LinkWindowRequest::fixture((
+                WindowTarget::with_window(session_name.clone(), 0),
+                WindowTarget::with_window(session_name.clone(), 2),
+            )))
             .expect("host window links");
         state
             .unlink_window(
@@ -2812,14 +2169,10 @@ async fn mode_tree_dismisses_after_host_relink_and_restores_zoom() {
             )
             .expect("old host occurrence unlinks");
         state
-            .link_window(rmux_proto::LinkWindowRequest {
-                source: rmux_proto::WindowTarget::with_window(session_name.clone(), 2),
-                target: rmux_proto::WindowTarget::with_window(session_name.clone(), 0),
-                after: false,
-                before: false,
-                kill_destination: false,
-                detached: true,
-            })
+            .link_window(LinkWindowRequest::fixture((
+                WindowTarget::with_window(session_name.clone(), 2),
+                WindowTarget::with_window(session_name.clone(), 0),
+            )))
             .expect("replacement host occurrence links");
         window_id
     };
@@ -2887,8 +2240,13 @@ async fn moved_mode_tree_host_fixture(
     let (handler, source, attach_pid, mut control_rx) =
         zoomed_choose_tree_fixture(label, attach_pid_offset).await;
     let destination = SessionName::new(format!("{label}-destination")).expect("valid session");
-    create_mode_tree_test_window(&handler, &source, 1).await;
-    create_mode_tree_test_session(&handler, &destination).await;
+    handler
+        .create_window(NewWindowRequest {
+            target_window_index: Some(1),
+            ..Fixture::fixture(&source)
+        })
+        .await;
+    handler.create_session(&destination).await;
     let (moved_window_id, moved_pane_id) = {
         let state = handler.state.lock().await;
         let window = state
@@ -2902,21 +2260,12 @@ async fn moved_mode_tree_host_fixture(
         )
     };
 
-    let response = handler
-        .handle(Request::MoveWindow(rmux_proto::MoveWindowRequest {
-            source: Some(rmux_proto::WindowTarget::with_window(source.clone(), 0)),
-            target: rmux_proto::MoveWindowTarget::Window(rmux_proto::WindowTarget::with_window(
-                destination.clone(),
-                1,
-            )),
-            renumber: false,
-            kill_destination: false,
-            detached: true,
-            after: false,
-            before: false,
-        }))
+    handler
+        .handle_ok(MoveWindowRequest::fixture((
+            WindowTarget::with_window(source.clone(), 0),
+            WindowTarget::with_window(destination.clone(), 1),
+        )))
         .await;
-    assert!(matches!(response, Response::MoveWindow(_)), "{response:?}");
     let moved_target = {
         let state = handler.state.lock().await;
         let window = state
@@ -2990,24 +2339,21 @@ async fn mode_tree_dismisses_after_host_window_moves_between_sessions() {
 #[tokio::test]
 async fn mode_tree_moved_host_cleanup_does_not_mutate_a_recreated_source_slot() {
     let mut fixture = moved_mode_tree_host_fixture("mode-tree-moved-host-aba", 909).await;
-    create_mode_tree_test_window(&fixture.handler, &fixture.source, 0).await;
+    fixture
+        .handler
+        .create_window(NewWindowRequest {
+            target_window_index: Some(0),
+            ..Fixture::fixture(&fixture.source)
+        })
+        .await;
     drain_moved_mode_tree_controls(&mut fixture);
-    assert!(matches!(
-        fixture
-            .handler
-            .handle(Request::SplitWindow(SplitWindowRequest {
-                target: SplitWindowTarget::Pane(PaneTarget::with_window(
-                    fixture.source.clone(),
-                    0,
-                    0,
-                )),
-                direction: SplitDirection::Horizontal,
-                before: false,
-                environment: None,
-            }))
-            .await,
-        Response::SplitWindow(_)
-    ));
+    fixture
+        .handler
+        .handle_ok(SplitWindowRequest {
+            direction: SplitDirection::Horizontal,
+            ..Fixture::fixture(PaneTarget::with_window(fixture.source.clone(), 0, 0))
+        })
+        .await;
     drain_moved_mode_tree_controls(&mut fixture);
     let replacement_target = PaneTarget::with_window(fixture.source.clone(), 0, 1);
     let replacement_window_id = fixture
@@ -3021,16 +2367,13 @@ async fn mode_tree_moved_host_cleanup_does_not_mutate_a_recreated_source_slot() 
         .expect("replacement source window exists")
         .id();
     assert_ne!(replacement_window_id, fixture.moved_window_id);
-    assert!(matches!(
-        fixture
-            .handler
-            .handle(Request::ResizePane(rmux_proto::ResizePaneRequest {
-                target: replacement_target,
-                adjustment: rmux_proto::ResizePaneAdjustment::Zoom,
-            }))
-            .await,
-        Response::ResizePane(_)
-    ));
+    fixture
+        .handler
+        .handle_ok(ResizePaneRequest {
+            target: replacement_target,
+            adjustment: rmux_proto::ResizePaneAdjustment::Zoom,
+        })
+        .await;
     drain_moved_mode_tree_controls(&mut fixture);
 
     assert!(fixture
@@ -3067,17 +2410,13 @@ async fn mode_tree_dismisses_after_host_pane_renumber_without_rezooming() {
     let label = "mode-tree-renumbered-host-pane";
     let (handler, session_name, attach_pid, _control_rx) =
         zoomed_choose_tree_fixture(label, 907).await;
-    let response = handler
-        .handle(Request::RotateWindow(rmux_proto::RotateWindowRequest {
-            target: rmux_proto::WindowTarget::with_window(session_name.clone(), 0),
+    handler
+        .handle_ok(RotateWindowRequest {
+            target: WindowTarget::with_window(session_name.clone(), 0),
             direction: rmux_proto::RotateWindowDirection::Down,
             restore_zoom: false,
-        }))
+        })
         .await;
-    assert!(
-        matches!(response, Response::RotateWindow(_)),
-        "{response:?}"
-    );
 
     assert!(handler
         .handle_mode_tree_key_event(attach_pid, PromptInputEvent::Escape)
@@ -3113,18 +2452,10 @@ async fn mode_tree_activation_rejects_a_same_pid_replacement_without_zoom_leak()
     let handler = RequestHandler::new();
     let session_name =
         SessionName::new("mode-tree-activation-attach-identity").expect("valid session");
-    create_mode_tree_test_session(&handler, &session_name).await;
+    handler.create_session(&session_name).await;
     let attach_pid = std::process::id().saturating_add(905);
-    let (old_tx, _old_rx) = mpsc::unbounded_channel();
-    handler
-        .register_attach(attach_pid, session_name.clone(), old_tx)
-        .await;
-    let parsed = CommandParser::new()
-        .parse_arguments(["choose-tree", "-Z"])
-        .expect("choose-tree -Z parses");
-    let command = RequestHandler::parse_mode_tree_queue_command(parsed.commands()[0].clone())
-        .expect("mode-tree command parses")
-        .expect("mode-tree command recognized");
+    let _old_rx = handler.attach_client(attach_pid, &session_name).await;
+    let command = parse_mode_tree(&["choose-tree", "-Z"]);
     let pause =
         install_mode_tree_identity_pause(ModeTreeIdentityPausePoint::Activation(attach_pid));
     let opening_handler = handler.clone();

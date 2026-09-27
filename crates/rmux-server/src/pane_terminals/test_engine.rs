@@ -193,9 +193,9 @@ pub(super) fn open(
             rows: ROWS,
             cols: COLS,
         },
-        filesystem,
         runtime.clone(),
         root.join("rmux.sock"),
+        |profile, frontend| marsh_core::test_support::mux(profile, frontend, filesystem),
     )
     .ok()?;
     // Both directions, before the consumer starts. Selection is the facade's own state now, so a

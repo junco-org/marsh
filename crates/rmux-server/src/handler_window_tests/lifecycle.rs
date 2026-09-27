@@ -1,30 +1,68 @@
 use super::*;
 
+/// Kills window `index` of `session` alone and answers with the window left active.
+pub(super) async fn kill_window(
+    handler: &RequestHandler,
+    session: &SessionName,
+    index: u32,
+) -> WindowTarget {
+    handler
+        .handle_ok(KillWindowRequest::fixture(WindowTarget::with_window(
+            session.clone(),
+            index,
+        )))
+        .await
+        .target
+}
+
+/// Groups beta with alpha and delta with gamma, links `alpha:0` into `gamma:1`, renames window 0
+/// of `renamed` to `name`, and asserts that every slot of the linked window carries `name`.
+async fn assert_linked_family_rename(renamed: &str, name: &str) {
+    let handler = RequestHandler::new();
+    let alpha = create_session(&handler, "alpha").await;
+    let beta = create_grouped_session(&handler, "beta", &alpha).await;
+    let gamma = create_session(&handler, "gamma").await;
+    let delta = create_grouped_session(&handler, "delta", &gamma).await;
+
+    handler
+        .handle_ok(LinkWindowRequest {
+            detached: false,
+            ..Fixture::fixture((
+                WindowTarget::with_window(alpha.clone(), 0),
+                WindowTarget::with_window(gamma.clone(), 1),
+            ))
+        })
+        .await;
+    handler
+        .handle_ok(RenameWindowRequest {
+            target: WindowTarget::with_window(session_name(renamed), 0),
+            name: name.to_owned(),
+        })
+        .await;
+
+    let state = handler.state.lock().await;
+    for (session_name, window_index) in [(&alpha, 0), (&beta, 0), (&gamma, 1), (&delta, 1)] {
+        let window = state
+            .sessions
+            .session(session_name)
+            .and_then(|session| session.window_at(window_index))
+            .expect("linked window should exist");
+        assert_eq!(
+            window.name(),
+            Some(name),
+            "{session_name}:{window_index} should reflect linked rename"
+        );
+    }
+}
+
 #[tokio::test]
 async fn new_window_detached_leaves_the_active_window_unchanged() {
     let handler = RequestHandler::new();
-    let alpha = session_name("alpha");
-    create_session(&handler, "alpha").await;
-
-    let response = handler
-        .handle(Request::NewWindow(Box::new(NewWindowRequest {
-            target: alpha.clone(),
-            name: None,
-            detached: true,
-            start_directory: None,
-            environment: None,
-            command: None,
-            process_command: None,
-            target_window_index: None,
-            insert_at_target: false,
-        })))
-        .await;
+    let alpha = create_session(&handler, "alpha").await;
 
     assert_eq!(
-        response,
-        Response::NewWindow(rmux_proto::NewWindowResponse {
-            target: WindowTarget::with_window(alpha.clone(), 1),
-        })
+        handler.create_window(&alpha).await,
+        WindowTarget::with_window(alpha.clone(), 1)
     );
 
     let state = handler.state.lock().await;
@@ -43,27 +81,17 @@ async fn new_window_detached_leaves_the_active_window_unchanged() {
 #[tokio::test]
 async fn kill_window_removes_latest_client_state_for_removed_window() {
     let handler = RequestHandler::new();
-    let alpha = session_name("latest-kill-window");
     let requester_pid = std::process::id();
-    create_session(&handler, "latest-kill-window").await;
+    let alpha = create_session(&handler, "latest-kill-window").await;
     insert_window(&handler, &alpha, 1).await;
 
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
+    let _control_rx = handler.attach_client(requester_pid, &alpha).await;
     {
         let mut active_attach = handler.active_attach.lock().await;
         active_attach.seed_active_client_for_window(requester_pid, &alpha, 1);
     }
 
-    let response = handler
-        .handle(Request::KillWindow(KillWindowRequest {
-            target: WindowTarget::with_window(alpha.clone(), 1),
-            kill_all_others: false,
-        }))
-        .await;
-    assert!(matches!(response, Response::KillWindow(_)), "{response:?}");
+    kill_window(&handler, &alpha, 1).await;
 
     let active_attach = handler.active_attach.lock().await;
     let windows = active_attach
@@ -77,29 +105,16 @@ async fn kill_window_removes_latest_client_state_for_removed_window() {
 #[tokio::test]
 async fn named_new_window_disables_automatic_rename_option() {
     let handler = RequestHandler::new();
-    let alpha = session_name("alpha-named-new-window");
-    create_session(&handler, "alpha-named-new-window").await;
+    let alpha = create_session(&handler, "alpha-named-new-window").await;
 
-    let response = handler
-        .handle(Request::NewWindow(Box::new(NewWindowRequest {
-            target: alpha.clone(),
+    let window = handler
+        .create_window(NewWindowRequest {
             name: Some("logs".to_owned()),
-            detached: true,
-            start_directory: None,
-            environment: None,
-            command: None,
-            process_command: None,
             target_window_index: Some(1),
-            insert_at_target: false,
-        })))
-        .await;
-
-    assert_eq!(
-        response,
-        Response::NewWindow(rmux_proto::NewWindowResponse {
-            target: WindowTarget::with_window(alpha.clone(), 1),
+            ..Fixture::fixture(&alpha)
         })
-    );
+        .await;
+    assert_eq!(window, WindowTarget::with_window(alpha.clone(), 1));
 
     let state = handler.state.lock().await;
     assert_eq!(
@@ -113,22 +128,15 @@ async fn named_new_window_disables_automatic_rename_option() {
 #[tokio::test]
 async fn select_window_updates_last_window_tracking() {
     let handler = RequestHandler::new();
-    let alpha = session_name("alpha");
-    create_session(&handler, "alpha").await;
+    let alpha = create_session(&handler, "alpha").await;
     insert_window(&handler, &alpha, 1).await;
 
-    let response = handler
-        .handle(Request::SelectWindow(SelectWindowRequest {
-            target: WindowTarget::with_window(alpha.clone(), 1),
-        }))
-        .await;
-
-    assert_eq!(
-        response,
-        Response::SelectWindow(rmux_proto::SelectWindowResponse {
+    let selected = handler
+        .handle_ok(SelectWindowRequest {
             target: WindowTarget::with_window(alpha.clone(), 1),
         })
-    );
+        .await;
+    assert_eq!(selected.target, WindowTarget::with_window(alpha.clone(), 1));
 
     let state = handler.state.lock().await;
     let session = state
@@ -142,23 +150,16 @@ async fn select_window_updates_last_window_tracking() {
 #[tokio::test]
 async fn rename_window_persists_the_name_and_disables_automatic_rename() {
     let handler = RequestHandler::new();
-    let alpha = session_name("alpha");
-    create_session(&handler, "alpha").await;
+    let alpha = create_session(&handler, "alpha").await;
     insert_window(&handler, &alpha, 1).await;
 
-    let response = handler
-        .handle(Request::RenameWindow(RenameWindowRequest {
+    let renamed = handler
+        .handle_ok(RenameWindowRequest {
             target: WindowTarget::with_window(alpha.clone(), 1),
             name: "logs".to_owned(),
-        }))
-        .await;
-
-    assert_eq!(
-        response,
-        Response::RenameWindow(rmux_proto::RenameWindowResponse {
-            target: WindowTarget::with_window(alpha.clone(), 1),
         })
-    );
+        .await;
+    assert_eq!(renamed.target, WindowTarget::with_window(alpha.clone(), 1));
 
     let state = handler.state.lock().await;
     let window = state
@@ -179,115 +180,18 @@ async fn rename_window_persists_the_name_and_disables_automatic_rename() {
 
 #[tokio::test]
 async fn rename_window_propagates_linked_slots_to_their_session_group_peers() {
-    let handler = RequestHandler::new();
-    let alpha = session_name("alpha");
-    let beta = session_name("beta");
-    let gamma = session_name("gamma");
-    let delta = session_name("delta");
-    create_session(&handler, "alpha").await;
-    create_grouped_session(&handler, "beta", &alpha).await;
-    create_session(&handler, "gamma").await;
-    create_grouped_session(&handler, "delta", &gamma).await;
-
-    let link = handler
-        .handle(Request::LinkWindow(LinkWindowRequest {
-            source: WindowTarget::with_window(alpha.clone(), 0),
-            target: WindowTarget::with_window(gamma.clone(), 1),
-            after: false,
-            before: false,
-            kill_destination: false,
-            detached: false,
-        }))
-        .await;
-    assert!(
-        matches!(link, Response::LinkWindow(_)),
-        "expected link-window success, got {link:?}"
-    );
-
-    let response = handler
-        .handle(Request::RenameWindow(RenameWindowRequest {
-            target: WindowTarget::with_window(alpha.clone(), 0),
-            name: "newname".to_owned(),
-        }))
-        .await;
-    assert!(
-        matches!(response, Response::RenameWindow(_)),
-        "expected rename-window success, got {response:?}"
-    );
-
-    let state = handler.state.lock().await;
-    for (session_name, window_index) in [(&alpha, 0), (&beta, 0), (&gamma, 1), (&delta, 1)] {
-        let window = state
-            .sessions
-            .session(session_name)
-            .and_then(|session| session.window_at(window_index))
-            .expect("linked window should exist");
-        assert_eq!(
-            window.name(),
-            Some("newname"),
-            "{session_name}:{window_index} should reflect linked rename"
-        );
-    }
+    assert_linked_family_rename("alpha", "newname").await;
 }
 
 #[tokio::test]
 async fn rename_window_from_session_group_peer_propagates_linked_family() {
-    let handler = RequestHandler::new();
-    let alpha = session_name("alpha");
-    let beta = session_name("beta");
-    let gamma = session_name("gamma");
-    let delta = session_name("delta");
-    create_session(&handler, "alpha").await;
-    create_grouped_session(&handler, "beta", &alpha).await;
-    create_session(&handler, "gamma").await;
-    create_grouped_session(&handler, "delta", &gamma).await;
-
-    let link = handler
-        .handle(Request::LinkWindow(LinkWindowRequest {
-            source: WindowTarget::with_window(alpha.clone(), 0),
-            target: WindowTarget::with_window(gamma.clone(), 1),
-            after: false,
-            before: false,
-            kill_destination: false,
-            detached: false,
-        }))
-        .await;
-    assert!(
-        matches!(link, Response::LinkWindow(_)),
-        "expected link-window success, got {link:?}"
-    );
-
-    let response = handler
-        .handle(Request::RenameWindow(RenameWindowRequest {
-            target: WindowTarget::with_window(beta.clone(), 0),
-            name: "peername".to_owned(),
-        }))
-        .await;
-    assert!(
-        matches!(response, Response::RenameWindow(_)),
-        "expected rename-window success, got {response:?}"
-    );
-
-    let state = handler.state.lock().await;
-    for (session_name, window_index) in [(&alpha, 0), (&beta, 0), (&gamma, 1), (&delta, 1)] {
-        let window = state
-            .sessions
-            .session(session_name)
-            .and_then(|session| session.window_at(window_index))
-            .expect("linked window should exist");
-        assert_eq!(
-            window.name(),
-            Some("peername"),
-            "{session_name}:{window_index} should reflect linked rename"
-        );
-    }
+    assert_linked_family_rename("beta", "peername").await;
 }
 
 #[tokio::test]
 async fn kill_window_prefers_last_window_as_the_active_fallback() {
     let handler = RequestHandler::new();
-    let alpha = session_name("alpha");
-    create_session(&handler, "alpha").await;
+    let alpha = create_session(&handler, "alpha").await;
     insert_window(&handler, &alpha, 1).await;
     insert_window(&handler, &alpha, 2).await;
 
@@ -329,18 +233,9 @@ async fn kill_window_prefers_last_window_as_the_active_fallback() {
         Some(9)
     );
 
-    let response = handler
-        .handle(Request::KillWindow(KillWindowRequest {
-            target: WindowTarget::with_window(alpha.clone(), 1),
-            kill_all_others: false,
-        }))
-        .await;
-
     assert_eq!(
-        response,
-        Response::KillWindow(rmux_proto::KillWindowResponse {
-            target: WindowTarget::with_window(alpha.clone(), 2),
-        })
+        kill_window(&handler, &alpha, 1).await,
+        WindowTarget::with_window(alpha.clone(), 2)
     );
 
     let state = handler.state.lock().await;
@@ -368,8 +263,7 @@ async fn kill_window_prefers_last_window_as_the_active_fallback() {
 #[tokio::test]
 async fn kill_window_falls_back_to_previous_then_next_when_needed() {
     let handler = RequestHandler::new();
-    let alpha = session_name("alpha");
-    create_session(&handler, "alpha").await;
+    let alpha = create_session(&handler, "alpha").await;
     insert_window(&handler, &alpha, 1).await;
     insert_window(&handler, &alpha, 2).await;
 
@@ -384,27 +278,12 @@ async fn kill_window_falls_back_to_previous_then_next_when_needed() {
     }
 
     assert_eq!(
-        handler
-            .handle(Request::KillWindow(KillWindowRequest {
-                target: WindowTarget::with_window(alpha.clone(), 0),
-                kill_all_others: false,
-            }))
-            .await,
-        Response::KillWindow(rmux_proto::KillWindowResponse {
-            target: WindowTarget::with_window(alpha.clone(), 2),
-        })
+        kill_window(&handler, &alpha, 0).await,
+        WindowTarget::with_window(alpha.clone(), 2)
     );
-
     assert_eq!(
-        handler
-            .handle(Request::KillWindow(KillWindowRequest {
-                target: WindowTarget::with_window(alpha.clone(), 2),
-                kill_all_others: false,
-            }))
-            .await,
-        Response::KillWindow(rmux_proto::KillWindowResponse {
-            target: WindowTarget::with_window(alpha.clone(), 1),
-        })
+        kill_window(&handler, &alpha, 2).await,
+        WindowTarget::with_window(alpha.clone(), 1)
     );
 
     insert_window(&handler, &alpha, 2).await;
@@ -420,57 +299,33 @@ async fn kill_window_falls_back_to_previous_then_next_when_needed() {
     }
 
     assert_eq!(
-        handler
-            .handle(Request::KillWindow(KillWindowRequest {
-                target: WindowTarget::with_window(alpha.clone(), 1),
-                kill_all_others: false,
-            }))
-            .await,
-        Response::KillWindow(rmux_proto::KillWindowResponse {
-            target: WindowTarget::with_window(alpha.clone(), 2),
-        })
+        kill_window(&handler, &alpha, 1).await,
+        WindowTarget::with_window(alpha.clone(), 2)
     );
 
-    let beta = session_name("beta");
-    create_session(&handler, "beta").await;
+    let beta = create_session(&handler, "beta").await;
     insert_window(&handler, &beta, 2).await;
 
-    let response = handler
-        .handle(Request::KillWindow(KillWindowRequest {
-            target: WindowTarget::with_window(beta.clone(), 0),
-            kill_all_others: false,
-        }))
-        .await;
-
     assert_eq!(
-        response,
-        Response::KillWindow(rmux_proto::KillWindowResponse {
-            target: WindowTarget::with_window(beta.clone(), 2),
-        })
+        kill_window(&handler, &beta, 0).await,
+        WindowTarget::with_window(beta.clone(), 2)
     );
 }
 
 #[tokio::test]
 async fn kill_window_all_others_leaves_only_the_target_window() {
     let handler = RequestHandler::new();
-    let alpha = session_name("alpha");
-    create_session(&handler, "alpha").await;
+    let alpha = create_session(&handler, "alpha").await;
     insert_window(&handler, &alpha, 1).await;
     insert_window(&handler, &alpha, 2).await;
 
-    let response = handler
-        .handle(Request::KillWindow(KillWindowRequest {
+    let killed = handler
+        .handle_ok(KillWindowRequest {
             target: WindowTarget::with_window(alpha.clone(), 1),
             kill_all_others: true,
-        }))
-        .await;
-
-    assert_eq!(
-        response,
-        Response::KillWindow(rmux_proto::KillWindowResponse {
-            target: WindowTarget::with_window(alpha.clone(), 1),
         })
-    );
+        .await;
+    assert_eq!(killed.target, WindowTarget::with_window(alpha.clone(), 1));
 
     let state = handler.state.lock().await;
     let session = state
@@ -487,60 +342,24 @@ async fn kill_window_all_others_leaves_only_the_target_window() {
 #[tokio::test]
 async fn new_window_reuses_the_lowest_available_index_after_kill() {
     let handler = RequestHandler::new();
-    let alpha = session_name("alpha");
-    create_session(&handler, "alpha").await;
+    let alpha = create_session(&handler, "alpha").await;
 
     assert_eq!(
-        handler
-            .handle(Request::NewWindow(Box::new(NewWindowRequest {
-                target: alpha.clone(),
-                name: None,
-                detached: true,
-                start_directory: None,
-                environment: None,
-                command: None,
-                process_command: None,
-                target_window_index: None,
-                insert_at_target: false,
-            })))
-            .await,
-        Response::NewWindow(rmux_proto::NewWindowResponse {
-            target: WindowTarget::with_window(alpha.clone(), 1),
-        })
+        handler.create_window(&alpha).await,
+        WindowTarget::with_window(alpha.clone(), 1)
     );
-
     assert_eq!(
-        handler
-            .handle(Request::KillWindow(KillWindowRequest {
-                target: WindowTarget::with_window(alpha.clone(), 0),
-                kill_all_others: false,
-            }))
-            .await,
-        Response::KillWindow(rmux_proto::KillWindowResponse {
-            target: WindowTarget::with_window(alpha.clone(), 1),
-        })
+        kill_window(&handler, &alpha, 0).await,
+        WindowTarget::with_window(alpha.clone(), 1)
     );
 
-    let response = handler
-        .handle(Request::NewWindow(Box::new(NewWindowRequest {
-            target: alpha.clone(),
+    let reused = handler
+        .create_window(NewWindowRequest {
             name: Some("reused".to_owned()),
-            detached: true,
-            start_directory: None,
-            environment: None,
-            command: None,
-            process_command: None,
-            target_window_index: None,
-            insert_at_target: false,
-        })))
-        .await;
-
-    assert_eq!(
-        response,
-        Response::NewWindow(rmux_proto::NewWindowResponse {
-            target: WindowTarget::with_window(alpha.clone(), 0),
+            ..Fixture::fixture(&alpha)
         })
-    );
+        .await;
+    assert_eq!(reused, WindowTarget::with_window(alpha.clone(), 0));
 
     let state = handler.state.lock().await;
     let session = state
@@ -560,8 +379,7 @@ async fn new_window_reuses_the_lowest_available_index_after_kill() {
 #[tokio::test]
 async fn new_window_does_not_mutate_the_session_when_existing_terminals_are_missing() {
     let handler = RequestHandler::new();
-    let alpha = session_name("alpha");
-    create_session(&handler, "alpha").await;
+    let alpha = create_session(&handler, "alpha").await;
     handler
         .wait_for_pane_startup_to_finish_for_test(&PaneTarget::with_window(alpha.clone(), 0, 0))
         .await;
@@ -581,17 +399,9 @@ async fn new_window_does_not_mutate_the_session_when_existing_terminals_are_miss
     };
 
     let response = handler
-        .handle(Request::NewWindow(Box::new(NewWindowRequest {
-            target: alpha.clone(),
-            name: None,
-            detached: true,
-            start_directory: None,
-            environment: None,
-            command: None,
-            process_command: None,
-            target_window_index: None,
-            insert_at_target: false,
-        })))
+        .handle(Request::NewWindow(Box::new(NewWindowRequest::fixture(
+            &alpha,
+        ))))
         .await;
 
     assert_eq!(
@@ -621,22 +431,12 @@ async fn new_window_does_not_mutate_the_session_when_existing_terminals_are_miss
 #[tokio::test]
 async fn killing_the_only_window_atomically_destroys_its_session_in_tmux_hook_order() {
     let handler = RequestHandler::new();
-    let alpha = session_name("alpha");
-    create_session(&handler, "alpha").await;
+    let alpha = create_session(&handler, "alpha").await;
     let mut events = handler.subscribe_lifecycle_events();
 
-    let response = handler
-        .handle(Request::KillWindow(KillWindowRequest {
-            target: WindowTarget::with_window(alpha.clone(), 0),
-            kill_all_others: false,
-        }))
-        .await;
-
     assert_eq!(
-        response,
-        Response::KillWindow(rmux_proto::KillWindowResponse {
-            target: WindowTarget::with_window(alpha.clone(), 0),
-        })
+        kill_window(&handler, &alpha, 0).await,
+        WindowTarget::with_window(alpha.clone(), 0)
     );
     assert!(handler
         .state
@@ -680,8 +480,7 @@ async fn killing_the_only_window_atomically_destroys_its_session_in_tmux_hook_or
 #[tokio::test]
 async fn kill_last_window_commit_excludes_a_concurrent_new_window() {
     let handler = std::sync::Arc::new(RequestHandler::new());
-    let alpha = session_name("kill-last-window-race");
-    create_session(&handler, alpha.as_str()).await;
+    let alpha = create_session(&handler, "kill-last-window-race").await;
     let target = WindowTarget::with_window(alpha.clone(), 0);
     let pause = handler.install_kill_window_commit_pause(target.clone());
 
@@ -689,10 +488,9 @@ async fn kill_last_window_commit_excludes_a_concurrent_new_window() {
     let killing_target = target.clone();
     let killing = tokio::spawn(async move {
         killing_handler
-            .handle(Request::KillWindow(KillWindowRequest {
-                target: killing_target,
-                kill_all_others: false,
-            }))
+            .handle(Request::KillWindow(KillWindowRequest::fixture(
+                killing_target,
+            )))
             .await
     });
     timeout(Duration::from_secs(1), pause.reached.notified())
@@ -703,17 +501,9 @@ async fn kill_last_window_commit_excludes_a_concurrent_new_window() {
     let creating_target = alpha.clone();
     let mut creating = tokio::spawn(async move {
         creating_handler
-            .handle(Request::NewWindow(Box::new(NewWindowRequest {
-                target: creating_target,
-                name: None,
-                detached: true,
-                environment: None,
-                command: None,
-                start_directory: None,
-                target_window_index: None,
-                insert_at_target: false,
-                process_command: None,
-            })))
+            .handle(Request::NewWindow(Box::new(NewWindowRequest::fixture(
+                creating_target,
+            ))))
             .await
     });
     assert!(
@@ -745,35 +535,21 @@ async fn kill_last_window_commit_excludes_a_concurrent_new_window() {
 #[tokio::test]
 async fn kill_last_linked_window_orders_target_session_before_surviving_alias() {
     let handler = RequestHandler::new();
-    let alpha = session_name("alpha-linked-last");
-    let beta = session_name("beta-linked-last");
-    create_session(&handler, alpha.as_str()).await;
-    create_session(&handler, beta.as_str()).await;
+    let alpha = create_session(&handler, "alpha-linked-last").await;
+    let beta = create_session(&handler, "beta-linked-last").await;
     insert_window(&handler, &beta, 1).await;
-    assert!(matches!(
-        handler
-            .handle(Request::LinkWindow(LinkWindowRequest {
-                source: WindowTarget::with_window(alpha.clone(), 0),
-                target: WindowTarget::with_window(beta.clone(), 2),
-                after: false,
-                before: false,
-                kill_destination: false,
-                detached: false,
-            }))
-            .await,
-        Response::LinkWindow(_)
-    ));
+    handler
+        .handle_ok(LinkWindowRequest {
+            detached: false,
+            ..Fixture::fixture((
+                WindowTarget::with_window(alpha.clone(), 0),
+                WindowTarget::with_window(beta.clone(), 2),
+            ))
+        })
+        .await;
     let mut events = handler.subscribe_lifecycle_events();
 
-    assert!(matches!(
-        handler
-            .handle(Request::KillWindow(KillWindowRequest {
-                target: WindowTarget::with_window(alpha.clone(), 0),
-                kill_all_others: false,
-            }))
-            .await,
-        Response::KillWindow(_)
-    ));
+    kill_window(&handler, &alpha, 0).await;
 
     let mut observed = Vec::new();
     for _ in 0..4 {
@@ -816,22 +592,12 @@ async fn kill_last_linked_window_orders_target_session_before_surviving_alias() 
 #[tokio::test]
 async fn kill_last_grouped_window_matches_tmux_peer_hook_order() {
     let handler = RequestHandler::new();
-    let alpha = session_name("alpha-grouped-last");
-    let beta = session_name("beta-grouped-last");
-    create_session(&handler, alpha.as_str()).await;
-    create_grouped_session(&handler, beta.as_str(), &alpha).await;
+    let alpha = create_session(&handler, "alpha-grouped-last").await;
+    let beta = create_grouped_session(&handler, "beta-grouped-last", &alpha).await;
     create_session(&handler, "survivor-grouped-last").await;
     let mut events = handler.subscribe_lifecycle_events();
 
-    assert!(matches!(
-        handler
-            .handle(Request::KillWindow(KillWindowRequest {
-                target: WindowTarget::with_window(alpha.clone(), 0),
-                kill_all_others: false,
-            }))
-            .await,
-        Response::KillWindow(_)
-    ));
+    kill_window(&handler, &alpha, 0).await;
 
     let mut observed = Vec::new();
     for _ in 0..4 {
@@ -866,8 +632,7 @@ async fn kill_last_grouped_window_matches_tmux_peer_hook_order() {
 #[tokio::test]
 async fn kill_window_all_others_prevalidates_the_full_removal_set() {
     let handler = RequestHandler::new();
-    let alpha = session_name("alpha");
-    create_session(&handler, "alpha").await;
+    let alpha = create_session(&handler, "alpha").await;
     insert_window(&handler, &alpha, 1).await;
     insert_window(&handler, &alpha, 2).await;
 
@@ -934,38 +699,10 @@ async fn kill_window_all_others_prevalidates_the_full_removal_set() {
 #[tokio::test]
 async fn kill_window_cleans_grouped_member_window_metadata_before_synchronizing() {
     let handler = RequestHandler::new();
-    let alpha = session_name("alpha");
-    let beta = session_name("beta");
-    create_session(&handler, "alpha").await;
+    let alpha = create_session(&handler, "alpha").await;
     insert_window(&handler, &alpha, 1).await;
+    let beta = create_grouped_session(&handler, "beta", &alpha).await;
 
-    let grouped = handler
-        .handle(Request::NewSessionExt(Box::new(NewSessionExtRequest {
-            session_name: Some(beta.clone()),
-            working_directory: None,
-            detached: true,
-            size: Some(TerminalSize {
-                cols: 120,
-                rows: 40,
-            }),
-            environment: None,
-            group_target: Some(alpha.clone()),
-            attach_if_exists: false,
-            detach_other_clients: false,
-            kill_other_clients: false,
-            flags: None,
-            window_name: None,
-            print_session_info: false,
-            print_format: None,
-            command: None,
-            process_command: None,
-            client_environment: None,
-            skip_environment_update: false,
-        })))
-        .await;
-    assert!(matches!(grouped, Response::NewSession(_)));
-
-    let alpha_target = WindowTarget::with_window(alpha.clone(), 1);
     let beta_target = WindowTarget::with_window(beta.clone(), 1);
     {
         let mut state = handler.state.lock().await;
@@ -1004,17 +741,9 @@ async fn kill_window_cleans_grouped_member_window_metadata_before_synchronizing(
         assert!(state.tracks_auto_named_window(&beta, 1));
     }
 
-    let killed = handler
-        .handle(Request::KillWindow(KillWindowRequest {
-            target: alpha_target.clone(),
-            kill_all_others: false,
-        }))
-        .await;
     assert_eq!(
-        killed,
-        Response::KillWindow(rmux_proto::KillWindowResponse {
-            target: WindowTarget::with_window(alpha.clone(), 0),
-        })
+        kill_window(&handler, &alpha, 1).await,
+        WindowTarget::with_window(alpha.clone(), 0)
     );
 
     let state = handler.state.lock().await;

@@ -2,24 +2,23 @@ use std::io;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use rmux_ipc::{LocalStream, PeerIdentity};
 use rmux_proto::{
-    encode_frame, CreateWebShareRequest, FrameDecoder, ListWebSharesRequest, NewSessionRequest,
-    Request, Response, SessionName, TerminalSize, WebShareRequest, WebShareScope,
+    CreateWebShareRequest, ListWebSharesRequest, Request, Response, SessionName, WebShareRequest,
+    WebShareScope,
 };
-use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::sync::watch;
 
-use super::run_connection_with_cleanup;
-use crate::daemon::ShutdownHandle;
+use super::connection_test_support::{read_test_response, spawn_connection, write_test_request};
 use crate::handler::{RequestHandler, UndeliveredWebShareGuard};
+use crate::test_fixtures::{unique_temp_path, wait_until, Fixture};
 
 #[tokio::test]
 async fn client_disconnect_cancels_web_share_tunnel_start() -> io::Result<()> {
     let _env_lock = crate::test_env::lock_async().await;
-    let fixture = TestDirectory::new("rmux-web-share-disconnect")?;
+    let fixture = TestDirectory::new("web-share-disconnect")?;
     let marker = fixture.path().join("provider.pid");
     let provider = fixture.path().join("provider.sh");
     std::fs::write(
@@ -43,7 +42,7 @@ async fn client_disconnect_cancels_web_share_tunnel_start() -> io::Result<()> {
 
     let handler = Arc::new(RequestHandler::new());
     handler.mark_web_listener_available();
-    let session_name = create_session(&handler, "disconnect-tunnel").await;
+    let session_name = handler.create_session("disconnect-tunnel").await;
     let (mut client, _shutdown_tx, mut connection_task) = spawn_test_connection(&handler)?;
     write_test_request(
         &mut client,
@@ -82,7 +81,7 @@ async fn client_disconnect_cancels_web_share_tunnel_start() -> io::Result<()> {
 async fn undelivered_web_share_response_is_rolled_back() {
     let handler = Arc::new(RequestHandler::new());
     handler.mark_web_listener_available();
-    let session_name = create_session(&handler, "undelivered-share").await;
+    let session_name = handler.create_session("undelivered-share").await;
     let response = handler
         .handle(create_web_share_request(session_name, None))
         .await;
@@ -107,7 +106,7 @@ async fn undelivered_web_share_response_is_rolled_back() {
 async fn disconnect_after_share_creation_before_hooks_rolls_back() -> io::Result<()> {
     let handler = Arc::new(RequestHandler::new());
     handler.mark_web_listener_available();
-    let session_name = create_session(&handler, "disconnect-after-create").await;
+    let session_name = handler.create_session("disconnect-after-create").await;
     let pause = handler.install_web_share_delivery_pause();
     let (mut client, _shutdown_tx, connection_task) = spawn_test_connection(&handler)?;
 
@@ -131,7 +130,7 @@ async fn disconnect_after_share_creation_before_hooks_rolls_back() -> io::Result
 async fn delivered_share_disarms_pre_hook_rollback() -> io::Result<()> {
     let handler = Arc::new(RequestHandler::new());
     handler.mark_web_listener_available();
-    let session_name = create_session(&handler, "delivered-after-hooks").await;
+    let session_name = handler.create_session("delivered-after-hooks").await;
     let pause = handler.install_web_share_delivery_pause();
     let (mut client, _shutdown_tx, connection_task) = spawn_test_connection(&handler)?;
 
@@ -161,54 +160,19 @@ async fn delivered_share_disarms_pre_hook_rollback() -> io::Result<()> {
 
 async fn list_web_shares(handler: &RequestHandler) -> Vec<rmux_proto::WebShareSummary> {
     let response = handler
-        .handle(Request::WebShare(Box::new(WebShareRequest::List(
-            ListWebSharesRequest,
-        ))))
+        .handle_ok(WebShareRequest::List(ListWebSharesRequest))
         .await;
-    let Response::WebShare(response) = response else {
-        panic!("expected web-share list response");
-    };
-    let rmux_proto::WebShareResponse::List(list) = response.as_ref() else {
+    let rmux_proto::WebShareResponse::List(list) = *response else {
         panic!("expected web-share list payload");
     };
-    list.shares.clone()
-}
-
-async fn create_session(handler: &RequestHandler, name: &str) -> SessionName {
-    let session_name = SessionName::new(name).expect("valid session name");
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: session_name.clone(),
-                detached: true,
-                size: Some(TerminalSize { cols: 80, rows: 24 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
-    session_name
+    list.shares
 }
 
 fn create_web_share_request(session_name: SessionName, tunnel_provider: Option<&str>) -> Request {
     Request::WebShare(Box::new(WebShareRequest::Create(CreateWebShareRequest {
-        scope: WebShareScope::Session(session_name),
-        public_base_url: None,
         tunnel_provider: tunnel_provider.map(str::to_owned),
-        frontend_url: None,
-        ttl_seconds: None,
-        expires_at_unix: None,
         max_spectators: Some(1),
-        max_operators: None,
-        url_options: Default::default(),
-        require_pin: false,
-        operator_pin: None,
-        spectator_pin: None,
-        terminal_palette: None,
-        operator: false,
-        spectator: true,
-        controls: false,
-        kill_session_on_expire: false,
+        ..Fixture::fixture(WebShareScope::Session(session_name))
     })))
 }
 
@@ -220,87 +184,51 @@ fn spawn_test_connection(
     tokio::task::JoinHandle<io::Result<()>>,
 )> {
     let (server, client) = LocalStream::pair()?;
-    let handler = Arc::clone(handler);
-    let (shutdown_tx, shutdown_rx) = watch::channel(());
-    let (shutdown_handle, _shutdown_request_rx) = ShutdownHandle::new();
-    let connection_id = handler.allocate_connection_id();
-    let task = tokio::spawn(async move {
-        run_connection_with_cleanup(
-            server,
-            PeerIdentity {
-                pid: std::process::id(),
-                uid: rmux_os::identity::real_user_id(),
-                user: rmux_os::identity::UserIdentity::Uid(rmux_os::identity::real_user_id()),
-            },
-            handler,
-            connection_id,
-            shutdown_rx,
-            shutdown_handle,
-        )
-        .await
-    });
+    let peer = PeerIdentity {
+        pid: std::process::id(),
+        uid: rmux_os::identity::real_user_id(),
+        user: rmux_os::identity::UserIdentity::Uid(rmux_os::identity::real_user_id()),
+    };
+    let (shutdown_tx, task) = spawn_connection(handler, peer, server);
     Ok((client, shutdown_tx, task))
 }
 
-async fn write_test_request(stream: &mut LocalStream, request: Request) -> io::Result<()> {
-    let frame = encode_frame(&request).map_err(io::Error::other)?;
-    stream.write_all(&frame).await
-}
-
-async fn read_test_response(stream: &mut LocalStream) -> io::Result<Response> {
-    let mut decoder = FrameDecoder::new();
-    let mut buffer = [0_u8; 512];
-
-    loop {
-        if let Some(response) = decoder.next_frame::<Response>().map_err(io::Error::other)? {
-            return Ok(response);
-        }
-        let bytes_read = stream.read(&mut buffer).await?;
-        if bytes_read == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "server closed before response frame",
-            ));
-        }
-        decoder.push_bytes(&buffer[..bytes_read]);
-    }
-}
-
 async fn wait_for_pid_marker(path: &Path) -> i32 {
-    for _ in 0..200 {
-        if let Some(pid) = std::fs::read_to_string(path)
-            .ok()
-            .and_then(|value| value.parse::<i32>().ok())
-        {
-            return pid;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    panic!("tunnel provider did not write its PID marker");
+    wait_until(
+        Duration::from_secs(2),
+        Duration::from_millis(10),
+        async || {
+            std::fs::read_to_string(path)
+                .ok()
+                .and_then(|value| value.parse::<i32>().ok())
+                .ok_or(())
+        },
+    )
+    .await
+    .unwrap_or_else(|()| panic!("tunnel provider did not write its PID marker"))
 }
 
 async fn wait_for_process_exit(pid: i32) -> bool {
     let Some(pid) = rustix::process::Pid::from_raw(pid) else {
         return true;
     };
-    for _ in 0..100 {
-        if rustix::process::test_kill_process(pid).is_err() {
-            return true;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    false
+    wait_until(
+        Duration::from_secs(1),
+        Duration::from_millis(10),
+        async || match rustix::process::test_kill_process(pid) {
+            Err(_) => Ok(()),
+            Ok(()) => Err(()),
+        },
+    )
+    .await
+    .is_ok()
 }
 
 struct TestDirectory(PathBuf);
 
 impl TestDirectory {
     fn new(prefix: &str) -> io::Result<Self> {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock after Unix epoch")
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!("{prefix}-{}-{nonce}", std::process::id(),));
+        let path = unique_temp_path(prefix);
         std::fs::create_dir_all(&path)?;
         Ok(Self(path))
     }

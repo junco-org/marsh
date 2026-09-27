@@ -3,174 +3,60 @@ use super::RequestHandler;
 use crate::pane_io::PaneExitEvent;
 use rmux_core::{LifecycleEvent, PaneId, WINLINK_SILENCE};
 use rmux_proto::{
-    BreakPaneRequest, KillPaneRequest, LinkWindowRequest, NewSessionExtRequest, NewWindowRequest,
-    OptionName, PaneKillRequest, PaneTarget, PaneTargetRef, Request, Response, ScopeSelector,
-    SessionName, SetOptionMode, SetOptionRequest, SplitDirection, SplitWindowExtRequest,
-    SplitWindowTarget, TerminalSize, WindowTarget,
+    BreakPaneRequest, KillPaneRequest, LinkWindowRequest, OptionName, PaneKillRequest, PaneTarget,
+    PaneTargetRef, Request, Response, ScopeSelector, SessionName, SplitWindowExtRequest,
+    WindowTarget,
 };
 
-use crate::test_names::session_name;
-
-fn quiet_command() -> Vec<String> {
-    ["/bin/sh", "-c", "sleep 60"]
-        .into_iter()
-        .map(str::to_owned)
-        .collect()
-}
-
-async fn create_quiet_session(handler: &RequestHandler, value: &str) -> SessionName {
-    let session = session_name(value);
-    let response = handler
-        .handle(Request::NewSessionExt(Box::new(NewSessionExtRequest {
-            session_name: Some(session.clone()),
-            working_directory: None,
-            detached: true,
-            size: Some(TerminalSize { cols: 80, rows: 24 }),
-            environment: None,
-            group_target: None,
-            attach_if_exists: false,
-            detach_other_clients: false,
-            kill_other_clients: false,
-            flags: None,
-            window_name: None,
-            print_session_info: false,
-            print_format: None,
-            command: Some(quiet_command()),
-            process_command: None,
-            client_environment: None,
-            skip_environment_update: false,
-        })))
-        .await;
-    assert!(matches!(response, Response::NewSession(_)), "{response:?}");
-    handler
-        .wait_for_pane_startup_to_finish_for_test(&PaneTarget::new(session.clone(), 0))
-        .await;
-    session
-}
-
-async fn create_grouped_session(
-    handler: &RequestHandler,
-    value: &str,
-    group_target: &SessionName,
-) -> SessionName {
-    let session = session_name(value);
-    let response = handler
-        .handle(Request::NewSessionExt(Box::new(NewSessionExtRequest {
-            session_name: Some(session.clone()),
-            working_directory: None,
-            detached: true,
-            size: Some(TerminalSize { cols: 80, rows: 24 }),
-            environment: None,
-            group_target: Some(group_target.clone()),
-            attach_if_exists: false,
-            detach_other_clients: false,
-            kill_other_clients: false,
-            flags: None,
-            window_name: None,
-            print_session_info: false,
-            print_format: None,
-            command: None,
-            process_command: None,
-            client_environment: None,
-            skip_environment_update: false,
-        })))
-        .await;
-    assert!(matches!(response, Response::NewSession(_)), "{response:?}");
-    session
-}
-
-async fn create_quiet_window(handler: &RequestHandler, session: &SessionName) -> WindowTarget {
-    let response = handler
-        .handle(Request::NewWindow(Box::new(NewWindowRequest {
-            target: session.clone(),
-            name: None,
-            detached: true,
-            start_directory: None,
-            environment: None,
-            command: Some(quiet_command()),
-            process_command: None,
-            target_window_index: None,
-            insert_at_target: false,
-        })))
-        .await;
-    let Response::NewWindow(response) = response else {
-        panic!("expected new-window response, got {response:?}");
-    };
-    handler
-        .wait_for_pane_startup_to_finish_for_test(&PaneTarget::with_window(
-            session.clone(),
-            response.target.window_index(),
-            0,
-        ))
-        .await;
-    response.target
-}
+use crate::test_fixtures::{quiet_command, Fixture, Grouped, Quiet};
 
 async fn split_quiet_window(
     handler: &RequestHandler,
     window: &WindowTarget,
 ) -> (PaneTarget, PaneId) {
-    let response = handler
-        .handle(Request::SplitWindowExt(Box::new(SplitWindowExtRequest {
-            target: SplitWindowTarget::Pane(PaneTarget::with_window(
+    let split = handler
+        .handle_ok(SplitWindowExtRequest {
+            command: Some(quiet_command()),
+            detached: true,
+            ..Fixture::fixture(PaneTarget::with_window(
                 window.session_name().clone(),
                 window.window_index(),
                 0,
-            )),
-            direction: SplitDirection::Vertical,
-            before: false,
-            environment: None,
-            command: Some(quiet_command()),
-            process_command: None,
-            start_directory: None,
-            keep_alive_on_exit: None,
-            detached: true,
-            size: None,
-            preserve_zoom: false,
-            full_size: false,
-            stdin_payload: None,
-        })))
-        .await;
-    let Response::SplitWindow(response) = response else {
-        panic!("expected split-window response, got {response:?}");
-    };
+            ))
+        })
+        .await
+        .pane;
     handler
-        .wait_for_pane_startup_to_finish_for_test(&response.pane)
+        .wait_for_pane_startup_to_finish_for_test(&split)
         .await;
     let pane_id = {
         let state = handler.state.lock().await;
         state
             .sessions
-            .session(response.pane.session_name())
-            .and_then(|session| session.window_at(response.pane.window_index()))
-            .and_then(|window| window.pane(response.pane.pane_index()))
+            .session(split.session_name())
+            .and_then(|session| session.window_at(split.window_index()))
+            .and_then(|window| window.pane(split.pane_index()))
             .map(|pane| pane.id())
             .expect("split pane exists")
     };
-    (response.pane, pane_id)
-}
-
-async fn set_monitor_silence(handler: &RequestHandler, scope: ScopeSelector) {
-    let response = handler
-        .handle(Request::SetOption(SetOptionRequest {
-            scope,
-            option: OptionName::MonitorSilence,
-            value: "60".to_owned(),
-            mode: SetOptionMode::Replace,
-        }))
-        .await;
-    assert!(matches!(response, Response::SetOption(_)), "{response:?}");
+    (split, pane_id)
 }
 
 async fn setup_non_last_pane_case(
     handler: &RequestHandler,
     value: &str,
 ) -> (SessionName, WindowTarget, PaneTarget, PaneId) {
-    let session = create_quiet_session(handler, value).await;
+    let session = handler.create_started_session(Quiet(value)).await;
     let monitored = WindowTarget::with_window(session.clone(), 0);
-    let second_window = create_quiet_window(handler, &session).await;
+    let second_window = handler.create_started_window(Quiet(&session)).await;
     let (split_pane, pane_id) = split_quiet_window(handler, &second_window).await;
-    set_monitor_silence(handler, ScopeSelector::Window(monitored.clone())).await;
+    handler
+        .set_option(
+            ScopeSelector::Window(monitored.clone()),
+            OptionName::MonitorSilence,
+            "60",
+        )
+        .await;
     (session, monitored, split_pane, pane_id)
 }
 
@@ -204,7 +90,9 @@ fn spawn_registered_silence_expiry(
 #[tokio::test]
 async fn normal_shutdown_waits_for_silence_timer_handoff_then_cancels_it() {
     let handler = RequestHandler::new();
-    let session = create_quiet_session(&handler, "silence-shutdown-handoff").await;
+    let session = handler
+        .create_started_session(Quiet("silence-shutdown-handoff"))
+        .await;
     let target = WindowTarget::with_window(session.clone(), 0);
     let pause = handler.install_pre_admitted_producer_spawn_pause("rmux-silence-timer");
     let (runtime_release_tx, runtime_release_rx) = tokio::sync::oneshot::channel();
@@ -216,7 +104,12 @@ async fn normal_shutdown_waits_for_silence_timer_handoff_then_cancels_it() {
             .build()
             .expect("silence timer installer runtime")
             .block_on(async move {
-                set_monitor_silence(&installer_handler, ScopeSelector::Window(installer_target))
+                installer_handler
+                    .set_option(
+                        ScopeSelector::Window(installer_target),
+                        OptionName::MonitorSilence,
+                        "60",
+                    )
                     .await;
                 let _ = runtime_release_rx.await;
             });
@@ -270,18 +163,24 @@ async fn normal_shutdown_waits_for_silence_timer_handoff_then_cancels_it() {
 #[tokio::test]
 async fn expired_silence_publication_outlives_its_mutation_guard() {
     let handler = RequestHandler::new();
-    let session = create_quiet_session(&handler, "silence-publication-handoff").await;
-    let target = WindowTarget::with_window(session.clone(), 0);
-    set_monitor_silence(&handler, ScopeSelector::Window(target.clone())).await;
-    let response = handler
-        .handle(Request::SetOption(SetOptionRequest {
-            scope: ScopeSelector::Session(session.clone()),
-            option: OptionName::SilenceAction,
-            value: "none".to_owned(),
-            mode: SetOptionMode::Replace,
-        }))
+    let session = handler
+        .create_started_session(Quiet("silence-publication-handoff"))
         .await;
-    assert!(matches!(response, Response::SetOption(_)), "{response:?}");
+    let target = WindowTarget::with_window(session.clone(), 0);
+    handler
+        .set_option(
+            ScopeSelector::Window(target.clone()),
+            OptionName::MonitorSilence,
+            "60",
+        )
+        .await;
+    handler
+        .set_option(
+            ScopeSelector::Session(session.clone()),
+            OptionName::SilenceAction,
+            "none",
+        )
+        .await;
     let pause = handler.install_alert_plan_effect_pause();
 
     let expiry = spawn_registered_silence_expiry(&handler, target.clone());
@@ -344,18 +243,24 @@ async fn expired_silence_publication_outlives_its_mutation_guard() {
 #[tokio::test]
 async fn full_lifecycle_outbox_cannot_hold_a_silence_mutation_open() {
     let handler = RequestHandler::with_lifecycle_dispatch_capacity_for_test(1);
-    let session = create_quiet_session(&handler, "silence-full-outbox").await;
-    let target = WindowTarget::with_window(session.clone(), 0);
-    set_monitor_silence(&handler, ScopeSelector::Window(target.clone())).await;
-    let response = handler
-        .handle(Request::SetOption(SetOptionRequest {
-            scope: ScopeSelector::Session(session.clone()),
-            option: OptionName::SilenceAction,
-            value: "any".to_owned(),
-            mode: SetOptionMode::Replace,
-        }))
+    let session = handler
+        .create_started_session(Quiet("silence-full-outbox"))
         .await;
-    assert!(matches!(response, Response::SetOption(_)), "{response:?}");
+    let target = WindowTarget::with_window(session.clone(), 0);
+    handler
+        .set_option(
+            ScopeSelector::Window(target.clone()),
+            OptionName::MonitorSilence,
+            "60",
+        )
+        .await;
+    handler
+        .set_option(
+            ScopeSelector::Session(session.clone()),
+            OptionName::SilenceAction,
+            "any",
+        )
+        .await;
     let lifecycle_receiver = handler
         .take_lifecycle_dispatch_receiver()
         .expect("test activates the lifecycle outbox receiver");
@@ -415,13 +320,12 @@ async fn direct_non_last_pane_kill_preserves_other_window_silence_deadline() {
         setup_non_last_pane_case(&handler, "silence-direct-pane-kill").await;
     let before = timer_snapshot(&handler, &monitored);
 
-    let response = handler
-        .handle(Request::KillPane(KillPaneRequest {
+    handler
+        .handle_ok(KillPaneRequest {
             target: split_pane,
             kill_all_except: false,
-        }))
+        })
         .await;
-    assert!(matches!(response, Response::KillPane(_)), "{response:?}");
 
     assert_eq!(timer_snapshot(&handler, &monitored), before);
 }
@@ -467,13 +371,19 @@ async fn natural_non_last_pane_exit_preserves_other_window_silence_deadline() {
 #[tokio::test]
 async fn last_pane_window_kill_removes_grouped_alias_timers_and_preserves_survivors() {
     let handler = RequestHandler::new();
-    let owner = create_quiet_session(&handler, "silence-last-pane-owner").await;
-    let removed_owner = create_quiet_window(&handler, &owner).await;
-    let peer = create_grouped_session(&handler, "silence-last-pane-peer", &owner).await;
+    let owner = handler
+        .create_started_session(Quiet("silence-last-pane-owner"))
+        .await;
+    let removed_owner = handler.create_started_window(Quiet(&owner)).await;
+    let peer = handler
+        .create_session(Grouped("silence-last-pane-peer", &owner))
+        .await;
     let survivor_owner = WindowTarget::with_window(owner.clone(), 0);
     let survivor_peer = WindowTarget::with_window(peer.clone(), 0);
     let removed_peer = WindowTarget::with_window(peer.clone(), removed_owner.window_index());
-    set_monitor_silence(&handler, ScopeSelector::Global).await;
+    handler
+        .set_option(ScopeSelector::Global, OptionName::MonitorSilence, "60")
+        .await;
     let survivor_owner_before = timer_snapshot(&handler, &survivor_owner);
     let survivor_peer_before = timer_snapshot(&handler, &survivor_peer);
     assert!(handler
@@ -483,13 +393,12 @@ async fn last_pane_window_kill_removes_grouped_alias_timers_and_preserves_surviv
         .silence_timer_snapshot_for_test(&removed_peer)
         .is_some());
 
-    let response = handler
-        .handle(Request::KillPane(KillPaneRequest {
+    handler
+        .handle_ok(KillPaneRequest {
             target: PaneTarget::with_window(owner.clone(), removed_owner.window_index(), 0),
             kill_all_except: false,
-        }))
+        })
         .await;
-    assert!(matches!(response, Response::KillPane(_)), "{response:?}");
 
     assert_eq!(
         handler.silence_timer_snapshot_for_test(&removed_owner),
@@ -509,11 +418,17 @@ async fn last_pane_window_kill_removes_grouped_alias_timers_and_preserves_surviv
 #[tokio::test]
 async fn break_last_pane_across_sessions_preserves_silence_deadline_and_identity() {
     let handler = RequestHandler::new();
-    let source_session = create_quiet_session(&handler, "silence-break-source").await;
-    let destination_session = create_quiet_session(&handler, "silence-break-destination").await;
+    let source_session = handler
+        .create_started_session(Quiet("silence-break-source"))
+        .await;
+    let destination_session = handler
+        .create_started_session(Quiet("silence-break-destination"))
+        .await;
     let source = WindowTarget::with_window(source_session.clone(), 0);
     let unrelated = WindowTarget::with_window(destination_session.clone(), 0);
-    set_monitor_silence(&handler, ScopeSelector::Global).await;
+    handler
+        .set_option(ScopeSelector::Global, OptionName::MonitorSilence, "60")
+        .await;
 
     let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(121);
     handler.replace_silence_timer_deadline_for_test(&source, deadline);
@@ -522,30 +437,14 @@ async fn break_last_pane_across_sessions_preserves_silence_deadline_and_identity
         .silence_timer_identity_for_test(&source)
         .expect("source timer has stable identity");
     let unrelated_before = timer_snapshot(&handler, &unrelated);
-    let destination_session_id = {
-        let state = handler.state.lock().await;
-        state
-            .sessions
-            .session(&destination_session)
-            .expect("destination session exists")
-            .id()
-    };
+    let destination_session_id = handler.session_id_for_test(&destination_session).await;
 
     let response = handler
-        .handle(Request::BreakPane(Box::new(BreakPaneRequest {
-            source: PaneTarget::with_window(source_session.clone(), 0, 0),
-            target: Some(WindowTarget::with_window(destination_session.clone(), 1)),
-            name: None,
-            detached: true,
-            after: false,
-            before: false,
-            print_target: false,
-            format: None,
-        })))
+        .handle_ok(BreakPaneRequest::fixture((
+            PaneTarget::with_window(source_session.clone(), 0, 0),
+            WindowTarget::with_window(destination_session.clone(), 1),
+        )))
         .await;
-    let Response::BreakPane(response) = response else {
-        panic!("expected cross-session break-pane success, got {response:?}");
-    };
     let destination = WindowTarget::with_window(destination_session, 1);
     assert_eq!(
         response.target,
@@ -571,18 +470,22 @@ async fn assert_expired_single_pane_break_does_not_rearm(
     expect_silence_flag: bool,
 ) {
     let handler = RequestHandler::new();
-    let source_session = create_quiet_session(&handler, &format!("{label}-source")).await;
+    let source_session = handler
+        .create_started_session(Quiet(&format!("{label}-source")))
+        .await;
     let source = WindowTarget::with_window(source_session.clone(), 0);
-    let owner = create_quiet_session(&handler, &format!("{label}-owner")).await;
-    let peer = create_grouped_session(&handler, &format!("{label}-peer"), &owner).await;
+    let owner = handler
+        .create_started_session(Quiet(&format!("{label}-owner")))
+        .await;
+    let peer = handler
+        .create_session(Grouped(&format!("{label}-peer"), &owner))
+        .await;
     handler.wait_for_initial_panes_for_test().await;
-    set_monitor_silence(&handler, ScopeSelector::Global).await;
+    handler
+        .set_option(ScopeSelector::Global, OptionName::MonitorSilence, "60")
+        .await;
     let _attached_control = if attach_source {
-        let (control_tx, control_rx) = tokio::sync::mpsc::unbounded_channel();
-        let _attach_id = handler
-            .register_attach(918, source_session.clone(), control_tx)
-            .await;
-        Some(control_rx)
+        Some(handler.attach_client(918, &source_session).await)
     } else {
         None
     };
@@ -614,20 +517,11 @@ async fn assert_expired_single_pane_break_does_not_rearm(
     }
 
     let response = handler
-        .handle(Request::BreakPane(Box::new(BreakPaneRequest {
-            source: PaneTarget::with_window(source_session.clone(), 0, 0),
-            target: Some(WindowTarget::with_window(owner.clone(), 1)),
-            name: None,
-            detached: true,
-            after: false,
-            before: false,
-            print_target: false,
-            format: None,
-        })))
+        .handle_ok(BreakPaneRequest::fixture((
+            PaneTarget::with_window(source_session.clone(), 0, 0),
+            WindowTarget::with_window(owner.clone(), 1),
+        )))
         .await;
-    let Response::BreakPane(response) = response else {
-        panic!("expected expired cross-session break success, got {response:?}");
-    };
     assert_eq!(
         response.target,
         PaneTarget::with_window(owner.clone(), 1, 0)
@@ -681,21 +575,22 @@ async fn attached_current_expired_single_pane_break_does_not_rearm_without_flag(
 #[tokio::test]
 async fn grouped_break_reorders_distinct_duplicate_alias_silence_deadlines() {
     let handler = RequestHandler::new();
-    let owner = create_quiet_session(&handler, "silence-break-duplicate-owner").await;
-    let linked = handler
-        .handle(Request::LinkWindow(LinkWindowRequest {
-            source: WindowTarget::with_window(owner.clone(), 0),
-            target: WindowTarget::with_window(owner.clone(), 1),
-            after: false,
-            before: false,
-            kill_destination: false,
-            detached: true,
-        }))
+    let owner = handler
+        .create_started_session(Quiet("silence-break-duplicate-owner"))
         .await;
-    assert!(matches!(linked, Response::LinkWindow(_)), "{linked:?}");
-    let peer = create_grouped_session(&handler, "silence-break-duplicate-peer", &owner).await;
+    handler
+        .handle_ok(LinkWindowRequest::fixture((
+            WindowTarget::with_window(owner.clone(), 0),
+            WindowTarget::with_window(owner.clone(), 1),
+        )))
+        .await;
+    let peer = handler
+        .create_session(Grouped("silence-break-duplicate-peer", &owner))
+        .await;
     handler.wait_for_initial_panes_for_test().await;
-    set_monitor_silence(&handler, ScopeSelector::Global).await;
+    handler
+        .set_option(ScopeSelector::Global, OptionName::MonitorSilence, "60")
+        .await;
 
     let targets = [
         WindowTarget::with_window(owner.clone(), 0),
@@ -715,20 +610,14 @@ async fn grouped_break_reorders_distinct_duplicate_alias_silence_deadlines() {
         .map(|target| timer_snapshot(&handler, &target));
 
     let response = handler
-        .handle(Request::BreakPane(Box::new(BreakPaneRequest {
-            source: PaneTarget::with_window(owner.clone(), 1, 0),
-            target: Some(WindowTarget::with_window(owner.clone(), 0)),
-            name: None,
-            detached: true,
-            after: false,
+        .handle_ok(BreakPaneRequest {
             before: true,
-            print_target: false,
-            format: None,
-        })))
+            ..Fixture::fixture((
+                PaneTarget::with_window(owner.clone(), 1, 0),
+                WindowTarget::with_window(owner.clone(), 0),
+            ))
+        })
         .await;
-    let Response::BreakPane(response) = response else {
-        panic!("expected duplicate-alias break-pane success, got {response:?}");
-    };
     assert_eq!(response.target, PaneTarget::with_window(owner, 0, 0));
 
     for (target, expected) in [
@@ -746,24 +635,27 @@ async fn grouped_break_reorders_distinct_duplicate_alias_silence_deadlines() {
 #[tokio::test]
 async fn cross_session_multi_pane_break_preserves_shifted_duplicate_alias_deadlines() {
     let handler = RequestHandler::new();
-    let source_session = create_quiet_session(&handler, "silence-break-multi-source").await;
+    let source_session = handler
+        .create_started_session(Quiet("silence-break-multi-source"))
+        .await;
     let source = WindowTarget::with_window(source_session.clone(), 0);
     let (moved_pane, _) = split_quiet_window(&handler, &source).await;
-    let owner = create_quiet_session(&handler, "silence-break-multi-owner").await;
-    let linked = handler
-        .handle(Request::LinkWindow(LinkWindowRequest {
-            source: WindowTarget::with_window(owner.clone(), 0),
-            target: WindowTarget::with_window(owner.clone(), 1),
-            after: false,
-            before: false,
-            kill_destination: false,
-            detached: true,
-        }))
+    let owner = handler
+        .create_started_session(Quiet("silence-break-multi-owner"))
         .await;
-    assert!(matches!(linked, Response::LinkWindow(_)), "{linked:?}");
-    let peer = create_grouped_session(&handler, "silence-break-multi-peer", &owner).await;
+    handler
+        .handle_ok(LinkWindowRequest::fixture((
+            WindowTarget::with_window(owner.clone(), 0),
+            WindowTarget::with_window(owner.clone(), 1),
+        )))
+        .await;
+    let peer = handler
+        .create_session(Grouped("silence-break-multi-peer", &owner))
+        .await;
     handler.wait_for_initial_panes_for_test().await;
-    set_monitor_silence(&handler, ScopeSelector::Global).await;
+    handler
+        .set_option(ScopeSelector::Global, OptionName::MonitorSilence, "60")
+        .await;
 
     let old_targets = [
         source.clone(),
@@ -784,20 +676,11 @@ async fn cross_session_multi_pane_break_preserves_shifted_duplicate_alias_deadli
         .map(|target| timer_snapshot(&handler, &target));
 
     let response = handler
-        .handle(Request::BreakPane(Box::new(BreakPaneRequest {
-            source: moved_pane,
-            target: Some(WindowTarget::with_window(owner.clone(), 0)),
-            name: None,
-            detached: true,
-            after: false,
+        .handle_ok(BreakPaneRequest {
             before: true,
-            print_target: false,
-            format: None,
-        })))
+            ..Fixture::fixture((moved_pane, WindowTarget::with_window(owner.clone(), 0)))
+        })
         .await;
-    let Response::BreakPane(response) = response else {
-        panic!("expected multi-pane cross-session break success, got {response:?}");
-    };
     assert_eq!(
         response.target,
         PaneTarget::with_window(owner.clone(), 0, 0)
@@ -830,23 +713,26 @@ async fn cross_session_multi_pane_break_preserves_shifted_duplicate_alias_deadli
 #[tokio::test]
 async fn cross_session_single_pane_break_preserves_moved_and_shifted_alias_deadlines() {
     let handler = RequestHandler::new();
-    let source_session = create_quiet_session(&handler, "silence-break-linked-source").await;
-    let source = WindowTarget::with_window(source_session.clone(), 0);
-    let owner = create_quiet_session(&handler, "silence-break-linked-owner").await;
-    let linked = handler
-        .handle(Request::LinkWindow(LinkWindowRequest {
-            source: source.clone(),
-            target: WindowTarget::with_window(owner.clone(), 1),
-            after: false,
-            before: false,
-            kill_destination: false,
-            detached: true,
-        }))
+    let source_session = handler
+        .create_started_session(Quiet("silence-break-linked-source"))
         .await;
-    assert!(matches!(linked, Response::LinkWindow(_)), "{linked:?}");
-    let peer = create_grouped_session(&handler, "silence-break-linked-peer", &owner).await;
+    let source = WindowTarget::with_window(source_session.clone(), 0);
+    let owner = handler
+        .create_started_session(Quiet("silence-break-linked-owner"))
+        .await;
+    handler
+        .handle_ok(LinkWindowRequest::fixture((
+            &source,
+            WindowTarget::with_window(owner.clone(), 1),
+        )))
+        .await;
+    let peer = handler
+        .create_session(Grouped("silence-break-linked-peer", &owner))
+        .await;
     handler.wait_for_initial_panes_for_test().await;
-    set_monitor_silence(&handler, ScopeSelector::Global).await;
+    handler
+        .set_option(ScopeSelector::Global, OptionName::MonitorSilence, "60")
+        .await;
 
     let old_targets = [
         source.clone(),
@@ -867,20 +753,14 @@ async fn cross_session_single_pane_break_preserves_moved_and_shifted_alias_deadl
         .map(|target| timer_snapshot(&handler, &target));
 
     let response = handler
-        .handle(Request::BreakPane(Box::new(BreakPaneRequest {
-            source: PaneTarget::with_window(source_session, 0, 0),
-            target: Some(WindowTarget::with_window(owner.clone(), 1)),
-            name: None,
-            detached: true,
-            after: false,
+        .handle_ok(BreakPaneRequest {
             before: true,
-            print_target: false,
-            format: None,
-        })))
+            ..Fixture::fixture((
+                PaneTarget::with_window(source_session, 0, 0),
+                WindowTarget::with_window(owner.clone(), 1),
+            ))
+        })
         .await;
-    let Response::BreakPane(response) = response else {
-        panic!("expected linked cross-session break success, got {response:?}");
-    };
     assert_eq!(
         response.target,
         PaneTarget::with_window(owner.clone(), 1, 0)

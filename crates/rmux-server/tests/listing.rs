@@ -1,16 +1,17 @@
 use std::error::Error;
-use std::io;
-use std::path::Path;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 mod common;
 
-use common::{send_request, session_name, start_server, TestHarness};
+use common::{
+    create_session, send, send_ok, send_request, session_name, shell_quote, shell_quote_str,
+    start_server, wait_for_file_contents, Fixture, TestHarness,
+};
 use rmux_proto::{
-    HasSessionRequest, HookLifecycle, HookName, ListPanesRequest, ListSessionsRequest,
-    NewSessionRequest, NewWindowRequest, Request, Response, ScopeSelector, SendKeysRequest,
-    SetEnvironmentRequest, SetHookRequest, SetOptionMode, SetOptionRequest, ShowEnvironmentRequest,
-    ShowOptionsRequest, SplitWindowRequest, SplitWindowTarget, TerminalSize, WindowTarget,
+    HasSessionRequest, HookName, ListPanesRequest, ListSessionsRequest, NewWindowRequest,
+    PaneTarget, Request, Response, ScopeSelector, SendKeysRequest, SetEnvironmentRequest,
+    SetHookRequest, SetOptionRequest, ShowEnvironmentRequest, ShowOptionsRequest,
+    SplitWindowRequest, TerminalSize, WindowTarget,
 };
 
 const FILE_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -32,48 +33,23 @@ async fn list_sessions_uses_shared_formatter_through_real_socket() -> Result<(),
         ),
         (alpha.clone(), TerminalSize { cols: 80, rows: 24 }),
     ] {
-        let created = send_request(
-            harness.socket_path(),
-            &Request::NewSession(NewSessionRequest {
-                session_name,
-                detached: true,
-                size: Some(size),
-
-                environment: None,
-            }),
-        )
-        .await?;
-        assert!(matches!(created, Response::NewSession(_)));
+        create_session(harness.socket_path(), (session_name, size)).await?;
     }
 
-    let new_window = send_request(
+    send_ok(
         harness.socket_path(),
-        &Request::NewWindow(Box::new(NewWindowRequest {
-            target: alpha,
+        NewWindowRequest {
             name: Some("logs".to_owned()),
-            detached: true,
-            start_directory: None,
-            environment: None,
-            command: None,
-            process_command: None,
-            target_window_index: None,
-            insert_at_target: false,
-        })),
+            ..Fixture::fixture(alpha)
+        },
     )
     .await?;
-    assert!(matches!(new_window, Response::NewWindow(_)));
 
-    let listed = send_request(
+    let listed = send(
         harness.socket_path(),
-        &Request::ListSessions(ListSessionsRequest {
-            format: Some(
-                "#{session_name}:#{session_windows}:#{session_attached}:#{session_width}x#{session_height}"
-                    .to_owned(),
-            ),
-            filter: None,
-            sort_order: None,
-            reversed: false,
-            }),
+        ListSessionsRequest::fixture(
+            "#{session_name}:#{session_windows}:#{session_attached}:#{session_width}x#{session_height}",
+        ),
     )
     .await?;
 
@@ -95,60 +71,23 @@ async fn list_panes_uses_shared_formatter_through_real_socket() -> Result<(), Bo
     let handle = start_server(&harness).await?;
     let alpha = session_name("alpha");
 
-    let created = send_request(
+    create_session(harness.socket_path(), &alpha).await?;
+    send_ok(harness.socket_path(), SplitWindowRequest::fixture(&alpha)).await?;
+    send_ok(
         harness.socket_path(),
-        &Request::NewSession(NewSessionRequest {
-            session_name: alpha.clone(),
-            detached: true,
-            size: Some(TerminalSize { cols: 80, rows: 24 }),
-            environment: None,
-        }),
-    )
-    .await?;
-    assert!(matches!(created, Response::NewSession(_)));
-
-    let split = send_request(
-        harness.socket_path(),
-        &Request::SplitWindow(SplitWindowRequest {
-            target: SplitWindowTarget::Session(alpha.clone()),
-            direction: rmux_proto::SplitDirection::Vertical,
-            before: false,
-            environment: None,
-        }),
-    )
-    .await?;
-    assert!(matches!(split, Response::SplitWindow(_)));
-
-    let new_window = send_request(
-        harness.socket_path(),
-        &Request::NewWindow(Box::new(NewWindowRequest {
-            target: alpha.clone(),
+        NewWindowRequest {
             name: Some("logs".to_owned()),
-            detached: true,
-            start_directory: None,
-            environment: None,
-            command: None,
-            process_command: None,
-            target_window_index: None,
-            insert_at_target: false,
-        })),
+            ..Fixture::fixture(&alpha)
+        },
     )
     .await?;
-    assert!(matches!(new_window, Response::NewWindow(_)));
 
-    let listed = send_request(
+    let listed = send(
         harness.socket_path(),
-        &Request::ListPanes(Box::new(ListPanesRequest {
-            target: alpha,
-            format: Some(
-                "#{session_name}:#{window_index}:#{pane_index}:#{pane_id}:#{pane_active}"
-                    .to_owned(),
-            ),
-            filter: None,
-            sort_order: None,
-            reversed: false,
-            target_window_index: None,
-        })),
+        ListPanesRequest::fixture((
+            alpha,
+            "#{session_name}:#{window_index}:#{pane_index}:#{pane_id}:#{pane_active}",
+        )),
     )
     .await?;
 
@@ -181,65 +120,36 @@ async fn rename_session_round_trips_and_migrates_session_scoped_state() -> Resul
     ));
     let _ = std::fs::remove_file(&hook_path);
 
-    let created = send_request(
+    create_session(harness.socket_path(), &alpha).await?;
+    send_ok(
         harness.socket_path(),
-        &Request::NewSession(NewSessionRequest {
-            session_name: alpha.clone(),
-            detached: true,
-            size: Some(TerminalSize { cols: 80, rows: 24 }),
-            environment: None,
-        }),
+        SetEnvironmentRequest::fixture((ScopeSelector::Session(alpha.clone()), "TERM", "screen")),
     )
     .await?;
-    assert!(matches!(created, Response::NewSession(_)));
-
-    assert!(matches!(
-        send_request(
-            harness.socket_path(),
-            &Request::SetEnvironment(Box::new(SetEnvironmentRequest {
-                scope: ScopeSelector::Session(alpha.clone()),
-                name: "TERM".to_owned(),
-                value: "screen".to_owned(),
-                mode: None,
-                hidden: false,
-                format: false,
-            })),
-        )
-        .await?,
-        Response::SetEnvironment(_)
-    ));
-    assert!(matches!(
-        send_request(
-            harness.socket_path(),
-            &Request::SetOption(SetOptionRequest {
-                scope: ScopeSelector::Window(WindowTarget::new(alpha.clone())),
-                option: rmux_proto::OptionName::PaneBorderStyle,
-                value: "red".to_owned(),
-                mode: SetOptionMode::Replace,
-            }),
-        )
-        .await?,
-        Response::SetOption(_)
-    ));
-    assert!(matches!(
-        send_request(
-            harness.socket_path(),
-            &Request::SetHook(SetHookRequest {
-                scope: ScopeSelector::Session(alpha.clone()),
-                hook: HookName::AfterSendKeys,
-                command: format!(
-                    "run-shell {}",
-                    shell_quote_str(&format!(
-                        "printf renamed-hook > {}",
-                        shell_quote(&hook_path)
-                    ))
-                ),
-                lifecycle: HookLifecycle::Persistent,
-            }),
-        )
-        .await?,
-        Response::SetHook(_)
-    ));
+    send_ok(
+        harness.socket_path(),
+        SetOptionRequest::fixture((
+            ScopeSelector::Window(WindowTarget::new(alpha.clone())),
+            rmux_proto::OptionName::PaneBorderStyle,
+            "red",
+        )),
+    )
+    .await?;
+    send_ok(
+        harness.socket_path(),
+        SetHookRequest::fixture((
+            ScopeSelector::Session(alpha.clone()),
+            HookName::AfterSendKeys,
+            format!(
+                "run-shell {}",
+                shell_quote_str(&format!(
+                    "printf renamed-hook > {}",
+                    shell_quote(&hook_path)
+                ))
+            ),
+        )),
+    )
+    .await?;
 
     let renamed = send_request(
         harness.socket_path(),
@@ -314,48 +224,17 @@ async fn rename_session_round_trips_and_migrates_session_scoped_state() -> Resul
         .expect("options output is utf-8")
         .contains("pane-border-style red"));
 
-    let sent = send_request(
+    send_ok(
         harness.socket_path(),
-        &Request::SendKeys(SendKeysRequest {
-            target: rmux_proto::PaneTarget::with_window(gamma.clone(), 0, 0),
-            keys: vec!["printf noop".to_owned(), "Enter".to_owned()],
-        }),
+        SendKeysRequest::fixture((
+            PaneTarget::with_window(gamma, 0, 0),
+            ["printf noop", "Enter"],
+        )),
     )
     .await?;
-    assert!(matches!(sent, Response::SendKeys(_)));
-    wait_for_file_contents(&hook_path, "renamed-hook").await?;
+    wait_for_file_contents(&hook_path, "renamed-hook", FILE_WAIT_TIMEOUT).await?;
 
     handle.shutdown().await?;
     let _ = std::fs::remove_file(&hook_path);
     Ok(())
-}
-
-async fn wait_for_file_contents(path: &Path, expected: &str) -> Result<(), Box<dyn Error>> {
-    let deadline = Instant::now() + FILE_WAIT_TIMEOUT;
-
-    while Instant::now() < deadline {
-        match std::fs::read_to_string(path) {
-            Ok(contents) if contents == expected => return Ok(()),
-            Ok(_) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
-
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-
-    Err(io::Error::other(format!(
-        "timed out waiting for '{}' to contain '{}'",
-        path.display(),
-        expected
-    ))
-    .into())
-}
-
-fn shell_quote(path: &Path) -> String {
-    format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
-}
-
-fn shell_quote_str(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\\''"))
 }

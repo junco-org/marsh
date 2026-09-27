@@ -1,8 +1,9 @@
 //! Clap argument model for the public RMUX command surface.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::LazyLock;
 
 use clap::{ArgAction, Args, CommandFactory, FromArgMatches, Parser};
 use rmux_core::{
@@ -80,7 +81,6 @@ use queue::{command_from_parsed, parse_command_queue, parse_runtime_command_grou
 /// Clap argument structs for the shell-scripting and config-sourcing commands.
 #[path = "cli_args/script.rs"]
 mod script;
-use script::parse_source_file_args;
 pub(crate) use script::{IfShellArgs, RunShellArgs, SourceFileArgs, WaitForArgs};
 /// Clap argument structs for the menu and popup overlay commands.
 #[path = "cli_args/overlay.rs"]
@@ -89,7 +89,6 @@ pub(crate) use overlay::{DisplayMenuArgs, DisplayPopupArgs};
 /// Parsing of tmux target specifiers such as `-t session:window.pane`.
 #[path = "cli_args/targets.rs"]
 mod targets;
-use targets::parse_session_name;
 pub(crate) use targets::{TargetSpec, parse_target_spec};
 /// Clap argument structs and hand-written parsers for the pane commands.
 #[path = "cli_args/pane.rs"]
@@ -98,10 +97,6 @@ pub(crate) use pane::{
     BreakPaneArgs, ClockModeArgs, CopyModeArgs, DisplayPanesArgs, JoinPaneArgs, LastPaneArgs,
     ListPanesArgs, PaneTargetArgs, PipePaneArgs, ResizePaneArgs, ResizePaneSize, RespawnPaneArgs,
     SelectLayoutArgs, SelectLayoutMode, SelectPaneArgs, SplitWindowArgs, SwapPaneArgs,
-};
-use pane::{
-    parse_join_pane_args, parse_resize_pane_args, parse_select_layout_args, parse_select_pane_args,
-    parse_split_window_args,
 };
 /// Clap argument structs for the session commands.
 #[path = "cli_args/session.rs"]
@@ -118,7 +113,10 @@ pub(crate) use window::{
     RenameWindowArgs, ResizeWindowArgs, RespawnWindowArgs, RotateWindowArgs, SelectWindowArgs,
     SwapWindowArgs, UnlinkWindowArgs, WindowTargetArgs,
 };
-use window::{parse_rename_window_args, parse_select_window_args, parse_swap_window_args};
+/// Post-parse validation and the tmux-shaped errors shared by the command parsers.
+#[path = "cli_args/validate.rs"]
+mod validate;
+use validate::{missing_value_error, too_many_arguments_error, unknown_flag_error};
 /// Clap argument structs for the `web-share` extension command.
 #[path = "cli_args/web.rs"]
 mod web;
@@ -142,12 +140,6 @@ const DOCUMENTED_CLI_ALIASES: &[DocumentedCliAlias] = &[
         expansion: "choose-tree -w",
     },
 ];
-
-/// Lazily built list of every tmux and `rmux` extension command this binary implements.
-static IMPLEMENTED_COMMAND_SURFACE: OnceLock<Vec<&'static CommandEntry>> = OnceLock::new();
-
-/// Lazily rendered `--help` trailer listing implemented commands and aliases.
-static IMPLEMENTED_COMMAND_HELP: OnceLock<String> = OnceLock::new();
 
 /// Parses a full `rmux` argument vector into a validated `Cli`.
 pub(crate) fn parse<I, T>(args: I) -> Result<Cli, clap::Error>
@@ -203,63 +195,26 @@ where
 }
 
 /// Runs clap over the top-level flags and the opaque trailing command tokens.
-fn parse_raw_cli<I, T>(args: I) -> Result<RawCli, clap::Error>
+fn parse_raw_cli<I, T>(args: I) -> Result<TopLevelCommandScan, clap::Error>
 where
     I: IntoIterator<Item = T>,
     T: Into<OsString> + Clone,
 {
     let args = normalize_top_level_attached_short_values(args.into_iter().map(Into::into));
-    let mut command = RawCli::command();
-    command = command.after_help(implemented_command_help());
-    let matches = command.try_get_matches_from(args)?;
-    RawCli::from_arg_matches(&matches)
-}
-
-/// Result of parsing only the clap-owned top-level prefix and opaque command
-/// tail. Extensions use this before command-queue parsing so they share the
-/// exact same short-option cluster and value-boundary rules as the main CLI.
-#[derive(Debug)]
-pub(crate) struct TopLevelCommandScan {
-    pub(crate) assume_256_colors: bool,
-    pub(crate) control_mode: u8,
-    pub(crate) no_fork: bool,
-    pub(crate) shell_command: Option<String>,
-    pub(crate) config_files: Vec<PathBuf>,
-    pub(crate) login_shell: bool,
-    pub(crate) socket_name: Option<OsString>,
-    pub(crate) no_start_server: bool,
-    pub(crate) socket_path: Option<OsString>,
-    pub(crate) terminal_features: Vec<String>,
-    pub(crate) utf8: bool,
-    pub(crate) verbose: u8,
-    pub(crate) command: Vec<OsString>,
+    let matches = TopLevelCommandScan::command()
+        .after_help(IMPLEMENTED_COMMAND_HELP.as_str())
+        .try_get_matches_from(args)?;
+    TopLevelCommandScan::from_arg_matches(&matches)
 }
 
 /// Parses only the top-level prefix of `arguments`, leaving the command tail unparsed.
 pub(crate) fn scan_top_level_command(
     arguments: &[OsString],
 ) -> Result<TopLevelCommandScan, clap::Error> {
-    let args = std::iter::once(OsString::from("rmux"))
-        .chain(arguments.iter().cloned())
-        .collect::<Vec<_>>();
-    let args = normalize_top_level_attached_short_values(args);
-    let matches = RawCli::command().try_get_matches_from(args)?;
-    let raw = RawCli::from_arg_matches(&matches)?;
-    Ok(TopLevelCommandScan {
-        assume_256_colors: raw.assume_256_colors,
-        control_mode: raw.control_mode,
-        no_fork: raw.no_fork,
-        shell_command: raw.shell_command,
-        config_files: raw.config_files,
-        login_shell: raw.login_shell,
-        socket_name: raw.socket_name,
-        no_start_server: raw.no_start_server,
-        socket_path: raw.socket_path,
-        terminal_features: raw.terminal_features,
-        utf8: raw.utf8,
-        verbose: raw.verbose,
-        command: raw.command,
-    })
+    let args = std::iter::once(OsString::from("rmux")).chain(arguments.iter().cloned());
+    let matches = TopLevelCommandScan::command()
+        .try_get_matches_from(normalize_top_level_attached_short_values(args))?;
+    TopLevelCommandScan::from_arg_matches(&matches)
 }
 
 /// Splits top-level short options such as `-Sname` into separate flag and value tokens.
@@ -353,23 +308,20 @@ fn build_implemented_command_help() -> String {
     help.trim_end().to_owned()
 }
 
+/// Lazily built list of every tmux and `rmux` extension command this binary implements.
+static IMPLEMENTED_COMMAND_SURFACE: LazyLock<Vec<&'static CommandEntry>> = LazyLock::new(|| {
+    COMMAND_TABLE
+        .iter()
+        .chain(RMUX_EXTENSION_COMMANDS.iter())
+        .collect()
+});
+
+/// Lazily rendered `--help` trailer listing implemented commands and aliases.
+static IMPLEMENTED_COMMAND_HELP: LazyLock<String> = LazyLock::new(build_implemented_command_help);
+
 /// The implemented command surface: the tmux command table plus `rmux` extensions.
 pub(crate) fn implemented_command_surface() -> &'static [&'static CommandEntry] {
-    IMPLEMENTED_COMMAND_SURFACE
-        .get_or_init(|| {
-            COMMAND_TABLE
-                .iter()
-                .chain(RMUX_EXTENSION_COMMANDS.iter())
-                .collect()
-        })
-        .as_slice()
-}
-
-/// The cached `--help` trailer, rendering it on first use.
-fn implemented_command_help() -> &'static str {
-    IMPLEMENTED_COMMAND_HELP
-        .get_or_init(build_implemented_command_help)
-        .as_str()
+    &IMPLEMENTED_COMMAND_SURFACE
 }
 
 /// The built-in command aliases advertised to users.
@@ -405,56 +357,58 @@ pub(crate) struct Cli {
 }
 
 /// The clap-derived top-level option model, before command-queue parsing.
+// That summary line doubles as the `--help` about text. Extensions scan with this struct so they
+// share the exact short-option cluster and value-boundary rules of the main CLI.
 #[derive(Debug, Parser)]
 #[command(disable_help_subcommand = true, version = rmux_server::VERSION)]
-struct RawCli {
+pub(crate) struct TopLevelCommandScan {
     #[arg(
         short = '2',
         action = ArgAction::SetTrue,
         overrides_with = "assume_256_colors"
     )]
-    assume_256_colors: bool,
+    pub(crate) assume_256_colors: bool,
     #[arg(short = 'C', action = ArgAction::Count)]
-    control_mode: u8,
+    pub(crate) control_mode: u8,
     #[arg(short = 'D', action = ArgAction::SetTrue, overrides_with = "no_fork")]
-    no_fork: bool,
+    pub(crate) no_fork: bool,
     #[arg(short = 'c', value_name = "shell-command")]
-    shell_command: Option<String>,
+    pub(crate) shell_command: Option<String>,
     #[arg(short = 'f', value_name = "file")]
-    config_files: Vec<PathBuf>,
+    pub(crate) config_files: Vec<PathBuf>,
     #[arg(
         short = 'l',
         action = ArgAction::SetTrue,
         overrides_with = "login_shell"
     )]
-    login_shell: bool,
+    pub(crate) login_shell: bool,
     #[arg(short = 'L', value_name = "socket-name", allow_hyphen_values = true)]
-    socket_name: Option<OsString>,
+    pub(crate) socket_name: Option<OsString>,
     #[arg(
         short = 'N',
         action = ArgAction::SetTrue,
         overrides_with = "no_start_server"
     )]
-    no_start_server: bool,
+    pub(crate) no_start_server: bool,
     #[arg(short = 'S', value_name = "socket-path", allow_hyphen_values = true)]
-    socket_path: Option<OsString>,
+    pub(crate) socket_path: Option<OsString>,
     #[arg(short = 'T', value_name = "features", allow_hyphen_values = true)]
-    terminal_features: Vec<String>,
+    pub(crate) terminal_features: Vec<String>,
     #[arg(short = 'u', action = ArgAction::SetTrue, overrides_with = "utf8")]
-    utf8: bool,
+    pub(crate) utf8: bool,
     #[arg(short = 'v', action = ArgAction::Count)]
-    verbose: u8,
+    pub(crate) verbose: u8,
     #[arg(
         value_name = "command",
         allow_hyphen_values = true,
         trailing_var_arg = true
     )]
-    command: Vec<OsString>,
+    pub(crate) command: Vec<OsString>,
 }
 
 impl Cli {
     /// Builds a `Cli` for control mode, where the tail becomes initial control lines.
-    fn from_raw_control(raw: RawCli) -> Result<Self, clap::Error> {
+    fn from_raw_control(raw: TopLevelCommandScan) -> Result<Self, clap::Error> {
         let explicit_command_args = !raw.command.is_empty();
         let control_command_lines = initial_control_command_lines(&raw.command)?;
         let command_queue = explicit_command_args
@@ -472,7 +426,7 @@ impl Cli {
 
     /// Builds a `Cli` from parsed top-level options and an already parsed command queue.
     fn from_raw(
-        raw: RawCli,
+        raw: TopLevelCommandScan,
         parsed_commands: ParsedCommands,
         apply_runtime_assignments: bool,
     ) -> Result<Self, clap::Error> {
@@ -509,7 +463,7 @@ impl Cli {
 
     /// Assembles the final `Cli` from raw options and the resolved queue.
     fn from_raw_queue(
-        raw: RawCli,
+        raw: TopLevelCommandScan,
         primary_command: Option<Command>,
         command_queue: Vec<Command>,
         control_command_lines: Vec<String>,
@@ -612,12 +566,7 @@ where
     )
     .args_override_self(true)
     .disable_help_subcommand(true)
-    .arg(
-        clap::Arg::new("help")
-            .long("help")
-            .action(ArgAction::Help)
-            .help("Print help"),
-    )
+    .arg(help_argument())
     .mut_args(|argument| {
         if argument_requires_value(&argument)
             && (argument.get_short().is_some() || argument.get_long().is_some())
@@ -651,24 +600,10 @@ fn delimit_options_before_positionals(
         .get_positionals()
         .any(|argument| argument.is_allow_hyphen_values_set());
 
-    let short_flags = command
-        .get_arguments()
-        .filter_map(clap::Arg::get_short)
-        .collect::<std::collections::BTreeSet<_>>();
-    let value_flags = command
-        .get_arguments()
-        .filter(|argument| argument_requires_value(argument))
-        .filter_map(clap::Arg::get_short)
-        .collect::<std::collections::BTreeSet<_>>();
-    let long_flags = command
-        .get_arguments()
-        .filter_map(clap::Arg::get_long)
-        .collect::<std::collections::BTreeSet<_>>();
-    let long_value_flags = command
-        .get_arguments()
-        .filter(|argument| argument_requires_value(argument))
-        .filter_map(clap::Arg::get_long)
-        .collect::<std::collections::BTreeSet<_>>();
+    let short_flags = flag_names(command, |_| true, clap::Arg::get_short);
+    let value_flags = flag_names(command, argument_requires_value, clap::Arg::get_short);
+    let long_flags = flag_names(command, |_| true, clap::Arg::get_long);
+    let long_value_flags = flag_names(command, argument_requires_value, clap::Arg::get_long);
 
     let mut expected_value_flag = None::<String>;
     let mut first_positional = None;
@@ -679,7 +614,7 @@ fn delimit_options_before_positionals(
         if argument == "--" {
             break;
         }
-        if !argument.starts_with('-') || argument == "-" {
+        if is_positional_start(argument) {
             first_positional = Some(index);
             break;
         }
@@ -732,12 +667,7 @@ fn delimit_options_before_positionals(
             return Ok(arguments);
         }
         if arguments.len() - index > positional_limit {
-            return Err(clap::Error::raw(
-                clap::error::ErrorKind::TooManyValues,
-                format!(
-                    "command {command_name}: too many arguments (need at most {positional_limit})"
-                ),
-            ));
+            return Err(too_many_arguments_error(command_name, positional_limit));
         }
 
         // tmux stops option parsing at the first positional. Clap otherwise
@@ -757,48 +687,44 @@ fn argument_requires_value(argument: &clap::Arg) -> bool {
             .is_none_or(|range| range.min_values() > 0)
 }
 
-/// Builds the tmux-shaped error for an unrecognized flag on `command_name`.
-fn unknown_flag_error(command_name: &'static str, flag: &str) -> clap::Error {
-    clap::Error::raw(
-        clap::error::ErrorKind::UnknownArgument,
-        format!("command {command_name}: unknown flag {flag}"),
+/// Whether `argument` is a switch that never consumes a value token.
+fn argument_is_switch(argument: &clap::Arg) -> bool {
+    matches!(
+        argument.get_action(),
+        ArgAction::SetTrue | ArgAction::SetFalse | ArgAction::Count
     )
 }
 
-/// Builds the tmux-shaped error for a flag on `command_name` that is missing its value.
-fn missing_value_error(command_name: &'static str, flag: &str) -> clap::Error {
-    clap::Error::raw(
-        clap::error::ErrorKind::ValueValidation,
-        format!("command {command_name}: {flag} expects an argument"),
-    )
+/// Collects the short or long name of every `command` argument that `keep` accepts.
+fn flag_names<'a, T: Ord>(
+    command: &'a clap::Command,
+    keep: impl Fn(&clap::Arg) -> bool,
+    name: impl Fn(&'a clap::Arg) -> Option<T>,
+) -> BTreeSet<T> {
+    command
+        .get_arguments()
+        .filter(|argument| keep(argument))
+        .filter_map(name)
+        .collect()
+}
+
+/// The explicit `--help` flag each subcommand parser offers in place of clap's `-h`/`--help`.
+fn help_argument() -> clap::Arg {
+    clap::Arg::new("help")
+        .long("help")
+        .action(ArgAction::Help)
+        .help("Print help")
 }
 
 /// Rewrites clustered and attached short options into the separate tokens clap expects.
 fn normalize_attached_short_values(command: &clap::Command, arguments: Vec<String>) -> Vec<String> {
-    let boolean_flags = command
-        .get_arguments()
-        .filter(|argument| {
-            matches!(
-                argument.get_action(),
-                ArgAction::SetTrue | ArgAction::SetFalse | ArgAction::Count
-            )
-        })
-        .filter_map(clap::Arg::get_short)
-        .collect::<std::collections::BTreeSet<_>>();
-    let value_flags = command
-        .get_arguments()
-        .filter(|argument| argument_requires_value(argument))
-        .filter_map(clap::Arg::get_short)
-        .collect::<std::collections::BTreeSet<_>>();
+    let boolean_flags = flag_names(command, argument_is_switch, clap::Arg::get_short);
+    let value_flags = flag_names(command, argument_requires_value, clap::Arg::get_short);
+    // tmux lets the last of several `new-window -t` targets win.
     let repeat_last_wins_flags = if command.get_name() == "new-window" {
-        command
-            .get_arguments()
-            .filter(|argument| matches!(argument.get_action(), ArgAction::Set))
-            .filter_map(clap::Arg::get_short)
-            .filter(|flag| *flag == 't')
-            .collect::<std::collections::BTreeSet<_>>()
+        BTreeSet::from(['t'])
     } else {
-        std::collections::BTreeSet::new()
+        BTreeSet::new()
     };
     if value_flags.is_empty() {
         return arguments;
@@ -858,8 +784,8 @@ fn is_positional_start(argument: &str) -> bool {
 /// Expands one clustered short-option token into separate flag and value tokens.
 fn normalize_compact_short_value_token(
     argument: &str,
-    boolean_flags: &std::collections::BTreeSet<char>,
-    value_flags: &std::collections::BTreeSet<char>,
+    boolean_flags: &BTreeSet<char>,
+    value_flags: &BTreeSet<char>,
 ) -> Option<(Vec<String>, bool)> {
     let flags = argument.strip_prefix('-')?;
     if flags.is_empty() || flags.starts_with('-') {
@@ -894,13 +820,13 @@ fn normalize_compact_short_value_token(
 /// Drops earlier occurrences of flags where tmux lets the last repetition win.
 fn collapse_repeated_short_values(
     arguments: Vec<String>,
-    repeat_last_wins_flags: &std::collections::BTreeSet<char>,
+    repeat_last_wins_flags: &BTreeSet<char>,
 ) -> Vec<String> {
     if repeat_last_wins_flags.is_empty() {
         return arguments;
     }
 
-    let mut occurrences = std::collections::BTreeMap::<char, Vec<(usize, usize)>>::new();
+    let mut occurrences = BTreeMap::<char, Vec<(usize, usize)>>::new();
     let mut index = 0;
     while index + 1 < arguments.len() {
         if let Some(flag) = exact_short_flag(&arguments[index], repeat_last_wins_flags) {
@@ -914,7 +840,7 @@ fn collapse_repeated_short_values(
         }
     }
 
-    let mut drop_indexes = std::collections::BTreeSet::new();
+    let mut drop_indexes = BTreeSet::new();
     for positions in occurrences.values() {
         for (flag_index, value_index) in positions
             .iter()
@@ -934,7 +860,7 @@ fn collapse_repeated_short_values(
 }
 
 /// Returns the flag character when `argument` is exactly one short flag drawn from `flags`.
-fn exact_short_flag(argument: &str, flags: &std::collections::BTreeSet<char>) -> Option<char> {
+fn exact_short_flag(argument: &str, flags: &BTreeSet<char>) -> Option<char> {
     let mut chars = argument.chars();
     if chars.next()? != '-' || chars.as_str().starts_with('-') {
         return None;
@@ -1068,26 +994,7 @@ pub(crate) struct StartServerArgs {
     pub(crate) web_frontend: Option<String>,
 }
 
-/// Argument structs that can record the raw command text queued for them.
-trait QueuedCommand {
-    /// Records the original command-queue text this invocation came from.
-    fn set_queue_command(&mut self, queue_command: String);
-}
-
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 #[path = "cli_args_tests.rs"]
 mod tests;
-
-#[cfg(test)]
-#[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
-#[path = "cli_args_config_tests.rs"]
-mod config_tests;
-#[cfg(test)]
-#[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
-#[path = "cli_args_layout_tests.rs"]
-mod layout_tests;
-#[cfg(test)]
-#[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
-#[path = "cli_args_zoom_tests.rs"]
-mod zoom_tests;

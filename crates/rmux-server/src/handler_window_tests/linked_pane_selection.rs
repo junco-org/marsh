@@ -1,68 +1,48 @@
 use super::*;
+use rmux_proto::request::SwitchClientExt3Request;
+use rmux_proto::SplitWindowExtRequest;
 
-struct LinkedPaneFixture {
-    owner: SessionName,
-    grouped_peer: SessionName,
-    linked_peer: SessionName,
-    pane_one_id: rmux_proto::PaneId,
+/// One two-pane window shared by its owner, the owner's group peer and a linked peer, with
+/// pane zero active in every alias.
+pub(super) struct LinkedPaneFixture {
+    pub(super) owner: SessionName,
+    pub(super) grouped_peer: SessionName,
+    pub(super) linked_peer: SessionName,
+    pub(super) pane_one_id: rmux_proto::PaneId,
 }
 
-async fn linked_two_pane_fixture(handler: &RequestHandler, label: &str) -> LinkedPaneFixture {
-    let owner = session_name(&format!("{label}-owner"));
-    let grouped_peer = session_name(&format!("{label}-grouped"));
-    let linked_peer = session_name(&format!("{label}-linked"));
-    create_session(handler, owner.as_str()).await;
-    create_grouped_session(handler, grouped_peer.as_str(), &owner).await;
+impl LinkedPaneFixture {
+    /// Links `owner`'s window 0 into index 1 of a new `{label}-linked` session, then selects
+    /// pane zero in all three aliases of that window.
+    pub(super) async fn link(
+        handler: &RequestHandler,
+        owner: SessionName,
+        grouped_peer: SessionName,
+        label: &str,
+    ) -> Self {
+        let linked_peer = create_session(handler, format!("{label}-linked")).await;
+        handler
+            .handle_ok(LinkWindowRequest::fixture((
+                WindowTarget::with_window(owner.clone(), 0),
+                WindowTarget::with_window(linked_peer.clone(), 1),
+            )))
+            .await;
 
-    // The default command is an interactive shell whose startup output is
-    // unbounded in time. Split the quiet command every other fixture pane runs
-    // so this window stops producing pane activity once its panes are up.
-    let split = handler
-        .handle(Request::SplitWindowExt(Box::new(
-            rmux_proto::SplitWindowExtRequest {
-                target: SplitWindowTarget::Session(owner.clone()),
-                direction: SplitDirection::Vertical,
-                before: false,
-                environment: None,
-                command: Some(quiet_window_test_command()),
-                process_command: None,
-                start_directory: None,
-                keep_alive_on_exit: None,
-                detached: false,
-                size: None,
-                preserve_zoom: false,
-                full_size: false,
-                stdin_payload: None,
-            },
-        )))
-        .await;
-    let Response::SplitWindow(split) = split else {
-        panic!("expected split-window response, got {split:?}");
-    };
-    handler
-        .wait_for_pane_startup_to_finish_for_test(&split.pane)
-        .await;
-
-    create_session(handler, linked_peer.as_str()).await;
-    let linked = handler
-        .handle(Request::LinkWindow(LinkWindowRequest {
-            source: WindowTarget::with_window(owner.clone(), 0),
-            target: WindowTarget::with_window(linked_peer.clone(), 1),
-            after: false,
-            before: false,
-            kill_destination: false,
-            detached: true,
-        }))
-        .await;
-    assert!(matches!(linked, Response::LinkWindow(_)), "{linked:?}");
-
-    let pane_one_id = {
         let mut state = handler.state.lock().await;
-        for target in [
-            WindowTarget::with_window(owner.clone(), 0),
-            WindowTarget::with_window(grouped_peer.clone(), 0),
-            WindowTarget::with_window(linked_peer.clone(), 1),
-        ] {
+        let pane_one_id = state
+            .sessions
+            .session(&owner)
+            .and_then(|session| session.window_at(0))
+            .and_then(|window| window.pane(1))
+            .expect("fixture pane one exists")
+            .id();
+        let fixture = Self {
+            owner,
+            grouped_peer,
+            linked_peer,
+            pane_one_id,
+        };
+        for target in fixture.targets() {
             state
                 .sessions
                 .session_mut(target.session_name())
@@ -70,21 +50,37 @@ async fn linked_two_pane_fixture(handler: &RequestHandler, label: &str) -> Linke
                 .select_pane_in_window(target.window_index(), 0)
                 .expect("fixture pane zero selection succeeds");
         }
-        state
-            .sessions
-            .session(&owner)
-            .and_then(|session| session.window_at(0))
-            .and_then(|window| window.pane(1))
-            .expect("fixture pane one exists")
-            .id()
-    };
+        fixture
+    }
 
-    let fixture = LinkedPaneFixture {
-        owner,
-        grouped_peer,
-        linked_peer,
-        pane_one_id,
-    };
+    /// The shared window in the owner, the group peer and the linked peer.
+    pub(super) fn targets(&self) -> [WindowTarget; 3] {
+        [
+            WindowTarget::with_window(self.owner.clone(), 0),
+            WindowTarget::with_window(self.grouped_peer.clone(), 0),
+            WindowTarget::with_window(self.linked_peer.clone(), 1),
+        ]
+    }
+}
+
+async fn linked_two_pane_fixture(handler: &RequestHandler, label: &str) -> LinkedPaneFixture {
+    let owner = create_session(handler, format!("{label}-owner")).await;
+    let grouped_peer = create_grouped_session(handler, format!("{label}-grouped"), &owner).await;
+
+    // The default command is an interactive shell whose startup output is
+    // unbounded in time. Split the quiet command every other fixture pane runs
+    // so this window stops producing pane activity once its panes are up.
+    let split = handler
+        .handle_ok(SplitWindowExtRequest {
+            command: Some(quiet_command()),
+            ..Fixture::fixture(&owner)
+        })
+        .await;
+    handler
+        .wait_for_pane_startup_to_finish_for_test(&split.pane)
+        .await;
+
+    let fixture = LinkedPaneFixture::link(handler, owner, grouped_peer, label).await;
     settle_linked_fixture_activity(handler, &fixture).await;
     fixture
 }
@@ -148,11 +144,7 @@ async fn assert_linked_active_pane(
     expected: u32,
 ) {
     let state = handler.state.lock().await;
-    for target in [
-        WindowTarget::with_window(fixture.owner.clone(), 0),
-        WindowTarget::with_window(fixture.grouped_peer.clone(), 0),
-        WindowTarget::with_window(fixture.linked_peer.clone(), 1),
-    ] {
+    for target in fixture.targets() {
         assert_eq!(
             state
                 .sessions
@@ -166,36 +158,52 @@ async fn assert_linked_active_pane(
     }
 }
 
+/// Switches client `requester_pid` to pane one of the owner's shared window.
+async fn switch_to_pane_one(
+    handler: &RequestHandler,
+    requester_pid: u32,
+    fixture: &LinkedPaneFixture,
+) {
+    let response = handler
+        .handle_switch_client_ext3(
+            requester_pid,
+            SwitchClientExt3Request {
+                target_client: None,
+                target: Some(format!("{}:0.1", fixture.owner)),
+                key_table: None,
+                last_session: false,
+                next_session: false,
+                previous_session: false,
+                toggle_read_only: false,
+                sort_order: None,
+                skip_environment_update: false,
+                zoom: false,
+            },
+        )
+        .await;
+    assert!(
+        matches!(response, Response::SwitchClient(_)),
+        "{response:?}"
+    );
+}
+
 #[tokio::test]
 async fn select_pane_synchronizes_linked_and_grouped_window_aliases() {
     let handler = RequestHandler::new();
     let fixture = linked_two_pane_fixture(&handler, "select-linked").await;
 
-    let (control_tx, mut control_rx) = mpsc::unbounded_channel();
-    handler
-        .register_attach(7_091, fixture.grouped_peer.clone(), control_tx)
-        .await;
+    let mut control_rx = handler.attach_client(7_091, &fixture.grouped_peer).await;
     drain_attach_controls(&mut control_rx).await;
 
-    let response = handler
-        .handle(Request::SelectPane(Box::new(SelectPaneRequest {
-            target: PaneTarget::with_window(fixture.owner.clone(), 0, 1),
-            title: None,
-            style: None,
-            input_disabled: None,
-            preserve_zoom: false,
-        })))
-        .await;
-    assert!(matches!(response, Response::SelectPane(_)), "{response:?}");
+    let pane = PaneTarget::with_window(fixture.owner.clone(), 0, 1);
+    handler.handle_ok(SelectPaneRequest::fixture(pane)).await;
     assert_linked_active_pane(&handler, &fixture, 1).await;
 
-    let refreshed = timeout(Duration::from_secs(2), control_rx.recv())
-        .await
-        .expect("attached grouped alias refresh is bounded")
-        .expect("attached grouped alias remains registered");
-    assert!(
-        matches!(refreshed, AttachControl::Switch(_)),
-        "{refreshed:?}"
+    assert_refresh(
+        timeout(Duration::from_secs(2), control_rx.recv())
+            .await
+            .expect("attached grouped alias refresh is bounded")
+            .expect("attached grouped alias remains registered"),
     );
 }
 
@@ -251,10 +259,7 @@ async fn attached_mouse_focus_synchronizes_linked_and_grouped_window_aliases() {
     let handler = RequestHandler::new();
     let fixture = linked_two_pane_fixture(&handler, "mouse-select-linked").await;
     let requester_pid = std::process::id();
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    handler
-        .register_attach(requester_pid, fixture.owner.clone(), control_tx)
-        .await;
+    let _control_rx = handler.attach_client(requester_pid, &fixture.owner).await;
     let identity = handler.active_attach_identity_for_test(requester_pid).await;
     let (session_id, window_id) = {
         let state = handler.state.lock().await;
@@ -283,58 +288,26 @@ async fn switch_client_pane_target_synchronizes_linked_and_grouped_window_aliase
     let handler = RequestHandler::new();
     let fixture = linked_two_pane_fixture(&handler, "switch-select-linked").await;
     let requester_pid = std::process::id();
-    let (control_tx, mut control_rx) = mpsc::unbounded_channel();
-    handler
-        .register_attach(requester_pid, fixture.owner.clone(), control_tx)
-        .await;
-    let (peer_control_tx, mut peer_control_rx) = mpsc::unbounded_channel();
-    handler
-        .register_attach(
-            requester_pid.saturating_add(1),
-            fixture.grouped_peer.clone(),
-            peer_control_tx,
-        )
+    let mut control_rx = handler.attach_client(requester_pid, &fixture.owner).await;
+    let mut peer_control_rx = handler
+        .attach_client(requester_pid.saturating_add(1), &fixture.grouped_peer)
         .await;
     drain_attach_control_pair(&mut control_rx, &mut peer_control_rx).await;
 
-    let response = handler
-        .handle_switch_client_ext3(
-            requester_pid,
-            rmux_proto::request::SwitchClientExt3Request {
-                target_client: None,
-                target: Some(format!("{}:0.1", fixture.owner)),
-                key_table: None,
-                last_session: false,
-                next_session: false,
-                previous_session: false,
-                toggle_read_only: false,
-                sort_order: None,
-                skip_environment_update: false,
-                zoom: false,
-            },
-        )
-        .await;
-    assert!(
-        matches!(response, Response::SwitchClient(_)),
-        "{response:?}"
-    );
+    switch_to_pane_one(&handler, requester_pid, &fixture).await;
     assert_linked_active_pane(&handler, &fixture, 1).await;
 
-    let requester_switch = timeout(Duration::from_secs(2), control_rx.recv())
-        .await
-        .expect("switched client update is bounded")
-        .expect("switched client remains registered");
-    assert!(
-        matches!(requester_switch, AttachControl::Switch(_)),
-        "{requester_switch:?}"
+    assert_refresh(
+        timeout(Duration::from_secs(2), control_rx.recv())
+            .await
+            .expect("switched client update is bounded")
+            .expect("switched client remains registered"),
     );
-    let peer_refresh = timeout(Duration::from_secs(2), peer_control_rx.recv())
-        .await
-        .expect("linked peer refresh is bounded")
-        .expect("linked peer remains registered");
-    assert!(
-        matches!(peer_refresh, AttachControl::Switch(_)),
-        "{peer_refresh:?}"
+    assert_refresh(
+        timeout(Duration::from_secs(2), peer_control_rx.recv())
+            .await
+            .expect("linked peer refresh is bounded")
+            .expect("linked peer remains registered"),
     );
     let redundant = control_rx.try_recv();
     assert!(
@@ -348,65 +321,23 @@ async fn control_switch_client_pane_target_synchronizes_linked_and_grouped_windo
     let handler = RequestHandler::new();
     let fixture = linked_two_pane_fixture(&handler, "control-switch-select-linked").await;
     let requester_pid = std::process::id().saturating_add(200);
-    let (event_tx, mut event_rx) =
-        tokio::sync::mpsc::channel(crate::control::CONTROL_SERVER_EVENT_CAPACITY);
-    handler
-        .register_control_with_closing(
-            requester_pid,
-            crate::control::ControlModeUpgrade {
-                initial_command_count: 0,
-                mode: rmux_proto::ControlMode::Plain,
-                terminal_context: crate::outer_terminal::OuterTerminalContext::default(),
-            },
-            event_tx,
-            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        )
+    let (_, mut event_rx) = handler
+        .register_control_for_test(requester_pid, Some(&fixture.owner))
         .await;
-    handler
-        .set_control_session(requester_pid, Some(fixture.owner.clone()))
-        .await
-        .expect("control session registration succeeds");
     while event_rx.try_recv().is_ok() {}
 
-    let (peer_control_tx, mut peer_control_rx) = mpsc::unbounded_channel();
-    handler
-        .register_attach(
-            requester_pid.saturating_add(1),
-            fixture.grouped_peer.clone(),
-            peer_control_tx,
-        )
+    let mut peer_control_rx = handler
+        .attach_client(requester_pid.saturating_add(1), &fixture.grouped_peer)
         .await;
     drain_attach_controls(&mut peer_control_rx).await;
 
-    let response = handler
-        .handle_switch_client_ext3(
-            requester_pid,
-            rmux_proto::request::SwitchClientExt3Request {
-                target_client: None,
-                target: Some(format!("{}:0.1", fixture.owner)),
-                key_table: None,
-                last_session: false,
-                next_session: false,
-                previous_session: false,
-                toggle_read_only: false,
-                sort_order: None,
-                skip_environment_update: false,
-                zoom: false,
-            },
-        )
-        .await;
-    assert!(
-        matches!(response, Response::SwitchClient(_)),
-        "{response:?}"
-    );
+    switch_to_pane_one(&handler, requester_pid, &fixture).await;
     assert_linked_active_pane(&handler, &fixture, 1).await;
 
-    let peer_refresh = timeout(Duration::from_secs(2), peer_control_rx.recv())
-        .await
-        .expect("control switch linked peer refresh is bounded")
-        .expect("linked peer remains registered");
-    assert!(
-        matches!(peer_refresh, AttachControl::Switch(_)),
-        "{peer_refresh:?}"
+    assert_refresh(
+        timeout(Duration::from_secs(2), peer_control_rx.recv())
+            .await
+            .expect("control switch linked peer refresh is bounded")
+            .expect("linked peer remains registered"),
     );
 }

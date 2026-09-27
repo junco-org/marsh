@@ -4,178 +4,15 @@ use super::{QueuedLifecycleEvent, RequestHandler};
 use crate::pane_io::{AttachControl, PaneAlertEvent};
 use rmux_core::{LifecycleEvent, PaneId, WINDOW_BELL, WINLINK_ACTIVITY, WINLINK_BELL};
 use rmux_proto::{
-    HookLifecycle, HookName, KillSessionRequest, LinkWindowRequest, NewSessionExtRequest,
-    NewWindowRequest, OptionName, OptionScopeSelector, PaneTarget, Request, Response,
-    ScopeSelector, SessionName, SetHookMutationRequest, SetOptionByNameRequest, SetOptionMode,
-    SetOptionRequest, SplitDirection, SplitWindowExtRequest, SplitWindowTarget, TerminalSize,
-    WaitForMode, WaitForRequest, WindowId, WindowTarget,
+    HookName, KillSessionRequest, LinkWindowRequest, OptionName, OptionScopeSelector,
+    ScopeSelector, SessionName, SplitWindowExtRequest, WaitForMode, WaitForRequest, WindowId,
+    WindowTarget,
 };
 use tokio::sync::{broadcast, mpsc};
 use tokio::time::{timeout, Duration, Instant};
 
+use crate::test_fixtures::{quiet_command, Fixture, Grouped, Quiet};
 use crate::test_names::session_name;
-
-fn quiet_command() -> Vec<String> {
-    ["/bin/sh", "-c", "sleep 60"]
-        .into_iter()
-        .map(str::to_owned)
-        .collect()
-}
-
-async fn create_quiet_session(handler: &RequestHandler, name: &str) -> SessionName {
-    let session = session_name(name);
-    let response = handler
-        .handle(Request::NewSessionExt(Box::new(NewSessionExtRequest {
-            session_name: Some(session.clone()),
-            working_directory: None,
-            detached: true,
-            size: Some(TerminalSize { cols: 80, rows: 24 }),
-            environment: None,
-            group_target: None,
-            attach_if_exists: false,
-            detach_other_clients: false,
-            kill_other_clients: false,
-            flags: None,
-            window_name: None,
-            print_session_info: false,
-            print_format: None,
-            command: Some(quiet_command()),
-            process_command: None,
-            client_environment: None,
-            skip_environment_update: false,
-        })))
-        .await;
-    assert!(matches!(response, Response::NewSession(_)), "{response:?}");
-    handler
-        .wait_for_pane_startup_to_finish_for_test(&PaneTarget::new(session.clone(), 0))
-        .await;
-    session
-}
-
-async fn create_grouped_quiet_session(
-    handler: &RequestHandler,
-    name: &str,
-    group_target: &SessionName,
-) -> SessionName {
-    let session = session_name(name);
-    let response = handler
-        .handle(Request::NewSessionExt(Box::new(NewSessionExtRequest {
-            session_name: Some(session.clone()),
-            working_directory: None,
-            detached: true,
-            size: Some(TerminalSize { cols: 80, rows: 24 }),
-            environment: None,
-            group_target: Some(group_target.clone()),
-            attach_if_exists: false,
-            detach_other_clients: false,
-            kill_other_clients: false,
-            flags: None,
-            window_name: None,
-            print_session_info: false,
-            print_format: None,
-            command: None,
-            process_command: None,
-            client_environment: None,
-            skip_environment_update: false,
-        })))
-        .await;
-    assert!(matches!(response, Response::NewSession(_)), "{response:?}");
-    session
-}
-
-async fn link_window_alias(handler: &RequestHandler, source: WindowTarget, target: WindowTarget) {
-    let response = handler
-        .handle(Request::LinkWindow(LinkWindowRequest {
-            source,
-            target,
-            after: false,
-            before: false,
-            kill_destination: false,
-            detached: true,
-        }))
-        .await;
-    assert!(matches!(response, Response::LinkWindow(_)), "{response:?}");
-}
-
-async fn create_quiet_window(handler: &RequestHandler, session: &SessionName) -> WindowTarget {
-    let response = handler
-        .handle(Request::NewWindow(Box::new(NewWindowRequest {
-            target: session.clone(),
-            name: None,
-            detached: true,
-            start_directory: None,
-            environment: None,
-            command: Some(quiet_command()),
-            process_command: None,
-            target_window_index: None,
-            insert_at_target: false,
-        })))
-        .await;
-    let Response::NewWindow(response) = response else {
-        panic!("expected quiet new-window response, got {response:?}");
-    };
-    handler
-        .wait_for_pane_startup_to_finish_for_test(&PaneTarget::with_window(
-            session.clone(),
-            response.target.window_index(),
-            0,
-        ))
-        .await;
-    response.target
-}
-
-async fn set_option(
-    handler: &RequestHandler,
-    scope: ScopeSelector,
-    option: OptionName,
-    value: &str,
-) {
-    let response = handler
-        .handle(Request::SetOption(SetOptionRequest {
-            scope,
-            option,
-            value: value.to_owned(),
-            mode: SetOptionMode::Replace,
-        }))
-        .await;
-    assert!(matches!(response, Response::SetOption(_)), "{response:?}");
-}
-
-async fn enable_clipboard_hooks(handler: &RequestHandler) {
-    let response = handler
-        .handle(Request::SetOptionByName(Box::new(SetOptionByNameRequest {
-            scope: OptionScopeSelector::ServerGlobal,
-            name: "set-clipboard".to_owned(),
-            value: Some("on".to_owned()),
-            mode: SetOptionMode::Replace,
-            only_if_unset: false,
-            unset: false,
-            unset_pane_overrides: false,
-            format: false,
-            format_target: None,
-        })))
-        .await;
-    assert!(
-        matches!(response, Response::SetOptionByName(_)),
-        "{response:?}"
-    );
-}
-
-async fn set_global_hook(handler: &RequestHandler, hook: HookName, command: String) {
-    let response = handler
-        .handle(Request::SetHookMutation(SetHookMutationRequest {
-            scope: ScopeSelector::Global,
-            hook,
-            command: Some(command),
-            lifecycle: HookLifecycle::Persistent,
-            append: false,
-            unset: false,
-            run_immediately: false,
-            index: None,
-        }))
-        .await;
-    assert!(matches!(response, Response::SetHook(_)), "{response:?}");
-}
 
 async fn pane_identity(
     handler: &RequestHandler,
@@ -201,19 +38,12 @@ fn pane_event(
     generation: Option<u64>,
 ) -> PaneAlertEvent {
     PaneAlertEvent {
-        session_name,
-        pane_id,
         bell_count: 1,
         title_changed: true,
-        title_change: None,
-        path_changed: false,
         clipboard_set: true,
-        clipboard_writes: Vec::new(),
-        clipboard_queries: Vec::new(),
-        mouse_mode_changed: false,
-        alternate_mode_changed: false,
         queue_activity_alert: true,
         generation,
+        ..Fixture::fixture((session_name, pane_id))
     }
 }
 
@@ -306,23 +136,27 @@ async fn assert_no_alert_effects(
 #[tokio::test]
 async fn queued_pane_hook_does_not_block_an_unrelated_pane_alert() {
     let handler = RequestHandler::new();
-    let hooked_session = create_quiet_session(&handler, "pane-alert-queued-hook").await;
-    let live_session = create_quiet_session(&handler, "pane-alert-live-after-hook").await;
+    let hooked_session = handler
+        .create_started_session(Quiet("pane-alert-queued-hook"))
+        .await;
+    let live_session = handler
+        .create_started_session(Quiet("pane-alert-live-after-hook"))
+        .await;
     let hooked_target = WindowTarget::with_window(hooked_session.clone(), 0);
     let live_target = WindowTarget::with_window(live_session.clone(), 0);
-    set_option(
-        &handler,
-        ScopeSelector::Window(live_target.clone()),
-        OptionName::MonitorBell,
-        "on",
-    )
-    .await;
-    set_global_hook(
-        &handler,
-        HookName::PaneTitleChanged,
-        "set-buffer -b queued-title-hook fired".to_owned(),
-    )
-    .await;
+    handler
+        .set_option(
+            ScopeSelector::Window(live_target.clone()),
+            OptionName::MonitorBell,
+            "on",
+        )
+        .await;
+    handler
+        .set_global_hook(
+            HookName::PaneTitleChanged,
+            "set-buffer -b queued-title-hook fired",
+        )
+        .await;
     let (hooked_pane_id, hooked_generation, _) = pane_identity(&handler, &hooked_target).await;
     let (live_pane_id, live_generation, _) = pane_identity(&handler, &live_target).await;
     let mut lifecycle = handler.subscribe_lifecycle_events();
@@ -331,19 +165,9 @@ async fn queued_pane_hook_does_not_block_an_unrelated_pane_alert() {
         .expect("test owns the lifecycle dispatch receiver");
 
     handler.pane_alert_callback()(PaneAlertEvent {
-        session_name: hooked_session,
-        pane_id: hooked_pane_id,
-        bell_count: 0,
         title_changed: true,
-        title_change: None,
-        path_changed: false,
-        clipboard_set: false,
-        clipboard_writes: Vec::new(),
-        clipboard_queries: Vec::new(),
-        mouse_mode_changed: false,
-        alternate_mode_changed: false,
-        queue_activity_alert: false,
         generation: hooked_generation,
+        ..Fixture::fixture((hooked_session, hooked_pane_id))
     });
     let event = timeout(Duration::from_secs(2), lifecycle.recv())
         .await
@@ -355,19 +179,9 @@ async fn queued_pane_hook_does_not_block_an_unrelated_pane_alert() {
     // queues lifecycle work but does not wait for the hook command to run, so
     // a slow hook cannot retain the pane-alert serialization lock.
     handler.pane_alert_callback()(PaneAlertEvent {
-        session_name: live_session.clone(),
-        pane_id: live_pane_id,
         bell_count: 1,
-        title_changed: false,
-        title_change: None,
-        path_changed: false,
-        clipboard_set: false,
-        clipboard_writes: Vec::new(),
-        clipboard_queries: Vec::new(),
-        mouse_mode_changed: false,
-        alternate_mode_changed: false,
-        queue_activity_alert: false,
         generation: live_generation,
+        ..Fixture::fixture((&live_session, live_pane_id))
     });
 
     let deadline = Instant::now() + Duration::from_secs(2);
@@ -397,23 +211,27 @@ async fn queued_pane_hook_does_not_block_an_unrelated_pane_alert() {
 #[tokio::test]
 async fn exiting_pane_hook_wait_does_not_block_unrelated_pane_alert_flush() {
     let handler = RequestHandler::new();
-    let exiting_session = create_quiet_session(&handler, "pane-alert-exit-hook").await;
-    let live_session = create_quiet_session(&handler, "pane-alert-live-peer").await;
+    let exiting_session = handler
+        .create_started_session(Quiet("pane-alert-exit-hook"))
+        .await;
+    let live_session = handler
+        .create_started_session(Quiet("pane-alert-live-peer"))
+        .await;
     let exiting_target = WindowTarget::with_window(exiting_session.clone(), 0);
     let live_target = WindowTarget::with_window(live_session.clone(), 0);
-    set_option(
-        &handler,
-        ScopeSelector::Window(live_target.clone()),
-        OptionName::MonitorBell,
-        "on",
-    )
-    .await;
-    set_global_hook(
-        &handler,
-        HookName::PaneTitleChanged,
-        "set-buffer -b exit-title-hook fired".to_owned(),
-    )
-    .await;
+    handler
+        .set_option(
+            ScopeSelector::Window(live_target.clone()),
+            OptionName::MonitorBell,
+            "on",
+        )
+        .await;
+    handler
+        .set_global_hook(
+            HookName::PaneTitleChanged,
+            "set-buffer -b exit-title-hook fired",
+        )
+        .await;
     let (exiting_pane_id, exiting_generation, _) = pane_identity(&handler, &exiting_target).await;
     let (live_pane_id, live_generation, _) = pane_identity(&handler, &live_target).await;
     let mut lifecycle = handler.subscribe_lifecycle_events();
@@ -422,19 +240,9 @@ async fn exiting_pane_hook_wait_does_not_block_unrelated_pane_alert_flush() {
         .expect("test owns the lifecycle dispatch receiver");
 
     handler.pane_alert_callback()(PaneAlertEvent {
-        session_name: exiting_session,
-        pane_id: exiting_pane_id,
-        bell_count: 0,
         title_changed: true,
-        title_change: None,
-        path_changed: false,
-        clipboard_set: false,
-        clipboard_writes: Vec::new(),
-        clipboard_queries: Vec::new(),
-        mouse_mode_changed: false,
-        alternate_mode_changed: false,
-        queue_activity_alert: false,
         generation: exiting_generation,
+        ..Fixture::fixture((exiting_session, exiting_pane_id))
     });
     let exit_handler = handler.clone();
     let mut exit_flush = tokio::spawn(async move {
@@ -454,19 +262,9 @@ async fn exiting_pane_hook_wait_does_not_block_unrelated_pane_alert_flush() {
     );
 
     handler.pane_alert_callback()(PaneAlertEvent {
-        session_name: live_session.clone(),
-        pane_id: live_pane_id,
         bell_count: 1,
-        title_changed: false,
-        title_change: None,
-        path_changed: false,
-        clipboard_set: false,
-        clipboard_writes: Vec::new(),
-        clipboard_queries: Vec::new(),
-        mouse_mode_changed: false,
-        alternate_mode_changed: false,
-        queue_activity_alert: false,
         generation: live_generation,
+        ..Fixture::fixture((&live_session, live_pane_id))
     });
     let deadline = Instant::now() + Duration::from_secs(2);
     loop {
@@ -526,20 +324,24 @@ async fn pane_alert_reserves_each_lifecycle_position_immediately_before_emission
     const WAIT_CHANNEL: &str = "pane-alert-per-event-sequencing";
 
     let handler = RequestHandler::new();
-    let session = create_quiet_session(&handler, "pane-alert-per-event-sequencing").await;
-    enable_clipboard_hooks(&handler).await;
-    set_global_hook(
-        &handler,
-        HookName::PaneTitleChanged,
-        format!("wait-for {WAIT_CHANNEL}"),
-    )
-    .await;
-    set_global_hook(
-        &handler,
-        HookName::PaneSetClipboard,
-        "set-buffer -b second-pane-hook finished".to_owned(),
-    )
-    .await;
+    let session = handler
+        .create_started_session(Quiet("pane-alert-per-event-sequencing"))
+        .await;
+    handler
+        .set_option_by_name(OptionScopeSelector::ServerGlobal, "set-clipboard", "on")
+        .await;
+    handler
+        .set_global_hook(
+            HookName::PaneTitleChanged,
+            &format!("wait-for {WAIT_CHANNEL}"),
+        )
+        .await;
+    handler
+        .set_global_hook(
+            HookName::PaneSetClipboard,
+            "set-buffer -b second-pane-hook finished",
+        )
+        .await;
     let target = WindowTarget::with_window(session.clone(), 0);
     let (pane_id, generation, _) = pane_identity(&handler, &target).await;
     let mut lifecycle = handler.subscribe_lifecycle_events();
@@ -555,19 +357,10 @@ async fn pane_alert_reserves_each_lifecycle_position_immediately_before_emission
     });
 
     handler.pane_alert_callback()(PaneAlertEvent {
-        session_name: session,
-        pane_id,
-        bell_count: 0,
         title_changed: true,
-        title_change: None,
-        path_changed: false,
         clipboard_set: true,
-        clipboard_writes: Vec::new(),
-        clipboard_queries: Vec::new(),
-        mouse_mode_changed: false,
-        alternate_mode_changed: false,
-        queue_activity_alert: false,
         generation,
+        ..Fixture::fixture((session, pane_id))
     });
     let flush_handler = handler.clone();
     let mut flush = tokio::spawn(async move {
@@ -601,13 +394,9 @@ async fn pane_alert_reserves_each_lifecycle_position_immediately_before_emission
     .expect("the next pane event must not reserve ahead of an intervening publication")
     .expect("intervening buffer publication succeeds");
 
-    let response = handler
-        .handle(Request::WaitFor(WaitForRequest {
-            channel: WAIT_CHANNEL.to_owned(),
-            mode: WaitForMode::Signal,
-        }))
+    handler
+        .handle_ok(WaitForRequest::fixture((WAIT_CHANNEL, WaitForMode::Signal)))
         .await;
-    assert!(matches!(response, Response::WaitFor(_)), "{response:?}");
     timeout(Duration::from_secs(2), &mut flush)
         .await
         .expect("pane alert flush completes without a lifecycle ticket cycle")
@@ -651,44 +440,33 @@ async fn pane_alert_reserves_each_lifecycle_position_immediately_before_emission
 #[tokio::test]
 async fn exiting_pane_activity_cannot_rearm_silence_after_newer_same_window_activity() {
     let handler = RequestHandler::new();
-    let session = create_quiet_session(&handler, "pane-alert-exit-silence-order").await;
+    let session = handler
+        .create_started_session(Quiet("pane-alert-exit-silence-order"))
+        .await;
     let window_target = WindowTarget::with_window(session.clone(), 0);
     let split = handler
-        .handle(Request::SplitWindowExt(Box::new(SplitWindowExtRequest {
-            target: SplitWindowTarget::Session(session.clone()),
-            direction: SplitDirection::Vertical,
-            before: false,
-            environment: None,
+        .handle_ok(SplitWindowExtRequest {
             command: Some(quiet_command()),
-            process_command: None,
-            start_directory: None,
-            keep_alive_on_exit: None,
             detached: true,
-            size: None,
-            preserve_zoom: false,
-            full_size: false,
-            stdin_payload: None,
-        })))
+            ..Fixture::fixture(&session)
+        })
         .await;
-    let Response::SplitWindow(split) = split else {
-        panic!("expected split-window success, got {split:?}");
-    };
     handler
         .wait_for_pane_startup_to_finish_for_test(&split.pane)
         .await;
-    set_option(
-        &handler,
-        ScopeSelector::Window(window_target.clone()),
-        OptionName::MonitorSilence,
-        "60",
-    )
-    .await;
-    set_global_hook(
-        &handler,
-        HookName::PaneTitleChanged,
-        "set-buffer -b exit-silence-hook fired".to_owned(),
-    )
-    .await;
+    handler
+        .set_option(
+            ScopeSelector::Window(window_target.clone()),
+            OptionName::MonitorSilence,
+            "60",
+        )
+        .await;
+    handler
+        .set_global_hook(
+            HookName::PaneTitleChanged,
+            "set-buffer -b exit-silence-hook fired",
+        )
+        .await;
 
     let (exiting_pane_id, exiting_generation, live_pane_id, live_generation) = {
         let state = handler.state.lock().await;
@@ -715,19 +493,10 @@ async fn exiting_pane_activity_cannot_rearm_silence_after_newer_same_window_acti
         .expect("test owns the lifecycle dispatch receiver");
 
     handler.pane_alert_callback()(PaneAlertEvent {
-        session_name: session.clone(),
-        pane_id: exiting_pane_id,
-        bell_count: 0,
         title_changed: true,
-        title_change: None,
-        path_changed: false,
-        clipboard_set: false,
-        clipboard_writes: Vec::new(),
-        clipboard_queries: Vec::new(),
-        mouse_mode_changed: false,
-        alternate_mode_changed: false,
         queue_activity_alert: true,
         generation: exiting_generation,
+        ..Fixture::fixture((&session, exiting_pane_id))
     });
     let exit_handler = handler.clone();
     let mut exit_flush = tokio::spawn(async move {
@@ -752,19 +521,9 @@ async fn exiting_pane_activity_cannot_rearm_silence_after_newer_same_window_acti
     );
 
     handler.pane_alert_callback()(PaneAlertEvent {
-        session_name: session,
-        pane_id: live_pane_id,
-        bell_count: 0,
-        title_changed: false,
-        title_change: None,
-        path_changed: false,
-        clipboard_set: false,
-        clipboard_writes: Vec::new(),
-        clipboard_queries: Vec::new(),
-        mouse_mode_changed: false,
-        alternate_mode_changed: false,
         queue_activity_alert: true,
         generation: live_generation,
+        ..Fixture::fixture((session, live_pane_id))
     });
     let newer_timer = timeout(Duration::from_secs(2), async {
         loop {
@@ -822,13 +581,24 @@ async fn exiting_pane_activity_cannot_rearm_silence_after_newer_same_window_acti
 #[tokio::test]
 async fn pane_alert_reaches_every_linked_and_grouped_window_alias_once() {
     let handler = RequestHandler::new();
-    let owner = create_quiet_session(&handler, "m-pane-alert-family-owner").await;
-    let peer = create_grouped_quiet_session(&handler, "z-pane-alert-family-peer", &owner).await;
-    let external = create_quiet_session(&handler, "a-pane-alert-family-external").await;
+    let owner = handler
+        .create_started_session(Quiet("m-pane-alert-family-owner"))
+        .await;
+    let peer = handler
+        .create_session(Grouped("z-pane-alert-family-peer", &owner))
+        .await;
+    let external = handler
+        .create_started_session(Quiet("a-pane-alert-family-external"))
+        .await;
     let owner_target = WindowTarget::with_window(owner.clone(), 0);
     let peer_target = WindowTarget::with_window(peer.clone(), 0);
     let external_target = WindowTarget::with_window(external.clone(), 1);
-    link_window_alias(&handler, owner_target.clone(), external_target.clone()).await;
+    handler
+        .handle_ok(LinkWindowRequest::fixture((
+            &owner_target,
+            &external_target,
+        )))
+        .await;
     let family_targets = vec![owner_target.clone(), peer_target, external_target];
 
     for target in &family_targets {
@@ -837,24 +607,16 @@ async fn pane_alert_reaches_every_linked_and_grouped_window_alias_once() {
             (OptionName::MonitorBell, "on"),
             (OptionName::MonitorSilence, "60"),
         ] {
-            set_option(
-                &handler,
-                ScopeSelector::Window(target.clone()),
-                option,
-                value,
-            )
-            .await;
+            handler
+                .set_option(ScopeSelector::Window(target.clone()), option, value)
+                .await;
         }
     }
     for session in [owner.clone(), peer, external] {
         for option in [OptionName::ActivityAction, OptionName::BellAction] {
-            set_option(
-                &handler,
-                ScopeSelector::Session(session.clone()),
-                option,
-                "any",
-            )
-            .await;
+            handler
+                .set_option(ScopeSelector::Session(session.clone()), option, "any")
+                .await;
         }
     }
     let timer_generations = family_targets
@@ -910,28 +672,24 @@ async fn pane_alert_reaches_every_linked_and_grouped_window_alias_once() {
 #[tokio::test]
 async fn pane_alert_survives_an_earlier_alias_added_between_prepare_and_apply() {
     let handler = RequestHandler::new();
-    let owner = create_quiet_session(&handler, "z-pane-alert-added-owner").await;
-    let alias = create_quiet_session(&handler, "a-pane-alert-added-alias").await;
+    let owner = handler
+        .create_started_session(Quiet("z-pane-alert-added-owner"))
+        .await;
+    let alias = handler
+        .create_started_session(Quiet("a-pane-alert-added-alias"))
+        .await;
     let owner_target = WindowTarget::with_window(owner.clone(), 0);
     let alias_target = WindowTarget::with_window(alias.clone(), 1);
     for option in [OptionName::MonitorActivity, OptionName::MonitorBell] {
-        set_option(
-            &handler,
-            ScopeSelector::Window(owner_target.clone()),
-            option,
-            "on",
-        )
-        .await;
+        handler
+            .set_option(ScopeSelector::Window(owner_target.clone()), option, "on")
+            .await;
     }
     for session in [owner.clone(), alias] {
         for option in [OptionName::ActivityAction, OptionName::BellAction] {
-            set_option(
-                &handler,
-                ScopeSelector::Session(session.clone()),
-                option,
-                "any",
-            )
-            .await;
+            handler
+                .set_option(ScopeSelector::Session(session.clone()), option, "any")
+                .await;
         }
     }
     let (pane_id, generation, window_id) = pane_identity(&handler, &owner_target).await;
@@ -940,15 +698,13 @@ async fn pane_alert_survives_an_earlier_alias_added_between_prepare_and_apply() 
         .await
         .expect("pane alert prepares before the alias exists");
 
-    link_window_alias(&handler, owner_target.clone(), alias_target.clone()).await;
-    for option in [OptionName::MonitorActivity, OptionName::MonitorBell] {
-        set_option(
-            &handler,
-            ScopeSelector::Window(alias_target.clone()),
-            option,
-            "on",
-        )
+    handler
+        .handle_ok(LinkWindowRequest::fixture((&owner_target, &alias_target)))
         .await;
+    for option in [OptionName::MonitorActivity, OptionName::MonitorBell] {
+        handler
+            .set_option(ScopeSelector::Window(alias_target.clone()), option, "on")
+            .await;
     }
     let mut lifecycle = handler.subscribe_lifecycle_events();
     handler
@@ -988,37 +744,43 @@ async fn pane_alert_survives_an_earlier_alias_added_between_prepare_and_apply() 
 #[tokio::test]
 async fn pane_alert_reindex_keeps_hooks_name_and_flags_on_the_original_window_id() {
     let handler = RequestHandler::new();
-    let destination = create_quiet_session(&handler, "pane-alert-reindex-destination").await;
-    let alerted = create_quiet_window(&handler, &destination).await;
-    let source = create_quiet_session(&handler, "pane-alert-reindex-source").await;
-    set_option(
-        &handler,
-        ScopeSelector::Window(alerted.clone()),
-        OptionName::MonitorActivity,
-        "on",
-    )
-    .await;
-    set_option(
-        &handler,
-        ScopeSelector::Window(alerted.clone()),
-        OptionName::AutomaticRenameFormat,
-        "stable-pane-alert-name",
-    )
-    .await;
-    enable_clipboard_hooks(&handler).await;
+    let destination = handler
+        .create_started_session(Quiet("pane-alert-reindex-destination"))
+        .await;
+    let alerted = handler.create_started_window(Quiet(&destination)).await;
+    let source = handler
+        .create_started_session(Quiet("pane-alert-reindex-source"))
+        .await;
+    handler
+        .set_option(
+            ScopeSelector::Window(alerted.clone()),
+            OptionName::MonitorActivity,
+            "on",
+        )
+        .await;
+    handler
+        .set_option(
+            ScopeSelector::Window(alerted.clone()),
+            OptionName::AutomaticRenameFormat,
+            "stable-pane-alert-name",
+        )
+        .await;
+    handler
+        .set_option_by_name(OptionScopeSelector::ServerGlobal, "set-clipboard", "on")
+        .await;
     let (pane_id, generation, alerted_window_id) = pane_identity(&handler, &alerted).await;
     for (hook, buffer) in [
         (HookName::PaneTitleChanged, "stable-pane-title"),
         (HookName::PaneSetClipboard, "stable-pane-clipboard"),
     ] {
-        set_global_hook(
-            &handler,
-            hook,
-            format!(
-                "if-shell -F '#{{==:#{{window_id}}:#{{window_index}},{alerted_window_id}:2}}' 'set-buffer -b {buffer} ok' 'set-buffer -b {buffer} bad'"
-            ),
-        )
-        .await;
+        handler
+            .set_global_hook(
+                hook,
+                &format!(
+                    "if-shell -F '#{{==:#{{window_id}}:#{{window_index}},{alerted_window_id}:2}}' 'set-buffer -b {buffer} ok' 'set-buffer -b {buffer} bad'"
+                ),
+            )
+            .await;
     }
     let mut lifecycle = handler.subscribe_lifecycle_events();
     let pause = handler.install_pane_alert_apply_pause();
@@ -1033,17 +795,15 @@ async fn pane_alert_reindex_keeps_hooks_name_and_flags_on_the_original_window_id
         .await
         .expect("pane alert reaches final-apply pause");
 
-    let response = handler
-        .handle(Request::LinkWindow(LinkWindowRequest {
-            source: WindowTarget::with_window(source, 0),
-            target: WindowTarget::with_window(destination.clone(), 0),
+    handler
+        .handle_ok(LinkWindowRequest {
             after: true,
-            before: false,
-            kill_destination: false,
-            detached: true,
-        }))
+            ..Fixture::fixture((
+                WindowTarget::with_window(source, 0),
+                WindowTarget::with_window(destination.clone(), 0),
+            ))
+        })
         .await;
-    assert!(matches!(response, Response::LinkWindow(_)), "{response:?}");
     pause.release.notify_one();
     timeout(Duration::from_secs(5), &mut task)
         .await
@@ -1086,35 +846,38 @@ async fn pane_alert_reindex_keeps_hooks_name_and_flags_on_the_original_window_id
 #[tokio::test]
 async fn pane_alert_replacement_fails_closed_before_hooks_name_or_flags_reach_reused_slot() {
     let handler = RequestHandler::new();
-    let destination = create_quiet_session(&handler, "pane-alert-replace-destination").await;
-    let alerted = create_quiet_window(&handler, &destination).await;
-    let source = create_quiet_session(&handler, "pane-alert-replace-source").await;
-    set_option(
-        &handler,
-        ScopeSelector::Window(alerted.clone()),
-        OptionName::MonitorActivity,
-        "on",
-    )
-    .await;
-    set_option(
-        &handler,
-        ScopeSelector::Window(alerted.clone()),
-        OptionName::AutomaticRenameFormat,
-        "stale-pane-alert-name",
-    )
-    .await;
-    enable_clipboard_hooks(&handler).await;
+    let destination = handler
+        .create_started_session(Quiet("pane-alert-replace-destination"))
+        .await;
+    let alerted = handler.create_started_window(Quiet(&destination)).await;
+    let source = handler
+        .create_started_session(Quiet("pane-alert-replace-source"))
+        .await;
+    handler
+        .set_option(
+            ScopeSelector::Window(alerted.clone()),
+            OptionName::MonitorActivity,
+            "on",
+        )
+        .await;
+    handler
+        .set_option(
+            ScopeSelector::Window(alerted.clone()),
+            OptionName::AutomaticRenameFormat,
+            "stale-pane-alert-name",
+        )
+        .await;
+    handler
+        .set_option_by_name(OptionScopeSelector::ServerGlobal, "set-clipboard", "on")
+        .await;
     let (pane_id, generation, alerted_window_id) = pane_identity(&handler, &alerted).await;
     for (hook, buffer) in [
         (HookName::PaneTitleChanged, "stale-pane-title"),
         (HookName::PaneSetClipboard, "stale-pane-clipboard"),
     ] {
-        set_global_hook(
-            &handler,
-            hook,
-            format!("set-buffer -b {buffer} wrong-target"),
-        )
-        .await;
+        handler
+            .set_global_hook(hook, &format!("set-buffer -b {buffer} wrong-target"))
+            .await;
     }
     let mut lifecycle = handler.subscribe_lifecycle_events();
     let pause = handler.install_pane_alert_apply_pause();
@@ -1129,17 +892,12 @@ async fn pane_alert_replacement_fails_closed_before_hooks_name_or_flags_reach_re
         .await
         .expect("pane alert reaches replacement pause");
 
-    let response = handler
-        .handle(Request::LinkWindow(LinkWindowRequest {
-            source: WindowTarget::with_window(source, 0),
-            target: alerted.clone(),
-            after: false,
-            before: false,
+    handler
+        .handle_ok(LinkWindowRequest {
             kill_destination: true,
-            detached: true,
-        }))
+            ..Fixture::fixture((WindowTarget::with_window(source, 0), &alerted))
+        })
         .await;
-    assert!(matches!(response, Response::LinkWindow(_)), "{response:?}");
     pause.release.notify_one();
     timeout(Duration::from_secs(5), &mut task)
         .await
@@ -1172,40 +930,34 @@ async fn pane_alert_replacement_fails_closed_before_hooks_name_or_flags_reach_re
 #[tokio::test]
 async fn alert_plan_effects_follow_session_id_through_hook_rename_and_name_reuse() {
     let handler = RequestHandler::new();
-    let alpha = create_quiet_session(&handler, "alert-plan-alpha").await;
-    let alerted = create_quiet_window(&handler, &alpha).await;
+    let alpha = handler
+        .create_started_session(Quiet("alert-plan-alpha"))
+        .await;
+    let alerted = handler.create_started_window(Quiet(&alpha)).await;
     let beta = session_name("alert-plan-beta");
-    let original_session_id = {
-        let state = handler.state.lock().await;
-        state.sessions.session(&alpha).expect("alpha exists").id()
-    };
-    set_option(
-        &handler,
-        ScopeSelector::Window(alerted.clone()),
-        OptionName::MonitorBell,
-        "on",
-    )
-    .await;
+    let original_session_id = handler.session_id_for_test(&alpha).await;
+    handler
+        .set_option(
+            ScopeSelector::Window(alerted.clone()),
+            OptionName::MonitorBell,
+            "on",
+        )
+        .await;
     for (option, value) in [
         (OptionName::BellAction, "any"),
         (OptionName::VisualBell, "both"),
     ] {
-        set_option(
-            &handler,
-            ScopeSelector::Session(alpha.clone()),
-            option,
-            value,
+        handler
+            .set_option(ScopeSelector::Session(alpha.clone()), option, value)
+            .await;
+    }
+    handler
+        .set_global_hook(
+            HookName::AlertBell,
+            &format!("rename-session -t {alpha} {beta}"),
         )
         .await;
-    }
-    set_global_hook(
-        &handler,
-        HookName::AlertBell,
-        format!("rename-session -t {alpha} {beta}"),
-    )
-    .await;
-    let (beta_tx, mut beta_rx) = mpsc::unbounded_channel();
-    handler.register_attach(710, alpha.clone(), beta_tx).await;
+    let mut beta_rx = handler.attach_client(710, &alpha).await;
     drain_controls(&mut beta_rx).await;
     let mut lifecycle = handler.subscribe_lifecycle_events();
     let pause = handler.install_alert_plan_effect_pause();
@@ -1233,9 +985,8 @@ async fn alert_plan_effects_follow_session_id_through_hook_rename_and_name_reuse
         );
     }
 
-    let reused_alpha = create_quiet_session(&handler, alpha.as_str()).await;
-    let (alpha_tx, mut alpha_rx) = mpsc::unbounded_channel();
-    handler.register_attach(711, reused_alpha, alpha_tx).await;
+    let reused_alpha = handler.create_started_session(Quiet(&alpha)).await;
+    let mut alpha_rx = handler.attach_client(711, reused_alpha).await;
     drain_controls(&mut beta_rx).await;
     drain_controls(&mut alpha_rx).await;
     pause.release.notify_one();
@@ -1272,26 +1023,24 @@ async fn alert_plan_effects_follow_session_id_through_hook_rename_and_name_reuse
 #[tokio::test]
 async fn alert_plan_effects_fail_closed_after_session_destroy_and_name_reuse() {
     let handler = RequestHandler::new();
-    let alpha = create_quiet_session(&handler, "alert-plan-destroy-alpha").await;
-    let alerted = create_quiet_window(&handler, &alpha).await;
-    set_option(
-        &handler,
-        ScopeSelector::Window(alerted.clone()),
-        OptionName::MonitorBell,
-        "on",
-    )
-    .await;
+    let alpha = handler
+        .create_started_session(Quiet("alert-plan-destroy-alpha"))
+        .await;
+    let alerted = handler.create_started_window(Quiet(&alpha)).await;
+    handler
+        .set_option(
+            ScopeSelector::Window(alerted.clone()),
+            OptionName::MonitorBell,
+            "on",
+        )
+        .await;
     for (option, value) in [
         (OptionName::BellAction, "any"),
         (OptionName::VisualBell, "both"),
     ] {
-        set_option(
-            &handler,
-            ScopeSelector::Session(alpha.clone()),
-            option,
-            value,
-        )
-        .await;
+        handler
+            .set_option(ScopeSelector::Session(alpha.clone()), option, value)
+            .await;
     }
     let pause = handler.install_alert_plan_effect_pause();
     let task_handler = handler.clone();
@@ -1301,18 +1050,9 @@ async fn alert_plan_effects_fail_closed_after_session_destroy_and_name_reuse() {
     timeout(Duration::from_secs(3), pause.reached.notified())
         .await
         .expect("alert plan pauses before effects");
-    let response = handler
-        .handle(Request::KillSession(KillSessionRequest {
-            target: alpha.clone(),
-            kill_all_except_target: false,
-            clear_alerts: false,
-            kill_group: false,
-        }))
-        .await;
-    assert!(matches!(response, Response::KillSession(_)), "{response:?}");
-    let reused_alpha = create_quiet_session(&handler, alpha.as_str()).await;
-    let (control_tx, mut control_rx) = mpsc::unbounded_channel();
-    handler.register_attach(712, reused_alpha, control_tx).await;
+    handler.handle_ok(KillSessionRequest::fixture(&alpha)).await;
+    let reused_alpha = handler.create_started_session(Quiet(&alpha)).await;
+    let mut control_rx = handler.attach_client(712, reused_alpha).await;
     drain_controls(&mut control_rx).await;
     pause.release.notify_one();
     timeout(Duration::from_secs(5), &mut task)
@@ -1329,26 +1069,24 @@ async fn alert_plan_effects_fail_closed_after_session_destroy_and_name_reuse() {
 #[tokio::test]
 async fn alert_overlay_fails_closed_when_session_name_is_reused_after_resolution() {
     let handler = RequestHandler::new();
-    let alpha = create_quiet_session(&handler, "alert-overlay-reuse").await;
-    let alerted = create_quiet_window(&handler, &alpha).await;
-    set_option(
-        &handler,
-        ScopeSelector::Window(alerted.clone()),
-        OptionName::MonitorBell,
-        "on",
-    )
-    .await;
+    let alpha = handler
+        .create_started_session(Quiet("alert-overlay-reuse"))
+        .await;
+    let alerted = handler.create_started_window(Quiet(&alpha)).await;
+    handler
+        .set_option(
+            ScopeSelector::Window(alerted.clone()),
+            OptionName::MonitorBell,
+            "on",
+        )
+        .await;
     for (option, value) in [
         (OptionName::BellAction, "any"),
         (OptionName::VisualBell, "on"),
     ] {
-        set_option(
-            &handler,
-            ScopeSelector::Session(alpha.clone()),
-            option,
-            value,
-        )
-        .await;
+        handler
+            .set_option(ScopeSelector::Session(alpha.clone()), option, value)
+            .await;
     }
 
     let pause = handler.install_alert_overlay_identity_pause();
@@ -1360,18 +1098,9 @@ async fn alert_overlay_fails_closed_when_session_name_is_reused_after_resolution
         .await
         .expect("alert overlay pauses after resolving the stable session");
 
-    let response = handler
-        .handle(Request::KillSession(KillSessionRequest {
-            target: alpha.clone(),
-            kill_all_except_target: false,
-            clear_alerts: false,
-            kill_group: false,
-        }))
-        .await;
-    assert!(matches!(response, Response::KillSession(_)), "{response:?}");
-    let replacement = create_quiet_session(&handler, alpha.as_str()).await;
-    let (control_tx, mut control_rx) = mpsc::unbounded_channel();
-    handler.register_attach(713, replacement, control_tx).await;
+    handler.handle_ok(KillSessionRequest::fixture(&alpha)).await;
+    let replacement = handler.create_started_session(Quiet(&alpha)).await;
+    let mut control_rx = handler.attach_client(713, replacement).await;
     drain_controls(&mut control_rx).await;
 
     pause.release();

@@ -19,6 +19,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::io::{Read, Write};
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
@@ -27,16 +28,16 @@ use brush_core::commands::{CommandArg, ShellForCommand, SimpleCommand};
 use brush_core::env::EnvironmentScope;
 use brush_core::openfiles::{OpenFile, OpenFiles};
 use brush_core::processes::{ChildProcess, ProcessWaitResult};
-use brush_core::results::{ExecutionSpawnResult, ExecutionWaitResult};
+use brush_core::results::ExecutionWaitResult;
 use brush_core::{
     ExecutionContext, ExecutionParameters, ExecutionResult, ProcessGroupPolicy, Shell,
     ShellExtensions, ShellVariable,
 };
 
-use super::git::SNAPSHOT_ROOT_VAR;
 use super::gitcmd::{self, GitAction, GitInvocation};
+use crate::shell::execution::brush_error;
 use crate::shell::policy::capability_of;
-use crate::shell::session::{GitCohortKind, GitEffectRecord, GitGuard, Snapshot, end_process};
+use crate::shell::snapshot::{GitCohortKind, GitEffectRecord, Snapshot};
 
 /// Exit code of a command the shell cannot find.
 const NOT_FOUND: u8 = 127;
@@ -75,7 +76,7 @@ const PROBE_OPTIONS: [&str; 5] = [
 pub(crate) async fn run<SE: ShellExtensions>(
     context: ExecutionContext<'_, SE>,
     argv: Vec<String>,
-    snapshot: Option<Arc<Snapshot>>,
+    snapshot: Arc<Snapshot>,
 ) -> Result<ExecutionResult, brush_core::Error> {
     let Some(git) = context
         .shell
@@ -90,18 +91,12 @@ pub(crate) async fn run<SE: ShellExtensions>(
         Some(action) if action.is_read() && !action.is_write() => GitCohortKind::Inspect,
         _ => GitCohortKind::Exclusive,
     };
-    let bound = match &snapshot {
-        Some(snapshot) => Some(snapshot.path().to_path_buf()),
-        None => context
-            .shell
-            .env_str(SNAPSHOT_ROOT_VAR)
-            .map(|root| physical(Path::new(&*root))),
-    };
+    let bound = snapshot.path().to_path_buf();
 
     // One clone per invocation carries every overlay, so nothing set here can leak into the
     // caller's shell, whatever becomes of this future.
     let mut shell = context.shell.clone();
-    isolate(&mut shell, bound.as_deref(), kind)?;
+    isolate(&mut shell, &bound, kind)?;
     let cwd = effective_cwd(shell.working_dir(), invocation.global_args);
     let mut runner = Runner {
         shell: &mut shell,
@@ -111,25 +106,12 @@ pub(crate) async fn run<SE: ShellExtensions>(
         target: None,
     };
 
-    let layout = match &bound {
-        None => None,
-        Some(bound) => match runner.contain(&invocation, &cwd, bound).await {
-            Ok(layout) => layout,
-            Err(refusal) => {
-                writeln!(context.stderr(), "fatal: {refusal}")?;
-                return Ok(ExecutionResult::new(FATAL));
-            }
-        },
+    let admitted = match runner.contain(&invocation, &cwd, &bound).await {
+        Ok(layout) => snapshot.begin_git(kind).map(|guard| (layout, guard)),
+        Err(refusal) => Err(format!("fatal: {refusal}")),
     };
-
-    let (Some(snapshot), Some(bound)) = (snapshot, bound) else {
-        let (result, _) = runner
-            .execute(&argv, context.process_group_id, None)
-            .await?;
-        return Ok(result);
-    };
-    let guard = match snapshot.begin_git(kind) {
-        Ok(guard) => guard,
+    let (layout, guard) = match admitted {
+        Ok(admitted) => admitted,
         Err(refusal) => {
             writeln!(context.stderr(), "{refusal}")?;
             return Ok(ExecutionResult::new(FATAL));
@@ -146,22 +128,31 @@ pub(crate) async fn run<SE: ShellExtensions>(
             }
         },
     };
-    let started_at = marsh_instrument::now_micros();
-    let (result, stopped) = runner
-        .execute(&argv, context.process_group_id, Some(&guard))
-        .await?;
-    let finished_at = marsh_instrument::now_micros();
+    let (result, stopped) = runner.execute(&argv, context.process_group_id).await?;
     if stopped {
         guard.fail("git: a managed git was stopped before it completed".to_string());
     }
 
-    let window = match crate::shell::blocking_boundary(|| snapshot.drain_trace()) {
-        Ok(()) => snapshot.writes_between(started_at, finished_at),
-        Err(error) => {
-            guard.fail(format!("git: {error}"));
+    let trace_snapshot = Arc::clone(&snapshot);
+    let run = snapshot.active().map_err(brush_error)?;
+    let drain = {
+        let internal = run.tracing.internal_scope()?;
+        let _guard = internal.enter();
+        run.runtime
+            .spawn_blocking(move || trace_snapshot.drain_trace())
+    };
+    let window = match drain.await {
+        Ok(Ok(())) => snapshot.writes_for(guard.invocation),
+        failure => {
+            guard.fail(format!("git: evidence drain failed: {failure:?}"));
             return Ok(result);
         }
     };
+    if !result.is_success() && !window.is_empty() {
+        guard.fail("failed git invocation changed protected state".into());
+        return Ok(result);
+    }
+    let invocation_id = guard.invocation;
     match (kind, before) {
         (GitCohortKind::Inspect, _) => {
             if window.iter().any(|path| changes_repository_state(path)) {
@@ -176,8 +167,9 @@ pub(crate) async fn run<SE: ShellExtensions>(
                 .await
             {
                 Ok((requests, metadata)) => guard.record(GitEffectRecord {
-                    started_at,
-                    finished_at,
+                    invocation: invocation_id,
+                    started_order: 0,
+                    finished_order: 0,
                     requests,
                     metadata,
                 }),
@@ -198,14 +190,14 @@ pub(crate) async fn run<SE: ShellExtensions>(
 /// cannot rewrite the index while only reading it.
 fn isolate<SE: ShellExtensions>(
     shell: &mut Shell<SE>,
-    bound: Option<&Path>,
+    bound: &Path,
     kind: GitCohortKind,
 ) -> Result<(), brush_core::Error> {
     let mut overlays: Vec<(String, String)> = ISOLATION
         .iter()
         .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
         .collect();
-    if let Some(ceiling) = bound.and_then(Path::parent) {
+    if let Some(ceiling) = bound.parent() {
         let ceiling = ceiling.to_string_lossy();
         let value = match shell.env_str("GIT_CEILING_DIRECTORIES") {
             Some(existing) if !existing.is_empty() => format!("{ceiling}:{existing}"),
@@ -244,51 +236,23 @@ fn isolate<SE: ShellExtensions>(
 
 /// The directory git runs in once the command line's `-C` options have been applied, in order.
 fn effective_cwd<S: AsRef<str>>(start: &Path, globals: &[S]) -> PathBuf {
-    let mut cwd = start.to_path_buf();
-    let mut words = globals.iter().map(AsRef::as_ref);
-    while let Some(word) = words.next() {
-        match word {
-            "-C" => {
-                if let Some(directory) = words.next() {
-                    cwd = gitcmd::resolve(&cwd, directory);
-                }
-            }
-            "-c" | "--git-dir" | "--work-tree" | "--namespace" | "--config-env"
-            | "--attr-source" | "--shallow-file" => {
-                words.next();
-            }
-            _ => {}
-        }
-    }
-    cwd
+    gitcmd::global_options(globals).fold(start.to_path_buf(), |cwd, option| match option {
+        ("-C", Some(directory)) => gitcmd::resolve(&cwd, directory),
+        _ => cwd,
+    })
 }
 
 /// The value of a global option that takes a path, from either spelling; the last one wins.
 fn global_path<'a, S: AsRef<str>>(globals: &'a [S], name: &str) -> Option<&'a str> {
-    let mut found = None;
-    let mut words = globals.iter().map(AsRef::as_ref);
-    while let Some(word) = words.next() {
+    gitcmd::global_options(globals).fold(None, |found, (word, value)| {
         if word == name {
-            found = words.next().or(found);
-        } else if let Some(value) = word
-            .strip_prefix(name)
-            .and_then(|rest| rest.strip_prefix('='))
-        {
-            found = Some(value);
-        } else if matches!(
-            word,
-            "-C" | "-c"
-                | "--git-dir"
-                | "--work-tree"
-                | "--namespace"
-                | "--config-env"
-                | "--attr-source"
-                | "--shallow-file"
-        ) {
-            words.next();
+            value.or(found)
+        } else {
+            word.strip_prefix(name)
+                .and_then(|rest| rest.strip_prefix('='))
+                .or(found)
         }
-    }
-    found
+    })
 }
 
 /// `path` with its longest existing ancestor resolved through the filesystem, so a symlink out
@@ -411,7 +375,6 @@ impl<SE: ShellExtensions> Runner<'_, SE> {
         &mut self,
         argv: &[String],
         group: Option<i32>,
-        guard: Option<&GitGuard>,
     ) -> Result<(ExecutionResult, bool), brush_core::Error> {
         let mut params = self.params.clone();
         if group.is_none()
@@ -422,26 +385,34 @@ impl<SE: ShellExtensions> Runner<'_, SE> {
         {
             params.process_group_policy = ProcessGroupPolicy::NewProcessGroup;
         }
-        let args = std::iter::once(self.git.to_string())
-            .chain(argv.iter().skip(1).cloned())
+        self.spawn(params, argv.iter().skip(1).cloned(), group)
+            .await
+    }
+
+    /// Runs `git` with `args` through the shell's own external-command path — never a function
+    /// of that name — and waits for it; a process that stopped instead is ended and reaped.
+    ///
+    /// Returns the result and whether the process had to be ended.
+    async fn spawn(
+        &mut self,
+        params: ExecutionParameters,
+        args: impl IntoIterator<Item = String> + Send,
+        group: Option<i32>,
+    ) -> Result<(ExecutionResult, bool), brush_core::Error> {
+        let argv = std::iter::once(self.git.to_string())
+            .chain(args)
             .map(CommandArg::String)
             .collect();
         let mut command = SimpleCommand::new(
             ShellForCommand::ParentShell(self.shell),
             params,
             self.git.to_string(),
-            args,
+            argv,
         );
         command.use_functions = false;
         command.argv0 = Some("git".to_string());
         command.process_group_id = group;
-        let spawned = command.execute().await?;
-        if let (Some(guard), ExecutionSpawnResult::StartedProcess(child)) = (guard, &spawned)
-            && let Some(pid) = child.pid()
-        {
-            guard.spawned(pid, child.pgid());
-        }
-        match spawned.wait().await? {
+        match command.execute().await?.wait().await? {
             ExecutionWaitResult::Completed(result) => Ok((result, false)),
             ExecutionWaitResult::Stopped(child) => Ok((reap(child).await?, true)),
         }
@@ -454,60 +425,46 @@ impl<SE: ShellExtensions> Runner<'_, SE> {
     /// cannot stall it. The probe goes through the same spawner as the command, and is recorded
     /// and traced like it: it is part of what this line ran.
     async fn probe(&mut self, args: &[&str]) -> Result<Probe, String> {
-        let failure =
-            |error: &dyn std::fmt::Display| format!("git: a probe could not run: {error}");
-        let (out, out_writer) = std::io::pipe().map_err(|error| failure(&error))?;
-        let (err, err_writer) = std::io::pipe().map_err(|error| failure(&error))?;
-        let null = std::fs::File::open("/dev/null").map_err(|error| failure(&error))?;
+        let (out, out_writer) = std::io::pipe().map_err(unprobed)?;
+        let (err, err_writer) = std::io::pipe().map_err(unprobed)?;
+        let null = std::fs::File::open("/dev/null").map_err(unprobed)?;
         let mut params = self.params.clone();
         params.set_fd(OpenFiles::STDIN_FD, OpenFile::File(null));
         params.set_fd(OpenFiles::STDOUT_FD, out_writer.into());
         params.set_fd(OpenFiles::STDERR_FD, err_writer.into());
         params.process_group_policy = ProcessGroupPolicy::NewProcessGroup;
-        let stdout = std::thread::spawn(move || read_all(out));
-        let stderr = std::thread::spawn(move || read_all(err));
+        let managed = super::current_context()
+            .ok_or_else(|| "git probe has no managed context".to_string())?;
+        let stdout = managed
+            .spawn_blocking(move || read_all(out))
+            .map_err(unprobed)?;
+        let stderr = managed
+            .spawn_blocking(move || read_all(err))
+            .map_err(unprobed)?;
 
-        let mut argv: Vec<CommandArg> = vec![CommandArg::String(self.git.to_string())];
-        argv.extend(
-            self.globals
-                .iter()
-                .map(|word| CommandArg::String(word.clone())),
-        );
-        if let Some(target) = &self.target {
-            argv.extend([
-                CommandArg::String("-C".to_string()),
-                CommandArg::String(target.clone()),
-            ]);
-        }
-        argv.extend(
-            PROBE_OPTIONS
-                .iter()
-                .chain(args)
-                .map(|word| CommandArg::String((*word).to_string())),
-        );
-        let mut command = SimpleCommand::new(
-            ShellForCommand::ParentShell(self.shell),
-            params,
-            self.git.to_string(),
-            argv,
-        );
-        command.use_functions = false;
-        command.argv0 = Some("git".to_string());
-        let status = match command.execute().await {
-            Ok(spawned) => match spawned.wait().await {
-                Ok(ExecutionWaitResult::Completed(result)) => Ok(result),
-                Ok(ExecutionWaitResult::Stopped(child)) => reap(child).await,
-                Err(error) => Err(error),
-            },
-            Err(error) => Err(error),
-        };
-        let stdout = stdout.join().unwrap_or_else(|_| Ok(Vec::new()));
-        let stderr = stderr.join().unwrap_or_else(|_| Ok(Vec::new()));
-        let status = status.map_err(|error| failure(&error))?;
+        let target = self
+            .target
+            .iter()
+            .flat_map(|target| ["-C".to_string(), target.clone()]);
+        let options = PROBE_OPTIONS
+            .iter()
+            .chain(args)
+            .map(|word| (*word).to_string());
+        let argv: Vec<String> = self
+            .globals
+            .iter()
+            .cloned()
+            .chain(target)
+            .chain(options)
+            .collect();
+        let status = self.spawn(params, argv, None).await;
+        let stdout = stdout.await.map_err(unprobed)?;
+        let stderr = stderr.await.map_err(unprobed)?;
+        let (status, _) = status.map_err(unprobed)?;
         Ok(Probe {
             status: status.exit_code.into(),
-            stdout: stdout.map_err(|error| failure(&error))?,
-            stderr: stderr.map_err(|error| failure(&error))?,
+            stdout: stdout.map_err(unprobed)?,
+            stderr: stderr.map_err(unprobed)?,
         })
     }
 
@@ -533,24 +490,25 @@ impl<SE: ShellExtensions> Runner<'_, SE> {
             return self.layout().await;
         };
         if matches!(subcommand, "init" | "clone") {
-            let mut writes: Vec<PathBuf> = Vec::new();
             let target = destination(subcommand, invocation.command_args, cwd)?;
-            for name in [
+            let environment = [
                 "GIT_DIR",
                 "GIT_WORK_TREE",
                 "GIT_COMMON_DIR",
                 "GIT_INDEX_FILE",
                 "GIT_OBJECT_DIRECTORY",
-            ] {
-                if let Some(value) = self.shell.env_str(name).filter(|value| !value.is_empty()) {
-                    writes.push(gitcmd::resolve(cwd, &value));
-                }
-            }
-            for name in ["--git-dir", "--work-tree"] {
-                if let Some(value) = global_path(self.globals, name) {
-                    writes.push(gitcmd::resolve(cwd, value));
-                }
-            }
+            ]
+            .into_iter()
+            .filter_map(|name| {
+                self.shell
+                    .env_str(name)
+                    .filter(|value| !value.is_empty())
+                    .map(|value| gitcmd::resolve(cwd, &value))
+            });
+            let options = ["--git-dir", "--work-tree"].into_iter().filter_map(|name| {
+                global_path(self.globals, name).map(|value| gitcmd::resolve(cwd, value))
+            });
+            let mut writes: Vec<PathBuf> = environment.chain(options).collect();
             let redirected = !writes.is_empty();
             writes.extend(target.separate.iter().cloned());
             writes.push(target.path.clone());
@@ -697,26 +655,16 @@ impl<SE: ShellExtensions> Runner<'_, SE> {
         }
         let action = &invocation.action;
         if matches!(action, Some(GitAction::Commit { .. })) || unknown(invocation) {
-            let head = self
-                .probe(&["rev-parse", "-q", "--verify", "HEAD^{commit}"])
-                .await?;
-            if head.status == 0 {
-                observation.head = Some(head.stdout.trim_ascii_end().to_vec());
-            }
+            observation.head = self.head().await?;
         }
         if before && matches!(action, Some(GitAction::Unstage)) {
-            let born = self
-                .probe(&["rev-parse", "-q", "--verify", "HEAD^{commit}"])
-                .await?
-                .status
-                == 0;
-            observation.staged = if born {
-                nul_separated(
-                    &self
-                        .probe(&["diff-index", "--cached", "--name-only", "-z", "HEAD", "--"])
-                        .await?
-                        .output("the staged paths")?,
-                )
+            observation.staged = if self.head().await?.is_some() {
+                let staged = self
+                    .probe(&["diff-index", "--cached", "--name-only", "-z", "HEAD", "--"])
+                    .await?;
+                records(&staged.output("the staged paths")?)
+                    .map(<[u8]>::to_vec)
+                    .collect()
             } else {
                 // An unborn branch: everything in the index is staged.
                 observation.index.keys().cloned().collect()
@@ -724,6 +672,14 @@ impl<SE: ShellExtensions> Runner<'_, SE> {
         }
         observation.layout = layout;
         Ok(observation)
+    }
+
+    /// The commit `HEAD` names, or `None` on an unborn branch.
+    async fn head(&mut self) -> Result<Option<Vec<u8>>, String> {
+        let head = self
+            .probe(&["rev-parse", "-q", "--verify", "HEAD^{commit}"])
+            .await?;
+        Ok((head.status == 0).then(|| head.stdout.trim_ascii_end().to_vec()))
     }
 
     /// What the run did, as git actions on snapshot-relative paths, and the repository metadata
@@ -970,16 +926,13 @@ impl<SE: ShellExtensions> Runner<'_, SE> {
         old: Option<&[u8]>,
         new: &[u8],
     ) -> Result<Vec<(Vec<u8>, Option<Vec<u8>>)>, String> {
-        let new = std::str::from_utf8(new)
-            .map_err(|_| "git: HEAD is not a hexadecimal object name".to_string())?;
+        let new = object_name(new)?;
         let Some(old) = old else {
             let listing = self
                 .probe(&["ls-tree", "-r", "-z", "--full-tree", new])
                 .await?
                 .output("the committed tree")?;
-            return Ok(listing
-                .split(|byte| *byte == 0)
-                .filter(|record| !record.is_empty())
+            return Ok(records(&listing)
                 .filter_map(|record| {
                     let tab = record.iter().position(|byte| *byte == b'\t')?;
                     let fields: Vec<&[u8]> = record[..tab].split(|byte| *byte == b' ').collect();
@@ -993,15 +946,12 @@ impl<SE: ShellExtensions> Runner<'_, SE> {
                 })
                 .collect());
         };
-        let old = std::str::from_utf8(old)
-            .map_err(|_| "git: HEAD is not a hexadecimal object name".to_string())?;
+        let old = object_name(old)?;
         let raw = self
             .probe(&["diff-tree", "-r", "-z", "--no-renames", old, new])
             .await?
             .output("the committed changes")?;
-        let mut fields = raw
-            .split(|byte| *byte == 0)
-            .filter(|field| !field.is_empty());
+        let mut fields = records(&raw);
         let mut committed = Vec::new();
         while let (Some(meta), Some(path)) = (fields.next(), fields.next()) {
             let parts: Vec<&[u8]> = meta.split(|byte| *byte == b' ').collect();
@@ -1019,8 +969,7 @@ impl<SE: ShellExtensions> Runner<'_, SE> {
 
     /// The message of `commit` as the object stores it, less exactly one terminating line feed.
     async fn message(&mut self, commit: &[u8]) -> Result<String, String> {
-        let commit = std::str::from_utf8(commit)
-            .map_err(|_| "git: HEAD is not a hexadecimal object name".to_string())?;
+        let commit = object_name(commit)?;
         let object = self
             .probe(&["cat-file", "commit", commit])
             .await?
@@ -1043,7 +992,29 @@ fn unknown<S: AsRef<str>>(invocation: &GitInvocation<'_, S>) -> bool {
 /// Ends a stopped process and waits for it to exit.
 async fn reap(mut child: ChildProcess) -> Result<ExecutionResult, brush_core::Error> {
     if let Some(pid) = child.pid() {
-        end_process(pid, child.pgid());
+        // The owned ChildProcess has not been reaped, so this PID still identifies that child.
+        // SAFETY: pidfd_open takes integer arguments and returns an owned descriptor.
+        let descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+        if descriptor < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let descriptor =
+            i32::try_from(descriptor).map_err(|error| std::io::Error::other(error.to_string()))?;
+        // SAFETY: pidfd_open returned a fresh descriptor, uniquely owned here.
+        let descriptor = unsafe { std::os::fd::OwnedFd::from_raw_fd(descriptor) };
+        // SAFETY: the pidfd pins the child; null siginfo requests an ordinary SIGKILL.
+        if unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                descriptor.as_raw_fd(),
+                libc::SIGKILL,
+                std::ptr::null::<libc::siginfo_t>(),
+                0,
+            )
+        } != 0
+        {
+            return Err(std::io::Error::last_os_error().into());
+        }
     }
     loop {
         if let ProcessWaitResult::Completed(output) = child.wait().await? {
@@ -1059,22 +1030,27 @@ fn read_all(mut pipe: std::io::PipeReader) -> std::io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
-/// NUL-terminated records, as a set.
-fn nul_separated(bytes: &[u8]) -> BTreeSet<Vec<u8>> {
+/// Why a probe could not run, as the attribution reports it.
+fn unprobed(error: impl std::fmt::Display) -> String {
+    format!("git: a probe could not run: {error}")
+}
+
+/// The non-empty NUL-terminated records of `bytes`.
+fn records(bytes: &[u8]) -> impl Iterator<Item = &[u8]> {
     bytes
         .split(|byte| *byte == 0)
         .filter(|record| !record.is_empty())
-        .map(<[u8]>::to_vec)
-        .collect()
+}
+
+/// A commit object name read back from git, which is hexadecimal and so UTF-8.
+fn object_name(bytes: &[u8]) -> Result<&str, String> {
+    std::str::from_utf8(bytes).map_err(|_| "git: HEAD is not a hexadecimal object name".to_string())
 }
 
 /// `git ls-files --stage -z`: `<mode> <object> <stage>\t<path>\0` per entry.
 fn parse_index(bytes: &[u8]) -> BTreeMap<Vec<u8>, Vec<Vec<u8>>> {
     let mut index: BTreeMap<Vec<u8>, Vec<Vec<u8>>> = BTreeMap::new();
-    for record in bytes
-        .split(|byte| *byte == 0)
-        .filter(|record| !record.is_empty())
-    {
+    for record in records(bytes) {
         if let Some(tab) = record.iter().position(|byte| *byte == b'\t') {
             index
                 .entry(record[tab + 1..].to_vec())
@@ -1100,8 +1076,7 @@ enum Status {
 /// untracked (`?`) and ignored (`!`) entries carry the path alone. The path is everything after
 /// the fixed fields, bytes and all.
 fn parse_status(bytes: &[u8]) -> BTreeMap<Vec<u8>, Status> {
-    bytes
-        .split(|byte| *byte == 0)
+    records(bytes)
         .filter_map(status_entry)
         .map(|(path, status)| (path.to_vec(), status))
         .collect()
@@ -1145,17 +1120,13 @@ fn destination<S: AsRef<str>>(
     args: &[S],
     cwd: &Path,
 ) -> Result<Destination, String> {
-    let grammar = if subcommand == "clone" {
-        &gitcmd::CLONE
-    } else {
-        &gitcmd::INIT
-    };
-    let scan = gitcmd::scan(args, grammar);
+    let clone = subcommand == "clone";
+    let scan = gitcmd::scan(args, if clone { &gitcmd::CLONE } else { &gitcmd::INIT });
     let bare = scan.has(None, "bare") || scan.has(None, "mirror");
     let separate = scan
         .value(None, "separate-git-dir")
         .map(|value| gitcmd::resolve(cwd, value));
-    let path = if subcommand == "clone" {
+    let path = if clone {
         let Some(source) = scan.positionals.first() else {
             return Err("git clone names no repository to clone".to_string());
         };

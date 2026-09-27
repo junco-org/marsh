@@ -39,10 +39,7 @@ pub(crate) struct ListClientsArgs {
 /// Flags for `switch-client`, which points a client at another session.
 #[derive(Debug, Clone, Args)]
 #[command(group(
-    ArgGroup::new("selector")
-        .required(false)
-        .multiple(false)
-        .args(["target", "last_session", "next_session", "previous_session"])
+    ArgGroup::new("selector").args(["target", "last_session", "next_session", "previous_session"])
 ))]
 pub(crate) struct SwitchClientArgs {
     #[arg(short = 'c', allow_hyphen_values = true)]

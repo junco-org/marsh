@@ -1,4 +1,5 @@
-//! Real byte pipes, for the jobs whose output is not a terminal.
+//! Real byte pipes, for the jobs whose output is not a terminal, and the non-blocking read and
+//! write loops every job stream — pipe or pseudoterminal master — goes through.
 //!
 //! A pseudoterminal is the wrong carrier for a helper process. It merges stdout and stderr, it
 //! rewrites `\n` into `\r\n`, it has no end-of-file a writer can send, and a line discipline
@@ -102,10 +103,7 @@ impl PipeInput {
         })
     }
 
-    /// Writes every byte of `bytes`, or reports why it could not.
-    ///
-    /// A short write is retried until the slice is gone. A failure partway through has already
-    /// delivered a prefix: this is a pipe, and there is no way to take bytes back.
+    /// Writes every byte of `bytes` under the input's lock, or reports why it could not.
     ///
     /// # Errors
     ///
@@ -119,23 +117,9 @@ impl PipeInput {
                 "job input is closed",
             ));
         };
-        let mut written = 0;
-        while written < bytes.len() {
-            // Tokio owns the readiness retry: a write the kernel refuses with `EAGAIN` clears the
-            // descriptor's readiness and waits again, inside `async_io`.
-            let attempt = fd
-                .async_io(Interest::WRITABLE, |inner| {
-                    nix::unistd::write(inner, &bytes[written..]).map_err(std::io::Error::from)
-                })
-                .await;
-            match attempt {
-                Ok(count) => written += count,
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(error) => return Err(error),
-            }
-        }
+        let written = write_fd(fd, bytes).await;
         drop(guard);
-        Ok(())
+        written
     }
 
     /// Closes the write end, which is the end-of-file the program reads.
@@ -150,6 +134,44 @@ impl PipeInput {
     }
 }
 
+/// Runs `call` on `fd` once it is ready for `interest`, retrying `EINTR`.
+///
+/// Tokio owns the readiness retry: a call the kernel refuses with `EAGAIN` clears the
+/// descriptor's readiness and waits again, inside `async_io`.
+async fn retrying<T>(
+    fd: &AsyncFd<OwnedFd>,
+    interest: Interest,
+    mut call: impl FnMut(&OwnedFd) -> nix::Result<T>,
+) -> std::io::Result<T> {
+    loop {
+        match fd
+            .async_io(interest, |inner| call(inner).map_err(std::io::Error::from))
+            .await
+        {
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            other => return other,
+        }
+    }
+}
+
+/// Writes every byte of `bytes` to `fd`, retrying short writes.
+///
+/// A failure partway through has already delivered a prefix: there is no way to take bytes back.
+///
+/// # Errors
+///
+/// Fails with whatever the write reported, other than `EINTR`, which is retried.
+pub(crate) async fn write_fd(fd: &AsyncFd<OwnedFd>, bytes: &[u8]) -> std::io::Result<()> {
+    let mut written = 0;
+    while written < bytes.len() {
+        written += retrying(fd, Interest::WRITABLE, move |inner| {
+            nix::unistd::write(inner, &bytes[written..])
+        })
+        .await?;
+    }
+    Ok(())
+}
+
 /// Reads whatever is available from a pipe's read end into `buffer`.
 ///
 /// `0` is end of file: every write end is gone. Bytes are preserved exactly — a NUL, a lone `\r`
@@ -160,39 +182,46 @@ impl PipeInput {
 ///
 /// Fails with whatever the read reported, other than `EINTR`, which is retried.
 pub(crate) async fn read_pipe(fd: &AsyncFd<OwnedFd>, buffer: &mut [u8]) -> std::io::Result<usize> {
-    loop {
-        let attempt = fd
-            .async_io(Interest::READABLE, |inner| {
-                nix::unistd::read(inner, &mut *buffer).map_err(std::io::Error::from)
-            })
-            .await;
-        match attempt {
-            Ok(count) => return Ok(count),
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(error) => return Err(error),
-        }
-    }
+    retrying(fd, Interest::READABLE, |inner| {
+        nix::unistd::read(inner, &mut *buffer)
+    })
+    .await
+}
+
+/// Reads whatever a shell's terminal has produced into `buffer`, returning how many bytes.
+///
+/// Bytes are preserved exactly: escape sequences, non-UTF-8 output and a final line with no
+/// newline all arrive as they were written. `0` is end of file, which on Linux is how a
+/// pseudoterminal reports that its last writer is gone.
+///
+/// # Errors
+///
+/// Fails with whatever the read reported, other than `EINTR`, which is retried.
+pub(crate) async fn read_terminal(
+    terminal: &AsyncFd<OwnedFd>,
+    buffer: &mut [u8],
+) -> std::io::Result<usize> {
+    retrying(
+        terminal,
+        Interest::READABLE,
+        |inner| match nix::unistd::read(inner, &mut *buffer) {
+            // A pseudoterminal master whose slave has been closed answers `EIO`. That is a hangup,
+            // not a failure: it is this stream's end of file. Only the syscall's own `EIO` is one — a
+            // readiness failure still propagates.
+            Err(nix::errno::Errno::EIO) => Ok(0),
+            other => other,
+        },
+    )
+    .await
 }
 
 #[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 #[cfg(test)]
 mod tests {
-    use std::pin::Pin;
-    use std::task::Poll;
-    use std::time::Duration;
-
     use nix::fcntl::FdFlag;
 
     use super::*;
-
-    /// How long a test may wait on the kernel before it is a failure rather than a hang.
-    const LIMIT: Duration = Duration::from_secs(5);
-
-    /// Polls `future` exactly once and leaves it alive, so a caller can establish that it is
-    /// waiting without consuming it.
-    async fn poll_once<F: Future>(mut future: Pin<&mut F>) -> Poll<F::Output> {
-        std::future::poll_fn(|cx| Poll::Ready(future.as_mut().poll(cx))).await
-    }
+    use crate::shellmux::testing::{LIMIT, is_nonblocking, poll_once};
 
     /// The pipe's real capacity, which is a kernel property and not a constant this may assume.
     fn capacity_of(fd: &OwnedFd) -> usize {
@@ -216,10 +245,24 @@ mod tests {
         accepted
     }
 
-    /// Whether the descriptor itself is in non-blocking mode, as the kernel reports it.
-    fn is_nonblocking(fd: &OwnedFd) -> bool {
-        OFlag::from_bits_retain(nix::fcntl::fcntl(fd, FcntlArg::F_GETFL).expect("status flags"))
-            .contains(OFlag::O_NONBLOCK)
+    /// `len` distinguishable bytes cycling through `modulus` values from `offset`.
+    fn pattern(len: usize, modulus: usize, offset: usize) -> Vec<u8> {
+        (0..len)
+            .map(|index| u8::try_from(index % modulus + offset).unwrap_or(0))
+            .collect()
+    }
+
+    /// Drains `reader` to end of file.
+    async fn drain(reader: &AsyncFd<OwnedFd>) -> Vec<u8> {
+        let mut collected = Vec::new();
+        let mut buffer = vec![0_u8; 4096];
+        loop {
+            let count = read_pipe(reader, &mut buffer).await.expect("a read");
+            if count == 0 {
+                break collected;
+            }
+            collected.extend_from_slice(&buffer[..count]);
+        }
     }
 
     /// The six ends divide into two roles, and the kernel is asked which one each descriptor
@@ -260,12 +303,8 @@ mod tests {
 
         // Distinguishable, and each longer than the pipe holds, so neither can be delivered
         // without the reader draining in the middle of it.
-        let first: Vec<u8> = (0..capacity * 2)
-            .map(|index| u8::try_from(index % 251).unwrap_or(0))
-            .collect();
-        let second: Vec<u8> = (0..capacity * 2)
-            .map(|index| u8::try_from(index % 241 + 1).unwrap_or(0))
-            .collect();
+        let first = pattern(capacity * 2, 251, 0);
+        let second = pattern(capacity * 2, 241, 1);
         let expected: Vec<u8> = prefilled
             .iter()
             .chain(&first)
@@ -299,18 +338,7 @@ mod tests {
                 write_second.as_mut().await.expect("the second write");
                 closing.as_mut().await;
             };
-            let drain = async {
-                let mut collected = Vec::new();
-                let mut buffer = vec![0_u8; 4096];
-                loop {
-                    let count = read_pipe(&reader, &mut buffer).await.expect("a read");
-                    if count == 0 {
-                        break collected;
-                    }
-                    collected.extend_from_slice(&buffer[..count]);
-                }
-            };
-            let ((), collected) = tokio::join!(writers, drain);
+            let ((), collected) = tokio::join!(writers, drain(&reader));
             collected
         })
         .await
@@ -320,21 +348,68 @@ mod tests {
         assert_eq!(drained, expected, "whole writes, in admission order");
 
         input.close().await;
-        assert_eq!(
-            input
-                .write_all(b"x")
-                .await
-                .expect_err("a closed input takes nothing")
-                .kind(),
-            std::io::ErrorKind::BrokenPipe
-        );
-        assert_eq!(
-            input
-                .write_all(b"")
-                .await
-                .expect_err("not even an empty write")
-                .kind(),
-            std::io::ErrorKind::BrokenPipe
-        );
+        for (bytes, why) in [
+            (&b"x"[..], "a closed input takes nothing"),
+            (&b""[..], "not even an empty write"),
+        ] {
+            assert_eq!(
+                input.write_all(bytes).await.expect_err(why).kind(),
+                std::io::ErrorKind::BrokenPipe
+            );
+        }
+    }
+
+    /// Keystrokes and one-shot stdin both reach a shell through `write_fd`, and a full descriptor
+    /// must delay them rather than truncate them: the reader sees the prefix that was already
+    /// there and then every byte of the payload, in order.
+    #[tokio::test]
+    async fn terminal_write_helper_survives_backpressure() {
+        let pipes = open_pipes().expect("three pipes");
+        let prefilled = prefill(&pipes.input);
+        assert!(!prefilled.is_empty(), "an empty pipe accepts something");
+        let payload = pattern(prefilled.len() * 2, 251, 0);
+
+        // Owned here, so a failure or a timeout below still drops it and lets the reader finish.
+        let writer = AsyncFd::new(pipes.input).expect("a registered write end");
+        let child_stdin = pipes.child_stdin;
+        let drain = tokio::task::spawn_blocking(move || {
+            use std::io::Read as _;
+            let mut collected = Vec::new();
+            std::fs::File::from(child_stdin)
+                .read_to_end(&mut collected)
+                .expect("the reader drains to end of file");
+            collected
+        });
+
+        tokio::time::timeout(LIMIT, write_fd(&writer, &payload))
+            .await
+            .expect("the write finishes once the reader drains")
+            .expect("a full descriptor is backpressure, not a failure");
+        drop(writer);
+
+        let collected = tokio::time::timeout(LIMIT, drain)
+            .await
+            .expect("the reader sees end of file")
+            .expect("the reader task");
+        let expected: Vec<u8> = prefilled.iter().chain(&payload).copied().collect();
+        assert_eq!(collected.len(), expected.len());
+        assert_eq!(collected, expected, "every byte, in order");
+    }
+
+    /// A pseudoterminal reports the loss of its last writer as `EIO`. That is this stream's end
+    /// of file, and reporting it as an error instead would make every closing shell look broken.
+    #[tokio::test]
+    async fn a_terminal_read_ends_when_its_slave_is_gone() {
+        let (master, slave) =
+            crate::shellmux::pty::open_pty(24, 80).expect("a private pseudoterminal");
+        let terminal = AsyncFd::new(master).expect("a registered master");
+        drop(slave);
+
+        let mut buffer = [0_u8; 32];
+        let count = tokio::time::timeout(LIMIT, read_terminal(&terminal, &mut buffer))
+            .await
+            .expect("the read resolves")
+            .expect("a hangup is not a read failure");
+        assert_eq!(count, 0, "the hangup is this stream's end of file");
     }
 }

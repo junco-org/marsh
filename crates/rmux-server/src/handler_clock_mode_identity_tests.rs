@@ -2,22 +2,23 @@ use std::sync::Arc;
 
 use super::{clock_mode_tests::create_session, RequestHandler};
 use crate::pane_io::AttachControl;
+use crate::test_fixtures::Fixture;
 use rmux_proto::{
-    ClockModeRequest, HookLifecycle, HookName, KillSessionRequest, PaneTarget, Request, Response,
-    ScopeSelector, SessionId, SetHookRequest, ShowBufferRequest, SwitchClientRequest, TerminalSize,
+    ClockModeRequest, HookName, KillSessionRequest, PaneTarget, Request, Response, ScopeSelector,
+    SessionId, SetHookRequest, ShowBufferRequest, SwitchClientRequest, TerminalSize,
 };
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::broadcast;
 use tokio::time::{timeout, Duration};
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(10);
+const CLOCK_SIZE: TerminalSize = TerminalSize { cols: 20, rows: 8 };
 
 async fn enter_clock_mode(handler: &RequestHandler, target: &PaneTarget) {
-    let response = handler
-        .handle(Request::ClockMode(ClockModeRequest {
+    handler
+        .handle_ok(ClockModeRequest {
             target: Some(target.clone()),
-        }))
+        })
         .await;
-    assert!(matches!(response, Response::ClockMode(_)), "{response:?}");
 }
 
 async fn assert_clock_mode(handler: &RequestHandler, target: &PaneTarget, expected: bool) {
@@ -107,22 +108,11 @@ async fn drain_mode_changed_hooks(
 #[tokio::test]
 async fn true_live_input_revalidates_attach_before_clock_exit() {
     let handler = RequestHandler::new();
-    let alpha = create_session(
-        &handler,
-        "live-clock-identity-alpha",
-        TerminalSize { cols: 20, rows: 8 },
-    )
-    .await;
-    let beta = create_session(
-        &handler,
-        "live-clock-identity-beta",
-        TerminalSize { cols: 20, rows: 8 },
-    )
-    .await;
+    let alpha = create_session(&handler, "live-clock-identity-alpha", CLOCK_SIZE).await;
+    let beta = create_session(&handler, "live-clock-identity-beta", CLOCK_SIZE).await;
     let requester_pid = std::process::id();
-    let (alpha_tx, _alpha_rx) = mpsc::unbounded_channel();
-    handler
-        .register_attach(requester_pid, alpha.session_name().clone(), alpha_tx)
+    let _alpha_rx = handler
+        .attach_client(requester_pid, alpha.session_name())
         .await;
     enter_clock_mode(&handler, &alpha).await;
 
@@ -138,9 +128,8 @@ async fn true_live_input_revalidates_attach_before_clock_exit() {
         .await
         .expect("live clock exit reaches identity pause");
 
-    let (beta_tx, _beta_rx) = mpsc::unbounded_channel();
-    handler
-        .register_attach(requester_pid, beta.session_name().clone(), beta_tx)
+    let _beta_rx = handler
+        .attach_client(requester_pid, beta.session_name())
         .await;
     pause.release();
     let _result = timeout(TEST_TIMEOUT, input)
@@ -154,22 +143,11 @@ async fn true_live_input_revalidates_attach_before_clock_exit() {
 #[tokio::test]
 async fn delayed_escape_revalidates_attach_before_clock_exit() {
     let handler = RequestHandler::new();
-    let alpha = create_session(
-        &handler,
-        "escape-clock-identity-alpha",
-        TerminalSize { cols: 20, rows: 8 },
-    )
-    .await;
-    let beta = create_session(
-        &handler,
-        "escape-clock-identity-beta",
-        TerminalSize { cols: 20, rows: 8 },
-    )
-    .await;
+    let alpha = create_session(&handler, "escape-clock-identity-alpha", CLOCK_SIZE).await;
+    let beta = create_session(&handler, "escape-clock-identity-beta", CLOCK_SIZE).await;
     let requester_pid = std::process::id();
-    let (alpha_tx, _alpha_rx) = mpsc::unbounded_channel();
-    handler
-        .register_attach(requester_pid, alpha.session_name().clone(), alpha_tx)
+    let _alpha_rx = handler
+        .attach_client(requester_pid, alpha.session_name())
         .await;
     enter_clock_mode(&handler, &alpha).await;
 
@@ -186,9 +164,8 @@ async fn delayed_escape_revalidates_attach_before_clock_exit() {
         .await
         .expect("delayed escape reaches identity pause");
 
-    let (beta_tx, _beta_rx) = mpsc::unbounded_channel();
-    handler
-        .register_attach(requester_pid, beta.session_name().clone(), beta_tx)
+    let _beta_rx = handler
+        .attach_client(requester_pid, beta.session_name())
         .await;
     pause.release();
     let _result = timeout(TEST_TIMEOUT, input)
@@ -202,22 +179,11 @@ async fn delayed_escape_revalidates_attach_before_clock_exit() {
 #[tokio::test]
 async fn switched_attach_uses_current_session_identity_for_clock_exit() {
     let handler = RequestHandler::new();
-    let alpha = create_session(
-        &handler,
-        "switched-clock-identity-alpha",
-        TerminalSize { cols: 20, rows: 8 },
-    )
-    .await;
-    let beta = create_session(
-        &handler,
-        "switched-clock-identity-beta",
-        TerminalSize { cols: 20, rows: 8 },
-    )
-    .await;
+    let alpha = create_session(&handler, "switched-clock-identity-alpha", CLOCK_SIZE).await;
+    let beta = create_session(&handler, "switched-clock-identity-beta", CLOCK_SIZE).await;
     let requester_pid = std::process::id();
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    handler
-        .register_attach(requester_pid, alpha.session_name().clone(), control_tx)
+    let _control_rx = handler
+        .attach_client(requester_pid, alpha.session_name())
         .await;
 
     let response = handler
@@ -245,29 +211,21 @@ async fn switched_attach_uses_current_session_identity_for_clock_exit() {
 #[tokio::test]
 async fn reentered_clock_mode_supersedes_stale_exit_restore_in_commit_order() {
     let handler = RequestHandler::new();
-    let target = create_session(
-        &handler,
-        "reentered-clock-effects",
-        TerminalSize { cols: 20, rows: 8 },
-    )
-    .await;
+    let target = create_session(&handler, "reentered-clock-effects", CLOCK_SIZE).await;
     let requester_pid = std::process::id();
-    let (control_tx, mut control_rx) = mpsc::unbounded_channel();
-    handler
-        .register_attach(requester_pid, target.session_name().clone(), control_tx)
+    let mut control_rx = handler
+        .attach_client(requester_pid, target.session_name())
         .await;
     enter_clock_mode(&handler, &target).await;
     while control_rx.try_recv().is_ok() {}
 
-    let set_hook = handler
-        .handle(Request::SetHook(SetHookRequest {
-            scope: ScopeSelector::Pane(target.clone()),
-            hook: HookName::PaneModeChanged,
-            command: "if-shell -F '#{pane_in_mode}' { set-buffer -b clock-reentry-format 1 } { set-buffer -b clock-reentry-format 0 }".to_owned(),
-            lifecycle: HookLifecycle::Persistent,
-        }))
+    handler
+        .handle_ok(SetHookRequest::fixture((
+            ScopeSelector::Pane(target.clone()),
+            HookName::PaneModeChanged,
+            "if-shell -F '#{pane_in_mode}' { set-buffer -b clock-reentry-format 1 } { set-buffer -b clock-reentry-format 0 }",
+        )))
         .await;
-    assert!(matches!(set_hook, Response::SetHook(_)), "{set_hook:?}");
     let mut lifecycle_events = handler.subscribe_lifecycle_events();
 
     let pause = handler.install_clock_mode_exit_commit_pause_for_test(target.clone());
@@ -340,16 +298,10 @@ async fn reentered_clock_mode_supersedes_stale_exit_restore_in_commit_order() {
 #[tokio::test]
 async fn restore_publication_serializes_a_later_clock_reentry() {
     let handler = RequestHandler::new();
-    let target = create_session(
-        &handler,
-        "serialized-clock-restore",
-        TerminalSize { cols: 20, rows: 8 },
-    )
-    .await;
+    let target = create_session(&handler, "serialized-clock-restore", CLOCK_SIZE).await;
     let requester_pid = std::process::id();
-    let (control_tx, mut control_rx) = mpsc::unbounded_channel();
-    handler
-        .register_attach(requester_pid, target.session_name().clone(), control_tx)
+    let mut control_rx = handler
+        .attach_client(requester_pid, target.session_name())
         .await;
     enter_clock_mode(&handler, &target).await;
     while control_rx.try_recv().is_ok() {}
@@ -424,28 +376,15 @@ async fn restore_publication_serializes_a_later_clock_reentry() {
 #[tokio::test]
 async fn clock_exit_effects_ignore_recreated_same_name_session() {
     let handler = RequestHandler::new();
-    let alpha = create_session(
-        &handler,
-        "recreated-clock-effects",
-        TerminalSize { cols: 20, rows: 8 },
-    )
-    .await;
-    let fallback = create_session(
-        &handler,
-        "recreated-clock-fallback",
-        TerminalSize { cols: 20, rows: 8 },
-    )
-    .await;
+    let alpha = create_session(&handler, "recreated-clock-effects", CLOCK_SIZE).await;
+    let fallback = create_session(&handler, "recreated-clock-fallback", CLOCK_SIZE).await;
     let requester_pid = std::process::id();
-    let (old_tx, _old_rx) = mpsc::unbounded_channel();
-    handler
-        .register_attach(requester_pid, alpha.session_name().clone(), old_tx)
+    let _old_rx = handler
+        .attach_client(requester_pid, alpha.session_name())
         .await;
     enter_clock_mode(&handler, &alpha).await;
 
-    let old_session_id = session_id(&handler, &alpha)
-        .await
-        .expect("old session identity exists");
+    let old_session_id = handler.session_id_for_test(alpha.session_name()).await;
     let pause = handler.install_clock_mode_exit_commit_pause_for_test(alpha.clone());
     let input_handler = handler.clone();
     let input = tokio::spawn(async move {
@@ -461,32 +400,24 @@ async fn clock_exit_effects_ignore_recreated_same_name_session() {
     let kill_target = alpha.session_name().clone();
     let kill = tokio::spawn(async move {
         kill_handler
-            .handle(Request::KillSession(KillSessionRequest {
-                target: kill_target,
-                kill_all_except_target: false,
-                clear_alerts: false,
-                kill_group: false,
-            }))
+            .handle(Request::KillSession(KillSessionRequest::fixture(
+                kill_target,
+            )))
             .await
     });
     wait_for_session_absence(&handler, &alpha).await;
 
     let recreate_handler = handler.clone();
     let recreate_name = alpha.session_name().as_str().to_owned();
-    let recreate = tokio::spawn(async move {
-        create_session(
-            &recreate_handler,
-            &recreate_name,
-            TerminalSize { cols: 20, rows: 8 },
-        )
-        .await
-    });
+    let recreate =
+        tokio::spawn(
+            async move { create_session(&recreate_handler, &recreate_name, CLOCK_SIZE).await },
+        );
     let replacement_session_id = wait_for_recreated_session(&handler, &alpha, old_session_id).await;
     assert_ne!(replacement_session_id, old_session_id);
 
-    let (replacement_tx, mut replacement_rx) = mpsc::unbounded_channel();
-    handler
-        .register_attach(requester_pid, alpha.session_name().clone(), replacement_tx)
+    let mut replacement_rx = handler
+        .attach_client(requester_pid, alpha.session_name())
         .await;
     while replacement_rx.try_recv().is_ok() {}
     pause.release();

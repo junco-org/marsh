@@ -1,29 +1,7 @@
 use super::*;
 use crate::handler::test_support::spawn_accounted_attach_control_drain;
-use rmux_core::{input::InputParser, Screen};
 
 const SIZE: TerminalSize = TerminalSize { cols: 20, rows: 5 };
-
-async fn replace_contents(handler: &RequestHandler, target: &PaneTarget) {
-    let transcript = {
-        let state = handler.state.lock().await;
-        state.transcript_handle(target).expect("session transcript")
-    };
-    let history_limit = transcript
-        .lock()
-        .expect("pane transcript mutex")
-        .history_limit();
-    let mut screen = Screen::new(SIZE, history_limit);
-    let mut parser = InputParser::new();
-    parser.parse(
-        b"zero one two three\r\nalpha beta gamma\r\nomega sigma tau\r\n",
-        &mut screen,
-    );
-    transcript
-        .lock()
-        .expect("pane transcript mutex")
-        .set_screen_for_test(screen);
-}
 
 async fn fixture(
     name: &str,
@@ -38,46 +16,26 @@ async fn fixture(
     let session = session_name(name);
     create_quiet_input_session(&handler, &session).await;
     let target = PaneTarget::new(session.clone(), 0);
-    replace_contents(&handler, &target).await;
+    handler
+        .replace_transcript_for_test(
+            &target,
+            SIZE,
+            b"zero one two three\r\nalpha beta gamma\r\nomega sigma tau\r\n",
+        )
+        .await;
 
     for (option, value) in [(OptionName::ModeKeys, "vi"), (OptionName::Mouse, "on")] {
-        assert!(matches!(
-            handler
-                .handle(Request::SetOption(SetOptionRequest {
-                    scope: ScopeSelector::Global,
-                    option,
-                    value: value.to_owned(),
-                    mode: SetOptionMode::Replace,
-                }))
-                .await,
-            Response::SetOption(_)
-        ));
+        handler
+            .set_option(ScopeSelector::Global, option, value)
+            .await;
     }
 
     let requester_pid = std::process::id();
-    let (control_tx, control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, session.clone(), control_tx)
-        .await;
+    let control_rx = handler.attach_client(requester_pid, &session).await;
     let _control_drain =
         spawn_accounted_attach_control_drain(&handler, requester_pid, control_rx).await;
 
-    assert!(matches!(
-        handler
-            .handle(Request::CopyMode(CopyModeRequest {
-                target: Some(target.clone()),
-                page_down: false,
-                exit_on_scroll: false,
-                hide_position: false,
-                mouse_drag_start: false,
-                cancel_mode: false,
-                scrollbar_scroll: false,
-                source: None,
-                page_up: false,
-            }))
-            .await,
-        Response::CopyMode(_)
-    ));
+    handler.handle_ok(CopyModeRequest::fixture(&target)).await;
 
     let pane_id = {
         let state = handler.state.lock().await;
@@ -161,40 +119,13 @@ async fn install_cached_mouse_event(
 }
 
 async fn install_scrollback(handler: &RequestHandler, target: &PaneTarget) {
-    let transcript = {
-        let state = handler.state.lock().await;
-        state.transcript_handle(target).expect("session transcript")
-    };
-    let history_limit = transcript
-        .lock()
-        .expect("pane transcript mutex")
-        .history_limit();
-    let mut screen = Screen::new(SIZE, history_limit);
-    let mut parser = InputParser::new();
     let contents = (0..80)
         .map(|line| format!("line {line:02}\r\n"))
         .collect::<String>();
-    parser.parse(contents.as_bytes(), &mut screen);
-    transcript
-        .lock()
-        .expect("pane transcript mutex")
-        .set_screen_for_test(screen);
-    assert!(matches!(
-        handler
-            .handle(Request::CopyMode(CopyModeRequest {
-                target: Some(target.clone()),
-                page_down: false,
-                exit_on_scroll: false,
-                hide_position: false,
-                mouse_drag_start: false,
-                cancel_mode: false,
-                scrollbar_scroll: false,
-                source: None,
-                page_up: false,
-            }))
-            .await,
-        Response::CopyMode(_)
-    ));
+    handler
+        .replace_transcript_for_test(target, SIZE, contents.as_bytes())
+        .await;
+    handler.handle_ok(CopyModeRequest::fixture(target)).await;
 }
 
 async fn send_copy_command(
@@ -204,16 +135,9 @@ async fn send_copy_command(
 ) -> Response {
     handler
         .handle(Request::SendKeysExt(SendKeysExtRequest {
-            target: Some(target.clone()),
-            keys: vec![command.to_owned()],
-            expand_formats: false,
-            hex: false,
-            literal: false,
             dispatch_key_table: false,
             copy_mode_command: true,
-            forward_mouse_event: false,
-            reset_terminal: false,
-            repeat_count: None,
+            ..Fixture::fixture((target, [command]))
         }))
         .await
 }
@@ -246,16 +170,8 @@ async fn keyboard_and_cli_copy_commands_ignore_cached_mouse_position() {
         reset_keyboard_cursor(&handler, &target).await;
         let response = handler
             .handle(Request::SendKeysExt(SendKeysExtRequest {
-                target: Some(target.clone()),
-                keys: vec!["Space".to_owned()],
-                expand_formats: false,
-                hex: false,
-                literal: false,
                 dispatch_key_table,
-                copy_mode_command: false,
-                forward_mouse_event: false,
-                reset_terminal: false,
-                repeat_count: None,
+                ..Fixture::fixture((&target, ["Space"]))
             }))
             .await;
         assert_eq!(
@@ -348,22 +264,16 @@ async fn live_mouse_binding_uses_its_originating_event() {
     // cell and ends at the current drag cell.
     let (handler, session, target, pane_id, requester_pid) = fixture("mouse-origin-binding").await;
     reset_keyboard_cursor(&handler, &target).await;
-    assert!(matches!(
-        handler
-            .handle(Request::BindKey(Box::new(BindKeyRequest {
-                table_name: "copy-mode-vi".to_owned(),
-                key: "MouseDrag1Pane".to_owned(),
-                note: Some("issue-125-origin".to_owned()),
-                repeat: false,
-                command: Some(vec![
-                    "send-keys".to_owned(),
-                    "-X".to_owned(),
-                    "begin-selection".to_owned(),
-                ]),
-            })))
-            .await,
-        Response::BindKey(_)
-    ));
+    handler
+        .handle_ok(BindKeyRequest {
+            note: Some("issue-125-origin".to_owned()),
+            ..Fixture::fixture((
+                "copy-mode-vi",
+                "MouseDrag1Pane",
+                ["send-keys", "-X", "begin-selection"],
+            ))
+        })
+        .await;
 
     handler
         .handle_attached_live_input_for_test(requester_pid, b"\x1b[<0;5;2M")

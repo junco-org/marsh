@@ -18,40 +18,60 @@ pub(super) fn title_capable_context() -> OuterTerminalContext {
     OuterTerminalContext::from_pairs(&[("TERM", "xterm-256color")])
 }
 
-pub(super) async fn new_detached_session(handler: &RequestHandler, name: &rmux_proto::SessionName) {
-    let created = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name: name.clone(),
-            detached: true,
-            size: Some(TerminalSize { cols: 80, rows: 24 }),
-            environment: None,
-        }))
-        .await;
-    assert!(matches!(created, Response::NewSession(_)));
-}
-
 pub(super) async fn set_global(handler: &RequestHandler, option: OptionName, value: &str) {
-    let set = handler
-        .handle(Request::SetOption(SetOptionRequest {
-            scope: ScopeSelector::Global,
-            option,
-            value: value.to_owned(),
-            mode: SetOptionMode::Replace,
-        }))
+    handler
+        .set_option(ScopeSelector::Global, option, value)
         .await;
-    assert!(matches!(set, Response::SetOption(_)), "set {option:?}");
 }
 
-pub(super) async fn append_global(handler: &RequestHandler, option: OptionName, value: &str) {
-    let set = handler
-        .handle(Request::SetOption(SetOptionRequest {
-            scope: ScopeSelector::Global,
-            option,
-            value: value.to_owned(),
+/// A terminal family advertising both the title and OSC 7 templates.
+pub(super) async fn enable_osc7(handler: &RequestHandler) {
+    let features = (
+        ScopeSelector::Global,
+        OptionName::TerminalFeatures,
+        "xterm*:osc7",
+    );
+    handler
+        .handle_ok(SetOptionRequest {
             mode: SetOptionMode::Append,
-        }))
+            ..Fixture::fixture(features)
+        })
         .await;
-    assert!(matches!(set, Response::SetOption(_)), "append {option:?}");
+}
+
+/// Attaches `attach_pid` to `session` from a terminal that advertises the title capability.
+pub(super) async fn attach_title_capable_client(
+    handler: &RequestHandler,
+    session: &rmux_proto::SessionName,
+    attach_pid: u32,
+) -> mpsc::UnboundedReceiver<AttachControl> {
+    let (control_tx, control_rx) = mpsc::unbounded_channel();
+    let context = title_capable_context();
+    let _attach_id = handler
+        .register_attach_with_terminal_context(attach_pid, session.clone(), control_tx, context)
+        .await;
+    control_rx
+}
+
+/// Registers one client with its own identity and geometry, exactly as
+/// `listener.rs` publishes a fresh attach.
+pub(super) async fn attach_sized_client(
+    handler: &RequestHandler,
+    session: &rmux_proto::SessionName,
+    attach_pid: u32,
+    client_size: TerminalSize,
+) -> mpsc::UnboundedReceiver<AttachControl> {
+    let (control_tx, control_rx) = mpsc::unbounded_channel();
+    let registration = AttachRegistration {
+        terminal_context: title_capable_context(),
+        client_size: Some(client_size),
+        ..Fixture::fixture((control_tx, current_owner_uid()))
+    };
+    handler
+        .register_attach_with_access(attach_pid, session.clone(), None, registration)
+        .await
+        .expect("attach registration succeeds");
+    control_rx
 }
 
 /// What the render told this client's outer terminal to show.
