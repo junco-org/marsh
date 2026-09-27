@@ -6,9 +6,11 @@ const LONG_PREFIX_CHAIN_REPETITIONS: usize = 8_192;
 const LARGE_FOCUS_CHAIN_REPETITIONS: usize = 4_096;
 const PROMPT_CANCEL_CHAIN_REPETITIONS: usize = 512;
 // These stress cases execute one real binding command per repetition in a
-// debug test binary. Keep the 8K recursion regression load and give parallel
-// nextest runs headroom without removing the finite completion bound.
-const LONG_PREFIX_CHAIN_TIMEOUT: Duration = Duration::from_secs(60);
+// debug test binary. Keep the 8K recursion regression load; the bound only has
+// to catch a hang. Each repetition renders the status line twice, and every
+// host syscall of that render takes a native-observation ptrace stop: the 16K
+// renders took ~104 s in a 2-CPU debug run, and about as long optimized.
+const LONG_PREFIX_CHAIN_TIMEOUT: Duration = Duration::from_secs(600);
 const ITERATIVE_INPUT_CHAIN_TIMEOUT: Duration = Duration::from_secs(30);
 const BOUNDED_REROUTE_CHAIN_TIMEOUT: Duration = Duration::from_secs(30);
 const BACKGROUND_RUN_SHELL_TIMEOUT: Duration = Duration::from_secs(10);

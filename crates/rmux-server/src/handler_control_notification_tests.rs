@@ -16,7 +16,7 @@ use rmux_proto::{
 };
 use tokio::sync::mpsc;
 
-use crate::test_fixtures::Fixture;
+use crate::test_fixtures::{Fixture, Quiet};
 use crate::test_names::session_name;
 
 fn drain_control_notifications(rx: &mut mpsc::Receiver<ControlServerEvent>) -> Vec<String> {
@@ -328,8 +328,9 @@ async fn control_notifications_name_clients_the_way_list_clients_does() {
 #[tokio::test]
 async fn control_window_notifications_follow_each_clients_session_visibility() {
     let handler = RequestHandler::new();
-    let alpha = handler.create_session("alpha").await;
-    let beta = handler.create_session("beta").await;
+    // Quiet: a real shell's first prompt would rename @0/@1 automatically, into these drains.
+    let alpha = handler.create_session(Quiet("alpha")).await;
+    let beta = handler.create_session(Quiet("beta")).await;
 
     let (_, mut alpha_rx) = handler
         .register_utf8_control_for_test(410, Some(&alpha))
@@ -397,8 +398,9 @@ async fn control_window_notifications_follow_each_clients_session_visibility() {
 #[tokio::test]
 async fn window_close_notifications_follow_each_clients_session_visibility() {
     let handler = RequestHandler::new();
-    let alpha = handler.create_session("alpha").await;
-    let beta = handler.create_session("beta").await;
+    // Quiet: a real shell's first prompt would rename @0/@1 automatically, into this drain.
+    let alpha = handler.create_session(Quiet("alpha")).await;
+    let beta = handler.create_session(Quiet("beta")).await;
 
     let (_, mut alpha_rx) = handler
         .register_utf8_control_for_test(430, Some(&alpha))

@@ -486,8 +486,12 @@ async fn killing_the_last_pane_in_the_only_window_removes_the_session_over_the_s
     );
 
     drop(client);
+    // The frontend's own lease keeps an emptied daemon up until its owner waits on it; waiting
+    // does not force a shutdown, so the daemon still has to exit-empty on its own.
+    tokio::time::timeout(Duration::from_secs(5), handle.wait())
+        .await
+        .map_err(|_| "the emptied daemon stayed up after its owner released it")??;
     wait_for_socket_removal(&socket_path).await?;
-    drop(handle);
     Ok(())
 }
 

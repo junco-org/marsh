@@ -508,18 +508,21 @@ impl CommandContext {
             .snapshot
             .upgrade()
             .ok_or_else(|| ShellError::new(ShellErrorKind::Closed))?;
-        let pattern = Path::new(pattern);
-        let logical = if pattern.is_absolute() {
-            pattern.to_path_buf()
+        let not_utf8 = || ShellError::unsupported("glob path is not UTF-8");
+        // Only the caller's pattern is glob syntax; the directory it is relative to is a literal
+        // path, and a `[` or `*` in its name must not turn it into a character class or wildcard.
+        let pattern = if Path::new(pattern).is_absolute() {
+            let physical = snapshot.physical(Path::new(pattern));
+            physical.to_str().ok_or_else(not_utf8)?.to_owned()
         } else {
-            cwd.unwrap_or(&self.cwd).join(pattern)
+            let base = snapshot.physical(cwd.unwrap_or(&self.cwd));
+            format!(
+                "{}/{pattern}",
+                glob::Pattern::escape(base.to_str().ok_or_else(not_utf8)?)
+            )
         };
-        let physical = snapshot.physical(&logical);
-        let pattern = physical
-            .to_str()
-            .ok_or_else(|| ShellError::unsupported("glob path is not UTF-8"))?;
         let inner =
-            glob::glob(pattern).map_err(|error| ShellError::unsupported(error.to_string()))?;
+            glob::glob(&pattern).map_err(|error| ShellError::unsupported(error.to_string()))?;
         Ok(GlobPaths {
             inner,
             context: self.clone(),
