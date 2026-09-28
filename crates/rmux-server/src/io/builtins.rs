@@ -9,9 +9,10 @@
 //! — worst — unstaged: it would write straight into the seed, bypassing the gate that every shell
 //! command has to pass.
 //!
-//! So it runs as a builtin, inside a managed command, in a job with its own snapshot and its own
-//! principal. Its writes are staged. Its attempt is recorded. Its result becomes visible only when
-//! the gate approves the boundary.
+//! So it runs as a builtin inside a shell command, under that shell's principal and the route
+//! its sandbox policy selected. On the managed route its writes are staged, its attempt is
+//! recorded, and its result becomes visible only when the gate approves the boundary; on the
+//! direct route it acts on the source exactly as the rest of that command does.
 //!
 //! Registration is local to each shell. Brush's generic observer scopes the real builtin body
 //! and every tracked worker, independently of other live muxes.
@@ -19,7 +20,7 @@
 //! # What it is not
 //!
 //! Not a wire protocol. Its subcommands are a closed set, its output is private command output
-//! inside a managed job, and nothing outside this crate speaks it.
+//! inside a shell command, and nothing outside this crate speaks it.
 //!
 //! Not a confinement boundary either. A FIFO endpoint or a `/dev` node reached through it is still
 //! an ordinary OS effect: it is *recorded*, and it is not claimed to be snapshotted, confidential
@@ -29,7 +30,7 @@ use std::path::{Path, PathBuf};
 
 use brush_core::commands::ExecutionContext;
 use brush_core::results::ExecutionResult;
-use marsh_core::builtins::{current_context, Command, CommandContext, Registration};
+use marsh_core::builtins::{current_context, BuiltinContext, Command, Registration};
 
 /// The name this builtin is registered under.
 ///
@@ -62,11 +63,10 @@ impl Command for RmuxIoBuiltin {
     }
 }
 
-/// Dispatches to a subcommand, refusing outright without a managed command context.
+/// Dispatches to a subcommand, refusing outright without an owning command context.
 ///
-/// The refusal is the point. A context is how this builtin learns which snapshot to stage into and
-/// which cancellation to honour; without one it would be doing unmanaged filesystem work under a
-/// name that promises the opposite.
+/// The refusal is the point. A context is how this builtin learns which filesystem view to act in
+/// and which cancellation to honour; without one it would be doing work no command owns.
 ///
 /// The shell hands a builtin its own command name as argument zero, the way a program's `argv`
 /// carries it, so that leading word is dropped before the subcommand is read. It is matched
@@ -76,10 +76,10 @@ async fn dispatch(
     context: &ExecutionContext<'_, impl brush_core::ShellExtensions>,
     words: &[String],
 ) -> ExecutionResult {
-    let Some(managed) = current_context() else {
+    let Some(owner) = current_context() else {
         let _ = writeln!(
             context.stderr(),
-            "{RMUX_IO_BUILTIN}: refusing to run outside a managed command"
+            "{RMUX_IO_BUILTIN}: refusing to run outside a shell command"
         );
         return ExecutionResult::new(2);
     };
@@ -94,10 +94,10 @@ async fn dispatch(
     };
 
     match subcommand.as_str() {
-        "read" => read(context, &managed, rest).await,
-        "write" => write(context, &managed, rest).await,
-        "source" => source(context, &managed, rest).await,
-        "presets" => presets(context, &managed, rest).await,
+        "read" => read(context, &owner, rest).await,
+        "write" => write(context, &owner, rest).await,
+        "source" => source(context, &owner, rest).await,
+        "presets" => presets(context, &owner, rest).await,
         other => {
             let _ = writeln!(
                 context.stderr(),
@@ -126,7 +126,7 @@ fn operands<'a>(words: &'a [String], flags: &mut Vec<&'a str>) -> &'a [String] {
 /// `read -- PATH`: the file's raw bytes on standard output.
 async fn read(
     context: &ExecutionContext<'_, impl brush_core::ShellExtensions>,
-    managed: &CommandContext,
+    owner: &BuiltinContext,
     words: &[String],
 ) -> ExecutionResult {
     let mut flags = Vec::new();
@@ -137,7 +137,7 @@ async fn read(
     };
     let path = PathBuf::from(path);
 
-    match crate::buffer_file_io::read(path, Some(managed)).await {
+    match crate::buffer_file_io::read(path, Some(owner)).await {
         Ok(bytes) => {
             let mut out = context.stdout();
             if out.write_all(&bytes).is_err() {
@@ -156,7 +156,7 @@ async fn read(
 /// `write [--append] [--mkdirs] -- PATH`: raw standard input into a staged file.
 async fn write(
     context: &ExecutionContext<'_, impl brush_core::ShellExtensions>,
-    managed: &CommandContext,
+    owner: &BuiltinContext,
     words: &[String],
 ) -> ExecutionResult {
     let mut flags = Vec::new();
@@ -183,7 +183,7 @@ async fn write(
         );
         return ExecutionResult::new(1);
     };
-    let drained = managed.spawn_blocking(move || {
+    let drained = owner.spawn_blocking(move || {
         let mut content = Vec::new();
         std::io::Read::read_to_end(&mut input, &mut content).map(|_| content)
     });
@@ -211,10 +211,10 @@ async fn write(
     if mkdirs {
         if let Some(parent) = path.parent() {
             let parent = parent.to_path_buf();
-            let worker_context = managed.clone();
+            let worker_context = owner.clone();
             // Through the context's tracked worker, so the core joins it before any boundary: a
             // directory created after a discard would be a change nobody staged.
-            match managed.spawn_blocking(move || worker_context.create_dir_all(&parent)) {
+            match owner.spawn_blocking(move || worker_context.create_dir_all(&parent)) {
                 Ok(receiver) => {
                     if let Ok(Err(error)) = receiver.await {
                         let _ = writeln!(context.stderr(), "{RMUX_IO_BUILTIN} write: {error}");
@@ -229,7 +229,7 @@ async fn write(
         }
     }
 
-    match crate::buffer_file_io::write(path, content, append, Some(managed)).await {
+    match crate::buffer_file_io::write(path, content, append, Some(owner)).await {
         Ok(()) => ExecutionResult::success(),
         Err(error) => {
             let _ = writeln!(context.stderr(), "{RMUX_IO_BUILTIN} write: {error}");
@@ -252,7 +252,7 @@ async fn write(
 /// Logical file paths and nested-source diagnostics are preserved while I/O targets the work view.
 async fn source(
     context: &ExecutionContext<'_, impl brush_core::ShellExtensions>,
-    managed: &CommandContext,
+    owner: &BuiltinContext,
     words: &[String],
 ) -> ExecutionResult {
     let mut flags = Vec::new();
@@ -276,7 +276,7 @@ async fn source(
                 cwd.as_deref(),
                 quiet,
                 strict,
-                Some(managed),
+                Some(owner),
             )
         })
         .collect();
@@ -300,7 +300,7 @@ async fn source(
 /// `presets -- DIR…`: the configured tunnel preset names, one per line.
 async fn presets(
     context: &ExecutionContext<'_, impl brush_core::ShellExtensions>,
-    managed: &CommandContext,
+    owner: &BuiltinContext,
     words: &[String],
 ) -> ExecutionResult {
     let mut flags = Vec::new();
@@ -308,7 +308,7 @@ async fn presets(
     let mut names: Vec<String> = Vec::new();
     for directory in directories {
         let path = Path::new(directory);
-        let Ok(entries) = managed.read_dir(path) else {
+        let Ok(entries) = owner.read_dir(path) else {
             continue;
         };
         for entry in entries.flatten() {

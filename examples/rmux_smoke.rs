@@ -225,6 +225,9 @@ impl Fixture {
         }
         self.filesystem.create_subvolume(&self.other)?;
         std::fs::create_dir_all(self.other.join("src"))?;
+        // Both seeds are Git work trees, so each is one policy root for sandbox routing.
+        git2::Repository::init(&self.seed)?;
+        git2::Repository::init(&self.other)?;
         Ok(())
     }
 
@@ -1064,11 +1067,6 @@ async fn prove_second_seed(
         "the pane starts where it was told to, relative to the seed it found"
     );
     let b = io.shell(&view.id)?;
-    ensure_eq!(
-        std::fs::read(&wal)?,
-        b"",
-        "the pane's startup replaced the incompatible log with an empty one"
-    );
 
     // The marker is assembled from two pieces for the same reason the first pane's is: an echoed
     // command line is not the command's output.
@@ -1082,6 +1080,15 @@ async fn prove_second_seed(
         published.is_published(),
         "the sibling seed publishes on its own: {}",
         describe(&published)
+    );
+    // Storage opens lazily at the pane's first admitted span rather than during construction, so
+    // the incompatible log is observed only once a command on that seed has completed; by then
+    // the log holds that command's own frames and none of the incompatible ones.
+    let log = std::fs::read(&wal)?;
+    ensure!(
+        !log.windows(b"old-schema".len())
+            .any(|window| window == b"old-schema"),
+        "the pane's first admission replaced the incompatible log"
     );
     ensure_eq!(
         std::fs::read(second.join("src").join("marker"))?,
@@ -1119,11 +1126,12 @@ async fn prove_second_seed(
     prove_prompt_sibling(io, &b, &view.id, &second).await
 }
 
-/// Writes the sibling seed's log as an old-schema record that startup must discard, returning it.
+/// Writes the sibling seed's log as an old-schema record that recovery must discard, returning it.
 ///
-/// The sibling seed has no live shell yet, so its pane's startup is the first to read this log:
-/// a complete record missing the `staging` every current `BEGIN` carries, which startup must
-/// discard whole rather than refuse the pane.
+/// The sibling seed's only live shell so far is an idle standalone peer that opens storage
+/// lazily, so the pane's first admission is the first to read this log: a complete record
+/// missing the `staging` every current `BEGIN` carries, which recovery must discard whole
+/// rather than refuse the pane.
 fn write_incompatible_wal(fixture: &Fixture) -> Result<PathBuf, Failure> {
     let wal = fixture
         .scratch
@@ -1563,14 +1571,14 @@ fn quoted_path(path: &Path) -> Result<String, Failure> {
     ))
 }
 
-/// A normal [`marsh::Shell`] on the fixture's first seed, through the fixture's own backend.
-async fn fixture_shell(fixture: &Fixture) -> Result<marsh::Shell, Failure> {
+/// A normal [`marsh::Shell`] starting in `initial_dir`, through the fixture's own backend.
+async fn fixture_shell(fixture: &Fixture, initial_dir: &Path) -> Result<marsh::Shell, Failure> {
     if fixture.real_btrfs {
-        Ok(marsh::Shell::new(&fixture.seed).await?)
+        Ok(marsh::Shell::new(initial_dir).await?)
     } else {
         Ok(
             marsh_core::test_support::shell_builder(Arc::clone(&fixture.filesystem))
-                .working_dir(fixture.seed.clone())
+                .working_dir(initial_dir.to_path_buf())
                 .build()
                 .await?,
         )
@@ -1619,8 +1627,8 @@ async fn prove_native_shells(
         initialized.status,
         String::from_utf8_lossy(&initialized.stderr)
     );
-    shells.push(fixture_shell(fixture).await?);
-    shells.push(fixture_shell(fixture).await?);
+    shells.push(fixture_shell(fixture, &fixture.seed).await?);
+    shells.push(fixture_shell(fixture, &fixture.seed).await?);
     let [a, b] = shells.as_slice() else {
         return Err("the two initial shells were not retained".into());
     };
@@ -1660,7 +1668,9 @@ async fn prove_native_shells(
     a.close(false).await?;
     b.close(false).await?;
     let first = a.principal().clone();
-    shells.push(fixture_shell(fixture).await?);
+    // An idle peer keeps the reopened shell on the managed route under the default policy.
+    shells.push(fixture_shell(fixture, &fixture.seed).await?);
+    shells.push(fixture_shell(fixture, &fixture.seed).await?);
     let reopened = shells.last().ok_or("the reopened shell was not retained")?;
     ensure!(*reopened.principal() != first);
     for path in ["owned", "read-claim", "zero-op"] {
@@ -2170,15 +2180,29 @@ async fn host_and_drive(fixture: &Fixture, binary: &Path) -> Result<(), Failure>
             ShellEnvironment::new(),
             geometry,
             Arc::clone(&fixture.filesystem),
+            marsh::SandboxPolicy::default(),
         )
         .await?
     };
 
-    // Everything below goes through the frontend's own operations. There is no `host.mux()`, and
-    // this driver would not compile if it reached for one.
-    let driven = drive(&host, fixture, binary, &socket).await;
+    // Idle standalone peers on each seed: under the default SharedSource policy they make every
+    // pane and workload shell take the managed route the proofs below observe.
+    let mut peers = Vec::new();
+    let driven = async {
+        peers.push(fixture_shell(fixture, &fixture.seed).await?);
+        peers.push(fixture_shell(fixture, &fixture.other).await?);
+        // Everything below goes through the frontend's own operations. There is no `host.mux()`,
+        // and this driver would not compile if it reached for one.
+        drive(&host, fixture, binary, &socket).await
+    }
+    .await;
     let shutdown = host.shutdown().await.map_err(Failure::from);
-    conclude(driven, shutdown)
+    let mut closed = Ok(());
+    for peer in &peers {
+        let outcome = peer.close(true).await.map_err(Failure::from);
+        closed = conclude(closed, outcome);
+    }
+    conclude(conclude(driven, shutdown), closed)
 }
 
 #[tokio::main(flavor = "multi_thread")]

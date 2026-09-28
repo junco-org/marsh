@@ -79,6 +79,8 @@ brush-core.workspace = true
 brush-builtins.workspace = true
 marsh-btrfs = { path = "crates/marsh-btrfs", features = ["fake"] }
 marsh-wal = { path = "crates/marsh-wal" }
+# Routing predicates that query a source's shared authority name its events directly.
+junco-rust-validator = { path = "../junco-policy" }
 # The WAL smoke's own transaction metadata derives its serde implementations.
 serde = { version = "1", features = ["derive"] }
 git2 = { version = "0.21", default-features = false, features = ["vendored-libgit2"] }
@@ -128,9 +130,11 @@ rmux-web-crypto = { version = "=0.10.0", git = "https://github.com/Helvesec/rmux
 # (https://github.com/reubeno/brush/pull/1382), which MarshExecutor is an implementation of, a
 # public accessor for a shell's spawner, the pipeline's process group carried into a builtin's
 # ExecutionContext, and a generic ExecutionObserver that scopes builtins and scheduled work.
-# crates/brush-core is crates.io's 0.5.0 plus those; every other brush crate is stock.
+# crates/brush-core is crates.io's 0.5.0 plus those; crates/brush-interactive is crates.io's 0.4.0
+# plus a caller-owned completion callback for the basic editor. Every other brush crate is stock.
 [patch.crates-io]
 brush-core = { path = "crates/brush-core" }
+brush-interactive = { path = "crates/brush-interactive" }
 rmux-server = { path = "crates/rmux-server" }
 
 [workspace.lints.rust]

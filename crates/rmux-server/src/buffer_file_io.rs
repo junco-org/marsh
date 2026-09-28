@@ -11,7 +11,7 @@ use std::thread;
 use std::time::Duration;
 
 use either::Either;
-use marsh_core::builtins::CommandContext;
+use marsh_core::builtins::BuiltinContext;
 use rustix::event::{poll, PollFd, PollFlags, Timespec};
 use rustix::fs::{Mode, OFlags};
 
@@ -69,11 +69,11 @@ struct CancellationState {
     special: SpecialFile,
     cancelled: AtomicBool,
     phase: AtomicU8,
-    context: Option<CommandContext>,
+    context: Option<BuiltinContext>,
 }
 
 impl CancellationState {
-    fn new(path: PathBuf, special: SpecialFile, context: Option<&CommandContext>) -> Self {
+    fn new(path: PathBuf, special: SpecialFile, context: Option<&BuiltinContext>) -> Self {
         Self {
             path,
             special,
@@ -146,7 +146,7 @@ impl<T, F: Future<Output = io::Result<T>>> Future for FifoOperation<F> {
 }
 
 fn start_worker<T: Send + 'static>(
-    context: Option<&CommandContext>,
+    context: Option<&BuiltinContext>,
     operation: impl FnOnce() -> io::Result<T> + Send + 'static,
 ) -> io::Result<impl Future<Output = io::Result<T>> + Send> {
     Ok(match context {
@@ -165,7 +165,7 @@ fn start_worker<T: Send + 'static>(
 
 pub(super) fn special_path(
     path: &Path,
-    context: Option<&CommandContext>,
+    context: Option<&BuiltinContext>,
 ) -> io::Result<Option<SpecialFile>> {
     match context.map_or_else(|| fs::metadata(path), |context| context.metadata(path)) {
         Ok(metadata) => Ok(special_file(&metadata)),
@@ -174,7 +174,7 @@ pub(super) fn special_path(
     }
 }
 
-pub(super) async fn read(path: PathBuf, context: Option<&CommandContext>) -> io::Result<Vec<u8>> {
+pub(super) async fn read(path: PathBuf, context: Option<&BuiltinContext>) -> io::Result<Vec<u8>> {
     if let Some(special) = special_path(&path, context)? {
         return start_read(path, special, None, context)?.await;
     }
@@ -195,7 +195,7 @@ pub(super) async fn write(
     path: PathBuf,
     content: Vec<u8>,
     append: bool,
-    context: Option<&CommandContext>,
+    context: Option<&BuiltinContext>,
 ) -> io::Result<()> {
     match open_write_target(&path, append, context)? {
         WriteTarget::Ordinary(mut file) => {
@@ -217,7 +217,7 @@ fn start_read(
     path: PathBuf,
     special: SpecialFile,
     file: Option<File>,
-    context: Option<&CommandContext>,
+    context: Option<&BuiltinContext>,
 ) -> io::Result<FifoOperation<impl Future<Output = io::Result<Vec<u8>>> + Send>> {
     let state = Arc::new(CancellationState::new(path, special, context));
     let worker_state = Arc::clone(&state);
@@ -234,7 +234,7 @@ fn start_write(
     append: bool,
     special: SpecialFile,
     file: Option<File>,
-    context: Option<&CommandContext>,
+    context: Option<&BuiltinContext>,
 ) -> io::Result<FifoOperation<impl Future<Output = io::Result<()>> + Send>> {
     let state = Arc::new(CancellationState::new(path, special, context));
     let worker_state = Arc::clone(&state);
@@ -341,7 +341,7 @@ fn write_special(
     Ok(())
 }
 
-fn open_read_target(path: &Path, context: Option<&CommandContext>) -> io::Result<ReadTarget> {
+fn open_read_target(path: &Path, context: Option<&BuiltinContext>) -> io::Result<ReadTarget> {
     let file = open_file(
         path,
         OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
@@ -357,7 +357,7 @@ fn open_read_target(path: &Path, context: Option<&CommandContext>) -> io::Result
 fn open_write_target(
     path: &Path,
     append: bool,
-    context: Option<&CommandContext>,
+    context: Option<&BuiltinContext>,
 ) -> io::Result<WriteTarget> {
     let disposition = if append {
         OFlags::APPEND
@@ -521,7 +521,7 @@ fn ensure_not_cancelled(state: &CancellationState) -> io::Result<()> {
         || state
             .context
             .as_ref()
-            .is_some_and(CommandContext::cancellation_requested)
+            .is_some_and(BuiltinContext::cancellation_requested)
     {
         Err(CancellationState::interrupted_error())
     } else {
@@ -537,7 +537,7 @@ fn open_file(
     path: &Path,
     flags: OFlags,
     mode: Mode,
-    context: Option<&CommandContext>,
+    context: Option<&BuiltinContext>,
 ) -> io::Result<File> {
     let mut options = fs::OpenOptions::new();
     options

@@ -3,7 +3,7 @@ use std::fs::{self, File};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
-use marsh_core::builtins::CommandContext;
+use marsh_core::builtins::BuiltinContext;
 use rmux_core::command_parser::{CommandParseError, ParsedCommands};
 use rmux_proto::{PaneTarget, RmuxError, SourceFileRequest};
 
@@ -268,7 +268,7 @@ pub(super) fn source_inputs_for_path_with_diagnostics(
     quiet: bool,
     stdin: Option<&str>,
     read_policy: SourceReadPolicy,
-    context: Option<&CommandContext>,
+    context: Option<&BuiltinContext>,
 ) -> Result<SourcePathRead, RmuxError> {
     if is_unix_null_config_path(path) {
         return Ok(SourcePathRead {
@@ -404,7 +404,7 @@ fn source_entry_read_error(entry: &Path, error: &io::Error) -> RmuxError {
 fn read_source_entry(
     entry: &Path,
     read_policy: SourceReadPolicy,
-    context: Option<&CommandContext>,
+    context: Option<&BuiltinContext>,
 ) -> io::Result<String> {
     match read_policy {
         SourceReadPolicy::Strict => read_limited_source_entry(entry, context),
@@ -412,7 +412,7 @@ fn read_source_entry(
     }
 }
 
-fn read_limited_source_entry(entry: &Path, context: Option<&CommandContext>) -> io::Result<String> {
+fn read_limited_source_entry(entry: &Path, context: Option<&BuiltinContext>) -> io::Result<String> {
     let metadata =
         context.map_or_else(|| fs::metadata(entry), |context| context.metadata(entry))?;
     validate_strict_source_metadata(&metadata)?;
@@ -448,7 +448,7 @@ fn validate_strict_source_metadata(metadata: &fs::Metadata) -> io::Result<()> {
     Ok(())
 }
 
-fn open_strict_source_entry(entry: &Path, context: Option<&CommandContext>) -> io::Result<File> {
+fn open_strict_source_entry(entry: &Path, context: Option<&BuiltinContext>) -> io::Result<File> {
     use rustix::fs::OFlags;
     use std::os::unix::fs::OpenOptionsExt;
     let mut options = fs::OpenOptions::new();
@@ -463,7 +463,7 @@ fn open_strict_source_entry(entry: &Path, context: Option<&CommandContext>) -> i
 
 fn read_tmux_compat_source_entry(
     entry: &Path,
-    context: Option<&CommandContext>,
+    context: Option<&BuiltinContext>,
 ) -> io::Result<String> {
     let preopen_metadata =
         context.map_or_else(|| fs::metadata(entry), |context| context.metadata(entry))?;
@@ -1002,7 +1002,7 @@ pub(crate) fn managed_source_read(
     cwd: Option<&Path>,
     quiet: bool,
     strict: bool,
-    context: Option<&CommandContext>,
+    context: Option<&BuiltinContext>,
 ) -> ManagedSourceFile {
     let policy = if strict {
         SourceReadPolicy::Strict

@@ -212,6 +212,8 @@ pub struct MuxProfile {
     ///
     /// Native work uses [`crate::builtins::current_context`] for logical I/O and cancellation.
     pub builtins: HashMap<String, crate::builtins::Registration>,
+    /// The routing policy every shell of this mux is built with; each shell gets its own clone.
+    pub sandbox_policy: crate::SandboxPolicy,
 }
 
 impl std::fmt::Debug for MuxProfile {
@@ -222,6 +224,6 @@ impl std::fmt::Debug for MuxProfile {
             .debug_struct("MuxProfile")
             .field("variables", &self.environment.iter().count())
             .field("builtins", &names)
-            .finish()
+            .finish_non_exhaustive()
     }
 }

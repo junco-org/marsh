@@ -8,88 +8,17 @@
 
 mod common;
 
-use std::collections::HashMap;
-use std::io::{BufRead, Read, Write};
-use std::os::fd::OwnedFd;
+use std::io::Read;
 use std::path::Path;
 use std::sync::Arc;
 
-use common::{Seed, TIMEOUT, denied, run, status};
-use marsh::{ExecutionResult, OpenFile, Shell, ShellError, ShellErrorKind};
+use common::{Seed, TIMEOUT, controlled, denied, join, launch, run, status};
+use marsh::{ExecutionResult, ShellErrorKind};
 use serial_test::serial;
 
 /// A source holding `src/a.txt`.
 fn seed() -> Seed {
     Seed::new("src/a.txt", "seed\n")
-}
-impl Seed {
-    /// A shell whose stdin this test writes and whose stdout and stderr it reads.
-    async fn controlled(&self) -> Controlled {
-        let (input, control) = std::io::pipe().unwrap();
-        let (output, writer) = std::io::pipe().unwrap();
-        let stdout = OpenFile::from(std::fs::File::from(OwnedFd::from(writer)));
-        let fds = HashMap::from([
-            (0, OpenFile::from(std::fs::File::from(OwnedFd::from(input)))),
-            (1, stdout.clone()),
-            (2, stdout),
-        ]);
-        Controlled {
-            shell: Arc::new(self.builder().fds(fds).build().await.unwrap()),
-            control,
-            output: Some(std::io::BufReader::new(output)),
-        }
-    }
-}
-struct Controlled {
-    shell: Arc<Shell>,
-    control: std::io::PipeWriter,
-    output: Option<std::io::BufReader<std::io::PipeReader>>,
-}
-impl Controlled {
-    async fn ready(&mut self) -> Vec<u8> {
-        let mut output = self.output.take().unwrap();
-        let (output, observed) = tokio::time::timeout(
-            TIMEOUT,
-            tokio::task::spawn_blocking(move || {
-                let mut observed = Vec::new();
-                loop {
-                    let mut line = Vec::new();
-                    assert_ne!(
-                        output.read_until(b'\n', &mut line).unwrap(),
-                        0,
-                        "producer exited before READY"
-                    );
-                    observed.extend_from_slice(&line);
-                    if line == b"READY\n" {
-                        return (output, observed);
-                    }
-                }
-            }),
-        )
-        .await
-        .unwrap()
-        .unwrap();
-        self.output = Some(output);
-        observed
-    }
-    fn release(&mut self) {
-        self.control.write_all(b"continue\n").unwrap();
-    }
-}
-fn launch(
-    shell: &Arc<Shell>,
-    line: String,
-) -> tokio::task::JoinHandle<Result<ExecutionResult, ShellError>> {
-    let shell = Arc::clone(shell);
-    tokio::spawn(async move { shell.run(&line).await })
-}
-async fn join(
-    task: tokio::task::JoinHandle<Result<ExecutionResult, ShellError>>,
-) -> Result<ExecutionResult, ShellError> {
-    tokio::time::timeout(TIMEOUT, task)
-        .await
-        .expect("owned operation completes")
-        .expect("operation task")
 }
 
 #[derive(clap::Parser)]
@@ -132,7 +61,7 @@ async fn read_claims_cover_external_builtin_and_native_io() {
         // Exercise a blocking pool that predates attachment, not only threads created by the run.
         tokio::task::spawn_blocking(|| {}).await.unwrap();
         let a = fixture
-            .builder()
+            .managed_builder()
             .builtin("native-read", marsh::builtins::builtin::<NativeRead>())
             .build()
             .await
@@ -292,7 +221,7 @@ async fn unmanaged_git_metadata_cannot_publish() {
 #[serial]
 async fn a_conflict_never_reexecutes_the_line() {
     let fixture = seed();
-    let mut a = fixture.controlled().await;
+    let mut a = controlled(fixture.managed_builder()).await;
     let b = fixture.shell().await;
     let counter = fixture.outside("counter");
     let task = launch(
@@ -337,7 +266,7 @@ async fn directory_membership_and_git_dependencies_become_stale() {
         if git {
             fixture.git();
         }
-        let mut a = fixture.controlled().await;
+        let mut a = controlled(fixture.managed_builder()).await;
         let b = fixture.shell().await;
         let inspect = if git {
             "git status >/dev/null"
@@ -376,7 +305,7 @@ async fn directory_membership_and_git_dependencies_become_stale() {
 #[serial]
 async fn disjoint_concurrent_writes_both_publish() {
     let fixture = seed();
-    let mut a = fixture.controlled().await;
+    let mut a = controlled(fixture.managed_builder()).await;
     let b = fixture.shell().await;
     let task = launch(
         &a.shell,
@@ -402,7 +331,7 @@ async fn background_producers_finish_before_the_boundary() {
         "printf 'READY\n'; /bin/cat <(/bin/sh -c 'read value'; printf substitution > late)",
     ] {
         let fixture = seed();
-        let mut controlled = fixture.controlled().await;
+        let mut controlled = controlled(fixture.managed_builder()).await;
         let task = launch(&controlled.shell, line.into());
         controlled.ready().await;
         assert!(!task.is_finished());
@@ -425,7 +354,7 @@ async fn background_producers_finish_before_the_boundary() {
 #[serial]
 async fn forced_close_joins_detached_descendants_and_a_sibling_still_publishes() {
     let fixture = seed();
-    let mut a = fixture.controlled().await;
+    let mut a = controlled(fixture.managed_builder()).await;
     let b = fixture.shell().await;
     let script = fixture.outside("detached.sh");
     std::fs::write(
@@ -470,7 +399,7 @@ async fn forced_close_joins_detached_descendants_and_a_sibling_still_publishes()
 #[serial]
 async fn abandoning_the_caller_does_not_abandon_finalization() {
     let fixture = seed();
-    let mut a = fixture.controlled().await;
+    let mut a = controlled(fixture.managed_builder()).await;
     let task = launch(
         &a.shell,
         "printf 'READY\n'; /bin/sh -c 'read value'; printf completed > owned".into(),

@@ -1,5 +1,6 @@
-//! Persistent in-process shells with automatic snapshot, native observation, capability checks
-//! and durable publication. Callers construct, execute and close shells; storage is private.
+//! Persistent in-process shells whose [`SandboxPolicy`] routes every command either through an
+//! automatic snapshot with native observation, capability checks and durable publication, or
+//! directly to its source. Callers construct, execute and close shells; storage is private.
 //!
 //! ```no_run
 //! # async fn example() -> Result<(), marsh_core::ShellError> {
@@ -18,7 +19,8 @@ pub mod shellmux;
 pub mod test_support;
 
 pub use shell::{
-    Denial, ExecutionParameters, ExecutionResult, OpenFile, Principal, ProfileLoadBehavior,
-    RcLoadBehavior, Shell, ShellBuilder, ShellEnvironment, ShellError, ShellErrorKind, ShellFd,
-    ShellVariable, Signal, SourceInfo, UIOptions, builtins,
+    CommandContext, Denial, ExecutionParameters, ExecutionResult, OpenFile, PolicyValidator,
+    Principal, ProfileLoadBehavior, RcLoadBehavior, SandboxPolicy, Shell, ShellBuilder,
+    ShellEnvironment, ShellError, ShellErrorKind, ShellFd, ShellVariable, Signal, SourceInfo,
+    UIOptions, builtins,
 };

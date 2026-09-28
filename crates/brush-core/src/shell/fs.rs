@@ -19,21 +19,7 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
     ///
     /// * `target_dir` - The path to set as the working directory.
     pub fn set_working_dir(&mut self, target_dir: impl AsRef<Path>) -> Result<(), error::Error> {
-        let abs_path = self.absolute_path(target_dir.as_ref());
-
-        match std::fs::metadata(&abs_path) {
-            Ok(m) => {
-                if !m.is_dir() {
-                    return Err(error::ErrorKind::NotADirectory(abs_path).into());
-                }
-            }
-            Err(e) => {
-                return Err(e.into());
-            }
-        }
-
-        // Normalize the path (but don't canonicalize it).
-        let cleaned_path = abs_path.normalize();
+        let cleaned_path = self.directory_target(target_dir.as_ref())?;
 
         let pwd = cleaned_path.to_string_lossy().to_string();
 
@@ -55,6 +41,40 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
         )?;
 
         Ok(())
+    }
+
+    /// Moves the shell's stored working directory to the given path without touching `PWD`,
+    /// `OLDPWD` or any other variable.
+    ///
+    /// Validates the target exactly like [`Self::set_working_dir`]; the caller owns keeping the
+    /// directory variables consistent with the relocated directory.
+    ///
+    /// # Arguments
+    ///
+    /// * `target_dir` - The path to store as the working directory.
+    pub fn relocate_working_dir(&mut self, target_dir: &Path) -> Result<(), error::Error> {
+        *self.working_dir_mut() = self.directory_target(target_dir)?;
+        Ok(())
+    }
+
+    /// The normalized (not canonicalized) absolute form of `target_dir`, which must name a
+    /// directory.
+    fn directory_target(&self, target_dir: &Path) -> Result<PathBuf, error::Error> {
+        let abs_path = self.absolute_path(target_dir);
+
+        match std::fs::metadata(&abs_path) {
+            Ok(m) => {
+                if !m.is_dir() {
+                    return Err(error::ErrorKind::NotADirectory(abs_path).into());
+                }
+            }
+            Err(e) => {
+                return Err(e.into());
+            }
+        }
+
+        // Normalize the path (but don't canonicalize it).
+        Ok(abs_path.normalize())
     }
 
     /// Tilde-shortens the given string, replacing the user's home directory with a tilde.

@@ -1,6 +1,5 @@
 //! Mux admission, terminal and lifecycle failures. Command verdicts are ordinary Shell errors.
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::ShellError;
@@ -13,14 +12,6 @@ pub enum MuxError {
     /// itself.
     #[error(transparent)]
     Marsh(#[from] ShellError),
-    /// A job directory escapes the seed or names nothing in it.
-    #[error("{path} cannot be used as a job directory: {reason}")]
-    SandboxDir {
-        /// The directory as the user typed it.
-        path: PathBuf,
-        /// Why it was rejected.
-        reason: String,
-    },
     /// A job name a live job already holds.
     #[error("{} already exists", .0.reference())]
     JobExists(ShellId),

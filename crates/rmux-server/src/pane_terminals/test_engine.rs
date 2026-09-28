@@ -195,7 +195,11 @@ pub(super) fn open(
         },
         runtime.clone(),
         root.join("rmux.sock"),
-        |profile, frontend| marsh_core::test_support::mux(profile, frontend, filesystem),
+        // Every command takes the managed route these handler tests were written against.
+        |mut profile, frontend| {
+            profile.sandbox_policy = marsh_core::SandboxPolicy::allow();
+            marsh_core::test_support::mux(profile, frontend, filesystem)
+        },
     )
     .ok()?;
     // Both directions, before the consumer starts. Selection is the facade's own state now, so a

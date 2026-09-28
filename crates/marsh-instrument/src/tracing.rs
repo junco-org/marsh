@@ -1192,7 +1192,12 @@ fn receive(tracing: &Weak<Tracing>, socket: UnixStream) -> io::Result<()> {
     }
 }
 
-pub(crate) fn open_process(pid: i32) -> io::Result<OwnedFd> {
+/// Opens a pidfd pinning the identity of live process `pid`, so a later signal cannot reach a
+/// recycled PID.
+///
+/// # Errors
+/// Fails when the process no longer exists or the kernel refuses a pidfd.
+pub fn open_process(pid: i32) -> io::Result<OwnedFd> {
     // SAFETY: pidfd_open accepts two integer arguments and accesses no pointer.
     let fd = i32::try_from(Errno::result(unsafe {
         libc::syscall(libc::SYS_pidfd_open, pid, 0)
@@ -1202,7 +1207,11 @@ pub(crate) fn open_process(pid: i32) -> io::Result<OwnedFd> {
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
-fn signal_process(process: &OwnedFd, signal: i32) -> io::Result<bool> {
+/// Sends `signal` through a pidfd; answers whether the process was still alive to receive it.
+///
+/// # Errors
+/// Fails for any refusal other than the process having already exited.
+pub fn signal_process(process: &OwnedFd, signal: i32) -> io::Result<bool> {
     // SAFETY: the descriptor pins process identity; a null siginfo requests the standard signal.
     Ok(alive(Errno::result(unsafe {
         libc::syscall(

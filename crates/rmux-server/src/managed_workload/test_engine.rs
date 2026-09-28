@@ -7,11 +7,12 @@
 //! to run against.
 //!
 //! This builds one, lazily, on first use, through the same [`ShellIo::new`] production goes
-//! through — a private seed behind [`marsh_btrfs::fake::CopyTree`], an isolated validator, and the
-//! daemon's own uniform profile so `__rmux_io` is registered exactly as it is in production — and
-//! it deliberately is not a simplified stand-in. A test running against a different builtin table
-//! or a shared policy history would be proving something about a configuration this daemon never
-//! ships.
+//! through — a private Git work tree behind [`marsh_btrfs::fake::CopyTree`], an isolated validator,
+//! and the daemon's own uniform profile so `__rmux_io` is registered exactly as it is in
+//! production — and it deliberately is not a simplified stand-in. A test running against a
+//! different builtin table or a shared policy history would be proving something about a
+//! configuration this daemon never ships. The one deliberate difference is the routing policy:
+//! every command takes the managed route, as it does whenever panes share a source.
 
 use std::sync::{Arc, Mutex as StdMutex};
 
@@ -48,6 +49,8 @@ pub(crate) fn install(handler: &RequestHandler) -> Option<ShellIo> {
     let root = scratch.path().canonicalize().ok()?;
     let seed = root.join("seed");
     std::fs::create_dir_all(&seed).ok()?;
+    // A work tree, so every job's source root is the seed and its directory label is relative to it.
+    git2::Repository::init(&seed).ok()?;
     let filesystem = Arc::new(marsh_btrfs::fake::CopyTree::new());
     filesystem.register(&seed);
 
@@ -60,7 +63,13 @@ pub(crate) fn install(handler: &RequestHandler) -> Option<ShellIo> {
         },
         runtime,
         handler.socket_path(),
-        |profile, frontend| marsh_core::test_support::mux(profile, frontend, filesystem),
+        // Every command takes the managed route these handler tests were written against: under
+        // the default policy a pane's long-running direct command would hold every other pane on
+        // the same seed in admission until it exits.
+        |mut profile, frontend| {
+            profile.sandbox_policy = marsh_core::SandboxPolicy::allow();
+            marsh_core::test_support::mux(profile, frontend, filesystem)
+        },
     )
     .ok()?;
 

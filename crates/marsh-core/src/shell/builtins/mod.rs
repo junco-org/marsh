@@ -7,7 +7,7 @@ mod git;
 pub(super) mod gitcmd;
 mod gitexec;
 
-pub use super::execution::{CommandContext, DirectoryEntry, GlobPaths, ReadDir, current_context};
+pub use super::execution::{BuiltinContext, DirectoryEntry, GlobPaths, ReadDir, current_context};
 pub use brush_core::builtins::{Command, DeclarationCommand, SimpleCommand};
 
 /// A builtin registration specialized internally for the managed interpreter.

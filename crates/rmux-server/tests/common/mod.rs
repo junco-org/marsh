@@ -247,6 +247,7 @@ pub(crate) async fn daemon_over_seed(
             cols: SEED_COLS,
         },
         filesystem,
+        marsh_core::SandboxPolicy::allow(),
     )
     .await
 }

@@ -1,7 +1,12 @@
 //! Stage 2: one evaluation, scoped Brush work, transitive producers, and final native drain.
+//!
+//! Both routes run the same persistent interpreter under one [`Run`]. A managed run observes its
+//! snapshot through the shared tracer; a direct run executes against the source and only owns the
+//! lifetimes of the children and tasks it starts.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, Weak};
@@ -16,6 +21,7 @@ use marsh_instrument::{
     InvocationId, PollScope, Scoped, TraceRun, TraceScope, TraceScopeGuard, Tracing,
 };
 use marsh_lib::RecoverPoison as _;
+use tokio::io::unix::AsyncFd;
 
 use super::completion::{Completion, Finalize};
 use super::snapshot::{CommandEvidence, PreparedCommand, Snapshot};
@@ -29,40 +35,65 @@ impl ShellExtensions for ManagedExtensions {
     type ExecutionObserver = MarshExecutor;
 }
 
+/// Which run, if any, the interpreter's hooks currently belong to.
+#[derive(Default)]
+pub(super) enum ExecutorState {
+    /// The interpreter is being constructed; no command owns its hooks yet.
+    Initializing,
+    /// Between spans: no hook has an owner.
+    #[default]
+    Idle,
+    /// The admitted span's run.
+    Running(Weak<Run>),
+}
+
+/// The interpreter's spawner and observer. Every clone shares one state cell.
 #[derive(Clone, Default)]
 pub(super) struct MarshExecutor {
-    snapshot: Weak<Snapshot>,
+    state: Arc<Mutex<ExecutorState>>,
 }
 impl MarshExecutor {
-    pub fn new(snapshot: &Arc<Snapshot>) -> Self {
+    pub fn new() -> Self {
         Self {
-            snapshot: Arc::downgrade(snapshot),
+            state: Arc::new(Mutex::new(ExecutorState::Initializing)),
         }
     }
-    /// `path` inside the attached snapshot, or unchanged once the snapshot is gone.
-    pub fn physical(&self, path: PathBuf) -> PathBuf {
-        match self.snapshot.upgrade() {
+    /// Makes `run` the owner of every hook until [`Self::idle`].
+    pub fn install(&self, run: &Arc<Run>) {
+        *self.state.lock().recover() = ExecutorState::Running(Arc::downgrade(run));
+    }
+    pub fn idle(&self) {
+        *self.state.lock().recover() = ExecutorState::Idle;
+    }
+    /// The live run owning the interpreter's hooks.
+    pub fn running(&self) -> Option<Arc<Run>> {
+        match &*self.state.lock().recover() {
+            ExecutorState::Running(run) => run.upgrade(),
+            ExecutorState::Initializing | ExecutorState::Idle => None,
+        }
+    }
+    /// `path` in the active run's filesystem view.
+    pub fn physical(&self, path: PathBuf) -> Result<PathBuf, ShellError> {
+        let context = self.context()?;
+        Ok(match context.snapshot()? {
             Some(snapshot) => snapshot.physical(&path),
             None => path,
-        }
+        })
     }
-    fn context(&self) -> Result<CommandContext, ShellError> {
-        if let Some(context) = current_context() {
-            if Weak::ptr_eq(&context.snapshot, &self.snapshot) {
-                context.check()?;
-                return Ok(context);
-            }
-        }
-        let snapshot = self
-            .snapshot
-            .upgrade()
+    fn context(&self) -> Result<BuiltinContext, ShellError> {
+        let run = self
+            .running()
             .ok_or_else(|| ShellError::new(ShellErrorKind::Closed))?;
-        let run = snapshot.active()?;
+        if let Some(context) = current_context()
+            && Arc::ptr_eq(&context.run, &run)
+        {
+            context.check()?;
+            return Ok(context);
+        }
         run.check()?;
-        Ok(CommandContext {
-            snapshot: self.snapshot.clone(),
+        Ok(BuiltinContext {
+            cwd: Arc::clone(&run.cwd),
             run,
-            cwd: Arc::new(snapshot.session.persistence.seed.clone()),
             builtin: None,
         })
     }
@@ -75,11 +106,12 @@ impl ExternalCommandSpawner for MarshExecutor {
     ) -> std::io::Result<brush_core::sys::process::Child> {
         let context = self.context().map_err(std::io::Error::other)?;
         let _guard = context.enter().map_err(std::io::Error::other)?;
-        DefaultExternalCommandSpawner.spawn(command, kill_on_drop)
+        let child = DefaultExternalCommandSpawner.spawn(command, kill_on_drop)?;
+        context.run.adopt(child)
     }
 }
 
-pub(super) struct BuiltinToken(Result<CommandContext, ShellError>);
+pub(super) struct BuiltinToken(Result<BuiltinContext, ShellError>);
 impl ExecutionObserver for MarshExecutor {
     type Builtin = BuiltinToken;
     type SyncGuard = SyncGuard;
@@ -90,12 +122,14 @@ impl ExecutionObserver for MarshExecutor {
     }
     fn begin_builtin(&self, _name: &str, _args: &[CommandArg], cwd: &Path) -> Self::Builtin {
         BuiltinToken(self.context().and_then(|mut context| {
-            let snapshot = context
-                .snapshot
-                .upgrade()
-                .ok_or_else(|| ShellError::new(ShellErrorKind::Closed))?;
-            context.cwd = Arc::new(snapshot.logical(cwd));
-            context.builtin = Some(context.run.tracing.invocation(context.run.trace)?);
+            context.cwd = Arc::new(match context.snapshot()? {
+                Some(snapshot) => snapshot.logical(cwd),
+                None => cwd.to_path_buf(),
+            });
+            context.builtin = match &context.run.backend {
+                Backend::Managed { tracing, trace, .. } => Some(tracing.invocation(*trace)?),
+                Backend::Direct { .. } => None,
+            };
             Ok(context)
         }))
     }
@@ -139,12 +173,8 @@ impl ExecutionObserver for MarshExecutor {
         let lease = context.run.lease().map_err(brush_error)?;
         let id = lease.id;
         let scoped = context.wrap(future).map_err(brush_error)?;
-        let internal = context
-            .run
-            .tracing
-            .internal_scope()
-            .map_err(|error| brush_error(error.into()))?;
-        let _guard = internal.enter();
+        let internal = context.run.internal_scope().map_err(brush_error)?;
+        let _guard = internal.as_ref().map(TraceScope::enter);
         let handle = context.run.runtime.spawn(async move {
             let result = scoped.await;
             lease.complete();
@@ -183,25 +213,83 @@ enum RunPhase {
     Publishing,
 }
 
+/// A child process of a direct run, pinned by its pidfd; readable once it has exited.
+type DirectChild = Arc<AsyncFd<OwnedFd>>;
+
+/// How a run's work is observed and ended.
+pub(super) enum Backend {
+    /// Traced work in a private snapshot, published only through authorization.
+    Managed {
+        tracing: Arc<Tracing>,
+        trace: TraceRun,
+        snapshot: Weak<Snapshot>,
+    },
+    /// Work against the source itself: only the children this run spawned are owned.
+    Direct { children: Mutex<Vec<DirectChild>> },
+}
+
 pub(super) struct Run {
     pub runtime: tokio::runtime::Handle,
-    pub tracing: Arc<Tracing>,
-    pub trace: TraceRun,
+    pub backend: Backend,
+    /// The span's logical initial directory, for contexts not created by a builtin.
+    pub cwd: Arc<PathBuf>,
     workers: Mutex<Workers>,
     pub closed: AtomicBool,
     phase: AtomicU8,
     changed: tokio::sync::Notify,
 }
 impl Run {
-    pub fn new(runtime: tokio::runtime::Handle, tracing: Arc<Tracing>, trace: TraceRun) -> Self {
+    fn new(runtime: tokio::runtime::Handle, backend: Backend, cwd: Arc<PathBuf>) -> Self {
         Self {
             runtime,
-            tracing,
-            trace,
+            backend,
+            cwd,
             workers: Mutex::new(Workers::default()),
             closed: AtomicBool::new(false),
             phase: AtomicU8::new(RunPhase::Running as u8),
             changed: tokio::sync::Notify::new(),
+        }
+    }
+    pub fn managed(
+        runtime: tokio::runtime::Handle,
+        tracing: Arc<Tracing>,
+        trace: TraceRun,
+        snapshot: Weak<Snapshot>,
+        cwd: Arc<PathBuf>,
+    ) -> Self {
+        Self::new(
+            runtime,
+            Backend::Managed {
+                tracing,
+                trace,
+                snapshot,
+            },
+            cwd,
+        )
+    }
+    pub fn direct(runtime: tokio::runtime::Handle, cwd: Arc<PathBuf>) -> Self {
+        Self::new(
+            runtime,
+            Backend::Direct {
+                children: Mutex::new(Vec::new()),
+            },
+            cwd,
+        )
+    }
+    /// The tracer and trace of a managed run; a direct run has neither.
+    pub fn trace(&self) -> Result<(&Arc<Tracing>, TraceRun), ShellError> {
+        match &self.backend {
+            Backend::Managed { tracing, trace, .. } => Ok((tracing, *trace)),
+            Backend::Direct { .. } => Err(ShellError::infrastructure(
+                "a direct command has no managed trace",
+            )),
+        }
+    }
+    /// A scope marking implementation work; direct runs are never traced.
+    fn internal_scope(&self) -> Result<Option<TraceScope>, ShellError> {
+        match &self.backend {
+            Backend::Managed { tracing, .. } => Ok(Some(tracing.internal_scope()?)),
+            Backend::Direct { .. } => Ok(None),
         }
     }
     pub fn check(&self) -> Result<(), ShellError> {
@@ -211,7 +299,9 @@ impl Run {
         if self.is_cancelled() {
             return Err(ShellError::new(ShellErrorKind::Interrupted));
         }
-        self.tracing.health(self.trace)?;
+        if let Backend::Managed { tracing, trace, .. } = &self.backend {
+            tracing.health(*trace)?;
+        }
         Ok(())
     }
     fn lease(self: &Arc<Self>) -> Result<Completion<Lease>, ShellError> {
@@ -241,6 +331,58 @@ impl Run {
             *slot = Some(abort);
         }
     }
+    /// Takes ownership of a freshly spawned child. A direct run pins it by pidfd, or kills and
+    /// reaps it when it cannot, so no child it spawned is ever left untracked.
+    fn adopt(
+        &self,
+        child: brush_core::sys::process::Child,
+    ) -> std::io::Result<brush_core::sys::process::Child> {
+        let Backend::Direct { children } = &self.backend else {
+            return Ok(child);
+        };
+        let pinned = child
+            .id()
+            .ok_or_else(|| std::io::Error::other("spawned child has no process id"))
+            .and_then(|pid| i32::try_from(pid).map_err(std::io::Error::other))
+            .and_then(marsh_instrument::open_process)
+            .and_then(|pidfd| {
+                let _runtime = self.runtime.enter();
+                AsyncFd::new(pidfd)
+            });
+        match pinned {
+            Ok(pidfd) => {
+                if self.is_cancelled() {
+                    let _ = marsh_instrument::signal_process(pidfd.get_ref(), libc::SIGKILL);
+                }
+                children.lock().recover().push(Arc::new(pidfd));
+                Ok(child)
+            }
+            Err(error) => {
+                let mut child = child;
+                let _ = child.start_kill();
+                self.runtime.spawn(async move {
+                    let _ = child.wait().await;
+                });
+                Err(error)
+            }
+        }
+    }
+    /// Signals the run's live processes; returns how many received it.
+    pub fn signal(&self, signal: i32) -> Result<usize, ShellError> {
+        match &self.backend {
+            Backend::Managed { tracing, trace, .. } => Ok(tracing.signal(*trace, signal)?),
+            Backend::Direct { children } => {
+                let children = children.lock().recover().clone();
+                let mut signalled = 0;
+                for child in &children {
+                    if marsh_instrument::signal_process(child.get_ref(), signal)? {
+                        signalled += 1;
+                    }
+                }
+                Ok(signalled)
+            }
+        }
+    }
     pub fn cancel(&self) {
         if self
             .phase
@@ -259,7 +401,14 @@ impl Run {
             abort.abort();
         }
         drop(workers);
-        let _ = self.tracing.cancel(self.trace);
+        match &self.backend {
+            Backend::Managed { tracing, trace, .. } => {
+                let _ = tracing.cancel(*trace);
+            }
+            Backend::Direct { .. } => {
+                let _ = self.signal(libc::SIGKILL);
+            }
+        }
         self.changed.notify_waiters();
     }
     pub fn is_cancelled(&self) -> bool {
@@ -285,8 +434,20 @@ impl Run {
             changed.await;
         }
     }
-    async fn finish(&self) -> Result<(), ShellError> {
-        loop {
+    /// Resolves with the native service's failure; a direct run has no such service.
+    async fn failure(&self) -> ShellError {
+        match &self.backend {
+            Backend::Managed { tracing, trace, .. } => {
+                std::future::poll_fn(|context| tracing.poll_failure(*trace, context))
+                    .await
+                    .into()
+            }
+            Backend::Direct { .. } => std::future::pending().await,
+        }
+    }
+    /// Waits for every owned producer. `Err(true)` means some producer's end cannot be proven.
+    async fn finish(&self) -> Result<(), (ShellError, bool)> {
+        let failed = loop {
             let changed = self.changed.notified();
             let state = {
                 let mut workers = self.workers.lock().recover();
@@ -298,17 +459,32 @@ impl Run {
                 }
             };
             if let Some(failed) = state {
-                self.closed.store(true, Ordering::Release);
-                self.changed.notify_waiters();
-                if failed {
-                    return Err(ShellError::infrastructure(
-                        "an owned producer did not complete",
-                    ));
-                }
-                return Ok(());
+                break failed;
             }
             changed.await;
+        };
+        let children = match &self.backend {
+            Backend::Direct { children } => children.lock().recover().clone(),
+            Backend::Managed { .. } => Vec::new(),
+        };
+        let mut uncertain = None;
+        for child in &children {
+            if let Err(error) = child.readable().await {
+                uncertain.get_or_insert(error);
+            }
         }
+        self.closed.store(true, Ordering::Release);
+        self.changed.notify_waiters();
+        if let Some(error) = uncertain {
+            return Err((error.into(), true));
+        }
+        if failed {
+            return Err((
+                ShellError::infrastructure("an owned producer did not complete"),
+                false,
+            ));
+        }
+        Ok(())
     }
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -327,10 +503,10 @@ impl Finalize for Lease {
     }
 }
 
-thread_local! { static CURRENT: RefCell<Option<CommandContext>> = const { RefCell::new(None) }; }
-struct ContextGuard(Option<CommandContext>);
+thread_local! { static CURRENT: RefCell<Option<BuiltinContext>> = const { RefCell::new(None) }; }
+struct ContextGuard(Option<BuiltinContext>);
 impl ContextGuard {
-    fn enter(context: CommandContext) -> Self {
+    fn enter(context: BuiltinContext) -> Self {
         Self(CURRENT.with(|current| current.replace(Some(context))))
     }
 }
@@ -342,44 +518,79 @@ impl Drop for ContextGuard {
     }
 }
 
-/// Normal callback I/O and cancellation facilities. Retaining this never retains a work tree.
+/// Normal callback I/O and cancellation facilities. Retaining this never retains a work tree,
+/// an admission, source membership or any later command's view.
 #[derive(Clone)]
-pub struct CommandContext {
-    snapshot: Weak<Snapshot>,
+pub struct BuiltinContext {
     run: Arc<Run>,
     cwd: Arc<PathBuf>,
     builtin: Option<InvocationId>,
 }
-impl std::fmt::Debug for CommandContext {
+impl std::fmt::Debug for BuiltinContext {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CommandContext")
+        f.debug_struct("BuiltinContext")
             .field("working_dir", &self.cwd)
             .field("cancelled", &self.cancellation_requested())
             .finish_non_exhaustive()
     }
 }
 /// Returns the context of the builtin currently executing on this thread or task poll.
-pub fn current_context() -> Option<CommandContext> {
+pub fn current_context() -> Option<BuiltinContext> {
     CURRENT.with(|current| current.borrow().clone())
 }
 
-impl CommandContext {
+/// `path` in `view`, or `path` itself on the direct route.
+fn physical(view: Option<&Snapshot>, path: &Path) -> PathBuf {
+    view.map_or_else(|| path.to_path_buf(), |snapshot| snapshot.physical(path))
+}
+/// `path` as the caller names it, from `view` or from the source itself.
+fn logical(view: Option<&Snapshot>, path: &Path) -> PathBuf {
+    view.map_or_else(|| path.to_path_buf(), |snapshot| snapshot.logical(path))
+}
+
+impl BuiltinContext {
     pub(super) const fn invocation(&self) -> Option<InvocationId> {
         self.builtin
     }
-    pub(super) fn snapshot(&self) -> Option<Arc<Snapshot>> {
-        self.check().ok()?;
-        self.snapshot.upgrade()
+    /// The owning run, as a nested call's admission sees its caller.
+    pub(super) fn parent(&self) -> Weak<Run> {
+        Arc::downgrade(&self.run)
+    }
+    /// The owning run, while it still accepts work.
+    pub(super) fn run(&self) -> Result<&Arc<Run>, ShellError> {
+        self.check()?;
+        Ok(&self.run)
+    }
+    /// The managed view of the owning run; `None` only for a direct run.
+    pub(super) fn snapshot(&self) -> Result<Option<Arc<Snapshot>>, ShellError> {
+        self.check()?;
+        match &self.run.backend {
+            Backend::Managed { snapshot, .. } => snapshot
+                .upgrade()
+                .map(Some)
+                .ok_or_else(|| ShellError::new(ShellErrorKind::Closed)),
+            Backend::Direct { .. } => Ok(None),
+        }
     }
     fn check(&self) -> Result<(), ShellError> {
         self.run.check()
     }
+    /// The workload scope of a managed run; direct work is never attributed.
+    fn scope(&self) -> Result<Option<TraceScope>, ShellError> {
+        match &self.run.backend {
+            Backend::Managed { tracing, trace, .. } => {
+                Ok(Some(tracing.scope(*trace, self.builtin)?))
+            }
+            Backend::Direct { .. } => Ok(None),
+        }
+    }
     fn enter(&self) -> Result<SyncGuard, ShellError> {
         self.check()?;
-        let scope = self.run.tracing.scope(self.run.trace, self.builtin)?;
+        let scope = self.scope()?;
+        let context = ContextGuard::enter(self.clone());
         Ok(SyncGuard {
-            _trace: scope.enter(),
-            _context: ContextGuard::enter(self.clone()),
+            _trace: scope.as_ref().map(TraceScope::enter),
+            _context: context,
         })
     }
     fn wrap<F: Future>(&self, future: F) -> Result<Scoped<F, ContextScope>, ShellError> {
@@ -387,7 +598,7 @@ impl CommandContext {
         Ok(Scoped::new(
             future,
             ContextScope {
-                scope: self.run.tracing.scope(self.run.trace, self.builtin)?,
+                scope: self.scope()?,
                 context: self.clone(),
             },
         ))
@@ -412,11 +623,11 @@ impl CommandContext {
         let lease = self.run.lease()?;
         let id = lease.id;
         let context = self.clone();
-        let scope = self.run.tracing.scope(self.run.trace, self.builtin)?;
-        let internal = self.run.tracing.internal_scope()?;
-        let _guard = internal.enter();
+        let scope = self.scope()?;
+        let internal = self.run.internal_scope()?;
+        let _guard = internal.as_ref().map(TraceScope::enter);
         let handle = self.run.runtime.spawn_blocking(move || {
-            let _trace = scope.enter();
+            let _trace = scope.as_ref().map(TraceScope::enter);
             let _context = ContextGuard::enter(context);
             let result = operation();
             lease.complete();
@@ -440,16 +651,24 @@ impl CommandContext {
         })?;
         Ok(receive)
     }
-    /// Runs `operation` against the live work generation as one registered, scoped step of the
-    /// owning run; `ended` is the failure once the snapshot has gone.
-    fn step<T>(&self, ended: &str, operation: impl FnOnce(&Snapshot) -> T) -> std::io::Result<T> {
+    /// Runs `operation` against the owning run's filesystem view as one registered, scoped step;
+    /// `ended` is the failure once a managed view has gone.
+    fn step<T>(
+        &self,
+        ended: &str,
+        operation: impl FnOnce(Option<&Snapshot>) -> T,
+    ) -> std::io::Result<T> {
         let mut lease = self.run.lease().map_err(std::io::Error::other)?;
         let _guard = self.enter().map_err(std::io::Error::other)?;
-        let snapshot = self
-            .snapshot
-            .upgrade()
-            .ok_or_else(|| std::io::Error::other(ended))?;
-        let result = operation(&snapshot);
+        let view = match &self.run.backend {
+            Backend::Managed { snapshot, .. } => Some(
+                snapshot
+                    .upgrade()
+                    .ok_or_else(|| std::io::Error::other(ended))?,
+            ),
+            Backend::Direct { .. } => None,
+        };
+        let result = operation(view.as_deref());
         lease.completed = true;
         Ok(result)
     }
@@ -463,11 +682,11 @@ impl CommandContext {
         } else {
             self.cwd.join(path)
         };
-        self.step("command context has ended", |snapshot| {
-            operation(&snapshot.physical(&logical))
+        self.step("command context has ended", |view| {
+            operation(&physical(view, &logical))
         })?
     }
-    /// Opens a logical path inside the owning command's work generation.
+    /// Opens a logical path in the owning command's filesystem view.
     pub fn open(
         &self,
         path: &Path,
@@ -493,20 +712,16 @@ impl CommandContext {
     }
     /// Expands a glob using the existing glob implementation and returns logical paths.
     pub fn glob(&self, pattern: &str, cwd: Option<&Path>) -> Result<GlobPaths, ShellError> {
-        self.check()?;
+        let view = self.snapshot()?;
         let _guard = self.enter()?;
-        let snapshot = self
-            .snapshot
-            .upgrade()
-            .ok_or_else(|| ShellError::new(ShellErrorKind::Closed))?;
         let not_utf8 = || ShellError::unsupported("glob path is not UTF-8");
         // Only the caller's pattern is glob syntax; the directory it is relative to is a literal
         // path, and a `[` or `*` in its name must not turn it into a character class or wildcard.
         let pattern = if Path::new(pattern).is_absolute() {
-            let physical = snapshot.physical(Path::new(pattern));
+            let physical = physical(view.as_deref(), Path::new(pattern));
             physical.to_str().ok_or_else(not_utf8)?.to_owned()
         } else {
-            let base = snapshot.physical(cwd.unwrap_or(&self.cwd));
+            let base = physical(view.as_deref(), cwd.unwrap_or(&self.cwd));
             format!(
                 "{}/{pattern}",
                 glob::Pattern::escape(base.to_str().ok_or_else(not_utf8)?)
@@ -524,16 +739,16 @@ impl CommandContext {
 /// Logical directory entries with lifetime-checked iteration.
 pub struct ReadDir {
     inner: std::fs::ReadDir,
-    context: CommandContext,
+    context: BuiltinContext,
 }
 impl Iterator for ReadDir {
     type Item = std::io::Result<DirectoryEntry>;
     fn next(&mut self) -> Option<Self::Item> {
         self.context
-            .step("ended directory context", |snapshot| {
+            .step("ended directory context", |view| {
                 self.inner.next().map(|entry| {
                     entry.map(|entry| DirectoryEntry {
-                        path: snapshot.logical(&entry.path()),
+                        path: logical(view, &entry.path()),
                         name: entry.file_name(),
                         context: self.context.clone(),
                     })
@@ -546,7 +761,7 @@ impl Iterator for ReadDir {
 pub struct DirectoryEntry {
     path: PathBuf,
     name: std::ffi::OsString,
-    context: CommandContext,
+    context: BuiltinContext,
 }
 impl DirectoryEntry {
     /// Logical full pathname.
@@ -567,18 +782,18 @@ impl DirectoryEntry {
         self.metadata().map(|metadata| metadata.file_type())
     }
 }
-/// Logical results from a managed glob.
+/// Logical results from a glob in the command's view.
 pub struct GlobPaths {
     inner: glob::Paths,
-    context: CommandContext,
+    context: BuiltinContext,
 }
 impl Iterator for GlobPaths {
     type Item = std::io::Result<PathBuf>;
     fn next(&mut self) -> Option<Self::Item> {
         self.context
-            .step("ended glob context", |snapshot| {
+            .step("ended glob context", |view| {
                 self.inner.next().map(|path| {
-                    path.map(|path| snapshot.logical(&path)).map_err(|error| {
+                    path.map(|path| logical(view, &path)).map_err(|error| {
                         std::io::Error::new(error.error().kind(), error.error().to_string())
                     })
                 })
@@ -588,20 +803,20 @@ impl Iterator for GlobPaths {
 }
 
 pub(super) struct SyncGuard {
-    _trace: TraceScopeGuard,
+    _trace: Option<TraceScopeGuard>,
     _context: ContextGuard,
 }
 /// Per-poll command context: TLS is entered before tracing and restored after it.
 struct ContextScope {
-    scope: TraceScope,
-    context: CommandContext,
+    scope: Option<TraceScope>,
+    context: BuiltinContext,
 }
 impl PollScope for ContextScope {
     type Guard = SyncGuard;
     fn enter(&self) -> Self::Guard {
         let context = ContextGuard::enter(self.context.clone());
         SyncGuard {
-            _trace: self.scope.enter(),
+            _trace: self.scope.as_ref().map(TraceScope::enter),
             _context: context,
         }
     }
@@ -615,46 +830,81 @@ pub(super) fn brush_error(error: ShellError) -> brush_core::Error {
     brush_core::ErrorKind::InternalError(error.to_string()).into()
 }
 
+/// Evaluates `command` exactly once under `run`, which every producer it starts inherits.
+pub(super) async fn evaluate(
+    interpreter: &mut brush_core::Shell<ManagedExtensions>,
+    run: &Arc<Run>,
+    command: super::Command,
+) -> (Option<ExecutionResult>, Option<ShellError>) {
+    let context = BuiltinContext {
+        run: Arc::clone(run),
+        cwd: Arc::clone(&run.cwd),
+        builtin: None,
+    };
+    let evaluation = match context.wrap(command.evaluate(interpreter)) {
+        Ok(evaluation) => evaluation,
+        Err(error) => return (None, Some(error)),
+    };
+    let evaluated = tokio::select! {
+        outcome = std::panic::AssertUnwindSafe(evaluation).catch_unwind() => match outcome {
+            Ok(result) => result.map_err(ShellError::from),
+            Err(_) => Err(ShellError::infrastructure("command producer panicked")),
+        },
+        () = run.cancelled() => Err(ShellError::new(ShellErrorKind::Interrupted)),
+        error = run.failure() => Err(error),
+    };
+    match evaluated {
+        Ok(value) => (Some(value), None),
+        Err(error) => (None, Some(error)),
+    }
+}
+
 pub(super) struct ExecutedCommand {
     pub prepared: Completion<PreparedCommand>,
     pub result: Option<ExecutionResult>,
     pub failure: Option<ShellError>,
     pub evidence: CommandEvidence,
     pub command: String,
+    /// Producer quiescence could not be proven; the view and its coverage must be retained.
+    pub uncertain: bool,
 }
 
 pub(super) async fn run(
     interpreter: &mut brush_core::Shell<ManagedExtensions>,
     prepared: Completion<PreparedCommand>,
     command: super::Command,
+    text: String,
 ) -> ExecutedCommand {
-    let context = CommandContext {
-        snapshot: Arc::downgrade(&prepared.snapshot),
-        run: Arc::clone(&prepared.run),
-        cwd: Arc::new(prepared.snapshot.logical(interpreter.working_dir())),
-        builtin: None,
-    };
-    let text = command.description();
-    let mut result = None;
-    let mut failure = None;
-    match context.wrap(command.evaluate(interpreter)) {
-        Err(error) => failure = Some(error),
-        Ok(evaluation) => {
-            let evaluated = tokio::select! {
-                outcome = std::panic::AssertUnwindSafe(evaluation).catch_unwind() => match outcome {
-                    Ok(result) => result.map_err(ShellError::from),
-                    Err(_) => Err(ShellError::infrastructure("command producer panicked")),
-                },
-                () = prepared.run.cancelled() => Err(ShellError::new(ShellErrorKind::Interrupted)),
-                error = std::future::poll_fn(|context| prepared.run.tracing.poll_failure(prepared.run.trace, context)) => Err(error.into()),
-            };
-            match evaluated {
-                Ok(value) => result = Some(value),
-                Err(error) => failure = Some(error),
-            }
-        }
-    }
+    let (result, failure) = evaluate(interpreter, &prepared.run, command).await;
     complete(prepared, result, failure, text).await
+}
+
+/// Drains a direct run: its tasks, and the children it spawned. Returns the native result, or
+/// the failure and whether producer quiescence is uncertain.
+pub(super) async fn complete_direct(
+    run: &Run,
+    result: Option<ExecutionResult>,
+    mut failure: Option<ShellError>,
+) -> (Result<ExecutionResult, ShellError>, bool) {
+    if failure.is_some() {
+        run.cancel();
+    }
+    let mut uncertain = false;
+    if let Err((error, unproven)) = run.finish().await {
+        uncertain = unproven;
+        failure.get_or_insert(error);
+    }
+    if run.is_cancelled() {
+        failure.get_or_insert_with(|| ShellError::new(ShellErrorKind::Interrupted));
+    }
+    let outcome = match (failure, result) {
+        (None, Some(result)) => Ok(result),
+        (Some(failure), result) => Err(failure.with_result(result)),
+        (None, None) => Err(ShellError::infrastructure(
+            "accepted execution has no native result",
+        )),
+    };
+    (outcome, uncertain)
 }
 
 pub(super) async fn complete(
@@ -666,43 +916,53 @@ pub(super) async fn complete(
     if failure.is_some() {
         prepared.run.cancel();
     }
-    if let Err(error) = prepared.run.finish().await {
+    if let Err((error, _)) = prepared.run.finish().await {
         failure.get_or_insert(error);
     }
-    let tracing = Arc::clone(&prepared.run.tracing);
-    let trace = prepared.run.trace;
-    let drain = {
-        let internal = tracing.internal_scope();
-        let _guard = internal.as_ref().ok().map(TraceScope::enter);
-        prepared
-            .run
-            .runtime
-            .spawn_blocking(move || tracing.quiesce(trace))
-    };
-    match drain.await {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => {
-            failure.get_or_insert_with(|| error.into());
-            prepared.snapshot.retained.store(true, Ordering::Release);
-        }
-        Err(error) => {
-            failure.get_or_insert_with(|| ShellError::infrastructure(error.to_string()));
-            prepared.snapshot.retained.store(true, Ordering::Release);
-        }
-    }
-    if prepared.run.is_cancelled() {
-        failure.get_or_insert_with(|| ShellError::new(ShellErrorKind::Interrupted));
-    }
-    let evidence = match prepared.snapshot.take_evidence(trace) {
-        Ok(evidence) => evidence,
+    let mut uncertain = false;
+    let mut evidence = CommandEvidence::default();
+    match prepared.run.trace() {
         Err(error) => {
             failure.get_or_insert(error);
-            CommandEvidence::default()
         }
-    };
-    if prepared.run.tracing.health(trace).is_ok() {
-        if let Err(error) = prepared.run.tracing.end_run(trace) {
-            failure.get_or_insert_with(|| error.into());
+        Ok((tracing, trace)) => {
+            let tracing = Arc::clone(tracing);
+            let drain = {
+                let internal = tracing.internal_scope();
+                let _guard = internal.as_ref().ok().map(TraceScope::enter);
+                let tracing = Arc::clone(&tracing);
+                prepared
+                    .run
+                    .runtime
+                    .spawn_blocking(move || tracing.quiesce(trace))
+            };
+            match drain.await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    failure.get_or_insert_with(|| error.into());
+                    prepared.snapshot.retained.store(true, Ordering::Release);
+                    uncertain = true;
+                }
+                Err(error) => {
+                    failure.get_or_insert_with(|| ShellError::infrastructure(error.to_string()));
+                    prepared.snapshot.retained.store(true, Ordering::Release);
+                    uncertain = true;
+                }
+            }
+            if prepared.run.is_cancelled() {
+                failure.get_or_insert_with(|| ShellError::new(ShellErrorKind::Interrupted));
+            }
+            match prepared.snapshot.take_evidence(trace) {
+                Ok(taken) => evidence = taken,
+                Err(error) => {
+                    failure.get_or_insert(error);
+                }
+            }
+            if tracing.health(trace).is_ok()
+                && let Err(error) = tracing.end_run(trace)
+            {
+                failure.get_or_insert_with(|| error.into());
+            }
         }
     }
     ExecutedCommand {
@@ -711,5 +971,6 @@ pub(super) async fn complete(
         failure,
         evidence,
         command: text,
+        uncertain,
     }
 }

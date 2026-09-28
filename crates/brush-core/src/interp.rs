@@ -115,6 +115,12 @@ impl ExecutionParameters {
         self.try_fd(shell, openfiles::OpenFiles::STDERR_FD)
     }
 
+    /// Returns the file descriptors this context explicitly overrides, including descriptors it
+    /// explicitly closed; descriptors it leaves to the shell are not specified here.
+    pub const fn open_files(&self) -> &openfiles::OpenFiles {
+        &self.open_files
+    }
+
     /// Returns the file descriptor with the given number. Returns `None`
     /// if the file descriptor is not open.
     ///

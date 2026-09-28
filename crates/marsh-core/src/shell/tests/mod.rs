@@ -2,7 +2,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use super::session::Session;
-use super::{Shell, ShellError, ShellErrorKind};
+use super::{SandboxPolicy, Shell, ShellError, ShellErrorKind};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -34,18 +34,18 @@ impl Fixture {
     async fn shell(&self) -> Shell {
         self.open().await.expect("build managed shell")
     }
-    /// Startup's verdict on a managed shell over the seed.
+    /// A managed shell over the seed with its storage opened, or the first managed operation's
+    /// failure.
     async fn open(&self) -> Result<Shell, ShellError> {
         self.open_on(self.fs.clone()).await
     }
-    /// Startup's verdict on a managed shell over the seed, stored through `backend`.
+    /// A managed shell over the seed, stored through `backend`. Storage is opened lazily, so the
+    /// first managed operation is run here and its failure is the verdict.
     async fn open_on(
         &self,
         backend: Arc<dyn marsh_btrfs::Subvolumes>,
     ) -> Result<Shell, ShellError> {
-        let mut builder = Shell::builder().working_dir(self.seed.clone());
-        builder.backend = Some(backend);
-        builder.build().await
+        managed(self.seed.clone(), backend).await
     }
     fn outside(&self, name: &str) -> PathBuf {
         self.seed.parent().unwrap().join(name)
@@ -69,6 +69,22 @@ impl Fixture {
 fn read(path: &Path) -> String {
     std::fs::read_to_string(path).unwrap_or_else(|error| panic!("read {}: {error}", path.display()))
 }
+/// An explicitly managed shell at `initial_dir` whose first managed operation has run.
+async fn managed(
+    initial_dir: PathBuf,
+    backend: Arc<dyn marsh_btrfs::Subvolumes>,
+) -> Result<Shell, ShellError> {
+    let mut builder = Shell::builder()
+        .working_dir(initial_dir)
+        .sandbox_policy(SandboxPolicy::allow());
+    builder.backend = Some(backend);
+    let shell = builder.build().await?;
+    if let Err(error) = shell.run(":").await {
+        let _ = shell.close(true).await;
+        return Err(error);
+    }
+    Ok(shell)
+}
 /// The session a live `shell` publishes through.
 async fn session(shell: &Shell) -> Arc<Session> {
     Arc::clone(
@@ -79,7 +95,10 @@ async fn session(shell: &Shell) -> Arc<Session> {
             .await
             .as_ref()
             .unwrap()
+            .resources
             .snapshot
+            .as_ref()
+            .expect("managed view")
             .session,
     )
 }

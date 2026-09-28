@@ -15,4 +15,5 @@ pub use helper::run_tracer_helper;
 pub use syscall::{FileTarget, Syscall};
 pub use tracing::{
     InvocationId, PollScope, RootId, Scoped, TraceRun, TraceScope, TraceScopeGuard, Tracing,
+    open_process, signal_process,
 };

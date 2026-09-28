@@ -89,6 +89,8 @@ rustix = { version = "=1.1.4", features = ["event", "fs", "net", "process"] }
 # so they run on any filesystem.
 marsh-btrfs = { path = "../marsh-btrfs", features = ["fake"] }
 marsh-core = { path = "../marsh-core", features = ["testing"] }
+# Test seeds are Git work trees, so a job's source root and directory label are the seed's.
+git2 = { version = "0.21", default-features = false, features = ["vendored-libgit2"] }
 rmux-core = { workspace = true, features = ["test-seams"] }
 rustix = { version = "1.1.4", features = ["event", "fs", "termios"] }
 serde_json = "1"

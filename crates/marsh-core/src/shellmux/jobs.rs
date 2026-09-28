@@ -467,10 +467,10 @@ impl ShellMux {
             readers,
         } = Self::open_streams(io)?;
         let interpreter = self
-            .build_shell(&requested, fds, options.environment)
+            .build_shell(id.clone(), &requested, fds, options.environment)
             .await?;
         let working_directory = interpreter.working_dir().await;
-        let sandbox = Self::source_sandbox(id.clone(), &interpreter, &working_directory)?;
+        let sandbox = interpreter.sandbox().clone();
         let (release, released) = tokio::sync::oneshot::channel::<Arc<JobEnd>>();
         let shell = Shell::new(
             sandbox,
@@ -532,29 +532,6 @@ impl ShellMux {
         registry.insert(id.clone(), None);
         drop(registry);
         Ok((id, io))
-    }
-
-    /// The sandbox `interpreter` answers for as `id`, at a source-relative `working_directory`.
-    fn source_sandbox(
-        id: ShellId,
-        interpreter: &crate::Shell,
-        working_directory: &Path,
-    ) -> Result<Sandbox, MuxError> {
-        let seed = interpreter.source_dir().to_path_buf();
-        let relative = working_directory
-            .strip_prefix(&seed)
-            .ok()
-            .and_then(Path::to_str)
-            .ok_or_else(|| MuxError::SandboxDir {
-                path: working_directory.to_path_buf(),
-                reason: "initial directory is not a representable source-relative path".into(),
-            })?;
-        Ok(Sandbox {
-            id,
-            seed,
-            dir: relative.into(),
-            uid: interpreter.principal().clone(),
-        })
     }
 
     /// Publishes `shell` under its reserved `id` with `io` resolved to the current default size,

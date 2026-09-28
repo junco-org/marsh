@@ -1,8 +1,8 @@
 //! Stage 1: clean work generation, immutable baseline, and owned evaluation resources.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use marsh_instrument::{InvocationId, RootId, Syscall, TraceRun};
 use marsh_lib::RecoverPoison as _;
@@ -11,8 +11,8 @@ use super::access::{Access, Effects};
 use super::builtins::gitcmd::GitAction;
 use super::completion::{Completion, Finalize};
 use super::execution::Run;
-use super::session::{Session, fresh_principal};
-use super::{Principal, ShellError, ShellErrorKind};
+use super::session::Session;
+use super::{Principal, ShellError};
 
 #[derive(Default)]
 pub(super) struct CommandEvidence {
@@ -29,29 +29,29 @@ pub(super) struct Snapshot {
     pub uid: Principal,
     path: PathBuf,
     root: OnceLock<RootId>,
-    serial: AtomicU64,
     pub retained: AtomicBool,
     closed: AtomicBool,
     reclaimed: AtomicBool,
     deferred: Mutex<Vec<PathBuf>>,
-    pub current: Mutex<Weak<Run>>,
     pub state: Mutex<SnapshotState>,
 }
 
 pub(super) struct SnapshotState {
     pub tree_seq: super::session::TreeVersion,
+    /// The source's direct epoch this generation was taken at.
+    epoch: u64,
     pub dirty: bool,
     access: Access,
     pub evidence: Option<(TraceRun, CommandEvidence)>,
 }
 
 impl Snapshot {
-    pub fn new(session: Arc<Session>) -> Result<Arc<Self>, ShellError> {
+    pub fn new(session: Arc<Session>, uid: Principal) -> Result<Arc<Self>, ShellError> {
         session.check()?;
-        let uid = fresh_principal()?;
         let path = session.persistence.work(uid.as_str());
-        let authority = session.authority.read().recover();
+        let authority = session.validator.read();
         let tree_seq = authority.tree_seq;
+        let epoch = session.epoch.load(Ordering::Acquire);
         let internal = session.tracing.internal_scope()?;
         let _guard = internal.enter();
         session.fs.snapshot(&session.persistence.seed, &path)?;
@@ -62,14 +62,13 @@ impl Snapshot {
             uid,
             path,
             root: OnceLock::new(),
-            serial: AtomicU64::new(1),
             retained: AtomicBool::new(false),
             closed: AtomicBool::new(false),
-            current: Mutex::new(Weak::new()),
             reclaimed: AtomicBool::new(false),
             deferred: Mutex::new(Vec::new()),
             state: Mutex::new(SnapshotState {
                 tree_seq,
+                epoch,
                 dirty: false,
                 access: Access::default(),
                 evidence: None,
@@ -159,13 +158,6 @@ impl Snapshot {
             .copied()
             .ok_or_else(|| ShellError::infrastructure("snapshot registration incomplete"))
     }
-    pub fn active(&self) -> Result<Arc<Run>, ShellError> {
-        self.current
-            .lock()
-            .recover()
-            .upgrade()
-            .ok_or_else(|| ShellError::new(ShellErrorKind::Closed))
-    }
     pub fn logical(&self, path: &Path) -> PathBuf {
         path.strip_prefix(&self.path).map_or_else(
             |_| path.to_path_buf(),
@@ -254,10 +246,6 @@ impl Snapshot {
         Ok(evidence)
     }
 
-    pub fn drain_trace(&self) -> Result<(), ShellError> {
-        self.session.tracing.drain(self.active()?.trace)?;
-        Ok(())
-    }
     pub fn writes_for(&self, invocation: InvocationId) -> Vec<PathBuf> {
         let state = self.state.lock().recover();
         let mut paths = std::collections::BTreeSet::new();
@@ -307,7 +295,7 @@ impl Drop for Snapshot {
 }
 
 #[derive(Clone, Copy)]
-pub(super) struct CommandNumber(u64);
+pub(super) struct CommandNumber(pub(super) u64);
 impl std::fmt::Display for CommandNumber {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.0.fmt(formatter)
@@ -323,34 +311,32 @@ pub(super) struct PreparedCommand {
     pub number: CommandNumber,
 }
 
+/// Refreshes a stale work generation, freezes its baseline and begins the traced run. `cwd` is
+/// the span's logical initial directory.
 pub(super) fn prepare(
-    session: &Arc<Session>,
     snapshot: &Arc<Snapshot>,
     runtime: tokio::runtime::Handle,
+    number: CommandNumber,
+    cwd: Arc<PathBuf>,
 ) -> Result<Completion<PreparedCommand>, ShellError> {
+    let session = &snapshot.session;
     session.check()?;
     let scope = session.tracing.internal_scope()?;
     let _guard = scope.enter();
-    let authority = session.authority.read().recover();
+    let authority = session.validator.read();
+    let epoch = session.epoch.load(Ordering::Acquire);
     let mut state = snapshot.state.lock().recover();
-    let retake = state.dirty || state.tree_seq != authority.tree_seq;
+    let retake = state.dirty || state.tree_seq != authority.tree_seq || state.epoch != epoch;
     if retake {
         session.fs.delete_subvolume(snapshot.path())?;
         session
             .fs
             .snapshot(&session.persistence.seed, snapshot.path())?;
         state.tree_seq = authority.tree_seq;
+        state.epoch = epoch;
         state.dirty = false;
     }
     state.access.prepare(snapshot.path(), retake)?;
-    let number = CommandNumber(
-        snapshot
-            .serial
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |number| {
-                number.checked_add(1)
-            })
-            .map_err(|_| ShellError::infrastructure("command identity exhaustion"))?,
-    );
     let baseline = session
         .persistence
         .snap()
@@ -368,8 +354,13 @@ pub(super) fn prepare(
     state.dirty = true;
     drop(state);
     drop(authority);
-    let run = Arc::new(Run::new(runtime, Arc::clone(&session.tracing), trace));
-    *snapshot.current.lock().recover() = Arc::downgrade(&run);
+    let run = Arc::new(Run::managed(
+        runtime,
+        Arc::clone(&session.tracing),
+        trace,
+        Arc::downgrade(snapshot),
+        cwd,
+    ));
     Ok(Completion::new(PreparedCommand {
         snapshot: Arc::clone(snapshot),
         baseline,

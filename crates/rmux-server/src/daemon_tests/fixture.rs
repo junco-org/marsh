@@ -49,6 +49,7 @@ pub(super) async fn daemon(config: DaemonConfig) -> (RmuxFrontend, TempDir) {
             cols: COLS,
         },
         filesystem,
+        marsh_core::SandboxPolicy::allow(),
     )
     .await
     .expect("open the test daemon");

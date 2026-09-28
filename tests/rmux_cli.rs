@@ -439,6 +439,17 @@ async fn relayed_stdin_reaches_the_workload_and_final_output_survives_exit() {
 async fn application_startup_replaces_the_daemon_but_control_commands_do_not() {
     let mut host = Host::new().await;
 
+    // The pane's first managed command starts the process-wide tracer unless a managed view
+    // already holds it. That start must not race the capture-pane polling below, whose clients
+    // this process keeps forking, so an idle managed shell holds the tracer across it.
+    let warm = marsh_core::test_support::shell_builder(Arc::clone(&host.fs))
+        .working_dir(host.seed.clone())
+        .sandbox_policy(marsh::SandboxPolicy::allow())
+        .build()
+        .await
+        .expect("build the tracer-holding shell");
+    run(&warm, ":").await;
+
     // A real session with a pane parked on `cat`: the marker is printed by the pane, and the two
     // `printf` pieces keep an echo of the command itself from being mistaken for its output.
     host.succeeds(
@@ -467,6 +478,10 @@ async fn application_startup_replaces_the_daemon_but_control_commands_do_not() {
         ))
     })
     .await;
+    // The pane's own managed view holds the tracer from here on.
+    warm.close(false)
+        .await
+        .expect("close the tracer-holding shell");
 
     for (label, args) in [
         ("an explicit control command", vec!["list-sessions"]),
@@ -738,9 +753,9 @@ async fn kill_server_waits_for_seed_release_before_releasing_endpoint() {
     let repo = host.seed("repo");
     std::fs::create_dir_all(&repo).expect("create the nested repository directory");
 
-    // Binding a host leases nothing; the first shell naming a directory on the seed is what takes
-    // it. A pipe job is hidden rather than adopted as a pane, so no pane lifecycle work can
-    // reclaim its snapshot before engine release does.
+    // Binding a host leases nothing, and neither does opening a shell: the first managed command
+    // of a shell on the seed is what takes it. A pipe job is hidden rather than adopted as a pane,
+    // so no pane lifecycle work can reclaim its snapshot before engine release does.
     let mut events = host.io.observe().events;
     let held = host
         .io
@@ -752,10 +767,36 @@ async fn kill_server_waits_for_seed_release_before_releasing_endpoint() {
         |envelope| matches!(&envelope.event, IoEvent::Opened { job } if job.id() == held.id()),
     )
     .await;
-    assert!(
-        observed_open,
-        "the held job is open, so its snapshot exists for teardown to reclaim"
-    );
+    assert!(observed_open, "the held job is open");
+    // Still running when teardown starts, so its private view and the seed's lease are held
+    // until engine release reclaims them.
+    let running = tokio::spawn({
+        let held = held.clone();
+        async move {
+            held.run_command("sleep 3600", CommandOptions::default())
+                .await
+        }
+    });
+    let seed_name = host.seed.file_name().expect("a named seed");
+    let view = host
+        .seed
+        .parent()
+        .expect("a seed parent")
+        .join(marsh_btrfs::STATE_DIR)
+        .join(seed_name)
+        .join("snap")
+        .join(held.sandbox().uid.as_str());
+    poll(async || {
+        if view.exists() {
+            Ok(())
+        } else {
+            Err(format!(
+                "the held command's view {} never appeared",
+                view.display()
+            ))
+        }
+    })
+    .await;
 
     // The consumer that proves both halves: refused while the seed is held, served once it is
     // released. Construction leases nothing, so this succeeds now and decides nothing yet.
@@ -826,6 +867,14 @@ async fn kill_server_waits_for_seed_release_before_releasing_endpoint() {
         .await
         .expect("shut the replacement host down");
     host.shutdown().await;
+    let held_verdict = tokio::time::timeout(TIMEOUT, running)
+        .await
+        .expect("teardown ends the held command")
+        .expect("the held command's task did not panic");
+    assert!(
+        held_verdict.is_err(),
+        "the held command was ended by teardown, not completed: {held_verdict:?}"
+    );
 
     assert!(
         socket_present,

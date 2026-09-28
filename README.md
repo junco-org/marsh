@@ -1,20 +1,26 @@
 # rmux-marsh
 
 A tmux-style terminal multiplexer with persistent, in-process
-[Brush](https://github.com/reubeno/brush) shells. Each shell owns four private stages:
+[Brush](https://github.com/reubeno/brush) shells. A per-command sandbox policy routes each accepted
+command either through four private managed stages:
 
 ```text
 immutable command baseline → observed execution → capability authorization → durable WAL merge
 ```
 
-Shells over the same canonical source share one authority. A command executes once: conflicting
-newer data returns `Stale`, never an automatic replay. Supported changes reach the source only
-when the complete [junco-policy](https://github.com/junco-org/junco-policy) batch is granted.
+or directly against its source. By default a shell sandboxes exactly while another live shell in
+the same process shares its source; a shell alone on its source runs commands natively.
+
+Shells over the same canonical source share one authority. A managed command executes once:
+conflicting newer data returns `Stale`, never an automatic replay. Supported managed changes reach
+the source only when the complete [junco-policy](https://github.com/junco-org/junco-policy) batch
+is granted.
 
 The interfaces are `marsh::Shell`, the `rmux` executable, and `marsh::rmux::RmuxFrontend`.
 None requires a caller to allocate snapshots, manage a validator, replay a log or finalize a line.
 This controls publication, **not OS confinement**. Terminal output, network effects, external
-FIFO/device operations and writes outside the private work view are not rolled back.
+FIFO/device operations, writes outside the private work view and every effect of a direct command
+are not rolled back.
 
 ## Build and distribution
 
@@ -146,6 +152,48 @@ current-thread runtime.
 durable grants and retained-handle identity. Display names never select ownership. There is no
 separate Marsh principal type, compatibility namespace or caller-supplied principal.
 
+### Sandbox routing
+
+`ShellBuilder::sandbox_policy(SandboxPolicy)` (and `MuxProfile::sandbox_policy` for every shell of
+a mux) selects the route of each accepted command. A policy is one recursive Rust value:
+
+```rust,no_run
+use marsh::{CommandContext, SandboxPolicy};
+
+fn scoped(ctx: &CommandContext<'_>) -> bool {
+    ctx.command.starts_with("make")
+}
+
+let policy = SandboxPolicy::or(SandboxPolicy::SharedSource, SandboxPolicy::Base(scoped));
+```
+
+`SandboxPolicy::allow()` always sandboxes, `forbid()` never does, `SharedSource` (the default) is
+true iff another live shell — any `marsh::Shell` in this process, idle or not, identified by its
+principal — has the same source root, and `and`/`or` short-circuit left to right. True selects the
+managed route; false runs the command in the same persistent interpreter against the source, with
+no snapshot, tracing, authorization or WAL. These permit or forbid *sandboxing*, not execution.
+
+A `CommandContext` carries the accepted top-level text (the submitted string byte for byte; a script
+path; a function name; empty for startup, prompt and end-of-input spans; the exact buffer of an
+interactive completion request), the current shell's `shellmux::Sandbox` record, every live
+shell's record, and the source's shared `PolicyValidator`, whose `decide` queries committed history
+without adopting anything. `Base` predicates must be synchronous, read-only and must not call back
+into a shell; a panicking predicate fails the command.
+
+A shell's source root is the canonical Git work-tree root containing its initial directory, or that
+directory itself outside a work tree, fixed for the shell's lifetime. Commands queue on the
+shallower of that root and the Btrfs seed: overlapping managed commands run concurrently, while a
+direct command or recovery excludes every overlapping command. Waiting commands re-evaluate the
+policy as shells join or leave and as authority changes. A command issued from inside another live
+command returns `Busy` rather than wait behind a conflict. Durable state is recovered before the
+first routing decision on a source; a source that requires recovery refuses both routes. A true
+route never falls back to direct when managed storage is unavailable.
+
+Route changes keep variables, functions, the logical working directory and `cd -`. Descriptors
+bound inside the view being left are revoked rather than reopened elsewhere, and caller-supplied
+parameters carrying a descriptor into a private view are refused. On the direct route, builtin
+context I/O and `git` act on the source natively.
+
 ### Native builtins
 
 Use `marsh::builtins::{builtin, simple_builtin, decl_builtin, raw_arg_builtin}` with Brush's existing
@@ -169,9 +217,10 @@ through this context; arbitrary unregistered Rust threads are not a safe extensi
   already happened once; the line is not reoffered or reexecuted.
 * Persistent descriptors survive unchanged work generations. Access through a descriptor or mapping
   from a necessarily retired generation fails rather than silently rebinding paths or offsets.
-* Managed Git preserves causal Stage/Commit/Checkout semantics. Direct/descendant Git and repository
-  metadata mutations outside a successful managed invocation are refused. `git add` releases an
-  unstaged stake; a reused display name never inherits an older shell instance's authority.
+* Managed Git preserves causal Stage/Commit/Checkout semantics. On the managed route,
+  direct/descendant Git and repository metadata mutations outside a successful managed invocation
+  are refused. `git add` releases an unstaged stake; a reused display name never inherits an older
+  shell instance's authority.
 * Directories, including empty directories and modes, have explicit operations. FIFO/socket/device
   publication, unsupported metadata effects and unrepresentable hard-link mutations are refused
   before intent. Directory removal is nonrecursive and replay never follows symlink ancestors.
@@ -215,12 +264,13 @@ tokio = { version = "1.52.3", features = ["macros", "rt-multi-thread", "time"] }
 
 [patch.crates-io]
 brush-core = { path = "/absolute/path/to/marsh/crates/brush-core" }
+brush-interactive = { path = "/absolute/path/to/marsh/crates/brush-interactive" }
 rmux-server = { path = "/absolute/path/to/marsh/crates/rmux-server" }
 ```
 
-Cargo ignores patches in dependency manifests. Only Brush 0.5.0 and rmux-server 0.10.0 need the
-local patches above; lurk-cli 0.3.14 comes directly from crates.io. Bundle the built `marsh-trace`
-alongside the consuming executable.
+Cargo ignores patches in dependency manifests. Only brush-core 0.5.0, brush-interactive 0.4.0 and
+rmux-server 0.10.0 need the local patches above; lurk-cli 0.3.14 comes directly from crates.io.
+Bundle the built `marsh-trace` alongside the consuming executable.
 
 [`examples/rmux_api.rs`](examples/rmux_api.rs) uses only the ordinary public interface. On a fresh
 Git-initialized source and unused socket:
@@ -250,17 +300,19 @@ cargo build -p marsh --bins
 cargo test -p marsh-instrument
 cargo test -p marsh-btrfs -p marsh-wal
 cargo test -p brush-core --test external_command_spawner_tests
+cargo test -p brush-interactive --lib --features basic
 cargo test -p marsh-core --lib
 cargo test -p rmux-server --lib pane_repl::
-cargo test -p marsh --test shell --test shellmux --test builtins --test git_shell --test rmux --test rmux_cli
+cargo test -p marsh --test sandbox_policy --test shell --test shellmux --test builtins --test git_shell --test rmux --test rmux_cli
 env -u RMUX -u TMUX cargo run -p marsh --example rmux_smoke
 ```
 
 The smoke first execs itself with `--native-trace-only` and a temporary PATH containing only Git,
 before the parent attaches any tracer. It checks normal Shell sharing/recovery, Read enforcement,
-explicit read+edit and zero-op grant durability. The parent then exercises the real rmux executable,
-independent sources (the sibling seed's pane starting over an incompatible WAL, which it resets),
-native file I/O, stale-without-replay and natural pane exit.
+explicit read+edit and zero-op grant durability. The parent keeps an idle standalone shell on each
+seed, so every pane routes through the managed stages, then exercises the real rmux executable,
+independent sources (the sibling seed's first pane command resetting an incompatible WAL), native
+file I/O, stale-without-replay and natural pane exit.
 
 `marsh-core/testing` and `rmux-server/testing` provide explicit CopyTree/configured-builder
 factories for deterministic tests. No production constructor accepts a backend. The smoke reports

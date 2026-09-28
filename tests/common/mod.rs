@@ -9,12 +9,18 @@
 
 pub mod rmux;
 
+use std::collections::HashMap;
+use std::io::{BufRead, Write};
+use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use marsh::shellmux::{CommandCompletion, CommandOptions, RunError};
-use marsh::{ExecutionResult, Shell, ShellBuilder, ShellError, ShellErrorKind, ShellVariable};
+use marsh::{
+    ExecutionResult, OpenFile, SandboxPolicy, Shell, ShellBuilder, ShellError, ShellErrorKind,
+    ShellVariable,
+};
 use marsh_btrfs::fake::CopyTree;
 use tempfile::TempDir;
 
@@ -127,14 +133,19 @@ impl Seed {
         Self { root, source, fs }
     }
 
-    /// Normal Shell construction over this source.
+    /// Normal Shell construction over this source, with the default routing policy.
     pub fn builder(&self) -> ShellBuilder {
         marsh_core::test_support::shell_builder(self.fs.clone()).working_dir(self.source.clone())
     }
 
+    /// Shell construction over this source whose every command takes the managed route.
+    pub fn managed_builder(&self) -> ShellBuilder {
+        self.builder().sandbox_policy(SandboxPolicy::allow())
+    }
+
     /// A managed shell over this source.
     pub async fn shell(&self) -> Shell {
-        self.builder().build().await.expect("build shell")
+        self.managed_builder().build().await.expect("build shell")
     }
 
     /// A path beside the source, outside every snapshot of it.
@@ -172,6 +183,84 @@ impl Seed {
     }
 }
 
+/// A shell whose stdin a test writes and whose merged stdout and stderr it reads.
+pub struct Controlled {
+    pub shell: Arc<Shell>,
+    control: std::io::PipeWriter,
+    output: Option<std::io::BufReader<std::io::PipeReader>>,
+}
+
+/// Builds `builder`'s shell with its standard descriptors on this test's pipes.
+pub async fn controlled(builder: ShellBuilder) -> Controlled {
+    let (input, control) = std::io::pipe().unwrap();
+    let (output, writer) = std::io::pipe().unwrap();
+    let stdout = OpenFile::from(std::fs::File::from(OwnedFd::from(writer)));
+    let fds = HashMap::from([
+        (0, OpenFile::from(std::fs::File::from(OwnedFd::from(input)))),
+        (1, stdout.clone()),
+        (2, stdout),
+    ]);
+    Controlled {
+        shell: Arc::new(builder.fds(fds).build().await.unwrap()),
+        control,
+        output: Some(std::io::BufReader::new(output)),
+    }
+}
+
+impl Controlled {
+    /// Reads output up to and including a `READY` line, returning everything read.
+    pub async fn ready(&mut self) -> Vec<u8> {
+        let mut output = self.output.take().unwrap();
+        let (output, observed) = tokio::time::timeout(
+            TIMEOUT,
+            tokio::task::spawn_blocking(move || {
+                let mut observed = Vec::new();
+                loop {
+                    let mut line = Vec::new();
+                    assert_ne!(
+                        output.read_until(b'\n', &mut line).unwrap(),
+                        0,
+                        "producer exited before READY"
+                    );
+                    observed.extend_from_slice(&line);
+                    if line == b"READY\n" {
+                        return (output, observed);
+                    }
+                }
+            }),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        self.output = Some(output);
+        observed
+    }
+
+    /// Writes one line to the shell's stdin.
+    pub fn release(&mut self) {
+        self.control.write_all(b"continue\n").unwrap();
+    }
+}
+
+/// Runs `line` on its own task, so the test can act while it is running.
+pub fn launch(
+    shell: &Arc<Shell>,
+    line: String,
+) -> tokio::task::JoinHandle<Result<ExecutionResult, ShellError>> {
+    let shell = Arc::clone(shell);
+    tokio::spawn(async move { shell.run(&line).await })
+}
+
+/// The verdict of a [`launch`]ed line, which must arrive within [`TIMEOUT`].
+pub async fn join(
+    task: tokio::task::JoinHandle<Result<ExecutionResult, ShellError>>,
+) -> Result<ExecutionResult, ShellError> {
+    tokio::time::timeout(TIMEOUT, task)
+        .await
+        .expect("owned operation completes")
+        .expect("operation task")
+}
+
 /// The git identity variables a reproducible commit pins, for the author and the committer alike.
 const IDENTITY: [(&str, &str); 3] = [
     ("NAME", "Test"),
@@ -197,6 +286,7 @@ pub async fn git_shell(dir: &Path, pinned: bool) -> Shell {
     filesystem.register(dir);
     let shell = marsh_core::test_support::shell_builder(filesystem)
         .working_dir(dir.to_path_buf())
+        .sandbox_policy(SandboxPolicy::allow())
         .build()
         .await
         .expect("build shell");

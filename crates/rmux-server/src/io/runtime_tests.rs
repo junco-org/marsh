@@ -73,7 +73,9 @@ impl Host {
                     },
                     tokio::runtime::Handle::current(),
                     socket,
-                    |profile, frontend| {
+                    |mut profile, frontend| {
+                        // Every command takes the managed route these tests were written against.
+                        profile.sandbox_policy = marsh_core::SandboxPolicy::allow();
                         marsh_core::test_support::mux(profile, frontend, filesystem)
                     },
                 )

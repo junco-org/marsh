@@ -2,7 +2,8 @@
 
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
-use std::sync::RwLockWriteGuard;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use super::builtins::gitcmd::GitAction;
 use super::completion::{Completion, Finalize};
@@ -38,14 +39,54 @@ impl std::fmt::Display for Denial {
     }
 }
 
-#[derive(Default)]
-pub(super) struct PolicyValidator {
-    pub history: Vec<Event>,
+/// One source's policy authority: its committed capability history and ledger ordering, shared by
+/// every shell on that source and by routing predicates that query it.
+pub struct PolicyValidator {
+    authority: RwLock<Authority>,
+    revision: AtomicU64,
 }
 impl PolicyValidator {
-    pub fn adopt(&mut self, history: impl IntoIterator<Item = Event>) {
-        self.history.extend(history);
+    /// An empty authority at the start of both orderings.
+    pub(super) fn new() -> Self {
+        Self {
+            authority: RwLock::new(Authority::default()),
+            revision: AtomicU64::new(0),
+        }
     }
+    /// What the policy would decide for `event` against the committed history, without adopting
+    /// it. Resources name seed-relative paths, exactly as managed authorization does.
+    pub fn decide(&self, event: &Event) -> Result<PolicyDecision, ShellError> {
+        let authority = self.read();
+        if authority.recovery_required {
+            return Err(ShellError::infrastructure(
+                "source requires recovery before new commands",
+            ));
+        }
+        let arena = Bump::new();
+        let mut policy = GitPolicy::new(&arena);
+        let decision = policy.decide(&authority.history, event);
+        drop(authority);
+        Ok(decision)
+    }
+    pub(super) fn read(&self) -> RwLockReadGuard<'_, Authority> {
+        self.authority.read().recover()
+    }
+    /// Exclusive authority for one mutation. The revision advances before the guard is returned,
+    /// so a concurrent routing decision either sees the change or waits for its final history.
+    pub(super) fn write(&self) -> Result<RwLockWriteGuard<'_, Authority>, ShellError> {
+        let guard = self.authority.write().recover();
+        self.revision
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |revision| {
+                revision.checked_add(1)
+            })
+            .map_err(|_| ShellError::infrastructure("policy revision exhaustion"))?;
+        Ok(guard)
+    }
+    pub(super) fn revision(&self) -> u64 {
+        self.revision.load(Ordering::Acquire)
+    }
+}
+impl Authority {
     fn check(&mut self, events: &[Event]) -> Result<(), Vec<Denial>> {
         let arena = Bump::new();
         let mut policy = GitPolicy::new(&arena);
@@ -92,7 +133,7 @@ impl Completion<AuthorizedCommand<'_>> {
 impl Finalize for AuthorizedCommand<'_> {
     fn finalize(&mut self, completed: bool) {
         if !completed && let Some(guard) = &mut self.guard {
-            guard.policy.history.truncate(self.checkpoint);
+            guard.history.truncate(self.checkpoint);
         }
     }
 }
@@ -121,7 +162,7 @@ pub(super) fn authorize(
             executed.prepared.snapshot.path(),
         )?;
         preflight(&executed, &operations)?;
-        let mut guard = session.authority.write().recover();
+        let mut guard = session.validator.write()?;
         if guard.recovery_required {
             return Err(ShellError::infrastructure("source requires recovery"));
         }
@@ -135,9 +176,8 @@ pub(super) fn authorize(
             }));
         }
         let events = translate(&executed)?;
-        let checkpoint = guard.policy.history.len();
+        let checkpoint = guard.history.len();
         guard
-            .policy
             .check(&events)
             .map_err(|denials| ShellError::new(ShellErrorKind::Denied { denials }))?;
         Ok((guard, operations, events, checkpoint))

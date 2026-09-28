@@ -17,7 +17,7 @@ use marsh::shellmux::{
     CommandCompletion, CommandHandle, CommandOptions, FrontendEvent, JobIo, JobView, MuxProfile,
     OutputChannel, Shell, ShellFrontend, ShellId, ShellMux, SpawnOptions, TerminalGeometry,
 };
-use marsh::{Principal, ShellErrorKind};
+use marsh::{Principal, SandboxPolicy, ShellErrorKind};
 use serial_test::serial;
 
 #[derive(Default)]
@@ -123,8 +123,12 @@ impl std::ops::Deref for Fixture {
     }
 }
 impl Fixture {
+    /// A mux whose every command takes the managed route.
     fn new() -> Self {
-        Self::profile(MuxProfile::default())
+        Self::profile(MuxProfile {
+            sandbox_policy: SandboxPolicy::allow(),
+            ..Default::default()
+        })
     }
     fn profile(profile: MuxProfile) -> Self {
         let seed = Seed::new("src/file", "original\n");
@@ -532,6 +536,7 @@ async fn idle_terminal_leases_are_reusable_after_each_line() {
 #[serial]
 async fn logical_directories_share_authority_and_distinct_sources_do_not() {
     let fixture = Fixture::new();
+    fixture.git();
     let alias = fixture.root.path().join("alias");
     std::os::unix::fs::symlink(&fixture.source, &alias).unwrap();
     let a = fixture
@@ -567,6 +572,115 @@ async fn logical_directories_share_authority_and_distinct_sources_do_not() {
         std::fs::read(other.join("src/file")).unwrap(),
         b"independent"
     );
+    fixture.shutdown().await;
+}
+
+/// Holds `line` at its READY barrier, checks host bytes, releases, and checks published bytes.
+async fn held(fixture: &Fixture, a: &Shell, line: &str, ready: &[u8], during: &[u8], after: &[u8]) {
+    let receipt = schedule(a, line).await;
+    fixture.output(a, ready).await;
+    assert_eq!(
+        fixture.bytes("src/marker"),
+        during,
+        "before release: {line}"
+    );
+    a.write_input(b"go\n").await.unwrap();
+    let result = completed(&receipt).await;
+    assert_eq!(result.exit_code(), Some(0), "{line}");
+    assert_eq!(
+        fixture.bytes("src/marker"),
+        after,
+        "after completion: {line}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn shared_source_uses_uid_and_seed_across_muxes_and_standalone_shells() {
+    let fixture = Fixture::profile(MuxProfile::default());
+    fixture.git();
+    let a = fixture
+        .mux
+        .open_shell(
+            &fixture.source.join("src"),
+            Some("same".into()),
+            SpawnOptions {
+                io: JobIo::Terminal { geometry: None },
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    held(
+        &fixture,
+        &a,
+        "printf raw > marker; printf 'READY-raw\\n'; read release",
+        b"READY-raw",
+        b"raw",
+        b"raw",
+    )
+    .await;
+    run(&a, "printf before > marker").await;
+    assert_eq!(fixture.bytes("src/marker"), b"before");
+
+    let alias = fixture.root.path().join("alias");
+    std::os::unix::fs::symlink(&fixture.source, &alias).unwrap();
+    let other = Arc::new(Mutex::new(Recorder::new(24, 80)));
+    let second =
+        marsh_core::test_support::mux(MuxProfile::default(), other, fixture.seed.fs.clone())
+            .unwrap();
+    let b = second
+        .open_shell(&alias, Some("same".into()), SpawnOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(a.sandbox().id, b.sandbox().id);
+    assert_eq!(a.sandbox().seed, b.sandbox().seed);
+    assert_ne!(a.sandbox().uid, b.sandbox().uid);
+    assert_ne!(a.sandbox().dir, b.sandbox().dir);
+    held(
+        &fixture,
+        &a,
+        "printf staged > marker; printf 'READY-managed\\n'; read release",
+        b"READY-managed",
+        b"before",
+        b"staged",
+    )
+    .await;
+
+    b.stop(false).await.unwrap();
+    tokio::time::timeout(TIMEOUT, b.wait_closed())
+        .await
+        .unwrap()
+        .unwrap();
+    held(
+        &fixture,
+        &a,
+        "printf restored > marker; printf 'READY-restored\\n'; read release",
+        b"READY-restored",
+        b"restored",
+        b"restored",
+    )
+    .await;
+
+    let standalone = fixture
+        .seed
+        .builder()
+        .working_dir(fixture.source.clone())
+        .build()
+        .await
+        .unwrap();
+    held(
+        &fixture,
+        &a,
+        "printf mixed > marker; printf 'READY-standalone\\n'; read release",
+        b"READY-standalone",
+        b"restored",
+        b"mixed",
+    )
+    .await;
+    standalone.close(false).await.unwrap();
+    drop(b);
+    second.shutdown().await.unwrap();
     fixture.shutdown().await;
 }
 
@@ -610,10 +724,12 @@ impl marsh::builtins::Command for StampB {
 async fn independent_muxes_keep_their_builtin_implementations() {
     let a = Fixture::profile(MuxProfile {
         builtins: HashMap::from([("stamp".into(), marsh::builtins::builtin::<StampA>())]),
+        sandbox_policy: SandboxPolicy::allow(),
         ..Default::default()
     });
     let b = Fixture::profile(MuxProfile {
         builtins: HashMap::from([("stamp".into(), marsh::builtins::builtin::<StampB>())]),
+        sandbox_policy: SandboxPolicy::allow(),
         ..Default::default()
     });
     let first = a.open("same", JobIo::Terminal { geometry: None }).await;

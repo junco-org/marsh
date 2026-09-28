@@ -518,7 +518,11 @@ fn a_snapshot_directory_opens_a_shell_on_its_original_seed() {
             marsh_core::shellmux::TerminalGeometry { rows: 24, cols: 80 },
             tokio::runtime::Handle::current(),
             root.join("rmux.sock"),
-            |profile, frontend| marsh_core::test_support::mux(profile, frontend, filesystem),
+            // A managed job, so its snapshot is one the daemon actually took.
+            |mut profile, frontend| {
+                profile.sandbox_policy = marsh_core::SandboxPolicy::allow();
+                marsh_core::test_support::mux(profile, frontend, filesystem)
+            },
         )
         .expect("open the test engine");
         // A real job, so the snapshot the daemon has to recognize is one it actually took.

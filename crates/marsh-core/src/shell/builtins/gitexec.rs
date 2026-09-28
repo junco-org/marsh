@@ -133,13 +133,18 @@ pub(crate) async fn run<SE: ShellExtensions>(
         guard.fail("git: a managed git was stopped before it completed".to_string());
     }
 
-    let trace_snapshot = Arc::clone(&snapshot);
-    let run = snapshot.active().map_err(brush_error)?;
+    let owner = super::current_context().ok_or_else(|| {
+        brush_core::Error::from(brush_core::ErrorKind::InternalError(
+            "git has no owning command context".into(),
+        ))
+    })?;
+    let run = owner.run().map_err(brush_error)?;
+    let (tracing, trace) = run.trace().map_err(brush_error)?;
+    let tracing = Arc::clone(tracing);
     let drain = {
-        let internal = run.tracing.internal_scope()?;
+        let internal = tracing.internal_scope()?;
         let _guard = internal.enter();
-        run.runtime
-            .spawn_blocking(move || trace_snapshot.drain_trace())
+        run.runtime.spawn_blocking(move || tracing.drain(trace))
     };
     let window = match drain.await {
         Ok(Ok(())) => snapshot.writes_for(guard.invocation),

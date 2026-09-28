@@ -1,10 +1,9 @@
 //! Storage faults are tested privately; consumer Shell APIs expose only their typed verdicts.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use super::super::{Shell, ShellErrorKind};
+use super::super::ShellErrorKind;
 use super::{Fixture, accepted, close, refused, session};
 use marsh_btrfs::Subvolumes;
-use marsh_lib::RecoverPoison as _;
 use serial_test::serial;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -81,8 +80,18 @@ async fn missing_staging_at_startup_starts_a_fresh_usable_wal() {
 #[tokio::test]
 #[serial]
 async fn pre_intent_failure_preserves_exit_and_rolls_back_tentative_grants() {
+    use super::super::policy::{Action, Event, Resource};
+    use rust_validator::PolicyDecision;
     let fixture = Fixture::new();
     let shell = fixture.shell().await;
+    // A live sibling keeps the source's in-memory authority across the failing shell's close.
+    let sibling = fixture.shell().await;
+    let validator = Arc::clone(&session(&sibling).await.validator);
+    let blind = Event::new(
+        sibling.principal().clone(),
+        Action::Edit,
+        Resource::from(["candidate"]),
+    );
     let log = fixture.log();
     std::fs::create_dir(&log).unwrap();
     let error = shell
@@ -95,6 +104,10 @@ async fn pre_intent_failure_preserves_exit_and_rolls_back_tentative_grants() {
     assert!(shell.is_closed());
     assert!(!fixture.seed.join("candidate").exists());
     close(shell).await;
+    assert!(
+        matches!(validator.decide(&blind).unwrap(), PolicyDecision::Grant),
+        "a routing query never sees the refused command's tentative grant"
+    );
     std::fs::remove_dir(log).unwrap();
     let reopened = fixture.shell().await;
     accepted(&reopened, "printf accepted > candidate").await;
@@ -102,7 +115,15 @@ async fn pre_intent_failure_preserves_exit_and_rolls_back_tentative_grants() {
         std::fs::read(fixture.seed.join("candidate")).unwrap(),
         b"accepted"
     );
+    assert!(
+        matches!(
+            validator.decide(&blind).unwrap(),
+            PolicyDecision::Deny { .. }
+        ),
+        "a committed grant is visible to the same query"
+    );
     close(reopened).await;
+    close(sibling).await;
 }
 
 #[tokio::test]
@@ -124,7 +145,7 @@ async fn failed_intent_retains_redo_and_poison_is_source_local() {
     assert_eq!(u8::from(error.execution_result().unwrap().exit_code), 1);
     {
         let session = session(&shell).await;
-        assert!(session.authority.read().recover().recovery_required);
+        assert!(session.validator.read().recovery_required);
         let redo = std::fs::read_dir(session.persistence.snap())
             .unwrap()
             .filter_map(Result::ok)
@@ -263,9 +284,8 @@ async fn lease_child(source: PathBuf) {
     let expected = std::env::var("MARSH_LEASE_EXPECT").expect("child expectation");
     let fs = Arc::new(marsh_btrfs::fake::CopyTree::new());
     fs.register(&source);
-    let mut builder = Shell::builder().working_dir(source);
-    builder.backend = Some(fs);
-    match (expected.as_str(), builder.build().await) {
+    // Storage is opened by the first managed command, so that is where the lease is refused.
+    match (expected.as_str(), super::managed(source, fs).await) {
         ("busy", Err(error)) => assert!(matches!(error.kind(), ShellErrorKind::Infrastructure)),
         ("released", Ok(shell)) => {
             accepted(&shell, "printf child > child").await;
@@ -368,10 +388,12 @@ async fn real_btrfs_redo_is_readonly_and_recovery_checks_its_fingerprint() {
     fs.create_subvolume(&seed)
         .unwrap_or_else(|error| panic!("{REQUIRED}: {}: {error}", seed.display()));
     std::fs::write(seed.join("file"), b"before").unwrap();
-    let shell = Shell::new(&seed).await.unwrap();
+    let shell = super::managed(seed.clone(), Arc::new(marsh_btrfs::LibBtrfs))
+        .await
+        .unwrap();
     let log = session(&shell).await.log.clone();
     let snapshots = session(&shell).await.persistence.snap();
-    let principal = shell.id.clone();
+    let principal = shell.principal().clone();
     std::os::unix::fs::symlink("/dev/full", &log).unwrap();
     assert!(
         shell
@@ -379,7 +401,8 @@ async fn real_btrfs_redo_is_readonly_and_recovery_checks_its_fingerprint() {
             .await
             .is_err()
     );
-    let uid = SourceUid::new(format!("{}-redo-1", shell.id)).unwrap();
+    // Command 1 opened the managed view; the refused command is number 2.
+    let uid = SourceUid::new(format!("{}-redo-2", shell.principal())).unwrap();
     let redo = snapshots.join(uid.as_str());
     let refusal = std::fs::write(redo.join("file"), b"tamper").unwrap_err();
     assert_eq!(refusal.raw_os_error(), Some(libc::EROFS));
@@ -424,7 +447,9 @@ async fn real_btrfs_redo_is_readonly_and_recovery_checks_its_fingerprint() {
         .unwrap()
         .append(&intent(uid, Seq::new(1), ContentHash::of(b"after")))
         .unwrap();
-    let reopened = Shell::new(&seed).await.unwrap();
+    let reopened = super::managed(seed.clone(), Arc::new(marsh_btrfs::LibBtrfs))
+        .await
+        .unwrap();
     assert_eq!(std::fs::read(seed.join("file")).unwrap(), b"after");
     assert_eq!(
         std::fs::metadata(seed.join("file"))
@@ -445,7 +470,11 @@ async fn real_btrfs_redo_is_readonly_and_recovery_checks_its_fingerprint() {
         .append(&intent(bad_uid, Seq::new(2), ContentHash::of(b"different")))
         .unwrap();
     let before = std::fs::read(&log).unwrap();
-    assert!(Shell::new(&seed).await.is_err());
+    assert!(
+        super::managed(seed.clone(), Arc::new(marsh_btrfs::LibBtrfs))
+            .await
+            .is_err()
+    );
     assert_eq!(std::fs::read(&log).unwrap(), before);
     assert_eq!(std::fs::read(seed.join("file")).unwrap(), b"after");
     assert!(bad.exists());

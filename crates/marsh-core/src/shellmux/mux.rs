@@ -18,9 +18,10 @@ use tokio::sync::Notify;
 pub struct Sandbox {
     /// Reusable display/lookup name; never a capability principal.
     pub id: ShellId,
-    /// Logical canonical source directory.
+    /// Canonical source root: the Git work-tree root containing the initial directory, or that
+    /// directory itself outside a work tree. Fixed for the shell's lifetime.
     pub seed: PathBuf,
-    /// Source-relative initial directory label.
+    /// Initial directory relative to `seed`; unchanged by later `cd`.
     pub dir: JobDir,
     /// The shell's stable Junco principal, also used for retained-handle identity.
     pub uid: Principal,
@@ -95,6 +96,7 @@ impl ShellMux {
 
     pub(crate) async fn build_shell(
         &self,
+        id: ShellId,
         directory: &Path,
         fds: HashMap<ShellFd, OpenFile>,
         environment: Option<ShellEnvironment>,
@@ -105,7 +107,8 @@ impl ShellMux {
             .interactive(false)
             .no_editing(true)
             .external_cmd_leads_session(true)
-            .enable_option("monitor".into());
+            .enable_option("monitor".into())
+            .sandbox_policy(self.profile.sandbox_policy.clone());
         if let Some(environment) = environment {
             builder = builder.environment(environment);
         } else {
@@ -116,6 +119,8 @@ impl ShellMux {
         for (name, registration) in &self.profile.builtins {
             builder = builder.builtin(name.clone(), registration.clone());
         }
+        // Startup already routes under the name the mux reserved.
+        builder.sandbox_id = Some(id);
         Ok(Arc::new(Box::pin(builder.build()).await?))
     }
 }

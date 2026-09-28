@@ -60,6 +60,8 @@ impl Host {
             ["seed", "other", "rmux.sock"].map(|name| scratch.path().join(name));
         for root in [&seed, &other] {
             fs.create_subvolume(root).expect("create a seed root");
+            // Each seed is its own work tree, so a shell's source root is the seed itself.
+            git2::Repository::init(root).expect("initialize a seed work tree");
         }
         let rmux = frontend(&socket, &seed, Arc::clone(&fs), "open an rmux frontend").await;
         Self {
@@ -87,6 +89,7 @@ impl Host {
 }
 
 /// Binds a daemon on `socket` whose default directory is `seed`, failing the test with `what`.
+/// Its shells take the managed route for every command.
 pub async fn frontend(
     socket: &Path,
     seed: &Path,
@@ -99,6 +102,7 @@ pub async fn frontend(
         ShellEnvironment::new(),
         TerminalGeometry { rows: 24, cols: 80 },
         fs,
+        marsh::SandboxPolicy::allow(),
     )
     .await
     .expect(what)

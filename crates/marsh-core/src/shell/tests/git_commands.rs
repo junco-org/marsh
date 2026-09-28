@@ -4,7 +4,6 @@
 use super::super::policy::{Action, Event, Resource};
 use super::super::{Shell, ShellVariable};
 use super::{Fixture, close, read, session};
-use marsh_lib::RecoverPoison as _;
 use serial_test::serial;
 use std::path::{Path, PathBuf};
 
@@ -94,13 +93,13 @@ fn event(shell: &Shell, action: Action, path: &str) -> Event {
 /// their own consumer regressions; neither is silently omitted from the actual authority history.
 async fn run(shell: &Shell, line: &str) -> (u8, Vec<Event>) {
     let session = session(shell).await;
-    let before = session.authority.read().recover().policy.history.len();
+    let before = session.validator.read().history.len();
     let result = shell
         .run(line)
         .await
         .unwrap_or_else(|error| panic!("{line}: {error}"));
-    let authority = session.authority.read().recover();
-    let granted = authority.policy.history[before..]
+    let authority = session.validator.read();
+    let granted = authority.history[before..]
         .iter()
         .filter(|event| {
             event.action.is_write()

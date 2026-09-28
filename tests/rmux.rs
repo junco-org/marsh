@@ -634,6 +634,7 @@ async fn a_closed_facade_answers_rather_than_pretending() {
     for (source, name) in [(&host.seed, "from-a"), (&host.other, "from-b")] {
         let shell = marsh_core::test_support::shell_builder(host.fs.clone())
             .working_dir(source.clone())
+            .sandbox_policy(marsh::SandboxPolicy::allow())
             .build()
             .await
             .unwrap();

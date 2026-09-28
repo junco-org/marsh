@@ -1,16 +1,19 @@
-//! Private Brush editor adapter. Shell owns every prompt/line/finalization span; input never replays.
+//! Private Brush editor adapter. Shell owns every prompt/line/completion/finalization span; input
+//! never replays, and no admission is held while the editor waits for a key.
 
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, Weak};
 
 use brush_interactive::{
-    BasicInputBackend, InputBackend, InteractivePrompt, InteractiveShell, ReadResult,
+    BasicInputBackend, Completions, InputBackend, InteractivePrompt, InteractiveShell, ReadResult,
 };
-use marsh_lib::RecoverPoison as _;
 
-use super::completion::Completion;
-use super::snapshot::{PreparedCommand, Snapshot};
-use super::{Command, ExecutionResult, Live, Shared, Shell, ShellError, ShellErrorKind, UIOptions};
+use super::execution::Run;
+use super::session::ExecutionResources;
+use super::{
+    Command, ExecutionResult, Live, Shared, Shell, ShellError, ShellErrorKind, Span, SpanRoute,
+    UIOptions,
+};
 
 pub(super) async fn run(shell: &Shell, options: UIOptions) -> Result<ExecutionResult, ShellError> {
     if shell.shared.runtime.runtime_flavor() == tokio::runtime::RuntimeFlavor::CurrentThread {
@@ -24,9 +27,41 @@ pub(super) async fn run(shell: &Shell, options: UIOptions) -> Result<ExecutionRe
 struct Adapter<'a> {
     backend: BasicInputBackend,
     owner: &'a Shared,
-    snapshot: Arc<Snapshot>,
-    pending: Option<Completion<PreparedCommand>>,
+    resources: &'a mut ExecutionResources,
+    parent: Option<Weak<Run>>,
+    /// The span covering the last accepted input and the prompt work after it.
+    pending: Option<Span>,
+    /// That span's accepted text, kept only when a managed publication records it.
     command: String,
+}
+impl Adapter<'_> {
+    /// Begins the span for `text` on the locked interpreter, keeping its text when managed.
+    fn begin(
+        &mut self,
+        shell: &brush_interactive::ShellRef<impl brush_core::ShellExtensions>,
+        text: &str,
+    ) -> Result<(), ShellError> {
+        let owner = self.owner;
+        let span = tokio::task::block_in_place(|| {
+            owner.runtime.block_on(async {
+                let mut interpreter = shell.lock().await;
+                owner
+                    .begin_span(
+                        &mut *interpreter,
+                        &mut *self.resources,
+                        text,
+                        self.parent.as_ref(),
+                        None,
+                    )
+                    .await
+            })
+        })?;
+        if matches!(span.route, SpanRoute::Managed(_)) {
+            text.clone_into(&mut self.command);
+        }
+        self.pending = Some(span);
+        Ok(())
+    }
 }
 impl InputBackend for Adapter<'_> {
     fn read_line(
@@ -42,39 +77,48 @@ impl InputBackend for Adapter<'_> {
                 ))
             })?
             .last_exit_status();
-        let pending = self.pending.take().ok_or_else(|| {
-            interactive_error(ShellError::infrastructure("interactive span missing"))
-        })?;
-        let command = std::mem::take(&mut self.command);
         let owner = self.owner;
-        let internal = self.snapshot.session.tracing.internal_scope()?;
-        let _internal = internal.enter();
-        let finished = tokio::task::block_in_place(|| {
-            owner.runtime.block_on(owner.finish_span(
-                pending,
-                ExecutionResult::new(status),
-                command,
-            ))
-        });
-        if let Err(error) = finished {
-            match error.kind() {
-                ShellErrorKind::Denied { .. }
-                | ShellErrorKind::Stale { .. }
-                | ShellErrorKind::Unsupported => eprintln!("marsh: {error}"),
-                _ => return Err(interactive_error(error)),
-            }
+        if let Some(span) = self.pending.take() {
+            let command = std::mem::take(&mut self.command);
+            let resources = &*self.resources;
+            let finished = tokio::task::block_in_place(|| {
+                owner.runtime.block_on(owner.finish_span(
+                    resources,
+                    span,
+                    ExecutionResult::new(status),
+                    None,
+                    command,
+                ))
+            });
+            report(finished).map_err(interactive_error)?;
         }
-        self.pending = Some(
-            owner
-                .begin_span(&self.snapshot)
-                .map_err(interactive_error)?,
-        );
         if owner.force.load(Ordering::Acquire) {
             return Ok(ReadResult::Eof);
         }
-        let read = self.backend.read_line(shell, prompt)?;
-        if let ReadResult::Input(line) | ReadResult::BoundCommand(line) = &read {
-            self.command.clone_from(line);
+        let Self {
+            backend,
+            resources,
+            parent,
+            ..
+        } = self;
+        let read =
+            backend.read_line_with_completion(shell, &prompt, |interpreter, line, cursor| {
+                complete(owner, resources, parent.as_ref(), interpreter, line, cursor)
+            })?;
+        match &read {
+            ReadResult::Input(line) | ReadResult::BoundCommand(line) => {
+                if let Err(error) = self.begin(shell, line) {
+                    // The line never ran; its prompt still gets its own span.
+                    eprintln!("marsh: {error}");
+                    let _ = self.begin(shell, "");
+                    return Ok(ReadResult::Interrupted);
+                }
+            }
+            ReadResult::Interrupted | ReadResult::Eof => {
+                if let Err(error) = self.begin(shell, "") {
+                    eprintln!("marsh: {error}");
+                }
+            }
         }
         Ok(read)
     }
@@ -86,12 +130,84 @@ impl InputBackend for Adapter<'_> {
     }
 }
 
+/// Answers one completion request as its own span, admitted with the exact line being completed.
+fn complete<SE: brush_core::ShellExtensions>(
+    owner: &Shared,
+    resources: &mut ExecutionResources,
+    parent: Option<&Weak<Run>>,
+    interpreter: &mut brush_core::Shell<SE>,
+    line: &str,
+    cursor: usize,
+) -> Result<Completions, brush_interactive::ShellError> {
+    let span = tokio::task::block_in_place(|| {
+        owner
+            .runtime
+            .block_on(owner.begin_span(interpreter, resources, line, parent, None))
+    });
+    let span = match span {
+        Ok(span) => span,
+        Err(error) => {
+            eprintln!("marsh: {error}");
+            return Ok(Completions {
+                insertion_index: cursor,
+                delete_count: 0,
+                candidates: Vec::new(),
+                options: brush_core::completion::ProcessingOptions::default(),
+            });
+        }
+    };
+    let command = if matches!(span.route, SpanRoute::Managed(_)) {
+        line.to_owned()
+    } else {
+        String::new()
+    };
+    let completions = BasicInputBackend::generate_completions(interpreter, line, cursor);
+    let status = interpreter.last_exit_status();
+    let resources = &*resources;
+    let finished = tokio::task::block_in_place(|| {
+        owner.runtime.block_on(owner.finish_span(
+            resources,
+            span,
+            ExecutionResult::new(status),
+            None,
+            command,
+        ))
+    });
+    report(finished).map_err(interactive_error)?;
+    completions
+}
+
+/// A refused span is reported and the session continues; any other failure ends it.
+fn report(finished: Result<ExecutionResult, ShellError>) -> Result<(), ShellError> {
+    match finished {
+        Ok(_) => Ok(()),
+        Err(error) => match error.kind() {
+            ShellErrorKind::Denied { .. }
+            | ShellErrorKind::Stale { .. }
+            | ShellErrorKind::Unsupported => {
+                eprintln!("marsh: {error}");
+                Ok(())
+            }
+            _ => Err(error),
+        },
+    }
+}
+
 pub(super) async fn run_owned(
     owner: &Shared,
     live: &mut Live,
     options: UIOptions,
+    parent: Option<Weak<Run>>,
 ) -> Result<ExecutionResult, ShellError> {
-    let prepared = owner.begin_span(&live.snapshot)?;
+    let span = owner
+        .begin_span(
+            &mut live.interpreter,
+            &mut live.resources,
+            "",
+            parent.as_ref(),
+            None,
+        )
+        .await?;
     // Move the live interpreter, not a clone of its state/descriptors, into the editor's private
     // reference. No caller receives this handle; admission remains owned by the enclosing Shell.
     let interpreter = Arc::new(tokio::sync::Mutex::new(std::mem::take(
@@ -100,8 +216,9 @@ pub(super) async fn run_owned(
     let mut adapter = Adapter {
         backend: BasicInputBackend,
         owner,
-        snapshot: Arc::clone(&live.snapshot),
-        pending: Some(prepared),
+        resources: &mut live.resources,
+        parent,
+        pending: Some(span),
         command: String::new(),
     };
     let outcome = match InteractiveShell::new(&interpreter, &mut adapter, &(&options).into()) {
@@ -113,17 +230,18 @@ pub(super) async fn run_owned(
     owner.closed.store(true, Ordering::Release);
     let mut native = ExecutionResult::new(live.interpreter.last_exit_status());
     native.next_control_flow = brush_core::ExecutionControlFlow::ExitShell;
-    let pending = adapter
-        .pending
-        .take()
-        .ok_or_else(|| ShellError::infrastructure("final editor span missing"))?;
-    let command = std::mem::take(&mut adapter.command);
     let failure = outcome
         .err()
         .map(|error| ShellError::infrastructure(error.to_string()));
-    let executed = super::execution::complete(pending, Some(native), failure, command).await;
-    *owner.active.lock().recover() = std::sync::Weak::new();
-    Shared::publish_span(&live.snapshot.session, executed)
+    let command = std::mem::take(&mut adapter.command);
+    match adapter.pending.take() {
+        Some(span) => {
+            owner
+                .finish_span(adapter.resources, span, native, failure, command)
+                .await
+        }
+        None => Err(failure.unwrap_or_else(|| ShellError::new(ShellErrorKind::Interrupted))),
+    }
 }
 fn interactive_error(error: ShellError) -> brush_interactive::ShellError {
     brush_interactive::ShellError::IoError(std::io::Error::other(error))
