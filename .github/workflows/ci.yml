@@ -33,7 +33,9 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: "0"
       CARGO_PROFILE_TEST_STRIP: debuginfo
       TOKIO_WORKER_THREADS: "2"
-      CARGO_HOME: ${{ github.workspace }}/marsh/target/ci-cargo
+      # Outside the marsh checkout: rust-cache keeps only the registry crates whose manifests lie
+      # outside the workspace root, so a Cargo home under marsh/ would be saved empty.
+      CARGO_HOME: ${{ github.workspace }}/cargo-home
       CARGO_TARGET_DIR: ${{ github.workspace }}/marsh/target/ci
       REPORT: ${{ github.workspace }}/marsh/target/slow-test-decile/ci-${{ github.run_id }}-${{ github.run_attempt }}
       UNIT: marsh-${{ github.run_id }}-${{ github.run_attempt }}-ci
