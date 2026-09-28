@@ -208,8 +208,9 @@ async fn prepared_client_session_changed(
 #[tokio::test]
 async fn control_switch_client_sends_self_and_other_session_notifications() {
     let handler = RequestHandler::new();
-    let alpha = handler.create_session("alpha").await;
-    let beta = handler.create_session("beta").await;
+    // Quiet: a real shell's first prompt would rename a window automatically, into these drains.
+    let alpha = handler.create_session(Quiet("alpha")).await;
+    let beta = handler.create_session(Quiet("beta")).await;
 
     let (_, mut self_rx) = handler
         .register_utf8_control_for_test(101, Some(&alpha))
@@ -265,8 +266,9 @@ async fn control_switch_client_sends_self_and_other_session_notifications() {
 #[tokio::test]
 async fn control_notifications_name_clients_the_way_list_clients_does() {
     let handler = RequestHandler::new();
-    let alpha = handler.create_session("alpha").await;
-    let beta = handler.create_session("beta").await;
+    // Quiet: a real shell's first prompt would rename a window automatically, into these drains.
+    let alpha = handler.create_session(Quiet("alpha")).await;
+    let beta = handler.create_session(Quiet("beta")).await;
 
     let switching_pid = 74_711;
     let (_, mut switching_rx) = handler
@@ -436,8 +438,9 @@ async fn window_close_notifications_follow_each_clients_session_visibility() {
 #[tokio::test]
 async fn killing_the_only_window_notifies_surviving_control_in_tmux_order() {
     let handler = RequestHandler::new();
-    let alpha = handler.create_session("alpha").await;
-    let beta = handler.create_session("beta").await;
+    // Quiet: a real shell's first prompt would rename @1 automatically, into this drain.
+    let alpha = handler.create_session(Quiet("alpha")).await;
+    let beta = handler.create_session(Quiet("beta")).await;
 
     let alpha_window_id = handler
         .window_id_for_test(&WindowTarget::new(alpha.clone()))
