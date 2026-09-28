@@ -28,7 +28,10 @@ jobs:
       RUSTUP_TOOLCHAIN: nightly-2026-02-15
       CARGO_BUILD_JOBS: "1"
       CARGO_INCREMENTAL: "0"
-      CARGO_PROFILE_TEST_DEBUG: line-tables-only
+      # No DWARF in CI artifacts (keeps the job under 10 GB of disk); symbols, debug assertions
+      # and overflow checks stay.
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_PROFILE_TEST_STRIP: debuginfo
       TOKIO_WORKER_THREADS: "2"
       CARGO_HOME: ${{ github.workspace }}/marsh/target/ci-cargo
       CARGO_TARGET_DIR: ${{ github.workspace }}/marsh/target/ci
@@ -50,13 +53,15 @@ jobs:
 
       - name: Install system packages
         run: |
+          mkdir -p "$REPORT"
+          { echo "== initial"; df -B1 "$GITHUB_WORKSPACE" "$RUNNER_TEMP"; } >> "$REPORT/disk.txt"
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends build-essential clang libclang-dev libbtrfsutil-dev pkg-config git python3 jq coreutils btrfs-progs time
 
       - name: Install Rust
         run: |
           rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
-          mkdir -p "$REPORT"
+          mkdir -p "$CARGO_HOME" "$CARGO_TARGET_DIR"
           {
             echo "marsh_sha=$(git rev-parse HEAD)"
             echo "policy_sha=$(git -C ../junco-policy rev-parse HEAD)"
@@ -69,18 +74,23 @@ jobs:
           cargo -V > "$REPORT/cargo.txt"
           env | sort > "$REPORT/env.txt"
 
+      # Sources only: the registry index, `.crate` archives and git checkouts. Compiled targets are
+      # never cached, so no second copy of the target directory is staged.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
           workspaces: marsh -> target/ci
-          shared-key: marsh-ci-v1-policy-43b007c2a9f87fe2e8fb46727f88c3546dc15e72-manifest-${{ hashFiles('marsh/Cargo.toml') }}
+          prefix-key: marsh-ci-sources-v1
+          shared-key: policy-43b007c2a9f87fe2e8fb46727f88c3546dc15e72-manifest-${{ hashFiles('marsh/Cargo.toml') }}
+          cache-targets: "false"
           cache-bin: false
-          cache-workspace-crates: true
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: ${{ github.ref == 'refs/heads/main' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) }}
 
       - name: Build test harnesses and executables
         timeout-minutes: 95
         run: |
-          { echo "== build pre"; df -B1 .; du -sb "$CARGO_HOME" "$CARGO_TARGET_DIR" ~/.rustup .. 2>/dev/null || true; } >> "$REPORT/disk.txt"
+          rustc_path=$(rustup which --toolchain "$RUSTUP_TOOLCHAIN" rustc)
+          toolchain_root=$(dirname "$(dirname "$rustc_path")")
+          { echo "== after cache restore"; df -B1 "$GITHUB_WORKSPACE" "$RUNNER_TEMP"; for p in "$CARGO_TARGET_DIR" "$CARGO_HOME" "$toolchain_root" "$REPORT" "$GITHUB_WORKSPACE/marsh" "$GITHUB_WORKSPACE/junco-policy"; do du -sb "$p"; done; } >> "$REPORT/disk.txt"
           sudo systemd-run --uid="$(id -u)" --gid="$(id -g)" --wait --pipe --collect --service-type=exec --expand-environment=no \
             --working-directory="$PWD" --unit="$UNIT-build" \
             -p CPUAffinity=0-1 -p CPUQuota=200% -p CPUQuotaPeriodSec=100ms \
@@ -89,15 +99,47 @@ jobs:
             -p KillMode=control-group -p TimeoutStopSec=5s -p RuntimeMaxSec=90min \
             --setenv=RUSTUP_TOOLCHAIN="$RUSTUP_TOOLCHAIN" --setenv=CARGO_BUILD_JOBS="$CARGO_BUILD_JOBS" \
             --setenv=CARGO_INCREMENTAL="$CARGO_INCREMENTAL" --setenv=CARGO_PROFILE_TEST_DEBUG="$CARGO_PROFILE_TEST_DEBUG" \
-            --setenv=TOKIO_WORKER_THREADS="$TOKIO_WORKER_THREADS" \
+            --setenv=CARGO_PROFILE_TEST_STRIP="$CARGO_PROFILE_TEST_STRIP" --setenv=TOKIO_WORKER_THREADS="$TOKIO_WORKER_THREADS" \
             --setenv=CARGO_HOME="$CARGO_HOME" --setenv=CARGO_TARGET_DIR="$CARGO_TARGET_DIR" \
             --setenv=HOME="$HOME" --setenv=PATH="$PATH" \
             ${RUSTUP_HOME+"--setenv=RUSTUP_HOME=$RUSTUP_HOME"} ${TMPDIR+"--setenv=TMPDIR=$TMPDIR"} \
             ${LANG+"--setenv=LANG=$LANG"} ${LC_ALL+"--setenv=LC_ALL=$LC_ALL"} \
             /usr/bin/time -v cargo test --workspace --locked --no-run --message-format=json \
             > "$REPORT/build-artifacts.json" 2> "$REPORT/build.log"
-          { echo "== build post"; df -B1 .; du -sb "$CARGO_HOME" "$CARGO_TARGET_DIR"; } >> "$REPORT/disk.txt"
+          { echo "== build post"; df -B1 "$GITHUB_WORKSPACE" "$RUNNER_TEMP"; for p in "$CARGO_TARGET_DIR" "$CARGO_HOME" "$toolchain_root" "$REPORT" "$GITHUB_WORKSPACE/marsh" "$GITHUB_WORKSPACE/junco-policy"; do du -sb "$p"; done; } >> "$REPORT/disk.txt"
           cargo metadata --locked --no-deps --format-version 1 > "$REPORT/metadata.json"
+
+      # Peak job disk: both checkouts (with target, Cargo home and reports), plus a second copy of
+      # the Cargo home (cache archive) and of the reports (artifact upload), the selected toolchain,
+      # and a fixed 2 GB reserve for setup downloads, linker temporaries and test fixtures.
+      - name: Enforce build disk budget
+        run: |
+          set -euo pipefail
+          rustc_path=$(rustup which --toolchain "$RUSTUP_TOOLCHAIN" rustc)
+          toolchain_root=$(dirname "$(dirname "$rustc_path")")
+          wa=$(du -sb "$GITHUB_WORKSPACE" | cut -f1)
+          wb=$(du -s -B1 "$GITHUB_WORKSPACE" | cut -f1)
+          ca=$(du -sb "$CARGO_HOME" | cut -f1)
+          cb=$(du -s -B1 "$CARGO_HOME" | cut -f1)
+          ua=$(du -sb "$toolchain_root" | cut -f1)
+          ub=$(du -s -B1 "$toolchain_root" | cut -f1)
+          la=$(du -sb "$REPORT" | cut -f1)
+          lb=$(du -s -B1 "$REPORT" | cut -f1)
+          workspace_bytes=$((wa > wb ? wa : wb))
+          cargo_bytes=$((ca > cb ? ca : cb))
+          toolchain_bytes=$((ua > ub ? ua : ub))
+          report_bytes=$((la > lb ? la : lb))
+          budget_bytes=$((workspace_bytes + cargo_bytes + toolchain_bytes + report_bytes + 2000000000))
+          {
+            echo "== build budget"
+            printf 'workspace_bytes=%s cargo_staging_bytes=%s toolchain_bytes=%s report_staging_bytes=%s reserve_bytes=2000000000 budget_bytes=%s limit_bytes=10000000000\n' \
+              "$workspace_bytes" "$cargo_bytes" "$toolchain_bytes" "$report_bytes" "$budget_bytes"
+            df -B1 "$GITHUB_WORKSPACE" "$RUNNER_TEMP" "$toolchain_root"
+          } | tee -a "$REPORT/disk.txt"
+          if ((budget_bytes >= 10000000000)); then
+            echo '::error::CI disk budget is not below 10,000,000,000 bytes'
+            exit 1
+          fi
 
       - name: Discover tests
         timeout-minutes: 20
@@ -110,7 +152,7 @@ jobs:
             -p KillMode=control-group -p TimeoutStopSec=5s -p RuntimeMaxSec=15min \
             --setenv=RUSTUP_TOOLCHAIN="$RUSTUP_TOOLCHAIN" --setenv=CARGO_BUILD_JOBS="$CARGO_BUILD_JOBS" \
             --setenv=CARGO_INCREMENTAL="$CARGO_INCREMENTAL" --setenv=CARGO_PROFILE_TEST_DEBUG="$CARGO_PROFILE_TEST_DEBUG" \
-            --setenv=TOKIO_WORKER_THREADS="$TOKIO_WORKER_THREADS" \
+            --setenv=CARGO_PROFILE_TEST_STRIP="$CARGO_PROFILE_TEST_STRIP" --setenv=TOKIO_WORKER_THREADS="$TOKIO_WORKER_THREADS" \
             --setenv=CARGO_HOME="$CARGO_HOME" --setenv=CARGO_TARGET_DIR="$CARGO_TARGET_DIR" \
             --setenv=HOME="$HOME" --setenv=PATH="$PATH" \
             ${RUSTUP_HOME+"--setenv=RUSTUP_HOME=$RUSTUP_HOME"} ${TMPDIR+"--setenv=TMPDIR=$TMPDIR"} \
@@ -129,7 +171,7 @@ jobs:
             -p KillMode=control-group -p TimeoutStopSec=5s -p RuntimeMaxSec=60min \
             --setenv=RUSTUP_TOOLCHAIN="$RUSTUP_TOOLCHAIN" --setenv=CARGO_BUILD_JOBS="$CARGO_BUILD_JOBS" \
             --setenv=CARGO_INCREMENTAL="$CARGO_INCREMENTAL" --setenv=CARGO_PROFILE_TEST_DEBUG="$CARGO_PROFILE_TEST_DEBUG" \
-            --setenv=TOKIO_WORKER_THREADS="$TOKIO_WORKER_THREADS" \
+            --setenv=CARGO_PROFILE_TEST_STRIP="$CARGO_PROFILE_TEST_STRIP" --setenv=TOKIO_WORKER_THREADS="$TOKIO_WORKER_THREADS" \
             --setenv=CARGO_HOME="$CARGO_HOME" --setenv=CARGO_TARGET_DIR="$CARGO_TARGET_DIR" \
             --setenv=HOME="$HOME" --setenv=PATH="$PATH" \
             ${RUSTUP_HOME+"--setenv=RUSTUP_HOME=$RUSTUP_HOME"} ${TMPDIR+"--setenv=TMPDIR=$TMPDIR"} \
@@ -149,7 +191,7 @@ jobs:
             -p KillMode=control-group -p TimeoutStopSec=5s -p RuntimeMaxSec=60min \
             --setenv=RUSTUP_TOOLCHAIN="$RUSTUP_TOOLCHAIN" --setenv=CARGO_BUILD_JOBS="$CARGO_BUILD_JOBS" \
             --setenv=CARGO_INCREMENTAL="$CARGO_INCREMENTAL" --setenv=CARGO_PROFILE_TEST_DEBUG="$CARGO_PROFILE_TEST_DEBUG" \
-            --setenv=TOKIO_WORKER_THREADS="$TOKIO_WORKER_THREADS" \
+            --setenv=CARGO_PROFILE_TEST_STRIP="$CARGO_PROFILE_TEST_STRIP" --setenv=TOKIO_WORKER_THREADS="$TOKIO_WORKER_THREADS" \
             --setenv=CARGO_HOME="$CARGO_HOME" --setenv=CARGO_TARGET_DIR="$CARGO_TARGET_DIR" \
             --setenv=HOME="$HOME" --setenv=PATH="$PATH" \
             ${RUSTUP_HOME+"--setenv=RUSTUP_HOME=$RUSTUP_HOME"} ${TMPDIR+"--setenv=TMPDIR=$TMPDIR"} \
@@ -169,7 +211,7 @@ jobs:
             -p KillMode=control-group -p TimeoutStopSec=5s -p RuntimeMaxSec=60min \
             --setenv=RUSTUP_TOOLCHAIN="$RUSTUP_TOOLCHAIN" --setenv=CARGO_BUILD_JOBS="$CARGO_BUILD_JOBS" \
             --setenv=CARGO_INCREMENTAL="$CARGO_INCREMENTAL" --setenv=CARGO_PROFILE_TEST_DEBUG="$CARGO_PROFILE_TEST_DEBUG" \
-            --setenv=TOKIO_WORKER_THREADS="$TOKIO_WORKER_THREADS" \
+            --setenv=CARGO_PROFILE_TEST_STRIP="$CARGO_PROFILE_TEST_STRIP" --setenv=TOKIO_WORKER_THREADS="$TOKIO_WORKER_THREADS" \
             --setenv=CARGO_HOME="$CARGO_HOME" --setenv=CARGO_TARGET_DIR="$CARGO_TARGET_DIR" \
             --setenv=HOME="$HOME" --setenv=PATH="$PATH" \
             ${RUSTUP_HOME+"--setenv=RUSTUP_HOME=$RUSTUP_HOME"} ${TMPDIR+"--setenv=TMPDIR=$TMPDIR"} \
@@ -190,7 +232,7 @@ jobs:
             -p KillMode=control-group -p TimeoutStopSec=5s -p RuntimeMaxSec=10min \
             --setenv=RUSTUP_TOOLCHAIN="$RUSTUP_TOOLCHAIN" --setenv=CARGO_BUILD_JOBS="$CARGO_BUILD_JOBS" \
             --setenv=CARGO_INCREMENTAL="$CARGO_INCREMENTAL" --setenv=CARGO_PROFILE_TEST_DEBUG="$CARGO_PROFILE_TEST_DEBUG" \
-            --setenv=TOKIO_WORKER_THREADS="$TOKIO_WORKER_THREADS" \
+            --setenv=CARGO_PROFILE_TEST_STRIP="$CARGO_PROFILE_TEST_STRIP" --setenv=TOKIO_WORKER_THREADS="$TOKIO_WORKER_THREADS" \
             --setenv=CARGO_HOME="$CARGO_HOME" --setenv=CARGO_TARGET_DIR="$CARGO_TARGET_DIR" \
             --setenv=HOME="$HOME" --setenv=PATH="$PATH" \
             ${RUSTUP_HOME+"--setenv=RUSTUP_HOME=$RUSTUP_HOME"} ${TMPDIR+"--setenv=TMPDIR=$TMPDIR"} \
@@ -200,7 +242,39 @@ jobs:
           grep -F '[lurk] native Rust tracing; no tracer executable; read claim enforced' "$REPORT/smoke.log"
           grep -F 'rmux_smoke: every observation held.' "$REPORT/smoke.log"
           grep -E 'real btrfs subvolumes|CopyTree fallback' "$REPORT/smoke.log" || true
-          { echo "== tests post"; df -B1 .; du -sb "$CARGO_HOME" "$CARGO_TARGET_DIR" ~/.rustup .. 2>/dev/null || true; } >> "$REPORT/disk.txt"
+          rustc_path=$(rustup which --toolchain "$RUSTUP_TOOLCHAIN" rustc)
+          toolchain_root=$(dirname "$(dirname "$rustc_path")")
+          { echo "== tests post"; df -B1 "$GITHUB_WORKSPACE" "$RUNNER_TEMP"; for p in "$CARGO_TARGET_DIR" "$CARGO_HOME" "$toolchain_root" "$REPORT" "$GITHUB_WORKSPACE/marsh" "$GITHUB_WORKSPACE/junco-policy"; do du -sb "$p"; done; } >> "$REPORT/disk.txt"
+
+      - name: Enforce final disk budget
+        if: always()
+        run: |
+          set -euo pipefail
+          rustc_path=$(rustup which --toolchain "$RUSTUP_TOOLCHAIN" rustc)
+          toolchain_root=$(dirname "$(dirname "$rustc_path")")
+          wa=$(du -sb "$GITHUB_WORKSPACE" | cut -f1)
+          wb=$(du -s -B1 "$GITHUB_WORKSPACE" | cut -f1)
+          ca=$(du -sb "$CARGO_HOME" | cut -f1)
+          cb=$(du -s -B1 "$CARGO_HOME" | cut -f1)
+          ua=$(du -sb "$toolchain_root" | cut -f1)
+          ub=$(du -s -B1 "$toolchain_root" | cut -f1)
+          la=$(du -sb "$REPORT" | cut -f1)
+          lb=$(du -s -B1 "$REPORT" | cut -f1)
+          workspace_bytes=$((wa > wb ? wa : wb))
+          cargo_bytes=$((ca > cb ? ca : cb))
+          toolchain_bytes=$((ua > ub ? ua : ub))
+          report_bytes=$((la > lb ? la : lb))
+          budget_bytes=$((workspace_bytes + cargo_bytes + toolchain_bytes + report_bytes + 2000000000))
+          {
+            echo "== final budget"
+            printf 'workspace_bytes=%s cargo_staging_bytes=%s toolchain_bytes=%s report_staging_bytes=%s reserve_bytes=2000000000 budget_bytes=%s limit_bytes=10000000000\n' \
+              "$workspace_bytes" "$cargo_bytes" "$toolchain_bytes" "$report_bytes" "$budget_bytes"
+            df -B1 "$GITHUB_WORKSPACE" "$RUNNER_TEMP" "$toolchain_root"
+          } | tee -a "$REPORT/disk.txt"
+          if ((budget_bytes >= 10000000000)); then
+            echo '::error::CI disk budget is not below 10,000,000,000 bytes'
+            exit 1
+          fi
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
