@@ -14,7 +14,17 @@ async fn linked_mutation_fixture(handler: &RequestHandler, label: &str) -> Linke
 
     let owner = create_session(handler, format!("{label}-owner")).await;
     let grouped_peer = create_grouped_session(handler, format!("{label}-grouped"), &owner).await;
-    handler.handle_ok(SplitWindowRequest::fixture(&owner)).await;
+    // Quiet, as in `linked_two_pane_fixture`: the default interactive shell's startup is
+    // unbounded in time, and its activity races the pane mutations these tests commit.
+    let split = handler
+        .handle_ok(SplitWindowExtRequest {
+            command: Some(quiet_command()),
+            ..Fixture::fixture(&owner)
+        })
+        .await;
+    handler
+        .wait_for_pane_startup_to_finish_for_test(&split.pane)
+        .await;
 
     let fixture = LinkedPaneFixture::link(handler, owner, grouped_peer, label).await;
     assert_alias_windows_identical(handler, &fixture).await;
