@@ -1332,17 +1332,20 @@ mod tests {
         )
         .await?;
 
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while !marker.exists() {
+        // Polled until it parses: `>` creates the marker before `printf` has written the pid.
+        let shell_pid = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(pid) = std::fs::read_to_string(&marker)
+                    .ok()
+                    .and_then(|text| text.parse::<u32>().ok())
+                {
+                    break pid;
+                }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await
-        .expect("foreground command starts before shutdown");
-        let shell_pid = std::fs::read_to_string(&marker)
-            .expect("foreground command writes its pid")
-            .parse::<u32>()
-            .expect("foreground command pid is numeric");
+        .expect("foreground command writes its pid before shutdown");
         assert!(rmux_os::process::is_live(shell_pid));
         assert!(!handler.normal_drain_requests_quiesced());
 
