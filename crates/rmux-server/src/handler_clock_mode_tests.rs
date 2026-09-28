@@ -39,11 +39,14 @@ pub(super) async fn create_session(
     target
 }
 
+/// Blocks in a builtin, so the pane's only process is the shell itself for as long as the test
+/// runs: a `sleep` child (or `sh -c` exec'ing into one) would flip the automatic window name from
+/// `sh` to `sleep` whenever it happened to start, racing every assertion on that name.
 fn quiet_clock_command(marker: &str) -> Vec<String> {
     vec![
         "/bin/sh".to_owned(),
         "-c".to_owned(),
-        format!("printf '{marker}\\n'; sleep 60"),
+        format!("printf '{marker}\\n'; read -r _"),
     ]
 }
 
