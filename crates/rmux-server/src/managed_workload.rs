@@ -311,16 +311,26 @@ pub(crate) async fn write_file(
     argv.push("--".to_owned());
     argv.push(path.to_string_lossy().into_owned());
 
-    let execution = start(
-        io,
-        builtin_spec(io, cwd, crate::io::protocol::builtin_plan(&argv))?,
-    )
-    .await?;
-    let input = execution.input();
-    input.write_all(&content).await.map_err(io_error)?;
-    // Before collecting: the builtin reads to end of file, so a collection that waited for the
-    // command without closing standard input first would wait forever.
-    input.close().await.map_err(io_error)?;
+    let spec = builtin_spec(io, cwd, crate::io::protocol::builtin_plan(&argv))?;
+    // Admitted and fed on the host's runtime, not in the caller's future: the builtin reads its
+    // standard input to end of file on a blocking thread, and a caller dropped between admission
+    // and `close` — a client that disconnected — would strand it on a pipe that never ends, where
+    // not even shutdown can reach it.
+    let feeder = io.clone();
+    let execution = io
+        .runtime()
+        .spawn(async move {
+            let execution = start(&feeder, spec).await?;
+            let input = execution.input();
+            let written = input.write_all(&content).await;
+            // Closed even after a failed write, and before collecting: a collection that waited
+            // for the command without closing standard input first would wait forever.
+            let closed = input.close().await;
+            written.and(closed).map_err(io_error)?;
+            Ok::<_, RmuxError>(execution)
+        })
+        .await
+        .map_err(|error| RmuxError::Server(format!("save feeder failed: {error}")))??;
     let captured = execution.collect(COMPLETE).await.map_err(io_error)?;
     finish_builtin(&captured, "write")?;
     require_published(&captured)
