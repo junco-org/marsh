@@ -1,0 +1,212 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  # A push or PR update supersedes its own run; a manual timing run is never cancelled.
+  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: ${{ github.event_name == 'workflow_dispatch' && 340 || 210 }}
+    defaults:
+      run:
+        shell: bash
+        working-directory: marsh
+    env:
+      # The sibling `junco-policy` checkout the path dependency in crates/marsh-core resolves to.
+      POLICY_SHA: 43b007c2a9f87fe2e8fb46727f88c3546dc15e72
+      RUSTUP_TOOLCHAIN: nightly-2026-02-15
+      CARGO_BUILD_JOBS: "1"
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_TEST_DEBUG: line-tables-only
+      TOKIO_WORKER_THREADS: "2"
+      CARGO_HOME: ${{ github.workspace }}/marsh/target/ci-cargo
+      CARGO_TARGET_DIR: ${{ github.workspace }}/marsh/target/ci
+      REPORT: ${{ github.workspace }}/marsh/target/slow-test-decile/ci-${{ github.run_id }}-${{ github.run_attempt }}
+      UNIT: marsh-${{ github.run_id }}-${{ github.run_attempt }}-ci
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          path: marsh
+          persist-credentials: false
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: junco-org/junco-policy
+          ref: 43b007c2a9f87fe2e8fb46727f88c3546dc15e72
+          path: junco-policy
+          ssh-key: ${{ secrets.JUNCO_POLICY_SSH_KEY }}
+          persist-credentials: false
+
+      - name: Install system packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential clang libclang-dev libbtrfsutil-dev pkg-config git python3 jq coreutils btrfs-progs time
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
+          mkdir -p "$REPORT"
+          {
+            echo "marsh_sha=$(git rev-parse HEAD)"
+            echo "policy_sha=$(git -C ../junco-policy rev-parse HEAD)"
+            echo "cargo_lock_sha256=$(sha256sum Cargo.lock | cut -d' ' -f1)"
+            echo "affinity=$(taskset -pc $$)"
+            nproc
+            free -b
+          } > "$REPORT/meta.txt"
+          rustc -Vv > "$REPORT/rustc.txt"
+          cargo -V > "$REPORT/cargo.txt"
+          env | sort > "$REPORT/env.txt"
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          workspaces: marsh -> target/ci
+          shared-key: marsh-ci-v1-policy-43b007c2a9f87fe2e8fb46727f88c3546dc15e72-manifest-${{ hashFiles('marsh/Cargo.toml') }}
+          cache-bin: false
+          cache-workspace-crates: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Build test harnesses and executables
+        timeout-minutes: 95
+        run: |
+          { echo "== build pre"; df -B1 .; du -sb "$CARGO_HOME" "$CARGO_TARGET_DIR" ~/.rustup .. 2>/dev/null || true; } >> "$REPORT/disk.txt"
+          sudo systemd-run --uid="$(id -u)" --gid="$(id -g)" --wait --pipe --collect --service-type=exec --expand-environment=no \
+            --working-directory="$PWD" --unit="$UNIT-build" \
+            -p CPUAffinity=0-1 -p CPUQuota=200% -p CPUQuotaPeriodSec=100ms \
+            -p MemoryMax=7G -p MemorySwapMax=0 -p OOMPolicy=kill \
+            -p CPUAccounting=yes -p MemoryAccounting=yes \
+            -p KillMode=control-group -p TimeoutStopSec=5s -p RuntimeMaxSec=90min \
+            --setenv=RUSTUP_TOOLCHAIN="$RUSTUP_TOOLCHAIN" --setenv=CARGO_BUILD_JOBS="$CARGO_BUILD_JOBS" \
+            --setenv=CARGO_INCREMENTAL="$CARGO_INCREMENTAL" --setenv=CARGO_PROFILE_TEST_DEBUG="$CARGO_PROFILE_TEST_DEBUG" \
+            --setenv=TOKIO_WORKER_THREADS="$TOKIO_WORKER_THREADS" \
+            --setenv=CARGO_HOME="$CARGO_HOME" --setenv=CARGO_TARGET_DIR="$CARGO_TARGET_DIR" \
+            --setenv=HOME="$HOME" --setenv=PATH="$PATH" \
+            ${RUSTUP_HOME+"--setenv=RUSTUP_HOME=$RUSTUP_HOME"} ${TMPDIR+"--setenv=TMPDIR=$TMPDIR"} \
+            ${LANG+"--setenv=LANG=$LANG"} ${LC_ALL+"--setenv=LC_ALL=$LC_ALL"} \
+            /usr/bin/time -v cargo test --workspace --locked --no-run --message-format=json \
+            > "$REPORT/build-artifacts.json" 2> "$REPORT/build.log"
+          { echo "== build post"; df -B1 .; du -sb "$CARGO_HOME" "$CARGO_TARGET_DIR"; } >> "$REPORT/disk.txt"
+          cargo metadata --locked --no-deps --format-version 1 > "$REPORT/metadata.json"
+
+      - name: Discover tests
+        timeout-minutes: 20
+        run: |
+          sudo systemd-run --uid="$(id -u)" --gid="$(id -g)" --wait --pipe --collect --service-type=exec --expand-environment=no \
+            --working-directory="$PWD" --unit="$UNIT-discovery" \
+            -p CPUAffinity=0-1 -p CPUQuota=200% -p CPUQuotaPeriodSec=100ms \
+            -p MemoryMax=7G -p MemorySwapMax=0 -p OOMPolicy=kill \
+            -p CPUAccounting=yes -p MemoryAccounting=yes \
+            -p KillMode=control-group -p TimeoutStopSec=5s -p RuntimeMaxSec=15min \
+            --setenv=RUSTUP_TOOLCHAIN="$RUSTUP_TOOLCHAIN" --setenv=CARGO_BUILD_JOBS="$CARGO_BUILD_JOBS" \
+            --setenv=CARGO_INCREMENTAL="$CARGO_INCREMENTAL" --setenv=CARGO_PROFILE_TEST_DEBUG="$CARGO_PROFILE_TEST_DEBUG" \
+            --setenv=TOKIO_WORKER_THREADS="$TOKIO_WORKER_THREADS" \
+            --setenv=CARGO_HOME="$CARGO_HOME" --setenv=CARGO_TARGET_DIR="$CARGO_TARGET_DIR" \
+            --setenv=HOME="$HOME" --setenv=PATH="$PATH" \
+            ${RUSTUP_HOME+"--setenv=RUSTUP_HOME=$RUSTUP_HOME"} ${TMPDIR+"--setenv=TMPDIR=$TMPDIR"} \
+            ${LANG+"--setenv=LANG=$LANG"} ${LC_ALL+"--setenv=LC_ALL=$LC_ALL"} \
+            /usr/bin/time -v cargo test --workspace --locked --no-fail-fast --color never -- --list -Z unstable-options --format json --test-threads 1 \
+            > "$REPORT/discovery.log" 2>&1
+
+      - name: Test sample 1
+        timeout-minutes: 65
+        run: |
+          sudo systemd-run --uid="$(id -u)" --gid="$(id -g)" --wait --pipe --collect --service-type=exec --expand-environment=no \
+            --working-directory="$PWD" --unit="$UNIT-sample-1" \
+            -p CPUAffinity=0-1 -p CPUQuota=200% -p CPUQuotaPeriodSec=100ms \
+            -p MemoryMax=7G -p MemorySwapMax=0 -p OOMPolicy=kill \
+            -p CPUAccounting=yes -p MemoryAccounting=yes \
+            -p KillMode=control-group -p TimeoutStopSec=5s -p RuntimeMaxSec=60min \
+            --setenv=RUSTUP_TOOLCHAIN="$RUSTUP_TOOLCHAIN" --setenv=CARGO_BUILD_JOBS="$CARGO_BUILD_JOBS" \
+            --setenv=CARGO_INCREMENTAL="$CARGO_INCREMENTAL" --setenv=CARGO_PROFILE_TEST_DEBUG="$CARGO_PROFILE_TEST_DEBUG" \
+            --setenv=TOKIO_WORKER_THREADS="$TOKIO_WORKER_THREADS" \
+            --setenv=CARGO_HOME="$CARGO_HOME" --setenv=CARGO_TARGET_DIR="$CARGO_TARGET_DIR" \
+            --setenv=HOME="$HOME" --setenv=PATH="$PATH" \
+            ${RUSTUP_HOME+"--setenv=RUSTUP_HOME=$RUSTUP_HOME"} ${TMPDIR+"--setenv=TMPDIR=$TMPDIR"} \
+            ${LANG+"--setenv=LANG=$LANG"} ${LC_ALL+"--setenv=LC_ALL=$LC_ALL"} \
+            /usr/bin/time -v cargo test --workspace --locked --no-fail-fast --color never -- -Z unstable-options --format json --report-time --test-threads 1 \
+            > "$REPORT/sample-1.log" 2>&1
+
+      - name: Test sample 2
+        if: github.event_name == 'workflow_dispatch'
+        timeout-minutes: 65
+        run: |
+          sudo systemd-run --uid="$(id -u)" --gid="$(id -g)" --wait --pipe --collect --service-type=exec --expand-environment=no \
+            --working-directory="$PWD" --unit="$UNIT-sample-2" \
+            -p CPUAffinity=0-1 -p CPUQuota=200% -p CPUQuotaPeriodSec=100ms \
+            -p MemoryMax=7G -p MemorySwapMax=0 -p OOMPolicy=kill \
+            -p CPUAccounting=yes -p MemoryAccounting=yes \
+            -p KillMode=control-group -p TimeoutStopSec=5s -p RuntimeMaxSec=60min \
+            --setenv=RUSTUP_TOOLCHAIN="$RUSTUP_TOOLCHAIN" --setenv=CARGO_BUILD_JOBS="$CARGO_BUILD_JOBS" \
+            --setenv=CARGO_INCREMENTAL="$CARGO_INCREMENTAL" --setenv=CARGO_PROFILE_TEST_DEBUG="$CARGO_PROFILE_TEST_DEBUG" \
+            --setenv=TOKIO_WORKER_THREADS="$TOKIO_WORKER_THREADS" \
+            --setenv=CARGO_HOME="$CARGO_HOME" --setenv=CARGO_TARGET_DIR="$CARGO_TARGET_DIR" \
+            --setenv=HOME="$HOME" --setenv=PATH="$PATH" \
+            ${RUSTUP_HOME+"--setenv=RUSTUP_HOME=$RUSTUP_HOME"} ${TMPDIR+"--setenv=TMPDIR=$TMPDIR"} \
+            ${LANG+"--setenv=LANG=$LANG"} ${LC_ALL+"--setenv=LC_ALL=$LC_ALL"} \
+            /usr/bin/time -v cargo test --workspace --locked --no-fail-fast --color never -- -Z unstable-options --format json --report-time --test-threads 1 \
+            > "$REPORT/sample-2.log" 2>&1
+
+      - name: Test sample 3
+        if: github.event_name == 'workflow_dispatch'
+        timeout-minutes: 65
+        run: |
+          sudo systemd-run --uid="$(id -u)" --gid="$(id -g)" --wait --pipe --collect --service-type=exec --expand-environment=no \
+            --working-directory="$PWD" --unit="$UNIT-sample-3" \
+            -p CPUAffinity=0-1 -p CPUQuota=200% -p CPUQuotaPeriodSec=100ms \
+            -p MemoryMax=7G -p MemorySwapMax=0 -p OOMPolicy=kill \
+            -p CPUAccounting=yes -p MemoryAccounting=yes \
+            -p KillMode=control-group -p TimeoutStopSec=5s -p RuntimeMaxSec=60min \
+            --setenv=RUSTUP_TOOLCHAIN="$RUSTUP_TOOLCHAIN" --setenv=CARGO_BUILD_JOBS="$CARGO_BUILD_JOBS" \
+            --setenv=CARGO_INCREMENTAL="$CARGO_INCREMENTAL" --setenv=CARGO_PROFILE_TEST_DEBUG="$CARGO_PROFILE_TEST_DEBUG" \
+            --setenv=TOKIO_WORKER_THREADS="$TOKIO_WORKER_THREADS" \
+            --setenv=CARGO_HOME="$CARGO_HOME" --setenv=CARGO_TARGET_DIR="$CARGO_TARGET_DIR" \
+            --setenv=HOME="$HOME" --setenv=PATH="$PATH" \
+            ${RUSTUP_HOME+"--setenv=RUSTUP_HOME=$RUSTUP_HOME"} ${TMPDIR+"--setenv=TMPDIR=$TMPDIR"} \
+            ${LANG+"--setenv=LANG=$LANG"} ${LC_ALL+"--setenv=LC_ALL=$LC_ALL"} \
+            /usr/bin/time -v cargo test --workspace --locked --no-fail-fast --color never -- -Z unstable-options --format json --report-time --test-threads 1 \
+            > "$REPORT/sample-3.log" 2>&1
+
+      - name: Smoke the built rmux_smoke example
+        timeout-minutes: 15
+        run: |
+          smoke=$(jq -r 'select(.reason == "compiler-artifact" and .target.name == "rmux_smoke" and (.target.kind | index("example")) and .profile.test == false) | .executable' "$REPORT/build-artifacts.json")
+          test "$(printf '%s\n' "$smoke" | wc -l)" -eq 1 && test -x "$smoke"
+          sudo systemd-run --uid="$(id -u)" --gid="$(id -g)" --wait --pipe --collect --service-type=exec --expand-environment=no \
+            --working-directory="$PWD" --unit="$UNIT-smoke" \
+            -p CPUAffinity=0-1 -p CPUQuota=200% -p CPUQuotaPeriodSec=100ms \
+            -p MemoryMax=7G -p MemorySwapMax=0 -p OOMPolicy=kill \
+            -p CPUAccounting=yes -p MemoryAccounting=yes \
+            -p KillMode=control-group -p TimeoutStopSec=5s -p RuntimeMaxSec=10min \
+            --setenv=RUSTUP_TOOLCHAIN="$RUSTUP_TOOLCHAIN" --setenv=CARGO_BUILD_JOBS="$CARGO_BUILD_JOBS" \
+            --setenv=CARGO_INCREMENTAL="$CARGO_INCREMENTAL" --setenv=CARGO_PROFILE_TEST_DEBUG="$CARGO_PROFILE_TEST_DEBUG" \
+            --setenv=TOKIO_WORKER_THREADS="$TOKIO_WORKER_THREADS" \
+            --setenv=CARGO_HOME="$CARGO_HOME" --setenv=CARGO_TARGET_DIR="$CARGO_TARGET_DIR" \
+            --setenv=HOME="$HOME" --setenv=PATH="$PATH" \
+            ${RUSTUP_HOME+"--setenv=RUSTUP_HOME=$RUSTUP_HOME"} ${TMPDIR+"--setenv=TMPDIR=$TMPDIR"} \
+            ${LANG+"--setenv=LANG=$LANG"} ${LC_ALL+"--setenv=LC_ALL=$LC_ALL"} \
+            /usr/bin/time -v env -u RMUX -u TMUX "$smoke" \
+            > "$REPORT/smoke.log" 2>&1
+          grep -F '[lurk] native Rust tracing; no tracer executable; read claim enforced' "$REPORT/smoke.log"
+          grep -F 'rmux_smoke: every observation held.' "$REPORT/smoke.log"
+          grep -E 'real btrfs subvolumes|CopyTree fallback' "$REPORT/smoke.log" || true
+          { echo "== tests post"; df -B1 .; du -sb "$CARGO_HOME" "$CARGO_TARGET_DIR" ~/.rustup .. 2>/dev/null || true; } >> "$REPORT/disk.txt"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: workspace-timing-${{ github.run_id }}-${{ github.run_attempt }}
+          path: marsh/target/slow-test-decile/ci-${{ github.run_id }}-${{ github.run_attempt }}
+          retention-days: 14
+          compression-level: 1
+          if-no-files-found: warn
