@@ -2,12 +2,14 @@
 
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
-use std::sync::{PoisonError, RwLockWriteGuard};
+use std::sync::RwLockWriteGuard;
 
 use super::builtins::gitcmd::GitAction;
+use super::completion::{Completion, Finalize};
 use super::execution::ExecutedCommand;
 use super::session::{Authority, Session};
 use super::{ShellError, ShellErrorKind};
+use marsh_lib::RecoverPoison as _;
 use marsh_wal::CommitOp;
 pub(super) use rust_validator::{Action, Event, Principal, Resource};
 use rust_validator::{Bump, GitPolicy, PolicyDecision};
@@ -71,30 +73,25 @@ impl PolicyValidator {
     }
 }
 
-/// Only this carrier can reach publication, holding the authority through intent and application.
+/// Only this payload can reach publication, holding the authority through intent and application;
+/// its finalizer rolls back tentative policy history unless the command completed.
 pub(super) struct AuthorizedCommand<'a> {
     pub guard: Option<RwLockWriteGuard<'a, Authority>>,
     pub executed: Option<ExecutedCommand>,
     pub operations: Vec<CommitOp>,
     pub events: Vec<Event>,
     checkpoint: usize,
-    pub committed: bool,
 }
-impl AuthorizedCommand<'_> {
+impl Completion<AuthorizedCommand<'_>> {
+    /// Finalizes now and releases the authority; the later drop finds no guard to roll back.
     pub fn release_authority(&mut self) {
-        if !self.committed
-            && let Some(guard) = &mut self.guard
-        {
-            guard.policy.history.truncate(self.checkpoint);
-        }
-        drop(self.guard.take());
+        self.payload.finalize(self.completed);
+        drop(self.payload.guard.take());
     }
 }
-impl Drop for AuthorizedCommand<'_> {
-    fn drop(&mut self) {
-        if !self.committed
-            && let Some(guard) = &mut self.guard
-        {
+impl Finalize for AuthorizedCommand<'_> {
+    fn finalize(&mut self, completed: bool) {
+        if !completed && let Some(guard) = &mut self.guard {
             guard.policy.history.truncate(self.checkpoint);
         }
     }
@@ -103,7 +100,7 @@ impl Drop for AuthorizedCommand<'_> {
 pub(super) fn authorize(
     session: &Session,
     mut executed: ExecutedCommand,
-) -> Result<AuthorizedCommand<'_>, ShellError> {
+) -> Result<Completion<AuthorizedCommand<'_>>, ShellError> {
     // Every refusal carries the native status the command already produced.
     let admitted = (|| -> Result<_, ShellError> {
         if let Some(failure) = executed.failure.take() {
@@ -124,10 +121,7 @@ pub(super) fn authorize(
             executed.prepared.snapshot.path(),
         )?;
         preflight(&executed, &operations)?;
-        let mut guard = session
-            .authority
-            .write()
-            .unwrap_or_else(PoisonError::into_inner);
+        let mut guard = session.authority.write().recover();
         if guard.recovery_required {
             return Err(ShellError::infrastructure("source requires recovery"));
         }
@@ -149,14 +143,13 @@ pub(super) fn authorize(
         Ok((guard, operations, events, checkpoint))
     })();
     match admitted {
-        Ok((guard, operations, events, checkpoint)) => Ok(AuthorizedCommand {
+        Ok((guard, operations, events, checkpoint)) => Ok(Completion::new(AuthorizedCommand {
             guard: Some(guard),
             executed: Some(executed),
             operations,
             events,
             checkpoint,
-            committed: false,
-        }),
+        })),
         Err(error) => Err(error.with_result(executed.result.take())),
     }
 }

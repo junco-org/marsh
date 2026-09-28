@@ -13,13 +13,17 @@
 
 mod directory;
 mod occurrences;
+mod poison;
 mod recorder;
 mod retention;
+mod sequence;
 
 pub use directory::walk_directory;
 pub use occurrences::{extend_occurrence_map, group_keys_by_value};
+pub use poison::RecoverPoison;
 pub use recorder::Recorder;
 pub use retention::{BoundedRetention, FifoSet};
+pub use sequence::CheckedAdvance;
 
 #[cfg(feature = "watch")]
 mod completion;

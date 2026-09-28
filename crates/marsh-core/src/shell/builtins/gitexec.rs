@@ -158,7 +158,7 @@ pub(crate) async fn run<SE: ShellExtensions>(
             if window.iter().any(|path| changes_repository_state(path)) {
                 guard.fail("git: inspection changed repository state".to_string());
             }
-            guard.finish();
+            guard.complete();
         }
         (GitCohortKind::Exclusive, None) => {}
         (GitCohortKind::Exclusive, Some(before)) => {

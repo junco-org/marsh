@@ -32,4 +32,4 @@ pub mod snapshot;
 
 pub use error::Error;
 pub use persistence::{PersistenceLayer, STATE_DIR, short_id};
-pub use snapshot::{LibBtrfs, Subvolumes, delete_subvolume, snapshot, snapshot_readonly};
+pub use snapshot::{LibBtrfs, Subvolumes};

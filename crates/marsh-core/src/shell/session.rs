@@ -3,10 +3,11 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock, Mutex, PoisonError, RwLock, Weak};
+use std::sync::{Arc, LazyLock, Mutex, RwLock, Weak};
 
 use marsh_btrfs::{LibBtrfs, PersistenceLayer, Subvolumes};
 use marsh_instrument::Tracing;
+use marsh_lib::{CheckedAdvance, RecoverPoison as _};
 use marsh_wal::{CommitOp, Seq};
 
 use super::ShellError;
@@ -134,12 +135,17 @@ pub(super) struct PublishMeta {
 
 #[derive(Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) struct TreeVersion(u64);
-impl TreeVersion {
-    pub fn next(self) -> Result<Self, ShellError> {
+impl CheckedAdvance for TreeVersion {
+    type Output = Self;
+    type Error = ShellError;
+    fn value(&self) -> u64 {
         self.0
-            .checked_add(1)
-            .map(Self)
-            .ok_or_else(|| ShellError::infrastructure("tree sequence exhaustion"))
+    }
+    fn advance(self, value: u64) -> Self {
+        Self(value)
+    }
+    fn exhausted() -> ShellError {
+        ShellError::infrastructure("tree sequence exhaustion")
     }
 }
 
@@ -174,7 +180,7 @@ impl Session {
         } else {
             initial.to_path_buf()
         };
-        let mut registry = SESSIONS.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut registry = SESSIONS.lock().recover();
         registry.retain(|_, session| session.strong_count() != 0);
         let canonical = initial.canonicalize()?;
         if !canonical.is_dir() {
@@ -184,10 +190,7 @@ impl Session {
         }
         let mut logical = canonical.clone();
         for session in registry.values().filter_map(Weak::upgrade) {
-            let snapshots = session
-                .snapshots
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
+            let snapshots = session.snapshots.lock().recover();
             for (work, snapshot) in &*snapshots {
                 if snapshot.strong_count() != 0
                     && let Ok(relative) = canonical.strip_prefix(work)
@@ -269,12 +272,7 @@ impl Session {
     }
 
     pub fn check(&self) -> Result<(), ShellError> {
-        if self
-            .authority
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .recovery_required
-        {
+        if self.authority.read().recover().recovery_required {
             Err(ShellError::infrastructure(
                 "source requires recovery before new commands",
             ))
@@ -289,22 +287,16 @@ impl Session {
         if paths.is_empty() {
             return false;
         }
-        let registry = SESSIONS.lock().unwrap_or_else(PoisonError::into_inner);
+        let registry = SESSIONS.lock().recover();
         let mut foreign = false;
         for session in registry.values().filter_map(Weak::upgrade) {
-            let snapshots = session
-                .snapshots
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
+            let snapshots = session.snapshots.lock().recover();
             for (root, snapshot) in &*snapshots {
                 if root == origin || !paths.iter().any(|path| path.starts_with(root)) {
                     continue;
                 }
                 if let Some(snapshot) = snapshot.upgrade() {
-                    let mut state = snapshot
-                        .state
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner);
+                    let mut state = snapshot.state.lock().recover();
                     state.dirty = true;
                     if let Some((_, evidence)) = &mut state.evidence {
                         evidence.failure.get_or_insert_with(|| {

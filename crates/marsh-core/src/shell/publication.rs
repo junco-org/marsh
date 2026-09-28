@@ -2,13 +2,14 @@
 
 use std::io::Write;
 use std::path::Path;
-use std::sync::PoisonError;
 use std::sync::atomic::Ordering;
 
 use brush_core::ExecutionResult;
+use marsh_lib::{CheckedAdvance, RecoverPoison as _};
 use marsh_wal::{Seq, SourceUid};
 
 use super::ShellError;
+use super::completion::Completion;
 use super::execution::ExecutedCommand;
 use super::policy::AuthorizedCommand;
 use super::session::{GrantedCapability, PublishMeta, Session};
@@ -18,8 +19,11 @@ use super::snapshot::{CommandEvidence, PreparedCommand, Snapshot};
     clippy::significant_drop_tightening,
     reason = "`authority` only borrows the guard `authorized` owns, which `release_authority` drops once publication ends"
 )]
-pub(super) fn commit(mut authorized: AuthorizedCommand<'_>) -> Result<ExecutionResult, ShellError> {
+pub(super) fn commit(
+    mut authorized: Completion<AuthorizedCommand<'_>>,
+) -> Result<ExecutionResult, ShellError> {
     let mut executed = authorized
+        .payload
         .executed
         .take()
         .ok_or_else(|| ShellError::infrastructure("missing authorized execution"))?;
@@ -31,16 +35,17 @@ pub(super) fn commit(mut authorized: AuthorizedCommand<'_>) -> Result<ExecutionR
         let scope = session.tracing.internal_scope()?;
         let _guard = scope.enter();
         let authority = authorized
+            .payload
             .guard
             .as_mut()
             .ok_or_else(|| ShellError::infrastructure("missing publication authority"))?;
-        let physical = !authorized.operations.is_empty();
+        let physical = !authorized.payload.operations.is_empty();
         let before = authority.tree_seq;
         if physical {
             before.next()?;
         }
         append_evidence(&snapshot, &executed.evidence)?;
-        if physical || !authorized.events.is_empty() {
+        if physical || !authorized.payload.events.is_empty() {
             let seq = Seq::new(
                 authority
                     .seq
@@ -58,6 +63,7 @@ pub(super) fn commit(mut authorized: AuthorizedCommand<'_>) -> Result<ExecutionR
                 cmd: std::mem::take(&mut executed.command),
                 principal: snapshot.uid.clone(),
                 granted: authorized
+                    .payload
                     .events
                     .iter()
                     .map(GrantedCapability::from)
@@ -70,7 +76,7 @@ pub(super) fn commit(mut authorized: AuthorizedCommand<'_>) -> Result<ExecutionR
                 &uid,
                 seq,
                 &meta,
-                &authorized.operations,
+                &authorized.payload.operations,
             )?;
             executed.prepared.run.seal_publication()?;
             // The very first BEGIN write can partially succeed. From here on, retain the frozen
@@ -80,17 +86,14 @@ pub(super) fn commit(mut authorized: AuthorizedCommand<'_>) -> Result<ExecutionR
             transaction.apply()?;
             durable = true;
             authority.seq = seq;
-            Session::record_versions(authority, &authorized.operations)?;
+            Session::record_versions(authority, &authorized.payload.operations)?;
             authority.recovery_required = false;
             snapshot.retained.store(false, Ordering::Release);
         } else {
             executed.prepared.run.seal_publication()?;
         }
-        authorized.committed = true;
-        let mut state = snapshot
-            .state
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        authorized.completed = true;
+        let mut state = snapshot.state.lock().recover();
         if executed.prepared.tree_seq == before {
             state.tree_seq = authority.tree_seq;
             state.dirty = false;

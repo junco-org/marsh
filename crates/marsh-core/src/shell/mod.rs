@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, PoisonError, Weak};
+use std::sync::{Arc, Mutex, Weak};
 
 pub use brush_core::env::ShellEnvironment;
 pub use brush_core::openfiles::OpenFile;
@@ -12,9 +12,11 @@ pub use brush_core::{
     ShellVariable, SourceInfo,
 };
 pub use brush_interactive::UIOptions;
+use marsh_lib::RecoverPoison as _;
 
 mod access;
 pub mod builtins;
+mod completion;
 mod error;
 mod execution;
 mod input;
@@ -430,12 +432,7 @@ impl Shell {
     }
     /// Signals this operation's verified live descendants without waiting for the interpreter lock.
     pub fn signal_running(&self, signal: Signal) -> Result<usize, ShellError> {
-        let active = self
-            .shared
-            .active
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .upgrade();
+        let active = self.shared.active.lock().recover().upgrade();
         active.map_or(Ok(0), |run| {
             run.tracing
                 .signal(run.trace, signal.number())
@@ -519,18 +516,8 @@ impl Shell {
         released: impl FnOnce(&Observed) -> T + Send,
     ) -> T {
         let live = self.shared.live.lock().await;
-        live.as_ref().map_or_else(
-            || {
-                released(
-                    &self
-                        .shared
-                        .observed
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner),
-                )
-            },
-            current,
-        )
+        live.as_ref()
+            .map_or_else(|| released(&self.shared.observed.lock().recover()), current)
     }
     /// Applies `change` to the live interpreter of a shell that still admits operations.
     async fn modify<T>(
@@ -563,11 +550,7 @@ impl Shared {
     /// Forces shutdown: the accepted operation is cancelled, and so is any span begun after it.
     fn cancel(&self) {
         self.force.store(true, Ordering::Release);
-        let active = self
-            .active
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .upgrade();
+        let active = self.active.lock().recover().upgrade();
         if let Some(run) = active {
             run.cancel();
         }
@@ -596,15 +579,15 @@ impl Shared {
             self.closed.store(true, Ordering::Release);
         }
         let result = Self::publish_span(&session, executed);
-        *self.active.lock().unwrap_or_else(PoisonError::into_inner) = Weak::new();
+        *self.active.lock().recover() = Weak::new();
         result
     }
     fn begin_span(
         &self,
         snapshot: &Arc<Snapshot>,
-    ) -> Result<snapshot::PreparedCommand, ShellError> {
+    ) -> Result<completion::Completion<snapshot::PreparedCommand>, ShellError> {
         let prepared = snapshot::prepare(&snapshot.session, snapshot, self.runtime.clone())?;
-        *self.active.lock().unwrap_or_else(PoisonError::into_inner) = Arc::downgrade(&prepared.run);
+        *self.active.lock().recover() = Arc::downgrade(&prepared.run);
         if self.force.load(Ordering::Acquire) {
             prepared.run.cancel();
         }
@@ -612,7 +595,7 @@ impl Shared {
     }
     async fn finish_span(
         &self,
-        prepared: snapshot::PreparedCommand,
+        prepared: completion::Completion<snapshot::PreparedCommand>,
         result: ExecutionResult,
         command: String,
     ) -> Result<ExecutionResult, ShellError> {
@@ -646,7 +629,7 @@ impl Shared {
                 environment: logical_environment(&live),
                 status: live.interpreter.last_exit_status(),
             };
-            *self.observed.lock().unwrap_or_else(PoisonError::into_inner) = observed;
+            *self.observed.lock().recover() = observed;
             let Live {
                 interpreter,
                 snapshot,
@@ -655,13 +638,13 @@ impl Shared {
             if let Err(error) = snapshot.close() {
                 self.close_failure
                     .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
+                    .recover()
                     .get_or_insert_with(|| Arc::new(error));
             }
         }
         self.close_failure
             .lock()
-            .unwrap_or_else(PoisonError::into_inner)
+            .recover()
             .as_ref()
             .map_or(Ok(()), |error| {
                 Err(ShellError::caused(

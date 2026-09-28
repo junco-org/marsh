@@ -4,7 +4,9 @@ use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Mutex, MutexGuard};
+
+use marsh_lib::RecoverPoison as _;
 
 use crate::error::Error;
 use crate::snapshot::{Subvolumes, existing};
@@ -40,7 +42,7 @@ impl CopyTree {
     /// The registered roots, even after a thread panicked holding them: every update is a single
     /// insert or remove, so the set is never left half-changed.
     fn roots(&self) -> MutexGuard<'_, BTreeSet<PathBuf>> {
-        self.roots.lock().unwrap_or_else(PoisonError::into_inner)
+        self.roots.lock().recover()
     }
 }
 

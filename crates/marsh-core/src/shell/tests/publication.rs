@@ -4,10 +4,11 @@
 use super::super::{Shell, ShellErrorKind};
 use super::{Fixture, accepted, close, refused, session};
 use marsh_btrfs::Subvolumes;
+use marsh_lib::RecoverPoison as _;
 use serial_test::serial;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, PoisonError};
 
 #[tokio::test]
 #[serial]
@@ -123,13 +124,7 @@ async fn failed_intent_retains_redo_and_poison_is_source_local() {
     assert_eq!(u8::from(error.execution_result().unwrap().exit_code), 1);
     {
         let session = session(&shell).await;
-        assert!(
-            session
-                .authority
-                .read()
-                .unwrap_or_else(PoisonError::into_inner)
-                .recovery_required
-        );
+        assert!(session.authority.read().recover().recovery_required);
         let redo = std::fs::read_dir(session.persistence.snap())
             .unwrap()
             .filter_map(Result::ok)

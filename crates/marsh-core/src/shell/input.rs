@@ -1,12 +1,14 @@
 //! Private Brush editor adapter. Shell owns every prompt/line/finalization span; input never replays.
 
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, PoisonError};
 
 use brush_interactive::{
     BasicInputBackend, InputBackend, InteractivePrompt, InteractiveShell, ReadResult,
 };
+use marsh_lib::RecoverPoison as _;
 
+use super::completion::Completion;
 use super::snapshot::{PreparedCommand, Snapshot};
 use super::{Command, ExecutionResult, Live, Shared, Shell, ShellError, ShellErrorKind, UIOptions};
 
@@ -23,7 +25,7 @@ struct Adapter<'a> {
     backend: BasicInputBackend,
     owner: &'a Shared,
     snapshot: Arc<Snapshot>,
-    pending: Option<PreparedCommand>,
+    pending: Option<Completion<PreparedCommand>>,
     command: String,
 }
 impl InputBackend for Adapter<'_> {
@@ -120,7 +122,7 @@ pub(super) async fn run_owned(
         .err()
         .map(|error| ShellError::infrastructure(error.to_string()));
     let executed = super::execution::complete(pending, Some(native), failure, command).await;
-    *owner.active.lock().unwrap_or_else(PoisonError::into_inner) = std::sync::Weak::new();
+    *owner.active.lock().recover() = std::sync::Weak::new();
     Shared::publish_span(&live.snapshot.session, executed)
 }
 fn interactive_error(error: ShellError) -> brush_interactive::ShellError {

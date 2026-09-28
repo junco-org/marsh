@@ -7,6 +7,7 @@ use std::time::Instant;
 
 use lurk_cli::args::Args;
 use lurk_cli::syscall_info::RetCode;
+use marsh_lib::CheckedAdvance;
 use nix::errno::Errno;
 use nix::sys::ptrace::{self, Event, Options};
 use nix::sys::signal::Signal;
@@ -48,6 +49,21 @@ pub(crate) struct Observer {
     sequence: u64,
 }
 
+impl CheckedAdvance for &mut Observer {
+    type Output = u64;
+    type Error = io::Error;
+    fn value(&self) -> u64 {
+        self.sequence
+    }
+    fn advance(self, value: u64) -> u64 {
+        self.sequence = value;
+        value
+    }
+    fn exhausted() -> io::Error {
+        io::Error::other("native delivery sequence exhausted")
+    }
+}
+
 impl Observer {
     pub(crate) fn attach(root: Pid, args: &Args) -> io::Result<Self> {
         let mut selected = args
@@ -77,14 +93,6 @@ impl Observer {
         };
         observer.seize_all(root)?;
         Ok(observer)
-    }
-
-    fn next(&mut self) -> io::Result<u64> {
-        self.sequence = self
-            .sequence
-            .checked_add(1)
-            .ok_or_else(|| io::Error::other("native delivery sequence exhausted"))?;
-        Ok(self.sequence)
     }
 
     /// Stop the entire host before admission, including threads auto-attached during enumeration.

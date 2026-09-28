@@ -2031,6 +2031,7 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "lurk-cli",
+ "marsh-lib",
  "nix 0.30.1",
  "rustix 1.1.4",
  "serde",

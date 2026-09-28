@@ -17,9 +17,9 @@ const BTRFS_SUPER_MAGIC: i64 = 0x9123_683E;
 
 /// The btrfs operations this crate performs: the one boundary a test replaces.
 ///
-/// Every method is the trait form of the free function of the same name in this module, so an
-/// implementation over real btrfs is pure delegation ([`LibBtrfs`]) and a test that has no btrfs
-/// supplies its own. `Send + Sync` because a session shares one behind an `Arc` across tasks.
+/// [`LibBtrfs`] implements the real operations directly; the optional `fake::CopyTree` supplies
+/// directory-backed operations for tests. `Send + Sync` because a session shares one behind an
+/// `Arc` across tasks.
 #[cfg_attr(test, mockall::automock)]
 pub trait Subvolumes: Send + Sync {
     /// Whether `path` is the root of a btrfs subvolume.
@@ -84,20 +84,47 @@ pub trait Subvolumes: Send + Sync {
 pub struct LibBtrfs;
 
 impl Subvolumes for LibBtrfs {
+    /// `btrfs_util_is_subvolume` is a `stat`/`statfs` check and needs no privilege, which is what
+    /// lets the seed walk run as the user. Anything that is not a subvolume root — a plain
+    /// directory, a missing path, a path on another filesystem — answers `false`.
     fn is_subvolume(&self, path: &Path) -> bool {
-        is_subvolume(path)
+        Subvolume::is_subvolume(path).is_ok()
     }
 
+    /// A seed that is its own mount root has no usable parent directory: state would land on
+    /// whatever filesystem the mount point sits in, outside the seed's own subvolume tree.
     fn is_mount_root(&self, path: &Path) -> Result<bool, Error> {
-        is_mount_root(path)
+        Ok(mount_of(path)?.is_some_and(|mount| mount.dest == path))
     }
 
+    /// A path that cannot be stat'ed at all fails with [`Error::Io`].
     fn assert_btrfs(&self, path: &Path) -> Result<(), Error> {
-        assert_btrfs(path)
+        let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
+            .map_err(|_| Error::NotBtrfs(path.to_path_buf()))?;
+        let mut buf = std::mem::MaybeUninit::<libc::statfs>::uninit();
+        // SAFETY: `c_path` is a valid NUL-terminated string and `buf` is a valid, writable
+        // `statfs` allocation that `statfs(2)` fills in on success.
+        let rc = unsafe { libc::statfs(c_path.as_ptr(), buf.as_mut_ptr()) };
+        if rc != 0 {
+            return Err(Error::Io(std::io::Error::last_os_error()));
+        }
+        // SAFETY: `statfs(2)` returned success, so it initialized every field of `buf`.
+        let fs_type = unsafe { buf.assume_init() }.f_type;
+        if fs_type == BTRFS_SUPER_MAGIC {
+            Ok(())
+        } else {
+            Err(Error::NotBtrfs(path.to_path_buf()))
+        }
     }
 
+    /// Snapshot deletion goes through the unprivileged ioctl, which returns `EPERM` without this
+    /// option; checking it once at startup turns a mid-session failure into a startup message.
     fn assert_user_subvol_rm_allowed(&self, path: &Path) -> Result<(), Error> {
-        assert_user_subvol_rm_allowed(path)
+        if mount_of(path)?.as_ref().is_some_and(allows_user_subvol_rm) {
+            Ok(())
+        } else {
+            Err(Error::NotUserSubvolRmAllowed(path.to_path_buf()))
+        }
     }
 
     fn create_subvolume(&self, path: &Path) -> Result<(), Error> {
@@ -106,41 +133,56 @@ impl Subvolumes for LibBtrfs {
             .map_err(|error| Error::Snapshot(format!("create {}: {error}", path.display())))
     }
 
+    /// Snapshots are deliberately **writable**: a command runs inside its own snapshot and writes
+    /// into it, which a read-only snapshot would refuse.
     fn snapshot(&self, src: &Path, dest: &Path) -> Result<(), Error> {
-        snapshot(src, dest)
+        create_snapshot(src, dest, None)
     }
 
+    /// A read-only snapshot is a frozen copy: nothing — not a command, not a stray descriptor
+    /// opened before it was taken — can change what it holds, so content verified against it
+    /// stays verified. The snapshot ioctl already waits for its own transaction; the sync after it
+    /// makes the snapshot durable before a caller logs anything that depends on it.
     fn snapshot_readonly(&self, src: &Path, dest: &Path) -> Result<(), Error> {
-        snapshot_readonly(src, dest)
+        create_snapshot(src, dest, Some(SnapshotFlags::READ_ONLY))?;
+        btrfsutil::sync::sync(dest)
+            .map_err(|error| Error::Snapshot(format!("sync {}: {error}", dest.display())))
     }
 
+    /// The unprivileged delete ioctl is the normal path. It refuses a read-only subvolume —
+    /// deleting one needs write access to its root — so a read-only flag is cleared first, which
+    /// the owner of the subvolume may do. The fallbacks cover a mount whose options changed under
+    /// a running session: `remove_dir_all` (kernels ≥ 4.18 let the owner rmdir an *empty*
+    /// subvolume, and removing the contents empties it), then `sudo -n btrfs subvolume delete`.
+    ///
+    /// When every branch fails the subvolume is still there and the failure is returned, naming
+    /// each: a snapshot that was not reclaimed is a resource its caller still holds, and only the
+    /// caller knows whether that fails what it was doing.
     fn delete_subvolume(&self, path: &Path) -> Result<(), Error> {
-        delete_subvolume(path)
-    }
-}
-
-/// Fails unless `path` lives on a btrfs filesystem.
-///
-/// # Errors
-///
-/// Fails with [`Error::NotBtrfs`] when `path` is on another filesystem, and with [`Error::Io`]
-/// when it cannot be stat'ed at all.
-pub fn assert_btrfs(path: &Path) -> Result<(), Error> {
-    let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
-        .map_err(|_| Error::NotBtrfs(path.to_path_buf()))?;
-    let mut buf = std::mem::MaybeUninit::<libc::statfs>::uninit();
-    // SAFETY: `c_path` is a valid NUL-terminated string and `buf` is a valid, writable `statfs`
-    // allocation that `statfs(2)` fills in on success.
-    let rc = unsafe { libc::statfs(c_path.as_ptr(), buf.as_mut_ptr()) };
-    if rc != 0 {
-        return Err(Error::Io(std::io::Error::last_os_error()));
-    }
-    // SAFETY: `statfs(2)` returned success, so it initialized every field of `buf`.
-    let fs_type = unsafe { buf.assume_init() }.f_type;
-    if fs_type == BTRFS_SUPER_MAGIC {
-        Ok(())
-    } else {
-        Err(Error::NotBtrfs(path.to_path_buf()))
+        if existing(path)?.is_none() {
+            return Ok(());
+        }
+        let Err(ioctl_error) = delete_ioctl(path) else {
+            return Ok(());
+        };
+        let Err(rmdir_error) = std::fs::remove_dir_all(path) else {
+            return Ok(());
+        };
+        let sudo_error = match std::process::Command::new("sudo")
+            .args(["-n", "btrfs", "subvolume", "delete"])
+            .arg(path)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+        {
+            Ok(status) if status.success() => return Ok(()),
+            Ok(status) => format!("exit {status}"),
+            Err(error) => error.to_string(),
+        };
+        Err(Error::Snapshot(format!(
+            "delete {} (ioctl: {ioctl_error}; rmdir: {rmdir_error}; sudo: {sudo_error})",
+            path.display()
+        )))
     }
 }
 
@@ -188,75 +230,6 @@ fn allows_user_subvol_rm(mount: &MountInfo) -> bool {
         .any(|option| option == "user_subvol_rm_allowed")
 }
 
-/// Fails unless `path`'s mount carries `user_subvol_rm_allowed`.
-///
-/// Snapshot deletion goes through the unprivileged ioctl, which returns `EPERM` without this
-/// option; checking it once at startup turns a mid-session failure into a startup message.
-///
-/// # Errors
-///
-/// Fails with [`Error::NotUserSubvolRmAllowed`] when the option is absent, and with [`Error::Io`]
-/// when `/proc/mounts` cannot be read.
-pub fn assert_user_subvol_rm_allowed(path: &Path) -> Result<(), Error> {
-    if mount_of(path)?.as_ref().is_some_and(allows_user_subvol_rm) {
-        Ok(())
-    } else {
-        Err(Error::NotUserSubvolRmAllowed(path.to_path_buf()))
-    }
-}
-
-/// Whether `path` is the root of a btrfs subvolume.
-///
-/// `btrfs_util_is_subvolume` is a `stat`/`statfs` check and needs no privilege, which is what lets
-/// the seed walk run as the user. Anything that is not a subvolume root — a plain directory, a
-/// missing path, a path on another filesystem — answers `false`.
-#[must_use]
-pub fn is_subvolume(path: &Path) -> bool {
-    Subvolume::is_subvolume(path).is_ok()
-}
-
-/// Whether `path` is the root of the mount that contains it.
-///
-/// A seed that is its own mount root has no usable parent directory: state would land on whatever
-/// filesystem the mount point sits in, outside the seed's own subvolume tree.
-///
-/// # Errors
-///
-/// Fails with [`Error::Io`] when `/proc/mounts` cannot be read.
-pub fn is_mount_root(path: &Path) -> Result<bool, Error> {
-    Ok(mount_of(path)?.is_some_and(|mount| mount.dest == path))
-}
-
-/// Snapshots the subvolume rooted at `src` to `dest`.
-///
-/// Snapshots are deliberately **writable**: a command runs inside its own snapshot and writes into
-/// it, which a read-only snapshot would refuse.
-///
-/// # Errors
-///
-/// Fails with [`Error::Snapshot`] when `src` cannot be opened as a subvolume or the snapshot ioctl
-/// is refused.
-pub fn snapshot(src: &Path, dest: &Path) -> Result<(), Error> {
-    create_snapshot(src, dest, None)
-}
-
-/// Snapshots the subvolume rooted at `src` to `dest`, read-only, and syncs the filesystem.
-///
-/// A read-only snapshot is a frozen copy: nothing — not a command, not a stray descriptor opened
-/// before it was taken — can change what it holds, so content verified against it stays verified.
-/// The snapshot ioctl already waits for its own transaction; the sync after it makes the snapshot
-/// durable before a caller logs anything that depends on it.
-///
-/// # Errors
-///
-/// Fails with [`Error::Snapshot`] when `src` cannot be opened as a subvolume, the snapshot ioctl
-/// is refused, or the sync fails.
-pub fn snapshot_readonly(src: &Path, dest: &Path) -> Result<(), Error> {
-    create_snapshot(src, dest, Some(SnapshotFlags::READ_ONLY))?;
-    btrfsutil::sync::sync(dest)
-        .map_err(|error| Error::Snapshot(format!("sync {}: {error}", dest.display())))
-}
-
 /// Snapshots the subvolume rooted at `src` to `dest` with `flags`.
 fn create_snapshot(src: &Path, dest: &Path, flags: Option<SnapshotFlags>) -> Result<(), Error> {
     Subvolume::get(src)
@@ -270,48 +243,6 @@ fn create_snapshot(src: &Path, dest: &Path, flags: Option<SnapshotFlags>) -> Res
                 dest.display()
             ))
         })
-}
-
-/// Deletes the subvolume at `path`, falling back through progressively more privileged mechanisms.
-///
-/// The unprivileged delete ioctl is the normal path. It refuses a read-only subvolume — deleting
-/// one needs write access to its root — so a read-only flag is cleared first, which the owner of
-/// the subvolume may do. The fallbacks cover a mount whose options changed under a running
-/// session: `remove_dir_all` (kernels ≥ 4.18 let the owner rmdir an *empty* subvolume, and
-/// removing the contents empties it), then `sudo -n btrfs subvolume delete`.
-///
-/// When every branch fails the subvolume is still there and the failure is returned, naming
-/// each: a snapshot that was not reclaimed is a resource its caller still holds, and only the
-/// caller knows whether that fails what it was doing.
-///
-/// # Errors
-///
-/// Fails with [`Error::Snapshot`] when no mechanism deleted `path`.
-pub fn delete_subvolume(path: &Path) -> Result<(), Error> {
-    if existing(path)?.is_none() {
-        return Ok(());
-    }
-    let Err(ioctl_error) = delete_ioctl(path) else {
-        return Ok(());
-    };
-    let Err(rmdir_error) = std::fs::remove_dir_all(path) else {
-        return Ok(());
-    };
-    let sudo_error = match std::process::Command::new("sudo")
-        .args(["-n", "btrfs", "subvolume", "delete"])
-        .arg(path)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-    {
-        Ok(status) if status.success() => return Ok(()),
-        Ok(status) => format!("exit {status}"),
-        Err(error) => error.to_string(),
-    };
-    Err(Error::Snapshot(format!(
-        "delete {} (ioctl: {ioctl_error}; rmdir: {rmdir_error}; sudo: {sudo_error})",
-        path.display()
-    )))
 }
 
 /// `path`'s own metadata, or `None` when nothing is there — which, for every [`Subvolumes`], is
@@ -371,8 +302,7 @@ mod tests {
     }
 
     /// Retires the environment risk in one test: btrfs snapshots work unprivileged here. Also pins
-    /// which branch of the deletion chain this machine takes, and that [`LibBtrfs`] really is the
-    /// free functions.
+    /// which branch of the deletion chain this machine takes.
     #[test]
     fn smoke_btrfs() {
         let root = test_root();
@@ -503,15 +433,19 @@ mod tests {
         use std::os::unix::ffi::OsStringExt;
 
         let with_nul = PathBuf::from(OsString::from_vec(b"/tmp/interior\0nul".to_vec()));
-        let error = assert_btrfs(&with_nul).expect_err("an unrepresentable path");
+        let error = LibBtrfs
+            .assert_btrfs(&with_nul)
+            .expect_err("an unrepresentable path");
         assert_error!(error, Error::NotBtrfs(path) if *path == with_nul);
 
         let missing = Path::new("/nonexistent-marsh-btrfs-probe/deeper");
-        let error = assert_btrfs(missing).expect_err("an absent path");
+        let error = LibBtrfs.assert_btrfs(missing).expect_err("an absent path");
         assert_error!(error, Error::Io(io) if io.kind() == std::io::ErrorKind::NotFound);
 
         let procfs = Path::new("/proc");
-        let error = assert_btrfs(procfs).expect_err("procfs is a filesystem, just not btrfs");
+        let error = LibBtrfs
+            .assert_btrfs(procfs)
+            .expect_err("procfs is a filesystem, just not btrfs");
         assert_error!(error, Error::NotBtrfs(path) if path == procfs);
     }
 
@@ -523,9 +457,8 @@ mod tests {
         let plain = scratch.path().join("plain");
         std::fs::create_dir_all(&plain).expect("plain directory");
 
-        assert!(!is_subvolume(&plain));
-        assert!(!is_subvolume(&scratch.path().join("absent")));
-        assert!(!LibBtrfs.is_subvolume(&plain), "the trait agrees");
+        assert!(!LibBtrfs.is_subvolume(&plain));
+        assert!(!LibBtrfs.is_subvolume(&scratch.path().join("absent")));
     }
 
     /// A path the deletion chain cannot reach at all is not an error to report: the caller asked
@@ -534,7 +467,9 @@ mod tests {
     fn deleting_an_absent_path_does_nothing() {
         let scratch = tempfile::tempdir().expect("scratch directory");
         let absent = scratch.path().join("absent");
-        delete_subvolume(&absent).expect("an absent path is already deleted");
+        LibBtrfs
+            .delete_subvolume(&absent)
+            .expect("an absent path is already deleted");
         assert!(!absent.exists());
     }
 
@@ -564,16 +499,18 @@ mod tests {
         let file = scratch.path().join("regular");
         std::fs::write(&file, b"x").expect("a regular file");
 
-        let error = delete_subvolume(&file).expect_err("nothing could delete it");
+        let error = LibBtrfs
+            .delete_subvolume(&file)
+            .expect_err("nothing could delete it");
         assert_error!(error, Error::Snapshot(message)
             if ["ioctl:", "rmdir:", "sudo:"].iter().all(|mechanism| message.contains(mechanism)));
         assert!(file.exists(), "the path is still there");
     }
 
-    /// [`LibBtrfs`] is delegation, so each method answers exactly what the free function of the
-    /// same name answers for inputs whose outcome does not depend on btrfs being present.
+    /// [`LibBtrfs`] reports the expected outcome for every operation whose answer does not depend
+    /// on btrfs being present.
     #[test]
-    fn the_real_implementation_answers_as_the_free_functions_do() {
+    fn the_real_implementation_reports_the_expected_errors_without_btrfs() {
         let scratch = tempfile::tempdir().expect("scratch directory");
         let plain = scratch.path().join("plain");
         std::fs::create_dir_all(&plain).expect("plain directory");

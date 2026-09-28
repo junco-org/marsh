@@ -4,7 +4,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use std::sync::{Arc, Mutex, PoisonError, Weak};
+use std::sync::{Arc, Mutex, Weak};
 
 use brush_core::extensions::{
     DefaultErrorFormatter, DefaultExternalCommandSpawner, ExecutionObserver,
@@ -15,7 +15,9 @@ use futures_util::FutureExt;
 use marsh_instrument::{
     InvocationId, PollScope, Scoped, TraceRun, TraceScope, TraceScopeGuard, Tracing,
 };
+use marsh_lib::RecoverPoison as _;
 
+use super::completion::{Completion, Finalize};
 use super::snapshot::{CommandEvidence, PreparedCommand, Snapshot};
 use super::{ShellError, ShellErrorKind};
 
@@ -212,9 +214,9 @@ impl Run {
         self.tracing.health(self.trace)?;
         Ok(())
     }
-    fn lease(self: &Arc<Self>) -> Result<Lease, ShellError> {
+    fn lease(self: &Arc<Self>) -> Result<Completion<Lease>, ShellError> {
         self.check()?;
-        let mut workers = self.workers.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut workers = self.workers.lock().recover();
         if workers.closing {
             return Err(ShellError::new(ShellErrorKind::Closed));
         }
@@ -225,14 +227,13 @@ impl Run {
         let id = WorkerId(workers.next);
         workers.handles.insert(id, None);
         drop(workers);
-        Ok(Lease {
+        Ok(Completion::new(Lease {
             run: Arc::clone(self),
             id,
-            completed: false,
-        })
+        }))
     }
     fn install(&self, id: WorkerId, abort: tokio::task::AbortHandle) {
-        let mut workers = self.workers.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut workers = self.workers.lock().recover();
         if self.is_cancelled() {
             abort.abort();
         }
@@ -253,7 +254,7 @@ impl Run {
         {
             return;
         }
-        let workers = self.workers.lock().unwrap_or_else(PoisonError::into_inner);
+        let workers = self.workers.lock().recover();
         for abort in workers.handles.values().flatten() {
             abort.abort();
         }
@@ -288,7 +289,7 @@ impl Run {
         loop {
             let changed = self.changed.notified();
             let state = {
-                let mut workers = self.workers.lock().unwrap_or_else(PoisonError::into_inner);
+                let mut workers = self.workers.lock().recover();
                 if workers.handles.is_empty() {
                     workers.closing = true;
                     Some(workers.failure)
@@ -315,22 +316,12 @@ struct WorkerId(u64);
 struct Lease {
     run: Arc<Run>,
     id: WorkerId,
-    completed: bool,
 }
-impl Lease {
-    fn complete(mut self) {
-        self.completed = true;
-    }
-}
-impl Drop for Lease {
-    fn drop(&mut self) {
-        let mut workers = self
-            .run
-            .workers
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+impl Finalize for Lease {
+    fn finalize(&mut self, completed: bool) {
+        let mut workers = self.run.workers.lock().recover();
         workers.handles.remove(&self.id);
-        workers.failure |= !self.completed && !self.run.is_cancelled();
+        workers.failure |= !completed && !self.run.is_cancelled();
         drop(workers);
         self.run.changed.notify_waiters();
     }
@@ -606,11 +597,13 @@ struct ContextScope {
     context: CommandContext,
 }
 impl PollScope for ContextScope {
-    type Guard = (TraceScopeGuard, ContextGuard);
+    type Guard = SyncGuard;
     fn enter(&self) -> Self::Guard {
-        let context_guard = ContextGuard::enter(self.context.clone());
-        let trace_guard = self.scope.enter();
-        (trace_guard, context_guard)
+        let context = ContextGuard::enter(self.context.clone());
+        SyncGuard {
+            _trace: self.scope.enter(),
+            _context: context,
+        }
     }
 }
 /// A managed-context failure as the interpreter reports one.
@@ -623,7 +616,7 @@ pub(super) fn brush_error(error: ShellError) -> brush_core::Error {
 }
 
 pub(super) struct ExecutedCommand {
-    pub prepared: PreparedCommand,
+    pub prepared: Completion<PreparedCommand>,
     pub result: Option<ExecutionResult>,
     pub failure: Option<ShellError>,
     pub evidence: CommandEvidence,
@@ -632,7 +625,7 @@ pub(super) struct ExecutedCommand {
 
 pub(super) async fn run(
     interpreter: &mut brush_core::Shell<ManagedExtensions>,
-    prepared: PreparedCommand,
+    prepared: Completion<PreparedCommand>,
     command: super::Command,
 ) -> ExecutedCommand {
     let context = CommandContext {
@@ -665,7 +658,7 @@ pub(super) async fn run(
 }
 
 pub(super) async fn complete(
-    prepared: PreparedCommand,
+    prepared: Completion<PreparedCommand>,
     result: Option<ExecutionResult>,
     mut failure: Option<ShellError>,
     text: String,

@@ -2,12 +2,14 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use marsh_instrument::{InvocationId, RootId, Syscall, TraceRun};
+use marsh_lib::RecoverPoison as _;
 
 use super::access::{Access, Effects};
 use super::builtins::gitcmd::GitAction;
+use super::completion::{Completion, Finalize};
 use super::execution::Run;
 use super::session::{Session, fresh_principal};
 use super::{Principal, ShellError, ShellErrorKind};
@@ -48,10 +50,7 @@ impl Snapshot {
         session.check()?;
         let uid = fresh_principal()?;
         let path = session.persistence.work(uid.as_str());
-        let authority = session
-            .authority
-            .read()
-            .unwrap_or_else(PoisonError::into_inner);
+        let authority = session.authority.read().recover();
         let tree_seq = authority.tree_seq;
         let internal = session.tracing.internal_scope()?;
         let _guard = internal.enter();
@@ -94,7 +93,7 @@ impl Snapshot {
             .session
             .snapshots
             .lock()
-            .unwrap_or_else(PoisonError::into_inner)
+            .recover()
             .insert(snapshot.path.clone(), Arc::downgrade(&snapshot));
         Ok(snapshot)
     }
@@ -119,8 +118,7 @@ impl Snapshot {
         }
         let internal = self.session.tracing.internal_scope().ok();
         let _scope = internal.as_ref().map(marsh_instrument::TraceScope::enter);
-        let mut pending =
-            std::mem::take(&mut *self.deferred.lock().unwrap_or_else(PoisonError::into_inner));
+        let mut pending = std::mem::take(&mut *self.deferred.lock().recover());
         if !pending.contains(&self.path) {
             pending.push(self.path.clone());
         }
@@ -132,7 +130,7 @@ impl Snapshot {
                 failure.get_or_insert(error);
             }
         }
-        *self.deferred.lock().unwrap_or_else(PoisonError::into_inner) = failed;
+        *self.deferred.lock().recover() = failed;
         if let Some(error) = failure {
             return Err(error.into());
         }
@@ -143,7 +141,7 @@ impl Snapshot {
         let internal = self.session.tracing.internal_scope().ok();
         let _scope = internal.as_ref().map(marsh_instrument::TraceScope::enter);
         if let Err(error) = self.session.fs.delete_subvolume(path) {
-            let mut deferred = self.deferred.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut deferred = self.deferred.lock().recover();
             if !deferred.iter().any(|held| held == path) {
                 deferred.push(path.to_path_buf());
             }
@@ -164,7 +162,7 @@ impl Snapshot {
     pub fn active(&self) -> Result<Arc<Run>, ShellError> {
         self.current
             .lock()
-            .unwrap_or_else(PoisonError::into_inner)
+            .recover()
             .upgrade()
             .ok_or_else(|| ShellError::new(ShellErrorKind::Closed))
     }
@@ -180,7 +178,7 @@ impl Snapshot {
     }
 
     fn observe(&self, run: TraceRun, builtin: Option<InvocationId>, info: Syscall) {
-        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut state = self.state.lock().recover();
         if state
             .evidence
             .as_ref()
@@ -193,7 +191,7 @@ impl Snapshot {
         let foreign = effect
             .as_ref()
             .is_ok_and(|effect| Session::invalidate_foreign(&self.path, &effect.outside_writes));
-        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut state = self.state.lock().recover();
         if let Some((_, evidence)) = &mut state.evidence {
             if foreign {
                 evidence.failure.get_or_insert_with(|| {
@@ -230,7 +228,7 @@ impl Snapshot {
     }
 
     pub fn take_evidence(&self, run: TraceRun) -> Result<CommandEvidence, ShellError> {
-        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut state = self.state.lock().recover();
         let Some((active, mut evidence)) = state.evidence.take() else {
             return Err(ShellError::infrastructure("missing command evidence"));
         };
@@ -261,7 +259,7 @@ impl Snapshot {
         Ok(())
     }
     pub fn writes_for(&self, invocation: InvocationId) -> Vec<PathBuf> {
-        let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let state = self.state.lock().recover();
         let mut paths = std::collections::BTreeSet::new();
         if let Some((_, evidence)) = &state.evidence {
             for (_, owner, effects) in &evidence.effects {
@@ -273,13 +271,16 @@ impl Snapshot {
         drop(state);
         paths.into_iter().collect()
     }
-    pub fn begin_git(self: &Arc<Self>, kind: GitCohortKind) -> Result<GitGuard, String> {
+    pub fn begin_git(
+        self: &Arc<Self>,
+        kind: GitCohortKind,
+    ) -> Result<Completion<GitGuard>, String> {
         let context = super::execution::current_context()
             .ok_or_else(|| "git has no owning command context".to_string())?;
         let invocation = context
             .invocation()
             .ok_or_else(|| "git has no builtin invocation".to_string())?;
-        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut state = self.state.lock().recover();
         let (_, evidence) = state
             .evidence
             .as_mut()
@@ -293,11 +294,10 @@ impl Snapshot {
         evidence.git_exclusive = kind == GitCohortKind::Exclusive;
         evidence.git_live += 1;
         drop(state);
-        Ok(GitGuard {
+        Ok(Completion::new(GitGuard {
             snapshot: Arc::clone(self),
             invocation,
-            completed: false,
-        })
+        }))
     }
 }
 impl Drop for Snapshot {
@@ -314,32 +314,25 @@ impl std::fmt::Display for CommandNumber {
     }
 }
 
-/// Owned command baseline; its Drop never publishes and leaves refused work dirty for reset.
+/// Owned command baseline; its finalizer never publishes and leaves refused work dirty for reset.
 pub(super) struct PreparedCommand {
     pub snapshot: Arc<Snapshot>,
     pub baseline: PathBuf,
     pub run: Arc<Run>,
     pub tree_seq: super::session::TreeVersion,
     pub number: CommandNumber,
-    pub settled: bool,
 }
 
 pub(super) fn prepare(
     session: &Arc<Session>,
     snapshot: &Arc<Snapshot>,
     runtime: tokio::runtime::Handle,
-) -> Result<PreparedCommand, ShellError> {
+) -> Result<Completion<PreparedCommand>, ShellError> {
     session.check()?;
     let scope = session.tracing.internal_scope()?;
     let _guard = scope.enter();
-    let authority = session
-        .authority
-        .read()
-        .unwrap_or_else(PoisonError::into_inner);
-    let mut state = snapshot
-        .state
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner);
+    let authority = session.authority.read().recover();
+    let mut state = snapshot.state.lock().recover();
     let retake = state.dirty || state.tree_seq != authority.tree_seq;
     if retake {
         session.fs.delete_subvolume(snapshot.path())?;
@@ -376,29 +369,26 @@ pub(super) fn prepare(
     drop(state);
     drop(authority);
     let run = Arc::new(Run::new(runtime, Arc::clone(&session.tracing), trace));
-    *snapshot
-        .current
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner) = Arc::downgrade(&run);
-    Ok(PreparedCommand {
+    *snapshot.current.lock().recover() = Arc::downgrade(&run);
+    Ok(Completion::new(PreparedCommand {
         snapshot: Arc::clone(snapshot),
         baseline,
         run,
         tree_seq,
         number,
-        settled: false,
-    })
+    }))
 }
 
-impl PreparedCommand {
+impl Completion<PreparedCommand> {
+    /// Reclaims the baseline once; a refused reclaim is not retried by the finalizer.
     pub fn reclaim(&mut self) -> Result<(), ShellError> {
-        self.settled = true;
-        self.snapshot.reclaim(&self.baseline)
+        self.completed = true;
+        self.payload.snapshot.reclaim(&self.payload.baseline)
     }
 }
-impl Drop for PreparedCommand {
-    fn drop(&mut self) {
-        if !self.settled {
+impl Finalize for PreparedCommand {
+    fn finalize(&mut self, completed: bool) {
+        if !completed {
             let _ = self.snapshot.reclaim(&self.baseline);
         }
     }
@@ -421,46 +411,28 @@ pub(super) enum GitCohortKind {
 pub(super) struct GitGuard {
     snapshot: Arc<Snapshot>,
     pub invocation: InvocationId,
-    completed: bool,
 }
-impl GitGuard {
+impl Completion<GitGuard> {
     pub fn record(mut self, record: GitEffectRecord) {
-        if let Some((_, evidence)) = &mut self
-            .snapshot
-            .state
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .evidence
-        {
+        if let Some((_, evidence)) = &mut self.payload.snapshot.state.lock().recover().evidence {
             evidence.git.push(record);
         }
         self.completed = true;
     }
-    pub fn finish(mut self) {
-        self.completed = true;
-    }
+}
+impl GitGuard {
     pub fn fail(&self, message: String) {
-        if let Some((_, evidence)) = &mut self
-            .snapshot
-            .state
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .evidence
-        {
+        if let Some((_, evidence)) = &mut self.snapshot.state.lock().recover().evidence {
             evidence.failure.get_or_insert(message);
         }
     }
 }
-impl Drop for GitGuard {
-    fn drop(&mut self) {
-        let mut state = self
-            .snapshot
-            .state
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+impl Finalize for GitGuard {
+    fn finalize(&mut self, completed: bool) {
+        let mut state = self.snapshot.state.lock().recover();
         if let Some((_, evidence)) = &mut state.evidence {
             evidence.git_live = evidence.git_live.saturating_sub(1);
-            if !self.completed {
+            if !completed {
                 evidence
                     .failure
                     .get_or_insert_with(|| "git invocation did not finish observation".into());

@@ -4,10 +4,11 @@ use std::collections::HashMap;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex};
 
 use lurk_cli::syscall_info::{RetCode, SyscallArg};
 use marsh_instrument::{FileTarget, Syscall};
+use marsh_lib::{CheckedAdvance, RecoverPoison as _};
 use nix_observer::unistd::Pid;
 use syscalls::Sysno;
 
@@ -24,12 +25,17 @@ pub(super) struct Effects {
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 struct WorkGeneration(u64);
-impl WorkGeneration {
-    fn next(self) -> std::io::Result<Self> {
+impl CheckedAdvance for WorkGeneration {
+    type Output = Self;
+    type Error = std::io::Error;
+    fn value(&self) -> u64 {
         self.0
-            .checked_add(1)
-            .map(Self)
-            .ok_or_else(|| std::io::Error::other("work generation exhausted"))
+    }
+    fn advance(self, value: u64) -> Self {
+        Self(value)
+    }
+    fn exhausted() -> std::io::Error {
+        std::io::Error::other("work generation exhausted")
     }
 }
 
@@ -216,12 +222,8 @@ impl Access {
                     self.opened(info, target, root)?;
                     if let Some(number) = returned(info).and_then(|value| i32::try_from(value).ok())
                     {
-                        if let Some(descriptor) = self
-                            .task(tid)
-                            .descriptors
-                            .lock()
-                            .unwrap_or_else(PoisonError::into_inner)
-                            .get_mut(&number)
+                        if let Some(descriptor) =
+                            self.task(tid).descriptors.lock().recover().get_mut(&number)
                         {
                             descriptor.generation = generation;
                         }
@@ -231,11 +233,7 @@ impl Access {
             Sysno::close => {
                 if success {
                     let number = descriptor_number(info, 0)?;
-                    self.task(tid)
-                        .descriptors
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner)
-                        .remove(&number);
+                    self.task(tid).descriptors.lock().recover().remove(&number);
                 }
             }
             Sysno::close_range => {
@@ -263,7 +261,7 @@ impl Access {
                     self.task(tid)
                         .descriptors
                         .lock()
-                        .unwrap_or_else(PoisonError::into_inner)
+                        .recover()
                         .retain(|number, _| {
                             let number = u64::from(number.cast_unsigned());
                             number < first || number > last
@@ -316,17 +314,13 @@ impl Access {
                     let end = start
                         .checked_add(integer(info, 1)?)
                         .ok_or_else(|| "mapping range overflow".to_string())?;
-                    self.task(tid)
-                        .mappings
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner)
-                        .push(Mapping {
-                            start,
-                            end,
-                            target: target.clone(),
-                            shared,
-                            generation: self.generation,
-                        });
+                    self.task(tid).mappings.lock().recover().push(Mapping {
+                        start,
+                        end,
+                        target: target.clone(),
+                        shared,
+                        generation: self.generation,
+                    });
                 }
             }
             Sysno::mprotect
@@ -536,11 +530,7 @@ impl Access {
         let Some(number) = returned(info).and_then(|value| i32::try_from(value).ok()) else {
             return Err("invalid returned descriptor".into());
         };
-        let mut table = self
-            .task(info.info.pid)
-            .descriptors
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let mut table = self.task(info.info.pid).descriptors.lock().recover();
         if protected(root, &target_path(target))?.is_some() {
             table.insert(
                 number,
@@ -570,7 +560,7 @@ impl Access {
             .task(info.info.pid)
             .descriptors
             .lock()
-            .unwrap_or_else(PoisonError::into_inner)
+            .recover()
             .get(&number)
             .filter(|origin| {
                 origin.inode == Inode(target.device, target.inode)
@@ -774,7 +764,7 @@ impl Access {
             .checked_add(integer(info, 1)?)
             .ok_or_else(|| "mapping range overflow".to_string())?;
         let group = Arc::clone(&self.task(info.info.pid).mappings);
-        let mut mappings = group.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut mappings = group.lock().recover();
         let mut after = Vec::new();
         for mapping in &*mappings {
             if start >= mapping.end || end <= mapping.start {
@@ -837,12 +827,7 @@ fn inherit<T: Clone>(parent: &Arc<Mutex<T>>, shared: bool) -> Arc<Mutex<T>> {
     if shared {
         return Arc::clone(parent);
     }
-    Arc::new(Mutex::new(
-        parent
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone(),
-    ))
+    Arc::new(Mutex::new(parent.lock().recover().clone()))
 }
 fn target_path(target: &FileTarget) -> PathBuf {
     PathBuf::from(std::ffi::OsStr::from_bytes(&target.path))

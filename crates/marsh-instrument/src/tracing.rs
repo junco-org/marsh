@@ -9,10 +9,11 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant};
 
 use crate::Syscall;
+use marsh_lib::{CheckedAdvance, RecoverPoison as _};
 use nix::errno::Errno;
 use nix::sys::ptrace::Event;
 use nix::sys::wait::WaitStatus;
@@ -144,15 +145,22 @@ struct State {
     failure: Option<String>,
 }
 
-impl State {
-    fn next(&mut self) -> io::Result<u64> {
-        self.ids = self
-            .ids
-            .checked_add(1)
-            .ok_or_else(|| io::Error::other("trace ID exhaustion"))?;
-        Ok(self.ids)
+impl CheckedAdvance for &mut State {
+    type Output = u64;
+    type Error = io::Error;
+    fn value(&self) -> u64 {
+        self.ids
     }
+    fn advance(self, value: u64) -> u64 {
+        self.ids = value;
+        value
+    }
+    fn exhausted() -> io::Error {
+        io::Error::other("trace ID exhaustion")
+    }
+}
 
+impl State {
     fn check(&self) -> io::Result<()> {
         self.failure
             .as_ref()
@@ -187,7 +195,7 @@ impl State {
 
 /// Locks trace bookkeeping, recovering the guard from a panicked holder.
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+    mutex.lock().recover()
 }
 
 /// The monitor thread's startup report: the helper's pinned identity and its release pipe.
@@ -402,10 +410,7 @@ impl Tracing {
             if !busy {
                 break;
             }
-            state = self
-                .progress
-                .wait(state)
-                .unwrap_or_else(PoisonError::into_inner);
+            state = self.progress.wait(state).recover();
         }
         drop(state);
         self.drain(run)
@@ -526,11 +531,7 @@ impl Tracing {
                     "native trace barrier timed out",
                 ));
             };
-            state = self
-                .progress
-                .wait_timeout(state, remaining)
-                .unwrap_or_else(PoisonError::into_inner)
-                .0;
+            state = self.progress.wait_timeout(state, remaining).recover().0;
         }
     }
 

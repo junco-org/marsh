@@ -11,7 +11,9 @@
 //! pays for the projection only.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Mutex, MutexGuard};
+
+use crate::RecoverPoison as _;
 
 /// An append-only log of `R`, plus the id series its producer stamps records with.
 ///
@@ -80,7 +82,7 @@ impl<R> Recorder<R> {
 
     /// The log, locked, with poisoning recovered for the reason the type documents.
     fn log(&self) -> MutexGuard<'_, Vec<R>> {
-        self.records.lock().unwrap_or_else(PoisonError::into_inner)
+        self.records.lock().recover()
     }
 }
 

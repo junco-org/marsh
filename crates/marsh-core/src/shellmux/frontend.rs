@@ -48,7 +48,9 @@
 //! channels and every control operation keep running. Dropping a receipt uncompleted is reported
 //! as a broken pipe on that stream; it is never turned into a successful write nobody consumed.
 
-use std::sync::{Mutex, MutexGuard, PoisonError, Weak};
+use std::sync::{Mutex, MutexGuard, Weak};
+
+use marsh_lib::RecoverPoison as _;
 
 use crate::shellmux::command::{CommandCompletion, CommandHandle};
 use crate::shellmux::types::{JobEnd, OutputChannel, TerminalGeometry};
@@ -205,5 +207,5 @@ pub(crate) fn notify(
 pub(crate) fn lock_frontend(
     frontend: &Mutex<dyn ShellFrontend>,
 ) -> MutexGuard<'_, dyn ShellFrontend> {
-    frontend.lock().unwrap_or_else(PoisonError::into_inner)
+    frontend.lock().recover()
 }

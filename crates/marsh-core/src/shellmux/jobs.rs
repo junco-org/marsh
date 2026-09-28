@@ -29,11 +29,11 @@ use std::os::fd::{AsFd as _, AsRawFd as _, BorrowedFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 use tokio::io::unix::AsyncFd;
 
-use marsh_lib::{WaitState, wait_for_completion};
+use marsh_lib::{RecoverPoison as _, WaitState, wait_for_completion};
 
 use crate::shellmux::command::{CommandCompletion, CommandHandle, CommandId, RunError, WaitError};
 use crate::shellmux::error::MuxError;
@@ -406,12 +406,12 @@ struct StreamSetup {
 impl ShellMux {
     /// The shell registry, recovering a poisoned lock like the rest of this module.
     pub(crate) fn shell_registry(&self) -> MutexGuard<'_, ShellRegistry> {
-        self.shells.lock().unwrap_or_else(PoisonError::into_inner)
+        self.shells.lock().recover()
     }
 
     /// The background task set, with the same poisoning recovery.
     fn background(&self) -> MutexGuard<'_, tokio::task::JoinSet<()>> {
-        self.tasks.lock().unwrap_or_else(PoisonError::into_inner)
+        self.tasks.lock().recover()
     }
 
     /// Reaps completed lifecycle tasks before admitting another onto this mux's own runtime.
@@ -688,8 +688,8 @@ impl ShellMux {
         };
         let completion = Arc::new(CommandCompletion {
             id: active.handle.id,
-            shell: shell.inner.sandbox.clone(),
-            command: Arc::clone(&active.handle.text),
+            shell: active.handle.shell,
+            command: active.handle.text,
             result: Arc::new(result),
         });
         active
@@ -908,21 +908,17 @@ impl ShellMux {
         failure
     }
 
-    /// Empties the registry, returning every shell that was still in it.
+    /// Removes every registration, yielding ready shells in creation order.
     ///
-    /// The one place a teardown removes shells, shared by [`Self::shutdown`] and [`Drop`] so that
-    /// a drop after an explicit shutdown finds nothing and is harmless. What each caller does
-    /// with the live halves afterwards is its own: shutdown releases them on a blocking worker,
-    /// while a drop has no runtime left to hand them to and releases them inline.
-    fn drain_registry(&self) -> Vec<Shell> {
+    /// The iterator owns the removed slots and borrows no mux state. Shutdown and Drop
+    /// release each shell's live resources after this method releases the registry lock;
+    /// draining again finds nothing.
+    fn drain_registry(&self) -> impl Iterator<Item = Shell> + use<> {
         let mut registry = self.shell_registry();
         registry.closing = true;
-        let shells = std::mem::take(&mut registry.shells)
-            .into_iter()
-            .filter_map(|(_, shell)| shell)
-            .collect();
+        let shells = std::mem::take(&mut registry.shells);
         drop(registry);
-        shells
+        shells.into_iter().filter_map(|(_, shell)| shell)
     }
 }
 
@@ -1079,10 +1075,7 @@ impl Shell {
 
     /// This generation's live half, recovering a poisoned lock like the rest of this module.
     fn live_lock(&self) -> MutexGuard<'_, Option<LiveShell>> {
-        self.inner
-            .live
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
+        self.inner.live.lock().recover()
     }
 
     /// Takes this generation's live half out, releasing the lock before it is dropped.
@@ -2033,10 +2026,7 @@ mod tests {
                     FrontendEvent::Output { .. } => {
                         self.delivered.fetch_add(1, Ordering::AcqRel);
                         let (sender, receiver) = tokio::sync::oneshot::channel();
-                        self.receipts
-                            .lock()
-                            .unwrap_or_else(PoisonError::into_inner)
-                            .push(sender);
+                        self.receipts.lock().recover().push(sender);
                         Some(receiver)
                     }
                     _ => None,
@@ -2047,10 +2037,7 @@ mod tests {
         /// The latest receipt the gate handed out, once it has handed one out.
         async fn next_receipt(receipts: &Receipts) -> tokio::sync::oneshot::Sender<()> {
             loop {
-                let popped = receipts
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .pop();
+                let popped = receipts.lock().recover().pop();
                 if let Some(receipt) = popped {
                     return receipt;
                 }
