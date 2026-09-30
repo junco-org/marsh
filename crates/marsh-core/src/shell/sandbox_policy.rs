@@ -18,6 +18,10 @@ use crate::shellmux::Sandbox;
 ///
 /// The owned and borrowed conversions into [`Action`] must agree, and be total, deterministic and
 /// side-effect-free: a call is classified once, from a borrow, before its concrete type is erased.
+///
+/// On the direct route, classifying a call as [`Action::Read`] promises that the call and any
+/// spawned work do not mutate the filesystem. This is trusted embedder metadata, not OS-enforced
+/// read-only access; potentially writing calls must be classified conservatively.
 pub trait MarshTool: Any + Send + Sync + Into<Action> {
     /// The accepted input as traces and published WAL metadata record it.
     fn description(&self) -> Cow<'_, str>;
@@ -30,8 +34,9 @@ pub struct ShellCommand {
     /// The exact input text submitted for this shell span.
     pub command: String,
 }
-/// Every shell span may write: conservative routing metadata, not a claim about what the text
-/// does. Observed effects and Git capabilities remain what publication authorizes.
+/// Every shell span may write, including `cat` and startup spans: conservative routing metadata,
+/// not a claim about what the text does. Observed effects and Git capabilities remain what
+/// publication authorizes.
 impl From<&ShellCommand> for Action {
     fn from(_: &ShellCommand) -> Self {
         Self::Edit

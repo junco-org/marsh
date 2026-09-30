@@ -185,20 +185,25 @@ fn overlaps(left: &Path, right: &Path) -> bool {
 /// What one admission holds, or would hold, over its coverage root.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Hold {
+    Read,
     Managed,
     Direct,
     Recovery,
 }
 impl Hold {
-    /// Only managed work shares a coverage root with other managed work.
+    /// Reads share with reads and work; recovery excludes every other hold.
     fn excludes(self, other: Self) -> bool {
-        !(self == Self::Managed && other == Self::Managed)
+        match (self, other) {
+            (Self::Recovery, _) | (_, Self::Recovery) => true,
+            (Self::Read, _) | (_, Self::Read) | (Self::Managed, Self::Managed) => false,
+            (Self::Direct, _) | (_, Self::Direct) => true,
+        }
     }
 }
 
 struct Ticket {
     coverage: PathBuf,
-    /// The validated verdict; none while one is being evaluated, which excludes like Direct.
+    /// The validated verdict; none while one is being evaluated, which excludes like Recovery.
     hold: Option<Hold>,
     active: bool,
 }
@@ -220,20 +225,28 @@ impl Registry {
             *other != ticket
                 && (entry.active || *other < ticket)
                 && overlaps(&entry.coverage, coverage)
-                && entry.hold.unwrap_or(Hold::Direct).excludes(hold)
+                && entry.hold.unwrap_or(Hold::Recovery).excludes(hold)
         })
     }
     fn live_domains(&self) -> Vec<Arc<SourceDomain>> {
         self.domains.values().filter_map(Weak::upgrade).collect()
     }
     /// Records a verdict: a grant activates it, a waiting verdict never downgrades a reservation.
-    fn settle(&mut self, ticket: u64, hold: Hold, grant: bool) {
-        if let Some(entry) = self.tickets.get_mut(&ticket)
-            && (grant || !entry.active)
-        {
-            entry.hold = Some(hold);
-            entry.active |= grant;
+    /// Returns whether the stored hold or activation changed.
+    fn settle(&mut self, ticket: u64, hold: Hold, grant: bool) -> bool {
+        let Some(entry) = self.tickets.get_mut(&ticket) else {
+            return false;
+        };
+        if !grant && entry.active {
+            return false;
         }
+        let active = entry.active || grant;
+        if entry.hold == Some(hold) && entry.active == active {
+            return false;
+        }
+        entry.hold = Some(hold);
+        entry.active = active;
+        true
     }
 }
 
@@ -295,7 +308,7 @@ pub(super) struct SourceDomain {
     storage: Result<(PathBuf, PathBuf), Arc<ShellError>>,
     session: tokio::sync::OnceCell<Arc<Session>>,
     materialized: tokio::sync::OnceCell<()>,
-    /// Advanced before every direct command over this source.
+    /// Advanced before every direct may-write call over this source.
     epoch: Arc<AtomicU64>,
     /// Uncertain producer quiescence, with the coverage it leaves unusable.
     failure: Mutex<Option<(PathBuf, Arc<ShellError>)>>,
@@ -439,9 +452,15 @@ impl SourceDomain {
     }
 
     async fn open(&self) -> Result<&Arc<Session>, ShellError> {
-        self.session
+        if let Some(session) = self.session.get() {
+            return Ok(session);
+        }
+        let session = self
+            .session
             .get_or_try_init(|| async { self.recover() })
-            .await
+            .await?;
+        CHANGED.notify_waiters();
+        Ok(session)
     }
 
     /// Takes the lease and recovers durable authority into this domain's validator.
@@ -617,15 +636,7 @@ impl ExecutionResources {
             if force.load(Ordering::Acquire) {
                 return Err(ShellError::new(ShellErrorKind::Interrupted));
             }
-            let domains = {
-                let mut registry = REGISTRY.lock().recover();
-                if let Some(entry) = registry.tickets.get_mut(&ticket)
-                    && !entry.active
-                {
-                    entry.hold = None;
-                }
-                registry.live_domains()
-            };
+            let domains = REGISTRY.lock().recover().live_domains();
             for domain in &domains {
                 if Arc::ptr_eq(domain, &self.domain) || overlaps(&domain.key, &self.coverage) {
                     domain.check(&self.coverage)?;
@@ -655,8 +666,10 @@ impl ExecutionResources {
     fn reserve(ticket: u64, coverage: &Path) -> bool {
         let mut registry = REGISTRY.lock().recover();
         let granted = !registry.blocked(ticket, coverage, Hold::Recovery);
-        if granted {
-            registry.settle(ticket, Hold::Recovery, true);
+        let changed = registry.settle(ticket, Hold::Recovery, granted);
+        drop(registry);
+        if changed {
+            CHANGED.notify_waiters();
         }
         granted
     }
@@ -692,6 +705,8 @@ impl ExecutionResources {
         .map_err(|_| ShellError::infrastructure("sandbox policy panicked"))?;
         let (route, hold) = if managed {
             (Route::Managed, Hold::Managed)
+        } else if *action == Action::Read {
+            (Route::Direct, Hold::Read)
         } else {
             (Route::Direct, Hold::Direct)
         };
@@ -702,12 +717,8 @@ impl ExecutionResources {
             drop(registry);
             return Ok(None);
         }
-        if registry.blocked(ticket, &self.coverage, hold) {
-            registry.settle(ticket, hold, false);
-            drop(registry);
-            return Ok(None);
-        }
-        if route == Route::Direct {
+        let granted = !registry.blocked(ticket, &self.coverage, hold);
+        if granted && hold == Hold::Direct {
             // Every managed view of this coverage must be retaken before it is used again.
             for domain in registry.live_domains() {
                 if overlaps(&domain.key, &self.coverage) {
@@ -720,10 +731,12 @@ impl ExecutionResources {
                 }
             }
         }
-        registry.settle(ticket, hold, true);
+        let changed = registry.settle(ticket, hold, granted);
         drop(registry);
-        CHANGED.notify_waiters();
-        Ok(Some(route))
+        if changed {
+            CHANGED.notify_waiters();
+        }
+        Ok(granted.then_some(route))
     }
 }
 impl Drop for ExecutionResources {
@@ -838,39 +851,77 @@ mod tests {
     }
 
     #[test]
-    fn only_managed_work_shares_an_overlapping_coverage() {
-        let active = registry(&[(0, "/src", Some(Hold::Managed), true)]);
-        assert!(!active.blocked(1, Path::new("/src/sub"), Hold::Managed));
-        assert!(active.blocked(1, Path::new("/src/sub"), Hold::Direct));
-        assert!(active.blocked(1, Path::new("/src"), Hold::Recovery));
-        assert!(!active.blocked(1, Path::new("/other"), Hold::Direct));
-        for exclusive in [Hold::Direct, Hold::Recovery] {
-            let active = registry(&[(0, "/src", Some(exclusive), true)]);
-            assert!(active.blocked(1, Path::new("/src"), Hold::Managed));
-            assert!(!active.blocked(1, Path::new("/elsewhere"), Hold::Managed));
+    fn read_holds_share_work_but_never_recovery() {
+        let cases = [
+            (Hold::Read, Hold::Read, true),
+            (Hold::Read, Hold::Managed, true),
+            (Hold::Read, Hold::Direct, true),
+            (Hold::Read, Hold::Recovery, false),
+            (Hold::Managed, Hold::Read, true),
+            (Hold::Managed, Hold::Managed, true),
+            (Hold::Managed, Hold::Direct, false),
+            (Hold::Managed, Hold::Recovery, false),
+            (Hold::Direct, Hold::Read, true),
+            (Hold::Direct, Hold::Managed, false),
+            (Hold::Direct, Hold::Direct, false),
+            (Hold::Direct, Hold::Recovery, false),
+            (Hold::Recovery, Hold::Read, false),
+            (Hold::Recovery, Hold::Managed, false),
+            (Hold::Recovery, Hold::Direct, false),
+            (Hold::Recovery, Hold::Recovery, false),
+        ];
+        for (case, (held, incoming, shares)) in cases.into_iter().enumerate() {
+            let active = registry(&[(0, "/src/repo", Some(held), true)]);
+            for coverage in ["/src/repo", "/src", "/src/repo/nested"] {
+                assert_eq!(
+                    active.blocked(1, Path::new(coverage), incoming),
+                    !shares,
+                    "case {case} over {coverage}"
+                );
+            }
+            assert!(!active.blocked(1, Path::new("/other"), incoming));
         }
     }
 
     #[test]
     fn earlier_pending_tickets_are_never_bypassed_by_conflicting_later_ones() {
-        // An earlier ticket still evaluating excludes like Direct.
+        // An unresolved verdict may need recovery, so even a read must wait for it.
         let evaluating = registry(&[(0, "/src", None, false)]);
-        assert!(evaluating.blocked(1, Path::new("/src"), Hold::Managed));
+        for incoming in [Hold::Read, Hold::Managed, Hold::Direct, Hold::Recovery] {
+            assert!(evaluating.blocked(1, Path::new("/src"), incoming));
+        }
+        let pending_recovery = registry(&[(0, "/src", Some(Hold::Recovery), false)]);
+        assert!(pending_recovery.blocked(1, Path::new("/src"), Hold::Read));
         // A later pending ticket never holds back an earlier one.
         let later = registry(&[(5, "/src", None, false)]);
-        assert!(!later.blocked(1, Path::new("/src"), Hold::Direct));
-        // A validated earlier managed verdict admits later managed work but not later raw work.
-        let validated = registry(&[(0, "/src", Some(Hold::Managed), false)]);
-        assert!(!validated.blocked(1, Path::new("/src"), Hold::Managed));
-        assert!(validated.blocked(1, Path::new("/src"), Hold::Direct));
+        assert!(!later.blocked(1, Path::new("/src"), Hold::Recovery));
+        // Validated pending work shares with reads, but not with conflicting writers.
+        for prior in [Hold::Read, Hold::Managed, Hold::Direct] {
+            let validated = registry(&[(0, "/src", Some(prior), false)]);
+            assert!(!validated.blocked(1, Path::new("/src"), Hold::Read));
+        }
+        let managed = registry(&[(0, "/src", Some(Hold::Managed), false)]);
+        assert!(!managed.blocked(1, Path::new("/src"), Hold::Managed));
+        assert!(managed.blocked(1, Path::new("/src"), Hold::Direct));
+        let direct = registry(&[(0, "/src", Some(Hold::Direct), false)]);
+        assert!(direct.blocked(1, Path::new("/src"), Hold::Managed));
     }
 
     #[test]
     fn a_waiting_verdict_never_downgrades_a_held_reservation() {
-        let mut held = registry(&[(0, "/src", Some(Hold::Recovery), true)]);
-        held.settle(0, Hold::Managed, false);
-        assert!(held.blocked(1, Path::new("/src"), Hold::Managed));
-        held.settle(0, Hold::Managed, true);
+        let mut held = registry(&[(0, "/src", None, false)]);
+        assert!(held.settle(0, Hold::Recovery, false));
+        assert!(!held.settle(0, Hold::Recovery, false));
+        assert!(held.blocked(1, Path::new("/src"), Hold::Read));
+        assert!(held.settle(0, Hold::Recovery, true));
+        assert!(!held.settle(0, Hold::Recovery, true));
+        for waiting in [Hold::Managed, Hold::Read] {
+            assert!(!held.settle(0, waiting, false));
+            assert!(held.blocked(1, Path::new("/src"), Hold::Read));
+        }
+        assert!(held.settle(0, Hold::Read, true));
+        assert!(!held.settle(0, Hold::Read, true));
         assert!(!held.blocked(1, Path::new("/src"), Hold::Managed));
+        assert!(!held.settle(99, Hold::Read, true));
     }
 }

@@ -416,6 +416,71 @@ async fn overlapping_commands_wait_for_direct_work() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
+async fn read_tools_finish_before_overlapping_writers() {
+    for (writer_policy, expected) in [
+        (SandboxPolicy::forbid(), b"during\n".as_slice()),
+        (SandboxPolicy::allow(), b"seed\n".as_slice()),
+    ] {
+        let seed = Seed::new("src/a.txt", "seed\n");
+        let mut writer = controlled(seed.builder().sandbox_policy(writer_policy)).await;
+        let writer_task = launch(
+            &writer.shell,
+            "printf 'during\n' > src/a.txt; printf 'READY\n'; read release; printf 'after\n' > src/a.txt".into(),
+        );
+        writer.ready().await;
+
+        let witness = seed.outside("queued-writer-started");
+        let queued_shell = Arc::new(
+            seed.builder()
+                .sandbox_policy(SandboxPolicy::forbid())
+                .build()
+                .await
+                .unwrap(),
+        );
+        let mut queued = launch(&queued_shell, format!("printf queued > {}", witness.display()));
+        stays_queued(&mut queued, &witness).await;
+
+        let read_shell = seed
+            .builder()
+            .working_dir(seed.source.join("src"))
+            .sandbox_policy(SandboxPolicy::Base(writes))
+            .build()
+            .await
+            .unwrap();
+        let observed = tokio::time::timeout(
+            TIMEOUT,
+            read_shell.run_tool(Inspect, |ctx| {
+                let physical = ctx.physical_path(Path::new("a.txt")).unwrap();
+                let bytes = std::fs::read(&physical).unwrap();
+                (physical, bytes)
+            }),
+        )
+        .await;
+        let writer_held = !writer_task.is_finished();
+        let queued_held = !queued.is_finished();
+        let witness_absent = !witness.exists();
+
+        writer.release();
+        let writer_result = join(writer_task).await;
+        let queued_result = join(queued).await;
+
+        let (physical, bytes) = observed.expect("read finishes before bash exits").unwrap();
+        assert_eq!(physical, seed.source.join("src/a.txt"));
+        assert_eq!(bytes, expected);
+        assert!(writer_held && queued_held, "both writers were held during the read");
+        assert!(witness_absent, "the queued writer did not run");
+        writer_result.unwrap();
+        queued_result.unwrap();
+        assert_eq!(seed.bytes("src/a.txt"), b"after\n");
+        assert_eq!(host(&witness).unwrap(), b"queued");
+        read_shell.close(false).await.unwrap();
+        queued_shell.close(false).await.unwrap();
+        writer.shell.close(false).await.unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
 async fn closing_a_queued_shell_interrupts_its_wait() {
     let seed = Seed::new("a.txt", "seed\n");
     let witness = seed.outside("started");
@@ -914,6 +979,14 @@ fn gated(ctx: &CommandContext<'_>) -> bool {
     verdict
 }
 
+/// Announces the first tool verdict without blocking or capturing policy state.
+fn announce_writes(ctx: &CommandContext<'_>) -> bool {
+    if let Some(entered) = ENTERED.lock().unwrap().take() {
+        entered.send(()).unwrap();
+    }
+    ctx.action.is_write()
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
 async fn a_verdict_made_stale_by_a_new_peer_is_discarded() {
@@ -948,6 +1021,100 @@ async fn a_verdict_made_stale_by_a_new_peer_is_discarded() {
     assert_eq!(host(&marker).unwrap(), b"staged");
     b.close(false).await.unwrap();
     a.shell.close(false).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn read_tools_wake_after_a_pending_writer_is_classified() {
+    let seed = Seed::new("src/a.txt", "seed\n");
+    let mut raw = controlled(seed.builder().sandbox_policy(SandboxPolicy::forbid())).await;
+    let raw_task = launch(&raw.shell, "printf 'READY\n'; read release".into());
+    raw.ready().await;
+
+    let (entered, announced) = std::sync::mpsc::channel();
+    let (open, gate) = std::sync::mpsc::channel();
+    *ENTERED.lock().unwrap() = Some(entered);
+    *GATE.lock().unwrap() = Some(gate);
+    let witness = seed.outside("classified-writer-started");
+    let writer = Arc::new(
+        seed.builder()
+            .sandbox_policy(SandboxPolicy::and(
+                SandboxPolicy::Base(gated),
+                SandboxPolicy::forbid(),
+            ))
+            .build()
+            .await
+            .unwrap(),
+    );
+    let queued = launch(&writer, format!("printf queued > {}", witness.display()));
+    tokio::time::timeout(
+        TIMEOUT,
+        tokio::task::spawn_blocking(move || announced.recv().unwrap()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    let (read_entered, read_announced) = std::sync::mpsc::channel();
+    *ENTERED.lock().unwrap() = Some(read_entered);
+    let read_shell = Arc::new(
+        seed.builder()
+            .sandbox_policy(SandboxPolicy::Base(announce_writes))
+            .build()
+            .await
+            .unwrap(),
+    );
+    let mut read_task = {
+        let shell = Arc::clone(&read_shell);
+        tokio::spawn(async move {
+            shell
+                .run_tool(Inspect, |ctx| {
+                    std::fs::read(ctx.physical_path(Path::new("src/a.txt")).unwrap()).unwrap()
+                })
+                .await
+        })
+    };
+    tokio::time::timeout(
+        TIMEOUT,
+        tokio::task::spawn_blocking(move || read_announced.recv().unwrap()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let before_gate = tokio::time::timeout(QUEUED, &mut read_task).await;
+    let reader_waited = before_gate.is_err();
+
+    open.send(()).unwrap();
+    let observed = match before_gate {
+        Ok(result) => Ok(result),
+        Err(_) => tokio::time::timeout(TIMEOUT, &mut read_task).await,
+    };
+    let raw_held = !raw_task.is_finished();
+    let writer_queued = !queued.is_finished();
+    let witness_absent = !witness.exists();
+    raw.release();
+    let raw_result = join(raw_task).await;
+    let queued_result = join(queued).await;
+    if observed.is_err() {
+        let _ = tokio::time::timeout(TIMEOUT, read_task).await;
+    }
+
+    assert!(reader_waited, "an unresolved writer excludes the reader");
+    assert_eq!(
+        observed
+            .expect("reader wakes while bash is held")
+            .expect("reader task")
+            .expect("read tool"),
+        b"seed\n"
+    );
+    assert!(raw_held && writer_queued, "neither bash barrier opened");
+    assert!(witness_absent, "the pending writer did not run");
+    raw_result.unwrap();
+    queued_result.unwrap();
+    assert_eq!(host(&witness).unwrap(), b"queued");
+    read_shell.close(false).await.unwrap();
+    writer.close(false).await.unwrap();
+    raw.shell.close(false).await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -992,10 +1159,38 @@ async fn cold_start_recovery_waits_for_overlapping_direct_work() {
         ),
     );
     stays_queued(&mut reader, &witness).await;
+    let read_shell = Arc::new(
+        managed()
+            .sandbox_policy(SandboxPolicy::forbid())
+            .build()
+            .await
+            .unwrap(),
+    );
+    let mut inspected = {
+        let shell = Arc::clone(&read_shell);
+        tokio::spawn(async move {
+            shell
+                .run_tool(Inspect, |ctx| {
+                    std::fs::read(ctx.physical_path(Path::new("marker")).unwrap()).unwrap()
+                })
+                .await
+        })
+    };
+    let before_release = tokio::time::timeout(QUEUED, &mut inspected).await;
+    let waited_for_recovery = before_release.is_err();
     raw.release();
     join(writer).await.unwrap();
     join(reader).await.unwrap();
+    let observed = match before_release {
+        Ok(result) => result,
+        Err(_) => tokio::time::timeout(TIMEOUT, inspected)
+            .await
+            .expect("read completes after recovery"),
+    };
+    assert!(waited_for_recovery, "source reads cannot bypass pending recovery");
+    assert_eq!(observed.expect("read task").expect("read tool"), b"final");
     assert_eq!(host(&repository.join("copy")).unwrap(), b"final");
+    read_shell.close(false).await.unwrap();
     recovering.close(false).await.unwrap();
     raw.shell.close(false).await.unwrap();
 }
@@ -1262,6 +1457,34 @@ async fn tool_calls_route_by_their_action_and_publish_their_effects() {
     assert_eq!(logical, source);
     assert_eq!(bytes, b"tool\n");
     shell.close(false).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn seed_reads_preserve_unchanged_managed_descriptors() {
+    let seed = Seed::new("src/a.txt", "seed\n");
+    let managed = seed.managed_builder().build().await.unwrap();
+    let direct = seed
+        .builder()
+        .sandbox_policy(SandboxPolicy::forbid())
+        .build()
+        .await
+        .unwrap();
+    run(&managed, "exec 3<src/a.txt").await;
+    let (physical, bytes) = direct
+        .run_tool(Inspect, |ctx| {
+            let physical = ctx.physical_path(Path::new("src/a.txt")).unwrap();
+            let bytes = std::fs::read(&physical).unwrap();
+            (physical, bytes)
+        })
+        .await
+        .unwrap();
+    assert_eq!(physical, seed.source.join("src/a.txt"));
+    assert_eq!(bytes, b"seed\n");
+    run(&managed, "read -r value <&3; exec 3<&-").await;
+    assert_eq!(string(&managed.env_var("value").await.unwrap()), "seed");
+    direct.close(false).await.unwrap();
+    managed.close(false).await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

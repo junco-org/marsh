@@ -193,13 +193,22 @@ predicates must be synchronous, read-only and must not call back into a shell; a
 predicate fails the call.
 
 A shell's source root is the canonical Git work-tree root containing its initial directory, or that
-directory itself outside a work tree, fixed for the shell's lifetime. Commands queue on the
-shallower of that root and the Btrfs seed: overlapping managed commands run concurrently, while a
-direct command or recovery excludes every overlapping command. Waiting commands re-evaluate the
-policy as shells join or leave and as authority changes. A command issued from inside another live
-command returns `Busy` rather than wait behind a conflict. Durable state is recovered before the
-first routing decision on a source; a source that requires recovery refuses both routes. A true
-route never falls back to direct when managed storage is unavailable.
+directory itself outside a work tree, fixed for the shell's lifetime. Calls queue on the shallower
+of that root and the Btrfs seed. Overlapping managed commands share admission; a direct
+`Action::Read` tool can run alongside managed work, other reads, or an in-flight direct writer.
+Direct may-write calls still exclude overlapping managed work and other writers. Recovery excludes
+every call, and an earlier unclassified ticket blocks reads until its verdict is known. Shell spans,
+including `cat` and startup, always use `Action::Edit` and may-write admission.
+
+A direct `Action::Read` classification promises that the tool and its spawned work do not mutate
+the filesystem; this is trusted embedder metadata, not OS-enforced read-only access. Reads use the
+live logical source: they can observe direct writes or managed publication in progress, but not
+unpublished private work, and do not promise an atomic multi-file view. Direct reads do not retire
+unchanged managed descriptors. Waiting calls re-evaluate the policy as shells join or leave and as
+authority changes. A call issued from inside another live command returns `Busy` rather than wait
+behind a conflict. Durable state is recovered before the first routing decision on a source; a
+source that requires recovery refuses both routes. A true route never falls back to direct when
+managed storage is unavailable.
 
 Route changes keep variables, functions, the logical working directory and `cd -`. Descriptors
 bound inside the view being left are revoked rather than reopened elsewhere, and caller-supplied
