@@ -12,6 +12,7 @@ use super::set_titles_support::{
     attach_title_capable_client, delivered_titles, remembered_title, set_global,
 };
 use super::*;
+use crate::test_fixtures::SessionSpec;
 
 /// Opens a real mode-tree overlay through the command funnel, so subsequent
 /// refreshes for this client are stamped with its persistent-overlay state.
@@ -47,7 +48,7 @@ async fn dismiss_mode_tree_and_refresh(handler: &RequestHandler, attach_pid: u32
 async fn a_title_discarded_by_an_overlay_barrier_reaches_the_successor_refresh() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
 
     let attach_pid = std::process::id();
     let mut control_rx = attach_title_capable_client(&handler, &alpha, attach_pid).await;
@@ -90,7 +91,7 @@ async fn a_title_discarded_by_an_overlay_barrier_reaches_the_successor_refresh()
 async fn a_title_surviving_its_overlay_barrier_is_not_re_emitted() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
 
     let attach_pid = std::process::id();
     let mut control_rx = attach_title_capable_client(&handler, &alpha, attach_pid).await;
@@ -131,7 +132,7 @@ async fn a_title_surviving_its_overlay_barrier_is_not_re_emitted() {
 async fn an_unstamped_title_is_never_reverted_by_a_barrier() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
 
     let attach_pid = std::process::id();
     let mut control_rx = attach_title_capable_client(&handler, &alpha, attach_pid).await;

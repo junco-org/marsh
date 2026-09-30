@@ -181,8 +181,6 @@ impl HandlerState {
                         pane: new_pane_id,
                         generation,
                     },
-                    shell_id: None,
-                    follow_mux_lifetime: false,
                 },
                 io,
                 runtime_session_name.clone(),

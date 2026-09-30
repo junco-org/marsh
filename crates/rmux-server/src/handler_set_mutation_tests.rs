@@ -6,14 +6,14 @@ use rmux_proto::{
     SetOptionByNameRequest, SetOptionMode, SetOptionRequest, WindowTarget,
 };
 
-use crate::test_fixtures::Fixture;
+use crate::test_fixtures::{Fixture, SessionSpec, TestRequest};
 use crate::test_names::session_name;
 
 #[tokio::test]
 async fn set_option_updates_the_store_and_session_values_override_global() {
     let handler = RequestHandler::new();
-    handler.create_session("alpha").await;
-    handler.create_session("beta").await;
+    SessionSpec::create(&handler, "alpha").await;
+    SessionSpec::create(&handler, "beta").await;
 
     assert_eq!(
         handler
@@ -128,7 +128,7 @@ async fn typed_and_named_default_shell_mutations_reject_unsuitable_paths() {
 #[tokio::test]
 async fn terminal_features_append_preserves_order_and_invalid_requests_fail_first() {
     let handler = RequestHandler::new();
-    handler.create_session("alpha").await;
+    SessionSpec::create(&handler, "alpha").await;
 
     assert_eq!(
         handler
@@ -207,7 +207,7 @@ async fn terminal_features_append_preserves_order_and_invalid_requests_fail_firs
 #[tokio::test]
 async fn set_option_by_name_refreshes_existing_transcripts_for_server_utf8_options() {
     let handler = RequestHandler::new();
-    handler.create_session("alpha").await;
+    SessionSpec::create(&handler, "alpha").await;
     let alpha = session_name("alpha");
 
     let before = {
@@ -247,8 +247,8 @@ async fn set_option_by_name_refreshes_existing_transcripts_for_server_utf8_optio
 #[tokio::test]
 async fn pane_style_options_resolve_session_then_global_for_supported_variants() {
     let handler = RequestHandler::new();
-    handler.create_session("alpha").await;
-    handler.create_session("beta").await;
+    SessionSpec::create(&handler, "alpha").await;
+    SessionSpec::create(&handler, "beta").await;
     let alpha_window = WindowTarget::with_window(session_name("alpha"), 0);
     let alpha_pane = PaneTarget::with_window(session_name("alpha"), 0, 0);
 
@@ -362,12 +362,14 @@ async fn set_option_to_nonexistent_session_returns_session_not_found() {
 async fn set_option_append_empty_string_is_noop() {
     let handler = RequestHandler::new();
 
-    handler
-        .handle_ok(SetOptionRequest {
+    TestRequest::send_ok(
+        &handler,
+        SetOptionRequest {
             mode: SetOptionMode::Append,
             ..Fixture::fixture((ScopeSelector::Global, OptionName::TerminalFeatures, ""))
-        })
-        .await;
+        },
+    )
+    .await;
 
     let state = handler.state.lock().await;
     assert_eq!(

@@ -12,6 +12,7 @@ use super::set_titles_support::{
     set_global,
 };
 use super::*;
+use crate::test_fixtures::{SessionSpec, TestRequest};
 
 /// Feeds bytes to a pane through the production reader path and applies the
 /// alert events production built from them.
@@ -71,7 +72,7 @@ async fn pane_path(handler: &RequestHandler, session: &rmux_proto::SessionName) 
 async fn a_live_pane_path_change_reaches_the_outer_terminal() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    handler.create_session(Quiet(&alpha)).await;
+    SessionSpec::create(&handler, Quiet(&alpha)).await;
 
     let attach_pid = std::process::id();
     let mut control_rx = attach_title_capable_client(&handler, &alpha, attach_pid).await;
@@ -106,7 +107,7 @@ async fn a_live_pane_path_change_reaches_the_outer_terminal() {
 async fn a_pane_clearing_its_path_clears_the_outer_terminal() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    handler.create_session(Quiet(&alpha)).await;
+    SessionSpec::create(&handler, Quiet(&alpha)).await;
 
     let attach_pid = std::process::id();
     let mut control_rx = attach_title_capable_client(&handler, &alpha, attach_pid).await;
@@ -147,7 +148,7 @@ async fn a_pane_clearing_its_path_clears_the_outer_terminal() {
 async fn a_path_change_writes_nothing_while_set_titles_is_off() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    handler.create_session(Quiet(&alpha)).await;
+    SessionSpec::create(&handler, Quiet(&alpha)).await;
 
     let attach_pid = std::process::id();
     let mut control_rx = attach_title_capable_client(&handler, &alpha, attach_pid).await;
@@ -173,7 +174,7 @@ async fn a_path_change_writes_nothing_while_set_titles_is_off() {
 async fn a_client_without_the_osc7_capability_receives_no_path() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    handler.create_session(Quiet(&alpha)).await;
+    SessionSpec::create(&handler, Quiet(&alpha)).await;
 
     let attach_pid = std::process::id();
     let mut control_rx = attach_title_capable_client(&handler, &alpha, attach_pid).await;
@@ -196,24 +197,26 @@ async fn a_linked_session_with_set_titles_off_is_not_redrawn_by_a_title_change()
     let handler = RequestHandler::new();
     let owner = session_name("titled-owner");
     let peer = session_name("untitled-peer");
-    handler.create_session(Quiet(&owner)).await;
-    handler.create_session(Quiet(&peer)).await;
+    SessionSpec::create(&handler, Quiet(&owner)).await;
+    SessionSpec::create(&handler, Quiet(&peer)).await;
 
     let owner_pid = u32::MAX - 182;
     let peer_pid = u32::MAX - 183;
     let mut owner_rx = attach_title_capable_client(&handler, &owner, owner_pid).await;
     let mut peer_rx = attach_title_capable_client(&handler, &peer, peer_pid).await;
 
-    handler
-        .handle_ok(LinkWindowRequest {
+    TestRequest::send_ok(
+        &handler,
+        LinkWindowRequest {
             kill_destination: true,
             detached: false,
             ..Fixture::fixture((
                 WindowTarget::with_window(owner.clone(), 0),
                 WindowTarget::with_window(peer.clone(), 0),
             ))
-        })
-        .await;
+        },
+    )
+    .await;
 
     for (session, option, value) in [
         (&owner, OptionName::SetTitlesString, "T:#{pane_title}"),

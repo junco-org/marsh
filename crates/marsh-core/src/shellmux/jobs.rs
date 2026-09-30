@@ -170,6 +170,7 @@ impl ActiveCommand {
             shell: shell.clone(),
             text: Arc::from(cmd),
             state,
+            execution: crate::shell::ExecutionProgress::new(),
         };
         Self {
             handle,
@@ -467,7 +468,7 @@ impl ShellMux {
             readers,
         } = Self::open_streams(io)?;
         let interpreter = self
-            .build_shell(id.clone(), &requested, fds, options.environment)
+            .build_shell(Some(id.clone()), &requested, fds, options.environment)
             .await?;
         let working_directory = interpreter.working_dir().await;
         let sandbox = interpreter.sandbox().clone();
@@ -1534,6 +1535,7 @@ async fn execute_command(
         })
         .map_err(RunError::Admission)?;
     mux.announce(FrontendEvent::CommandAccepted { command: &receipt });
+    let progress = receipt.execution.clone();
     // After admission and after the lease is back, before anything can be written or finished:
     // this is the observation a caller feeding standard input or signalling the line needs, and
     // it must never arrive late enough for the command to have ended first.
@@ -1546,7 +1548,7 @@ async fn execute_command(
         None => Err(ShellError::new(ShellErrorKind::Interrupted)),
         Some(interpreter) => {
             mux.announce(FrontendEvent::Changed);
-            run_line(&shell, interpreter, &cmd).await
+            run_line(&shell, interpreter, &cmd, progress).await
         }
     };
     let completion = mux.conclude_command(&shell, result);
@@ -1569,8 +1571,9 @@ async fn run_line(
     shell: &Shell,
     interpreter: Arc<crate::Shell>,
     cmd: &str,
+    progress: crate::shell::ExecutionProgress,
 ) -> Result<ExecutionResult, ShellError> {
-    let result = interpreter.run(cmd).await;
+    let result = interpreter.run_with_progress(cmd, progress).await;
     let working_directory = interpreter.working_dir().await;
     let mut guard = shell.live_lock();
     if let Some(live) = guard.as_mut() {

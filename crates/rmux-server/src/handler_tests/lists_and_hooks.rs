@@ -1,5 +1,5 @@
 use super::*;
-use crate::test_fixtures::{Fixture, Sizeless};
+use crate::test_fixtures::{Fixture, SessionSpec, Sizeless, TestRequest};
 
 #[tokio::test]
 async fn list_sessions_returns_empty_output_when_no_sessions_exist() {
@@ -24,7 +24,7 @@ async fn list_sessions_returns_empty_output_when_no_sessions_exist() {
 async fn list_sessions_sorts_sessions_by_name() {
     let handler = RequestHandler::new();
     for name in ["charlie", "alpha", "bravo"] {
-        handler.create_session(Sizeless(name)).await;
+        SessionSpec::create(&handler, Sizeless(name)).await;
     }
 
     let response = handler
@@ -56,13 +56,15 @@ async fn list_sessions_format_uses_each_sessions_active_pane_context() {
     let beta_dir = canonical_context_path(root.child("beta").path());
 
     for (name, path) in [("alpha", &alpha_dir), ("beta", &beta_dir)] {
-        handler
-            .create_session(NewSessionExtRequest {
+        SessionSpec::create(
+            &handler,
+            NewSessionExtRequest {
                 working_directory: Some(path.to_string_lossy().into_owned()),
                 size: None,
                 ..Fixture::fixture(name)
-            })
-            .await;
+            },
+        )
+        .await;
     }
 
     let response = handler
@@ -99,21 +101,25 @@ async fn session_path_stays_at_session_cwd_when_pane_cwds_differ() {
     let split_dir = canonical_context_path(root.child("split").path());
     let session = session_name("session-path-context");
 
-    handler
-        .create_session(NewSessionExtRequest {
+    SessionSpec::create(
+        &handler,
+        NewSessionExtRequest {
             working_directory: Some(session_dir.to_string_lossy().into_owned()),
             size: None,
             ..Fixture::fixture(&session)
-        })
-        .await;
+        },
+    )
+    .await;
 
-    handler
-        .handle_ok(rmux_proto::SplitWindowExtRequest {
+    TestRequest::send_ok(
+        &handler,
+        rmux_proto::SplitWindowExtRequest {
             start_directory: Some(split_dir.clone()),
             detached: true,
             ..Fixture::fixture(&session)
-        })
-        .await;
+        },
+    )
+    .await;
 
     let response = handler
         .handle(Request::ListPanes(Box::new(ListPanesRequest {

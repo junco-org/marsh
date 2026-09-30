@@ -1,4 +1,5 @@
 use super::*;
+use crate::test_fixtures::{SessionSpec, TestRequest};
 
 #[tokio::test]
 async fn copy_mode_mouse_drag_start_anchors_on_press_cell() {
@@ -7,9 +8,7 @@ async fn copy_mode_mouse_drag_start_anchors_on_press_cell() {
     let requester_pid = std::process::id();
     let target = PaneTarget::new(alpha.clone(), 0);
 
-    handler
-        .create_session((&alpha, TerminalSize::new(20, 5)))
-        .await;
+    SessionSpec::create(&handler, (&alpha, TerminalSize::new(20, 5))).await;
 
     let _control_rx = handler.attach_client(requester_pid, &alpha).await;
 
@@ -50,12 +49,14 @@ async fn copy_mode_mouse_drag_start_anchors_on_press_cell() {
         });
     }
 
-    handler
-        .handle_ok(CopyModeRequest {
+    TestRequest::send_ok(
+        &handler,
+        CopyModeRequest {
             mouse_drag_start: true,
             ..Fixture::fixture(target)
-        })
-        .await;
+        },
+    )
+    .await;
 
     let summary = {
         let state = handler.state.lock().await;
@@ -80,13 +81,15 @@ async fn copy_mode_single_motion_drag_copies_from_press_to_motion_cell() {
     let target = PaneTarget::new(alpha.clone(), 0);
     let size = TerminalSize { cols: 20, rows: 5 };
 
-    handler
-        .create_started_session(NewSessionExtRequest {
+    SessionSpec::create_started(
+        &handler,
+        NewSessionExtRequest {
             size: Some(size),
             command: Some(quiet_command()),
             ..Fixture::fixture(&alpha)
-        })
-        .await;
+        },
+    )
+    .await;
     handler
         .replace_transcript_for_test(&target, size, b"ABCDEF\r\n")
         .await;
@@ -130,12 +133,14 @@ async fn copy_mode_single_motion_drag_copies_from_press_to_motion_cell() {
         });
     }
 
-    handler
-        .handle_ok(CopyModeRequest {
+    TestRequest::send_ok(
+        &handler,
+        CopyModeRequest {
             mouse_drag_start: true,
             ..Fixture::fixture(&target)
-        })
-        .await;
+        },
+    )
+    .await;
 
     let copied = handler
         .handle(Request::SendKeysExt(SendKeysExtRequest {
@@ -168,13 +173,15 @@ async fn copy_mode_mouse_entry_uses_left_scrollbar_content_origin() {
     let alpha = session_name("copy-mode-left-scrollbar");
     let requester_pid = std::process::id();
     let target = PaneTarget::new(alpha.clone(), 0);
-    handler
-        .create_session(NewSessionExtRequest {
+    SessionSpec::create(
+        &handler,
+        NewSessionExtRequest {
             size: Some(TerminalSize { cols: 20, rows: 5 }),
             command: Some(quiet_command()),
             ..Fixture::fixture(&alpha)
-        })
-        .await;
+        },
+    )
+    .await;
     for (option, value) in [
         (OptionName::PaneScrollbars, "on"),
         (OptionName::PaneScrollbarsPosition, "left"),
@@ -236,19 +243,23 @@ async fn copy_mode_mouse_entry_uses_left_scrollbar_content_origin() {
         });
     }
 
-    handler
-        .handle_ok(CopyModeRequest {
+    TestRequest::send_ok(
+        &handler,
+        CopyModeRequest {
             mouse_drag_start: true,
             ..Fixture::fixture(&target)
-        })
-        .await;
-    handler
-        .handle_ok(SendKeysExtRequest {
+        },
+    )
+    .await;
+    TestRequest::send_ok(
+        &handler,
+        SendKeysExtRequest {
             dispatch_key_table: false,
             copy_mode_command: true,
             ..Fixture::fixture((target, ["copy-selection"]))
-        })
-        .await;
+        },
+    )
+    .await;
     let shown = handler
         .handle(Request::ShowBuffer(ShowBufferRequest { name: None }))
         .await;

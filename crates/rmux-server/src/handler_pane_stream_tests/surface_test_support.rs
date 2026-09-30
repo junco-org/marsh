@@ -7,7 +7,7 @@ use rmux_proto::{
 
 use crate::pane_recovery::{PaneProjectionSeed, MAX_RECOVERY_STRING_BYTES};
 use crate::pane_transcript::SharedPaneTranscript;
-use crate::test_fixtures::Fixture;
+use crate::test_fixtures::{Fixture, TestRequest};
 
 use super::CONNECTION_ID;
 
@@ -98,14 +98,16 @@ pub(super) async fn resize_window(
     cols: u16,
     rows: u16,
 ) {
-    handler
-        .handle_ok(ResizeWindowRequest {
+    TestRequest::send_ok(
+        handler,
+        ResizeWindowRequest {
             target: WindowTarget::with_window(target.session_name().clone(), target.window_index()),
             width: Some(cols),
             height: Some(rows),
             adjustment: None,
-        })
-        .await;
+        },
+    )
+    .await;
 }
 
 pub(super) fn materialize_frame(

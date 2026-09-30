@@ -5,7 +5,9 @@
 use super::super::mode_tree_order::{pane_item_id, session_item_id};
 use super::*;
 
-use crate::test_fixtures::{collect_control_notifications_through, settle_control_notifications};
+use crate::test_fixtures::{
+    collect_control_notifications_through, settle_control_notifications, SessionSpec, TestRequest,
+};
 
 /// Frozen tmux 3.7b oracle, measured 2026-07-25
 /// (`.rmux-audit/oracle/scenario_switch_destination.py`): a 101x41 client
@@ -21,8 +23,8 @@ async fn choose_tree_switch_notifies_the_destination_session_layout_change_like_
     let handler = RequestHandler::new();
     let source = SessionName::new("choose-tree-switch-source").expect("valid session");
     let target = SessionName::new("choose-tree-switch-target").expect("valid session");
-    handler.create_session(&source).await;
-    handler.create_session(&target).await;
+    SessionSpec::create(&handler, &source).await;
+    SessionSpec::create(&handler, &target).await;
     for session in [&source, &target] {
         handler
             .set_option(
@@ -49,15 +51,17 @@ async fn choose_tree_switch_notifies_the_destination_session_layout_change_like_
     let (_, mut control_events) = handler
         .register_control_for_test(control_pid, Some(&target))
         .await;
-    handler
-        .handle_ok(rmux_proto::RefreshClientRequest {
+    TestRequest::send_ok(
+        &handler,
+        rmux_proto::RefreshClientRequest {
             control_size: Some(format!(
                 "{}x{}",
                 destination_size.cols, destination_size.rows
             )),
             ..Fixture::fixture(Some(control_pid.to_string()))
-        })
-        .await;
+        },
+    )
+    .await;
     assert_eq!(
         handler.active_window_size_for_test(&target).await,
         destination_size
@@ -120,8 +124,8 @@ async fn choose_tree_switch_carries_a_sizeless_client_outer_terminal_anchor() {
     let handler = RequestHandler::new();
     let source = SessionName::new("choose-tree-sizeless-source").expect("valid session");
     let target = SessionName::new("choose-tree-sizeless-target").expect("valid session");
-    handler.create_session(&source).await;
-    handler.create_session(&target).await;
+    SessionSpec::create(&handler, &source).await;
+    SessionSpec::create(&handler, &target).await;
     for session in [&source, &target] {
         handler
             .set_option(
@@ -175,16 +179,18 @@ async fn choose_tree_pane_switch_keeps_the_control_selection_model_current() {
     let handler = RequestHandler::new();
     let source = SessionName::new("choose-tree-selection-source").expect("valid session");
     let target = SessionName::new("choose-tree-selection-target").expect("valid session");
-    handler.create_session(&source).await;
-    handler.create_session(&target).await;
+    SessionSpec::create(&handler, &source).await;
+    SessionSpec::create(&handler, &target).await;
     let window = handler.create_window(&target).await;
     assert_eq!(window.window_index(), 1);
-    handler
-        .handle_ok(SplitWindowRequest {
+    TestRequest::send_ok(
+        &handler,
+        SplitWindowRequest {
             direction: SplitDirection::Horizontal,
             ..Fixture::fixture(PaneTarget::with_window(target.clone(), 1, 0))
-        })
-        .await;
+        },
+    )
+    .await;
 
     let (
         pane_item,

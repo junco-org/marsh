@@ -1,14 +1,16 @@
 use std::path::Path;
 
 use rmux_client::Connection;
-use rmux_proto::{HookLifecycle, HookName, ResolveTargetType, ScopeSelector, SessionName, Target};
+use rmux_proto::{
+    HookLifecycle, HookName, ResolveTargetType, ScopeSelector, SessionName, Target, WindowTarget,
+};
 
 use crate::cli::target_resolution::{
     resolve_active_pane_index, resolve_active_window_index, target_session, target_window,
 };
 use crate::cli::{
-    ExitFailure, resolve_current_pane_target, resolve_current_session_target, resolve_target_spec,
-    resolve_window_target_or_current, run_command_resolved, run_payload_command_resolved,
+    CommandTarget, ExitFailure, resolve_current_pane_target, resolve_current_session_target,
+    resolve_target_spec, run_command_resolved, run_payload_command_resolved,
 };
 use crate::cli_args::{SetHookArgs, ShowHooksArgs, TargetSpec};
 
@@ -203,8 +205,9 @@ impl HookScope {
                     session_name,
                 )
             }
-            Self::CurrentWindow => resolve_window_target_or_current(connection, None, command)
-                .map(ScopeSelector::Window),
+            Self::CurrentWindow => {
+                WindowTarget::resolve_fallback(connection, command).map(ScopeSelector::Window)
+            }
             Self::CurrentPane => {
                 resolve_current_pane_target(connection, command).map(ScopeSelector::Pane)
             }

@@ -1,5 +1,5 @@
 use super::*;
-use crate::test_fixtures::Sizeless;
+use crate::test_fixtures::{SessionSpec, Sizeless};
 
 #[tokio::test]
 async fn lock_client_emits_lock_control_before_refresh() {
@@ -7,9 +7,7 @@ async fn lock_client_emits_lock_control_before_refresh() {
     let requester_pid = std::process::id();
     let alpha = session_name("alpha");
 
-    handler
-        .create_session((&alpha, TerminalSize::new(120, 40)))
-        .await;
+    SessionSpec::create(&handler, (&alpha, TerminalSize::new(120, 40))).await;
     let mut control_rx = handler.attach_client(requester_pid, alpha).await;
 
     let response = handler
@@ -36,7 +34,7 @@ async fn lock_server_skips_already_suspended_clients() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
 
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
     let mut control_rx = handler.attach_client(std::process::id(), alpha).await;
 
     let first_lock = handler
@@ -100,7 +98,7 @@ async fn kill_server_sets_shutdown_flag() {
 async fn daemon_status_reports_version_and_activity_counts() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    handler.create_session(Sizeless(&alpha)).await;
+    SessionSpec::create(&handler, Sizeless(&alpha)).await;
     let _control_rx = handler.attach_client(std::process::id(), alpha).await;
 
     let response = handler
@@ -136,7 +134,7 @@ async fn shutdown_if_idle_queues_shutdown_only_when_empty() {
 #[tokio::test]
 async fn shutdown_if_idle_refuses_live_sessions() {
     let handler = RequestHandler::new();
-    handler.create_session(Sizeless("alpha")).await;
+    SessionSpec::create(&handler, Sizeless("alpha")).await;
 
     let response = handler
         .handle(Request::ShutdownIfIdle(rmux_proto::ShutdownIfIdleRequest))

@@ -1,4 +1,5 @@
 use super::*;
+use crate::test_fixtures::TestRequest;
 
 #[tokio::test]
 async fn live_attach_synchronize_panes_writes_to_each_live_pane() {
@@ -7,18 +8,18 @@ async fn live_attach_synchronize_panes_writes_to_each_live_pane() {
     let requester_pid = std::process::id();
 
     create_send_keys_test_session(&handler, &alpha).await;
-    handler
-        .handle_ok(SplitWindowRequest {
+    TestRequest::send_ok(
+        &handler,
+        SplitWindowRequest {
             direction: SplitDirection::Horizontal,
             ..Fixture::fixture(PaneTarget::new(alpha.clone(), 0))
-        })
-        .await;
+        },
+    )
+    .await;
 
     let pane_zero = PaneTarget::with_window(alpha.clone(), 0, 0);
     let pane_one = PaneTarget::with_window(alpha.clone(), 0, 1);
-    handler
-        .handle_ok(SelectPaneRequest::fixture(&pane_zero))
-        .await;
+    TestRequest::send_ok(&handler, SelectPaneRequest::fixture(&pane_zero)).await;
 
     let scope = ScopeSelector::Window(WindowTarget::with_window(alpha.clone(), 0));
     handler
@@ -283,19 +284,21 @@ async fn create_synchronized_two_pane_session(
     // startup output must not race the stamped modes (the same class as the
     // double-click content race fixed in live_attach.rs).
     create_quiet_input_session(handler, alpha).await;
-    let split = handler
-        .handle_ok(rmux_proto::SplitWindowExtRequest {
+    let split = TestRequest::send_ok(
+        handler,
+        rmux_proto::SplitWindowExtRequest {
             direction: SplitDirection::Horizontal,
             command: Some(quiet_command()),
             ..Fixture::fixture(PaneTarget::new(alpha.clone(), 0))
-        })
-        .await;
+        },
+    )
+    .await;
     handler
         .wait_for_pane_startup_to_finish_for_test(&split.pane)
         .await;
 
     let first = PaneTarget::with_window(alpha.clone(), 0, 0);
-    handler.handle_ok(SelectPaneRequest::fixture(first)).await;
+    TestRequest::send_ok(handler, SelectPaneRequest::fixture(first)).await;
 
     let scope = ScopeSelector::Window(WindowTarget::with_window(alpha.clone(), 0));
     handler
@@ -331,7 +334,7 @@ async fn setup_synchronized_attached_mode_captures(
     }
 
     let active = PaneTarget::with_window(session_name.clone(), 0, active_pane);
-    handler.handle_ok(SelectPaneRequest::fixture(active)).await;
+    TestRequest::send_ok(handler, SelectPaneRequest::fixture(active)).await;
 
     let requester_pid = std::process::id();
     // The receiver has to outlive the caller, not this helper. A live pane keeps refreshing its

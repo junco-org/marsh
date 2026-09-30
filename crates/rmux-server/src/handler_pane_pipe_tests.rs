@@ -7,7 +7,7 @@ use rmux_proto::{KillPaneRequest, PaneTarget, PipePaneRequest, SendKeysRequest};
 
 const PANE_PIPE_TEST_TIMEOUT: Duration = Duration::from_secs(15);
 
-use crate::test_fixtures::wait_until;
+use crate::test_fixtures::{wait_until, SessionSpec, TestRequest};
 use crate::test_names::session_name;
 
 /// A pipe command that logs the first line it is given and then exits.
@@ -67,24 +67,28 @@ async fn pipe_pane(
     once: bool,
     command: Option<String>,
 ) {
-    handler
-        .handle_ok(PipePaneRequest {
+    TestRequest::send_ok(
+        handler,
+        PipePaneRequest {
             target,
             stdin: false,
             stdout: true,
             once,
             command,
-        })
-        .await;
+        },
+    )
+    .await;
 }
 
 async fn send_pane_line(handler: &RequestHandler, target: PaneTarget, text: &str) {
-    handler
-        .handle_ok(SendKeysRequest {
+    TestRequest::send_ok(
+        handler,
+        SendKeysRequest {
             target,
             keys: vec![pane_print_command(text), "Enter".to_owned()],
-        })
-        .await;
+        },
+    )
+    .await;
 }
 
 async fn wait_for_file_contains(path: &Path, expected: &str) {
@@ -123,7 +127,7 @@ async fn pipe_pane_once_closes_existing_pipe_without_reopening() {
     let target = PaneTarget::with_window(alpha.clone(), 0, 0);
     let first_output = seed.join("once-first");
     let second_output = seed.join("once-second");
-    handler.create_started_session(&alpha).await;
+    SessionSpec::create_started(&handler, &alpha).await;
     wait_for_pane_process(&handler, target.clone()).await;
 
     pipe_pane(
@@ -164,7 +168,7 @@ async fn pane_pipe_format_reports_active_pipe_state() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
     let target = PaneTarget::with_window(alpha.clone(), 0, 0);
-    handler.create_started_session(&alpha).await;
+    SessionSpec::create_started(&handler, &alpha).await;
 
     assert_eq!(
         display_pane_format(&handler, target.clone(), "#{pane_pipe}").await,
@@ -212,7 +216,7 @@ async fn killing_a_pane_discards_its_pipe_log_instead_of_publishing_it() {
     let ready = tempfile::NamedTempFile::new().expect("logger acknowledgement");
     let script = format!("while IFS= read -r line; do printf '%s\\n' \"$line\" >> killed-pipe-log; case \"$line\" in *pipe-killed*) printf ready > {};; esac; done", crate::test_shell::sh_quote(&ready.path().to_string_lossy()));
     let logger = format!("/bin/sh -c {}", crate::test_shell::sh_quote(&script));
-    handler.create_started_session(&alpha).await;
+    SessionSpec::create_started(&handler, &alpha).await;
     wait_for_pane_process(&handler, target.clone()).await;
 
     pipe_pane(&handler, target.clone(), false, Some(logger)).await;
@@ -235,12 +239,14 @@ async fn killing_a_pane_discards_its_pipe_log_instead_of_publishing_it() {
         "a running pipe's log is staged, not published, so it must not be in the seed yet"
     );
 
-    handler
-        .handle_ok(KillPaneRequest {
+    TestRequest::send_ok(
+        &handler,
+        KillPaneRequest {
             target: target.clone(),
             kill_all_except: false,
-        })
-        .await;
+        },
+    )
+    .await;
 
     let completion = tokio::time::timeout(PANE_PIPE_TEST_TIMEOUT, receipt.wait())
         .await

@@ -1,4 +1,5 @@
 use super::*;
+use crate::test_fixtures::TestRequest;
 
 #[tokio::test]
 async fn send_keys_target_client_uses_that_clients_current_pane() {
@@ -75,12 +76,14 @@ async fn send_keys_target_client_key_dispatch_uses_target_client_context() {
 
     let _control_rx = handler.attach_client(77, &alpha).await;
 
-    handler
-        .handle_ok(BindKeyRequest {
+    TestRequest::send_ok(
+        &handler,
+        BindKeyRequest {
             note: Some("target-client-context".to_owned()),
             ..Fixture::fixture(("prefix", "x", ["switch-client", "-t", beta.as_str()]))
-        })
-        .await;
+        },
+    )
+    .await;
 
     let response = handler
         .handle(Request::SendKeysExt2(Box::new(

@@ -24,47 +24,113 @@ pub(super) fn parse_spec(raw: &str) -> Result<TargetSpec, ExitFailure> {
     parse_target_spec(raw).map_err(|error| ExitFailure::new(1, error))
 }
 
-/// Signature of the `-t`-or-fallback resolvers behind [`CommandTarget`].
-type TargetResolver<T> = fn(&mut Connection, Option<&TargetSpec>, &str) -> Result<T, ExitFailure>;
-
 /// A target a command resolves from its optional `-t` spec before it builds its request.
 pub(super) trait CommandTarget: Sized {
+    /// Resolves an explicit `-t` spec as this target.
+    fn resolve_explicit(
+        connection: &mut Connection,
+        target: &TargetSpec,
+    ) -> Result<Self, ExitFailure>;
+
+    /// Resolves the target a command falls back to when no `-t` spec was given.
+    fn resolve_fallback(
+        connection: &mut Connection,
+        command_name: &str,
+    ) -> Result<Self, ExitFailure>;
+
     /// Resolves the spec, or the command's fallback target when none was given.
-    const RESOLVE: TargetResolver<Self>;
+    fn resolve(
+        connection: &mut Connection,
+        target: Option<&TargetSpec>,
+        command_name: &str,
+    ) -> Result<Self, ExitFailure> {
+        match target {
+            Some(target) => Self::resolve_explicit(connection, target),
+            None => Self::resolve_fallback(connection, command_name),
+        }
+    }
+
+    /// Resolves a command's `-t` target, sends the request `send` builds for it, and reports
+    /// the response the way every one-shot command does.
+    fn run<E>(
+        socket_path: &Path,
+        command_name: &'static str,
+        target: Option<&TargetSpec>,
+        send: impl FnOnce(&mut Connection, Self) -> Result<Response, E>,
+    ) -> Result<i32, ExitFailure>
+    where
+        ExitFailure: From<E>,
+    {
+        run_command_resolved(socket_path, command_name, |connection| {
+            let target = Self::resolve(connection, target, command_name)?;
+            send(connection, target).map_err(ExitFailure::from)
+        })
+    }
 }
 
 impl CommandTarget for SessionName {
-    const RESOLVE: TargetResolver<Self> = resolve_session_target_or_current;
+    fn resolve_explicit(
+        connection: &mut Connection,
+        target: &TargetSpec,
+    ) -> Result<Self, ExitFailure> {
+        resolve_session_target_spec(connection, target, false)
+    }
+
+    fn resolve_fallback(
+        connection: &mut Connection,
+        _command_name: &str,
+    ) -> Result<Self, ExitFailure> {
+        resolve_current_session_target(connection)
+    }
 }
 
 impl CommandTarget for WindowTarget {
-    const RESOLVE: TargetResolver<Self> = resolve_window_target_or_current;
+    fn resolve_explicit(
+        connection: &mut Connection,
+        target: &TargetSpec,
+    ) -> Result<Self, ExitFailure> {
+        resolve_window_target_spec(connection, target, false)
+    }
+
+    fn resolve_fallback(
+        connection: &mut Connection,
+        command_name: &str,
+    ) -> Result<Self, ExitFailure> {
+        resolve_current_pane_target(connection, command_name).map(|pane| pane_window(&pane))
+    }
 }
 
 impl CommandTarget for PaneTarget {
-    const RESOLVE: TargetResolver<Self> = resolve_pane_target_or_current;
+    fn resolve_explicit(
+        connection: &mut Connection,
+        target: &TargetSpec,
+    ) -> Result<Self, ExitFailure> {
+        resolve_pane_target_spec(connection, target)
+    }
+
+    fn resolve_fallback(
+        connection: &mut Connection,
+        command_name: &str,
+    ) -> Result<Self, ExitFailure> {
+        resolve_current_pane_target(connection, command_name)
+    }
 }
 
+/// An optional pane stays unset when no `-t` spec was given, but an explicit spec must resolve.
 impl CommandTarget for Option<PaneTarget> {
-    const RESOLVE: TargetResolver<Self> =
-        |connection, target, _| resolve_optional_pane_target(connection, target);
-}
+    fn resolve_explicit(
+        connection: &mut Connection,
+        target: &TargetSpec,
+    ) -> Result<Self, ExitFailure> {
+        resolve_pane_target_spec(connection, target).map(Some)
+    }
 
-/// Resolves a command's `-t` target as `T`, sends the request `send` builds for it, and reports
-/// the response the way every one-shot command does.
-pub(super) fn run_targeted<T: CommandTarget, E>(
-    socket_path: &Path,
-    command_name: &'static str,
-    target: Option<&TargetSpec>,
-    send: impl FnOnce(&mut Connection, T) -> Result<Response, E>,
-) -> Result<i32, ExitFailure>
-where
-    ExitFailure: From<E>,
-{
-    run_command_resolved(socket_path, command_name, |connection| {
-        let target = T::RESOLVE(connection, target, command_name)?;
-        send(connection, target).map_err(ExitFailure::from)
-    })
+    fn resolve_fallback(
+        _connection: &mut Connection,
+        _command_name: &str,
+    ) -> Result<Self, ExitFailure> {
+        Ok(None)
+    }
 }
 
 /// The failure for a response a command did not expect: a server error by its own message,
@@ -80,7 +146,7 @@ pub(super) fn response_failure(command_name: &str, response: &Response) -> ExitF
 pub(super) fn resolve_current_session_target(
     connection: &mut Connection,
 ) -> Result<SessionName, ExitFailure> {
-    resolve_current_as(connection, ToString::to_string)
+    SessionName::resolve_current(connection, ToString::to_string)
 }
 
 /// Lists every live session name by formatting `list-sessions` output one name per line.
@@ -116,7 +182,7 @@ pub(super) fn resolve_session_target_spec(
     target: &TargetSpec,
     prefer_unattached: bool,
 ) -> Result<SessionName, ExitFailure> {
-    resolve_spec_as(connection, target, false, prefer_unattached)
+    SessionName::resolve_spec(connection, target, false, prefer_unattached)
 }
 
 /// Resolves a `-t` spec to a window, short-circuiting an exact `@id` spec without a round trip.
@@ -130,21 +196,7 @@ pub(super) fn resolve_window_target_spec(
             return Ok(target.clone());
         }
     }
-    resolve_spec_as(connection, target, window_index, false)
-}
-
-/// Resolves an optional window spec, falling back to the window holding the current pane.
-pub(super) fn resolve_window_target_or_current(
-    connection: &mut Connection,
-    target: Option<&TargetSpec>,
-    command_name: &str,
-) -> Result<WindowTarget, ExitFailure> {
-    match target {
-        Some(target) => resolve_window_target_spec(connection, target, false),
-        None => {
-            resolve_current_pane_target(connection, command_name).map(|pane| pane_window(&pane))
-        }
-    }
+    WindowTarget::resolve_spec(connection, target, window_index, false)
 }
 
 /// Resolves an optional window spec as an index, defaulting to the current session's window.
@@ -157,7 +209,7 @@ pub(super) fn resolve_window_index_target_or_current_session(
         return resolve_window_target_spec(connection, target, true);
     }
 
-    let session_name = resolve_session_target_or_current(connection, None, command_name)?;
+    let session_name = SessionName::resolve_fallback(connection, command_name)?;
     let implicit = parse_spec(&format!("{session_name}:"))?;
     resolve_window_target_spec(connection, &implicit, true)
 }
@@ -167,17 +219,7 @@ pub(super) fn resolve_pane_target_spec(
     connection: &mut Connection,
     target: &TargetSpec,
 ) -> Result<PaneTarget, ExitFailure> {
-    resolve_spec_as(connection, target, false, false)
-}
-
-/// Resolves an optional pane spec, leaving the pane unset when none was given.
-pub(super) fn resolve_optional_pane_target(
-    connection: &mut Connection,
-    target: Option<&TargetSpec>,
-) -> Result<Option<PaneTarget>, ExitFailure> {
-    target
-        .map(|target| resolve_pane_target_spec(connection, target))
-        .transpose()
+    PaneTarget::resolve_spec(connection, target, false, false)
 }
 
 /// Resolves a `-t` spec to a pane, mapping a server error to `None` instead of failing.
@@ -194,7 +236,7 @@ pub(super) fn resolve_canfail_pane_target_spec(
         )
         .map_err(ExitFailure::from)?;
     match response {
-        Response::ResolveTarget(response) => narrow_target(response.target).map(Some),
+        Response::ResolveTarget(response) => PaneTarget::checked(response.target).map(Some),
         Response::Error(_) => Ok(None),
         other => Err(unexpected_response("resolve-target", &other)),
     }
@@ -244,22 +286,8 @@ pub(super) fn resolve_existing_window_target_or_current(
     command_name: &str,
 ) -> Result<WindowTarget, ExitFailure> {
     match target {
-        Some(target) => resolve_spec_as(connection, target, false, false),
-        None => {
-            resolve_current_pane_target(connection, command_name).map(|pane| pane_window(&pane))
-        }
-    }
-}
-
-/// Resolves an optional pane spec, falling back to the client's current pane.
-pub(super) fn resolve_pane_target_or_current(
-    connection: &mut Connection,
-    target: Option<&TargetSpec>,
-    command_name: &str,
-) -> Result<PaneTarget, ExitFailure> {
-    match target {
-        Some(target) => resolve_pane_target_spec(connection, target),
-        None => resolve_current_pane_target(connection, command_name),
+        Some(target) => WindowTarget::resolve_spec(connection, target, false, false),
+        None => WindowTarget::resolve_fallback(connection, command_name),
     }
 }
 
@@ -400,26 +428,12 @@ pub(super) fn wrong_target_kind(target: &Target, required: &str) -> ExitFailure 
     )
 }
 
-/// Resolves an optional session spec, defaulting to the current session.
-pub(super) fn resolve_session_target_or_current(
-    connection: &mut Connection,
-    target: Option<&TargetSpec>,
-    command_name: &str,
-) -> Result<SessionName, ExitFailure> {
-    if let Some(target) = target {
-        return resolve_session_target_spec(connection, target, false);
-    }
-
-    let _ = command_name;
-    resolve_current_session_target(connection)
-}
-
 /// Asks the server for the client's current pane, reporting misses as `can't find pane`.
 pub(super) fn resolve_current_pane_target(
     connection: &mut Connection,
     command_name: &str,
 ) -> Result<PaneTarget, ExitFailure> {
-    resolve_current_as(connection, |error| {
+    PaneTarget::resolve_current(connection, |error| {
         target_resolution_error_message(error, ResolveTargetType::Pane, command_name)
     })
 }
@@ -513,6 +527,45 @@ trait TargetKind: Sized {
     const NAME: &'static str;
     /// Takes this kind out of a resolved target, handing any other kind back.
     fn narrow(target: Target) -> Result<Self, Target>;
+
+    /// Narrows a resolved target to this kind, failing when the server produced another kind.
+    fn checked(target: Target) -> Result<Self, ExitFailure> {
+        Self::narrow(target).map_err(|other| wrong_target_kind(&other, Self::NAME))
+    }
+
+    /// Resolves a `-t` spec through [`resolve_target_spec`] as this kind.
+    fn resolve_spec(
+        connection: &mut Connection,
+        target: &TargetSpec,
+        window_index: bool,
+        prefer_unattached: bool,
+    ) -> Result<Self, ExitFailure> {
+        Self::checked(resolve_target_spec(
+            connection,
+            target,
+            Self::TYPE,
+            window_index,
+            prefer_unattached,
+        )?)
+    }
+
+    /// Asks the server for the client's current target of this kind, wording a server error with
+    /// `error_message`.
+    fn resolve_current(
+        connection: &mut Connection,
+        error_message: impl FnOnce(&RmuxError) -> String,
+    ) -> Result<Self, ExitFailure> {
+        match connection
+            .resolve_target(None, Self::TYPE, false, false)
+            .map_err(ExitFailure::from)?
+        {
+            Response::ResolveTarget(response) => Self::checked(response.target),
+            Response::Error(ErrorResponse { error }) => {
+                Err(ExitFailure::new(1, error_message(&error)))
+            }
+            other => Err(unexpected_response("resolve-target", &other)),
+        }
+    }
 }
 
 impl TargetKind for SessionName {
@@ -545,43 +598,6 @@ impl TargetKind for PaneTarget {
             Target::Pane(pane) => Ok(pane),
             other => Err(other),
         }
-    }
-}
-
-/// Narrows a resolved target to kind `T`, failing when the server produced another kind.
-fn narrow_target<T: TargetKind>(target: Target) -> Result<T, ExitFailure> {
-    T::narrow(target).map_err(|other| wrong_target_kind(&other, T::NAME))
-}
-
-/// Resolves a `-t` spec through [`resolve_target_spec`] as target kind `T`.
-fn resolve_spec_as<T: TargetKind>(
-    connection: &mut Connection,
-    target: &TargetSpec,
-    window_index: bool,
-    prefer_unattached: bool,
-) -> Result<T, ExitFailure> {
-    narrow_target(resolve_target_spec(
-        connection,
-        target,
-        T::TYPE,
-        window_index,
-        prefer_unattached,
-    )?)
-}
-
-/// Asks the server for the client's current target of kind `T`, wording a server error with
-/// `error_message`.
-fn resolve_current_as<T: TargetKind>(
-    connection: &mut Connection,
-    error_message: impl FnOnce(&RmuxError) -> String,
-) -> Result<T, ExitFailure> {
-    match connection
-        .resolve_target(None, T::TYPE, false, false)
-        .map_err(ExitFailure::from)?
-    {
-        Response::ResolveTarget(response) => narrow_target(response.target),
-        Response::Error(ErrorResponse { error }) => Err(ExitFailure::new(1, error_message(&error))),
-        other => Err(unexpected_response("resolve-target", &other)),
     }
 }
 

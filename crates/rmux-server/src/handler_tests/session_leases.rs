@@ -1,5 +1,5 @@
 use super::*;
-use crate::test_fixtures::{Fixture, Sizeless};
+use crate::test_fixtures::{Fixture, SessionSpec, Sizeless, TestRequest};
 
 static LEASE_REAPER_PAUSE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
@@ -8,7 +8,7 @@ async fn session_lease_rejects_too_short_ttl() {
     let handler = RequestHandler::new();
     let alpha = session_name("lease-short");
 
-    handler.create_session(Sizeless(&alpha)).await;
+    SessionSpec::create(&handler, Sizeless(&alpha)).await;
 
     let created_lease = handler
         .handle(Request::CreateSessionLease(
@@ -33,7 +33,7 @@ async fn session_lease_reaper_kills_unrenewed_session() {
     let handler = RequestHandler::new();
     let alpha = session_name("leased");
 
-    handler.create_session(Sizeless(&alpha)).await;
+    SessionSpec::create(&handler, Sizeless(&alpha)).await;
 
     let created_lease = handler
         .handle(Request::CreateSessionLease(
@@ -63,7 +63,7 @@ async fn session_lease_renew_and_release_preserves_session() {
     let handler = RequestHandler::new();
     let alpha = session_name("renewed");
 
-    handler.create_session(Sizeless(&alpha)).await;
+    SessionSpec::create(&handler, Sizeless(&alpha)).await;
 
     let created_lease = handler
         .handle(Request::CreateSessionLease(
@@ -123,7 +123,7 @@ async fn renamed_session_lease_retains_its_initial_wire_address() {
     let old_name = session_name("lease-before-rename");
     let new_name = session_name("lease-after-rename");
 
-    handler.create_session(Sizeless(&old_name)).await;
+    SessionSpec::create(&handler, Sizeless(&old_name)).await;
 
     let created_lease = handler
         .handle(Request::CreateSessionLease(
@@ -198,7 +198,7 @@ async fn renamed_session_lease_expiration_kills_the_renamed_session() {
     let old_name = session_name("lease-expire-before-rename");
     let new_name = session_name("lease-expire-after-rename");
 
-    handler.create_session(Sizeless(&old_name)).await;
+    SessionSpec::create(&handler, Sizeless(&old_name)).await;
 
     let created_lease = handler
         .handle(Request::CreateSessionLease(
@@ -210,12 +210,14 @@ async fn renamed_session_lease_expiration_kills_the_renamed_session() {
         .await;
     assert!(matches!(created_lease, Response::CreateSessionLease(_)));
 
-    handler
-        .handle_ok(RenameSessionRequest {
+    TestRequest::send_ok(
+        &handler,
+        RenameSessionRequest {
             target: old_name,
             new_name: new_name.clone(),
-        })
-        .await;
+        },
+    )
+    .await;
 
     tokio::time::sleep(Duration::from_millis(800)).await;
     wait_for_session_state(&handler, new_name, false).await;
@@ -228,7 +230,7 @@ async fn expired_session_lease_reaper_follows_rename_after_expiration_extraction
     let old_name = session_name("lease-reap-race-before-rename");
     let new_name = session_name("lease-reap-race-after-rename");
 
-    handler.create_session(Sizeless(&old_name)).await;
+    SessionSpec::create(&handler, Sizeless(&old_name)).await;
     let session_id = handler.session_id_for_test(&old_name).await;
     let pause = handler.install_expired_session_lease_reap_pause(old_name.clone(), session_id);
 
@@ -248,12 +250,14 @@ async fn expired_session_lease_reaper_follows_rename_after_expiration_extraction
     tokio::time::timeout(Duration::from_secs(2), pause.reached.notified())
         .await
         .expect("lease reaper extracts the expired stable session identity");
-    handler
-        .handle_ok(RenameSessionRequest {
+    TestRequest::send_ok(
+        &handler,
+        RenameSessionRequest {
             target: old_name,
             new_name: new_name.clone(),
-        })
-        .await;
+        },
+    )
+    .await;
     pause.release.notify_one();
 
     wait_for_session_state(&handler, new_name, false).await;
@@ -265,7 +269,7 @@ async fn expired_session_lease_reaper_preserves_recreated_and_renewed_ownership(
     let handler = RequestHandler::new();
     let session_name = session_name("lease-reap-recreated-ownership");
 
-    handler.create_session(Sizeless(&session_name)).await;
+    SessionSpec::create(&handler, Sizeless(&session_name)).await;
     let session_id = handler.session_id_for_test(&session_name).await;
     let pause = handler.install_expired_session_lease_reap_pause(session_name.clone(), session_id);
 
@@ -345,7 +349,7 @@ async fn session_destroyed_by_last_pane_kill_clears_stale_lease() {
     let handler = RequestHandler::new();
     let alpha = session_name("lease-pane-kill");
 
-    handler.create_session(Sizeless(&alpha)).await;
+    SessionSpec::create(&handler, Sizeless(&alpha)).await;
 
     let created_lease = handler
         .handle(Request::CreateSessionLease(
@@ -371,7 +375,7 @@ async fn session_destroyed_by_last_pane_kill_clears_stale_lease() {
         })
     );
 
-    handler.create_session(Sizeless(&alpha)).await;
+    SessionSpec::create(&handler, Sizeless(&alpha)).await;
 
     tokio::time::sleep(Duration::from_millis(800)).await;
 
@@ -391,7 +395,7 @@ async fn session_destroyed_by_last_pane_exit_clears_stale_lease() {
     let handler = RequestHandler::new();
     let alpha = session_name("lease-pane-exit");
 
-    handler.create_session(Sizeless(&alpha)).await;
+    SessionSpec::create(&handler, Sizeless(&alpha)).await;
 
     let created_lease = handler
         .handle(Request::CreateSessionLease(
@@ -403,15 +407,17 @@ async fn session_destroyed_by_last_pane_exit_clears_stale_lease() {
         .await;
     assert!(matches!(created_lease, Response::CreateSessionLease(_)));
 
-    handler
-        .handle_ok(rmux_proto::RespawnPaneRequest {
+    TestRequest::send_ok(
+        &handler,
+        rmux_proto::RespawnPaneRequest {
             process_command: Some(rmux_proto::ProcessCommand::Shell("exit 0".to_owned())),
             ..Fixture::fixture(PaneTarget::new(alpha.clone(), 0))
-        })
-        .await;
+        },
+    )
+    .await;
     wait_for_session_state(&handler, alpha.clone(), false).await;
 
-    handler.create_session(Sizeless(&alpha)).await;
+    SessionSpec::create(&handler, Sizeless(&alpha)).await;
 
     tokio::time::sleep(Duration::from_millis(800)).await;
     wait_for_session_state(&handler, alpha, true).await;
@@ -422,8 +428,8 @@ async fn literal_dollar_name_lease_reaper_never_kills_the_colliding_session_id()
     let handler = RequestHandler::new();
     let victim_name = session_name("lease-literal-victim");
     let literal_name = session_name("$0");
-    handler.create_session(Sizeless(&victim_name)).await;
-    handler.create_session(Sizeless(&literal_name)).await;
+    SessionSpec::create(&handler, Sizeless(&victim_name)).await;
+    SessionSpec::create(&handler, Sizeless(&literal_name)).await;
     {
         let state = handler.state.lock().await;
         assert_eq!(
@@ -465,7 +471,7 @@ async fn renamed_lease_and_new_homonym_are_correlated_by_wire_name_and_token() {
     let handler = RequestHandler::new();
     let wire_name = session_name("lease-wire-reused");
     let renamed = session_name("lease-wire-renamed");
-    handler.create_session(Sizeless(&wire_name)).await;
+    SessionSpec::create(&handler, Sizeless(&wire_name)).await;
     let Response::CreateSessionLease(original_lease) = handler
         .handle(Request::CreateSessionLease(
             rmux_proto::CreateSessionLeaseRequest {
@@ -477,13 +483,15 @@ async fn renamed_lease_and_new_homonym_are_correlated_by_wire_name_and_token() {
     else {
         panic!("original lease create failed");
     };
-    handler
-        .handle_ok(RenameSessionRequest {
+    TestRequest::send_ok(
+        &handler,
+        RenameSessionRequest {
             target: wire_name.clone(),
             new_name: renamed.clone(),
-        })
-        .await;
-    handler.create_session(Sizeless(&wire_name)).await;
+        },
+    )
+    .await;
+    SessionSpec::create(&handler, Sizeless(&wire_name)).await;
     let Response::CreateSessionLease(homonym_lease) = handler
         .handle(Request::CreateSessionLease(
             rmux_proto::CreateSessionLeaseRequest {

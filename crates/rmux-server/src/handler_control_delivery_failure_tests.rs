@@ -13,7 +13,7 @@ use tokio::sync::mpsc;
 use super::{ControlClientIdentity, RequestHandler};
 use crate::control::{ControlModeUpgrade, ControlServerEvent};
 use crate::outer_terminal::OuterTerminalContext;
-use crate::test_fixtures::Fixture;
+use crate::test_fixtures::{Fixture, SessionSpec, TestRequest};
 use crate::test_names::session_name;
 
 struct AttachedControl {
@@ -68,9 +68,9 @@ async fn refresh_delivery_failures_keep_exact_control_identities_until_finish() 
     let by_name = session_name("refresh-failure-by-name");
     let by_session_id = session_name("refresh-failure-by-session-id");
     let by_client_id = session_name("refresh-failure-by-client-id");
-    handler.create_session(&by_name).await;
-    handler.create_session(&by_session_id).await;
-    handler.create_session(&by_client_id).await;
+    SessionSpec::create(&handler, &by_name).await;
+    SessionSpec::create(&handler, &by_session_id).await;
+    SessionSpec::create(&handler, &by_client_id).await;
 
     let mut controls = vec![
         register_attached_control(&handler, 43_001, by_name.clone()).await,
@@ -112,17 +112,19 @@ async fn failed_rename_delivery_tracks_the_committed_stable_session_until_finish
     let handler = RequestHandler::new();
     let original = session_name("rename-failure-original");
     let renamed = session_name("rename-failure-renamed");
-    handler.create_session(&original).await;
+    SessionSpec::create(&handler, &original).await;
     let session_id = handler.session_id_for_test(&original).await;
     let mut control = register_attached_control(&handler, 43_010, original.clone()).await;
     control.events.close();
 
-    handler
-        .handle_ok(RenameSessionRequest {
+    TestRequest::send_ok(
+        &handler,
+        RenameSessionRequest {
             target: original,
             new_name: renamed.clone(),
-        })
-        .await;
+        },
+    )
+    .await;
     assert!(control.closing.load(Ordering::SeqCst));
     {
         let active_control = handler.active_control.lock().await;
@@ -157,7 +159,7 @@ async fn failed_rename_delivery_tracks_the_committed_stable_session_until_finish
 async fn queue_attach_without_exact_identity_commits_event_identity_and_touch() {
     let handler = RequestHandler::new();
     let target = session_name("queue-attach-success-target");
-    handler.create_session(&target).await;
+    SessionSpec::create(&handler, &target).await;
     let target_id = handler.session_id_for_test(&target).await;
     let requester_pid = 43_019;
     let (event_tx, mut events) = mpsc::channel(1);
@@ -214,8 +216,8 @@ async fn failed_queue_attach_and_destroy_switch_restore_their_source_identities(
     let handler = RequestHandler::new();
     let source = session_name("delivery-failure-destroy-source");
     let target = session_name("delivery-failure-target");
-    handler.create_session(&source).await;
-    handler.create_session(&target).await;
+    SessionSpec::create(&handler, &source).await;
+    SessionSpec::create(&handler, &target).await;
     let source_id = handler.session_id_for_test(&source).await;
     let target_id = handler.session_id_for_test(&target).await;
 
@@ -307,17 +309,15 @@ async fn failed_queue_attach_and_destroy_switch_restore_their_source_identities(
 async fn stale_closing_control_does_not_keep_recreated_destroy_unattached_session_alive() {
     let handler = RequestHandler::new();
     let session = session_name("delivery-failure-recreated-destroy-unattached");
-    handler.create_session(&session).await;
+    SessionSpec::create(&handler, &session).await;
     let old_session_id = handler.session_id_for_test(&session).await;
     let mut stale = register_attached_control(&handler, 43_030, session.clone()).await;
     stale.events.close();
 
-    handler
-        .handle_ok(KillSessionRequest::fixture(&session))
-        .await;
+    TestRequest::send_ok(&handler, KillSessionRequest::fixture(&session)).await;
     assert!(stale.closing.load(Ordering::SeqCst));
 
-    handler.create_session(&session).await;
+    SessionSpec::create(&handler, &session).await;
     let replacement_session_id = handler.session_id_for_test(&session).await;
     assert_ne!(replacement_session_id, old_session_id);
     handler

@@ -12,6 +12,7 @@ use super::set_titles_support::{
     attach_sized_client, delivered_titles, remembered_title, set_global,
 };
 use super::*;
+use crate::test_fixtures::SessionSpec;
 
 /// The same variables, resolved through the independent `list-clients` format
 /// path, keyed by client pid. This is the oracle the title must agree with.
@@ -46,7 +47,7 @@ async fn list_clients_bindings(handler: &RequestHandler) -> Vec<(String, String)
 async fn two_clients_expand_their_own_size_and_name_into_the_title() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
 
     let wide_pid = 41_821;
     let narrow_pid = 41_822;
@@ -133,7 +134,7 @@ async fn two_clients_expand_their_own_size_and_name_into_the_title() {
 async fn the_title_resolves_the_client_key_table_and_terminal() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
 
     let attach_pid = 41_823;
     let mut control_rx = attach_sized_client(

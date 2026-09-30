@@ -1,5 +1,5 @@
 use super::*;
-use crate::test_fixtures::{Fixture, Sizeless};
+use crate::test_fixtures::{Fixture, SessionSpec, Sizeless, TestRequest};
 
 #[tokio::test]
 async fn new_session_uses_the_default_size_when_request_omits_geometry() {
@@ -69,7 +69,7 @@ async fn new_session_honors_global_base_index_and_default_size() {
             .await;
     }
 
-    handler.create_session(Sizeless("alpha")).await;
+    SessionSpec::create(&handler, Sizeless("alpha")).await;
 
     let state = handler.state.lock().await;
     let session = state
@@ -104,7 +104,7 @@ async fn new_session_uses_default_command_when_request_omits_command() {
         )
         .await;
 
-    handler.create_session("alpha").await;
+    SessionSpec::create(&handler, "alpha").await;
 
     let state = handler.state.lock().await;
     let session = state
@@ -182,7 +182,7 @@ async fn failed_new_session_spawn_does_not_leak_environment_into_reused_name() {
         assert_eq!(state.environment.session_value(&alpha, sentinel), None);
     }
 
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
 
     let state = handler.state.lock().await;
     assert_eq!(state.environment.session_value(&alpha, sentinel), None);
@@ -192,15 +192,17 @@ async fn failed_new_session_spawn_does_not_leak_environment_into_reused_name() {
 async fn attach_if_exists_reports_attach_semantics_without_new_session_hook() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    handler.create_session(Sizeless(&alpha)).await;
+    SessionSpec::create(&handler, Sizeless(&alpha)).await;
 
-    handler
-        .handle_ok(SetHookRequest::fixture((
+    TestRequest::send_ok(
+        &handler,
+        SetHookRequest::fixture((
             ScopeSelector::Global,
             HookName::AfterNewSession,
             "set-environment -g ATTACH_EXISTING_HOOK ran",
-        )))
-        .await;
+        )),
+    )
+    .await;
 
     let reused = handler
         .handle(Request::NewSessionExt(Box::new(NewSessionExtRequest {
@@ -226,7 +228,7 @@ async fn attach_if_exists_reports_attach_semantics_without_new_session_hook() {
     );
     drop(state);
 
-    handler.create_session(Sizeless("fresh-after-hook")).await;
+    SessionSpec::create(&handler, Sizeless("fresh-after-hook")).await;
     let state = handler.state.lock().await;
     assert_eq!(
         state.environment.global_value("ATTACH_EXISTING_HOOK"),
@@ -240,7 +242,7 @@ async fn grouped_new_session_without_explicit_name_uses_tmux_suffix_shape() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
 
-    handler.create_session(Sizeless(&alpha)).await;
+    SessionSpec::create(&handler, Sizeless(&alpha)).await;
 
     let grouped = handler
         .handle(Request::NewSessionExt(Box::new(NewSessionExtRequest {
@@ -301,12 +303,14 @@ async fn new_session_print_resolves_captured_identity_after_concurrent_rename() 
     tokio::time::timeout(Duration::from_secs(2), pause.reached.notified())
         .await
         .expect("new-session reaches the pre-print pause");
-    handler
-        .handle_ok(RenameSessionRequest {
+    TestRequest::send_ok(
+        &handler,
+        RenameSessionRequest {
             target: session_name("print-before-rename"),
             new_name: new_name.clone(),
-        })
-        .await;
+        },
+    )
+    .await;
     pause.release.notify_one();
 
     assert_eq!(
@@ -325,7 +329,7 @@ async fn new_session_print_resolves_captured_identity_after_concurrent_rename() 
 async fn auto_named_session_uses_next_global_session_id_after_named_sessions() {
     let handler = RequestHandler::new();
     for name in ["0", "1", "bob"] {
-        handler.create_session(Sizeless(name)).await;
+        SessionSpec::create(&handler, Sizeless(name)).await;
     }
 
     let unnamed = handler
@@ -353,7 +357,7 @@ async fn grouped_new_session_rejects_shell_command_like_tmux() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
 
-    handler.create_session(Sizeless(&alpha)).await;
+    SessionSpec::create(&handler, Sizeless(&alpha)).await;
 
     let grouped = handler
         .handle(Request::NewSessionExt(Box::new(NewSessionExtRequest {
@@ -374,7 +378,7 @@ async fn grouped_new_session_rejects_shell_command_like_tmux() {
 async fn grouped_new_session_uses_next_global_session_id_suffix_when_group_is_new() {
     let handler = RequestHandler::new();
     for name in ["0", "1", "bob"] {
-        handler.create_session(Sizeless(name)).await;
+        SessionSpec::create(&handler, Sizeless(name)).await;
     }
 
     let grouped = handler

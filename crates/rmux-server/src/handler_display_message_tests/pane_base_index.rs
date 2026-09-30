@@ -1,4 +1,5 @@
 use super::*;
+use crate::test_fixtures::{SessionSpec, TestRequest};
 use rmux_core::formats::{DEFAULT_LIST_PANES_ALL_FORMAT, DEFAULT_LIST_PANES_SESSION_FORMAT};
 use rmux_proto::{CommandOutput, ListPanesRequest};
 
@@ -22,10 +23,8 @@ fn default_list_pane_labels(output: &CommandOutput) -> Vec<&str> {
 async fn pane_index_formats_use_window_local_pane_base_index() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    handler
-        .create_session((&alpha, TerminalSize { cols: 20, rows: 6 }))
-        .await;
-    handler.handle_ok(SplitWindowRequest::fixture(&alpha)).await;
+    SessionSpec::create(&handler, (&alpha, TerminalSize { cols: 20, rows: 6 })).await;
+    TestRequest::send_ok(&handler, SplitWindowRequest::fixture(&alpha)).await;
     handler
         .set_option(
             ScopeSelector::Window(WindowTarget::with_window(alpha.clone(), 0)),
@@ -34,16 +33,18 @@ async fn pane_index_formats_use_window_local_pane_base_index() {
         )
         .await;
 
-    let list = handler
-        .handle_ok(ListPanesRequest {
+    let list = TestRequest::send_ok(
+        &handler,
+        ListPanesRequest {
             target: alpha.clone(),
             target_window_index: Some(0),
             format: Some("#{pane_index}:#{pane-base-index}".to_owned()),
             filter: None,
             sort_order: None,
             reversed: false,
-        })
-        .await;
+        },
+    )
+    .await;
     assert_eq!(stdout_string(&list.output), "10:10\n11:10\n");
 
     for (format, expected) in [
@@ -57,16 +58,18 @@ async fn pane_index_formats_use_window_local_pane_base_index() {
             vec!["alpha:0.10", "alpha:0.11"],
         ),
     ] {
-        let list = handler
-            .handle_ok(ListPanesRequest {
+        let list = TestRequest::send_ok(
+            &handler,
+            ListPanesRequest {
                 target: alpha.clone(),
                 target_window_index: Some(0),
                 format,
                 filter: None,
                 sort_order: None,
                 reversed: false,
-            })
-            .await;
+            },
+        )
+        .await;
         assert_eq!(default_list_pane_labels(&list.output), expected);
     }
 
@@ -83,33 +86,35 @@ async fn default_list_panes_uses_global_pane_base_index_without_window_override(
     handler
         .set_option(ScopeSelector::Global, OptionName::PaneBaseIndex, "7")
         .await;
-    handler
-        .create_session((&beta, TerminalSize { cols: 20, rows: 6 }))
-        .await;
-    handler.handle_ok(SplitWindowRequest::fixture(&beta)).await;
+    SessionSpec::create(&handler, (&beta, TerminalSize { cols: 20, rows: 6 })).await;
+    TestRequest::send_ok(&handler, SplitWindowRequest::fixture(&beta)).await;
 
-    let list = handler
-        .handle_ok(ListPanesRequest {
+    let list = TestRequest::send_ok(
+        &handler,
+        ListPanesRequest {
             target: beta.clone(),
             target_window_index: Some(0),
             format: None,
             filter: None,
             sort_order: None,
             reversed: false,
-        })
-        .await;
+        },
+    )
+    .await;
     assert_eq!(default_list_pane_labels(&list.output), ["7", "8"]);
 
-    let list = handler
-        .handle_ok(ListPanesRequest {
+    let list = TestRequest::send_ok(
+        &handler,
+        ListPanesRequest {
             target: beta,
             target_window_index: Some(0),
             format: Some("#{pane_index}:#{pane-base-index}".to_owned()),
             filter: None,
             sort_order: None,
             reversed: false,
-        })
-        .await;
+        },
+    )
+    .await;
     assert_eq!(stdout_string(&list.output), "7:7\n8:7\n");
 }
 
@@ -117,10 +122,8 @@ async fn default_list_panes_uses_global_pane_base_index_without_window_override(
 async fn target_resolution_uses_visible_pane_base_index() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    handler
-        .create_session((&alpha, TerminalSize { cols: 20, rows: 6 }))
-        .await;
-    handler.handle_ok(SplitWindowRequest::fixture(&alpha)).await;
+    SessionSpec::create(&handler, (&alpha, TerminalSize { cols: 20, rows: 6 })).await;
+    TestRequest::send_ok(&handler, SplitWindowRequest::fixture(&alpha)).await;
     handler
         .set_option(
             ScopeSelector::Window(WindowTarget::with_window(alpha.clone(), 0)),

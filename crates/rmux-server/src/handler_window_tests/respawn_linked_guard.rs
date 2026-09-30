@@ -1,4 +1,5 @@
 use super::*;
+use crate::test_fixtures::TestRequest;
 use rmux_proto::CapturePaneRequest;
 
 async fn create_linked_respawn_family(
@@ -9,15 +10,17 @@ async fn create_linked_respawn_family(
     let alias2 = create_session(handler, "respawn-linked-guard-alias2").await;
 
     for alias in [&alias1, &alias2] {
-        handler
-            .handle_ok(LinkWindowRequest {
+        TestRequest::send_ok(
+            handler,
+            LinkWindowRequest {
                 kill_destination: true,
                 ..Fixture::fixture((
                     WindowTarget::with_window(owner.clone(), 0),
                     WindowTarget::with_window(alias.clone(), 0),
                 ))
-            })
-            .await;
+            },
+        )
+        .await;
     }
 
     (owner, alias1, alias2)
@@ -36,8 +39,7 @@ fn linked_targets(
 }
 
 async fn capture_pane_print(handler: &RequestHandler, target: &PaneTarget) -> String {
-    let output = handler
-        .handle_ok(CapturePaneRequest::fixture(target))
+    let output = TestRequest::send_ok(handler, CapturePaneRequest::fixture(target))
         .await
         .output
         .expect("capture-pane -p should return command output");

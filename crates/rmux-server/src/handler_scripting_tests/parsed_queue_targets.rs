@@ -1,21 +1,24 @@
 use super::*;
+use crate::test_fixtures::{SessionSpec, TestRequest};
 
 #[tokio::test]
 async fn parsed_queue_uses_current_target_for_rename_window_session_and_last_window() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
     handler
         .create_window(NewWindowRequest {
             name: Some("w1".to_owned()),
             ..Fixture::fixture(&alpha)
         })
         .await;
-    handler
-        .handle_ok(rmux_proto::SelectWindowRequest {
+    TestRequest::send_ok(
+        &handler,
+        rmux_proto::SelectWindowRequest {
             target: WindowTarget::with_window(alpha.clone(), 1),
-        })
-        .await;
+        },
+    )
+    .await;
 
     for command in [
         "rename-window renamed",
@@ -52,7 +55,7 @@ async fn parsed_queue_uses_current_target_for_rename_window_session_and_last_win
 async fn parsed_queue_select_window_navigation_flags_use_window_session() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha-select-flags");
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
     handler
         .create_window(NewWindowRequest {
             name: Some("w1".to_owned()),
@@ -137,7 +140,7 @@ async fn parsed_queue_select_window_navigation_flags_use_window_session() {
 async fn parsed_queue_select_window_repeated_navigation_flags_follow_tmux_priority() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha-select-priority");
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
     handler
         .create_window(NewWindowRequest {
             name: Some("w1".to_owned()),
@@ -186,7 +189,7 @@ async fn parsed_queue_select_window_repeated_navigation_flags_follow_tmux_priori
 async fn parsed_queue_list_panes_resolves_bare_window_name_in_current_session() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
     handler
         .create_window(NewWindowRequest {
             name: Some("editor".to_owned()),
@@ -194,13 +197,11 @@ async fn parsed_queue_list_panes_resolves_bare_window_name_in_current_session() 
             ..Fixture::fixture(&alpha)
         })
         .await;
-    handler
-        .handle_ok(SplitWindowRequest::fixture(PaneTarget::with_window(
-            alpha.clone(),
-            1,
-            0,
-        )))
-        .await;
+    TestRequest::send_ok(
+        &handler,
+        SplitWindowRequest::fixture(PaneTarget::with_window(alpha.clone(), 1, 0)),
+    )
+    .await;
 
     let command = CommandParser::new()
         .parse("list-panes -t editor -F '#{pane_index}'")
@@ -222,16 +223,12 @@ async fn parsed_queue_join_move_swap_without_source_fall_back_to_current_pane() 
     ] {
         let handler = RequestHandler::new();
         let alpha = session_name("alpha-transfer-default");
-        handler
-            .create_session((&alpha, TerminalSize::new(100, 24)))
-            .await;
-        handler
-            .handle_ok(SplitWindowRequest::fixture(PaneTarget::with_window(
-                alpha.clone(),
-                0,
-                0,
-            )))
-            .await;
+        SessionSpec::create(&handler, (&alpha, TerminalSize::new(100, 24))).await;
+        TestRequest::send_ok(
+            &handler,
+            SplitWindowRequest::fixture(PaneTarget::with_window(alpha.clone(), 0, 0)),
+        )
+        .await;
 
         let parsed = CommandParser::new().parse(command).expect("command parses");
         let output = handler
@@ -253,7 +250,7 @@ async fn parsed_queue_join_move_swap_without_source_fall_back_to_current_pane() 
 async fn parsed_queue_uses_current_target_for_more_default_targeted_commands() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
 
     let current_pane = PaneTarget::with_window(alpha.clone(), 0, 0);
     let current_window = WindowTarget::with_window(alpha.clone(), 0);
@@ -354,13 +351,15 @@ async fn parsed_queue_uses_current_target_for_more_default_targeted_commands() {
 async fn parsed_queue_resolves_attached_short_target_values_for_select_pane() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    handler.create_session(&alpha).await;
-    handler
-        .handle_ok(SplitWindowRequest {
+    SessionSpec::create(&handler, &alpha).await;
+    TestRequest::send_ok(
+        &handler,
+        SplitWindowRequest {
             direction: SplitDirection::Horizontal,
             ..Fixture::fixture(PaneTarget::with_window(alpha.clone(), 0, 0))
-        })
-        .await;
+        },
+    )
+    .await;
 
     let parsed = CommandParser::new()
         .parse("select-pane -t:.+")
@@ -392,13 +391,15 @@ async fn parsed_queue_resolves_attached_short_target_values_for_select_pane() {
 async fn parsed_queue_resolves_select_pane_mark_against_the_current_pane() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    handler.create_session(&alpha).await;
-    handler
-        .handle_ok(SplitWindowRequest {
+    SessionSpec::create(&handler, &alpha).await;
+    TestRequest::send_ok(
+        &handler,
+        SplitWindowRequest {
             direction: SplitDirection::Horizontal,
             ..Fixture::fixture(PaneTarget::with_window(alpha.clone(), 0, 0))
-        })
-        .await;
+        },
+    )
+    .await;
 
     let parsed = CommandParser::new()
         .parse("select-pane -m")
@@ -428,13 +429,15 @@ async fn parsed_queue_resolves_select_pane_mark_against_the_current_pane() {
 async fn parsed_queue_uses_marked_pane_as_default_swap_source() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    handler.create_session(&alpha).await;
-    handler
-        .handle_ok(SplitWindowRequest {
+    SessionSpec::create(&handler, &alpha).await;
+    TestRequest::send_ok(
+        &handler,
+        SplitWindowRequest {
             direction: SplitDirection::Horizontal,
             ..Fixture::fixture(PaneTarget::with_window(alpha.clone(), 0, 0))
-        })
-        .await;
+        },
+    )
+    .await;
 
     let (pane_zero_id, pane_one_id) = {
         let state = handler.state.lock().await;
@@ -485,7 +488,7 @@ async fn parsed_queue_uses_marked_pane_as_default_swap_source() {
 async fn parsed_queue_uses_marked_pane_window_as_default_swap_window_source() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
     handler
         .create_window(NewWindowRequest {
             name: Some("marked-window".to_owned()),
@@ -522,13 +525,15 @@ async fn parsed_queue_uses_marked_pane_window_as_default_swap_window_source() {
 async fn parsed_queue_resolves_explicit_marked_pane_targets() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    handler.create_session(&alpha).await;
-    handler
-        .handle_ok(SplitWindowRequest {
+    SessionSpec::create(&handler, &alpha).await;
+    TestRequest::send_ok(
+        &handler,
+        SplitWindowRequest {
             direction: SplitDirection::Horizontal,
             ..Fixture::fixture(PaneTarget::with_window(alpha.clone(), 0, 0))
-        })
-        .await;
+        },
+    )
+    .await;
 
     let mark = CommandParser::new()
         .parse("select-pane -m")
@@ -561,18 +566,20 @@ async fn marked_pane_prefers_original_linked_window_slot() {
     let alpha = session_name("alpha");
     let beta = session_name("beta");
     for session_name in [&alpha, &beta] {
-        handler.create_session(session_name).await;
+        SessionSpec::create(&handler, session_name).await;
     }
 
-    handler
-        .handle_ok(LinkWindowRequest {
+    TestRequest::send_ok(
+        &handler,
+        LinkWindowRequest {
             detached: false,
             ..Fixture::fixture((
                 WindowTarget::with_window(alpha.clone(), 0),
                 WindowTarget::with_window(beta.clone(), 1),
             ))
-        })
-        .await;
+        },
+    )
+    .await;
 
     let mark = CommandParser::new()
         .parse("select-pane -t alpha:0.0 -m")
@@ -597,7 +604,7 @@ async fn marked_pane_prefers_original_linked_window_slot() {
 async fn parsed_queue_display_message_canfail_target_uses_empty_context_without_current_target() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    handler.create_session(alpha).await;
+    SessionSpec::create(&handler, alpha).await;
 
     let command = CommandParser::new()
         .parse("display-message -p -t nosuch '#{session_name}:#{window_index}.#{pane_index}'")
@@ -614,7 +621,7 @@ async fn parsed_queue_display_message_canfail_target_uses_empty_context_without_
 async fn parsed_queue_display_message_canfail_target_falls_back_to_queue_current_target() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
 
     let command = CommandParser::new()
         .parse("display-message -p -t '{up-of}' '#{session_name}:#{window_index}.#{pane_index}'")

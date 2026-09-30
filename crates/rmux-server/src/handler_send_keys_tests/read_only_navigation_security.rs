@@ -1,12 +1,15 @@
 use super::*;
+use crate::test_fixtures::TestRequest;
 
 async fn bind_key(handler: &RequestHandler, key: &str, command: &[&str]) {
-    handler
-        .handle_ok(BindKeyRequest {
+    TestRequest::send_ok(
+        handler,
+        BindKeyRequest {
             note: Some("read-only security boundary test".to_owned()),
             ..Fixture::fixture(("root", key, command.iter().copied()))
-        })
-        .await;
+        },
+    )
+    .await;
 }
 
 fn assert_no_terminal_control(control_rx: &mut mpsc::UnboundedReceiver<AttachControl>) {

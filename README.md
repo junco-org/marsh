@@ -42,21 +42,27 @@ cargo build --release -p marsh --bins
 cargo install --path . --bins
 ```
 
-`marsh-trace` is the package-owned companion to `rmux` and embedded library applications. It
-imports unmodified crates.io `lurk-cli = "=0.3.14"`; lurk is neither vendored nor patched. No
-installed `strace` or `lurk` executable is used. Bundle `marsh-trace` beside the application's
-executable. Cargo test/example executables also locate the sibling in their parent output
-directory. There is no PATH search or caller-selected tracing backend.
+Observation is in-process. Marsh imports unmodified crates.io `lurk-cli = "=0.3.14"`; lurk is
+neither vendored nor patched, and no companion, installed `strace` or `lurk` executable is used.
 
 Marsh's observation wrapper reuses lurk's public syscall types, argument tables and filters.
-It supplies the stopped-task callbacks, all-thread attachment and filesystem identities absent
-from the released tracer API. Its records contain an upstream `SyscallInfo` plus raw path bytes,
-descriptor identities and entry order; no renderer output is reparsed. The host grants its exact
-helper child `PR_SET_PTRACER` permission. The service's monitor thread creates and reaps the helper,
-so Linux's thread-bound parent-death signal cannot tie it to a short-lived caller runtime.
-Records use a bounded Unix socket queue; pinned process identities travel as pidfds. Kernel/LSM
-refusal, incompatible helpers, queue overflow and lost observation fail closed. No trace spool,
-sysctl changes or fallback tracer is involved.
+It supplies the stopped-task callbacks and filesystem identities absent from the released tracer
+API. Its records contain an upstream `SyscallInfo` plus raw path bytes, descriptor identities and
+entry order; no renderer output is reparsed. Linux lets a process trace its descendants but never
+its own threads, so each command a managed run spawns parks in a handshake between its launch
+setup and `exec`, where a dedicated tracer thread of the host seizes it; that thread then follows
+and reaps the command's whole process tree. The interpreter's own filesystem accesses
+(redirections, tests, globs, PATH lookups, sourced scripts) are reported by brush-core as host
+records in the same vocabulary. A launch the tracer cannot seize never runs, and failed
+observation fails closed. No trace spool, sysctl changes or fallback tracer is involved.
+
+`io_uring` operations bypass per-operation syscalls, so at every `io_uring_enter` stop the tracer
+reads the opcodes pending in that ring's submission queue. A ring is accepted only without a
+kernel submission thread (`IORING_SETUP_SQPOLL`) and while every submission has no filesystem
+effect (poll, timeout, cancel, `EPOLL_CTL`); that is exactly libuv's event-loop batching, so Node
+children work. Unknown rings, unreadable queues, any other opcode and `io_uring_register` are
+refused. Other threads of the tracee can rewrite the queue between that read and the kernel's
+consumption; like every argument read, this is observation, not confinement.
 
 ## Start a disposable daemon
 
@@ -155,13 +161,14 @@ separate Marsh principal type, compatibility namespace or caller-supplied princi
 ### Sandbox routing
 
 `ShellBuilder::sandbox_policy(SandboxPolicy)` (and `MuxProfile::sandbox_policy` for every shell of
-a mux) selects the route of each accepted command. A policy is one recursive Rust value:
+a mux) selects the route of each accepted call. A policy is one recursive Rust value:
 
 ```rust,no_run
-use marsh::{CommandContext, SandboxPolicy};
+use marsh::{CommandContext, SandboxPolicy, ShellCommand};
 
 fn scoped(ctx: &CommandContext<'_>) -> bool {
-    ctx.command.starts_with("make")
+    ctx.tool_as::<ShellCommand>()
+        .is_some_and(|shell| shell.command.starts_with("make"))
 }
 
 let policy = SandboxPolicy::or(SandboxPolicy::SharedSource, SandboxPolicy::Base(scoped));
@@ -170,15 +177,20 @@ let policy = SandboxPolicy::or(SandboxPolicy::SharedSource, SandboxPolicy::Base(
 `SandboxPolicy::allow()` always sandboxes, `forbid()` never does, `SharedSource` (the default) is
 true iff another live shell — any `marsh::Shell` in this process, idle or not, identified by its
 principal — has the same source root, and `and`/`or` short-circuit left to right. True selects the
-managed route; false runs the command in the same persistent interpreter against the source, with
+managed route; false runs the call in the same persistent interpreter against the source, with
 no snapshot, tracing, authorization or WAL. These permit or forbid *sandboxing*, not execution.
 
-A `CommandContext` carries the accepted top-level text (the submitted string byte for byte; a script
+Every routed call is a `MarshTool`: `Any + Send + Sync + Into<Action>` (junco-policy's `Action`)
+plus a `description` that traces and published WAL metadata record. A shell span is a
+`ShellCommand` carrying the accepted top-level text (the submitted string byte for byte; a script
 path; a function name; empty for startup, prompt and end-of-input spans; the exact buffer of an
-interactive completion request), the current shell's `shellmux::Sandbox` record, every live
-shell's record, and the source's shared `PolicyValidator`, whose `decide` queries committed history
-without adopting anything. `Base` predicates must be synchronous, read-only and must not call back
-into a shell; a panicking predicate fails the command.
+interactive completion request), classified conservatively as `Action::Edit` whatever that text
+does. A `CommandContext` carries the original call (`tool_as::<T>()` downcasts it to its concrete
+type, `None` for any other), its `Action`, converted once from a borrow before its type is erased,
+the current shell's `shellmux::Sandbox` record, every live shell's record, and the source's shared
+`PolicyValidator`, whose `decide` queries committed history without adopting anything. `Base`
+predicates must be synchronous, read-only and must not call back into a shell; a panicking
+predicate fails the call.
 
 A shell's source root is the canonical Git work-tree root containing its initial directory, or that
 directory itself outside a work tree, fixed for the shell's lifetime. Commands queue on the
@@ -201,9 +213,24 @@ command traits. Registrations are opaque and local to each shell; no global hook
 another mux's implementation.
 
 `marsh::builtins::current_context()` provides logical `working_dir`, `open`, `metadata`,
-`create_dir_all`, `read_dir` and `glob`, plus cancellation and tracked `spawn_blocking`. Retained
-contexts/iterators refuse I/O after their run ends. Trusted native plugins must register spawned work
-through this context; arbitrary unregistered Rust threads are not a safe extension mechanism.
+`create_dir_all`, `remove_file`, `read_dir` and `glob`, plus cancellation and tracked
+`spawn_blocking`; `physical_path`/`logical_path` map a path into and out of the run's view for
+engines that read it directly. Retained contexts/iterators refuse I/O after their run ends. Trusted
+native plugins must register spawned work through this context; arbitrary unregistered Rust threads
+are not a safe extension mechanism.
+
+### Tool calls
+
+`Shell::run_tool(tool, operation)` runs an embedder's call as one accepted call routed like a
+command: the policy sees the concrete `tool` (`tool_as::<T>()`) and the `Action` converted from a
+borrow of it before its type is erased. `operation` receives a `BuiltinContext` on a registered,
+trace-scoped blocking thread and returns a value the caller gets back once the call finished — on
+the managed route, only once its effects were published. A process cannot trace its own threads, so
+the view's changes are evidence only when made through the context's I/O methods; any other change
+refuses publication. On the direct route the operation acts on the source. A refused, failed or
+interrupted call drops the operation's result. `ShellMux::run_tool(directory, tool, operation)` runs
+one such call in a transient shell built with the mux's builder and profile policy; the shell has
+no streams, is not a job, and closes when the call ends.
 
 ## Publication and recovery
 
@@ -270,7 +297,6 @@ rmux-server = { path = "/absolute/path/to/marsh/crates/rmux-server" }
 
 Cargo ignores patches in dependency manifests. Only brush-core 0.5.0, brush-interactive 0.4.0 and
 rmux-server 0.10.0 need the local patches above; lurk-cli 0.3.14 comes directly from crates.io.
-Bundle the built `marsh-trace` alongside the consuming executable.
 
 [`examples/rmux_api.rs`](examples/rmux_api.rs) uses only the ordinary public interface. On a fresh
 Git-initialized source and unused socket:
@@ -308,11 +334,12 @@ env -u RMUX -u TMUX cargo run -p marsh --example rmux_smoke
 ```
 
 The smoke first execs itself with `--native-trace-only` and a temporary PATH containing only Git,
-before the parent attaches any tracer. It checks normal Shell sharing/recovery, Read enforcement,
-explicit read+edit and zero-op grant durability. The parent keeps an idle standalone shell on each
-seed, so every pane routes through the managed stages, then exercises the real rmux executable,
-independent sources (the sibling seed's first pane command resetting an incompatible WAL), native
-file I/O, stale-without-replay and natural pane exit.
+before the parent attaches any tracer. It checks that shell construction attaches the tracer
+before any command or storage and that closing every shell detaches it, then normal Shell
+sharing/recovery, Read enforcement, explicit read+edit and zero-op grant durability. The parent
+keeps an idle standalone shell on each seed, so every pane routes through the managed stages, then
+exercises the real rmux executable, independent sources (the sibling seed's first pane command
+resetting an incompatible WAL), native file I/O, stale-without-replay and natural pane exit.
 
 `marsh-core/testing` and `rmux-server/testing` provide explicit CopyTree/configured-builder
 factories for deterministic tests. No production constructor accepts a backend. The smoke reports

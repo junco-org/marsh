@@ -1,6 +1,7 @@
 use super::*;
 
 use crate::control::ControlServerEvent;
+use crate::test_fixtures::TestRequest;
 use rmux_proto::{BreakPaneRequest, ResizeWindowAdjustment, ResizeWindowRequest};
 
 const EXTERNAL_SIZE: TerminalSize = TerminalSize {
@@ -42,9 +43,7 @@ async fn attached_status_split_and_last_detach_keep_terminal_and_content_geometr
         STATUS_ON_CONTENT_SIZE
     );
 
-    handler
-        .handle_ok(SplitWindowRequest::fixture(&session_name))
-        .await;
+    TestRequest::send_ok(&handler, SplitWindowRequest::fixture(&session_name)).await;
     assert_pane_rows(&handler, &session_name, 0, &[20, 19]).await;
     assert_eq!(handler.pane_terminal_size_for_test(&pane_0).await.rows, 20);
     assert_eq!(handler.pane_terminal_size_for_test(&pane_1).await.rows, 19);
@@ -144,13 +143,10 @@ async fn attached_new_break_resize_and_formats_use_content_geometry() {
     );
 
     let active_pane = PaneTarget::with_window(session_name.clone(), active_window, 0);
-    handler
-        .handle_ok(SplitWindowRequest::fixture(&active_pane))
-        .await;
+    TestRequest::send_ok(&handler, SplitWindowRequest::fixture(&active_pane)).await;
     assert_pane_rows(&handler, &session_name, active_window, &[19, 18]).await;
     let broken_pane = PaneTarget::with_window(session_name.clone(), active_window, 1);
-    let broken_window = handler
-        .handle_ok(BreakPaneRequest::fixture(broken_pane))
+    let broken_window = TestRequest::send_ok(&handler, BreakPaneRequest::fixture(broken_pane))
         .await
         .target
         .window_index();
@@ -170,8 +166,9 @@ async fn attached_new_break_resize_and_formats_use_content_geometry() {
         );
     }
 
-    let list_windows = handler
-        .handle_ok(ListWindowsRequest {
+    let list_windows = TestRequest::send_ok(
+        &handler,
+        ListWindowsRequest {
             target: session_name.clone(),
             format: Some(
                 "#{window_index}:#{window_width}x#{window_height}:#{pane_height}".to_owned(),
@@ -179,22 +176,25 @@ async fn attached_new_break_resize_and_formats_use_content_geometry() {
             filter: None,
             sort_order: None,
             reversed: false,
-        })
-        .await;
+        },
+    )
+    .await;
     assert_eq!(
         list_windows.output.stdout(),
         b"0:101x38:38\n1:101x38:38\n2:101x38:38\n3:101x38:38\n"
     );
-    let list_inactive_pane = handler
-        .handle_ok(ListPanesRequest {
+    let list_inactive_pane = TestRequest::send_ok(
+        &handler,
+        ListPanesRequest {
             target: session_name.clone(),
             format: Some("#{pane_width}x#{pane_height}".to_owned()),
             filter: None,
             sort_order: None,
             reversed: false,
             target_window_index: Some(detached_window),
-        })
-        .await;
+        },
+    )
+    .await;
     assert_eq!(list_inactive_pane.output.stdout(), b"101x38\n");
 
     resize_window(
@@ -314,14 +314,16 @@ async fn resize_window(
     height: Option<u16>,
     adjustment: Option<ResizeWindowAdjustment>,
 ) {
-    handler
-        .handle_ok(ResizeWindowRequest {
+    TestRequest::send_ok(
+        handler,
+        ResizeWindowRequest {
             target: WindowTarget::with_window(session_name.clone(), window_index),
             width,
             height,
             adjustment,
-        })
-        .await;
+        },
+    )
+    .await;
 }
 
 async fn assert_session_geometry(

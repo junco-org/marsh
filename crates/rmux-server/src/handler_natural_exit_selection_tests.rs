@@ -8,7 +8,7 @@ use tokio::time::{sleep, timeout, Duration, Instant};
 use super::RequestHandler;
 use crate::control::ControlServerEvent;
 use crate::pane_io::AttachControl;
-use crate::test_fixtures::{wait_until, Fixture};
+use crate::test_fixtures::{wait_until, Fixture, SessionSpec, TestRequest};
 
 const EXIT_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -91,20 +91,18 @@ async fn register_target_client(
 
 async fn fixture(scenario: SelectionScenario) -> SelectionFixture {
     let handler = RequestHandler::new();
-    let observer = handler
-        .create_session(("observer", TerminalSize::new(100, 40)))
-        .await;
-    let target = handler
-        .create_session(("target", TerminalSize::new(100, 40)))
-        .await;
+    let observer = SessionSpec::create(&handler, ("observer", TerminalSize::new(100, 40))).await;
+    let target = SessionSpec::create(&handler, ("target", TerminalSize::new(100, 40))).await;
     for _ in 1..scenario.panes {
-        handler
-            .handle_ok(SplitWindowExtRequest {
+        TestRequest::send_ok(
+            &handler,
+            SplitWindowExtRequest {
                 process_command: Some(sleeping_process()),
                 detached: true,
                 ..Fixture::fixture(&target)
-            })
-            .await;
+            },
+        )
+        .await;
     }
     for _ in 1..scenario.windows {
         handler
@@ -228,12 +226,14 @@ async fn exit_and_wait_removed(handler: &RequestHandler, target: PaneTarget) {
             .expect("exit target exists")
             .id()
     };
-    handler
-        .handle_ok(RespawnPaneRequest {
+    TestRequest::send_ok(
+        handler,
+        RespawnPaneRequest {
             process_command: Some(exiting_process()),
             ..Fixture::fixture(target)
-        })
-        .await;
+        },
+    )
+    .await;
 
     wait_until(EXIT_TIMEOUT, Duration::from_millis(20), async || {
         let state = handler.state.lock().await;
@@ -266,12 +266,14 @@ async fn exit_and_wait_dead(
             .expect("exit target exists")
             .id()
     };
-    handler
-        .handle_ok(RespawnPaneRequest {
+    TestRequest::send_ok(
+        handler,
+        RespawnPaneRequest {
             process_command: Some(exiting_process()),
             ..Fixture::fixture(target)
-        })
-        .await;
+        },
+    )
+    .await;
 
     wait_until(EXIT_TIMEOUT, Duration::from_millis(20), async || {
         let state = handler.state.lock().await;

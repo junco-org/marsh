@@ -9,8 +9,8 @@ use std::{
 use strum::IntoEnumIterator;
 
 use crate::{
-    Shell, commands, env, error, escape, expansion, extensions, interfaces, jobs, namedoptions,
-    patterns,
+    Shell, commands, env, error, escape, expansion, extensions, hostfs, interfaces, jobs,
+    namedoptions, patterns,
     sys::{self, users},
     trace_categories, traps,
     variables::{self, ShellValueLiteral},
@@ -328,6 +328,7 @@ impl Spec {
 
             let expansions = pattern
                 .expand(
+                    shell.execution_observer(),
                     shell.working_dir(),
                     Some(&patterns::Pattern::accept_all_expand_filter),
                     &patterns::FilenameExpansionOptions::default(),
@@ -1217,7 +1218,9 @@ async fn get_file_completions(
 
     let glob = std::format!("{expanded_token}*");
 
-    let path_filter = |path: &Path| !must_be_dir || shell.absolute_path(path).is_dir();
+    let path_filter = |path: &Path| {
+        !must_be_dir || hostfs::is_dir(shell.execution_observer(), &shell.absolute_path(path))
+    };
 
     let pattern = patterns::Pattern::from(glob)
         .set_extended_globbing(shell.options().extended_globbing)
@@ -1225,6 +1228,7 @@ async fn get_file_completions(
 
     let mut completions: Vec<String> = pattern
         .expand(
+            shell.execution_observer(),
             shell.working_dir(),
             Some(&path_filter),
             &patterns::FilenameExpansionOptions::default(),

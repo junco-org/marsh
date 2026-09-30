@@ -1,6 +1,7 @@
 use super::lifecycle::kill_window;
 use super::*;
 use crate::pane_io::PaneExitEvent;
+use crate::test_fixtures::TestRequest;
 use rmux_proto::{OptionScopeSelector, PaneKillRequest, SetHookRequest};
 
 const RENUMBER_MARKER: &str = "@renumber-metadata";
@@ -34,13 +35,15 @@ async fn set_renumber_metadata(
             marker,
         )
         .await;
-    handler
-        .handle_ok(SetHookRequest::fixture((
+    TestRequest::send_ok(
+        handler,
+        SetHookRequest::fixture((
             ScopeSelector::Window(target),
             HookName::WindowLayoutChanged,
             hook_command,
-        )))
-        .await;
+        )),
+    )
+    .await;
 }
 
 async fn enable_renumber_windows(handler: &RequestHandler, session: &SessionName) {
@@ -76,12 +79,14 @@ async fn renumber_metadata_fixture(
         "display-message survivor-hook",
     )
     .await;
-    handler
-        .handle_ok(RenameWindowRequest {
+    TestRequest::send_ok(
+        handler,
+        RenameWindowRequest {
             target: WindowTarget::with_window(session_name.clone(), 2),
             name: "surviving-name".to_owned(),
-        })
-        .await;
+        },
+    )
+    .await;
 
     let state = handler.state.lock().await;
     let session = state
@@ -190,12 +195,14 @@ async fn kill_last_pane_renumbers_when_session_option_is_enabled() {
     insert_window(&handler, &alpha, 2).await;
     enable_renumber_windows(&handler, &alpha).await;
 
-    handler
-        .handle_ok(KillPaneRequest {
+    TestRequest::send_ok(
+        &handler,
+        KillPaneRequest {
             target: PaneTarget::with_window(alpha.clone(), 1, 0),
             kill_all_except: false,
-        })
-        .await;
+        },
+    )
+    .await;
 
     let state = handler.state.lock().await;
     let session = state.sessions.session(&alpha).expect("session survives");
@@ -210,12 +217,14 @@ async fn kill_last_pane_discards_removed_metadata_before_renumbering_survivor() 
     let handler = RequestHandler::new();
     let fixture = renumber_metadata_fixture(&handler, "kill-pane-renumber-metadata").await;
 
-    handler
-        .handle_ok(KillPaneRequest {
+    TestRequest::send_ok(
+        &handler,
+        KillPaneRequest {
             target: fixture.removed_pane.clone(),
             kill_all_except: false,
-        })
-        .await;
+        },
+    )
+    .await;
 
     assert_surviving_renumber_metadata(&handler, &fixture).await;
 }
@@ -266,22 +275,26 @@ async fn kill_last_linked_pane_renumbers_each_surviving_session() {
     insert_window(&handler, &owner, 2).await;
     let alias = create_session(&handler, "kill-linked-pane-renumber-alias").await;
 
-    handler
-        .handle_ok(LinkWindowRequest::fixture((
+    TestRequest::send_ok(
+        &handler,
+        LinkWindowRequest::fixture((
             WindowTarget::with_window(owner.clone(), 1),
             WindowTarget::with_window(alias.clone(), 9),
-        )))
-        .await;
+        )),
+    )
+    .await;
     for session_name in [&owner, &alias] {
         enable_renumber_windows(&handler, session_name).await;
     }
 
-    handler
-        .handle_ok(KillPaneRequest {
+    TestRequest::send_ok(
+        &handler,
+        KillPaneRequest {
             target: PaneTarget::with_window(owner.clone(), 1, 0),
             kill_all_except: false,
-        })
-        .await;
+        },
+    )
+    .await;
 
     let state = handler.state.lock().await;
     assert_eq!(
@@ -433,12 +446,14 @@ async fn linked_and_grouped_removal_preserves_each_oracle_window_identity() {
     insert_window(&handler, &owner, 2).await;
     let linked_peer = create_session(&handler, "oracle-linked-peer").await;
     insert_window(&handler, &linked_peer, 1).await;
-    handler
-        .handle_ok(LinkWindowRequest::fixture((
+    TestRequest::send_ok(
+        &handler,
+        LinkWindowRequest::fixture((
             WindowTarget::with_window(owner.clone(), 0),
             WindowTarget::with_window(linked_peer.clone(), 9),
-        )))
-        .await;
+        )),
+    )
+    .await;
     for session in [&owner, &linked_peer] {
         enable_renumber_windows(&handler, session).await;
     }

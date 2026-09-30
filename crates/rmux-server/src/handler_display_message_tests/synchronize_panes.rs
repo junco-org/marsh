@@ -1,11 +1,12 @@
 use super::*;
+use crate::test_fixtures::SessionSpec;
 
 #[tokio::test]
 async fn display_message_pane_synchronized_reflects_window_option() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
 
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
     handler
         .set_option(
             ScopeSelector::Window(WindowTarget::with_window(alpha.clone(), 0)),

@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use crate::{error, extensions::ExecutionObserver as _, openfiles};
+use crate::{error, extensions::ExecutionObserver as _, hostfs, openfiles};
 
 impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
     /// Loads the history file, if one is set. A refusal by the observer's
@@ -58,7 +58,7 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
 
     /// Saves history back to any backing storage.
     pub fn save_history(&mut self) -> Result<(), error::Error> {
-        if let Some(history_file_path) = self.history_file_path()
+        if let Some(history_file_path) = self.history_file_path().map(|p| self.absolute_path(p))
             && let Some(history) = &mut self.history
         {
             // See if there's *any* time format configured. That triggers writing out
@@ -69,8 +69,8 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
             let _guard = self.execution_observer.enter_sync()?;
 
             // TODO(history): Observe options.append_to_history_file
-            history.flush(
-                history_file_path,
+            history.flush_with(
+                |options| hostfs::open(&self.execution_observer, options, &history_file_path),
                 true, /* append? */
                 true, /* unsaved items only? */
                 write_timestamps,

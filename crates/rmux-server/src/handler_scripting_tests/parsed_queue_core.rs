@@ -3,6 +3,7 @@ use super::*;
 use crate::handler::scripting_support::{
     CONTROL_QUEUE_INSERTED_COMMAND_LIMIT, CONTROL_QUEUE_STDOUT_LIMIT,
 };
+use crate::test_fixtures::{SessionSpec, TestRequest};
 use rmux_core::LifecycleEvent;
 use rmux_proto::SetHookRequest;
 
@@ -275,9 +276,11 @@ async fn control_queue_bounds_aggregate_stdout_before_extension() {
     let requester_pid = 424_006;
     let _control_events = register_control_client(&handler, requester_pid, true).await;
     let chunk = vec![b'x'; CONTROL_QUEUE_STDOUT_LIMIT / 2 + 1];
-    handler
-        .handle_ok(SetBufferRequest::fixture(("control-limit", chunk.clone())))
-        .await;
+    TestRequest::send_ok(
+        &handler,
+        SetBufferRequest::fixture(("control-limit", chunk.clone())),
+    )
+    .await;
     let parsed = CommandParser::new()
         .parse("show-buffer -b control-limit ; show-buffer -b control-limit")
         .expect("bounded output commands parse");
@@ -316,9 +319,7 @@ async fn read_only_control_allows_list_panes_all_observation() {
 #[tokio::test]
 async fn read_only_control_allows_list_windows_all_observation() {
     let handler = RequestHandler::new();
-    handler
-        .create_session(session_name("read-only-windows"))
-        .await;
+    SessionSpec::create(&handler, session_name("read-only-windows")).await;
     let requester_pid = 42_104;
     let _control_events = register_control_client(&handler, requester_pid, false).await;
     let parsed = CommandParser::new()
@@ -338,7 +339,7 @@ async fn compact_short_options_execute_in_control_queue() {
     let handler = RequestHandler::new();
     let requester_pid = 42_005;
     let _control_events = register_control_client(&handler, requester_pid, true).await;
-    handler.create_session(session_name("alpha")).await;
+    SessionSpec::create(&handler, session_name("alpha")).await;
 
     let commands = handler
         .parse_control_commands("run-shell -Ctalpha:0.0 'set-buffer -b compact-control ok'")
@@ -363,7 +364,7 @@ async fn compact_short_options_execute_in_control_queue() {
 #[tokio::test]
 async fn compact_short_options_execute_in_detached_queue() {
     let handler = RequestHandler::new();
-    handler.create_session(session_name("alpha")).await;
+    SessionSpec::create(&handler, session_name("alpha")).await;
     let commands = CommandParser::new()
         .parse("capture-pane -epJtalpha:0.0")
         .expect("detached queue command parses");
@@ -381,7 +382,7 @@ async fn parsed_queue_lock_client_defaults_to_current_client() {
     let handler = RequestHandler::new();
     let alpha = SessionName::new("alpha").expect("valid session name");
 
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
 
     let _control_rx = handler.attach_client(std::process::id(), alpha).await;
 
@@ -456,7 +457,7 @@ async fn queue_error_aborts_later_commands_in_the_same_group_only() {
 #[tokio::test]
 async fn parsed_queue_set_buffer_accepts_target_and_rename_trailing_content() {
     let handler = RequestHandler::new();
-    handler.create_session(session_name("alpha")).await;
+    SessionSpec::create(&handler, session_name("alpha")).await;
 
     let parsed = CommandParser::new()
         .parse(
@@ -562,7 +563,7 @@ async fn if_shell_string_mode_newlines_share_one_abort_group() {
 async fn parsed_queue_resolves_unresolved_window_targets_before_protocol_dispatch() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
     handler
         .create_window(NewWindowRequest {
             name: Some("logs".to_owned()),
@@ -596,7 +597,7 @@ async fn parsed_queue_resolves_unresolved_window_targets_before_protocol_dispatc
 async fn parsed_queue_resolves_session_only_new_window_targets_at_protocol_boundary() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
     let parsed = CommandParser::new()
         .parse("new-window -t alp -d -n logs")
         .expect("commands parse");
@@ -627,14 +628,12 @@ async fn parsed_queue_resolves_session_only_new_window_targets_at_protocol_bound
 async fn parsed_queue_new_window_prepares_linked_identity_before_same_slot_reuse() {
     let handler = Arc::new(RequestHandler::new());
     let alpha = session_name("queued-new-window-slot-reuse");
-    handler.create_session(&alpha).await;
-    handler
-        .handle_ok(SetHookRequest::fixture((
-            ScopeSelector::Global,
-            HookName::WindowLinked,
-            "kill-window",
-        )))
-        .await;
+    SessionSpec::create(&handler, &alpha).await;
+    TestRequest::send_ok(
+        &handler,
+        SetHookRequest::fixture((ScopeSelector::Global, HookName::WindowLinked, "kill-window")),
+    )
+    .await;
     let mut events = handler.subscribe_lifecycle_events();
     let pause = handler.install_window_lifecycle_emit_pause();
     let parsed = CommandParser::new()
@@ -730,7 +729,7 @@ async fn parsed_queue_new_window_prepares_linked_identity_before_same_slot_reuse
 async fn parsed_queue_resolves_session_colon_new_window_targets_at_protocol_boundary() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha-colon");
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
     let parsed = CommandParser::new()
         .parse("new-window -t alpha-col: -d -n logs")
         .expect("commands parse");
@@ -757,7 +756,7 @@ async fn parsed_queue_resolves_session_colon_new_window_targets_at_protocol_boun
 async fn parsed_queue_keeps_signed_new_window_targets_relative() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha-relative");
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
     let parsed = CommandParser::new()
         .parse(
             "new-window -d -t alpha-relative:1 -n one ; \
@@ -787,7 +786,7 @@ async fn parsed_queue_keeps_signed_new_window_targets_relative() {
 async fn parsed_queue_accepts_compact_new_window_flags() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
 
     let parsed = CommandParser::new()
         .parse(
@@ -821,7 +820,7 @@ async fn parsed_queue_accepts_compact_new_window_flags() {
 async fn parsed_queue_new_window_k_validates_environment_before_replacing_target() {
     let handler = RequestHandler::new();
     let alpha = session_name("new-window-k-env-validation");
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
     let setup = CommandParser::new()
         .parse("new-window -d -t new-window-k-env-validation:1 -n protected")
         .expect("window setup parses");
@@ -867,7 +866,7 @@ async fn parsed_queue_new_window_k_validates_environment_before_replacing_target
 async fn parsed_queue_new_window_k_replaces_the_only_window_without_destroying_session() {
     let handler = RequestHandler::new();
     let alpha = session_name("queued-new-window-k-only");
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
     let previous_window_id = handler
         .state
         .lock()
@@ -901,7 +900,7 @@ async fn parsed_queue_new_window_before_beats_after_like_tmux() {
     for flags in ["-b -a", "-ba"] {
         let handler = RequestHandler::new();
         let session = session_name("alpha");
-        handler.create_session(&session).await;
+        SessionSpec::create(&handler, &session).await;
 
         let parsed = CommandParser::new()
             .parse(&format!("new-window {flags} -t alpha:0 -n inserted"))
@@ -934,7 +933,7 @@ async fn parsed_queue_accepts_compact_break_pane_flag_clusters() {
     ] {
         let handler = RequestHandler::new();
         let alpha = session_name(session);
-        handler.create_session(&alpha).await;
+        SessionSpec::create(&handler, &alpha).await;
 
         let parsed = CommandParser::new()
             .parse(&format!(
@@ -963,7 +962,7 @@ async fn parsed_queue_accepts_compact_break_pane_flag_clusters() {
 async fn parsed_queue_accepts_compact_kill_window_and_kill_pane_targets() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
 
     let setup = CommandParser::new()
         .parse("new-window -d -n keep ; new-window -d -n remove")
@@ -981,12 +980,14 @@ async fn parsed_queue_accepts_compact_kill_window_and_kill_pane_targets() {
         .await
         .expect("compact kill-window target should execute");
 
-    handler
-        .handle_ok(SplitWindowRequest {
+    TestRequest::send_ok(
+        &handler,
+        SplitWindowRequest {
             direction: SplitDirection::Horizontal,
             ..Fixture::fixture(PaneTarget::with_window(alpha.clone(), 1, 0))
-        })
-        .await;
+        },
+    )
+    .await;
 
     let kill_pane = CommandParser::new()
         .parse("kill-pane -at alpha:1.1")
@@ -1015,7 +1016,7 @@ async fn parsed_queue_accepts_compact_kill_window_and_kill_pane_targets() {
 async fn parsed_queue_uses_current_target_for_new_window_split_and_zoom() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
     let current_target = Target::Pane(PaneTarget::with_window(alpha.clone(), 0, 0));
 
     for command in ["new-window -d -n logs", "split-window -h", "resize-pane -Z"] {
@@ -1055,7 +1056,7 @@ async fn parsed_queue_uses_current_target_for_new_window_split_and_zoom() {
 async fn parsed_queue_reports_missing_target_client_before_input() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
 
     for command in [
         "send-keys -c 999999 -t alpha:0.0 echo SHOULD_NOT_TYPE",
@@ -1088,7 +1089,7 @@ async fn parsed_queue_uses_current_target_for_display_panes_without_t() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
     let requester_pid = 52_u32;
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
     let mut control_rx = handler.attach_client(requester_pid, &alpha).await;
 
     let parsed = CommandParser::new()
@@ -1111,7 +1112,7 @@ async fn parsed_queue_uses_current_target_for_display_panes_without_t() {
 async fn parsed_queue_display_panes_t_reports_target_client_errors_like_cli() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    handler.create_session(alpha).await;
+    SessionSpec::create(&handler, alpha).await;
 
     for (command, expected) in [
         ("display-panes -t 999999", "can't find client: 999999"),
@@ -1135,7 +1136,7 @@ async fn parsed_queue_display_panes_t_reports_target_client_errors_like_cli() {
 async fn parsed_queue_compact_client_and_overlay_flags_preserve_their_meaning() {
     let handler = RequestHandler::new();
     let alpha = session_name("compact-flags");
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
 
     let state = handler.state.lock().await;
     let current = TargetFindContext::new(Some(Target::Pane(PaneTarget::with_window(alpha, 0, 0))));
@@ -1358,13 +1359,15 @@ async fn parsed_queue_server_access_list_ignores_conflicting_flags() {
 async fn parsed_queue_uses_current_target_for_kill_pane_without_t() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    handler.create_session(&alpha).await;
-    handler
-        .handle_ok(SplitWindowRequest {
+    SessionSpec::create(&handler, &alpha).await;
+    TestRequest::send_ok(
+        &handler,
+        SplitWindowRequest {
             direction: SplitDirection::Horizontal,
             ..Fixture::fixture(PaneTarget::with_window(alpha.clone(), 0, 0))
-        })
-        .await;
+        },
+    )
+    .await;
 
     let parsed = CommandParser::new()
         .parse("kill-pane")

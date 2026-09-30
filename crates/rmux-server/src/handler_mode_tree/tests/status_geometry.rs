@@ -1,5 +1,6 @@
 use super::*;
 
+use crate::test_fixtures::SessionSpec;
 use rmux_core::PaneGeometry;
 
 #[derive(Clone, Copy)]
@@ -108,7 +109,7 @@ async fn overlay_geometry_case(
         origin_case.label()
     );
     let session_name = SessionName::new(label).expect("valid session");
-    handler.create_session(&session_name).await;
+    SessionSpec::create(&handler, &session_name).await;
     set_status_case(&handler, status_case).await;
 
     let observer_pid = std::process::id().saturating_add(pid_offset);

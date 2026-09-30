@@ -6,7 +6,7 @@ use tokio::sync::mpsc;
 
 use super::RequestHandler;
 use crate::control::ControlServerEvent;
-use crate::test_fixtures::Fixture;
+use crate::test_fixtures::{Fixture, SessionSpec, TestRequest};
 use crate::test_names::session_name;
 
 async fn run_control(handler: &RequestHandler, requester_pid: u32, control_id: u64, command: &str) {
@@ -76,7 +76,7 @@ async fn new_window_and_explicit_select_publish_only_stable_id_changes() {
     // window-add. Selecting the current stable window is silent.
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
     let (control_id, mut rx) = handler
         .register_control_for_test(31_001, Some(&alpha))
         .await;
@@ -141,8 +141,8 @@ async fn link_and_unlink_window_follow_detached_and_no_switch_semantics() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
     let beta = session_name("beta");
-    handler.create_session(&alpha).await;
-    handler.create_session(&beta).await;
+    SessionSpec::create(&handler, &alpha).await;
+    SessionSpec::create(&handler, &beta).await;
     let beta_source = handler.create_window(&beta).await;
     let beta_detached = handler.create_window(&beta).await;
     let (control_id, mut rx) = handler
@@ -205,14 +205,14 @@ async fn move_window_orders_destination_and_source_stable_transitions() {
         let handler = RequestHandler::new();
         let alpha = session_name("alpha");
         let beta = session_name("beta");
-        handler.create_session(&alpha).await;
+        SessionSpec::create(&handler, &alpha).await;
         let moving = handler
             .create_window(NewWindowRequest {
                 detached: false,
                 ..Fixture::fixture(&alpha)
             })
             .await;
-        handler.create_session(&beta).await;
+        SessionSpec::create(&handler, &beta).await;
         let moving_window_id = handler.window_id_for_test(&moving).await;
         let (control_id, mut rx) = handler
             .register_control_for_test(31_003, Some(&alpha))
@@ -250,20 +250,22 @@ async fn linked_kill_window_interleaves_each_real_session_transition_and_close()
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
     let beta = session_name("beta");
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
     let shared = handler
         .create_window(NewWindowRequest {
             detached: false,
             ..Fixture::fixture(&alpha)
         })
         .await;
-    handler.create_session(&beta).await;
-    handler
-        .handle_ok(LinkWindowRequest {
+    SessionSpec::create(&handler, &beta).await;
+    TestRequest::send_ok(
+        &handler,
+        LinkWindowRequest {
             detached: false,
             ..Fixture::fixture((&shared, WindowTarget::with_window(beta.clone(), 1)))
-        })
-        .await;
+        },
+    )
+    .await;
     let shared_id = handler.window_id_for_test(&shared).await;
     let (control_id, mut rx) = handler
         .register_control_for_test(31_004, Some(&alpha))
@@ -292,14 +294,16 @@ async fn split_and_kill_pane_preserve_tmux_transition_order_and_detached_silence
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
     let beta = session_name("beta");
-    handler.create_session(&alpha).await;
-    handler.create_session(&beta).await;
-    handler
-        .handle_ok(LinkWindowRequest::fixture((
+    SessionSpec::create(&handler, &alpha).await;
+    SessionSpec::create(&handler, &beta).await;
+    TestRequest::send_ok(
+        &handler,
+        LinkWindowRequest::fixture((
             WindowTarget::with_window(alpha.clone(), 0),
             WindowTarget::with_window(beta, 1),
-        )))
-        .await;
+        )),
+    )
+    .await;
     let (control_id, mut rx) = handler
         .register_control_for_test(31_005, Some(&alpha))
         .await;
@@ -376,14 +380,16 @@ async fn break_pane_orders_source_selection_layout_add_and_destination_selection
         let handler = RequestHandler::new();
         let alpha = session_name("alpha");
         let beta = session_name("beta");
-        handler.create_session(&alpha).await;
-        handler.create_session(&beta).await;
-        handler
-            .handle_ok(LinkWindowRequest::fixture((
+        SessionSpec::create(&handler, &alpha).await;
+        SessionSpec::create(&handler, &beta).await;
+        TestRequest::send_ok(
+            &handler,
+            LinkWindowRequest::fixture((
                 WindowTarget::with_window(alpha.clone(), 0),
                 WindowTarget::with_window(beta, 1),
-            )))
-            .await;
+            )),
+        )
+        .await;
         let (control_id, mut rx) = handler
             .register_control_for_test(31_006, Some(&alpha))
             .await;
@@ -438,7 +444,7 @@ async fn initial_window_is_published_before_sessions_changed() {
     // window-add in the same order.
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
     let (control_id, mut rx) = handler
         .register_control_for_test(31_007, Some(&alpha))
         .await;

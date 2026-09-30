@@ -1,14 +1,18 @@
 use super::*;
-use crate::test_fixtures::{quiet_command, Fixture, Sizeless};
+use crate::test_fixtures::{
+    quiet_command, Fixture, SessionSpec, Sizeless, SubscribeRequest, TestRequest,
+};
 
 async fn create_quiet_kill_session(handler: &RequestHandler, name: &str) -> SessionName {
-    handler
-        .create_started_session(NewSessionExtRequest {
+    SessionSpec::create_started(
+        handler,
+        NewSessionExtRequest {
             size: None,
             command: Some(quiet_command()),
             ..Fixture::fixture(name)
-        })
-        .await
+        },
+    )
+    .await
 }
 
 async fn create_grouped_kill_session(
@@ -16,13 +20,15 @@ async fn create_grouped_kill_session(
     name: &str,
     group_target: &SessionName,
 ) -> SessionName {
-    handler
-        .create_session(NewSessionExtRequest {
+    SessionSpec::create(
+        handler,
+        NewSessionExtRequest {
             size: None,
             group_target: Some(group_target.clone()),
             ..Fixture::fixture(name)
-        })
-        .await
+        },
+    )
+    .await
 }
 
 /// How long a queued last-session shutdown is given to settle.
@@ -50,7 +56,7 @@ async fn kill_session_is_idempotent_for_missing_sessions() {
 #[tokio::test]
 async fn has_session_resolves_unique_prefix_matches() {
     let handler = RequestHandler::new();
-    handler.create_session(Sizeless("alpha")).await;
+    SessionSpec::create(&handler, Sizeless("alpha")).await;
 
     assert_eq!(
         handler
@@ -74,7 +80,7 @@ async fn has_session_resolves_unique_prefix_matches() {
 async fn kill_session_all_except_target_preserves_only_the_resolved_target() {
     let handler = RequestHandler::new();
     for name in ["alpha", "beta", "gamma"] {
-        handler.create_session(Sizeless(name)).await;
+        SessionSpec::create(&handler, Sizeless(name)).await;
     }
 
     let response = handler
@@ -114,12 +120,12 @@ async fn concurrent_group_owner_kills_rekey_live_subscription_to_final_owner() {
             .and_then(rmux_core::Session::active_pane_id)
             .expect("group owner has an active pane")
     };
-    let subscribed = handler
-        .subscribe_ok(
-            4244,
-            rmux_proto::SubscribePaneOutputRefRequest::fixture((&owner, pane_id)),
-        )
-        .await;
+    let subscribed = SubscribeRequest::subscribe_ok(
+        &handler,
+        4244,
+        rmux_proto::SubscribePaneOutputRefRequest::fixture((&owner, pane_id)),
+    )
+    .await;
 
     let pause = handler.install_kill_session_subscription_rekey_pause(owner.clone());
     let first_handler = handler.clone();
@@ -213,7 +219,7 @@ async fn kill_session_last_session_requests_shutdown() {
     let (shutdown_handle, shutdown_rx) = ShutdownHandle::new();
     handler.install_shutdown_handle(shutdown_handle);
 
-    handler.create_session(Sizeless("alpha")).await;
+    SessionSpec::create(&handler, Sizeless("alpha")).await;
     let pane_id = {
         let state = handler.state.lock().await;
         state
@@ -254,7 +260,7 @@ async fn exit_empty_shutdown_is_cancelled_when_a_new_session_starts_first() {
     let (shutdown_handle, mut shutdown_rx) = ShutdownHandle::new();
     handler.install_shutdown_handle(shutdown_handle);
 
-    handler.create_session(Sizeless("alpha")).await;
+    SessionSpec::create(&handler, Sizeless("alpha")).await;
 
     let response = handler
         .handle(Request::KillSession(KillSessionRequest::fixture("alpha")))
@@ -264,7 +270,7 @@ async fn exit_empty_shutdown_is_cancelled_when_a_new_session_starts_first() {
         Response::KillSession(rmux_proto::KillSessionResponse { existed: true })
     );
 
-    handler.create_session(Sizeless("beta")).await;
+    SessionSpec::create(&handler, Sizeless("beta")).await;
     assert!(
         !handler.request_shutdown_if_pending(),
         "stale exit-empty shutdown must not stop a newly non-empty server"
@@ -280,7 +286,7 @@ async fn exit_empty_shutdown_retries_after_state_lock_contention() {
     let (shutdown_handle, shutdown_rx) = ShutdownHandle::new();
     handler.install_shutdown_handle(shutdown_handle);
 
-    handler.create_session(Sizeless("alpha")).await;
+    SessionSpec::create(&handler, Sizeless("alpha")).await;
 
     let response = handler
         .handle(Request::KillSession(KillSessionRequest::fixture("alpha")))
@@ -311,7 +317,7 @@ async fn exit_empty_shutdown_waits_for_last_session_control_cleanup() {
     let alpha = session_name("exit-empty-control-alpha");
     let requester_pid = 42_461;
 
-    handler.create_session(Sizeless(&alpha)).await;
+    SessionSpec::create(&handler, Sizeless(&alpha)).await;
     let session_id = handler.session_id_for_test(&alpha).await;
     let (event_tx, mut event_rx) = mpsc::channel(1);
     let closing = Arc::new(AtomicBool::new(false));
@@ -341,7 +347,7 @@ async fn exit_empty_shutdown_waits_for_last_session_control_cleanup() {
             if session_name == &alpha
     ));
 
-    handler.handle_ok(KillSessionRequest::fixture(&alpha)).await;
+    TestRequest::send_ok(&handler, KillSessionRequest::fixture(&alpha)).await;
     assert!(
         !handler.request_shutdown_if_pending(),
         "bound control cleanup defers rather than cancels exit-empty"
@@ -372,7 +378,7 @@ async fn exit_empty_shutdown_is_cancelled_by_live_unattached_control() {
     handler.install_shutdown_handle(shutdown_handle);
     let alpha = session_name("exit-empty-unattached-control-alpha");
 
-    handler.create_session(Sizeless(&alpha)).await;
+    SessionSpec::create(&handler, Sizeless(&alpha)).await;
     let (event_tx, _event_rx) = mpsc::channel(1);
     let control_id = handler
         .register_control_with_closing(
@@ -387,7 +393,7 @@ async fn exit_empty_shutdown_is_cancelled_by_live_unattached_control() {
         )
         .await;
 
-    handler.handle_ok(KillSessionRequest::fixture(alpha)).await;
+    TestRequest::send_ok(&handler, KillSessionRequest::fixture(alpha)).await;
     assert!(
         !handler.request_shutdown_if_pending(),
         "a live unattached control makes exit-empty stale"
@@ -404,7 +410,7 @@ async fn exit_empty_does_not_downgrade_pending_kill_server_shutdown() {
     let (shutdown_handle, shutdown_rx) = ShutdownHandle::new();
     handler.install_shutdown_handle(shutdown_handle);
 
-    handler.create_session(Sizeless("alpha")).await;
+    SessionSpec::create(&handler, Sizeless("alpha")).await;
 
     let kill_server = handler
         .handle(Request::KillServer(rmux_proto::KillServerRequest))
@@ -419,7 +425,7 @@ async fn exit_empty_does_not_downgrade_pending_kill_server_shutdown() {
         Response::KillSession(rmux_proto::KillSessionResponse { existed: true })
     );
 
-    handler.create_session(Sizeless("beta")).await;
+    SessionSpec::create(&handler, Sizeless("beta")).await;
     assert!(
         handler.request_shutdown_if_pending(),
         "explicit kill-server must not become a cancellable exit-empty shutdown"
@@ -440,7 +446,7 @@ async fn kill_session_last_session_respects_exit_empty_off() {
         .set_option(ScopeSelector::Global, OptionName::ExitEmpty, "off")
         .await;
 
-    handler.create_session(Sizeless("alpha")).await;
+    SessionSpec::create(&handler, Sizeless("alpha")).await;
 
     let response = handler
         .handle(Request::KillSession(KillSessionRequest::fixture("alpha")))
@@ -468,7 +474,7 @@ async fn kill_session_last_session_exits_attached_clients_before_shutdown() {
     let alpha = session_name("alpha");
     let requester_pid = std::process::id();
 
-    handler.create_session(Sizeless(&alpha)).await;
+    SessionSpec::create(&handler, Sizeless(&alpha)).await;
 
     let mut control_rx = handler.attach_client(requester_pid, &alpha).await;
     {
@@ -516,7 +522,7 @@ async fn kill_session_all_except_target_does_not_request_shutdown_while_target_s
     handler.install_shutdown_handle(shutdown_handle);
 
     for name in ["alpha", "beta"] {
-        handler.create_session(Sizeless(name)).await;
+        SessionSpec::create(&handler, Sizeless(name)).await;
     }
 
     let response = handler
@@ -559,7 +565,7 @@ async fn kill_session_group_selectors_fail_closed_when_target_name_is_recreated(
     });
 
     pause.reached.notified().await;
-    handler.handle_ok(KillSessionRequest::fixture(&alpha)).await;
+    TestRequest::send_ok(&handler, KillSessionRequest::fixture(&alpha)).await;
     let recreated = create_quiet_kill_session(&handler, alpha.as_str()).await;
     pause.release.notify_one();
 
@@ -610,7 +616,7 @@ async fn kill_session_group_selectors_fail_closed_when_target_name_is_recreated(
     });
 
     pause.reached.notified().await;
-    handler.handle_ok(KillSessionRequest::fixture(&alpha)).await;
+    TestRequest::send_ok(&handler, KillSessionRequest::fixture(&alpha)).await;
     let recreated = create_quiet_kill_session(&handler, alpha.as_str()).await;
     pause.release.notify_one();
 
@@ -665,12 +671,14 @@ async fn kill_session_group_selectors_follow_a_renamed_victim_identity() {
     });
 
     pause.reached.notified().await;
-    handler
-        .handle_ok(RenameSessionRequest {
+    TestRequest::send_ok(
+        &handler,
+        RenameSessionRequest {
             target: beta,
             new_name: renamed.clone(),
-        })
-        .await;
+        },
+    )
+    .await;
     pause.release.notify_one();
 
     let response = kill_all_except.await.expect("kill task joins");
@@ -714,12 +722,14 @@ async fn kill_session_group_selectors_follow_a_renamed_victim_identity() {
     });
 
     pause.reached.notified().await;
-    handler
-        .handle_ok(RenameSessionRequest {
+    TestRequest::send_ok(
+        &handler,
+        RenameSessionRequest {
             target: beta,
             new_name: renamed.clone(),
-        })
-        .await;
+        },
+    )
+    .await;
     pause.release.notify_one();
 
     let response = kill_group.await.expect("kill task joins");
@@ -749,7 +759,7 @@ async fn kill_session_clear_alerts_does_not_request_shutdown() {
     let (shutdown_handle, shutdown_rx) = ShutdownHandle::new();
     handler.install_shutdown_handle(shutdown_handle);
 
-    handler.create_session(Sizeless("alpha")).await;
+    SessionSpec::create(&handler, Sizeless("alpha")).await;
 
     let response = handler
         .handle(Request::KillSession(KillSessionRequest {
@@ -788,12 +798,14 @@ async fn kill_session_explicit_id_follows_concurrent_rename_and_preserves_old_na
     });
 
     pause.reached.notified().await;
-    handler
-        .handle_ok(RenameSessionRequest {
+    TestRequest::send_ok(
+        &handler,
+        RenameSessionRequest {
             target: original.clone(),
             new_name: renamed.clone(),
-        })
-        .await;
+        },
+    )
+    .await;
     let homonym = create_quiet_kill_session(&handler, original.as_str()).await;
     pause.release.notify_one();
 

@@ -1,4 +1,5 @@
 use super::*;
+use crate::test_fixtures::TestRequest;
 
 #[derive(Debug, Clone, Copy)]
 enum PaletteModalSurface {
@@ -69,15 +70,17 @@ async fn command_prompt_supersedes_an_ignored_display_message() {
     let requester_pid = std::process::id();
     create_send_keys_test_session(&handler, &alpha).await;
     let _control_rx = handler.attach_client(requester_pid, &alpha).await;
-    handler
-        .handle_ok(DisplayMessageExtRequest {
+    TestRequest::send_ok(
+        &handler,
+        DisplayMessageExtRequest {
             target: Some(Target::Session(alpha)),
             target_client: Some(requester_pid.to_string()),
             duration_ms: Some(rmux_proto::DisplayMessageDurationMillis::new(10_000)),
             ignore_input: true,
             ..Fixture::fixture("old message")
-        })
-        .await;
+        },
+    )
+    .await;
 
     activate_surface(&handler, requester_pid, PaletteModalSurface::Prompt).await;
     assert!(

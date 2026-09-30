@@ -19,15 +19,16 @@
 //!
 //! Opening a pipe is one admission. Closing one has to do four things in order: stop feeding it,
 //! deliver end of file, wait for the command to finish *and be gated*, and only then say whether
-//! the user's log exists. A command that will not finish is signalled and then forced — and a
-//! forced job is discarded, which is a failure to report, not a clean close.
+//! the user's log exists. A command that is still executing and will not finish is signalled and
+//! then forced — and a forced job is discarded, which is a failure to report, not a clean close.
+//! A command that is still being set up, or whose producers have finished and whose verdict is
+//! being processed, is not a stuck consumer and is waited for, however long the disk takes.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use marsh_core::shellmux::{CommandCompletion, CommandHandle, WaitError};
-use marsh_core::Signal;
 use rmux_core::events::OutputCursorItem;
 use rmux_core::PaneId;
 use rmux_proto::{ProcessCommand, RmuxError, SessionName};
@@ -39,12 +40,15 @@ use crate::managed_workload;
 use crate::pane_io::{PaneOutputReceiver, PaneOutputSender};
 use crate::terminal::TerminalProfile;
 
-/// How long a closing pipe is given to finish before it is signalled, and then forced.
+/// How long a closing pipe's executing command is given to finish before it is signalled, and
+/// then forced.
 ///
 /// This is the bound the pipe's own child waiter has always worked to, kept exactly. It applies
 /// at each escalation step: once for the command to notice end of file, once more after
 /// `SIGTERM`, because a logger that flushes on a signal deserves the same chance as one that
-/// notices its input ending.
+/// notices its input ending. It bounds execution only: a command still being set up is not yet
+/// reading its input, and one whose producers have finished is having its verdict processed.
+/// Neither has a fixed wall-clock deadline. The same bound caps draining the `-O` writer.
 const PIPE_TERMINATION_GRACE: Duration = Duration::from_millis(250);
 
 /// How many pane output chunks may be queued for a `-O` pipe's standard input.
@@ -372,8 +376,8 @@ impl ActivePanePipe {
     /// Closes this pipe and reports what the gate did with it.
     ///
     /// For the paths where a user is waiting on the answer: a `pipe-pane` with no command, a
-    /// `pipe-pane -o` toggle. The wait is bounded by the supervisor's own escalation, so a
-    /// command that will not finish cannot hold the request open.
+    /// `pipe-pane -o` toggle. A command that keeps executing cannot hold the request open: the
+    /// supervisor signals and then forces it. Setup and verdict processing are awaited.
     ///
     /// # Errors
     ///
@@ -412,7 +416,7 @@ struct PaneInput {
 
 /// One pipe's owned work, handed to its supervisor.
 struct PipeJob {
-    /// The engine, for the escalation path.
+    /// The engine, for tearing a discarded pipe's job down.
     io: ShellIo,
     /// The pipe command's own job.
     shell: ShellHandle,
@@ -480,7 +484,13 @@ async fn supervise(job: PipeJob) {
     let _ = stdin.close().await;
 
     let outcome = match stop {
-        Some(PipeStop::Close) => close_within_grace(&io, &shell, &command, &text).await,
+        // End of file is delivered. What remains is the command's own choice: finish and be
+        // gated, or be signalled and then forced — and a forced command's verdict, not the force,
+        // is what gets reported, because a force cannot undo an approval already sealed.
+        Some(PipeStop::Close) => publication(
+            command.finish_with_grace(PIPE_TERMINATION_GRACE).await,
+            &text,
+        ),
         Some(PipeStop::Discard) => discarded(command.wait().await, &text),
         None => publication(command.wait().await, &text),
     };
@@ -505,40 +515,6 @@ async fn supervise(job: PipeJob) {
         let _ = task.await;
     }
     let _ = shell.wait_closed().await;
-}
-
-/// Waits for a closing pipe's command to finish, escalating when it will not.
-///
-/// End of file has already been delivered. What remains is the command's own choice: finish and
-/// be gated, or be signalled and then forced.
-async fn close_within_grace(
-    io: &ShellIo,
-    shell: &ShellHandle,
-    command: &CommandHandle,
-    text: &str,
-) -> Result<(), RmuxError> {
-    if let Ok(result) = tokio::time::timeout(PIPE_TERMINATION_GRACE, command.wait()).await {
-        return publication(result, text);
-    }
-    // End of file was not enough. Ask politely first: a command that traps the signal still
-    // flushes what it buffered and is still gated normally.
-    let _ = io.signal(shell, Signal::Terminate);
-    if let Ok(result) = tokio::time::timeout(PIPE_TERMINATION_GRACE, command.wait()).await {
-        return publication(result, text);
-    }
-    // Forced. That normally discards, and calling it a clean close would tell a user their log
-    // was written when the gate never saw it — so the completion, not the force, is what gets
-    // reported: a cancellation landing after an approved publication has begun cannot undo it,
-    // and the verdict is authoritative about which of the two happened.
-    let _ = io.stop(shell, true).await;
-    if let Ok(result) = tokio::time::timeout(PIPE_TERMINATION_GRACE, command.wait()).await {
-        return publication(result, text);
-    }
-    Err(RmuxError::Server(format!(
-        "pipe-pane command '{text}' did not finish within {}ms of its input ending, and reached \
-         no verdict after being signalled and forced; nothing it staged was published",
-        PIPE_TERMINATION_GRACE.as_millis()
-    )))
 }
 
 /// Turns one command's verdict into what its pipe's closer is told.

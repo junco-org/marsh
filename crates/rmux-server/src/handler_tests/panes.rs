@@ -1,14 +1,12 @@
 use super::*;
-use crate::test_fixtures::{Fixture, Sizeless};
+use crate::test_fixtures::{Fixture, SessionSpec, Sizeless, TestRequest};
 
 #[tokio::test]
 async fn split_window_routes_session_and_pane_targets_to_the_expected_panes() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
 
-    handler
-        .create_session((&alpha, TerminalSize::new(120, 40)))
-        .await;
+    SessionSpec::create(&handler, (&alpha, TerminalSize::new(120, 40))).await;
 
     let first_split = handler
         .handle(Request::SplitWindow(SplitWindowRequest::fixture(&alpha)))
@@ -74,7 +72,7 @@ async fn target_action_split_and_resize_resolve_raw_targets_server_side() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
 
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
 
     let split = handler
         .handle(Request::SplitWindowTargetAction(Box::new(
@@ -124,7 +122,7 @@ async fn sdk_split_identity_returns_visible_base_index_and_stable_id_atomically(
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
 
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
     handler
         .set_option(ScopeSelector::Global, OptionName::PaneBaseIndex, "5")
         .await;
@@ -173,7 +171,7 @@ async fn sdk_split_identity_accepts_a_stable_pane_target() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha-stable-split");
 
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
     let original_pane_id = {
         let state = handler.state.lock().await;
         state
@@ -220,8 +218,8 @@ async fn sdk_split_identity_rejects_a_reindexed_replacement_after_resolution() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha-stale-split");
 
-    handler.create_session(&alpha).await;
-    handler.handle_ok(SplitWindowRequest::fixture(&alpha)).await;
+    SessionSpec::create(&handler, &alpha).await;
+    TestRequest::send_ok(&handler, SplitWindowRequest::fixture(&alpha)).await;
     let (removed_pane_id, surviving_pane_id) = {
         let state = handler.state.lock().await;
         let window = state
@@ -267,12 +265,14 @@ async fn sdk_split_identity_rejects_a_reindexed_replacement_after_resolution() {
         .await
         .expect("stable split reaches the post-resolution pause");
 
-    handler
-        .handle_ok(KillPaneRequest {
+    TestRequest::send_ok(
+        &handler,
+        KillPaneRequest {
             target: PaneTarget::new(alpha.clone(), 0),
             kill_all_except: false,
-        })
-        .await;
+        },
+    )
+    .await;
     pause.release.notify_one();
 
     assert_eq!(
@@ -300,10 +300,8 @@ async fn select_pane_style_sets_pane_style_and_format_colours() {
     let alpha = session_name("alpha");
     let target = PaneTarget::new(alpha.clone(), 1);
 
-    handler
-        .create_session((&alpha, TerminalSize::new(80, 10)))
-        .await;
-    handler.handle_ok(SplitWindowRequest::fixture(&alpha)).await;
+    SessionSpec::create(&handler, (&alpha, TerminalSize::new(80, 10))).await;
+    TestRequest::send_ok(&handler, SplitWindowRequest::fixture(&alpha)).await;
 
     let response = handler
         .handle(Request::SelectPane(Box::new(SelectPaneRequest {
@@ -339,9 +337,7 @@ async fn split_window_rolls_back_the_session_when_terminal_resize_fails() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
 
-    handler
-        .create_session((&alpha, TerminalSize::new(120, 40)))
-        .await;
+    SessionSpec::create(&handler, (&alpha, TerminalSize::new(120, 40))).await;
 
     {
         let mut state = handler.state.lock().await;
@@ -384,9 +380,7 @@ async fn horizontal_split_updates_layout_and_geometry() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
 
-    handler
-        .create_session((&alpha, TerminalSize::new(100, 50)))
-        .await;
+    SessionSpec::create(&handler, (&alpha, TerminalSize::new(100, 50))).await;
 
     let split = handler
         .handle(Request::SplitWindow(SplitWindowRequest {
@@ -419,23 +413,19 @@ async fn kill_pane_removes_the_terminal_and_uses_last_pane_fallback() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
 
-    handler
-        .create_session((&alpha, TerminalSize::new(120, 40)))
-        .await;
+    SessionSpec::create(&handler, (&alpha, TerminalSize::new(120, 40))).await;
 
-    handler.handle_ok(SplitWindowRequest::fixture(&alpha)).await;
-    handler
-        .handle_ok(SelectPaneRequest::fixture(PaneTarget::new(
-            alpha.clone(),
-            1,
-        )))
-        .await;
-    handler
-        .handle_ok(SelectPaneRequest::fixture(PaneTarget::new(
-            alpha.clone(),
-            0,
-        )))
-        .await;
+    TestRequest::send_ok(&handler, SplitWindowRequest::fixture(&alpha)).await;
+    TestRequest::send_ok(
+        &handler,
+        SelectPaneRequest::fixture(PaneTarget::new(alpha.clone(), 1)),
+    )
+    .await;
+    TestRequest::send_ok(
+        &handler,
+        SelectPaneRequest::fixture(PaneTarget::new(alpha.clone(), 0)),
+    )
+    .await;
 
     let (removed_pane_id, surviving_pane_id) = {
         let state = handler.state.lock().await;
@@ -504,11 +494,9 @@ async fn kill_pane_rolls_back_when_terminal_resize_fails() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
 
-    handler
-        .create_session((&alpha, TerminalSize::new(120, 40)))
-        .await;
+    SessionSpec::create(&handler, (&alpha, TerminalSize::new(120, 40))).await;
 
-    handler.handle_ok(SplitWindowRequest::fixture(&alpha)).await;
+    TestRequest::send_ok(&handler, SplitWindowRequest::fixture(&alpha)).await;
 
     let removed_pane_id = {
         let state = handler.state.lock().await;
@@ -553,9 +541,7 @@ async fn kill_last_pane_in_only_window_removes_the_session() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
 
-    handler
-        .create_session((&alpha, TerminalSize::new(120, 40)))
-        .await;
+    SessionSpec::create(&handler, (&alpha, TerminalSize::new(120, 40))).await;
 
     let killed = handler
         .handle(Request::KillPane(KillPaneRequest {
@@ -583,9 +569,7 @@ async fn resize_pane_rolls_back_geometry_when_terminal_resize_fails() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
 
-    handler
-        .create_session((&alpha, TerminalSize::new(200, 50)))
-        .await;
+    SessionSpec::create(&handler, (&alpha, TerminalSize::new(200, 50))).await;
 
     let split = handler
         .handle(Request::SplitWindow(SplitWindowRequest {
@@ -662,7 +646,7 @@ async fn resize_pane_noop_validates_target_slot() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
 
-    handler.create_session(Sizeless(&alpha)).await;
+    SessionSpec::create(&handler, Sizeless(&alpha)).await;
 
     let missing_pane_resize = handler
         .handle(Request::ResizePane(rmux_proto::ResizePaneRequest {

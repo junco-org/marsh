@@ -6,7 +6,7 @@ use super::session_name;
 use crate::input_keys::MAX_SGR_MOUSE_FRAME_BYTES;
 use crate::mouse::{layout_for_session, StatusRangeType};
 use crate::pane_io::AttachControl;
-use crate::test_fixtures::{Fixture, Quiet, SessionSpec};
+use crate::test_fixtures::{Fixture, Quiet, SessionSpec, TestRequest};
 use rmux_proto::request::RefreshClientRequest;
 use rmux_proto::{
     BindKeyRequest, CapturePaneRequest, ListSessionsRequest, OptionName, PaneTarget, Request,
@@ -71,15 +71,6 @@ impl Drop for PopupJobCleanup {
     }
 }
 
-async fn create_attached_session(
-    handler: &RequestHandler,
-    requester_pid: u32,
-    spec: impl SessionSpec,
-) -> mpsc::UnboundedReceiver<AttachControl> {
-    let session = handler.create_session(spec).await;
-    handler.attach_client(requester_pid, session).await
-}
-
 async fn run_overlay_command(handler: &RequestHandler, requester_pid: u32, command: &str) {
     let parsed = handler
         .parse_control_commands(command)
@@ -97,7 +88,7 @@ async fn display_menu_accepts_parsed_command_list_items_from_queue() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
     let requester_pid = std::process::id();
-    let mut control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
+    let mut control_rx = SessionSpec::create_attached(&handler, requester_pid, &alpha).await;
 
     run_overlay_command(
         &handler,
@@ -116,7 +107,7 @@ async fn display_menu_renders_mouse_word_and_line_from_clicked_pane() {
     let handler = RequestHandler::new();
     let alpha = session_name("menu-mouse-word");
     let requester_pid = std::process::id();
-    let mut control_rx = create_attached_session(&handler, requester_pid, Quiet(&alpha)).await;
+    let mut control_rx = SessionSpec::create_attached(&handler, requester_pid, Quiet(&alpha)).await;
     handler
         .set_option(ScopeSelector::Global, OptionName::Mouse, "on")
         .await;
@@ -152,7 +143,7 @@ async fn display_menu_single_character_shortcut_executes_item() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha-shortcut");
     let requester_pid = std::process::id();
-    let mut control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
+    let mut control_rx = SessionSpec::create_attached(&handler, requester_pid, &alpha).await;
 
     run_overlay_command(
         &handler,
@@ -180,7 +171,7 @@ async fn display_menu_hyphen_prefixed_label_with_command_is_actionable() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha-hyphen-menu");
     let requester_pid = std::process::id();
-    let mut control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
+    let mut control_rx = SessionSpec::create_attached(&handler, requester_pid, &alpha).await;
 
     run_overlay_command(
         &handler,
@@ -272,7 +263,7 @@ async fn refresh_client_replays_active_menu_after_base_switch() {
     let handler = RequestHandler::new();
     let alpha = session_name("refresh-client-menu-overlay");
     let requester_pid = std::process::id();
-    let mut control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
+    let mut control_rx = SessionSpec::create_attached(&handler, requester_pid, &alpha).await;
 
     run_overlay_command(
         &handler,
@@ -303,7 +294,7 @@ async fn refresh_client_replays_active_popup_after_base_switch() {
     let handler = RequestHandler::new();
     let alpha = session_name("refresh-client-popup-overlay");
     let requester_pid = std::process::id();
-    let mut control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
+    let mut control_rx = SessionSpec::create_attached(&handler, requester_pid, &alpha).await;
 
     run_overlay_command(
         &handler,
@@ -334,7 +325,7 @@ async fn cancelling_prompt_replays_the_menu_it_temporarily_hid() {
     let handler = RequestHandler::new();
     let alpha = session_name("prompt-cancel-menu-overlay");
     let requester_pid = std::process::id();
-    let mut control_rx = create_attached_session(&handler, requester_pid, Quiet(&alpha)).await;
+    let mut control_rx = SessionSpec::create_attached(&handler, requester_pid, Quiet(&alpha)).await;
 
     run_overlay_command(
         &handler,
@@ -377,7 +368,7 @@ async fn session_identity_refresh_keeps_the_underlying_menu_hidden_by_a_prompt()
     let handler = RequestHandler::new();
     let alpha = session_name("identity-refresh-prompt-menu");
     let requester_pid = std::process::id();
-    let mut control_rx = create_attached_session(&handler, requester_pid, Quiet(&alpha)).await;
+    let mut control_rx = SessionSpec::create_attached(&handler, requester_pid, Quiet(&alpha)).await;
 
     run_overlay_command(
         &handler,
@@ -424,7 +415,7 @@ async fn stale_same_pid_popup_callbacks_cannot_mutate_replacement_popup() {
     let handler = RequestHandler::new();
     let alpha = session_name("popup-callback-identity");
     let requester_pid = 920_041;
-    let mut old_control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
+    let mut old_control_rx = SessionSpec::create_attached(&handler, requester_pid, &alpha).await;
 
     run_overlay_command(
         &handler,
@@ -503,7 +494,7 @@ async fn replacing_a_job_backed_popup_terminates_its_child() {
     let handler = RequestHandler::new();
     let alpha = session_name("popup-replacement-terminates-child");
     let requester_pid = std::process::id();
-    let mut control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
+    let mut control_rx = SessionSpec::create_attached(&handler, requester_pid, &alpha).await;
 
     run_overlay_command(
         &handler,
@@ -561,7 +552,7 @@ async fn rename_session_rekeys_menu_and_popup_targets_before_they_handle_input()
     let beta = session_name("overlay-rename-beta");
     let gamma = session_name("overlay-rename-gamma");
     let requester_pid = std::process::id();
-    let mut control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
+    let mut control_rx = SessionSpec::create_attached(&handler, requester_pid, &alpha).await;
 
     run_overlay_command(
         &handler,
@@ -570,12 +561,14 @@ async fn rename_session_rekeys_menu_and_popup_targets_before_they_handle_input()
     )
     .await;
     let _ = next_overlay_frame(&mut control_rx).await;
-    handler
-        .handle_ok(rmux_proto::RenameSessionRequest {
+    TestRequest::send_ok(
+        &handler,
+        rmux_proto::RenameSessionRequest {
             target: alpha,
             new_name: beta.clone(),
-        })
-        .await;
+        },
+    )
+    .await;
     {
         let active_attach = handler.active_attach.lock().await;
         let Some(ClientOverlayState::Menu(menu)) =
@@ -597,12 +590,14 @@ async fn rename_session_rekeys_menu_and_popup_targets_before_they_handle_input()
     )
     .await;
     let _ = next_overlay_frame(&mut control_rx).await;
-    handler
-        .handle_ok(rmux_proto::RenameSessionRequest {
+    TestRequest::send_ok(
+        &handler,
+        rmux_proto::RenameSessionRequest {
             target: beta,
             new_name: gamma.clone(),
-        })
-        .await;
+        },
+    )
+    .await;
     {
         let active_attach = handler.active_attach.lock().await;
         let Some(ClientOverlayState::Popup(popup)) =
@@ -619,8 +614,7 @@ async fn rename_session_rekeys_menu_and_popup_targets_before_they_handle_input()
 }
 
 async fn capture_pane_print(handler: &RequestHandler, target: PaneTarget) -> String {
-    let output = handler
-        .handle_ok(CapturePaneRequest::fixture(target))
+    let output = TestRequest::send_ok(handler, CapturePaneRequest::fixture(target))
         .await
         .output
         .expect("capture-pane -p should return command output");
@@ -733,7 +727,7 @@ async fn display_popup_preserves_process_colours_and_attributes() {
     let handler = RequestHandler::new();
     let alpha = session_name("popup-process-sgr");
     let requester_pid = std::process::id();
-    let mut control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
+    let mut control_rx = SessionSpec::create_attached(&handler, requester_pid, &alpha).await;
 
     run_overlay_command(
         &handler,
@@ -779,7 +773,7 @@ async fn display_popup_resets_process_attributes_at_their_boundaries() {
     let handler = RequestHandler::new();
     let alpha = session_name("popup-process-sgr-reset");
     let requester_pid = std::process::id();
-    let mut control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
+    let mut control_rx = SessionSpec::create_attached(&handler, requester_pid, &alpha).await;
 
     run_overlay_command(
         &handler,
@@ -821,7 +815,7 @@ async fn display_popup_style_only_paints_cells_the_process_left_unstyled() {
     let handler = RequestHandler::new();
     let alpha = session_name("popup-style-defaults");
     let requester_pid = std::process::id();
-    let mut control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
+    let mut control_rx = SessionSpec::create_attached(&handler, requester_pid, &alpha).await;
 
     run_overlay_command(
         &handler,
@@ -861,7 +855,7 @@ async fn display_popup_keeps_wide_characters_whole_when_clipping() {
     let handler = RequestHandler::new();
     let alpha = session_name("popup-unicode-clip");
     let requester_pid = std::process::id();
-    let mut control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
+    let mut control_rx = SessionSpec::create_attached(&handler, requester_pid, &alpha).await;
 
     run_overlay_command(
         &handler,
@@ -905,7 +899,7 @@ async fn display_menu_keyboard_navigation_wraps_around_separators() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
     let requester_pid = std::process::id();
-    let mut control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
+    let mut control_rx = SessionSpec::create_attached(&handler, requester_pid, &alpha).await;
 
     run_overlay_command(
         &handler,
@@ -981,7 +975,7 @@ async fn display_menu_unterminated_sgr_mouse_input_is_bounded() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
     let requester_pid = std::process::id();
-    let mut control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
+    let mut control_rx = SessionSpec::create_attached(&handler, requester_pid, &alpha).await;
 
     run_overlay_command(
         &handler,
@@ -1035,7 +1029,7 @@ async fn display_menu_partial_utf8_input_is_retained_and_recovered() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
     let requester_pid = std::process::id();
-    let mut control_rx = create_attached_session(&handler, requester_pid, Quiet(&alpha)).await;
+    let mut control_rx = SessionSpec::create_attached(&handler, requester_pid, Quiet(&alpha)).await;
     let target = PaneTarget::new(alpha.clone(), 0);
     let before_capture = capture_pane_print(&handler, target.clone()).await;
 
@@ -1087,7 +1081,7 @@ async fn display_menu_extended_key_partial_is_bounded_without_pane_leak() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
     let requester_pid = std::process::id();
-    let mut control_rx = create_attached_session(&handler, requester_pid, Quiet(&alpha)).await;
+    let mut control_rx = SessionSpec::create_attached(&handler, requester_pid, Quiet(&alpha)).await;
     let target = PaneTarget::new(alpha.clone(), 0);
     let before_capture = capture_pane_print(&handler, target.clone()).await;
 
@@ -1145,7 +1139,7 @@ async fn blocked_popup_key_write_times_out_without_stalling_attach_or_server() {
     let handler = RequestHandler::new();
     let alpha = session_name("popup-blocking-writer");
     let requester_pid = std::process::id();
-    let mut control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
+    let mut control_rx = SessionSpec::create_attached(&handler, requester_pid, &alpha).await;
 
     run_overlay_command(
         &handler,
@@ -1226,7 +1220,7 @@ async fn popup_mouse_forward_uses_nonblocking_io_queue() {
     let handler = RequestHandler::new();
     let alpha = session_name("popup-mouse-writer");
     let requester_pid = std::process::id();
-    let mut control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
+    let mut control_rx = SessionSpec::create_attached(&handler, requester_pid, &alpha).await;
 
     run_overlay_command(
         &handler,
@@ -1266,13 +1260,15 @@ async fn popup_menu_paste_uses_nonblocking_io_queue() {
     let handler = RequestHandler::new();
     let alpha = session_name("popup-paste-writer");
     let requester_pid = std::process::id();
-    let mut control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
-    handler
-        .handle_ok(SetBufferRequest {
+    let mut control_rx = SessionSpec::create_attached(&handler, requester_pid, &alpha).await;
+    TestRequest::send_ok(
+        &handler,
+        SetBufferRequest {
             name: None,
             ..Fixture::fixture(("", b"paste-data".to_vec()))
-        })
-        .await;
+        },
+    )
+    .await;
 
     run_overlay_command(
         &handler,
@@ -1313,7 +1309,7 @@ async fn popup_attached_resize_releases_attach_lock_while_pty_resize_blocks() {
     let handler = RequestHandler::new();
     let alpha = session_name("popup-resize-writer");
     let requester_pid = std::process::id();
-    let mut control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
+    let mut control_rx = SessionSpec::create_attached(&handler, requester_pid, &alpha).await;
 
     run_overlay_command(
         &handler,
@@ -1385,7 +1381,7 @@ async fn popup_menu_resize_releases_attach_lock_while_pty_resize_blocks() {
     let handler = RequestHandler::new();
     let alpha = session_name("popup-menu-resize-writer");
     let requester_pid = std::process::id();
-    let mut control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
+    let mut control_rx = SessionSpec::create_attached(&handler, requester_pid, &alpha).await;
     run_overlay_command(
         &handler,
         requester_pid,
@@ -1458,7 +1454,7 @@ async fn popup_drag_resize_releases_attach_lock_while_pty_resize_blocks() {
     let handler = RequestHandler::new();
     let alpha = session_name("popup-drag-resize-writer");
     let requester_pid = std::process::id();
-    let mut control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
+    let mut control_rx = SessionSpec::create_attached(&handler, requester_pid, &alpha).await;
     run_overlay_command(
         &handler,
         requester_pid,
@@ -1539,7 +1535,7 @@ async fn popup_right_click_opens_nested_menu_and_escape_closes_layers() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
     let requester_pid = std::process::id();
-    let mut control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
+    let mut control_rx = SessionSpec::create_attached(&handler, requester_pid, &alpha).await;
 
     run_overlay_command(
         &handler,
@@ -1623,7 +1619,7 @@ async fn nested_popup_menu_close_reroutes_same_chunk_tail_to_popup() {
     let handler = RequestHandler::new();
     let alpha = session_name("popup-menu-tail");
     let requester_pid = std::process::id();
-    let _control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
+    let _control_rx = SessionSpec::create_attached(&handler, requester_pid, &alpha).await;
 
     run_overlay_command(
         &handler,
@@ -1672,12 +1668,13 @@ async fn status_right_click_routes_window_menu_to_clicked_window_target() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
     let requester_pid = std::process::id();
-    let mut control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
+    let mut control_rx = SessionSpec::create_attached(&handler, requester_pid, &alpha).await;
     handler
         .set_option(ScopeSelector::Global, OptionName::Mouse, "on")
         .await;
-    handler
-        .handle_ok(BindKeyRequest {
+    TestRequest::send_ok(
+        &handler,
+        BindKeyRequest {
             note: Some("overlay-status-menu".to_owned()),
             ..Fixture::fixture((
                 "root",
@@ -1695,8 +1692,9 @@ async fn status_right_click_routes_window_menu_to_clicked_window_target() {
                     "display-message inspect",
                 ],
             ))
-        })
-        .await;
+        },
+    )
+    .await;
 
     let (click_x, click_y) = {
         let state = handler.state.lock().await;

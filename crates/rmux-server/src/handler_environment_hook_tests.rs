@@ -12,7 +12,9 @@ use rmux_proto::{
     ShowOptionsRequest, SplitWindowRequest, UnlinkWindowRequest, WindowTarget,
 };
 
-use crate::test_fixtures::{unique_temp_path, wait_until, Fixture, Grouped};
+use crate::test_fixtures::{
+    unique_temp_path, wait_until, Fixture, Grouped, SessionSpec, TestRequest,
+};
 use crate::test_names::session_name;
 use crate::test_shell::{command_quote, sh_quote_path};
 
@@ -47,7 +49,7 @@ async fn global_environment_applies_to_initial_panes_created_after_mutation() {
         })
     );
 
-    handler.create_session("alpha").await;
+    SessionSpec::create(&handler, "alpha").await;
 
     let state = handler.state.lock().await;
     let pane_zero = state
@@ -76,7 +78,7 @@ async fn default_terminal_applies_to_initial_panes_and_yields_to_explicit_term()
         })
     );
 
-    handler.create_session("alpha").await;
+    SessionSpec::create(&handler, "alpha").await;
 
     {
         let state = handler.state.lock().await;
@@ -103,9 +105,7 @@ async fn default_terminal_applies_to_initial_panes_and_yields_to_explicit_term()
         })
     );
 
-    handler
-        .handle_ok(SplitWindowRequest::fixture(session_name("alpha")))
-        .await;
+    TestRequest::send_ok(&handler, SplitWindowRequest::fixture(session_name("alpha"))).await;
 
     let state = handler.state.lock().await;
     let pane_one = state
@@ -114,12 +114,14 @@ async fn default_terminal_applies_to_initial_panes_and_yields_to_explicit_term()
     assert_eq!(pane_one.environment_value("TERM"), Some("tmux-256color"));
     drop(state);
 
-    handler
-        .handle_ok(SplitWindowRequest {
+    TestRequest::send_ok(
+        &handler,
+        SplitWindowRequest {
             environment: Some(vec!["TERM=screen-256color".to_owned()]),
             ..Fixture::fixture(session_name("alpha"))
-        })
-        .await;
+        },
+    )
+    .await;
 
     let state = handler.state.lock().await;
     let pane_two = state
@@ -132,7 +134,7 @@ async fn default_terminal_applies_to_initial_panes_and_yields_to_explicit_term()
 async fn environment_mutations_apply_only_to_future_panes_and_session_values_win() {
     let handler = RequestHandler::new();
     let variable_name = "RMUX_TEST_SESSION_VALUE";
-    handler.create_session("alpha").await;
+    SessionSpec::create(&handler, "alpha").await;
 
     {
         let state = handler.state.lock().await;
@@ -172,9 +174,7 @@ async fn environment_mutations_apply_only_to_future_panes_and_session_values_win
         );
     }
 
-    handler
-        .handle_ok(SplitWindowRequest::fixture(session_name("alpha")))
-        .await;
+    TestRequest::send_ok(&handler, SplitWindowRequest::fixture(session_name("alpha"))).await;
     {
         let state = handler.state.lock().await;
         let pane_one = state
@@ -213,9 +213,7 @@ async fn environment_mutations_apply_only_to_future_panes_and_session_values_win
         );
     }
 
-    handler
-        .handle_ok(SplitWindowRequest::fixture(session_name("alpha")))
-        .await;
+    TestRequest::send_ok(&handler, SplitWindowRequest::fixture(session_name("alpha"))).await;
 
     let state = handler.state.lock().await;
     let pane_two = state
@@ -230,7 +228,7 @@ async fn environment_mutations_apply_only_to_future_panes_and_session_values_win
 #[tokio::test]
 async fn set_hook_updates_the_store_and_one_shot_hooks_are_consumed_on_attach() {
     let handler = RequestHandler::new();
-    handler.create_session("alpha").await;
+    SessionSpec::create(&handler, "alpha").await;
 
     assert_eq!(
         handler
@@ -296,7 +294,7 @@ async fn set_hook_updates_the_store_and_one_shot_hooks_are_consumed_on_attach() 
 #[tokio::test]
 async fn session_closed_hooks_fire_before_session_scope_is_removed() {
     let handler = RequestHandler::new();
-    handler.create_session("alpha").await;
+    SessionSpec::create(&handler, "alpha").await;
     let lifecycle_events = handler
         .take_lifecycle_dispatch_receiver()
         .expect("test owns the lifecycle dispatch receiver");
@@ -308,12 +306,11 @@ async fn session_closed_hooks_fire_before_session_scope_is_removed() {
             .await;
     });
 
-    handler
-        .handle_ok(SetHookRequest::fixture((
-            ScopeSelector::Session(session_name("alpha")),
-            HookName::SessionClosed,
-            "if-shell -F '#{==:#{hook_session_name},alpha}' 'set-buffer -b closed ok' 'set-buffer -b closed bad'",
-        )))
+    TestRequest::send_ok(&handler, SetHookRequest::fixture((
+        ScopeSelector::Session(session_name("alpha")),
+        HookName::SessionClosed,
+        "if-shell -F '#{==:#{hook_session_name},alpha}' 'set-buffer -b closed ok' 'set-buffer -b closed bad'",
+    )))
         .await;
 
     assert_eq!(
@@ -333,8 +330,8 @@ async fn move_window_last_source_session_emits_lifecycle_hooks_in_tmux_3_7b_orde
     let handler = RequestHandler::new();
     let source = session_name("move-lifecycle-source");
     let destination = session_name("move-lifecycle-destination");
-    handler.create_session(&source).await;
-    handler.create_session(&destination).await;
+    SessionSpec::create(&handler, &source).await;
+    SessionSpec::create(&handler, &destination).await;
     let source_session_id = handler.session_id_for_test(&source).await.as_u32();
     let hook_commands = [
         (
@@ -351,22 +348,22 @@ async fn move_window_last_source_session_emits_lifecycle_hooks_in_tmux_3_7b_orde
         ),
     ];
     for (hook, command) in hook_commands {
-        handler
-            .handle_ok(SetHookRequest::fixture((
-                ScopeSelector::Global,
-                hook,
-                command,
-            )))
-            .await;
+        TestRequest::send_ok(
+            &handler,
+            SetHookRequest::fixture((ScopeSelector::Global, hook, command)),
+        )
+        .await;
     }
     let mut events = handler.subscribe_lifecycle_events();
 
-    handler
-        .handle_ok(MoveWindowRequest::fixture((
+    TestRequest::send_ok(
+        &handler,
+        MoveWindowRequest::fixture((
             WindowTarget::with_window(source.clone(), 0),
             WindowTarget::with_window(destination.clone(), 1),
-        )))
-        .await;
+        )),
+    )
+    .await;
 
     let lifecycle = std::iter::from_fn(|| events.try_recv().ok())
         .filter(|event| {
@@ -414,30 +411,30 @@ async fn move_window_last_source_group_emits_tmux_3_7b_lifecycle_batch_order() {
     let owner = session_name("move-group-lifecycle-owner");
     let peer = session_name("move-group-lifecycle-peer");
     let destination = session_name("move-group-lifecycle-destination");
-    handler.create_session(&owner).await;
-    handler.create_session(Grouped(&peer, &owner)).await;
-    handler.create_session(&destination).await;
+    SessionSpec::create(&handler, &owner).await;
+    SessionSpec::create(&handler, Grouped(&peer, &owner)).await;
+    SessionSpec::create(&handler, &destination).await;
     for (hook, command) in [
         (HookName::WindowLinked, "display-message group-linked"),
         (HookName::WindowUnlinked, "display-message group-unlinked"),
         (HookName::SessionClosed, "display-message group-closed"),
     ] {
-        handler
-            .handle_ok(SetHookRequest::fixture((
-                ScopeSelector::Global,
-                hook,
-                command,
-            )))
-            .await;
+        TestRequest::send_ok(
+            &handler,
+            SetHookRequest::fixture((ScopeSelector::Global, hook, command)),
+        )
+        .await;
     }
     let mut events = handler.subscribe_lifecycle_events();
 
-    handler
-        .handle_ok(MoveWindowRequest::fixture((
+    TestRequest::send_ok(
+        &handler,
+        MoveWindowRequest::fixture((
             WindowTarget::with_window(peer.clone(), 0),
             WindowTarget::with_window(destination.clone(), 1),
-        )))
-        .await;
+        )),
+    )
+    .await;
 
     let lifecycle = std::iter::from_fn(|| events.try_recv().ok())
         .filter_map(|event| match &event.event {
@@ -493,32 +490,38 @@ async fn move_window_last_source_session_preserves_local_closed_hook_product_div
     let handler = RequestHandler::new();
     let source = session_name("move-local-hook-source");
     let destination = session_name("move-local-hook-destination");
-    handler.create_session(&source).await;
-    handler.create_session(&destination).await;
+    SessionSpec::create(&handler, &source).await;
+    SessionSpec::create(&handler, &destination).await;
     let global_command = "display-message global-session-closed-fallback";
     let local_command = "display-message local-session-closed";
-    handler
-        .handle_ok(SetHookRequest::fixture((
+    TestRequest::send_ok(
+        &handler,
+        SetHookRequest::fixture((
             ScopeSelector::Global,
             HookName::SessionClosed,
             global_command,
-        )))
-        .await;
-    handler
-        .handle_ok(SetHookRequest::fixture((
+        )),
+    )
+    .await;
+    TestRequest::send_ok(
+        &handler,
+        SetHookRequest::fixture((
             ScopeSelector::Session(source.clone()),
             HookName::SessionClosed,
             local_command,
-        )))
-        .await;
+        )),
+    )
+    .await;
     let mut events = handler.subscribe_lifecycle_events();
 
-    handler
-        .handle_ok(MoveWindowRequest::fixture((
+    TestRequest::send_ok(
+        &handler,
+        MoveWindowRequest::fixture((
             WindowTarget::with_window(source.clone(), 0),
             WindowTarget::with_window(destination, 1),
-        )))
-        .await;
+        )),
+    )
+    .await;
 
     let closed = std::iter::from_fn(|| events.try_recv().ok())
         .find(|event| {
@@ -551,27 +554,29 @@ async fn move_window_last_source_session_preserves_local_closed_hook_product_div
 #[tokio::test]
 async fn kill_pane_does_not_synthesize_pane_exited_hook_like_tmux() {
     let handler = RequestHandler::new();
-    handler.create_session("alpha").await;
+    SessionSpec::create(&handler, "alpha").await;
 
-    handler
-        .handle_ok(SplitWindowRequest::fixture(session_name("alpha")))
-        .await;
+    TestRequest::send_ok(&handler, SplitWindowRequest::fixture(session_name("alpha"))).await;
 
     let pane_target = PaneTarget::with_window(session_name("alpha"), 0, 1);
-    handler
-        .handle_ok(SetHookRequest::fixture((
+    TestRequest::send_ok(
+        &handler,
+        SetHookRequest::fixture((
             ScopeSelector::Pane(pane_target.clone()),
             HookName::PaneExited,
             "set-buffer -b exited bad",
-        )))
-        .await;
+        )),
+    )
+    .await;
 
-    handler
-        .handle_ok(KillPaneRequest {
+    TestRequest::send_ok(
+        &handler,
+        KillPaneRequest {
             target: pane_target,
             kill_all_except: false,
-        })
-        .await;
+        },
+    )
+    .await;
 
     let state = handler.state.lock().await;
     assert!(
@@ -583,7 +588,7 @@ async fn kill_pane_does_not_synthesize_pane_exited_hook_like_tmux() {
 #[tokio::test]
 async fn window_unlinked_hooks_keep_removed_window_name_and_id() {
     let handler = RequestHandler::new();
-    handler.create_session("alpha").await;
+    SessionSpec::create(&handler, "alpha").await;
 
     let window = handler
         .create_window(NewWindowRequest {
@@ -593,18 +598,17 @@ async fn window_unlinked_hooks_keep_removed_window_name_and_id() {
         .await;
     let window_id = handler.window_id_for_test(&window).await.as_u32();
 
-    handler
-        .handle_ok(SetHookRequest::fixture((
-            ScopeSelector::Global,
-            HookName::WindowUnlinked,
-            format!(
-                "if-shell -F '#{{==:#{{hook_window_name}} #{{hook_window}},logs @{window_id}}}' 'set-buffer -b unlinked ok' 'set-buffer -b unlinked bad'"
-            )
-            .as_str(),
-        )))
+    TestRequest::send_ok(&handler, SetHookRequest::fixture((
+        ScopeSelector::Global,
+        HookName::WindowUnlinked,
+        format!(
+            "if-shell -F '#{{==:#{{hook_window_name}} #{{hook_window}},logs @{window_id}}}' 'set-buffer -b unlinked ok' 'set-buffer -b unlinked bad'"
+        )
+        .as_str(),
+    )))
         .await;
 
-    handler.handle_ok(KillWindowRequest::fixture(window)).await;
+    TestRequest::send_ok(&handler, KillWindowRequest::fixture(window)).await;
 
     let state = handler.state.lock().await;
     let (_, content) = state
@@ -618,7 +622,7 @@ async fn window_unlinked_hooks_keep_removed_window_name_and_id() {
 async fn kill_window_renumbered_unlinked_hook_keeps_removed_formats_and_active_target() {
     let handler = RequestHandler::new();
     let alpha = session_name("kill-window-unlinked-target");
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
     for (window_index, name) in [(1, "removed"), (2, "renumbered")] {
         handler
             .create_window(NewWindowRequest {
@@ -645,23 +649,21 @@ async fn kill_window_renumbered_unlinked_hook_keeps_removed_formats_and_active_t
             "on",
         )
         .await;
-    handler
-        .handle_ok(SetHookRequest::fixture((
-            ScopeSelector::Global,
-            HookName::WindowUnlinked,
-            format!(
-                "if-shell -F '#{{==:#{{window_id}} #{{hook_window}} #{{hook_window_name}},{active_window_id} {removed_window_id} removed}}' 'set-buffer -b kill-window-unlinked-target active-removed' 'set-buffer -b kill-window-unlinked-target wrong'"
-            )
-            .as_str(),
-        )))
+    TestRequest::send_ok(&handler, SetHookRequest::fixture((
+        ScopeSelector::Global,
+        HookName::WindowUnlinked,
+        format!(
+            "if-shell -F '#{{==:#{{window_id}} #{{hook_window}} #{{hook_window_name}},{active_window_id} {removed_window_id} removed}}' 'set-buffer -b kill-window-unlinked-target active-removed' 'set-buffer -b kill-window-unlinked-target wrong'"
+        )
+        .as_str(),
+    )))
         .await;
 
-    handler
-        .handle_ok(KillWindowRequest::fixture(WindowTarget::with_window(
-            alpha.clone(),
-            1,
-        )))
-        .await;
+    TestRequest::send_ok(
+        &handler,
+        KillWindowRequest::fixture(WindowTarget::with_window(alpha.clone(), 1)),
+    )
+    .await;
 
     assert_eq!(
         buffer_text(&handler, "kill-window-unlinked-target").await,
@@ -685,8 +687,8 @@ async fn unlink_window_unlinked_hook_targets_the_surviving_window_alias() {
     let handler = RequestHandler::new();
     let alpha = session_name("unlink-window-unlinked-source");
     let keeper = session_name("unlink-window-unlinked-keeper");
-    handler.create_session(&alpha).await;
-    handler.create_session(&keeper).await;
+    SessionSpec::create(&handler, &alpha).await;
+    SessionSpec::create(&handler, &keeper).await;
     let linked = handler
         .create_window(NewWindowRequest {
             name: Some("linked".to_owned()),
@@ -695,29 +697,29 @@ async fn unlink_window_unlinked_hook_targets_the_surviving_window_alias() {
         })
         .await;
     let linked_window_id = handler.window_id_for_test(&linked).await;
-    handler
-        .handle_ok(LinkWindowRequest::fixture((
-            &linked,
-            WindowTarget::with_window(keeper.clone(), 5),
-        )))
-        .await;
-    handler
-        .handle_ok(SetHookRequest::fixture((
-            ScopeSelector::Global,
-            HookName::WindowUnlinked,
-            format!(
-                "if-shell -F '#{{==:#{{window_id}},{linked_window_id}}}' 'set-buffer -b unlink-window-unlinked-target alias' 'set-buffer -b unlink-window-unlinked-target wrong'"
-            )
-            .as_str(),
-        )))
+    TestRequest::send_ok(
+        &handler,
+        LinkWindowRequest::fixture((&linked, WindowTarget::with_window(keeper.clone(), 5))),
+    )
+    .await;
+    TestRequest::send_ok(&handler, SetHookRequest::fixture((
+        ScopeSelector::Global,
+        HookName::WindowUnlinked,
+        format!(
+            "if-shell -F '#{{==:#{{window_id}},{linked_window_id}}}' 'set-buffer -b unlink-window-unlinked-target alias' 'set-buffer -b unlink-window-unlinked-target wrong'"
+        )
+        .as_str(),
+    )))
         .await;
 
-    handler
-        .handle_ok(UnlinkWindowRequest {
+    TestRequest::send_ok(
+        &handler,
+        UnlinkWindowRequest {
             target: linked,
             kill_if_last: false,
-        })
-        .await;
+        },
+    )
+    .await;
 
     assert_eq!(
         buffer_text(&handler, "unlink-window-unlinked-target").await,
@@ -745,7 +747,7 @@ async fn unlink_window_unlinked_hook_targets_the_surviving_window_alias() {
 async fn unlink_window_kill_if_last_renumbered_hook_keeps_removed_formats_and_active_target() {
     let handler = RequestHandler::new();
     let alpha = session_name("unlink-kill-unlinked-target");
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
     for window_index in [1, 2] {
         handler
             .create_window(NewWindowRequest {
@@ -770,23 +772,24 @@ async fn unlink_window_kill_if_last_renumbered_hook_keeps_removed_formats_and_ac
             "on",
         )
         .await;
-    handler
-        .handle_ok(SetHookRequest::fixture((
-            ScopeSelector::Global,
-            HookName::WindowUnlinked,
-            format!(
-                "if-shell -F '#{{==:#{{window_id}} #{{hook_window}} #{{hook_window_name}},{active_window_id} {removed_window_id} window-1}}' 'set-buffer -b unlink-kill-unlinked-target active-removed' 'set-buffer -b unlink-kill-unlinked-target wrong'"
-            )
-            .as_str(),
-        )))
+    TestRequest::send_ok(&handler, SetHookRequest::fixture((
+        ScopeSelector::Global,
+        HookName::WindowUnlinked,
+        format!(
+            "if-shell -F '#{{==:#{{window_id}} #{{hook_window}} #{{hook_window_name}},{active_window_id} {removed_window_id} window-1}}' 'set-buffer -b unlink-kill-unlinked-target active-removed' 'set-buffer -b unlink-kill-unlinked-target wrong'"
+        )
+        .as_str(),
+    )))
         .await;
 
-    handler
-        .handle_ok(UnlinkWindowRequest {
+    TestRequest::send_ok(
+        &handler,
+        UnlinkWindowRequest {
             target: WindowTarget::with_window(alpha.clone(), 1),
             kill_if_last: true,
-        })
-        .await;
+        },
+    )
+    .await;
 
     assert_eq!(
         buffer_text(&handler, "unlink-kill-unlinked-target").await,
@@ -799,7 +802,7 @@ async fn unlink_window_kill_if_last_renumbered_hook_keeps_removed_formats_and_ac
 async fn relative_move_window_unlinked_hook_follows_the_moved_window_identity() {
     let handler = RequestHandler::new();
     let alpha = session_name("relative-move-unlinked");
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
     for (window_index, name) in [(1, "middle"), (2, "moved")] {
         handler
             .create_window(NewWindowRequest {
@@ -812,27 +815,28 @@ async fn relative_move_window_unlinked_hook_follows_the_moved_window_identity() 
     let moved_window_id = handler
         .window_id_for_test(&WindowTarget::with_window(alpha.clone(), 2))
         .await;
-    handler
-        .handle_ok(SetHookRequest::fixture((
-            ScopeSelector::Global,
-            HookName::WindowUnlinked,
-            format!(
-                "if-shell -F '#{{==:#{{hook_window}} #{{window_index}} #{{window_id}},{} 0 {}}}' 'set-buffer -b relative-move-unlinked ok' 'set-buffer -b relative-move-unlinked bad'",
-                moved_window_id, moved_window_id
-            )
-            .as_str(),
-        )))
+    TestRequest::send_ok(&handler, SetHookRequest::fixture((
+        ScopeSelector::Global,
+        HookName::WindowUnlinked,
+        format!(
+            "if-shell -F '#{{==:#{{hook_window}} #{{window_index}} #{{window_id}},{} 0 {}}}' 'set-buffer -b relative-move-unlinked ok' 'set-buffer -b relative-move-unlinked bad'",
+            moved_window_id, moved_window_id
+        )
+        .as_str(),
+    )))
         .await;
 
-    handler
-        .handle_ok(MoveWindowRequest {
+    TestRequest::send_ok(
+        &handler,
+        MoveWindowRequest {
             before: true,
             ..Fixture::fixture((
                 WindowTarget::with_window(alpha.clone(), 2),
                 WindowTarget::with_window(alpha.clone(), 0),
             ))
-        })
-        .await;
+        },
+    )
+    .await;
 
     handler
         .wait_for_buffer("relative-move-unlinked", "ok")
@@ -851,7 +855,7 @@ async fn relative_move_window_unlinked_hook_follows_the_moved_window_identity() 
 #[tokio::test]
 async fn kill_session_emits_window_unlinked_for_removed_windows() {
     let handler = RequestHandler::new();
-    handler.create_session("alpha").await;
+    SessionSpec::create(&handler, "alpha").await;
 
     let window = handler
         .create_window(NewWindowRequest {
@@ -861,20 +865,17 @@ async fn kill_session_emits_window_unlinked_for_removed_windows() {
         .await;
     let window_id = handler.window_id_for_test(&window).await.as_u32();
 
-    handler
-        .handle_ok(SetHookRequest::fixture((
-            ScopeSelector::Global,
-            HookName::WindowUnlinked,
-            format!(
-                "if-shell -F '#{{==:#{{hook_window_name}} #{{hook_window}},logs @{window_id}}}' 'set-buffer -b kill-session-unlinked ok' 'set-buffer -b kill-session-unlinked bad'"
-            )
-            .as_str(),
-        )))
+    TestRequest::send_ok(&handler, SetHookRequest::fixture((
+        ScopeSelector::Global,
+        HookName::WindowUnlinked,
+        format!(
+            "if-shell -F '#{{==:#{{hook_window_name}} #{{hook_window}},logs @{window_id}}}' 'set-buffer -b kill-session-unlinked ok' 'set-buffer -b kill-session-unlinked bad'"
+        )
+        .as_str(),
+    )))
         .await;
 
-    handler
-        .handle_ok(KillSessionRequest::fixture("alpha"))
-        .await;
+    TestRequest::send_ok(&handler, KillSessionRequest::fixture("alpha")).await;
 
     let state = handler.state.lock().await;
     let (_, content) = state
@@ -889,21 +890,22 @@ async fn unlink_only_linked_window_runs_window_hook_before_session_cleanup() {
     let handler = RequestHandler::new();
     let owner = session_name("unlink-order-owner");
     let alias = session_name("unlink-order-alias");
-    handler.create_session(&owner).await;
-    handler.create_session(&alias).await;
+    SessionSpec::create(&handler, &owner).await;
+    SessionSpec::create(&handler, &alias).await;
 
-    handler
-        .handle_ok(LinkWindowRequest::fixture((
+    TestRequest::send_ok(
+        &handler,
+        LinkWindowRequest::fixture((
             WindowTarget::with_window(owner.clone(), 0),
             WindowTarget::with_window(alias.clone(), 9),
-        )))
-        .await;
-    handler
-        .handle_ok(KillWindowRequest::fixture(WindowTarget::with_window(
-            alias.clone(),
-            0,
-        )))
-        .await;
+        )),
+    )
+    .await;
+    TestRequest::send_ok(
+        &handler,
+        KillWindowRequest::fixture(WindowTarget::with_window(alias.clone(), 0)),
+    )
+    .await;
     assert_eq!(
         handler
             .handle(Request::SetEnvironment(Box::new(SetEnvironmentRequest {
@@ -920,30 +922,36 @@ async fn unlink_only_linked_window_runs_window_hook_before_session_cleanup() {
             name: "RMUX_UNLINK_HOOK_DEPENDENCY".to_owned(),
         })
     );
-    handler
-        .handle_ok(SetHookRequest::fixture((
+    TestRequest::send_ok(
+        &handler,
+        SetHookRequest::fixture((
             ScopeSelector::Global,
             HookName::WindowUnlinked,
             "if-shell -F '#{==:#{RMUX_UNLINK_HOOK_DEPENDENCY},alive}' \
-             'set-buffer -a -b unlink-hook-order window-saw-alive,' \
-             'set-buffer -a -b unlink-hook-order window-saw-missing,'",
-        )))
-        .await;
-    handler
-        .handle_ok(SetHookRequest::fixture((
+         'set-buffer -a -b unlink-hook-order window-saw-alive,' \
+         'set-buffer -a -b unlink-hook-order window-saw-missing,'",
+        )),
+    )
+    .await;
+    TestRequest::send_ok(
+        &handler,
+        SetHookRequest::fixture((
             ScopeSelector::Global,
             HookName::SessionClosed,
             "run-shell -C 'set-buffer -a -b unlink-hook-order session-cleanup, ; \
-             set-environment -gu RMUX_UNLINK_HOOK_DEPENDENCY'",
-        )))
-        .await;
+         set-environment -gu RMUX_UNLINK_HOOK_DEPENDENCY'",
+        )),
+    )
+    .await;
 
-    handler
-        .handle_ok(UnlinkWindowRequest {
+    TestRequest::send_ok(
+        &handler,
+        UnlinkWindowRequest {
             target: WindowTarget::with_window(alias.clone(), 9),
             kill_if_last: false,
-        })
-        .await;
+        },
+    )
+    .await;
 
     let observed = wait_until(
         Duration::from_secs(5),
@@ -972,28 +980,32 @@ async fn unlink_only_linked_window_runs_window_hook_before_session_cleanup() {
 #[tokio::test]
 async fn kill_session_emits_session_closed_before_window_unlinked() {
     let handler = RequestHandler::new();
-    handler.create_session("alpha").await;
-    handler.create_session("keeper").await;
+    SessionSpec::create(&handler, "alpha").await;
+    SessionSpec::create(&handler, "keeper").await;
     handler
         .create_window(NewWindowRequest {
             name: Some("logs".to_owned()),
             ..Fixture::fixture("alpha")
         })
         .await;
-    handler
-        .handle_ok(SetHookRequest::fixture((
+    TestRequest::send_ok(
+        &handler,
+        SetHookRequest::fixture((
             ScopeSelector::Global,
             HookName::SessionClosed,
             "set-buffer -a -b kill-session-order session-closed,",
-        )))
-        .await;
-    handler
-        .handle_ok(SetHookRequest::fixture((
+        )),
+    )
+    .await;
+    TestRequest::send_ok(
+        &handler,
+        SetHookRequest::fixture((
             ScopeSelector::Global,
             HookName::WindowUnlinked,
             "set-buffer -a -b kill-session-order unlinked,",
-        )))
-        .await;
+        )),
+    )
+    .await;
 
     assert_eq!(
         handler
@@ -1010,30 +1022,36 @@ async fn kill_session_emits_session_closed_before_window_unlinked() {
 #[tokio::test]
 async fn last_pane_shell_exit_emits_window_unlinked_before_session_closed() {
     let handler = RequestHandler::new();
-    handler.create_session("alpha").await;
-    handler.create_session("keeper").await;
-    handler
-        .handle_ok(SetHookRequest::fixture((
+    SessionSpec::create(&handler, "alpha").await;
+    SessionSpec::create(&handler, "keeper").await;
+    TestRequest::send_ok(
+        &handler,
+        SetHookRequest::fixture((
             ScopeSelector::Global,
             HookName::WindowUnlinked,
             "set-buffer -a -b last-pane-order unlinked,",
-        )))
-        .await;
-    handler
-        .handle_ok(SetHookRequest::fixture((
+        )),
+    )
+    .await;
+    TestRequest::send_ok(
+        &handler,
+        SetHookRequest::fixture((
             ScopeSelector::Global,
             HookName::SessionClosed,
             "set-buffer -a -b last-pane-order session-closed,",
-        )))
-        .await;
+        )),
+    )
+    .await;
     let mut lifecycle_events = handler.subscribe_lifecycle_events();
 
-    handler
-        .handle_ok(RespawnPaneRequest {
+    TestRequest::send_ok(
+        &handler,
+        RespawnPaneRequest {
             process_command: Some(ProcessCommand::Shell("exit 0".to_owned())),
             ..Fixture::fixture(PaneTarget::new(session_name("alpha"), 0))
-        })
-        .await;
+        },
+    )
+    .await;
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
@@ -1059,22 +1077,26 @@ async fn last_pane_shell_exit_emits_window_unlinked_before_session_closed() {
 #[tokio::test]
 async fn kill_server_emits_session_closed_without_window_unlinked() {
     let handler = RequestHandler::new();
-    handler.create_session("alpha").await;
-    handler.create_session("beta").await;
-    handler
-        .handle_ok(SetHookRequest::fixture((
+    SessionSpec::create(&handler, "alpha").await;
+    SessionSpec::create(&handler, "beta").await;
+    TestRequest::send_ok(
+        &handler,
+        SetHookRequest::fixture((
             ScopeSelector::Global,
             HookName::SessionClosed,
             "set-buffer -a -b kill-server-hooks session-closed,",
-        )))
-        .await;
-    handler
-        .handle_ok(SetHookRequest::fixture((
+        )),
+    )
+    .await;
+    TestRequest::send_ok(
+        &handler,
+        SetHookRequest::fixture((
             ScopeSelector::Global,
             HookName::WindowUnlinked,
             "set-buffer -a -b kill-server-hooks unlinked,",
-        )))
-        .await;
+        )),
+    )
+    .await;
 
     assert_eq!(
         handler
@@ -1091,7 +1113,7 @@ async fn kill_server_emits_session_closed_without_window_unlinked() {
 #[tokio::test]
 async fn self_unsetting_hook_payloads_are_normalized_to_one_shot_shell_commands() {
     let handler = RequestHandler::new();
-    handler.create_session("alpha").await;
+    SessionSpec::create(&handler, "alpha").await;
 
     assert_eq!(
         handler
@@ -1148,7 +1170,7 @@ async fn session_scoped_mutations_require_live_sessions_and_are_cleared_on_kill(
         })
     );
 
-    handler.create_session("alpha").await;
+    SessionSpec::create(&handler, "alpha").await;
     handler
         .set_option(
             ScopeSelector::Session(session_name("alpha")),
@@ -1156,16 +1178,18 @@ async fn session_scoped_mutations_require_live_sessions_and_are_cleared_on_kill(
             "off",
         )
         .await;
-    handler
-        .handle_ok(SetEnvironmentRequest {
+    TestRequest::send_ok(
+        &handler,
+        SetEnvironmentRequest {
             scope: ScopeSelector::Session(session_name("alpha")),
             name: "TERM".to_owned(),
             value: "screen".to_owned(),
             mode: None,
             hidden: false,
             format: false,
-        })
-        .await;
+        },
+    )
+    .await;
     assert_eq!(
         handler
             .handle(Request::KillSession(KillSessionRequest::fixture("alpha")))
@@ -1173,7 +1197,7 @@ async fn session_scoped_mutations_require_live_sessions_and_are_cleared_on_kill(
         Response::KillSession(KillSessionResponse { existed: true })
     );
 
-    handler.create_session("alpha").await;
+    SessionSpec::create(&handler, "alpha").await;
     {
         let state = handler.state.lock().await;
         assert_eq!(
@@ -1199,12 +1223,11 @@ async fn session_scoped_mutations_require_live_sessions_and_are_cleared_on_kill(
 async fn after_show_options_runs_without_triggering_nested_notify_hooks() {
     let handler = RequestHandler::new();
 
-    handler
-        .handle_ok(SetHookRequest::fixture((
-            ScopeSelector::Global,
-            HookName::AfterShowOptions,
-            "if-shell -F '#{==:#{hook},after-show-options}' 'set-buffer -b observed ok' 'set-buffer -b observed bad'",
-        )))
+    TestRequest::send_ok(&handler, SetHookRequest::fixture((
+        ScopeSelector::Global,
+        HookName::AfterShowOptions,
+        "if-shell -F '#{==:#{hook},after-show-options}' 'set-buffer -b observed ok' 'set-buffer -b observed bad'",
+    )))
         .await;
     assert!(matches!(
         handler
@@ -1249,19 +1272,19 @@ async fn split_window_runs_after_hook_once() {
     let handler = RequestHandler::new();
     let output_path = unique_temp_path("after-split-window");
     let shell_command = format!("printf x >> {}", sh_quote_path(&output_path));
-    handler.create_session("alpha").await;
+    SessionSpec::create(&handler, "alpha").await;
 
-    handler
-        .handle_ok(SetHookRequest::fixture((
+    TestRequest::send_ok(
+        &handler,
+        SetHookRequest::fixture((
             ScopeSelector::Global,
             HookName::AfterSplitWindow,
             format!("run-shell {}", command_quote(&shell_command)).as_str(),
-        )))
-        .await;
+        )),
+    )
+    .await;
 
-    handler
-        .handle_ok(SplitWindowRequest::fixture(session_name("alpha")))
-        .await;
+    TestRequest::send_ok(&handler, SplitWindowRequest::fixture(session_name("alpha"))).await;
 
     assert_eq!(
         fs::read_to_string(&output_path).expect("split hook output exists"),
@@ -1273,14 +1296,13 @@ async fn split_window_runs_after_hook_once() {
 #[tokio::test]
 async fn window_linked_hooks_receive_session_and_window_format_context() {
     let handler = RequestHandler::new();
-    handler.create_session("alpha").await;
+    SessionSpec::create(&handler, "alpha").await;
 
-    handler
-        .handle_ok(SetHookRequest::fixture((
-            ScopeSelector::Global,
-            HookName::WindowLinked,
-            "if-shell -F '#{==:#{hook_session} #{hook_window},$0 @1}' 'set-buffer -b linked ok' 'set-buffer -b linked bad'",
-        )))
+    TestRequest::send_ok(&handler, SetHookRequest::fixture((
+        ScopeSelector::Global,
+        HookName::WindowLinked,
+        "if-shell -F '#{==:#{hook_session} #{hook_window},$0 @1}' 'set-buffer -b linked ok' 'set-buffer -b linked bad'",
+    )))
         .await;
 
     let window = handler
@@ -1309,15 +1331,17 @@ async fn window_linked_hooks_receive_session_and_window_format_context() {
 #[tokio::test]
 async fn hook_commands_do_not_pre_expand_set_buffer_arguments() {
     let handler = RequestHandler::new();
-    handler.create_session("alpha").await;
+    SessionSpec::create(&handler, "alpha").await;
 
-    handler
-        .handle_ok(SetHookRequest::fixture((
+    TestRequest::send_ok(
+        &handler,
+        SetHookRequest::fixture((
             ScopeSelector::Global,
             HookName::AfterNewWindow,
             "set-buffer -b hook '#{hook} #{hook_window_name}'",
-        )))
-        .await;
+        )),
+    )
+    .await;
 
     handler
         .create_window(NewWindowRequest {
@@ -1341,7 +1365,7 @@ async fn hook_commands_do_not_pre_expand_set_buffer_arguments() {
 #[tokio::test]
 async fn spawned_pane_environment_contains_pane_id_with_percent_prefix() {
     let handler = RequestHandler::new();
-    handler.create_session("alpha").await;
+    SessionSpec::create(&handler, "alpha").await;
 
     let state = handler.state.lock().await;
     let pane_zero = state
@@ -1368,7 +1392,7 @@ async fn spawned_pane_environment_contains_pane_id_with_percent_prefix() {
 #[tokio::test]
 async fn spawned_pane_environment_contains_mux_socket_pid_session_format() {
     let handler = RequestHandler::new();
-    handler.create_session("alpha").await;
+    SessionSpec::create(&handler, "alpha").await;
 
     let state = handler.state.lock().await;
     let pane_zero = state
@@ -1398,24 +1422,28 @@ async fn spawned_pane_environment_contains_mux_socket_pid_session_format() {
 async fn environment_override_layering_session_then_override_then_rmux_pane() {
     let handler = RequestHandler::new();
 
-    handler
-        .handle_ok(SetEnvironmentRequest {
+    TestRequest::send_ok(
+        &handler,
+        SetEnvironmentRequest {
             scope: ScopeSelector::Global,
             name: "MY_VAR".to_owned(),
             value: "global".to_owned(),
             mode: None,
             hidden: false,
             format: false,
-        })
-        .await;
+        },
+    )
+    .await;
 
     // Create session with -e overrides: MY_VAR should be overridden by -e.
-    handler
-        .create_session(NewSessionRequest {
+    SessionSpec::create(
+        &handler,
+        NewSessionRequest {
             environment: Some(vec!["MY_VAR=override".to_owned()]),
             ..Fixture::fixture("alpha")
-        })
-        .await;
+        },
+    )
+    .await;
 
     let state = handler.state.lock().await;
     let pane_zero = state
@@ -1448,20 +1476,23 @@ async fn new_session_ext_client_environment_respects_tmux_precedence() {
     let session = session_name("client-env");
 
     for name in ["RMUX_GLOBAL_ENV_SENTINEL", "RMUX_OVERRIDE_ENV_SENTINEL"] {
-        handler
-            .handle_ok(SetEnvironmentRequest {
+        TestRequest::send_ok(
+            &handler,
+            SetEnvironmentRequest {
                 scope: ScopeSelector::Global,
                 name: name.to_owned(),
                 value: "from-server".to_owned(),
                 mode: None,
                 hidden: false,
                 format: false,
-            })
-            .await;
+            },
+        )
+        .await;
     }
 
-    handler
-        .create_session(NewSessionExtRequest {
+    SessionSpec::create(
+        &handler,
+        NewSessionExtRequest {
             environment: Some(vec![
                 "RMUX_OVERRIDE_ENV_SENTINEL=from-explicit".to_owned(),
                 "RMUX_CLIENT_ENV_SENTINEL=from-explicit".to_owned(),
@@ -1475,8 +1506,9 @@ async fn new_session_ext_client_environment_respects_tmux_precedence() {
                 "RMUX_CLIENT_ONLY_ENV_SENTINEL=from-client".to_owned(),
             ]),
             ..Fixture::fixture(&session)
-        })
-        .await;
+        },
+    )
+    .await;
 
     let state = handler.state.lock().await;
     let pane_zero = state
@@ -1524,16 +1556,18 @@ async fn new_session_ext_skip_environment_update_keeps_client_spawn_environment(
     let handler = RequestHandler::new();
     let session = session_name("skip-client-env");
 
-    handler
-        .create_session(NewSessionExtRequest {
+    SessionSpec::create(
+        &handler,
+        NewSessionExtRequest {
             client_environment: Some(vec![
                 "PATH=/tmp/rmux-client-bin:/usr/bin".to_owned(),
                 "RMUX_CLIENT_ONLY_ENV_SENTINEL=from-client".to_owned(),
             ]),
             skip_environment_update: true,
             ..Fixture::fixture(&session)
-        })
-        .await;
+        },
+    )
+    .await;
 
     let state = handler.state.lock().await;
     let pane_zero = state

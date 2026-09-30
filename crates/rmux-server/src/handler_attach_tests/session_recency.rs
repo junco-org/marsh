@@ -8,6 +8,7 @@
 //! survive, and then asserts the reader's own outcome rather than the token.
 
 use super::*;
+use crate::test_fixtures::{SessionSpec, TestRequest};
 
 /// One arbitrary but fixed second shared by every session in a fixture.
 const PINNED_SECOND: i64 = 1_785_500_000;
@@ -17,7 +18,7 @@ const PINNED_SECOND: i64 = 1_785_500_000;
 async fn same_second_handler(creation_order: &[&str], use_order: &[&str]) -> RequestHandler {
     let handler = RequestHandler::new();
     for name in creation_order {
-        handler.create_session(*name).await;
+        SessionSpec::create(&handler, *name).await;
     }
     let mut state = handler.state.lock().await;
     for name in use_order {
@@ -101,7 +102,7 @@ async fn targetless_attach_ranks_a_later_creation_above_an_earlier_attach() {
     // afterwards. Attach history must not outrank the later lifetime event.
     let handler = RequestHandler::new();
     for name in ["m03", "a01"] {
-        handler.create_session(name).await;
+        SessionSpec::create(&handler, name).await;
     }
     {
         let mut state = handler.state.lock().await;
@@ -111,7 +112,7 @@ async fn targetless_attach_ranks_a_later_creation_above_an_earlier_attach() {
             .expect("a01 exists")
             .touch_attached();
     }
-    handler.create_session("z99").await;
+    SessionSpec::create(&handler, "z99").await;
     // Targetless selection prefers sessions whose deferred pane process is
     // live before it ranks by recency. Equalize that independent precondition
     // so this fixture measures only the lifetime order it names.
@@ -153,9 +154,7 @@ async fn destroy_switch_ranks_the_all_session_candidate_set_by_recency() {
         .await;
 
     let mut control_rx = handler.attach_client(141_001, "source").await;
-    handler
-        .handle_ok(KillSessionRequest::fixture("source"))
-        .await;
+    TestRequest::send_ok(&handler, KillSessionRequest::fixture("source")).await;
 
     let target = recv_switch_target(&mut control_rx, "detach-on-destroy off").await;
     assert_eq!(target.session_name, session_name("m03"));
@@ -172,9 +171,7 @@ async fn destroy_switch_establishes_its_detached_candidate_set_before_ranking_it
 
     let _occupied_rx = handler.attach_client(142_001, "c03").await;
     let mut control_rx = handler.attach_client(142_002, "source").await;
-    handler
-        .handle_ok(KillSessionRequest::fixture("source"))
-        .await;
+    TestRequest::send_ok(&handler, KillSessionRequest::fixture("source")).await;
 
     let target = recv_switch_target(&mut control_rx, "detach-on-destroy no-detached").await;
     assert_eq!(target.session_name, session_name("b02"));

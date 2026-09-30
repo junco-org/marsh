@@ -9,8 +9,8 @@ use rmux_proto::{
 use super::super::format_print::print_target_format;
 use super::super::target_resolution::{connect_cli, response_failure};
 use super::super::{
-    ExitFailure, cli_target_actions_enabled, resolve_pane_target_or_current,
-    target_action_needs_legacy_retry, unexpected_response,
+    CommandTarget, ExitFailure, cli_target_actions_enabled, target_action_needs_legacy_retry,
+    unexpected_response,
 };
 use crate::cli_args::SplitWindowArgs;
 use crate::cli_response::tmux_cli_error_message;
@@ -84,7 +84,7 @@ fn run_split_window_legacy(
 ) -> Result<i32, ExitFailure> {
     let direction = args.direction();
     let mut connection = connect_cli(socket_path)?;
-    let target = SplitWindowTarget::Pane(resolve_pane_target_or_current(
+    let target = SplitWindowTarget::Pane(PaneTarget::resolve(
         &mut connection,
         args.target.as_ref(),
         "split-window",

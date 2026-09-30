@@ -3,21 +3,24 @@ use super::*;
 use rmux_proto::UnlinkWindowRequest;
 
 use crate::handler::scripting_support::install_queue_exact_target_capture_pause;
+use crate::test_fixtures::{SessionSpec, TestRequest};
 
 async fn replace_window_slot(
     handler: &RequestHandler,
     source: &SessionName,
     target: &SessionName,
 ) -> rmux_core::WindowId {
-    handler
-        .handle_ok(LinkWindowRequest {
+    TestRequest::send_ok(
+        handler,
+        LinkWindowRequest {
             kill_destination: true,
             ..Fixture::fixture((
                 WindowTarget::with_window(source.clone(), 0),
                 WindowTarget::with_window(target.clone(), 0),
             ))
-        })
-        .await;
+        },
+    )
+    .await;
     handler
         .state
         .lock()
@@ -33,12 +36,8 @@ async fn replace_window_slot(
 async fn exact_window_and_pane_targets_reject_post_parse_slot_replacement() {
     for command_name in ["rename-window", "kill-pane"] {
         let handler = RequestHandler::new();
-        let source = handler
-            .create_session(format!("exact-{command_name}-source"))
-            .await;
-        let target = handler
-            .create_session(format!("exact-{command_name}-target"))
-            .await;
+        let source = SessionSpec::create(&handler, format!("exact-{command_name}-source")).await;
+        let target = SessionSpec::create(&handler, format!("exact-{command_name}-target")).await;
         let (selector, original_window_id) = {
             let state = handler.state.lock().await;
             let window = state
@@ -102,7 +101,7 @@ async fn exact_window_and_pane_targets_reject_post_parse_slot_replacement() {
 #[tokio::test]
 async fn exact_pane_target_rejects_respawned_output_generation() {
     let handler = RequestHandler::new();
-    let target_session = handler.create_session("exact-pane-respawn").await;
+    let target_session = SessionSpec::create(&handler, "exact-pane-respawn").await;
     let target = PaneTarget::with_window(target_session.clone(), 0, 0);
     let (pane_id, initial_generation) = {
         let state = handler.state.lock().await;
@@ -131,12 +130,14 @@ async fn exact_pane_target_rejects_respawned_output_generation() {
     });
 
     pause.wait_until_reached().await;
-    handler
-        .handle_ok(RespawnPaneRequest {
+    TestRequest::send_ok(
+        &handler,
+        RespawnPaneRequest {
             command: Some(vec![crate::test_shell::stdin_discard_command()]),
             ..Fixture::fixture(&target)
-        })
-        .await;
+        },
+    )
+    .await;
     let replacement_generation = {
         let state = handler.state.lock().await;
         assert_eq!(
@@ -237,14 +238,16 @@ async fn capture_initializes_only_the_addressed_lazy_occurrence() {
 #[tokio::test]
 async fn unlink_relink_of_the_same_window_id_is_still_rejected() {
     let handler = RequestHandler::new();
-    let owner = handler.create_session("exact-target-owner").await;
-    let alias = handler.create_session("exact-target-alias").await;
-    handler
-        .handle_ok(LinkWindowRequest::fixture((
+    let owner = SessionSpec::create(&handler, "exact-target-owner").await;
+    let alias = SessionSpec::create(&handler, "exact-target-alias").await;
+    TestRequest::send_ok(
+        &handler,
+        LinkWindowRequest::fixture((
             WindowTarget::with_window(owner.clone(), 0),
             WindowTarget::with_window(alias.clone(), 1),
-        )))
-        .await;
+        )),
+    )
+    .await;
     let window_id = handler
         .state
         .lock()
@@ -267,18 +270,22 @@ async fn unlink_relink_of_the_same_window_id_is_still_rejected() {
     });
 
     pause.wait_until_reached().await;
-    handler
-        .handle_ok(UnlinkWindowRequest {
+    TestRequest::send_ok(
+        &handler,
+        UnlinkWindowRequest {
             target: WindowTarget::with_window(alias.clone(), 1),
             kill_if_last: false,
-        })
-        .await;
-    handler
-        .handle_ok(LinkWindowRequest::fixture((
+        },
+    )
+    .await;
+    TestRequest::send_ok(
+        &handler,
+        LinkWindowRequest::fixture((
             WindowTarget::with_window(owner.clone(), 0),
             WindowTarget::with_window(alias.clone(), 1),
-        )))
-        .await;
+        )),
+    )
+    .await;
     pause.release.notify_one();
 
     let error = tokio::time::timeout(Duration::from_secs(2), queued)
@@ -303,8 +310,8 @@ async fn unlink_relink_of_the_same_window_id_is_still_rejected() {
 #[tokio::test]
 async fn control_queue_uses_the_same_exact_target_guard() {
     let handler = RequestHandler::new();
-    let source = handler.create_session("exact-control-source").await;
-    let target = handler.create_session("exact-control-target").await;
+    let source = SessionSpec::create(&handler, "exact-control-source").await;
+    let target = SessionSpec::create(&handler, "exact-control-target").await;
     let selector = handler
         .state
         .lock()
@@ -358,8 +365,8 @@ async fn control_queue_uses_the_same_exact_target_guard() {
 #[tokio::test]
 async fn source_file_queue_uses_the_same_exact_target_guard() {
     let handler = RequestHandler::new();
-    let source = handler.create_session("exact-source-file-source").await;
-    let target = handler.create_session("exact-source-file-target").await;
+    let source = SessionSpec::create(&handler, "exact-source-file-source").await;
+    let target = SessionSpec::create(&handler, "exact-source-file-target").await;
     let selector = handler
         .state
         .lock()
@@ -415,8 +422,8 @@ async fn source_file_queue_uses_the_same_exact_target_guard() {
 #[tokio::test]
 async fn hook_command_path_uses_the_same_exact_target_guard() {
     let handler = RequestHandler::new();
-    let source = handler.create_session("exact-hook-source").await;
-    let target = handler.create_session("exact-hook-target").await;
+    let source = SessionSpec::create(&handler, "exact-hook-source").await;
+    let target = SessionSpec::create(&handler, "exact-hook-target").await;
     let selector = handler
         .state
         .lock()

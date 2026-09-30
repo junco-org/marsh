@@ -2,6 +2,7 @@ use super::*;
 
 use super::super::mode_tree_model::{ModeTreeActionIdentity, ModeTreeDeferredAction};
 use super::super::mode_tree_order::session_item_id;
+use crate::test_fixtures::{SessionSpec, TestRequest};
 
 struct DeferredTreeFixture {
     handler: RequestHandler,
@@ -15,10 +16,10 @@ struct DeferredTreeFixture {
 
 async fn deferred_tree_fixture(label: &str, pid_offset: u32) -> DeferredTreeFixture {
     let handler = RequestHandler::new();
-    let host_name = handler.create_session(format!("{label}-host")).await;
-    let first_name = handler.create_session(format!("{label}-first")).await;
+    let host_name = SessionSpec::create(&handler, format!("{label}-host")).await;
+    let first_name = SessionSpec::create(&handler, format!("{label}-first")).await;
     let first_id = handler.session_id_for_test(&first_name).await;
-    let second_name = handler.create_session(format!("{label}-second")).await;
+    let second_name = SessionSpec::create(&handler, format!("{label}-second")).await;
     let second_id = handler.session_id_for_test(&second_name).await;
 
     let attach_pid = std::process::id().saturating_add(pid_offset);
@@ -144,13 +145,15 @@ struct DeferredPaneFixture {
 
 async fn deferred_pane_fixture(label: &str, pid_offset: u32) -> DeferredPaneFixture {
     let handler = RequestHandler::new();
-    let session_name = handler.create_session(label).await;
-    handler
-        .handle_ok(SplitWindowRequest {
+    let session_name = SessionSpec::create(&handler, label).await;
+    TestRequest::send_ok(
+        &handler,
+        SplitWindowRequest {
             direction: SplitDirection::Horizontal,
             ..Fixture::fixture(&session_name)
-        })
-        .await;
+        },
+    )
+    .await;
     let (host_pane_id, target, target_pane_id) = {
         let state = handler.state.lock().await;
         let window = state
@@ -247,10 +250,11 @@ async fn confirmed_pane_kill_rejects_a_respawned_output_generation() {
         .await
         .expect("confirmed kill reaches deferred commit");
 
-    fixture
-        .handler
-        .handle_ok(rmux_proto::RespawnPaneRequest::fixture(&fixture.target))
-        .await;
+    TestRequest::send_ok(
+        &fixture.handler,
+        rmux_proto::RespawnPaneRequest::fixture(&fixture.target),
+    )
+    .await;
     pause.release.notify_one();
 
     assert!(

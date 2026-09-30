@@ -11,7 +11,7 @@ use rmux_proto::{
 use tokio::sync::{broadcast, mpsc};
 use tokio::time::{timeout, Duration, Instant};
 
-use crate::test_fixtures::{quiet_command, Fixture, Grouped, Quiet};
+use crate::test_fixtures::{quiet_command, Fixture, Grouped, Quiet, SessionSpec, TestRequest};
 use crate::test_names::session_name;
 
 async fn pane_identity(
@@ -136,12 +136,10 @@ async fn assert_no_alert_effects(
 #[tokio::test]
 async fn queued_pane_hook_does_not_block_an_unrelated_pane_alert() {
     let handler = RequestHandler::new();
-    let hooked_session = handler
-        .create_started_session(Quiet("pane-alert-queued-hook"))
-        .await;
-    let live_session = handler
-        .create_started_session(Quiet("pane-alert-live-after-hook"))
-        .await;
+    let hooked_session =
+        SessionSpec::create_started(&handler, Quiet("pane-alert-queued-hook")).await;
+    let live_session =
+        SessionSpec::create_started(&handler, Quiet("pane-alert-live-after-hook")).await;
     let hooked_target = WindowTarget::with_window(hooked_session.clone(), 0);
     let live_target = WindowTarget::with_window(live_session.clone(), 0);
     handler
@@ -211,12 +209,9 @@ async fn queued_pane_hook_does_not_block_an_unrelated_pane_alert() {
 #[tokio::test]
 async fn exiting_pane_hook_wait_does_not_block_unrelated_pane_alert_flush() {
     let handler = RequestHandler::new();
-    let exiting_session = handler
-        .create_started_session(Quiet("pane-alert-exit-hook"))
-        .await;
-    let live_session = handler
-        .create_started_session(Quiet("pane-alert-live-peer"))
-        .await;
+    let exiting_session =
+        SessionSpec::create_started(&handler, Quiet("pane-alert-exit-hook")).await;
+    let live_session = SessionSpec::create_started(&handler, Quiet("pane-alert-live-peer")).await;
     let exiting_target = WindowTarget::with_window(exiting_session.clone(), 0);
     let live_target = WindowTarget::with_window(live_session.clone(), 0);
     handler
@@ -324,9 +319,8 @@ async fn pane_alert_reserves_each_lifecycle_position_immediately_before_emission
     const WAIT_CHANNEL: &str = "pane-alert-per-event-sequencing";
 
     let handler = RequestHandler::new();
-    let session = handler
-        .create_started_session(Quiet("pane-alert-per-event-sequencing"))
-        .await;
+    let session =
+        SessionSpec::create_started(&handler, Quiet("pane-alert-per-event-sequencing")).await;
     handler
         .set_option_by_name(OptionScopeSelector::ServerGlobal, "set-clipboard", "on")
         .await;
@@ -394,9 +388,11 @@ async fn pane_alert_reserves_each_lifecycle_position_immediately_before_emission
     .expect("the next pane event must not reserve ahead of an intervening publication")
     .expect("intervening buffer publication succeeds");
 
-    handler
-        .handle_ok(WaitForRequest::fixture((WAIT_CHANNEL, WaitForMode::Signal)))
-        .await;
+    TestRequest::send_ok(
+        &handler,
+        WaitForRequest::fixture((WAIT_CHANNEL, WaitForMode::Signal)),
+    )
+    .await;
     timeout(Duration::from_secs(2), &mut flush)
         .await
         .expect("pane alert flush completes without a lifecycle ticket cycle")
@@ -440,17 +436,18 @@ async fn pane_alert_reserves_each_lifecycle_position_immediately_before_emission
 #[tokio::test]
 async fn exiting_pane_activity_cannot_rearm_silence_after_newer_same_window_activity() {
     let handler = RequestHandler::new();
-    let session = handler
-        .create_started_session(Quiet("pane-alert-exit-silence-order"))
-        .await;
+    let session =
+        SessionSpec::create_started(&handler, Quiet("pane-alert-exit-silence-order")).await;
     let window_target = WindowTarget::with_window(session.clone(), 0);
-    let split = handler
-        .handle_ok(SplitWindowExtRequest {
+    let split = TestRequest::send_ok(
+        &handler,
+        SplitWindowExtRequest {
             command: Some(quiet_command()),
             detached: true,
             ..Fixture::fixture(&session)
-        })
-        .await;
+        },
+    )
+    .await;
     handler
         .wait_for_pane_startup_to_finish_for_test(&split.pane)
         .await;
@@ -581,24 +578,18 @@ async fn exiting_pane_activity_cannot_rearm_silence_after_newer_same_window_acti
 #[tokio::test]
 async fn pane_alert_reaches_every_linked_and_grouped_window_alias_once() {
     let handler = RequestHandler::new();
-    let owner = handler
-        .create_started_session(Quiet("m-pane-alert-family-owner"))
-        .await;
-    let peer = handler
-        .create_session(Grouped("z-pane-alert-family-peer", &owner))
-        .await;
-    let external = handler
-        .create_started_session(Quiet("a-pane-alert-family-external"))
-        .await;
+    let owner = SessionSpec::create_started(&handler, Quiet("m-pane-alert-family-owner")).await;
+    let peer = SessionSpec::create(&handler, Grouped("z-pane-alert-family-peer", &owner)).await;
+    let external =
+        SessionSpec::create_started(&handler, Quiet("a-pane-alert-family-external")).await;
     let owner_target = WindowTarget::with_window(owner.clone(), 0);
     let peer_target = WindowTarget::with_window(peer.clone(), 0);
     let external_target = WindowTarget::with_window(external.clone(), 1);
-    handler
-        .handle_ok(LinkWindowRequest::fixture((
-            &owner_target,
-            &external_target,
-        )))
-        .await;
+    TestRequest::send_ok(
+        &handler,
+        LinkWindowRequest::fixture((&owner_target, &external_target)),
+    )
+    .await;
     let family_targets = vec![owner_target.clone(), peer_target, external_target];
 
     for target in &family_targets {
@@ -672,12 +663,8 @@ async fn pane_alert_reaches_every_linked_and_grouped_window_alias_once() {
 #[tokio::test]
 async fn pane_alert_survives_an_earlier_alias_added_between_prepare_and_apply() {
     let handler = RequestHandler::new();
-    let owner = handler
-        .create_started_session(Quiet("z-pane-alert-added-owner"))
-        .await;
-    let alias = handler
-        .create_started_session(Quiet("a-pane-alert-added-alias"))
-        .await;
+    let owner = SessionSpec::create_started(&handler, Quiet("z-pane-alert-added-owner")).await;
+    let alias = SessionSpec::create_started(&handler, Quiet("a-pane-alert-added-alias")).await;
     let owner_target = WindowTarget::with_window(owner.clone(), 0);
     let alias_target = WindowTarget::with_window(alias.clone(), 1);
     for option in [OptionName::MonitorActivity, OptionName::MonitorBell] {
@@ -698,9 +685,11 @@ async fn pane_alert_survives_an_earlier_alias_added_between_prepare_and_apply() 
         .await
         .expect("pane alert prepares before the alias exists");
 
-    handler
-        .handle_ok(LinkWindowRequest::fixture((&owner_target, &alias_target)))
-        .await;
+    TestRequest::send_ok(
+        &handler,
+        LinkWindowRequest::fixture((&owner_target, &alias_target)),
+    )
+    .await;
     for option in [OptionName::MonitorActivity, OptionName::MonitorBell] {
         handler
             .set_option(ScopeSelector::Window(alias_target.clone()), option, "on")
@@ -744,13 +733,10 @@ async fn pane_alert_survives_an_earlier_alias_added_between_prepare_and_apply() 
 #[tokio::test]
 async fn pane_alert_reindex_keeps_hooks_name_and_flags_on_the_original_window_id() {
     let handler = RequestHandler::new();
-    let destination = handler
-        .create_started_session(Quiet("pane-alert-reindex-destination"))
-        .await;
+    let destination =
+        SessionSpec::create_started(&handler, Quiet("pane-alert-reindex-destination")).await;
     let alerted = handler.create_started_window(Quiet(&destination)).await;
-    let source = handler
-        .create_started_session(Quiet("pane-alert-reindex-source"))
-        .await;
+    let source = SessionSpec::create_started(&handler, Quiet("pane-alert-reindex-source")).await;
     handler
         .set_option(
             ScopeSelector::Window(alerted.clone()),
@@ -795,15 +781,17 @@ async fn pane_alert_reindex_keeps_hooks_name_and_flags_on_the_original_window_id
         .await
         .expect("pane alert reaches final-apply pause");
 
-    handler
-        .handle_ok(LinkWindowRequest {
+    TestRequest::send_ok(
+        &handler,
+        LinkWindowRequest {
             after: true,
             ..Fixture::fixture((
                 WindowTarget::with_window(source, 0),
                 WindowTarget::with_window(destination.clone(), 0),
             ))
-        })
-        .await;
+        },
+    )
+    .await;
     pause.release.notify_one();
     timeout(Duration::from_secs(5), &mut task)
         .await
@@ -846,13 +834,10 @@ async fn pane_alert_reindex_keeps_hooks_name_and_flags_on_the_original_window_id
 #[tokio::test]
 async fn pane_alert_replacement_fails_closed_before_hooks_name_or_flags_reach_reused_slot() {
     let handler = RequestHandler::new();
-    let destination = handler
-        .create_started_session(Quiet("pane-alert-replace-destination"))
-        .await;
+    let destination =
+        SessionSpec::create_started(&handler, Quiet("pane-alert-replace-destination")).await;
     let alerted = handler.create_started_window(Quiet(&destination)).await;
-    let source = handler
-        .create_started_session(Quiet("pane-alert-replace-source"))
-        .await;
+    let source = SessionSpec::create_started(&handler, Quiet("pane-alert-replace-source")).await;
     handler
         .set_option(
             ScopeSelector::Window(alerted.clone()),
@@ -892,12 +877,14 @@ async fn pane_alert_replacement_fails_closed_before_hooks_name_or_flags_reach_re
         .await
         .expect("pane alert reaches replacement pause");
 
-    handler
-        .handle_ok(LinkWindowRequest {
+    TestRequest::send_ok(
+        &handler,
+        LinkWindowRequest {
             kill_destination: true,
             ..Fixture::fixture((WindowTarget::with_window(source, 0), &alerted))
-        })
-        .await;
+        },
+    )
+    .await;
     pause.release.notify_one();
     timeout(Duration::from_secs(5), &mut task)
         .await
@@ -930,9 +917,7 @@ async fn pane_alert_replacement_fails_closed_before_hooks_name_or_flags_reach_re
 #[tokio::test]
 async fn alert_plan_effects_follow_session_id_through_hook_rename_and_name_reuse() {
     let handler = RequestHandler::new();
-    let alpha = handler
-        .create_started_session(Quiet("alert-plan-alpha"))
-        .await;
+    let alpha = SessionSpec::create_started(&handler, Quiet("alert-plan-alpha")).await;
     let alerted = handler.create_started_window(Quiet(&alpha)).await;
     let beta = session_name("alert-plan-beta");
     let original_session_id = handler.session_id_for_test(&alpha).await;
@@ -985,7 +970,7 @@ async fn alert_plan_effects_follow_session_id_through_hook_rename_and_name_reuse
         );
     }
 
-    let reused_alpha = handler.create_started_session(Quiet(&alpha)).await;
+    let reused_alpha = SessionSpec::create_started(&handler, Quiet(&alpha)).await;
     let mut alpha_rx = handler.attach_client(711, reused_alpha).await;
     drain_controls(&mut beta_rx).await;
     drain_controls(&mut alpha_rx).await;
@@ -1023,9 +1008,7 @@ async fn alert_plan_effects_follow_session_id_through_hook_rename_and_name_reuse
 #[tokio::test]
 async fn alert_plan_effects_fail_closed_after_session_destroy_and_name_reuse() {
     let handler = RequestHandler::new();
-    let alpha = handler
-        .create_started_session(Quiet("alert-plan-destroy-alpha"))
-        .await;
+    let alpha = SessionSpec::create_started(&handler, Quiet("alert-plan-destroy-alpha")).await;
     let alerted = handler.create_started_window(Quiet(&alpha)).await;
     handler
         .set_option(
@@ -1050,8 +1033,8 @@ async fn alert_plan_effects_fail_closed_after_session_destroy_and_name_reuse() {
     timeout(Duration::from_secs(3), pause.reached.notified())
         .await
         .expect("alert plan pauses before effects");
-    handler.handle_ok(KillSessionRequest::fixture(&alpha)).await;
-    let reused_alpha = handler.create_started_session(Quiet(&alpha)).await;
+    TestRequest::send_ok(&handler, KillSessionRequest::fixture(&alpha)).await;
+    let reused_alpha = SessionSpec::create_started(&handler, Quiet(&alpha)).await;
     let mut control_rx = handler.attach_client(712, reused_alpha).await;
     drain_controls(&mut control_rx).await;
     pause.release.notify_one();
@@ -1069,9 +1052,7 @@ async fn alert_plan_effects_fail_closed_after_session_destroy_and_name_reuse() {
 #[tokio::test]
 async fn alert_overlay_fails_closed_when_session_name_is_reused_after_resolution() {
     let handler = RequestHandler::new();
-    let alpha = handler
-        .create_started_session(Quiet("alert-overlay-reuse"))
-        .await;
+    let alpha = SessionSpec::create_started(&handler, Quiet("alert-overlay-reuse")).await;
     let alerted = handler.create_started_window(Quiet(&alpha)).await;
     handler
         .set_option(
@@ -1098,8 +1079,8 @@ async fn alert_overlay_fails_closed_when_session_name_is_reused_after_resolution
         .await
         .expect("alert overlay pauses after resolving the stable session");
 
-    handler.handle_ok(KillSessionRequest::fixture(&alpha)).await;
-    let replacement = handler.create_started_session(Quiet(&alpha)).await;
+    TestRequest::send_ok(&handler, KillSessionRequest::fixture(&alpha)).await;
+    let replacement = SessionSpec::create_started(&handler, Quiet(&alpha)).await;
     let mut control_rx = handler.attach_client(713, replacement).await;
     drain_controls(&mut control_rx).await;
 

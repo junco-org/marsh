@@ -1,4 +1,5 @@
 use super::*;
+use crate::test_fixtures::TestRequest;
 
 async fn register_delegated_attach(
     handler: &RequestHandler,
@@ -15,12 +16,14 @@ async fn bind_read_only_key(
     key: &str,
     command: &[&str],
 ) {
-    handler
-        .handle_ok(BindKeyRequest {
+    TestRequest::send_ok(
+        handler,
+        BindKeyRequest {
             note: Some("read-only client action test".to_owned()),
             ..Fixture::fixture((table_name, key, command.iter().copied()))
-        })
-        .await;
+        },
+    )
+    .await;
 }
 
 async fn recv_detach(control_rx: &mut mpsc::UnboundedReceiver<AttachControl>) {
@@ -340,12 +343,14 @@ async fn delegated_read_only_attach_rejects_chained_detach_binding_product_diver
     let alpha = session_name("delegated-read-only-chained");
     let requester_pid = std::process::id();
     let mut control_rx = register_delegated_attach(&handler, requester_pid, &alpha).await;
-    handler
-        .handle_ok(BindKeyRequest {
+    TestRequest::send_ok(
+        &handler,
+        BindKeyRequest {
             note: Some("delegated detach must remain local".to_owned()),
             ..Fixture::fixture(("prefix", "d", ["detach-client", ";", "new-window"]))
-        })
-        .await;
+        },
+    )
+    .await;
 
     handler
         .handle_attached_live_input_for_test(requester_pid, b"\x02d")

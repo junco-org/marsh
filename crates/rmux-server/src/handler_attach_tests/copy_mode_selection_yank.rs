@@ -1,4 +1,5 @@
 use super::*;
+use crate::test_fixtures::TestRequest;
 
 const ORACLE_YANK_BYTES: &[u8] = b"alpha ";
 const ORACLE_OLD_BUFFER_BYTES: &[u8] = b"OLD";
@@ -16,7 +17,7 @@ async fn enter_copy_mode_with_selection_seed(
             b"alpha beta gamma\r\nsecond beta line\r\nthird alpha marker\r\nfourth delta marker\r\nfifth beta tail\r\n\x1b[1;1H",
         )
         .await;
-    handler.handle_ok(CopyModeRequest::fixture(target)).await;
+    TestRequest::send_ok(handler, CopyModeRequest::fixture(target)).await;
     copy_selection_status(handler, target.clone()).await
 }
 
@@ -62,12 +63,14 @@ async fn show_top_buffer_bytes(handler: &RequestHandler) -> Vec<u8> {
 }
 
 async fn set_top_buffer_bytes(handler: &RequestHandler, bytes: &[u8]) {
-    handler
-        .handle_ok(rmux_proto::SetBufferRequest {
+    TestRequest::send_ok(
+        handler,
+        rmux_proto::SetBufferRequest {
             name: None,
             ..Fixture::fixture(("", bytes))
-        })
-        .await;
+        },
+    )
+    .await;
 }
 
 async fn enter_vi_selection_yank_fixture(

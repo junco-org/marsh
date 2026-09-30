@@ -15,6 +15,7 @@ use super::set_titles_support::{
     title_capable_context, titles_in, TITLE_OPEN,
 };
 use super::*;
+use crate::test_fixtures::SessionSpec;
 
 /// The reporter's configuration: a custom `set-titles-string` must reach the
 /// outer terminal expanded. Before the fix the frame carried only the bare
@@ -23,7 +24,7 @@ use super::*;
 async fn set_titles_on_carries_the_expanded_custom_string() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
     let mut control_rx = attach_title_capable_client(&handler, &alpha, std::process::id()).await;
 
     set_global(&handler, OptionName::SetTitlesString, "RMUXTEST #S:#I").await;
@@ -49,7 +50,7 @@ async fn set_titles_on_carries_the_expanded_custom_string() {
 async fn set_titles_on_expands_the_default_string() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
     let mut control_rx = attach_title_capable_client(&handler, &alpha, std::process::id()).await;
 
     set_global(&handler, OptionName::SetTitles, "on").await;
@@ -73,7 +74,7 @@ async fn set_titles_on_expands_the_default_string() {
 async fn set_titles_off_writes_no_title_and_no_path() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
     let mut control_rx = attach_title_capable_client(&handler, &alpha, std::process::id()).await;
 
     // Turn the osc7 capability on so the path would be emitted if it were not
@@ -107,7 +108,7 @@ async fn set_titles_off_writes_no_title_and_no_path() {
 async fn an_unchanged_title_is_not_re_emitted_on_the_next_refresh() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
     let mut control_rx = attach_title_capable_client(&handler, &alpha, std::process::id()).await;
 
     set_global(&handler, OptionName::SetTitlesString, "STATIC-TITLE").await;
@@ -144,7 +145,7 @@ async fn an_unchanged_title_is_not_re_emitted_on_the_next_refresh() {
 async fn a_client_without_the_title_capability_receives_no_title() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
 
     let (control_tx, mut control_rx) = mpsc::unbounded_channel();
     let _attach_id = handler
@@ -180,7 +181,7 @@ async fn a_client_without_the_title_capability_receives_no_title() {
 async fn control_characters_in_the_title_cannot_inject_a_second_sequence() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
     let mut control_rx = attach_title_capable_client(&handler, &alpha, std::process::id()).await;
 
     set_global(
@@ -215,7 +216,7 @@ async fn control_characters_in_the_title_cannot_inject_a_second_sequence() {
 async fn an_active_pane_title_change_carries_the_new_title_to_the_client() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    handler.create_session(Quiet(&alpha)).await;
+    SessionSpec::create(&handler, Quiet(&alpha)).await;
     let target = PaneTarget::with_window(alpha.clone(), 0, 0);
     let pane_id = active_pane_id(&handler, &alpha).await;
     let mut control_rx = attach_title_capable_client(&handler, &alpha, std::process::id()).await;
@@ -249,7 +250,7 @@ async fn an_active_pane_title_change_carries_the_new_title_to_the_client() {
 async fn an_active_pane_title_change_does_not_refresh_when_set_titles_is_off() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    handler.create_session(Quiet(&alpha)).await;
+    SessionSpec::create(&handler, Quiet(&alpha)).await;
     let target = PaneTarget::with_window(alpha.clone(), 0, 0);
     let pane_id = active_pane_id(&handler, &alpha).await;
     let mut control_rx = attach_title_capable_client(&handler, &alpha, std::process::id()).await;
@@ -277,7 +278,7 @@ async fn an_active_pane_title_change_does_not_refresh_when_set_titles_is_off() {
 async fn toggling_set_titles_off_and_on_does_not_rewrite_an_unchanged_title() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
     let mut control_rx = attach_title_capable_client(&handler, &alpha, std::process::id()).await;
 
     set_global(&handler, OptionName::SetTitlesString, "STABLE").await;
@@ -308,7 +309,7 @@ async fn toggling_set_titles_off_and_on_does_not_rewrite_an_unchanged_title() {
 async fn a_title_change_survives_a_coalesced_follow_up_refresh() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
     let mut control_rx = attach_title_capable_client(&handler, &alpha, std::process::id()).await;
 
     set_global(&handler, OptionName::SetTitlesString, "FIRST").await;
@@ -349,7 +350,7 @@ fn drain_queued_titles(control_rx: &mut mpsc::UnboundedReceiver<AttachControl>) 
 async fn the_attach_frame_title_is_not_repeated_by_the_first_refresh() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
     set_global(&handler, OptionName::SetTitlesString, "SEEDED-TITLE").await;
     set_global(&handler, OptionName::SetTitles, "on").await;
 
@@ -433,7 +434,7 @@ async fn attach_with_initial_title(
 async fn the_web_and_snapshot_renders_carry_no_title() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
     set_global(&handler, OptionName::SetTitlesString, "WEB-MUST-NOT-APPEAR").await;
     set_global(&handler, OptionName::SetTitles, "on").await;
 
@@ -481,7 +482,7 @@ async fn the_web_and_snapshot_renders_carry_no_title() {
 async fn a_shell_command_in_the_title_expands_through_the_status_job_runtime() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
     let mut control_rx = attach_title_capable_client(&handler, &alpha, std::process::id()).await;
 
     let marker = format!("TITLEJOB{}", std::process::id());
@@ -528,7 +529,7 @@ async fn a_shell_command_in_the_title_expands_through_the_status_job_runtime() {
 async fn the_status_tick_carries_a_changed_title_and_repeats_nothing() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
 
     let (control_tx, mut control_rx) = mpsc::unbounded_channel();
     let attach_pid = std::process::id();

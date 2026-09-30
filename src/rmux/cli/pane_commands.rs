@@ -6,9 +6,9 @@ use rmux_core::formats::{
     DEFAULT_LIST_PANES_WINDOW_FORMAT,
 };
 use rmux_proto::{
-    CommandOutput, ResizePaneAdjustment, ResizePaneRelativeDirection,
+    CommandOutput, PaneTarget, ResizePaneAdjustment, ResizePaneRelativeDirection,
     ResizePaneTargetActionRequest, ResolveTargetType, RespawnPaneRequest, Response, SessionName,
-    Target,
+    Target, WindowTarget,
 };
 
 /// Client-side implementation of `split-window`.
@@ -23,13 +23,12 @@ use super::json_output::{
 };
 use super::target_resolution::{
     CommandTarget, LISTING_FIELD_SEPARATOR, connect_cli, filtered_listing_line,
-    resolve_active_window_index, run_targeted, target_session,
+    resolve_active_window_index, target_session,
 };
 use super::{
     ExitFailure, cli_target_actions_enabled, expect_command_output, expect_command_success,
     list_session_names, listed_pane_index_matches_target, resolve_current_session_target,
-    resolve_pane_target_or_current, resolve_target_spec, shell_command_text,
-    target_action_needs_legacy_retry, write_lines_output,
+    resolve_target_spec, shell_command_text, target_action_needs_legacy_retry, write_lines_output,
 };
 use crate::cli_args::{
     LastPaneArgs, ListPanesArgs, PipePaneArgs, ResizePaneArgs, ResizePaneSize, RespawnPaneArgs,
@@ -46,7 +45,7 @@ pub(super) fn run_last_pane(args: &LastPaneArgs, socket_path: &Path) -> Result<i
     } else {
         args.disable_input.then_some(true)
     };
-    run_targeted(
+    WindowTarget::run(
         socket_path,
         "last-pane",
         args.target.as_ref(),
@@ -60,7 +59,7 @@ pub(super) fn run_last_pane(args: &LastPaneArgs, socket_path: &Path) -> Result<i
 pub(super) fn run_pipe_pane(args: PipePaneArgs, socket_path: &Path) -> Result<i32, ExitFailure> {
     let command = (!args.command.is_empty()).then(|| shell_command_text(args.command));
     let stdout = args.stdout || !args.stdin;
-    run_targeted(
+    PaneTarget::run(
         socket_path,
         "pipe-pane",
         args.target.as_ref(),
@@ -73,7 +72,7 @@ pub(super) fn run_respawn_pane(
     args: RespawnPaneArgs,
     socket_path: &Path,
 ) -> Result<i32, ExitFailure> {
-    run_targeted(
+    PaneTarget::run(
         socket_path,
         "respawn-pane",
         args.target.as_ref(),
@@ -210,12 +209,12 @@ pub(super) fn run_select_pane(
         });
     }
     if let Some(direction) = args.direction() {
-        return run_targeted(socket_path, "select-pane", target, |connection, pane| {
+        return PaneTarget::run(socket_path, "select-pane", target, |connection, pane| {
             connection.select_pane_adjacent_with_zoom(pane, direction, keep_zoom)
         });
     }
     if !args.mark && !args.clear_marked {
-        return run_targeted(socket_path, "select-pane", target, |connection, pane| {
+        return PaneTarget::run(socket_path, "select-pane", target, |connection, pane| {
             connection.select_pane_with_options(pane, args.title, args.style, None, keep_zoom)
         });
     }
@@ -233,7 +232,7 @@ fn select_pane_uncached<T: CommandTarget>(
     send: impl FnOnce(&mut Connection, T) -> Result<Response, ClientError>,
 ) -> Result<i32, ExitFailure> {
     let mut connection = connect_cli(socket_path)?;
-    let target = T::RESOLVE(&mut connection, target, "select-pane")?;
+    let target = T::resolve(&mut connection, target, "select-pane")?;
     expect_command_success(send(&mut connection, target)?, check_name)?;
     Ok(0)
 }
@@ -262,8 +261,7 @@ pub(super) fn run_resize_pane(
 /// Resizes a pane after resolving its target locally, as older servers require.
 fn run_resize_pane_legacy(args: &ResizePaneArgs, socket_path: &Path) -> Result<i32, ExitFailure> {
     let mut connection = connect_cli(socket_path)?;
-    let target =
-        resolve_pane_target_or_current(&mut connection, args.target.as_ref(), "resize-pane")?;
+    let target = PaneTarget::resolve(&mut connection, args.target.as_ref(), "resize-pane")?;
     let window_size = resize_pane_uses_percent(args)
         .then(|| resize_pane_window_size(&mut connection, &target))
         .transpose()?;

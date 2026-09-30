@@ -3,6 +3,7 @@ use super::*;
 use rmux_proto::{LinkWindowRequest, WindowTarget};
 
 use crate::pane_terminals::WindowLinkOccurrenceId;
+use crate::test_fixtures::{SessionSpec, TestRequest};
 
 use super::super::mode_tree_model::{ChooseTreeTarget, ModeTreeActionIdentity};
 use super::super::mode_tree_order::{pane_item_id, window_item_id};
@@ -26,13 +27,15 @@ async fn linked_occurrence_fixture(
     attach_pid_offset: u32,
 ) -> LinkedOccurrenceFixture {
     let session_name = SessionName::new(label).expect("valid session");
-    handler.create_session(&session_name).await;
-    handler
-        .handle_ok(LinkWindowRequest::fixture((
+    SessionSpec::create(handler, &session_name).await;
+    TestRequest::send_ok(
+        handler,
+        LinkWindowRequest::fixture((
             WindowTarget::with_window(session_name.clone(), 0),
             WindowTarget::with_window(session_name.clone(), 2),
-        )))
-        .await;
+        )),
+    )
+    .await;
 
     let (session_id, window_id, pane_id, pane_output_generation, old_occurrence_id) = {
         let state = handler.state.lock().await;

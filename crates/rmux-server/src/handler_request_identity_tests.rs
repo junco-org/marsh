@@ -1,6 +1,6 @@
 use super::attach_support::ActiveAttachIdentity;
 use super::{with_expected_attach_and_session_identity, RequestHandler};
-use crate::test_fixtures::Fixture;
+use crate::test_fixtures::{Fixture, SessionSpec, TestRequest};
 use rmux_proto::{
     KillPaneRequest, KillSessionRequest, LinkWindowRequest, MoveWindowRequest, MoveWindowTarget,
     NewWindowRequest, PaneTarget, Request, RespawnPaneRequest, RespawnWindowRequest, Response,
@@ -9,15 +9,17 @@ use rmux_proto::{
 
 async fn replace_session(handler: &RequestHandler, session_name: &SessionName) -> SessionId {
     let stale_id = handler.session_id_for_test(session_name).await;
-    handler
-        .handle_ok(KillSessionRequest {
+    TestRequest::send_ok(
+        handler,
+        KillSessionRequest {
             target: session_name.clone(),
             kill_all_except_target: false,
             clear_alerts: false,
             kill_group: false,
-        })
-        .await;
-    let recreated = handler.create_session(session_name).await;
+        },
+    )
+    .await;
+    let recreated = SessionSpec::create(handler, session_name).await;
     assert_eq!(&recreated, session_name);
     assert_ne!(handler.session_id_for_test(session_name).await, stale_id);
     stale_id
@@ -41,7 +43,7 @@ async fn run_as_stale_attached_session(
 #[tokio::test]
 async fn stale_attached_session_cannot_respawn_replacement_window() {
     let handler = RequestHandler::new();
-    let session_name = handler.create_session("identity-respawn-window").await;
+    let session_name = SessionSpec::create(&handler, "identity-respawn-window").await;
     let stale_id = replace_session(&handler, &session_name).await;
 
     let response = run_as_stale_attached_session(
@@ -65,7 +67,7 @@ async fn stale_attached_session_cannot_respawn_replacement_window() {
 #[tokio::test]
 async fn stale_attached_session_cannot_respawn_or_kill_replacement_pane() {
     let handler = RequestHandler::new();
-    let session_name = handler.create_session("identity-pane-mutations").await;
+    let session_name = SessionSpec::create(&handler, "identity-pane-mutations").await;
     let stale_id = replace_session(&handler, &session_name).await;
     let target = PaneTarget::with_window(session_name.clone(), 0, 0);
 
@@ -95,7 +97,7 @@ async fn stale_attached_session_cannot_respawn_or_kill_replacement_pane() {
 #[tokio::test]
 async fn stale_attached_session_cannot_unlink_recreated_window_slot() {
     let handler = RequestHandler::new();
-    let session_name = handler.create_session("identity-unlink-window").await;
+    let session_name = SessionSpec::create(&handler, "identity-unlink-window").await;
     let window = NewWindowRequest {
         target_window_index: Some(1),
         ..Fixture::fixture(&session_name)
@@ -130,8 +132,8 @@ async fn stale_attached_session_cannot_unlink_recreated_window_slot() {
 #[tokio::test]
 async fn stale_attached_session_cannot_drive_cross_session_window_mutations() {
     let handler = RequestHandler::new();
-    let attached = handler.create_session("identity-window-source").await;
-    let other = handler.create_session("identity-window-other").await;
+    let attached = SessionSpec::create(&handler, "identity-window-source").await;
+    let other = SessionSpec::create(&handler, "identity-window-other").await;
     let stale_id = replace_session(&handler, &attached).await;
 
     let move_response = run_as_stale_attached_session(
@@ -193,11 +195,9 @@ async fn stale_attached_session_cannot_drive_cross_session_window_mutations() {
 #[tokio::test]
 async fn attached_queue_can_still_mutate_explicit_other_sessions() {
     let handler = RequestHandler::new();
-    let attached = handler.create_session("identity-explicit-attached").await;
-    let source = handler.create_session("identity-explicit-source").await;
-    let destination = handler
-        .create_session("identity-explicit-destination")
-        .await;
+    let attached = SessionSpec::create(&handler, "identity-explicit-attached").await;
+    let source = SessionSpec::create(&handler, "identity-explicit-source").await;
+    let destination = SessionSpec::create(&handler, "identity-explicit-destination").await;
     let attached_id = handler.session_id_for_test(&attached).await;
 
     let response = with_expected_attach_and_session_identity(

@@ -28,6 +28,7 @@ fn info(syscall: Sysno, args: Vec<SyscallArg>, result: RetCode) -> Syscall {
         paths: Vec::new(),
         descriptors: Vec::new(),
         flags: None,
+        submissions: None,
     }
 }
 fn with_descriptor(mut info: Syscall, index: usize, path: &[u8]) -> Syscall {
@@ -61,6 +62,54 @@ fn read_fd(path: &[u8]) -> Syscall {
         0,
         path,
     )
+}
+
+#[test]
+fn io_uring_is_accepted_only_while_every_submission_is_effectless_and_visible() {
+    let mut access = Access::default();
+    let root = Path::new("/work");
+    let setup = |flags: u64| {
+        let mut setup = info(
+            Sysno::io_uring_setup,
+            vec![SyscallArg::Int(256), SyscallArg::Addr(0x1000)],
+            RetCode::Ok(4),
+        );
+        setup.flags = Some(flags);
+        setup
+    };
+    let enter = |to_submit: i64, submissions: Option<Vec<u8>>| {
+        let mut enter = info(
+            Sysno::io_uring_enter,
+            vec![
+                SyscallArg::Int(4),
+                SyscallArg::Int(to_submit),
+                SyscallArg::Int(0),
+                SyscallArg::Int(0),
+            ],
+            RetCode::Ok(0),
+        );
+        enter.submissions = submissions;
+        enter
+    };
+    // libuv's epoll batching ring: no submission thread, only EPOLL_CTL.
+    assert!(access.observe(&setup(1 << 16), root).is_ok());
+    assert!(access.observe(&enter(2, Some(vec![29, 29])), root).is_ok());
+    // Waiting for completions submits nothing.
+    assert!(access.observe(&enter(0, None), root).is_ok());
+    // A kernel submission thread consumes entries no stop ever shows.
+    assert!(access.observe(&setup(1 << 1), root).is_err());
+    // OPENAT, or entries that could not be read, carry effects nothing observed.
+    assert!(access.observe(&enter(2, Some(vec![29, 18])), root).is_err());
+    assert!(access.observe(&enter(1, None), root).is_err());
+    // Registration stays unsupported.
+    assert!(
+        access
+            .observe(
+                &info(Sysno::io_uring_register, Vec::new(), RetCode::Ok(0)),
+                root
+            )
+            .is_err()
+    );
 }
 
 #[test]

@@ -1,5 +1,6 @@
 use super::*;
 use crate::handler::with_expected_attach_and_session_identity;
+use crate::test_fixtures::{SessionSpec, TestRequest};
 use rmux_proto::ErrorResponse;
 
 #[tokio::test]
@@ -170,8 +171,8 @@ async fn background_run_shell_commands_reject_a_reused_control_registration() {
     let original = session_name("run-shell-control-original");
     let replacement = session_name("run-shell-control-replacement");
     let wait_channel = "run-shell-control-registration-reuse";
-    handler.create_session(&original).await;
-    handler.create_session(&replacement).await;
+    SessionSpec::create(&handler, &original).await;
+    SessionSpec::create(&handler, &replacement).await;
     let (original_control_id, original_events) = handler
         .register_control_for_test(requester_pid, Some(&original))
         .await;
@@ -204,8 +205,8 @@ async fn background_run_shell_commands_reject_a_reused_attach_registration() {
     let original = session_name("run-shell-attach-original");
     let replacement = session_name("run-shell-attach-replacement");
     let wait_channel = "run-shell-attach-registration-reuse";
-    handler.create_session(&original).await;
-    handler.create_session(&replacement).await;
+    SessionSpec::create(&handler, &original).await;
+    SessionSpec::create(&handler, &replacement).await;
     let _original_control_rx = handler.attach_client(requester_pid, &original).await;
     let original_identity = handler.active_attach_identity_for_test(requester_pid).await;
 
@@ -257,8 +258,8 @@ async fn background_run_shell_commands_survive_a_same_registration_session_switc
     let beta = session_name("run-shell-attach-switch-beta");
     let wait_channel = "run-shell-attach-session-switch";
     let followed_window_name = "run-shell-followed-attached-session";
-    handler.create_session(&alpha).await;
-    handler.create_session(&beta).await;
+    SessionSpec::create(&handler, &alpha).await;
+    SessionSpec::create(&handler, &beta).await;
     let _control_rx = handler.attach_client(requester_pid, &alpha).await;
     let identity = handler.active_attach_identity_for_test(requester_pid).await;
 
@@ -319,8 +320,8 @@ async fn background_run_shell_expands_implicit_formats_after_attached_switch() {
     let requester_pid = 424_306;
     let alpha = session_name("run-shell-format-switch-alpha");
     let beta = session_name("run-shell-format-switch-beta");
-    handler.create_session(&alpha).await;
-    handler.create_session(&beta).await;
+    SessionSpec::create(&handler, &alpha).await;
+    SessionSpec::create(&handler, &beta).await;
     let _control_rx = handler.attach_client(requester_pid, &alpha).await;
     let identity = handler.active_attach_identity_for_test(requester_pid).await;
 
@@ -352,19 +353,21 @@ async fn background_run_shell_builds_environment_for_followed_attached_session()
     let requester_pid = 424_311;
     let alpha = session_name("run-shell-environment-switch-alpha");
     let beta = session_name("run-shell-environment-switch-beta");
-    handler.create_session(&alpha).await;
-    handler.create_session(&beta).await;
+    SessionSpec::create(&handler, &alpha).await;
+    SessionSpec::create(&handler, &beta).await;
     for (session, value) in [(&alpha, "alpha"), (&beta, "beta")] {
-        handler
-            .handle_ok(SetEnvironmentRequest {
+        TestRequest::send_ok(
+            &handler,
+            SetEnvironmentRequest {
                 scope: ScopeSelector::Session(session.clone()),
                 name: "RMUX_BG_TARGET".to_owned(),
                 value: value.to_owned(),
                 mode: None,
                 hidden: false,
                 format: false,
-            })
-            .await;
+            },
+        )
+        .await;
     }
 
     // Two different places on purpose: the job's start directory is NAMED, so it must live in
@@ -419,9 +422,9 @@ async fn explicit_background_run_shell_target_survives_attached_switch() {
     let beta = session_name("run-shell-explicit-switch-beta");
     let gamma = session_name("run-shell-explicit-switch-gamma");
     let expected_window_name = "run-shell-explicit-target";
-    handler.create_session(&alpha).await;
-    handler.create_session(&beta).await;
-    handler.create_session(&gamma).await;
+    SessionSpec::create(&handler, &alpha).await;
+    SessionSpec::create(&handler, &beta).await;
+    SessionSpec::create(&handler, &gamma).await;
     let _control_rx = handler.attach_client(requester_pid, &alpha).await;
     let identity = handler.active_attach_identity_for_test(requester_pid).await;
 
@@ -458,8 +461,8 @@ async fn explicit_background_shell_target_survives_origin_attach_detach() {
     let requester_pid = 424_312;
     let origin = session_name("run-shell-explicit-detach-origin");
     let target = session_name("run-shell-explicit-detach-target");
-    handler.create_session(&origin).await;
-    handler.create_session(&target).await;
+    SessionSpec::create(&handler, &origin).await;
+    SessionSpec::create(&handler, &target).await;
 
     // Two different places on purpose: the job's start directory NAMES the seed it publishes
     // into, so it must live in this handler's, while the probe it writes is an absolute host
@@ -507,9 +510,9 @@ async fn explicit_background_shell_target_survives_same_pid_attach_replacement()
     let origin = session_name("run-shell-explicit-reuse-origin");
     let replacement = session_name("run-shell-explicit-reuse-replacement");
     let target = session_name("run-shell-explicit-reuse-target");
-    handler.create_session(&origin).await;
-    handler.create_session(&replacement).await;
-    handler.create_session(&target).await;
+    SessionSpec::create(&handler, &origin).await;
+    SessionSpec::create(&handler, &replacement).await;
+    SessionSpec::create(&handler, &target).await;
 
     // Start directory in the seed, probe on the host: see the detach case above.
     let cwd = seed_scratch_dir(&handler, "run-shell-explicit-reuse");
@@ -566,7 +569,7 @@ async fn explicit_background_shell_target_survives_same_pid_attach_replacement()
 #[tokio::test]
 async fn background_run_shell_commands_still_emit_after_hooks_outside_hook_context() {
     let handler = RequestHandler::new();
-    handler.create_session("run-shell-after-hooks").await;
+    SessionSpec::create(&handler, "run-shell-after-hooks").await;
     execute_test_command(
         &handler,
         "set-hook -g after-new-window 'set-buffer -b after-run-shell yes'",
@@ -751,7 +754,7 @@ async fn assert_named_buffer(handler: &RequestHandler, name: &str, expected: Opt
 #[tokio::test]
 async fn run_shell_command_mode_attach_session_requires_terminal_like_tmux() {
     let handler = RequestHandler::new();
-    handler.create_session("run-shell-attach-target").await;
+    SessionSpec::create(&handler, "run-shell-attach-target").await;
 
     let response = handler
         .handle(
@@ -777,7 +780,7 @@ async fn run_shell_command_mode_rejects_nested_and_implicit_attach_like_tmux() {
     // "open terminal failed: not a terminal" for attach-session nested in a
     // brace body and for a non-detached new-session (and creates nothing).
     let handler = RequestHandler::new();
-    handler.create_session("run-shell-nested-attach").await;
+    SessionSpec::create(&handler, "run-shell-nested-attach").await;
 
     for command in [
         "if-shell -F 1 { attach-session -t run-shell-nested-attach }",
@@ -851,7 +854,7 @@ async fn run_shell_missing_explicit_target_is_nonfatal() {
 #[tokio::test]
 async fn background_if_shell_still_emits_after_hooks_outside_hook_context() {
     let handler = RequestHandler::new();
-    handler.create_session("if-shell-after-hooks").await;
+    SessionSpec::create(&handler, "if-shell-after-hooks").await;
     execute_test_command(
         &handler,
         "set-hook -g after-new-window 'set-buffer -b after-if-shell yes'",

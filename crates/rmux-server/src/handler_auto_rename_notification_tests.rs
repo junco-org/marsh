@@ -10,7 +10,7 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use super::{QueuedLifecycleEvent, RequestHandler};
 use crate::control::ControlServerEvent;
 use crate::pane_io::PaneAlertEvent;
-use crate::test_fixtures::{Fixture, Quiet};
+use crate::test_fixtures::{Fixture, Quiet, SessionSpec, TestRequest};
 
 fn drain_control_notifications(rx: &mut mpsc::Receiver<ControlServerEvent>) -> Vec<String> {
     let mut notifications = Vec::new();
@@ -120,20 +120,16 @@ async fn automatic_and_manual_renames_publish_one_link_aware_event_before_the_ho
     // renames publish one linked/unlinked control notification per client,
     // followed by exactly one window-renamed hook.
     let handler = RequestHandler::new();
-    let alpha = handler
-        .create_started_session(Quiet("auto-rename-alpha"))
-        .await;
-    let beta = handler
-        .create_started_session(Quiet("auto-rename-beta"))
-        .await;
-    let gamma = handler
-        .create_started_session(Quiet("auto-rename-gamma"))
-        .await;
+    let alpha = SessionSpec::create_started(&handler, Quiet("auto-rename-alpha")).await;
+    let beta = SessionSpec::create_started(&handler, Quiet("auto-rename-beta")).await;
+    let gamma = SessionSpec::create_started(&handler, Quiet("auto-rename-gamma")).await;
     let alpha_target = WindowTarget::with_window(alpha.clone(), 0);
     let gamma_target = WindowTarget::with_window(gamma.clone(), 1);
-    handler
-        .handle_ok(LinkWindowRequest::fixture((&alpha_target, &gamma_target)))
-        .await;
+    TestRequest::send_ok(
+        &handler,
+        LinkWindowRequest::fixture((&alpha_target, &gamma_target)),
+    )
+    .await;
     handler
         .set_option(
             ScopeSelector::Window(alpha_target.clone()),
@@ -141,16 +137,18 @@ async fn automatic_and_manual_renames_publish_one_link_aware_event_before_the_ho
             "automatic-oracle",
         )
         .await;
-    handler
-        .handle_ok(SetHookRequest {
+    TestRequest::send_ok(
+        &handler,
+        SetHookRequest {
             lifecycle: HookLifecycle::OneShot,
             ..Fixture::fixture((
                 ScopeSelector::Global,
                 HookName::WindowRenamed,
                 "set-buffer -b automatic-rename-hook fired",
             ))
-        })
-        .await;
+        },
+    )
+    .await;
     let lifecycle_dispatch = handler
         .take_lifecycle_dispatch_receiver()
         .expect("test owns lifecycle hook dispatch");
@@ -212,22 +210,26 @@ async fn automatic_and_manual_renames_publish_one_link_aware_event_before_the_ho
     assert_hook_window_name(&automatic_event, "automatic-oracle");
     assert_no_additional_window_renamed(&mut lifecycle);
 
-    handler
-        .handle_ok(SetHookRequest {
+    TestRequest::send_ok(
+        &handler,
+        SetHookRequest {
             lifecycle: HookLifecycle::OneShot,
             ..Fixture::fixture((
                 ScopeSelector::Global,
                 HookName::WindowRenamed,
                 "set-buffer -b manual-rename-hook fired",
             ))
-        })
-        .await;
-    handler
-        .handle_ok(RenameWindowRequest {
+        },
+    )
+    .await;
+    TestRequest::send_ok(
+        &handler,
+        RenameWindowRequest {
             target: alpha_target,
             name: "manual-oracle".to_owned(),
-        })
-        .await;
+        },
+    )
+    .await;
 
     let manual_event = recv_window_renamed(&mut lifecycle).await;
     handler.wait_for_buffer("manual-rename-hook", "fired").await;

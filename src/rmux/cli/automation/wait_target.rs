@@ -6,7 +6,7 @@ use rmux_proto::{
 
 use crate::cli_args::TargetSpec;
 
-use super::super::{ExitFailure, resolve_pane_target_or_current};
+use super::super::{CommandTarget, ExitFailure};
 use super::common::{
     command_error, list_panes_output, pane_snapshot, parse_i32_field, parse_pane_id,
     protocol_mismatch, slot_row_fields, target_kind_name,
@@ -113,7 +113,7 @@ pub(super) fn resolve(
     target: Option<&TargetSpec>,
     command_name: &'static str,
 ) -> Result<StableWaitTarget, ExitFailure> {
-    let slot = resolve_pane_target_or_current(connection, target, command_name)?;
+    let slot = PaneTarget::resolve(connection, target, command_name)?;
     for_slot(connection, &slot, command_name)
 }
 

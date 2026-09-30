@@ -3,7 +3,7 @@ use super::inactive_winlink_resize::{
 };
 use super::{create_grouped_last_pane_family, RequestHandler};
 use crate::pane_io::PaneExitEvent;
-use crate::test_fixtures::Fixture;
+use crate::test_fixtures::{Fixture, SessionSpec, TestRequest};
 use rmux_proto::{
     KillPaneRequest, LinkWindowRequest, NewWindowRequest, PaneKillRequest, PaneTarget,
     PaneTargetRef, Request, Response, SelectWindowRequest, TerminalSize, UnlinkWindowRequest,
@@ -119,20 +119,22 @@ async fn pane_id_group_and_real_winlink_reconcile_smallest_after_alias_removal()
     let handler = RequestHandler::new();
     let (_keeper, owner, peer, family_pane_id) =
         create_grouped_last_pane_family(&handler, "pane-id-smallest-linked").await;
-    let linked_survivor = handler
-        .create_session("pane-id-smallest-linked-survivor")
-        .await;
-    handler
-        .handle_ok(LinkWindowRequest::fixture((
+    let linked_survivor = SessionSpec::create(&handler, "pane-id-smallest-linked-survivor").await;
+    TestRequest::send_ok(
+        &handler,
+        LinkWindowRequest::fixture((
             WindowTarget::with_window(owner.clone(), 0),
             WindowTarget::with_window(linked_survivor.clone(), 1),
-        )))
-        .await;
-    handler
-        .handle_ok(SelectWindowRequest {
+        )),
+    )
+    .await;
+    TestRequest::send_ok(
+        &handler,
+        SelectWindowRequest {
             target: WindowTarget::with_window(linked_survivor.clone(), 1),
-        })
-        .await;
+        },
+    )
+    .await;
     handler.wait_for_initial_panes_for_test().await;
 
     let large_pid = 7321;
@@ -177,19 +179,23 @@ async fn assert_multi_window_alias_removal_reconciles_real_winlink_survivor(
     first_pid: u32,
 ) {
     let handler = RequestHandler::new();
-    let source = handler.create_session(format!("{label}-source")).await;
-    let survivor = handler.create_session(format!("{label}-survivor")).await;
-    handler
-        .handle_ok(LinkWindowRequest::fixture((
+    let source = SessionSpec::create(&handler, format!("{label}-source")).await;
+    let survivor = SessionSpec::create(&handler, format!("{label}-survivor")).await;
+    TestRequest::send_ok(
+        &handler,
+        LinkWindowRequest::fixture((
             WindowTarget::with_window(survivor.clone(), 0),
             WindowTarget::with_window(source.clone(), 1),
-        )))
-        .await;
-    handler
-        .handle_ok(SelectWindowRequest {
+        )),
+    )
+    .await;
+    TestRequest::send_ok(
+        &handler,
+        SelectWindowRequest {
             target: WindowTarget::with_window(source.clone(), 1),
-        })
-        .await;
+        },
+    )
+    .await;
     handler.wait_for_initial_panes_for_test().await;
 
     let family_pane_id = {
@@ -317,29 +323,39 @@ async fn assert_linked_family_removal_reconciles_replacement_window(
     first_pid: u32,
 ) {
     let handler = RequestHandler::new();
-    let source = handler
-        .create_session((format!("{label}-source"), scenario.expected_before))
-        .await;
-    let survivor = handler
-        .create_session((format!("{label}-survivor"), scenario.expected_before))
-        .await;
-    let replacement_alias = handler
-        .create_session((
+    let source = SessionSpec::create(
+        &handler,
+        (format!("{label}-source"), scenario.expected_before),
+    )
+    .await;
+    let survivor = SessionSpec::create(
+        &handler,
+        (format!("{label}-survivor"), scenario.expected_before),
+    )
+    .await;
+    let replacement_alias = SessionSpec::create(
+        &handler,
+        (
             format!("{label}-replacement-alias"),
             scenario.expected_before,
-        ))
-        .await;
-    handler
-        .handle_ok(LinkWindowRequest::fixture((
+        ),
+    )
+    .await;
+    TestRequest::send_ok(
+        &handler,
+        LinkWindowRequest::fixture((
             WindowTarget::with_window(survivor.clone(), 0),
             WindowTarget::with_window(replacement_alias.clone(), 1),
-        )))
-        .await;
-    handler
-        .handle_ok(SelectWindowRequest {
+        )),
+    )
+    .await;
+    TestRequest::send_ok(
+        &handler,
+        SelectWindowRequest {
             target: WindowTarget::with_window(replacement_alias.clone(), 1),
-        })
-        .await;
+        },
+    )
+    .await;
     handler
         .create_window(NewWindowRequest {
             name: Some("shared".to_owned()),
@@ -347,18 +363,22 @@ async fn assert_linked_family_removal_reconciles_replacement_window(
             ..Fixture::fixture(&source)
         })
         .await;
-    handler
-        .handle_ok(LinkWindowRequest::fixture((
+    TestRequest::send_ok(
+        &handler,
+        LinkWindowRequest::fixture((
             WindowTarget::with_window(source.clone(), 1),
             WindowTarget::with_window(survivor.clone(), 1),
-        )))
-        .await;
+        )),
+    )
+    .await;
     for session_name in [&source, &survivor] {
-        handler
-            .handle_ok(SelectWindowRequest {
+        TestRequest::send_ok(
+            &handler,
+            SelectWindowRequest {
                 target: WindowTarget::with_window(session_name.clone(), 1),
-            })
-            .await;
+            },
+        )
+        .await;
         handler
             .set_window_size_policy(session_name, 1, scenario.policy)
             .await;
@@ -396,12 +416,14 @@ async fn assert_linked_family_removal_reconciles_replacement_window(
 
     match removal {
         LinkedFamilyRemoval::KillPane => {
-            handler
-                .handle_ok(KillPaneRequest {
+            TestRequest::send_ok(
+                &handler,
+                KillPaneRequest {
                     target: PaneTarget::with_window(source.clone(), 1, 0),
                     kill_all_except: false,
-                })
-                .await;
+                },
+            )
+            .await;
         }
         LinkedFamilyRemoval::NaturalExit => {
             {

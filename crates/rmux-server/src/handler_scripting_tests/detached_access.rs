@@ -3,6 +3,7 @@ use super::*;
 use rmux_ipc::PeerIdentity;
 
 use crate::server_access::{current_owner_uid, ServerAccessAdmission};
+use crate::test_fixtures::{SessionSpec, TestRequest};
 
 #[derive(Clone, Copy)]
 enum CallbackPath {
@@ -184,7 +185,8 @@ async fn background_prompt_keeps_valid_detached_origin_after_request_scope_ends(
     let requester_pid = 821_020;
     let uid = synthetic_uid(21_020);
     let buffer_name = "prompt-valid-origin";
-    let _control_rx = create_callback_attach(&handler, requester_pid, "prompt-valid-origin").await;
+    let _control_rx =
+        SessionSpec::create_attached(&handler, requester_pid, "prompt-valid-origin").await;
     let admission = grant_admission(&handler, uid, AccessMode::ReadWrite);
     let scope = handler.begin_detached_requester_access(requester_pid, admission);
 
@@ -215,7 +217,8 @@ async fn background_prompt_rejects_remove_regrant_epoch_even_with_attach_pid_col
     let requester_pid = 821_021;
     let uid = synthetic_uid(21_021);
     let buffer_name = "prompt-stale-origin";
-    let _control_rx = create_callback_attach(&handler, requester_pid, "prompt-stale-origin").await;
+    let _control_rx =
+        SessionSpec::create_attached(&handler, requester_pid, "prompt-stale-origin").await;
     let admission = grant_admission(&handler, uid, AccessMode::ReadWrite);
     let scope = handler.begin_detached_requester_access(requester_pid, admission);
 
@@ -250,7 +253,7 @@ async fn incremental_prompt_revalidates_its_origin_on_every_dispatch() {
     let uid = synthetic_uid(21_022);
     let buffer_name = "prompt-incremental-origin";
     let _control_rx =
-        create_callback_attach(&handler, requester_pid, "prompt-incremental-origin").await;
+        SessionSpec::create_attached(&handler, requester_pid, "prompt-incremental-origin").await;
     let admission = grant_admission(&handler, uid, AccessMode::ReadWrite);
     let scope = handler.begin_detached_requester_access(requester_pid, admission);
 
@@ -292,7 +295,8 @@ async fn confirm_before_rejects_stale_origin_after_remove_regrant() {
     let requester_pid = 821_023;
     let uid = synthetic_uid(21_023);
     let buffer_name = "confirm-stale-origin";
-    let _control_rx = create_callback_attach(&handler, requester_pid, "confirm-stale-origin").await;
+    let _control_rx =
+        SessionSpec::create_attached(&handler, requester_pid, "confirm-stale-origin").await;
     let admission = grant_admission(&handler, uid, AccessMode::ReadWrite);
     let scope = handler.begin_detached_requester_access(requester_pid, admission);
 
@@ -326,7 +330,8 @@ async fn root_menu_rejects_stale_origin_instead_of_borrowing_colliding_attach() 
     let requester_pid = 821_024;
     let uid = synthetic_uid(21_024);
     let buffer_name = "menu-stale-origin";
-    let _control_rx = create_callback_attach(&handler, requester_pid, "menu-stale-origin").await;
+    let _control_rx =
+        SessionSpec::create_attached(&handler, requester_pid, "menu-stale-origin").await;
     let admission = grant_admission(&handler, uid, AccessMode::ReadWrite);
     let scope = handler.begin_detached_requester_access(requester_pid, admission);
     let menu = CommandParser::new()
@@ -361,8 +366,8 @@ async fn popup_internal_menu_captures_interacting_attach_origin_and_target() {
     let uid = synthetic_uid(21_025);
     let alpha = SessionName::new("popup-menu-origin-alpha").expect("valid session");
     let beta = SessionName::new("popup-menu-origin-beta").expect("valid session");
-    let _control_rx = create_callback_attach(&handler, attach_pid, alpha.as_str()).await;
-    handler.create_session(&beta).await;
+    let _control_rx = SessionSpec::create_attached(&handler, attach_pid, alpha.as_str()).await;
+    SessionSpec::create(&handler, &beta).await;
     let admission = grant_admission(&handler, uid, AccessMode::ReadWrite);
     let scope = handler.begin_detached_requester_access(popup_requester_pid, admission);
     let popup = CommandParser::new()
@@ -409,7 +414,8 @@ async fn display_panes_custom_action_rejects_stale_origin_with_attach_pid_collis
     let uid = synthetic_uid(21_027);
     let session_name = SessionName::new("display-panes-stale-origin").expect("valid session name");
     let buffer_name = "display-panes-stale-origin";
-    let _control_rx = create_callback_attach(&handler, requester_pid, session_name.as_str()).await;
+    let _control_rx =
+        SessionSpec::create_attached(&handler, requester_pid, session_name.as_str()).await;
     let admission = grant_admission(&handler, uid, AccessMode::ReadWrite);
     let scope = handler.begin_detached_requester_access(requester_pid, admission);
     let response = handler
@@ -451,7 +457,8 @@ async fn display_panes_default_action_rejects_stale_origin() {
     let requester_pid = 821_028;
     let uid = synthetic_uid(21_028);
     let session_name = SessionName::new("display-panes-default-stale").expect("valid session name");
-    let _control_rx = create_callback_attach(&handler, requester_pid, session_name.as_str()).await;
+    let _control_rx =
+        SessionSpec::create_attached(&handler, requester_pid, session_name.as_str()).await;
     let admission = grant_admission(&handler, uid, AccessMode::ReadWrite);
     let scope = handler.begin_detached_requester_access(requester_pid, admission);
     let response = handler
@@ -492,10 +499,13 @@ async fn mode_tree_default_action_rejects_stale_origin_before_buffer_mutation() 
     let requester_pid = 821_029;
     let uid = synthetic_uid(21_029);
     let buffer_name = "mode-default-stale";
-    let _control_rx = create_callback_attach(&handler, requester_pid, "mode-default-stale").await;
-    handler
-        .handle_ok(SetBufferRequest::fixture((buffer_name, b"preserved")))
-        .await;
+    let _control_rx =
+        SessionSpec::create_attached(&handler, requester_pid, "mode-default-stale").await;
+    TestRequest::send_ok(
+        &handler,
+        SetBufferRequest::fixture((buffer_name, b"preserved")),
+    )
+    .await;
     let admission = grant_admission(&handler, uid, AccessMode::ReadWrite);
     let scope = handler.begin_detached_requester_access(requester_pid, admission);
     open_mode_tree(&handler, requester_pid, "choose-buffer").await;
@@ -524,10 +534,13 @@ async fn mode_tree_custom_template_rejects_stale_origin() {
     let uid = synthetic_uid(21_030);
     let source_buffer = "mode-custom-source";
     let marker = "mode-custom-stale";
-    let _control_rx = create_callback_attach(&handler, requester_pid, "mode-custom-stale").await;
-    handler
-        .handle_ok(SetBufferRequest::fixture((source_buffer, b"source")))
-        .await;
+    let _control_rx =
+        SessionSpec::create_attached(&handler, requester_pid, "mode-custom-stale").await;
+    TestRequest::send_ok(
+        &handler,
+        SetBufferRequest::fixture((source_buffer, b"source")),
+    )
+    .await;
     let admission = grant_admission(&handler, uid, AccessMode::ReadWrite);
     let scope = handler.begin_detached_requester_access(requester_pid, admission);
     open_mode_tree(
@@ -558,10 +571,13 @@ async fn mode_tree_command_prompt_preserves_stale_origin() {
     let uid = synthetic_uid(21_031);
     let source_buffer = "mode-prompt-source";
     let marker = "mode-prompt-stale";
-    let _control_rx = create_callback_attach(&handler, requester_pid, "mode-prompt-stale").await;
-    handler
-        .handle_ok(SetBufferRequest::fixture((source_buffer, b"source")))
-        .await;
+    let _control_rx =
+        SessionSpec::create_attached(&handler, requester_pid, "mode-prompt-stale").await;
+    TestRequest::send_ok(
+        &handler,
+        SetBufferRequest::fixture((source_buffer, b"source")),
+    )
+    .await;
     let admission = grant_admission(&handler, uid, AccessMode::ReadWrite);
     let scope = handler.begin_detached_requester_access(requester_pid, admission);
     open_mode_tree(&handler, requester_pid, "choose-buffer").await;
@@ -592,10 +608,13 @@ async fn mode_tree_confirmation_preserves_stale_origin() {
     let requester_pid = 821_032;
     let uid = synthetic_uid(21_032);
     let buffer_name = "mode-confirm-stale";
-    let _control_rx = create_callback_attach(&handler, requester_pid, "mode-confirm-stale").await;
-    handler
-        .handle_ok(SetBufferRequest::fixture((buffer_name, b"preserved")))
-        .await;
+    let _control_rx =
+        SessionSpec::create_attached(&handler, requester_pid, "mode-confirm-stale").await;
+    TestRequest::send_ok(
+        &handler,
+        SetBufferRequest::fixture((buffer_name, b"preserved")),
+    )
+    .await;
     let admission = grant_admission(&handler, uid, AccessMode::ReadWrite);
     let scope = handler.begin_detached_requester_access(requester_pid, admission);
     open_mode_tree(&handler, requester_pid, "choose-buffer").await;
@@ -628,16 +647,16 @@ async fn detached_mode_tree_command_prompt_targets_interacting_attach() {
     let interacting_attach_pid = 821_035;
     let uid = synthetic_uid(21_033);
     let session_name = SessionName::new("mode-prompt-multiple-attaches").expect("valid session");
-    let _first_rx = create_callback_attach(&handler, first_attach_pid, session_name.as_str()).await;
+    let _first_rx =
+        SessionSpec::create_attached(&handler, first_attach_pid, session_name.as_str()).await;
     let _interacting_rx = handler
         .attach_client(interacting_attach_pid, &session_name)
         .await;
-    handler
-        .handle_ok(SetBufferRequest::fixture((
-            "mode-prompt-multiple-source",
-            b"source",
-        )))
-        .await;
+    TestRequest::send_ok(
+        &handler,
+        SetBufferRequest::fixture(("mode-prompt-multiple-source", b"source")),
+    )
+    .await;
     let admission = grant_admission(&handler, uid, AccessMode::ReadWrite);
     let _scope = handler.begin_detached_requester_access(requester_pid, admission);
 
@@ -669,16 +688,16 @@ async fn detached_mode_tree_confirmation_targets_interacting_attach() {
     let interacting_attach_pid = 821_038;
     let uid = synthetic_uid(21_036);
     let session_name = SessionName::new("mode-confirm-multiple-attaches").expect("valid session");
-    let _first_rx = create_callback_attach(&handler, first_attach_pid, session_name.as_str()).await;
+    let _first_rx =
+        SessionSpec::create_attached(&handler, first_attach_pid, session_name.as_str()).await;
     let _interacting_rx = handler
         .attach_client(interacting_attach_pid, &session_name)
         .await;
-    handler
-        .handle_ok(SetBufferRequest::fixture((
-            "mode-confirm-multiple-source",
-            b"preserved",
-        )))
-        .await;
+    TestRequest::send_ok(
+        &handler,
+        SetBufferRequest::fixture(("mode-confirm-multiple-source", b"preserved")),
+    )
+    .await;
     let admission = grant_admission(&handler, uid, AccessMode::ReadWrite);
     let _scope = handler.begin_detached_requester_access(requester_pid, admission);
 
@@ -814,15 +833,6 @@ fn admission_for_uid(handler: &RequestHandler, uid: u32) -> ServerAccessAdmissio
             user: UserIdentity::Uid(uid),
         })
         .expect("granted test peer has an admission")
-}
-
-async fn create_callback_attach(
-    handler: &RequestHandler,
-    requester_pid: u32,
-    name: &str,
-) -> mpsc::UnboundedReceiver<AttachControl> {
-    let session_name = handler.create_session(name).await;
-    handler.attach_client(requester_pid, session_name).await
 }
 
 async fn open_mode_tree(handler: &RequestHandler, requester_pid: u32, command: &str) {

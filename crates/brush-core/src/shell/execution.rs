@@ -5,7 +5,7 @@ use std::path::Path;
 use crate::{
     ExecutionControlFlow, ExecutionParameters, ExecutionResult, ProcessGroupPolicy, SourceInfo,
     arithmetic::Evaluatable as _, callstack, error, extensions::ExecutionObserver as _,
-    interp::Execute as _, openfiles, trace_categories,
+    hostfs, interp::Execute as _, openfiles, trace_categories,
 };
 
 impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
@@ -28,7 +28,7 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
         params: &ExecutionParameters,
     ) -> Result<bool, error::Error> {
         let path = path.as_ref();
-        if path.exists() {
+        if hostfs::exists(&self.execution_observer, &self.absolute_path(path)) {
             self.source_script(path, std::iter::empty::<String>(), params)
                 .await?;
             Ok(true)

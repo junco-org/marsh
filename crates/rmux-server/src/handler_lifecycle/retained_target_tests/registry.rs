@@ -1,4 +1,5 @@
 use super::*;
+use crate::test_fixtures::{SessionSpec, TestRequest};
 
 #[tokio::test]
 async fn moved_pane_stays_live_while_its_destroyed_source_window_retires() {
@@ -63,9 +64,9 @@ async fn moved_pane_stays_live_while_its_destroyed_source_window_retires() {
 #[tokio::test]
 async fn retained_targets_follow_surviving_aliases_deterministically() {
     let handler = RequestHandler::new();
-    let alpha = handler.create_session("retained-alias-alpha").await;
-    let beta = handler.create_session("retained-alias-beta").await;
-    let gamma = handler.create_session("retained-alias-gamma").await;
+    let alpha = SessionSpec::create(&handler, "retained-alias-alpha").await;
+    let beta = SessionSpec::create(&handler, "retained-alias-beta").await;
+    let gamma = SessionSpec::create(&handler, "retained-alias-gamma").await;
     handler
         .create_window(NewWindowRequest {
             target_window_index: Some(1),
@@ -73,12 +74,14 @@ async fn retained_targets_follow_surviving_aliases_deterministically() {
         })
         .await;
     for (session_name, window_index) in [(&gamma, 3), (&gamma, 2), (&beta, 1)] {
-        handler
-            .handle_ok(LinkWindowRequest::fixture((
+        TestRequest::send_ok(
+            &handler,
+            LinkWindowRequest::fixture((
                 WindowTarget::with_window(alpha.clone(), 0),
                 WindowTarget::with_window(session_name.clone(), window_index),
-            )))
-            .await;
+            )),
+        )
+        .await;
     }
 
     let source_window = WindowTarget::with_window(alpha.clone(), 0);
@@ -106,12 +109,14 @@ async fn retained_targets_follow_surviving_aliases_deterministically() {
         (window_lease, pane_lease, stable_window, stable_pane)
     };
 
-    handler
-        .handle_ok(UnlinkWindowRequest {
+    TestRequest::send_ok(
+        &handler,
+        UnlinkWindowRequest {
             target: source_window,
             kill_if_last: false,
-        })
-        .await;
+        },
+    )
+    .await;
 
     let state = handler.state.lock().await;
     assert!(
@@ -133,8 +138,8 @@ async fn retained_targets_follow_surviving_aliases_deterministically() {
 #[tokio::test]
 async fn surviving_alias_becomes_the_retirement_slot_after_original_slot_reuse() {
     let handler = RequestHandler::new();
-    let alpha = handler.create_session("retained-cursor-alpha").await;
-    let beta = handler.create_session("retained-cursor-beta").await;
+    let alpha = SessionSpec::create(&handler, "retained-cursor-alpha").await;
+    let beta = SessionSpec::create(&handler, "retained-cursor-beta").await;
     handler
         .create_window(NewWindowRequest {
             target_window_index: Some(1),
@@ -142,12 +147,11 @@ async fn surviving_alias_becomes_the_retirement_slot_after_original_slot_reuse()
         })
         .await;
     let source = WindowTarget::with_window(alpha.clone(), 0);
-    handler
-        .handle_ok(LinkWindowRequest::fixture((
-            &source,
-            WindowTarget::with_window(beta.clone(), 1),
-        )))
-        .await;
+    TestRequest::send_ok(
+        &handler,
+        LinkWindowRequest::fixture((&source, WindowTarget::with_window(beta.clone(), 1))),
+    )
+    .await;
     let lease = {
         let state = handler.state.lock().await;
         state
@@ -155,12 +159,14 @@ async fn surviving_alias_becomes_the_retirement_slot_after_original_slot_reuse()
             .expect("capture retained aliased window")
     };
 
-    handler
-        .handle_ok(UnlinkWindowRequest {
+    TestRequest::send_ok(
+        &handler,
+        UnlinkWindowRequest {
             target: source,
             kill_if_last: false,
-        })
-        .await;
+        },
+    )
+    .await;
     {
         let state = handler.state.lock().await;
         assert_eq!(
@@ -176,12 +182,14 @@ async fn surviving_alias_becomes_the_retirement_slot_after_original_slot_reuse()
         })
         .await;
 
-    handler
-        .handle_ok(UnlinkWindowRequest {
+    TestRequest::send_ok(
+        &handler,
+        UnlinkWindowRequest {
             target: WindowTarget::with_window(beta, 1),
             kill_if_last: true,
-        })
-        .await;
+        },
+    )
+    .await;
     let state = handler.state.lock().await;
     assert_retired(&lease, &state);
 }

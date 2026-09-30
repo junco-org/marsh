@@ -1,4 +1,5 @@
 use super::*;
+use crate::test_fixtures::TestRequest;
 
 #[tokio::test]
 async fn send_keys_uses_copy_mode_vi_default_bindings() {
@@ -16,7 +17,7 @@ async fn send_keys_uses_copy_mode_vi_default_bindings() {
         .await;
 
     set_mode_keys(&handler, &alpha, "vi").await;
-    handler.handle_ok(CopyModeRequest::fixture(&target)).await;
+    TestRequest::send_ok(&handler, CopyModeRequest::fixture(&target)).await;
 
     let response = handler
         .handle(Request::SendKeys(SendKeysRequest {

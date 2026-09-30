@@ -13,7 +13,7 @@ use crate::cli_response::expect_command_success;
 
 use super::super::key_commands::send_keys_extended;
 use super::super::target_resolution::connect_cli;
-use super::super::{ExitFailure, resolve_pane_target_or_current};
+use super::super::{CommandTarget, ExitFailure};
 use super::common::{
     DEFAULT_STABLE_FOR, check_disabled, duration_millis, elapsed_millis, find_visible_text,
     response_error, sleep_poll_interval, target_kind_name, timeout_deadline, visible_text,
@@ -555,7 +555,7 @@ fn send_keys_target_plan(
     args: &SendKeysArgs,
 ) -> Result<SendKeysTargetPlan, ExitFailure> {
     let send_target = if args.target.is_some() {
-        Some(resolve_pane_target_or_current(
+        Some(PaneTarget::resolve(
             connection,
             args.target.as_ref(),
             "send-keys",
@@ -568,7 +568,7 @@ fn send_keys_target_plan(
     } else if let Some(target_client) = args.client_target.as_deref() {
         attached_target_client_pane_ref(connection, target_client)?
     } else {
-        let current = resolve_pane_target_or_current(connection, None, "send-keys")?;
+        let current = PaneTarget::resolve_fallback(connection, "send-keys")?;
         Some(wait_target::for_slot(connection, &current, "send-keys")?)
     };
 

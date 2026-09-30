@@ -65,7 +65,12 @@ pub trait ErrorFormatter: Clone + Default + Send + Sync + 'static {
 /// program in a tracer, or running it on another host).
 ///
 /// The returned [`Child`](sys::process::Child) is what the shell waits on and reports through
-/// `$?`. An `Err` is mapped to the command's exit status:
+/// `$?`. A Tokio-backed child (`Child::from(tokio::process::Child)`) is reaped by the shell,
+/// which also detects its stops with a `waitid` on its pid alone. A
+/// [`Child::hosted`](sys::process::Child::hosted) child is never waited on by the shell: its
+/// stops and exit are taken from the [`HostedChild`](sys::process::HostedChild)'s event channel,
+/// so an embedder that ptraces the command from this process keeps sole ownership of its wait
+/// status. An `Err` is mapped to the command's exit status:
 /// [`NotFound`](std::io::ErrorKind::NotFound) is reported as command-not-found (127), anything
 /// else as failed-to-execute (126).
 ///
@@ -102,15 +107,57 @@ impl ExternalCommandSpawner for DefaultExternalCommandSpawner {
     }
 }
 
+/// One filesystem access the interpreter itself performed on a host thread, reported after it
+/// happened through [`ExecutionObserver::host_access`].
+///
+/// Paths are absolute (already joined with the shell's working directory).
+#[non_exhaustive]
+pub enum HostAccess<'a> {
+    /// An open; `Ok(fd)` is the raw descriptor of the just-opened file (still open during the
+    /// call), `Err(errno)` otherwise.
+    Open {
+        /// The path that was opened.
+        path: &'a Path,
+        /// The opened descriptor, or the errno the open failed with.
+        result: Result<std::os::fd::RawFd, i32>,
+    },
+    /// A metadata/existence probe (stat when `follow`, lstat otherwise). `errno` when it
+    /// failed.
+    Metadata {
+        /// The path that was probed.
+        path: &'a Path,
+        /// Whether a final symbolic link was followed.
+        follow: bool,
+        /// The errno the probe failed with, if it failed.
+        errno: Option<i32>,
+    },
+    /// A directory enumeration. `errno` when opening the directory failed.
+    ReadDir {
+        /// The directory that was enumerated.
+        path: &'a Path,
+        /// The errno opening the directory failed with, if it failed.
+        errno: Option<i32>,
+    },
+    /// A file descriptor the shell kept from an earlier command (for example, from
+    /// `exec 3> file`) is handed to this command's host-side reads and writes, which are not
+    /// reported one by one.
+    Descriptor {
+        /// The raw descriptor, open during the call.
+        fd: std::os::fd::RawFd,
+    },
+}
+
 /// Trait for observing the work a shell performs in its host process.
 ///
 /// The shell interprets commands in-process: builtins, shell functions, expansions, prompts,
 /// completions and sourced files all run on the host's threads, and some constructs schedule
 /// further work on other Tokio tasks or blocking threads. An observer is consulted at each of
 /// those points so that an embedder can attribute everything the shell does to an operation of
-/// its own and account for every piece of scheduled work until it finishes. The observer sees
-/// *where* the shell runs code, never *what* that code does; it has no say over the shell's
-/// semantics other than refusing to run a unit of work.
+/// its own and account for every piece of scheduled work until it finishes. Beyond *where* the
+/// shell runs code, the observer is also told about each filesystem access the interpreter
+/// itself performs on a host thread ([`host_access`](Self::host_access)), since such accesses
+/// are invisible to any tracer of the external commands the shell spawns. It has no say over
+/// the shell's semantics other than refusing to run a unit of work.
 ///
 /// The hooks are:
 ///
@@ -131,6 +178,9 @@ impl ExternalCommandSpawner for DefaultExternalCommandSpawner {
 ///   schedule the shell's concurrent work: background (`&`) lists, coprocesses, process
 ///   substitutions, command substitutions, and builtins run as a stage of a multi-command
 ///   pipeline. The shell never schedules work through any other path.
+/// * [`host_access`](Self::host_access) reports, after the fact, each filesystem access the
+///   interpreter performs itself: opens for redirections and sourced scripts, `test`/`[[`
+///   probes, glob directory enumeration, `PATH` searches, working-directory changes.
 ///
 /// The futures returned by [`run_builtin`](Self::run_builtin) and
 /// [`scope_future`](Self::scope_future) capture exactly their type parameters
@@ -219,6 +269,13 @@ pub trait ExecutionObserver: Clone + Default + Send + Sync + 'static {
     where
         F: FnOnce() -> T + Send + 'static,
         T: Send + 'static;
+
+    /// Reports one filesystem access the interpreter just performed on the current thread.
+    ///
+    /// Called synchronously right after the access, never across an `.await`, on whatever
+    /// thread performed it. Accesses made by external commands (after the spawner's
+    /// [`spawn`](ExternalCommandSpawner::spawn)) are not reported. The default does nothing.
+    fn host_access(&self, _access: HostAccess<'_>) {}
 }
 
 /// Default execution observer; runs and schedules everything exactly as the shell requests,

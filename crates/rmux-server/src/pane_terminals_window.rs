@@ -632,8 +632,6 @@ impl HandlerState {
             environment_overrides: environment_overrides.as_deref(),
             respawn_shell,
             respawn_environment: respawn_environment.as_deref(),
-            shell_id: None,
-            follow_mux_lifetime: false,
         };
         let removed_pane_ids = pane_ids
             .iter()

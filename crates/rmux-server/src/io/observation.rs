@@ -392,13 +392,13 @@ async fn deliver(
                         if let Some(completion) = end.completion.as_ref().filter(|completion| {
                             !io.report_was_rendered(&end.shell.uid, completion.id)
                         }) {
-                            for line in marsh_core::shellmux::repl::report_lines(
+                            if let Some(mut report) = crate::managed_workload::report_line(
                                 &end.shell.id,
                                 &completion.result,
                             ) {
-                                let bytes = format!("{line}\r\n");
+                                report.push_str("\r\n");
                                 handler
-                                    .apply_final_report(&end.shell, bytes.as_bytes())
+                                    .apply_final_report(&end.shell, report.as_bytes())
                                     .await;
                             }
                         }

@@ -1,5 +1,5 @@
 use super::RequestHandler;
-use crate::test_fixtures::Fixture;
+use crate::test_fixtures::{Fixture, SessionSpec, TestRequest};
 use rmux_core::PaneGeometry;
 use rmux_proto::{
     LayoutName, NextLayoutRequest, PaneTarget, PreviousLayoutRequest, Request,
@@ -20,12 +20,11 @@ fn layout_string(body: &str) -> String {
 }
 
 async fn split_pane_zero(handler: &RequestHandler, session_name: &SessionName, expected_pane: u32) {
-    let split = handler
-        .handle_ok(SplitWindowRequest::fixture(PaneTarget::new(
-            session_name.clone(),
-            0,
-        )))
-        .await;
+    let split = TestRequest::send_ok(
+        handler,
+        SplitWindowRequest::fixture(PaneTarget::new(session_name.clone(), 0)),
+    )
+    .await;
     assert_eq!(
         split.pane,
         PaneTarget::new(session_name.clone(), expected_pane)
@@ -37,9 +36,7 @@ async fn select_layout_even_layouts_apply_tmux_geometry_through_the_handler() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
 
-    handler
-        .create_session((&alpha, TerminalSize::new(100, 40)))
-        .await;
+    SessionSpec::create(&handler, (&alpha, TerminalSize::new(100, 40))).await;
 
     for expected_pane in [1, 1] {
         split_pane_zero(&handler, &alpha, expected_pane).await;
@@ -170,9 +167,7 @@ async fn select_layout_even_layouts_apply_tmux_geometry_through_the_handler() {
 async fn next_layout_uses_tmux_cycle_order_and_wraps() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    handler
-        .create_session((&alpha, TerminalSize { cols: 80, rows: 24 }))
-        .await;
+    SessionSpec::create(&handler, (&alpha, TerminalSize { cols: 80, rows: 24 })).await;
 
     let selected = handler
         .handle(Request::SelectLayout(SelectLayoutRequest {
@@ -216,9 +211,7 @@ async fn next_layout_uses_tmux_cycle_order_and_wraps() {
 async fn previous_layout_from_even_horizontal_wraps_to_tiled() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    handler
-        .create_session((&alpha, TerminalSize { cols: 80, rows: 24 }))
-        .await;
+    SessionSpec::create(&handler, (&alpha, TerminalSize { cols: 80, rows: 24 })).await;
 
     let selected = handler
         .handle(Request::SelectLayout(SelectLayoutRequest {
@@ -250,9 +243,7 @@ async fn previous_layout_from_even_horizontal_wraps_to_tiled() {
 async fn next_and_previous_layout_auto_unzoom_zoomed_windows() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    handler
-        .create_session((&alpha, TerminalSize { cols: 80, rows: 24 }))
-        .await;
+    SessionSpec::create(&handler, (&alpha, TerminalSize { cols: 80, rows: 24 })).await;
     split_pane_zero(&handler, &alpha, 1).await;
 
     let selected = handler
@@ -268,12 +259,14 @@ async fn next_and_previous_layout_auto_unzoom_zoomed_windows() {
         })
     );
 
-    handler
-        .handle_ok(ResizePaneRequest {
+    TestRequest::send_ok(
+        &handler,
+        ResizePaneRequest {
             target: PaneTarget::new(alpha.clone(), 1),
             adjustment: ResizePaneAdjustment::Zoom,
-        })
-        .await;
+        },
+    )
+    .await;
 
     {
         let state = handler.state.lock().await;
@@ -300,12 +293,14 @@ async fn next_and_previous_layout_auto_unzoom_zoomed_windows() {
         assert_eq!(session.window().layout(), LayoutName::EvenHorizontal);
     }
 
-    handler
-        .handle_ok(ResizePaneRequest {
+    TestRequest::send_ok(
+        &handler,
+        ResizePaneRequest {
             target: PaneTarget::new(alpha.clone(), 1),
             adjustment: ResizePaneAdjustment::Zoom,
-        })
-        .await;
+        },
+    )
+    .await;
 
     let previous = handler
         .handle(Request::PreviousLayout(PreviousLayoutRequest {
@@ -329,9 +324,7 @@ async fn next_and_previous_layout_auto_unzoom_zoomed_windows() {
 async fn resize_pane_preserves_custom_layout_trees_through_the_handler() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    handler
-        .create_session((&alpha, TerminalSize::new(100, 40)))
-        .await;
+    SessionSpec::create(&handler, (&alpha, TerminalSize::new(100, 40))).await;
     split_pane_zero(&handler, &alpha, 1).await;
     split_pane_zero(&handler, &alpha, 1).await;
 
@@ -345,12 +338,14 @@ async fn resize_pane_preserves_custom_layout_trees_through_the_handler() {
         .await;
     assert!(matches!(selected, Response::SelectLayout(_)));
 
-    handler
-        .handle_ok(ResizePaneRequest {
+    TestRequest::send_ok(
+        &handler,
+        ResizePaneRequest {
             target: PaneTarget::new(alpha.clone(), 0),
             adjustment: ResizePaneAdjustment::AbsoluteWidth { columns: 34 },
-        })
-        .await;
+        },
+    )
+    .await;
 
     let state = handler.state.lock().await;
     let session = state.sessions.session(&alpha).expect("session exists");

@@ -1,4 +1,5 @@
 use super::*;
+use crate::test_fixtures::TestRequest;
 
 fn respawn_refresh_target(
     control: AttachControl,
@@ -34,8 +35,7 @@ async fn respawn_window_refreshes_attached_link_aliases_after_active_pane_is_rem
     let alias = create_session(&handler, "respawn-refresh-alias").await;
     let alias_peer = create_grouped_session(&handler, "respawn-refresh-alias-peer", &alias).await;
 
-    let split_target = handler
-        .handle_ok(SplitWindowRequest::fixture(&owner))
+    let split_target = TestRequest::send_ok(&handler, SplitWindowRequest::fixture(&owner))
         .await
         .pane;
     let (retained_pane_id, removed_active_pane_id) = {
@@ -52,15 +52,17 @@ async fn respawn_window_refreshes_attached_link_aliases_after_active_pane_is_rem
     };
     assert_ne!(retained_pane_id, removed_active_pane_id);
 
-    handler
-        .handle_ok(LinkWindowRequest {
+    TestRequest::send_ok(
+        &handler,
+        LinkWindowRequest {
             kill_destination: true,
             ..Fixture::fixture((
                 WindowTarget::with_window(owner.clone(), 0),
                 WindowTarget::with_window(alias.clone(), 0),
             ))
-        })
-        .await;
+        },
+    )
+    .await;
     {
         let state = handler.state.lock().await;
         for session_name in [&owner, &alias, &alias_peer] {
@@ -88,15 +90,17 @@ async fn respawn_window_refreshes_attached_link_aliases_after_active_pane_is_rem
         drain_attach_controls(&mut peer_rx),
     );
 
-    handler
-        .handle_ok(RespawnWindowRequest {
+    TestRequest::send_ok(
+        &handler,
+        RespawnWindowRequest {
             target: WindowTarget::with_window(owner.clone(), 0),
             kill: true,
             start_directory: None,
             environment: None,
             command: Some(quiet_command()),
-        })
-        .await;
+        },
+    )
+    .await;
 
     let mut alias_target = receive_latest_respawn_refresh(&mut alias_rx, &alias).await;
     let mut peer_target = receive_latest_respawn_refresh(&mut peer_rx, &alias_peer).await;

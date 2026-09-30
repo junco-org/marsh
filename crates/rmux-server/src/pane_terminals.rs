@@ -98,13 +98,6 @@ enum WindowNameApplication {
 }
 
 /// Everything one window's initial pane terminal is created from.
-///
-/// `shell_id` and `follow_mux_lifetime` exist for the shell prompt's own window creation and for
-/// nothing else. An ordinary rmux request — `new-window`, `respawn-window`, a startup config
-/// line — passes `None` and `false`: it wants rmux's lifetime rules, where an explicit one-shot
-/// command closes the pane when it finishes. The prompt's `&` and directory forms pass the
-/// parsed id and `true`, because there the *engine's* anonymous-job rules are the semantics the
-/// user asked for: automatic closure that `keep` can cancel, and a name they already typed.
 #[derive(Clone)]
 pub(crate) struct WindowSpawnOptions<'a> {
     /// The directory the pane starts in, or `None` to fall back to the session's and then this
@@ -117,10 +110,6 @@ pub(crate) struct WindowSpawnOptions<'a> {
     /// The shell decision a respawn replays, rather than re-reading `default-shell`.
     pub(crate) respawn_shell: Option<&'a crate::terminal::PaneShell>,
     pub(crate) respawn_environment: Option<&'a [String]>,
-    /// The job name to open under, when the caller has already parsed one.
-    pub(crate) shell_id: Option<marsh_core::shellmux::ShellId>,
-    /// Whether the job's lifetime is the engine's decision rather than rmux's.
-    pub(crate) follow_mux_lifetime: bool,
 }
 
 pub(crate) struct InitialPaneSpawnOptions<'a> {

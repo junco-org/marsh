@@ -1,5 +1,6 @@
 use super::*;
 use crate::pane_terminals::PaneCaptureRequest;
+use crate::test_fixtures::SessionSpec;
 use rmux_core::{GridRenderOptions, ScreenCaptureRange};
 
 #[tokio::test]
@@ -7,13 +8,15 @@ async fn parsed_queue_resize_pane_trim_flag_trims_below_cursor() {
     let handler = RequestHandler::new();
     let session = session_name("resize-trim");
     let target = PaneTarget::with_window(session.clone(), 0, 0);
-    handler
-        .create_started_session(NewSessionExtRequest {
+    SessionSpec::create_started(
+        &handler,
+        NewSessionExtRequest {
             size: Some(TerminalSize { cols: 10, rows: 5 }),
             command: Some(quiet_command()),
             ..Fixture::fixture(&session)
-        })
-        .await;
+        },
+    )
+    .await;
     {
         let mut state = handler.state.lock().await;
         state
@@ -60,7 +63,7 @@ async fn parsed_queue_resize_pane_trim_flag_trims_below_cursor() {
 async fn parsed_queue_resize_pane_trim_flag_takes_precedence_over_size_flags() {
     let handler = RequestHandler::new();
     let session = session_name("resize-trim-size");
-    handler.create_started_session(Quiet(&session)).await;
+    SessionSpec::create_started(&handler, Quiet(&session)).await;
     execute(&handler, "split-window -v -t resize-trim-size:0.0").await;
 
     let before = pane_height(&handler, &session, 0).await;
@@ -74,7 +77,7 @@ async fn parsed_queue_resize_pane_trim_flag_takes_precedence_over_size_flags() {
 async fn parsed_queue_resize_pane_zoom_takes_precedence_over_other_adjustments() {
     let handler = RequestHandler::new();
     let session = session_name("resize-zoom-precedence");
-    handler.create_started_session(Quiet(&session)).await;
+    SessionSpec::create_started(&handler, Quiet(&session)).await;
     execute(&handler, "split-window -h -t resize-zoom-precedence:0.0").await;
 
     execute(&handler, "resize-pane -R -Z -t resize-zoom-precedence:0.0").await;
@@ -93,7 +96,7 @@ async fn parsed_queue_resize_pane_zoom_takes_precedence_over_other_adjustments()
 async fn parsed_queue_resize_pane_repeated_directions_follow_tmux_priority() {
     let handler = RequestHandler::new();
     let session = session_name("resize-priority");
-    handler.create_started_session(Quiet(&session)).await;
+    SessionSpec::create_started(&handler, Quiet(&session)).await;
     execute(&handler, "split-window -h -t resize-priority:0.0").await;
 
     execute(&handler, "resize-pane -L -R -t resize-priority:0.0").await;
@@ -108,7 +111,7 @@ async fn parsed_queue_resize_pane_repeated_directions_follow_tmux_priority() {
 async fn parsed_queue_resize_pane_trailing_adjustment_after_target_matches_tmux() {
     let handler = RequestHandler::new();
     let session = session_name("resize-trailing-adjustment");
-    handler.create_started_session(Quiet(&session)).await;
+    SessionSpec::create_started(&handler, Quiet(&session)).await;
     execute(
         &handler,
         "split-window -h -t resize-trailing-adjustment:0.0",
@@ -131,7 +134,7 @@ async fn parsed_queue_resize_pane_trailing_adjustment_after_target_matches_tmux(
 async fn parsed_queue_resize_pane_composes_absolute_then_relative_like_tmux() {
     let handler = RequestHandler::new();
     let session = session_name("resize-compose");
-    handler.create_started_session(Quiet(&session)).await;
+    SessionSpec::create_started(&handler, Quiet(&session)).await;
     execute(&handler, "split-window -h -t resize-compose:0.0").await;
 
     execute(&handler, "resize-pane -x 30 -R -t resize-compose:0.0").await;
@@ -146,7 +149,7 @@ async fn parsed_queue_resize_pane_composes_absolute_then_relative_like_tmux() {
 async fn parsed_queue_resize_pane_mouse_flag_is_noop_without_mouse_context() {
     let handler = RequestHandler::new();
     let session = session_name("resize-mouse-noop");
-    handler.create_started_session(Quiet(&session)).await;
+    SessionSpec::create_started(&handler, Quiet(&session)).await;
     execute(&handler, "split-window -h -t resize-mouse-noop:0.0").await;
 
     let before = pane_sizes(&handler, &session).await;
@@ -161,7 +164,7 @@ async fn parsed_queue_resize_pane_mouse_flag_resizes_from_border_context() {
     let handler = RequestHandler::new();
     let session = session_name("resize-mouse-border");
     let target = PaneTarget::with_window(session.clone(), 0, 0);
-    handler.create_started_session(Quiet(&session)).await;
+    SessionSpec::create_started(&handler, Quiet(&session)).await;
     execute(&handler, "split-window -h -t resize-mouse-border:0.0").await;
 
     let before = pane_sizes(&handler, &session).await;
@@ -203,7 +206,7 @@ async fn parsed_queue_resize_pane_mouse_flag_shrinks_horizontal_split_from_borde
     let handler = RequestHandler::new();
     let session = session_name("resize-mouse-border-shrink-h");
     let target = PaneTarget::with_window(session.clone(), 0, 0);
-    handler.create_started_session(Quiet(&session)).await;
+    SessionSpec::create_started(&handler, Quiet(&session)).await;
     execute(
         &handler,
         "split-window -h -t resize-mouse-border-shrink-h:0.0",
@@ -248,7 +251,7 @@ async fn parsed_queue_resize_pane_mouse_flag_shrinks_vertical_split_from_border_
     let handler = RequestHandler::new();
     let session = session_name("resize-mouse-border-shrink-v");
     let target = PaneTarget::with_window(session.clone(), 0, 0);
-    handler.create_started_session(Quiet(&session)).await;
+    SessionSpec::create_started(&handler, Quiet(&session)).await;
     execute(
         &handler,
         "split-window -v -t resize-mouse-border-shrink-v:0.0",
@@ -293,7 +296,7 @@ async fn parsed_queue_mouse_resize_survives_prior_command_in_pipeline() {
     let handler = RequestHandler::new();
     let session = session_name("resize-mouse-pipeline");
     let target = PaneTarget::with_window(session.clone(), 0, 0);
-    handler.create_started_session(Quiet(&session)).await;
+    SessionSpec::create_started(&handler, Quiet(&session)).await;
     execute(&handler, "split-window -h -t resize-mouse-pipeline:0.0").await;
 
     let before = pane_sizes(&handler, &session).await;
@@ -336,7 +339,7 @@ async fn parsed_queue_mouse_resize_can_recover_attached_current_mouse_event() {
     let session = session_name("resize-mouse-fallback");
     let target = PaneTarget::with_window(session.clone(), 0, 0);
     let requester_pid = std::process::id();
-    handler.create_started_session(Quiet(&session)).await;
+    SessionSpec::create_started(&handler, Quiet(&session)).await;
     execute(&handler, "split-window -h -t resize-mouse-fallback:0.0").await;
     let _control_rx = handler.attach_client(requester_pid, &session).await;
 

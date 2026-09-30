@@ -1,4 +1,5 @@
 use super::*;
+use crate::test_fixtures::TestRequest;
 
 #[tokio::test]
 async fn attached_copy_mode_renders_mark_regular_and_current_match_styles() {
@@ -32,7 +33,7 @@ async fn attached_copy_mode_renders_mark_regular_and_current_match_styles() {
     }
     drain_attach_controls(&mut control_rx);
 
-    handler.handle_ok(CopyModeRequest::fixture(&target)).await;
+    TestRequest::send_ok(&handler, CopyModeRequest::fixture(&target)).await;
     let _ = recv_render_frame(&mut control_rx, "copy-mode initial refresh").await;
     drain_attach_controls(&mut control_rx);
 
@@ -83,23 +84,27 @@ async fn attached_copy_mode_u_attach_render_matches_mode_capture_source() {
         .await;
     drain_attach_controls(&mut control_rx);
 
-    handler
-        .handle_ok(CopyModeRequest {
+    TestRequest::send_ok(
+        &handler,
+        CopyModeRequest {
             page_up: true,
             ..Fixture::fixture(&target)
-        })
-        .await;
+        },
+    )
+    .await;
 
     let frame = recv_render_frame(&mut control_rx, "copy-mode -u refresh").await;
     let mode_capture = {
-        let output = handler
-            .handle_ok(CapturePaneRequest {
+        let output = TestRequest::send_ok(
+            &handler,
+            CapturePaneRequest {
                 use_mode_screen: true,
                 ..Fixture::fixture(target)
-            })
-            .await
-            .output
-            .expect("capture-pane -p -M should return command output");
+            },
+        )
+        .await
+        .output
+        .expect("capture-pane -p -M should return command output");
         String::from_utf8(output.stdout().to_vec()).expect("mode capture stdout is utf-8")
     };
     assert!(
@@ -131,7 +136,7 @@ async fn attached_copy_mode_clipped_cursor_marker_wins_over_position_badge() {
         .await;
     drain_attach_controls(&mut control_rx);
 
-    handler.handle_ok(CopyModeRequest::fixture(target)).await;
+    TestRequest::send_ok(&handler, CopyModeRequest::fixture(target)).await;
     let frame = recv_render_frame(&mut control_rx, "line-number marker refresh").await;
     let rendered = {
         let mut screen = Screen::new(TerminalSize { cols: 80, rows: 24 }, 0);
@@ -165,12 +170,14 @@ async fn attached_copy_mode_hide_and_toggle_position_control_the_badge() {
         .await;
     drain_attach_controls(&mut control_rx);
 
-    handler
-        .handle_ok(CopyModeRequest {
+    TestRequest::send_ok(
+        &handler,
+        CopyModeRequest {
             hide_position: true,
             ..Fixture::fixture(&target)
-        })
-        .await;
+        },
+    )
+    .await;
     let hidden = recv_render_frame(&mut control_rx, "hidden position refresh").await;
     assert!(
         !hidden.contains("POSITION-VISIBLE"),
@@ -245,23 +252,27 @@ async fn attached_mouse_drag_copy_mode_refresh_keeps_prompt_visible() {
     });
     drop(active_attach);
 
-    handler
-        .handle_ok(CopyModeRequest {
+    TestRequest::send_ok(
+        &handler,
+        CopyModeRequest {
             mouse_drag_start: true,
             ..Fixture::fixture(&target)
-        })
-        .await;
+        },
+    )
+    .await;
 
     let frame = recv_render_frame(&mut control_rx, "copy-mode mouse refresh").await;
     let mode_capture = {
-        let output = handler
-            .handle_ok(CapturePaneRequest {
+        let output = TestRequest::send_ok(
+            &handler,
+            CapturePaneRequest {
                 use_mode_screen: true,
                 ..Fixture::fixture(&target)
-            })
-            .await
-            .output
-            .expect("capture-pane -p -M should return command output");
+            },
+        )
+        .await
+        .output
+        .expect("capture-pane -p -M should return command output");
         String::from_utf8(output.stdout().to_vec()).expect("mode capture stdout is utf-8")
     };
     let rendered_screen = {
@@ -309,21 +320,24 @@ async fn attached_copy_mode_unhandled_key_falls_back_to_prefix_table() {
     let requester_pid = std::process::id();
     let alpha = session_name("alpha");
     let _control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
-    handler
-        .handle_ok(SplitWindowRequest {
+    TestRequest::send_ok(
+        &handler,
+        SplitWindowRequest {
             direction: rmux_proto::SplitDirection::Horizontal,
             ..Fixture::fixture(&alpha)
-        })
-        .await;
-    handler
-        .handle_ok(SelectPaneRequest::fixture(PaneTarget::new(
-            alpha.clone(),
-            0,
-        )))
-        .await;
-    handler
-        .handle_ok(CopyModeRequest::fixture(PaneTarget::new(alpha.clone(), 0)))
-        .await;
+        },
+    )
+    .await;
+    TestRequest::send_ok(
+        &handler,
+        SelectPaneRequest::fixture(PaneTarget::new(alpha.clone(), 0)),
+    )
+    .await;
+    TestRequest::send_ok(
+        &handler,
+        CopyModeRequest::fixture(PaneTarget::new(alpha.clone(), 0)),
+    )
+    .await;
 
     handler
         .handle_attached_live_input_for_test(requester_pid, b"\x02o")

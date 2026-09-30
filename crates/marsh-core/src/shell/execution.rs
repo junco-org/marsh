@@ -10,15 +10,18 @@ use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, Weak};
+use std::time::Duration;
 
 use brush_core::extensions::{
     DefaultErrorFormatter, DefaultExternalCommandSpawner, ExecutionObserver,
-    ExternalCommandSpawner, ShellExtensions,
+    ExternalCommandSpawner, HostAccess, ShellExtensions,
 };
+use brush_core::sys::process::{Child, HostedChild, HostedEvent};
 use brush_core::{CommandArg, ExecutionResult};
 use futures_util::FutureExt;
 use marsh_instrument::{
-    InvocationId, PollScope, Scoped, TraceRun, TraceScope, TraceScopeGuard, Tracing,
+    ChildEvent, HostCall, InvocationId, PollScope, Scoped, TraceRun, TraceScope,
+    TraceScopeGuard, Tracing,
 };
 use marsh_lib::RecoverPoison as _;
 use tokio::io::unix::AsyncFd;
@@ -103,11 +106,32 @@ impl ExternalCommandSpawner for MarshExecutor {
         &self,
         command: std::process::Command,
         kill_on_drop: bool,
-    ) -> std::io::Result<brush_core::sys::process::Child> {
+    ) -> std::io::Result<Child> {
         let context = self.context().map_err(std::io::Error::other)?;
         let _guard = context.enter().map_err(std::io::Error::other)?;
-        let child = DefaultExternalCommandSpawner.spawn(command, kill_on_drop)?;
-        context.run.adopt(child)
+        let Backend::Managed { tracing, .. } = &context.run.backend else {
+            let child = DefaultExternalCommandSpawner.spawn(command, kill_on_drop)?;
+            return context.run.adopt(child);
+        };
+        // The tracer reaps the command and reports it here; the shell never waits on its pid.
+        let (sender, events) = tokio::sync::mpsc::unbounded_channel();
+        let traced = tracing.spawn(
+            command,
+            Box::new(move |event| {
+                let _ = sender.send(match event {
+                    ChildEvent::Stopped => HostedEvent::Stopped,
+                    ChildEvent::Exited(status) => HostedEvent::Exited(status),
+                });
+            }),
+        )?;
+        let process = traced.process;
+        Ok(Child::hosted(HostedChild {
+            pid: traced.pid,
+            events,
+            kill: Box::new(move || {
+                marsh_instrument::signal_process(&process, libc::SIGKILL).map(|_| ())
+            }),
+        }))
     }
 }
 
@@ -195,6 +219,36 @@ impl ExecutionObserver for MarshExecutor {
             .and_then(|context| context.blocking(operation))
             .map_err(brush_error)
     }
+    /// The interpreter's own accesses are the run's evidence exactly as a traced command's are:
+    /// a process cannot trace its own threads, so they are restated here.
+    fn host_access(&self, access: HostAccess<'_>) {
+        let Ok(context) = self.context() else {
+            return;
+        };
+        let Backend::Managed { tracing, .. } = &context.run.backend else {
+            return;
+        };
+        let call = match access {
+            HostAccess::Open { path, result } => HostCall::Open { path, result },
+            HostAccess::Metadata {
+                path,
+                follow,
+                errno,
+            } => HostCall::Metadata {
+                path,
+                follow,
+                errno,
+            },
+            HostAccess::ReadDir { path, errno } => HostCall::ReadDir { path, errno },
+            HostAccess::Descriptor { fd } => HostCall::Descriptor { fd },
+            _ => {
+                return context.fail_evidence("unsupported host filesystem access".into());
+            }
+        };
+        if let Err(error) = tracing.host(call) {
+            context.fail_evidence(format!("host filesystem evidence: {error}"));
+        }
+    }
 }
 
 #[derive(Default)]
@@ -208,8 +262,11 @@ struct Workers {
 
 #[repr(u8)]
 enum RunPhase {
+    /// The interpreter or a producer it started may still be running.
     Running,
     Cancelled,
+    /// Every owned producer has finished; the effects are not yet sealed for publication.
+    Finalizing,
     Publishing,
 }
 
@@ -383,7 +440,33 @@ impl Run {
             }
         }
     }
+    /// Discards this run unless its publication is already sealed.
+    ///
+    /// Explicit teardown keeps this right after the producers have finished: a run that is only
+    /// finalizing is still unsealed, so it is cancelled like a running one.
     pub fn cancel(&self) {
+        let mut phase = self.phase.load(Ordering::Acquire);
+        loop {
+            if phase != RunPhase::Running as u8 && phase != RunPhase::Finalizing as u8 {
+                return;
+            }
+            match self.phase.compare_exchange_weak(
+                phase,
+                RunPhase::Cancelled as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(actual) => phase = actual,
+            }
+        }
+        self.cancel_owned_producers();
+    }
+    /// Discards this run only while its producers may still be running.
+    ///
+    /// One atomic transition, so a run that finished its producers in the meantime is left to
+    /// finalize rather than being cancelled by a decision made against its earlier phase.
+    fn cancel_if_running(&self) {
         if self
             .phase
             .compare_exchange(
@@ -392,10 +475,14 @@ impl Run {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             )
-            .is_err()
+            .is_ok()
         {
-            return;
+            self.cancel_owned_producers();
         }
+    }
+    /// Aborts every owned worker and ends the run's native processes; the caller won the
+    /// transition to [`RunPhase::Cancelled`].
+    fn cancel_owned_producers(&self) {
         let workers = self.workers.lock().recover();
         for abort in workers.handles.values().flatten() {
             abort.abort();
@@ -414,16 +501,86 @@ impl Run {
     pub fn is_cancelled(&self) -> bool {
         self.phase.load(Ordering::Acquire) == RunPhase::Cancelled as u8
     }
+    fn is_running(&self) -> bool {
+        self.phase.load(Ordering::Acquire) == RunPhase::Running as u8
+    }
+    /// Records that every owned producer finished; a cancellation that already won stands.
+    fn enter_finalization(&self) {
+        if self
+            .phase
+            .compare_exchange(
+                RunPhase::Running as u8,
+                RunPhase::Finalizing as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            self.changed.notify_waiters();
+        }
+    }
     pub fn seal_publication(&self) -> Result<(), ShellError> {
         self.phase
             .compare_exchange(
-                RunPhase::Running as u8,
+                RunPhase::Finalizing as u8,
                 RunPhase::Publishing as u8,
                 Ordering::AcqRel,
                 Ordering::Acquire,
             )
             .map(|_| ())
             .map_err(|_| ShellError::new(ShellErrorKind::Interrupted))
+    }
+    /// Resolves once the run's producers are no longer running: finished, or cancelled.
+    async fn wait_until_not_running(&self) {
+        loop {
+            let changed = self.changed.notified();
+            if !self.is_running() {
+                return;
+            }
+            changed.await;
+        }
+    }
+    /// Bounds the run's remaining execution once its input has ended.
+    ///
+    /// `grace` for the producers to finish, then `SIGTERM` and `grace` again, then cancellation.
+    /// Each step applies only while the run is still running, so a run that reached finalization
+    /// is never signalled or discarded here, however long finalization takes.
+    ///
+    /// Cancellation also needs something alive to end. The native service reports a traced
+    /// process's end only when its shared stream delivers it, and that stream lags behind every
+    /// other shell's work. Once the evaluation returned and no owned process is alive, the
+    /// producers are gone and only that delivery is pending: it is waited out a window at a time
+    /// instead of discarding finished work, and a descendant that delivery later reveals alive
+    /// is cancelled at the next window. Signalling failures are ignored: the run's own verdict
+    /// says what happened.
+    async fn terminate_within(&self, grace: Duration) {
+        if tokio::time::timeout(grace, self.wait_until_not_running())
+            .await
+            .is_ok()
+        {
+            return;
+        }
+        if self.is_running() {
+            let _ = self.signal(libc::SIGTERM);
+        }
+        loop {
+            if tokio::time::timeout(grace, self.wait_until_not_running())
+                .await
+                .is_ok()
+            {
+                return;
+            }
+            if self.has_live_producers() {
+                self.cancel_if_running();
+                return;
+            }
+        }
+    }
+    /// Whether a producer this run could still end is alive: the evaluation has not returned, or
+    /// an owned process — traced or directly spawned — has not exited. A failed probe counts as
+    /// alive, so doubt ends in cancellation rather than an unbounded wait.
+    fn has_live_producers(&self) -> bool {
+        !self.closed.load(Ordering::Acquire) || !matches!(self.signal(0), Ok(0))
     }
     pub async fn cancelled(&self) {
         loop {
@@ -485,6 +642,48 @@ impl Run {
             ));
         }
         Ok(())
+    }
+}
+
+/// Which run, once one exists, a tracked command is executing as.
+///
+/// Attached only after the command's admission and view preparation, so a watcher never mistakes
+/// setup for execution. The run is held weakly: a finished command's run and view are not kept
+/// alive through this, and a later command on the same shell is never reached through it.
+#[derive(Clone, Debug)]
+pub(crate) struct ExecutionProgress {
+    run: tokio::sync::watch::Sender<Option<Weak<Run>>>,
+}
+impl ExecutionProgress {
+    pub(crate) fn new() -> Self {
+        Self {
+            run: tokio::sync::watch::Sender::new(None),
+        }
+    }
+    /// Records that the command's execution began as `run`.
+    ///
+    /// Replaced rather than sent: the run may begin before anyone watches for it.
+    pub(super) fn attach(&self, run: &Arc<Run>) {
+        self.run.send_replace(Some(Arc::downgrade(run)));
+    }
+    /// Bounds the command's execution after its input ended, as [`Run::terminate_within`].
+    ///
+    /// Waits, untimed, for the execution to begin. Returns at once when it already ended, and
+    /// never resolves for a command that never begins executing; the caller races this against
+    /// the command's verdict.
+    pub(crate) async fn finish_with_grace(&self, grace: Duration) {
+        let mut attached = self.run.subscribe();
+        let Ok(run) = attached
+            .wait_for(Option::is_some)
+            .await
+            .map(|run| run.as_ref().and_then(Weak::upgrade))
+        else {
+            // The sender is this value's own, so the channel cannot close while it is awaited.
+            return;
+        };
+        if let Some(run) = run {
+            run.terminate_within(grace).await;
+        }
     }
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -561,6 +760,12 @@ impl BuiltinContext {
         self.check()?;
         Ok(&self.run)
     }
+    /// Refuses the owning managed run's publication: its evidence is incomplete.
+    pub(super) fn fail_evidence(&self, cause: String) {
+        if let Ok(Some(snapshot)) = self.snapshot() {
+            snapshot.fail_evidence(cause);
+        }
+    }
     /// The managed view of the owning run; `None` only for a direct run.
     pub(super) fn snapshot(&self) -> Result<Option<Arc<Snapshot>>, ShellError> {
         self.check()?;
@@ -606,6 +811,22 @@ impl BuiltinContext {
     /// Logical working directory of the callback invocation.
     pub fn working_dir(&self) -> &Path {
         &self.cwd
+    }
+    /// `path` (absolute, or relative to the logical working directory) in this command's
+    /// filesystem view: inside its private snapshot on the managed route, the path itself on the
+    /// direct route. Paths outside the source map to themselves.
+    ///
+    /// Accesses made through the result are not evidence: a managed run publishes changes made
+    /// only through this context's I/O methods, and refuses any other change to its view.
+    pub fn physical_path(&self, path: &Path) -> Result<PathBuf, ShellError> {
+        let view = self.snapshot()?;
+        Ok(physical(view.as_deref(), &self.cwd.join(path)))
+    }
+    /// A path in this command's view as the caller names it: the inverse of
+    /// [`Self::physical_path`].
+    pub fn logical_path(&self, path: &Path) -> Result<PathBuf, ShellError> {
+        let view = self.snapshot()?;
+        Ok(logical(view.as_deref(), path))
     }
     /// Whether its owner requested cancellation or already ended the run.
     pub fn cancellation_requested(&self) -> bool {
@@ -686,25 +907,90 @@ impl BuiltinContext {
             operation(&physical(view, &logical))
         })?
     }
+    /// Restates one access made through this context as the run's evidence. A process cannot
+    /// trace its own threads, so without this the access would be unobserved.
+    fn report(&self, call: HostCall<'_>) {
+        if let Backend::Managed { tracing, .. } = &self.run.backend
+            && let Err(error) = tracing.host(call)
+        {
+            self.fail_evidence(format!("host filesystem evidence: {error}"));
+        }
+    }
     /// Opens a logical path in the owning command's filesystem view.
     pub fn open(
         &self,
         path: &Path,
         options: &std::fs::OpenOptions,
     ) -> std::io::Result<std::fs::File> {
-        self.io(path, |path| options.open(path))
+        self.io(path, |path| {
+            let opened = options.open(path);
+            self.report(HostCall::Open {
+                path,
+                result: opened
+                    .as_ref()
+                    .map(std::os::fd::AsRawFd::as_raw_fd)
+                    .map_err(errno),
+            });
+            opened
+        })
     }
     /// Reads metadata through the command's logical filesystem view.
     pub fn metadata(&self, path: &Path) -> std::io::Result<std::fs::Metadata> {
-        self.io(path, |path| std::fs::metadata(path))
+        self.io(path, |path| {
+            let metadata = std::fs::metadata(path);
+            self.report(HostCall::Metadata {
+                path,
+                follow: true,
+                errno: metadata.as_ref().err().map(errno),
+            });
+            metadata
+        })
     }
     /// Creates directories through the command's logical filesystem view.
     pub fn create_dir_all(&self, path: &Path) -> std::io::Result<()> {
-        self.io(path, |path| std::fs::create_dir_all(path))
+        self.io(path, |path| {
+            let missing: Vec<&Path> = path
+                .ancestors()
+                .take_while(|directory| std::fs::symlink_metadata(directory).is_err())
+                .collect();
+            let created = std::fs::create_dir_all(path);
+            if missing.is_empty() {
+                self.report(HostCall::Metadata {
+                    path,
+                    follow: true,
+                    errno: created.as_ref().err().map(errno),
+                });
+            }
+            for directory in missing.into_iter().rev() {
+                self.report(HostCall::CreateDir {
+                    path: directory,
+                    errno: std::fs::symlink_metadata(directory).err().as_ref().map(errno),
+                });
+            }
+            created
+        })
+    }
+    /// Removes a file through the command's logical filesystem view.
+    pub fn remove_file(&self, path: &Path) -> std::io::Result<()> {
+        self.io(path, |path| {
+            let removed = std::fs::remove_file(path);
+            self.report(HostCall::Unlink {
+                path,
+                errno: removed.as_ref().err().map(errno),
+            });
+            removed
+        })
     }
     /// Opens a directory iterator; each subsequent call still checks owning-run liveness.
     pub fn read_dir(&self, path: &Path) -> std::io::Result<ReadDir> {
-        let inner = self.io(path, |path| std::fs::read_dir(path))?;
+        let inner = self.io(path, |path| {
+            let listed = std::fs::read_dir(path);
+            self.report(HostCall::ReadDir {
+                path,
+                errno: listed.as_ref().err().map(errno),
+            });
+            listed
+        })?;
         Ok(ReadDir {
             inner,
             context: self.clone(),
@@ -717,16 +1003,41 @@ impl BuiltinContext {
         let not_utf8 = || ShellError::unsupported("glob path is not UTF-8");
         // Only the caller's pattern is glob syntax; the directory it is relative to is a literal
         // path, and a `[` or `*` in its name must not turn it into a character class or wildcard.
-        let pattern = if Path::new(pattern).is_absolute() {
+        let (pattern, searched) = if Path::new(pattern).is_absolute() {
             let physical = physical(view.as_deref(), Path::new(pattern));
-            physical.to_str().ok_or_else(not_utf8)?.to_owned()
+            let searched = physical
+                .components()
+                .take_while(|part| {
+                    !part
+                        .as_os_str()
+                        .as_encoded_bytes()
+                        .iter()
+                        .any(|byte| matches!(byte, b'*' | b'?' | b'['))
+                })
+                .collect::<PathBuf>();
+            (physical.to_str().ok_or_else(not_utf8)?.to_owned(), searched)
         } else {
             let base = physical(view.as_deref(), cwd.unwrap_or(&self.cwd));
-            format!(
+            let pattern = format!(
                 "{}/{pattern}",
                 glob::Pattern::escape(base.to_str().ok_or_else(not_utf8)?)
-            )
+            );
+            (pattern, base)
         };
+        // The expansion lists and probes everything below its literal prefix; that whole subtree
+        // is what the result depends on. A prefix that is no directory (a literal pattern naming
+        // one file) is only probed.
+        match std::fs::metadata(&searched) {
+            Ok(metadata) if metadata.is_dir() => self.report(HostCall::ReadDir {
+                path: &searched,
+                errno: None,
+            }),
+            probed => self.report(HostCall::Metadata {
+                path: &searched,
+                follow: true,
+                errno: probed.err().as_ref().map(errno),
+            }),
+        }
         let inner =
             glob::glob(&pattern).map_err(|error| ShellError::unsupported(error.to_string()))?;
         Ok(GlobPaths {
@@ -734,6 +1045,11 @@ impl BuiltinContext {
             context: self.clone(),
         })
     }
+}
+
+/// The errno an access failed with, for its evidence record.
+fn errno(error: &std::io::Error) -> i32 {
+    error.raw_os_error().unwrap_or(libc::EIO)
 }
 
 /// Logical directory entries with lifetime-checked iteration.
@@ -774,8 +1090,15 @@ impl DirectoryEntry {
     }
     /// Metadata without following a symlink leaf, matching standard directory-entry semantics.
     pub fn metadata(&self) -> std::io::Result<std::fs::Metadata> {
-        self.context
-            .io(&self.path, |path| std::fs::symlink_metadata(path))
+        self.context.io(&self.path, |path| {
+            let metadata = std::fs::symlink_metadata(path);
+            self.context.report(HostCall::Metadata {
+                path,
+                follow: false,
+                errno: metadata.as_ref().err().map(errno),
+            });
+            metadata
+        })
     }
     /// The entry's kind without following a symlink leaf.
     pub fn file_type(&self) -> std::io::Result<std::fs::FileType> {
@@ -890,9 +1213,13 @@ pub(super) async fn complete_direct(
         run.cancel();
     }
     let mut uncertain = false;
-    if let Err((error, unproven)) = run.finish().await {
-        uncertain = unproven;
-        failure.get_or_insert(error);
+    match run.finish().await {
+        // Every child it spawned has exited: nothing of this run is executing any more.
+        Ok(()) => run.enter_finalization(),
+        Err((error, unproven)) => {
+            uncertain = unproven;
+            failure.get_or_insert(error);
+        }
     }
     if run.is_cancelled() {
         failure.get_or_insert_with(|| ShellError::new(ShellErrorKind::Interrupted));
@@ -937,7 +1264,8 @@ pub(super) async fn complete(
                     .spawn_blocking(move || tracing.quiesce(trace))
             };
             match drain.await {
-                Ok(Ok(())) => {}
+                // Native quiescence is proven: what remains is verdict processing, not execution.
+                Ok(Ok(())) => prepared.run.enter_finalization(),
                 Ok(Err(error)) => {
                     failure.get_or_insert_with(|| error.into());
                     prepared.snapshot.retained.store(true, Ordering::Release);
@@ -972,5 +1300,64 @@ pub(super) async fn complete(
         evidence,
         command: text,
         uncertain,
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use std::os::unix::process::ExitStatusExt as _;
+
+    const GRACE: Duration = Duration::from_millis(250);
+
+    fn direct_run() -> Arc<Run> {
+        Arc::new(Run::direct(
+            tokio::runtime::Handle::current(),
+            Arc::new(PathBuf::from("/")),
+        ))
+    }
+
+    /// Producers that all ended are not discarded while their ends are still being proven,
+    /// however many grace windows that takes; finalization then releases the watch.
+    #[tokio::test(start_paused = true)]
+    async fn finished_producers_are_not_cancelled_while_their_ends_are_proven() {
+        let run = direct_run();
+        run.finish().await.expect("a run with no producers finishes");
+        let watch = tokio::spawn({
+            let run = Arc::clone(&run);
+            async move { run.terminate_within(GRACE).await }
+        });
+        tokio::time::sleep(GRACE * 20).await;
+        assert!(!run.is_cancelled(), "finished work is not discarded");
+        assert!(!watch.is_finished(), "the watch waits for finalization");
+        run.enter_finalization();
+        watch.await.expect("the watch ends with finalization");
+        assert!(!run.is_cancelled());
+    }
+
+    /// A producer that outlives the evaluation and ignores `SIGTERM` is still cancelled.
+    #[tokio::test(start_paused = true)]
+    async fn a_live_producer_after_evaluation_is_still_cancelled() {
+        let run = direct_run();
+        let (mut reader, writer) = std::io::pipe().expect("a readiness pipe");
+        let mut command = std::process::Command::new("/bin/sh");
+        command
+            .args(["-c", "trap '' TERM; echo ready; exec /bin/sleep 30"])
+            .stdout(writer);
+        let child = DefaultExternalCommandSpawner
+            .spawn(command, false)
+            .expect("spawn a producer");
+        let mut child = run.adopt(child).expect("pin the producer");
+        // Paused time would otherwise run both windows before the trap is installed.
+        let mut ready = [0_u8; 6];
+        std::io::Read::read_exact(&mut reader, &mut ready).expect("the producer acknowledges");
+        assert_eq!(&ready, b"ready\n");
+        // The evaluation returned; only the adopted producer outlives it.
+        run.closed.store(true, Ordering::Release);
+        run.terminate_within(GRACE).await;
+        assert!(run.is_cancelled(), "a live producer is cancelled");
+        let status = child.wait().await.expect("reap the producer");
+        assert_eq!(status.signal(), Some(libc::SIGKILL));
     }
 }

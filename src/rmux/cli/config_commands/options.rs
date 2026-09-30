@@ -12,8 +12,7 @@ use crate::cli_args::{SetOptionArgs, SetOptionCommandKind, TargetSpec};
 use crate::cli_response::tmux_cli_error_message;
 
 use super::super::{
-    resolve_current_pane_target, resolve_current_session_target, resolve_target_spec,
-    resolve_window_target_or_current,
+    CommandTarget, resolve_current_pane_target, resolve_current_session_target, resolve_target_spec,
 };
 pub(super) use show_scope::resolve_show_options_scope;
 #[cfg(test)]
@@ -482,7 +481,7 @@ impl SetOptionTargetResolver for ConnectionSetOptionTargetResolver<'_> {
 
     /// Asks the daemon for the client's current window.
     fn current_window(&mut self, command_name: &str) -> Result<WindowTarget, ExitFailure> {
-        resolve_window_target_or_current(self.connection, None, command_name)
+        WindowTarget::resolve_fallback(self.connection, command_name)
     }
 }
 

@@ -1,5 +1,5 @@
 use super::{session_name, RequestHandler};
-use crate::test_fixtures::Fixture;
+use crate::test_fixtures::{Fixture, SessionSpec, TestRequest};
 use rmux_proto::{
     KillSessionRequest, KillWindowRequest, NewWindowRequest, PaneTarget, TerminalGeometry,
     TerminalPixels, TerminalSize, WindowTarget,
@@ -24,7 +24,7 @@ async fn live_resize_aborts_if_the_attach_switches_after_geometry_capture() {
     let alpha = session_name("attached-resize-switch-alpha");
     let beta = session_name("attached-resize-switch-beta");
     for name in [&alpha, &beta] {
-        handler.create_session((name, SMALL_SIZE)).await;
+        SessionSpec::create(&handler, (name, SMALL_SIZE)).await;
     }
     handler.wait_for_initial_panes_for_test().await;
 
@@ -82,7 +82,7 @@ async fn live_resize_aborts_if_the_attach_switches_after_geometry_capture() {
 async fn live_resize_never_mutates_a_recreated_same_name_session() {
     let handler = RequestHandler::new();
     let session_name = session_name("attached-resize-session-identity");
-    handler.create_session((&session_name, SMALL_SIZE)).await;
+    SessionSpec::create(&handler, (&session_name, SMALL_SIZE)).await;
     handler.wait_for_initial_panes_for_test().await;
 
     let attach_pid = 7_510;
@@ -94,10 +94,8 @@ async fn live_resize_never_mutates_a_recreated_same_name_session() {
     let resize = handler.handle_attached_resize_for_identity(identity, LARGE_SIZE);
     let replace = async {
         pause.reached.notified().await;
-        handler
-            .handle_ok(KillSessionRequest::fixture(&session_name))
-            .await;
-        handler.create_session((&session_name, SMALL_SIZE)).await;
+        TestRequest::send_ok(&handler, KillSessionRequest::fixture(&session_name)).await;
+        SessionSpec::create(&handler, (&session_name, SMALL_SIZE)).await;
         pause.release.notify_one();
     };
     let (resized, ()) = tokio::join!(resize, replace);
@@ -116,7 +114,7 @@ async fn live_resize_never_mutates_a_recreated_same_name_session() {
 async fn attached_size_selection_retries_after_the_captured_window_is_killed() {
     let handler = RequestHandler::new();
     let session_name = session_name("attached-size-window-race");
-    handler.create_session((&session_name, SMALL_SIZE)).await;
+    SessionSpec::create(&handler, (&session_name, SMALL_SIZE)).await;
     handler
         .create_window(NewWindowRequest {
             name: Some("captured-window".to_owned()),
@@ -150,9 +148,7 @@ async fn attached_size_selection_retries_after_the_captured_window_is_killed() {
     let captured_window = WindowTarget::with_window(session_name.clone(), 1);
     let kill_captured_window = async {
         pause.reached.notified().await;
-        handler
-            .handle_ok(KillWindowRequest::fixture(&captured_window))
-            .await;
+        TestRequest::send_ok(&handler, KillWindowRequest::fixture(&captured_window)).await;
         pause.release.notify_one();
     };
     let (reconciled, ()) = tokio::join!(reconcile, kill_captured_window);
@@ -183,7 +179,7 @@ async fn attached_size_selection_retries_after_the_captured_window_is_killed() {
 async fn attached_size_selection_retries_after_the_candidate_epoch_changes() {
     let handler = RequestHandler::new();
     let session_name = session_name("attached-size-candidate-race");
-    handler.create_session((&session_name, LARGE_SIZE)).await;
+    SessionSpec::create(&handler, (&session_name, LARGE_SIZE)).await;
     handler.wait_for_initial_panes_for_test().await;
 
     let attach_pid = 7512;
@@ -220,7 +216,7 @@ async fn attached_size_selection_retries_after_the_candidate_epoch_changes() {
 async fn attached_size_selection_retries_after_the_policy_changes() {
     let handler = RequestHandler::new();
     let session_name = session_name("attached-size-policy-race");
-    handler.create_session((&session_name, LARGE_SIZE)).await;
+    SessionSpec::create(&handler, (&session_name, LARGE_SIZE)).await;
     handler.wait_for_initial_panes_for_test().await;
 
     let attach_pid = 7513;
@@ -256,7 +252,7 @@ async fn attached_size_selection_retries_after_the_policy_changes() {
 async fn attached_candidate_cannot_change_between_final_validation_and_apply() {
     let handler = RequestHandler::new();
     let session_name = session_name("attached-size-final-apply-race");
-    handler.create_session((&session_name, LARGE_SIZE)).await;
+    SessionSpec::create(&handler, (&session_name, LARGE_SIZE)).await;
     handler.wait_for_initial_panes_for_test().await;
 
     let attach_pid = 7514;

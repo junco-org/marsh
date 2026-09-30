@@ -3,14 +3,16 @@
 //! Three small traits carry the request boilerplate tests used to spell out by hand:
 //! [`Fixture`] builds a request payload from the one or two values a test always supplies and
 //! fills every other field with its usual test default, [`TestRequest`] pairs a payload with the
-//! response variant that means it succeeded, and [`Owned`] lets a fixture argument be a literal,
-//! a borrow or an owned value. The [`RequestHandler`] methods below compose them into the session,
-//! window, option and hook set-up most tests begin with. Integration tests under `tests/` cannot
-//! see this module; they share `tests/common/mod.rs` instead.
+//! response variant that means it succeeded and sends it expecting that variant, and [`Owned`]
+//! lets a fixture argument be a literal, a borrow or an owned value. [`SessionSpec`] composes them
+//! into session set-up, and the [`RequestHandler`] methods below into the window, option and hook
+//! set-up most tests begin with. Integration tests under `tests/` cannot see this module; they
+//! share `tests/common/mod.rs` instead.
 
 #[path = "test_fixtures/requests.rs"]
 mod requests;
 
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -118,9 +120,9 @@ impl<N: Owned<SessionName>> Owned<NewWindowRequest> for N {
     }
 }
 
-/// A request payload [`RequestHandler::handle_ok`] can send, paired with the response variant that
+/// A request payload [`TestRequest::send_ok`] can send, paired with the response variant that
 /// means it succeeded.
-pub(crate) trait TestRequest {
+pub(crate) trait TestRequest: Sized + Send {
     /// The payload of the success response.
     type Success;
 
@@ -129,34 +131,107 @@ pub(crate) trait TestRequest {
 
     /// Unwraps the success payload, or hands back any other response unchanged.
     fn success(response: Response) -> Result<Self::Success, Response>;
+
+    /// Sends `request` through `handler` and answers with its success payload.
+    ///
+    /// # Panics
+    ///
+    /// Panics with the response when the request fails or answers with another variant.
+    fn send_ok(
+        handler: &RequestHandler,
+        request: Self,
+    ) -> impl Future<Output = Self::Success> + Send {
+        async move {
+            let request = request.into_request();
+            let command = request.command_name();
+            Self::success(handler.handle(request).await)
+                .unwrap_or_else(|response| panic!("{command} failed: {response:?}"))
+        }
+    }
 }
 
-/// A subscription request [`RequestHandler::subscribe_ok`] sends on a connection, paired with the
-/// response variant that means it succeeded. Implemented in `handler_test_support.rs`, beside the
-/// handler-private entry points it calls.
-pub(crate) trait SubscribeRequest {
+/// A subscription request [`SubscribeRequest::subscribe_ok`] sends on a connection, paired with
+/// the response variant that means it succeeded. Implemented in `handler_test_support.rs`, beside
+/// the handler-private entry points it calls.
+pub(crate) trait SubscribeRequest: Sized + Send {
     /// The payload of the success response.
     type Success;
 
     /// Sends the request on `connection_id` and answers with the raw response.
-    async fn subscribe(self, handler: &RequestHandler, connection_id: u64) -> Response;
+    fn subscribe(
+        self,
+        handler: &RequestHandler,
+        connection_id: u64,
+    ) -> impl Future<Output = Response> + Send;
 
     /// Unwraps the success payload, or hands back any other response unchanged.
     fn success(response: Response) -> Result<Self::Success, Response>;
+
+    /// Subscribes connection `connection_id` through `handler` with `request` and answers with the
+    /// success payload.
+    ///
+    /// # Panics
+    ///
+    /// Panics with the response when the subscription is refused.
+    fn subscribe_ok(
+        handler: &RequestHandler,
+        connection_id: u64,
+        request: Self,
+    ) -> impl Future<Output = Self::Success> + Send {
+        async move {
+            Self::success(request.subscribe(handler, connection_id).await)
+                .unwrap_or_else(|response| panic!("subscription failed: {response:?}"))
+        }
+    }
 }
 
-/// What [`RequestHandler::create_session`] accepts: a session name (a detached 80x24
-/// `new-session`), a `(name, TerminalSize)` pair, [`Sizeless`], [`Quiet`], [`Grouped`], or a
-/// complete request.
-pub(crate) trait SessionSpec {
+/// What [`SessionSpec::create`] opens: a session name (a detached 80x24 `new-session`), a
+/// `(name, TerminalSize)` pair, [`Sizeless`], [`Quiet`], [`Grouped`], or a complete request.
+pub(crate) trait SessionSpec: Sized + Send {
     /// The request the spec sends.
     type Request: TestRequest<Success = NewSessionResponse>;
 
     /// Builds that request.
     fn into_session_request(self) -> Self::Request;
+
+    /// Creates the detached session `spec` describes through `handler` and answers with its name.
+    fn create(handler: &RequestHandler, spec: Self) -> impl Future<Output = SessionName> + Send {
+        async move {
+            TestRequest::send_ok(handler, spec.into_session_request())
+                .await
+                .session_name
+        }
+    }
+
+    /// [`create`](Self::create), then waits until the session's first pane has started.
+    ///
+    /// Unlike its siblings this future promises no `Send`: rustc cannot prove the startup wait's
+    /// async-closure poll `Send` for every lifetime of the borrows it captures.
+    fn create_started(handler: &RequestHandler, spec: Self) -> impl Future<Output = SessionName> {
+        async move {
+            let session = Self::create(handler, spec).await;
+            handler
+                .wait_for_pane_startup_to_finish_for_test(&PaneTarget::new(session.clone(), 0))
+                .await;
+            session
+        }
+    }
+
+    /// [`create`](Self::create), then attaches a client with pid `requester_pid` to the new
+    /// session and answers with the receiver of its attach controls.
+    fn create_attached(
+        handler: &RequestHandler,
+        requester_pid: u32,
+        spec: Self,
+    ) -> impl Future<Output = mpsc::UnboundedReceiver<AttachControl>> + Send {
+        async move {
+            let session = Self::create(handler, spec).await;
+            handler.attach_client(requester_pid, session).await
+        }
+    }
 }
 
-impl<N: Owned<SessionName>> SessionSpec for N {
+impl<N: Owned<SessionName> + Send> SessionSpec for N {
     type Request = NewSessionRequest;
 
     fn into_session_request(self) -> NewSessionRequest {
@@ -164,7 +239,7 @@ impl<N: Owned<SessionName>> SessionSpec for N {
     }
 }
 
-impl<N: Owned<SessionName>> SessionSpec for (N, TerminalSize) {
+impl<N: Owned<SessionName> + Send> SessionSpec for (N, TerminalSize) {
     type Request = NewSessionRequest;
 
     fn into_session_request(self) -> NewSessionRequest {
@@ -194,11 +269,11 @@ impl SessionSpec for NewSessionExtRequest {
 /// A session or window spec whose first pane runs [`quiet_command`] instead of the shell.
 ///
 /// Such a pane neither prints nor exits, so activity, silence and title tests observe only what
-/// they cause. Pair it with [`RequestHandler::create_started_session`] or
+/// they cause. Pair it with [`SessionSpec::create_started`] or
 /// [`RequestHandler::create_started_window`], which wait for the pane to finish starting.
 pub(crate) struct Quiet<S>(pub(crate) S);
 
-impl<N: Owned<SessionName>> SessionSpec for Quiet<N> {
+impl<N: Owned<SessionName> + Send> SessionSpec for Quiet<N> {
     type Request = NewSessionExtRequest;
 
     fn into_session_request(self) -> NewSessionExtRequest {
@@ -221,7 +296,7 @@ impl<N: Owned<SessionName>> Owned<NewWindowRequest> for Quiet<N> {
 /// A session spec for session `.0` joining the group of session `.1`.
 pub(crate) struct Grouped<N, G>(pub(crate) N, pub(crate) G);
 
-impl<N: Owned<SessionName>, G: Owned<SessionName>> SessionSpec for Grouped<N, G> {
+impl<N: Owned<SessionName> + Send, G: Owned<SessionName> + Send> SessionSpec for Grouped<N, G> {
     type Request = NewSessionExtRequest;
 
     fn into_session_request(self) -> NewSessionExtRequest {
@@ -235,7 +310,7 @@ impl<N: Owned<SessionName>, G: Owned<SessionName>> SessionSpec for Grouped<N, G>
 /// A plain `new-session` spec for session `.0` that requests no size, so the server picks one.
 pub(crate) struct Sizeless<N>(pub(crate) N);
 
-impl<N: Owned<SessionName>> SessionSpec for Sizeless<N> {
+impl<N: Owned<SessionName> + Send> SessionSpec for Sizeless<N> {
     type Request = NewSessionRequest;
 
     fn into_session_request(self) -> NewSessionRequest {
@@ -247,51 +322,10 @@ impl<N: Owned<SessionName>> SessionSpec for Sizeless<N> {
 }
 
 impl RequestHandler {
-    /// Sends `request` and answers with its success payload.
-    ///
-    /// # Panics
-    ///
-    /// Panics with the response when the request fails or answers with another variant.
-    pub(crate) async fn handle_ok<R: TestRequest>(&self, request: R) -> R::Success {
-        let request = request.into_request();
-        let command = request.command_name();
-        R::success(self.handle(request).await)
-            .unwrap_or_else(|response| panic!("{command} failed: {response:?}"))
-    }
-
-    /// Subscribes connection `connection_id` with `request` and answers with the success payload.
-    ///
-    /// # Panics
-    ///
-    /// Panics with the response when the subscription is refused.
-    pub(crate) async fn subscribe_ok<R: SubscribeRequest>(
-        &self,
-        connection_id: u64,
-        request: R,
-    ) -> R::Success {
-        R::success(request.subscribe(self, connection_id).await)
-            .unwrap_or_else(|response| panic!("subscription failed: {response:?}"))
-    }
-
-    /// Creates the detached session `spec` describes and answers with its name.
-    pub(crate) async fn create_session(&self, spec: impl SessionSpec) -> SessionName {
-        self.handle_ok(spec.into_session_request())
-            .await
-            .session_name
-    }
-
-    /// [`create_session`](Self::create_session), then waits until its first pane has started.
-    pub(crate) async fn create_started_session(&self, spec: impl SessionSpec) -> SessionName {
-        let session = self.create_session(spec).await;
-        self.wait_for_pane_startup_to_finish_for_test(&PaneTarget::new(session.clone(), 0))
-            .await;
-        session
-    }
-
     /// Opens the window `spec` describes (a session name opens a detached default window) and
     /// answers with its target.
     pub(crate) async fn create_window(&self, spec: impl Owned<NewWindowRequest>) -> WindowTarget {
-        self.handle_ok(spec.owned()).await.target
+        TestRequest::send_ok(self, spec.owned()).await.target
     }
 
     /// [`create_window`](Self::create_window), then waits until the window's pane has started.
@@ -455,8 +489,7 @@ impl RequestHandler {
 
     /// Sets `option` to `value` in `scope`, replacing any earlier value.
     pub(crate) async fn set_option(&self, scope: ScopeSelector, option: OptionName, value: &str) {
-        self.handle_ok(SetOptionRequest::fixture((scope, option, value)))
-            .await;
+        TestRequest::send_ok(self, SetOptionRequest::fixture((scope, option, value))).await;
     }
 
     /// Sets the option spelled `name` to `value` in `scope`, replacing any earlier value.
@@ -466,17 +499,15 @@ impl RequestHandler {
         name: &str,
         value: &str,
     ) {
-        self.handle_ok(SetOptionByNameRequest::fixture((scope, name, value)))
-            .await;
+        TestRequest::send_ok(self, SetOptionByNameRequest::fixture((scope, name, value))).await;
     }
 
     /// Installs `command` as the persistent global `hook`.
     pub(crate) async fn set_global_hook(&self, hook: HookName, command: &str) {
-        self.handle_ok(SetHookMutationRequest::fixture((
-            ScopeSelector::Global,
-            hook,
-            command,
-        )))
+        TestRequest::send_ok(
+            self,
+            SetHookMutationRequest::fixture((ScopeSelector::Global, hook, command)),
+        )
         .await;
     }
 
@@ -487,10 +518,13 @@ impl RequestHandler {
         target: impl Owned<Option<Target>>,
         message: impl Into<String>,
     ) -> Vec<u8> {
-        self.handle_ok(DisplayMessageRequest {
-            target: target.owned(),
-            ..Fixture::fixture(message)
-        })
+        TestRequest::send_ok(
+            self,
+            DisplayMessageRequest {
+                target: target.owned(),
+                ..Fixture::fixture(message)
+            },
+        )
         .await
         .output
         .expect("display-message -p returns output")

@@ -39,7 +39,7 @@ use crate::daemon::ShutdownHandle;
 use crate::handler::RequestHandler;
 use crate::outer_terminal::{OuterTerminal, OuterTerminalContext};
 use crate::renderer::PaneRenderDeltaFrame;
-use crate::test_fixtures::Fixture;
+use crate::test_fixtures::{Fixture, SessionSpec, TestRequest};
 use crate::test_names::session_name;
 
 mod persistent_overlay;
@@ -271,9 +271,7 @@ async fn dispatch_live_attach_message_for_test(
 async fn forward_attach_resize_during_command_prompt_keeps_exact_identity_alive() {
     let handler = Arc::new(RequestHandler::new());
     let attach_pid = std::process::id();
-    let session_name = handler
-        .create_session("resize-command-prompt-identity")
-        .await;
+    let session_name = SessionSpec::create(&handler, "resize-command-prompt-identity").await;
     let control_rx = handler.attach_client(attach_pid, &session_name).await;
     let identity = handler.active_attach_identity_for_test(attach_pid).await;
 
@@ -342,7 +340,7 @@ async fn forward_attach_resize_during_command_prompt_keeps_exact_identity_alive(
 }
 
 async fn create_attach_input_test_session(handler: &RequestHandler, name: &str) -> PaneTarget {
-    let target = PaneTarget::with_window(handler.create_session(name).await, 0, 0);
+    let target = PaneTarget::with_window(SessionSpec::create(handler, name).await, 0, 0);
     handler.start_attached_input_capture_for_test(&target).await;
     target
 }
@@ -430,16 +428,18 @@ async fn same_pid_replacement_publishes_while_old_binding_waits() {
     let channel = "attach-identity-blocked-binding";
     let alpha = create_attach_input_test_session(&handler, "identity-wait-alpha").await;
     let beta = create_attach_input_test_session(&handler, "identity-wait-beta").await;
-    handler
-        .handle_ok(BindKeyRequest {
+    TestRequest::send_ok(
+        &handler,
+        BindKeyRequest {
             note: Some("identity-wait".to_owned()),
             ..Fixture::fixture((
                 "identity-wait",
                 "x",
                 [format!("wait-for {channel} ; detach-client")],
             ))
-        })
-        .await;
+        },
+    )
+    .await;
 
     let mut alpha_control_rx = handler
         .attach_client(attach_pid, alpha.session_name())
@@ -483,9 +483,11 @@ async fn same_pid_replacement_publishes_while_old_binding_waits() {
     .await
     .expect("old attach receives Detach");
 
-    handler
-        .handle_ok(WaitForRequest::fixture((channel, WaitForMode::Signal)))
-        .await;
+    TestRequest::send_ok(
+        &handler,
+        WaitForRequest::fixture((channel, WaitForMode::Signal)),
+    )
+    .await;
     let _old_input_result = tokio::time::timeout(Duration::from_secs(2), input_task)
         .await
         .expect("old binding unwinds after signal")
@@ -518,17 +520,19 @@ async fn unlock_flushes_resume_output_before_following_blocking_keystroke() {
     let handler = Arc::new(RequestHandler::new());
     let attach_pid = std::process::id();
     let channel = "attach-unlock-output-barrier";
-    let session_name = handler.create_session("unlock-output-barrier").await;
-    handler
-        .handle_ok(BindKeyRequest {
+    let session_name = SessionSpec::create(&handler, "unlock-output-barrier").await;
+    TestRequest::send_ok(
+        &handler,
+        BindKeyRequest {
             note: Some("unlock output barrier".to_owned()),
             ..Fixture::fixture((
                 "unlock-output-barrier",
                 "x",
                 [format!("wait-for {channel}")],
             ))
-        })
-        .await;
+        },
+    )
+    .await;
 
     let _control_rx = handler.attach_client(attach_pid, &session_name).await;
     handler
@@ -570,9 +574,11 @@ async fn unlock_flushes_resume_output_before_following_blocking_keystroke() {
         "unlock must restore the terminal before the following binding completes"
     );
 
-    handler
-        .handle_ok(WaitForRequest::fixture((channel, WaitForMode::Signal)))
-        .await;
+    TestRequest::send_ok(
+        &handler,
+        WaitForRequest::fixture((channel, WaitForMode::Signal)),
+    )
+    .await;
     input_task
         .await
         .expect("input task join")
@@ -668,7 +674,7 @@ async fn pending_escape_socket_fixture(
 ) {
     let handler = Arc::new(RequestHandler::new());
     let attach_pid = std::process::id();
-    let session_name = handler.create_session(session).await;
+    let session_name = SessionSpec::create(&handler, session).await;
     let target = PaneTarget::with_window(session_name.clone(), 0, 0);
     let control_rx = handler.attach_client(attach_pid, session_name).await;
     handler.start_attached_input_capture_for_test(&target).await;
@@ -713,7 +719,7 @@ impl PendingEscapeSchedulerFixture {
     async fn start(session: &str) -> Self {
         let handler = Arc::new(RequestHandler::new());
         let attach_pid = std::process::id();
-        let session_name = handler.create_started_session(session).await;
+        let session_name = SessionSpec::create_started(&handler, session).await;
         let target = PaneTarget::with_window(session_name.clone(), 0, 0);
         handler
             .set_option(ScopeSelector::Global, OptionName::EscapeTime, "500")
@@ -812,16 +818,17 @@ impl PendingEscapeSchedulerFixture {
 }
 
 async fn arm_ignored_display_message(fixture: &PendingEscapeSchedulerFixture, duration_ms: u32) {
-    fixture
-        .handler
-        .handle_ok(DisplayMessageExtRequest {
+    TestRequest::send_ok(
+        &fixture.handler,
+        DisplayMessageExtRequest {
             target: Some(Target::Pane(fixture.target.clone())),
             target_client: Some(std::process::id().to_string()),
             duration_ms: Some(rmux_proto::DisplayMessageDurationMillis::new(duration_ms)),
             ignore_input: true,
             ..Fixture::fixture("ignore input")
-        })
-        .await;
+        },
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -1502,7 +1509,7 @@ async fn first_keystroke_reply(
 ) -> Option<AttachMessage> {
     let handler = Arc::new(RequestHandler::new());
     let attach_pid = std::process::id();
-    let session_name = handler.create_session("alpha").await;
+    let session_name = SessionSpec::create(&handler, "alpha").await;
     let _control_rx = handler.attach_client(attach_pid, session_name).await;
 
     let live_input = LiveAttachInputContext::current_for_test(handler, attach_pid).await;
@@ -1560,7 +1567,7 @@ async fn mouse_keystroke_wire_does_not_error_or_drop_the_attach() {
 async fn data_payload_does_not_trust_an_unversioned_cached_pane_shell() {
     let handler = Arc::new(RequestHandler::new());
     let attach_pid = std::process::id();
-    let session_name = handler.create_session("cached-master").await;
+    let session_name = SessionSpec::create(&handler, "cached-master").await;
     let target = PaneTarget::with_window(session_name.clone(), 0, 0);
     let _control_rx = handler.attach_client(attach_pid, &session_name).await;
     handler.start_attached_input_capture_for_test(&target).await;
@@ -2552,7 +2559,7 @@ async fn closing_shutdown_discards_mutating_controls_but_finishes_terminal_exit(
 #[tokio::test]
 async fn last_session_exit_waits_for_attach_wire_drain_before_daemon_shutdown() {
     let handler = Arc::new(RequestHandler::new());
-    let session_name = handler.create_session("attach-drain").await;
+    let session_name = SessionSpec::create(&handler, "attach-drain").await;
     let (daemon_shutdown, mut daemon_shutdown_rx) = ShutdownHandle::new();
     handler.install_shutdown_handle(daemon_shutdown);
     let forwarder_guard = handler.begin_attach_forwarder();
@@ -2581,9 +2588,7 @@ async fn last_session_exit_waits_for_attach_wire_drain_before_daemon_shutdown() 
     );
     let _ = read_attach_data_until(&mut attach.peer, b"BASE-0").await;
 
-    handler
-        .handle_ok(KillSessionRequest::fixture(session_name))
-        .await;
+    TestRequest::send_ok(&handler, KillSessionRequest::fixture(session_name)).await;
     assert!(
         !handler.request_shutdown_if_pending(),
         "exit-empty must wait for the attached exit frame to drain"
@@ -2689,9 +2694,7 @@ async fn session_exit_before_input_validation_still_drains_final_output() {
 
     let _ = pane_output.send_for_generation(None, b"FINAL_AFTER_CLOSE".to_vec());
     let _ = pane_output.send_for_generation(None, Vec::new());
-    handler
-        .handle_ok(KillSessionRequest::fixture(session_name))
-        .await;
+    TestRequest::send_ok(&handler, KillSessionRequest::fixture(session_name)).await;
     pause.release.notify_one();
 
     let exited = read_attach_data_until(peer, b"[exited]\r\n").await;
@@ -3019,7 +3022,7 @@ async fn forward_attach_plain_refresh_does_not_clear_the_screen() {
 async fn forward_attach_select_switch_preserves_fragmented_same_pane_input() {
     let handler = Arc::new(RequestHandler::new());
     let attach_pid = std::process::id();
-    let session_name = handler.create_session("refresh-pending-input").await;
+    let session_name = SessionSpec::create(&handler, "refresh-pending-input").await;
     let target = PaneTarget::with_window(session_name.clone(), 0, 0);
 
     let (control_tx, control_rx) = mpsc::unbounded_channel();
@@ -3091,7 +3094,7 @@ async fn forward_attach_select_switch_preserves_fragmented_same_pane_input() {
 async fn forward_attach_lock_boundary_discards_fragmented_input_before_unlock() {
     let handler = Arc::new(RequestHandler::new());
     let attach_pid = std::process::id();
-    let session_name = handler.create_session("lock-pending-input").await;
+    let session_name = SessionSpec::create(&handler, "lock-pending-input").await;
     let target = PaneTarget::with_window(session_name.clone(), 0, 0);
     handler
         .set_option(ScopeSelector::Global, OptionName::EscapeTime, "30000")
@@ -3254,10 +3257,12 @@ async fn forward_attach_counts_coalesced_switches_before_persistent_overlay() {
 async fn forward_attach_emits_overlay_control_frames() {
     let handler = Arc::new(RequestHandler::new());
     let attach_pid = std::process::id();
-    let session_name = handler.create_session("alpha").await;
-    handler
-        .handle_ok(rmux_proto::SplitWindowRequest::fixture(&session_name))
-        .await;
+    let session_name = SessionSpec::create(&handler, "alpha").await;
+    TestRequest::send_ok(
+        &handler,
+        rmux_proto::SplitWindowRequest::fixture(&session_name),
+    )
+    .await;
     handler
         .set_option(
             ScopeSelector::Session(session_name.clone()),

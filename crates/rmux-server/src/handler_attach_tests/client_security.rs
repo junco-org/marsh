@@ -1,11 +1,12 @@
 use super::*;
+use crate::test_fixtures::SessionSpec;
 
 #[tokio::test]
 async fn lock_client_with_empty_lock_command_is_noop() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
 
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
 
     handler
         .set_option(ScopeSelector::Global, OptionName::LockCommand, "")
@@ -31,7 +32,7 @@ async fn lock_client_with_invalid_target_returns_error() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
 
-    handler.create_session(alpha).await;
+    SessionSpec::create(&handler, alpha).await;
 
     let response = handler
         .handle(Request::LockClient(rmux_proto::LockClientRequest {
@@ -59,7 +60,7 @@ async fn lock_client_accepts_tty_path_targets() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
 
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
 
     handler
         .set_option(ScopeSelector::Global, OptionName::LockCommand, "")
@@ -103,7 +104,7 @@ async fn lock_client_accepts_tty_path_targets() {
 async fn overlay_commands_resolve_names_published_by_list_clients() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
 
     let mut child = spawn_tty_child().expect("spawn tty child");
     let mut control_rx = handler.attach_client(child.id(), alpha).await;
@@ -215,7 +216,7 @@ async fn detach_client_all_other_detaches_only_non_requester_clients() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
 
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
 
     let mut first_rx = handler.attach_client(101, &alpha).await;
     let mut second_rx = handler.attach_client(202, alpha).await;
@@ -252,7 +253,7 @@ async fn suspend_client_marks_client_as_suspended() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
 
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
 
     let mut control_rx = handler.attach_client(std::process::id(), alpha).await;
 
@@ -311,7 +312,7 @@ async fn refresh_client_flags_merge_incrementally() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
 
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
 
     let _control_rx = handler.attach_client(std::process::id(), alpha).await;
 
@@ -375,7 +376,7 @@ async fn refresh_client_reserved_wire_fields_from_old_clients_are_rejected() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
 
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
 
     let _control_rx = handler.attach_client(std::process::id(), alpha).await;
 

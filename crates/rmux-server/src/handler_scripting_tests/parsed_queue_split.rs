@@ -1,4 +1,5 @@
 use super::*;
+use crate::test_fixtures::SessionSpec;
 
 #[tokio::test]
 async fn parsed_queue_split_window_accepts_start_directory() {
@@ -7,7 +8,7 @@ async fn parsed_queue_split_window_accepts_start_directory() {
     // `-c` NAMES this directory, so it has to be inside the seed this handler leased: the split's
     // pane opens over a snapshot of that one tree.
     let cwd = seed_scratch_dir(&handler, "split-cwd").path().to_path_buf();
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
 
     let parsed = CommandParser::new()
         .parse(&format!("split-window -c {}", sh_quote_path(&cwd)))
@@ -34,7 +35,7 @@ async fn parsed_queue_split_window_accepts_start_directory() {
 async fn parsed_queue_split_window_applies_stateful_compat_flags() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
 
     let parsed = CommandParser::new()
         .parse("split-window -d -Z -l 5 -t alpha:0.0")
@@ -80,7 +81,7 @@ async fn parsed_queue_split_window_applies_stateful_compat_flags() {
 async fn parsed_queue_split_window_keep_flag_retains_exited_pane() {
     let handler = RequestHandler::new();
     let alpha = session_name("split-keep");
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
 
     let parsed = CommandParser::new()
         .parse("split-window -dk -t split-keep:0.0 'exit 7'")
@@ -118,7 +119,7 @@ async fn parsed_queue_split_window_keep_flag_retains_exited_pane() {
 async fn parsed_queue_split_window_direction_flags_follow_tmux_priority() {
     let handler = RequestHandler::new();
     let alpha = session_name("split-priority");
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
 
     let parsed = CommandParser::new()
         .parse("split-window -h -v -t split-priority:0.0")
@@ -142,7 +143,7 @@ async fn parsed_queue_split_window_direction_flags_follow_tmux_priority() {
 async fn parsed_queue_split_window_full_size_splits_the_window_root() {
     let handler = RequestHandler::new();
     let alpha = session_name("split-full");
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
 
     let parsed = CommandParser::new()
         .parse("split-window -v -l 5 -t split-full:0.0 ; split-window -f -v -t split-full:0.1")
@@ -180,7 +181,7 @@ async fn parsed_queue_split_window_full_size_splits_the_window_root() {
 async fn parsed_queue_split_window_prints_formatted_target() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
 
     let parsed = CommandParser::new()
         .parse("split-window -P -F '#{session_name}:#{window_index}.#{pane_index}' -t alpha:0.0")
@@ -197,7 +198,7 @@ async fn parsed_queue_split_window_prints_formatted_target() {
 async fn parsed_queue_split_window_percentage_size_uses_target_pane_axis() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
 
     let parsed = CommandParser::new()
         .parse("split-window -v -l 5 -t alpha:0.0 ; split-window -v -l 50% -t alpha:0.1")

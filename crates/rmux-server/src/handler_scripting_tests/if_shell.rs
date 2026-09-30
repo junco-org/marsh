@@ -1,17 +1,20 @@
 use super::*;
 use crate::handler::with_expected_attach_and_session_identity;
+use crate::test_fixtures::{SessionSpec, TestRequest};
 
 #[tokio::test]
 async fn if_shell_format_mode_dispatches_selected_rmux_command() {
     let handler = RequestHandler::new();
 
-    let response = handler
-        .handle_ok(IfShellRequest {
+    let response = TestRequest::send_ok(
+        &handler,
+        IfShellRequest {
             format_mode: true,
             else_command: Some("set-buffer -b chosen wrong".to_owned()),
             ..Fixture::fixture(("1", "set-buffer -b chosen selected"))
-        })
-        .await;
+        },
+    )
+    .await;
 
     assert_eq!(response, rmux_proto::IfShellResponse::no_output());
 
@@ -28,12 +31,11 @@ async fn if_shell_format_mode_dispatches_selected_rmux_command() {
 #[tokio::test]
 async fn queued_if_shell_returns_nested_command_output() {
     let handler = RequestHandler::new();
-    handler
-        .handle_ok(SetBufferRequest::fixture((
-            "queued-selected",
-            b"queued-output",
-        )))
-        .await;
+    TestRequest::send_ok(
+        &handler,
+        SetBufferRequest::fixture(("queued-selected", b"queued-output")),
+    )
+    .await;
 
     let parsed = handler
         .parse_control_commands("if-shell -F 1 'show-buffer -b queued-selected'")
@@ -120,8 +122,8 @@ async fn background_if_shell_request_rejects_a_reused_control_registration() {
     let original = session_name("if-shell-request-control-original");
     let replacement = session_name("if-shell-request-control-replacement");
     let wait_channel = "if-shell-request-control-registration-reuse";
-    handler.create_session(&original).await;
-    handler.create_session(&replacement).await;
+    SessionSpec::create(&handler, &original).await;
+    SessionSpec::create(&handler, &replacement).await;
     let (original_control_id, original_events) = handler
         .register_control_for_test(requester_pid, Some(&original))
         .await;
@@ -211,8 +213,8 @@ async fn queued_background_if_shell_rejects_a_reused_control_registration() {
     let original = session_name("if-shell-queue-control-original");
     let replacement = session_name("if-shell-queue-control-replacement");
     let wait_channel = "if-shell-queue-control-registration-reuse";
-    handler.create_session(&original).await;
-    handler.create_session(&replacement).await;
+    SessionSpec::create(&handler, &original).await;
+    SessionSpec::create(&handler, &replacement).await;
     let (original_control_id, original_events) = handler
         .register_control_for_test(requester_pid, Some(&original))
         .await;
@@ -246,8 +248,8 @@ async fn assert_background_if_shell_rejects_reused_attach_registration(queued: b
     let original = session_name(&format!("if-shell-{suffix}-attach-original"));
     let replacement = session_name(&format!("if-shell-{suffix}-attach-replacement"));
     let wait_channel = format!("if-shell-{suffix}-attach-registration-reuse");
-    handler.create_session(&original).await;
-    handler.create_session(&replacement).await;
+    SessionSpec::create(&handler, &original).await;
+    SessionSpec::create(&handler, &replacement).await;
     let _original_control_rx = handler.attach_client(requester_pid, &original).await;
     let original_identity = handler.active_attach_identity_for_test(requester_pid).await;
 
@@ -329,8 +331,8 @@ async fn background_if_shell_queue_survives_a_same_registration_session_switch()
     let beta = session_name("if-shell-attach-switch-beta");
     let wait_channel = "if-shell-attach-session-switch";
     let followed_window_name = "if-shell-followed-attached-session";
-    handler.create_session(&alpha).await;
-    handler.create_session(&beta).await;
+    SessionSpec::create(&handler, &alpha).await;
+    SessionSpec::create(&handler, &beta).await;
     let _control_rx = handler.attach_client(requester_pid, &alpha).await;
     let identity = handler.active_attach_identity_for_test(requester_pid).await;
 
@@ -390,9 +392,9 @@ async fn assert_explicit_background_if_shell_target_survives_switch(queued: bool
     let gamma = session_name(&format!("if-shell-explicit-{suffix}-gamma"));
     let wait_channel = format!("if-shell-explicit-{suffix}-wait");
     let expected_window_name = format!("if-shell-explicit-{suffix}-target");
-    handler.create_session(&alpha).await;
-    handler.create_session(&beta).await;
-    handler.create_session(&gamma).await;
+    SessionSpec::create(&handler, &alpha).await;
+    SessionSpec::create(&handler, &beta).await;
+    SessionSpec::create(&handler, &gamma).await;
     let _control_rx = handler.attach_client(requester_pid, &alpha).await;
     let identity = handler.active_attach_identity_for_test(requester_pid).await;
 
@@ -472,12 +474,14 @@ async fn explicit_background_if_shell_targets_survive_attached_switch() {
 async fn background_if_shell_is_tracked_as_detached_request_until_finished() {
     let handler = RequestHandler::new();
 
-    let response = handler
-        .handle_ok(IfShellRequest {
+    let response = TestRequest::send_ok(
+        &handler,
+        IfShellRequest {
             background: true,
             ..Fixture::fixture(("sleep 0.2; true", "display-message done"))
-        })
-        .await;
+        },
+    )
+    .await;
 
     assert_eq!(response, rmux_proto::IfShellResponse::no_output());
     wait_for_detached_request_count(&handler, 1).await;
@@ -489,13 +493,15 @@ async fn if_shell_format_mode_expands_socket_path_without_target() {
     let handler = RequestHandler::new();
     handler.set_socket_path("/tmp/rmux-test.sock");
 
-    let response = handler
-        .handle_ok(IfShellRequest {
+    let response = TestRequest::send_ok(
+        &handler,
+        IfShellRequest {
             format_mode: true,
             else_command: Some("set-buffer -b chosen wrong".to_owned()),
             ..Fixture::fixture(("#{socket_path}", "set-buffer -b chosen selected"))
-        })
-        .await;
+        },
+    )
+    .await;
 
     assert_eq!(response, rmux_proto::IfShellResponse::no_output());
 
@@ -515,13 +521,15 @@ async fn if_shell_format_mode_treats_zero_prefixed_values_as_false_like_tmux() {
 
     for condition in ["00", "09", "01", "0abc", "0.0"] {
         let buffer = format!("chosen-{condition}");
-        let response = handler
-            .handle_ok(IfShellRequest {
+        let response = TestRequest::send_ok(
+            &handler,
+            IfShellRequest {
                 format_mode: true,
                 else_command: Some(format!("set-buffer -b {buffer} fallback")),
                 ..Fixture::fixture((condition, format!("set-buffer -b {buffer} selected")))
-            })
-            .await;
+            },
+        )
+        .await;
         assert_eq!(response, rmux_proto::IfShellResponse::no_output());
 
         let response = handler.handle(show_buffer_request(&buffer)).await;
@@ -540,15 +548,17 @@ async fn if_shell_format_mode_treats_zero_prefixed_values_as_false_like_tmux() {
 async fn if_shell_format_mode_without_target_uses_preferred_session_context() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
 
-    let response = handler
-        .handle_ok(IfShellRequest {
+    let response = TestRequest::send_ok(
+        &handler,
+        IfShellRequest {
             format_mode: true,
             else_command: Some("set-buffer -b chosen wrong".to_owned()),
             ..Fixture::fixture(("#{session_name}", "set-buffer -b chosen selected"))
-        })
-        .await;
+        },
+    )
+    .await;
 
     assert_eq!(response, rmux_proto::IfShellResponse::no_output());
 
@@ -566,7 +576,7 @@ async fn if_shell_format_mode_without_target_uses_preferred_session_context() {
 async fn if_shell_missing_explicit_target_is_nonfatal() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    handler.create_session(alpha).await;
+    SessionSpec::create(&handler, alpha).await;
 
     let response = handler
         .handle(
@@ -624,7 +634,7 @@ async fn source_file_if_shell_true_executes_brace_command_list() {
 async fn if_shell_pane_id_target_resolves_like_display_message() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
 
     let display_message = CommandParser::new()
         .parse("display-message -p -t %0 OKDM")
@@ -659,7 +669,7 @@ async fn queued_if_shell_target_becomes_branch_current_target() {
     let alpha = session_name("alpha");
     let beta = session_name("beta");
     for session in [&alpha, &beta] {
-        handler.create_session(session).await;
+        SessionSpec::create(&handler, session).await;
     }
 
     let parsed = CommandParser::new()
@@ -706,7 +716,7 @@ async fn queued_if_shell_accepts_compact_format_target_with_attached_value() {
     let alpha = session_name("alpha");
     let beta = session_name("beta");
     for session in [&alpha, &beta] {
-        handler.create_session(session).await;
+        SessionSpec::create(&handler, session).await;
     }
 
     let parsed = CommandParser::new()
@@ -731,7 +741,7 @@ async fn queued_if_shell_compact_mouse_target_falls_back_to_current_target() {
     let alpha = session_name("alpha");
     let beta = session_name("beta");
     for session in [&alpha, &beta] {
-        handler.create_session(session).await;
+        SessionSpec::create(&handler, session).await;
     }
 
     let parsed = CommandParser::new()
@@ -755,7 +765,7 @@ async fn queued_if_shell_separated_mouse_target_falls_back_to_current_target() {
     let alpha = session_name("alpha");
     let beta = session_name("beta");
     for session in [&alpha, &beta] {
-        handler.create_session(session).await;
+        SessionSpec::create(&handler, session).await;
     }
 
     let parsed = CommandParser::new()
@@ -779,7 +789,7 @@ async fn queued_if_shell_accepts_compact_format_target_with_next_argument() {
     let alpha = session_name("alpha");
     let beta = session_name("beta");
     for session in [&alpha, &beta] {
-        handler.create_session(session).await;
+        SessionSpec::create(&handler, session).await;
     }
 
     let parsed = CommandParser::new()
@@ -824,12 +834,14 @@ async fn queued_if_shell_accepts_compact_format_target_with_next_argument() {
 async fn if_shell_false_without_else_is_a_successful_noop() {
     let handler = RequestHandler::new();
 
-    let response = handler
-        .handle_ok(IfShellRequest {
+    let response = TestRequest::send_ok(
+        &handler,
+        IfShellRequest {
             format_mode: true,
             ..Fixture::fixture(("0", "set-buffer impossible"))
-        })
-        .await;
+        },
+    )
+    .await;
 
     assert_eq!(response, rmux_proto::IfShellResponse::no_output());
 }
@@ -839,14 +851,16 @@ async fn scripted_pane_commands_accept_session_targets_like_tmux() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
 
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
 
-    handler
-        .handle_ok(IfShellRequest {
+    TestRequest::send_ok(
+        &handler,
+        IfShellRequest {
             format_mode: true,
             ..Fixture::fixture(("1", "copy-mode -t alpha"))
-        })
-        .await;
+        },
+    )
+    .await;
 
     let output = handler
         .display_print(PaneTarget::new(alpha, 0), "#{pane_in_mode}")
@@ -875,7 +889,7 @@ async fn if_shell_shell_mode_uses_bin_sh_environment_and_caller_cwd() {
         ),
     );
 
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
     handler
         .set_option(
             ScopeSelector::Global,
@@ -883,16 +897,18 @@ async fn if_shell_shell_mode_uses_bin_sh_environment_and_caller_cwd() {
             &shell_path.to_string_lossy(),
         )
         .await;
-    handler
-        .handle_ok(SetEnvironmentRequest {
+    TestRequest::send_ok(
+        &handler,
+        SetEnvironmentRequest {
             scope: ScopeSelector::Session(alpha.clone()),
             name: "FOO".to_owned(),
             value: "bar".to_owned(),
             mode: None,
             hidden: false,
             format: false,
-        })
-        .await;
+        },
+    )
+    .await;
 
     // A job's own directory is the *snapshot* of the seed — `<root>/.marsh/seed/snap/
     // <uid>/<seed-relative dir>` — and the uid is minted per job, so no absolute path
@@ -903,14 +919,16 @@ async fn if_shell_shell_mode_uses_bin_sh_environment_and_caller_cwd() {
         "test \"$FOO\" = bar && test \"${{PWD%/{relative}}}\" != \"$PWD\"",
         relative = caller_cwd.relative()
     );
-    let response = handler
-        .handle_ok(IfShellRequest {
+    let response = TestRequest::send_ok(
+        &handler,
+        IfShellRequest {
             else_command: Some("set-buffer -b chosen no".to_owned()),
             target: Some(Target::Session(alpha)),
             caller_cwd: Some(caller_cwd.path().to_path_buf()),
             ..Fixture::fixture((condition, "set-buffer -b chosen yes"))
-        })
-        .await;
+        },
+    )
+    .await;
 
     assert_eq!(response, rmux_proto::IfShellResponse::no_output());
     assert_eq!(
@@ -932,12 +950,14 @@ async fn if_shell_shell_mode_uses_bin_sh_environment_and_caller_cwd() {
 async fn if_shell_nested_set_buffer_accepts_hyphen_prefixed_content_after_separator() {
     let handler = RequestHandler::new();
 
-    let response = handler
-        .handle_ok(IfShellRequest {
+    let response = TestRequest::send_ok(
+        &handler,
+        IfShellRequest {
             format_mode: true,
             ..Fixture::fixture(("1", "set-buffer -b hyphen -- -value"))
-        })
-        .await;
+        },
+    )
+    .await;
 
     assert_eq!(response, rmux_proto::IfShellResponse::no_output());
 
@@ -982,12 +1002,14 @@ async fn if_shell_nested_set_buffer_rejects_hyphen_prefixed_content_without_sepa
 async fn if_shell_nested_wait_for_accepts_hyphen_prefixed_channel_after_separator() {
     let handler = RequestHandler::new();
 
-    let response = handler
-        .handle_ok(IfShellRequest {
+    let response = TestRequest::send_ok(
+        &handler,
+        IfShellRequest {
             format_mode: true,
             ..Fixture::fixture(("1", "wait-for -S -- -channel"))
-        })
-        .await;
+        },
+    )
+    .await;
 
     assert_eq!(response, rmux_proto::IfShellResponse::no_output());
 }
@@ -996,15 +1018,17 @@ async fn if_shell_nested_wait_for_accepts_hyphen_prefixed_channel_after_separato
 async fn if_shell_nested_run_shell_accepts_double_dash_before_command() {
     let handler = RequestHandler::new();
 
-    let response = handler
-        .handle_ok(IfShellRequest {
+    let response = TestRequest::send_ok(
+        &handler,
+        IfShellRequest {
             format_mode: true,
             ..Fixture::fixture((
                 "1",
                 format!("run-shell -- {}", command_quote(&shell_success_command())),
             ))
-        })
-        .await;
+        },
+    )
+    .await;
 
     assert_eq!(response, rmux_proto::IfShellResponse::no_output());
 }
@@ -1013,12 +1037,14 @@ async fn if_shell_nested_run_shell_accepts_double_dash_before_command() {
 async fn if_shell_string_mode_runs_multiple_commands_in_one_group() {
     let handler = RequestHandler::new();
 
-    let response = handler
-        .handle_ok(IfShellRequest {
+    let response = TestRequest::send_ok(
+        &handler,
+        IfShellRequest {
             format_mode: true,
             ..Fixture::fixture(("1", "set-buffer -b one first; set-buffer -b two second"))
-        })
-        .await;
+        },
+    )
+    .await;
 
     assert_eq!(response, rmux_proto::IfShellResponse::no_output());
     assert_eq!(

@@ -8,7 +8,7 @@ use rmux_proto::{
     WindowTarget,
 };
 
-use crate::test_fixtures::{wait_until, Fixture};
+use crate::test_fixtures::{wait_until, Fixture, SessionSpec, TestRequest};
 use crate::test_names::session_name;
 
 async fn set_indexed_global_hook(
@@ -17,12 +17,14 @@ async fn set_indexed_global_hook(
     index: u32,
     command: &str,
 ) {
-    handler
-        .handle_ok(SetHookMutationRequest {
+    TestRequest::send_ok(
+        handler,
+        SetHookMutationRequest {
             index: Some(index),
             ..Fixture::fixture((ScopeSelector::Global, hook, command))
-        })
-        .await;
+        },
+    )
+    .await;
 }
 
 async fn wait_for_session_absent(handler: &RequestHandler, name: &SessionName) {
@@ -41,8 +43,8 @@ async fn wait_for_session_absent(handler: &RequestHandler, name: &SessionName) {
 #[tokio::test]
 async fn session_renamed_hook_chain_keeps_target_identity_after_first_hook_renames_again() {
     let handler = RequestHandler::new();
-    handler.create_session("alpha").await;
-    handler.create_session("keeper").await;
+    SessionSpec::create(&handler, "alpha").await;
+    SessionSpec::create(&handler, "keeper").await;
     set_indexed_global_hook(
         &handler,
         HookName::SessionRenamed,
@@ -52,12 +54,14 @@ async fn session_renamed_hook_chain_keeps_target_identity_after_first_hook_renam
     .await;
     set_indexed_global_hook(&handler, HookName::SessionRenamed, 1, "kill-session").await;
 
-    handler
-        .handle_ok(RenameSessionRequest {
+    TestRequest::send_ok(
+        &handler,
+        RenameSessionRequest {
             target: session_name("alpha"),
             new_name: session_name("beta"),
-        })
-        .await;
+        },
+    )
+    .await;
 
     // "beta" exists after the rename unless the first hook renamed it away;
     // waiting on it (not only on "gamma", which never exists if the chain
@@ -71,10 +75,8 @@ async fn session_renamed_hook_chain_keeps_target_identity_after_first_hook_renam
 #[tokio::test]
 async fn session_hook_chain_falls_back_to_stable_window_after_current_pane_is_killed() {
     let handler = RequestHandler::new();
-    handler.create_session("alpha").await;
-    handler
-        .handle_ok(SplitWindowRequest::fixture(session_name("alpha")))
-        .await;
+    SessionSpec::create(&handler, "alpha").await;
+    TestRequest::send_ok(&handler, SplitWindowRequest::fixture(session_name("alpha"))).await;
     set_indexed_global_hook(&handler, HookName::SessionRenamed, 0, "kill-pane").await;
     set_indexed_global_hook(
         &handler,
@@ -119,8 +121,8 @@ async fn session_hook_chain_falls_back_to_stable_window_after_current_pane_is_ki
 #[tokio::test]
 async fn session_window_changed_hook_chain_follows_session_through_rename() {
     let handler = RequestHandler::new();
-    handler.create_session("alpha").await;
-    handler.create_session("keeper").await;
+    SessionSpec::create(&handler, "alpha").await;
+    SessionSpec::create(&handler, "keeper").await;
     handler
         .create_window(NewWindowRequest {
             target_window_index: Some(1),
@@ -136,11 +138,13 @@ async fn session_window_changed_hook_chain_follows_session_through_rename() {
     .await;
     set_indexed_global_hook(&handler, HookName::SessionWindowChanged, 1, "kill-session").await;
 
-    handler
-        .handle_ok(SelectWindowRequest {
+    TestRequest::send_ok(
+        &handler,
+        SelectWindowRequest {
             target: WindowTarget::with_window(session_name("alpha"), 1),
-        })
-        .await;
+        },
+    )
+    .await;
 
     // "alpha" survives unless the first hook renamed it away; waiting on it
     // (not only on "beta", which never exists if the chain never ran) proves
@@ -154,8 +158,8 @@ async fn session_window_changed_hook_chain_follows_session_through_rename() {
 #[tokio::test]
 async fn window_hook_chain_follows_window_identity_across_session_move() {
     let handler = RequestHandler::new();
-    handler.create_session("alpha").await;
-    handler.create_session("beta").await;
+    SessionSpec::create(&handler, "alpha").await;
+    SessionSpec::create(&handler, "beta").await;
     set_indexed_global_hook(
         &handler,
         HookName::AlertActivity,
@@ -195,20 +199,22 @@ async fn window_hook_chain_follows_window_identity_across_session_move() {
 #[tokio::test]
 async fn window_hook_chain_follows_surviving_cross_session_alias_after_unlink() {
     let handler = RequestHandler::new();
-    handler.create_session("alpha").await;
-    handler.create_session("beta").await;
+    SessionSpec::create(&handler, "alpha").await;
+    SessionSpec::create(&handler, "beta").await;
     handler
         .create_window(NewWindowRequest {
             target_window_index: Some(1),
             ..Fixture::fixture("alpha")
         })
         .await;
-    handler
-        .handle_ok(LinkWindowRequest::fixture((
+    TestRequest::send_ok(
+        &handler,
+        LinkWindowRequest::fixture((
             WindowTarget::with_window(session_name("alpha"), 0),
             WindowTarget::with_window(session_name("beta"), 1),
-        )))
-        .await;
+        )),
+    )
+    .await;
     set_indexed_global_hook(
         &handler,
         HookName::AlertActivity,
@@ -259,9 +265,9 @@ async fn window_hook_chain_follows_surviving_cross_session_alias_after_unlink() 
 #[tokio::test]
 async fn stable_alias_resolution_prefers_newest_surviving_session() {
     let handler = RequestHandler::new();
-    handler.create_session("alpha").await;
-    handler.create_session("beta").await;
-    handler.create_session("gamma").await;
+    SessionSpec::create(&handler, "alpha").await;
+    SessionSpec::create(&handler, "beta").await;
+    SessionSpec::create(&handler, "gamma").await;
     handler
         .create_window(NewWindowRequest {
             target_window_index: Some(1),
@@ -269,12 +275,14 @@ async fn stable_alias_resolution_prefers_newest_surviving_session() {
         })
         .await;
     for peer in ["gamma", "beta"] {
-        handler
-            .handle_ok(LinkWindowRequest::fixture((
+        TestRequest::send_ok(
+            &handler,
+            LinkWindowRequest::fixture((
                 WindowTarget::with_window(session_name("alpha"), 0),
                 WindowTarget::with_window(session_name(peer), 1),
-            )))
-            .await;
+            )),
+        )
+        .await;
     }
     let gamma_id = handler.session_id_for_test("gamma").await;
     set_indexed_global_hook(
@@ -319,8 +327,8 @@ async fn stable_alias_resolution_prefers_newest_surviving_session() {
 #[tokio::test]
 async fn stable_alias_resolution_prefers_lowest_index_within_session() {
     let handler = RequestHandler::new();
-    handler.create_session("alpha").await;
-    handler.create_session("beta").await;
+    SessionSpec::create(&handler, "alpha").await;
+    SessionSpec::create(&handler, "beta").await;
     handler
         .create_window(NewWindowRequest {
             target_window_index: Some(1),
@@ -328,12 +336,14 @@ async fn stable_alias_resolution_prefers_lowest_index_within_session() {
         })
         .await;
     for window_index in [3, 2] {
-        handler
-            .handle_ok(LinkWindowRequest::fixture((
+        TestRequest::send_ok(
+            &handler,
+            LinkWindowRequest::fixture((
                 WindowTarget::with_window(session_name("alpha"), 0),
                 WindowTarget::with_window(session_name("beta"), window_index),
-            )))
-            .await;
+            )),
+        )
+        .await;
     }
     set_indexed_global_hook(
         &handler,
@@ -488,13 +498,15 @@ async fn removed_window_hook_does_not_target_recreated_same_slot() {
 async fn window_unlinked_hook_tracks_the_selected_winlink_occurrence_through_slot_aba() {
     let handler = RequestHandler::new();
     let session = session_name("window-unlinked-occurrence-aba");
-    handler.create_session(&session).await;
-    handler
-        .handle_ok(LinkWindowRequest::fixture((
+    SessionSpec::create(&handler, &session).await;
+    TestRequest::send_ok(
+        &handler,
+        LinkWindowRequest::fixture((
             WindowTarget::with_window(session.clone(), 0),
             WindowTarget::with_window(session.clone(), 2),
-        )))
-        .await;
+        )),
+    )
+    .await;
     handler.wait_for_initial_panes_for_test().await;
     for (index, command) in [
         (0, format!("move-window -s {session}:0 -t {session}:5")),
@@ -543,13 +555,15 @@ async fn window_unlinked_hook_tracks_the_selected_winlink_occurrence_through_slo
 async fn window_unlinked_hook_fails_closed_after_the_selected_occurrence_is_relinked() {
     let handler = RequestHandler::new();
     let session = session_name("window-unlinked-occurrence-replaced");
-    handler.create_session(&session).await;
-    handler
-        .handle_ok(LinkWindowRequest::fixture((
+    SessionSpec::create(&handler, &session).await;
+    TestRequest::send_ok(
+        &handler,
+        LinkWindowRequest::fixture((
             WindowTarget::with_window(session.clone(), 0),
             WindowTarget::with_window(session.clone(), 2),
-        )))
-        .await;
+        )),
+    )
+    .await;
     handler.wait_for_initial_panes_for_test().await;
     set_indexed_global_hook(
         &handler,
@@ -609,7 +623,7 @@ async fn window_unlinked_hook_fails_closed_after_the_selected_occurrence_is_reli
 async fn deferred_window_unlinked_hook_does_not_follow_a_replaced_active_survivor_slot() {
     let handler = RequestHandler::new();
     let alpha = session_name("window-unlinked-survivor-aba");
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
     for window_index in [1, 2] {
         handler
             .create_window(NewWindowRequest {

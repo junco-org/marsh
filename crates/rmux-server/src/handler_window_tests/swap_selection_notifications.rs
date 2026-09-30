@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use super::*;
 use crate::control::ControlServerEvent;
+use crate::test_fixtures::TestRequest;
 
 #[derive(Debug)]
 struct StableSessionSelection {
@@ -297,13 +298,15 @@ async fn cross_session_swap_orders_each_real_transition_target_then_source() {
     let sessions = [alpha.clone(), beta.clone()];
     let mut model = active_window_model(&handler, &sessions).await;
 
-    handler
-        .handle_ok(SwapWindowRequest {
+    TestRequest::send_ok(
+        &handler,
+        SwapWindowRequest {
             source: WindowTarget::with_window(alpha.clone(), 0),
             target: WindowTarget::with_window(beta.clone(), 0),
             detached: true,
-        })
-        .await;
+        },
+    )
+    .await;
 
     let source_window_id = alpha_windows.get(&0).expect("source identity");
     let target_window_id = beta_windows.get(&0).expect("target identity");
@@ -409,13 +412,15 @@ async fn grouped_and_linked_peers_do_not_receive_identity_stable_noise() {
         .await;
     let _ = swap_notifications(&mut rx);
 
-    handler
-        .handle_ok(SwapWindowRequest {
+    TestRequest::send_ok(
+        &handler,
+        SwapWindowRequest {
             source: WindowTarget::with_window(owner.clone(), 0),
             target: WindowTarget::with_window(owner.clone(), 1),
             detached: true,
-        })
-        .await;
+        },
+    )
+    .await;
     assert_eq!(
         swap_notifications(&mut rx),
         vec![format!(
@@ -428,12 +433,14 @@ async fn grouped_and_linked_peers_do_not_receive_identity_stable_noise() {
     let handler = RequestHandler::new();
     let owner = create_indexed_windows(&handler, "link-owner", 3).await;
     let peer = create_indexed_windows(&handler, "link-peer", 1).await;
-    handler
-        .handle_ok(LinkWindowRequest::fixture((
+    TestRequest::send_ok(
+        &handler,
+        LinkWindowRequest::fixture((
             WindowTarget::with_window(owner.clone(), 0),
             WindowTarget::with_window(peer.clone(), 1),
-        )))
-        .await;
+        )),
+    )
+    .await;
     select_window(&handler, &owner, 2).await;
     select_window(&handler, &peer, 1).await;
     let (owner_id, owner_windows) = session_window_ids(&handler, &owner).await;
@@ -443,13 +450,15 @@ async fn grouped_and_linked_peers_do_not_receive_identity_stable_noise() {
         .await;
     let _ = swap_notifications(&mut rx);
 
-    handler
-        .handle_ok(SwapWindowRequest {
+    TestRequest::send_ok(
+        &handler,
+        SwapWindowRequest {
             source: WindowTarget::with_window(owner.clone(), 0),
             target: WindowTarget::with_window(owner.clone(), 1),
             detached: true,
-        })
-        .await;
+        },
+    )
+    .await;
     assert_eq!(
         swap_notifications(&mut rx),
         vec![format!(

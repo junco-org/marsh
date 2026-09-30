@@ -1,4 +1,5 @@
 use super::*;
+use crate::test_fixtures::{SessionSpec, TestRequest};
 
 #[tokio::test]
 async fn session_target_refreshes_follow_the_current_active_window() {
@@ -6,9 +7,7 @@ async fn session_target_refreshes_follow_the_current_active_window() {
     let requester_pid = std::process::id();
     let alpha = session_name("alpha");
 
-    handler
-        .create_session((&alpha, TerminalSize::new(120, 40)))
-        .await;
+    SessionSpec::create(&handler, (&alpha, TerminalSize::new(120, 40))).await;
 
     {
         let mut state = handler.state.lock().await;
@@ -41,8 +40,6 @@ async fn session_target_refreshes_follow_the_current_active_window() {
                     environment_overrides: None,
                     respawn_shell: None,
                     respawn_environment: None,
-                    shell_id: None,
-                    follow_mux_lifetime: false,
                 },
             )
             .await
@@ -51,12 +48,14 @@ async fn session_target_refreshes_follow_the_current_active_window() {
 
     let mut control_rx = handler.attach_client(requester_pid, &alpha).await;
 
-    let split = handler
-        .handle_ok(SplitWindowRequest {
+    let split = TestRequest::send_ok(
+        &handler,
+        SplitWindowRequest {
             direction: rmux_proto::SplitDirection::Horizontal,
             ..Fixture::fixture(&alpha)
-        })
-        .await;
+        },
+    )
+    .await;
     assert_eq!(
         split,
         rmux_proto::SplitWindowResponse {
@@ -72,10 +71,8 @@ async fn attach_session_upgrade_renders_only_the_active_window() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
 
-    handler
-        .create_session((&alpha, TerminalSize::new(120, 40)))
-        .await;
-    handler.handle_ok(SplitWindowRequest::fixture(&alpha)).await;
+    SessionSpec::create(&handler, (&alpha, TerminalSize::new(120, 40))).await;
+    TestRequest::send_ok(&handler, SplitWindowRequest::fixture(&alpha)).await;
 
     let ready_marker = format!("RMUX_ATTACH_ACTIVE_READY_{}", std::process::id());
     let quiet_command = rmux_proto::ProcessCommand::Argv(quiet_ready_command(&ready_marker));
@@ -98,8 +95,6 @@ async fn attach_session_upgrade_renders_only_the_active_window() {
                 environment_overrides: None,
                 respawn_shell: None,
                 respawn_environment: None,
-                shell_id: None,
-                follow_mux_lifetime: false,
             },
         )
         .await
@@ -153,7 +148,7 @@ async fn attach_session_render_frame_positions_cursor_at_active_pane_cursor() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
 
-    handler.create_session(Quiet(&alpha)).await;
+    SessionSpec::create(&handler, Quiet(&alpha)).await;
 
     handler
         .replace_transcript_for_test(
@@ -185,7 +180,7 @@ async fn attach_session_active_pane_geometry_tracks_top_status_offset() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
 
-    handler.create_session(Quiet(&alpha)).await;
+    SessionSpec::create(&handler, Quiet(&alpha)).await;
     handler
         .set_option(ScopeSelector::Global, OptionName::StatusPosition, "top")
         .await;
@@ -214,18 +209,22 @@ async fn attach_session_replays_all_visible_pane_screens() {
     let top_ready = "RMUX_ATTACH_REPLAY_TOP_READY";
     let bottom_ready = "RMUX_ATTACH_REPLAY_BOTTOM_READY";
 
-    handler
-        .create_session(NewSessionExtRequest {
+    SessionSpec::create(
+        &handler,
+        NewSessionExtRequest {
             command: Some(quiet_ready_command(top_ready)),
             ..Fixture::fixture(&alpha)
-        })
-        .await;
-    handler
-        .handle_ok(SplitWindowExtRequest {
+        },
+    )
+    .await;
+    TestRequest::send_ok(
+        &handler,
+        SplitWindowExtRequest {
             command: Some(quiet_ready_command(bottom_ready)),
             ..Fixture::fixture(&alpha)
-        })
-        .await;
+        },
+    )
+    .await;
     wait_for_capture_containing(
         &handler,
         PaneTarget::with_window(alpha.clone(), 0, 0),
@@ -284,7 +283,7 @@ async fn attach_session_uses_client_size_before_first_frame() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
 
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
 
     let outcome = handler
         .dispatch(
@@ -312,19 +311,21 @@ async fn attach_session_target_spec_selects_requested_window_and_pane_before_att
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
 
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
     handler
         .create_window(NewWindowRequest {
             name: Some("w1".to_owned()),
             ..Fixture::fixture(&alpha)
         })
         .await;
-    handler
-        .handle_ok(SplitWindowRequest {
+    TestRequest::send_ok(
+        &handler,
+        SplitWindowRequest {
             direction: rmux_proto::SplitDirection::Horizontal,
             ..Fixture::fixture(PaneTarget::with_window(alpha.clone(), 1, 0))
-        })
-        .await;
+        },
+    )
+    .await;
 
     let outcome = handler
         .dispatch(
@@ -354,7 +355,7 @@ async fn legacy_attach_request_disables_render_stream_frames() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
 
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
 
     let outcome = handler
         .dispatch(
@@ -375,7 +376,7 @@ async fn attach_render_capability_enables_render_stream_frames() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
 
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
 
     let request = AttachSessionExt3Request::from_ext2(
         attach_session_ext2(&alpha, TerminalSize { cols: 80, rows: 24 }),

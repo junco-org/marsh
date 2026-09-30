@@ -14,7 +14,7 @@ use super::RequestHandler;
 use crate::clipboard_protocol::CLIPBOARD_QUERY_SEQUENCE;
 use crate::pane_io::{AttachControl, PaneAlertEvent};
 use crate::server_access::current_owner_uid;
-use crate::test_fixtures::Fixture;
+use crate::test_fixtures::{Fixture, SessionSpec, TestRequest};
 
 struct PaneFixture {
     handler: RequestHandler,
@@ -43,7 +43,7 @@ impl Default for AttachSettings {
 
 async fn create_fixture(name: &str) -> PaneFixture {
     let handler = RequestHandler::new();
-    let session = handler.create_started_session(name).await;
+    let session = SessionSpec::create_started(&handler, name).await;
     let target = PaneTarget::new(session.clone(), 0);
     let (pane_id, generation) = {
         let state = handler.state.lock().await;
@@ -381,16 +381,17 @@ async fn ignored_display_message_routes_fragmented_clipboard_responses() {
     request_query(&fixture, TerminalClipboardQuery::new("c", InputEndType::St)).await;
     recv_clipboard_query(&fixture.handler, attach_pid, &mut control_rx).await;
 
-    fixture
-        .handler
-        .handle_ok(DisplayMessageExtRequest {
+    TestRequest::send_ok(
+        &fixture.handler,
+        DisplayMessageExtRequest {
             target: Some(Target::Session(fixture.session.clone())),
             target_client: Some(attach_pid.to_string()),
             duration_ms: Some(rmux_proto::DisplayMessageDurationMillis::new(10_000)),
             ignore_input: true,
             ..Fixture::fixture("clipboard response")
-        })
-        .await;
+        },
+    )
+    .await;
     loop {
         if matches!(
             timeout(Duration::from_secs(1), control_rx.recv())
@@ -591,10 +592,11 @@ async fn both_mode_pane_respawn_before_commit_preserves_the_existing_buffer() {
     .await;
     let (pause, response) = begin_paused_both_response(&fixture, 604, &mut control_rx).await;
 
-    fixture
-        .handler
-        .handle_ok(RespawnPaneRequest::fixture(fixture.target.clone()))
-        .await;
+    TestRequest::send_ok(
+        &fixture.handler,
+        RespawnPaneRequest::fixture(fixture.target.clone()),
+    )
+    .await;
     finish_paused_clipboard_response(pause, response).await;
 
     assert_old_buffer_is_unchanged(&fixture).await;
@@ -819,7 +821,7 @@ async fn pane_alert_clipboard_query_queue_is_bounded_while_the_worker_is_busy() 
 async fn request_prefers_latest_eligible_client_and_excludes_ineligible_attaches() {
     let fixture = create_fixture("clipboard-client-choice").await;
     enable_get_clipboard(&fixture.handler, "request").await;
-    let unrelated = fixture.handler.create_session("clipboard-unrelated").await;
+    let unrelated = SessionSpec::create(&fixture.handler, "clipboard-unrelated").await;
     let (_, mut latest_rx) = register_attach(
         &fixture.handler,
         201,
@@ -909,10 +911,7 @@ async fn request_prefers_latest_eligible_client_and_excludes_ineligible_attaches
 async fn inactive_window_stays_eligible_but_session_switch_and_replacement_drop_responses() {
     let fixture = create_fixture("clipboard-attach-races").await;
     enable_get_clipboard(&fixture.handler, "request").await;
-    let unrelated = fixture
-        .handler
-        .create_session("clipboard-switched-away")
-        .await;
+    let unrelated = SessionSpec::create(&fixture.handler, "clipboard-switched-away").await;
     let new_window = fixture.handler.create_window(&fixture.session).await;
     let (attach_id, mut control_rx) = register_attach(
         &fixture.handler,
@@ -928,12 +927,13 @@ async fn inactive_window_stays_eligible_but_session_switch_and_replacement_drop_
     )
     .await;
     recv_clipboard_query(&fixture.handler, 301, &mut control_rx).await;
-    fixture
-        .handler
-        .handle_ok(SelectWindowRequest {
+    TestRequest::send_ok(
+        &fixture.handler,
+        SelectWindowRequest {
             target: new_window.clone(),
-        })
-        .await;
+        },
+    )
+    .await;
     feed_clipboard_response(&fixture.handler, 301, b"\x1b]52;c;c3dpdGNoZWQ=\x07").await;
     assert_eq!(
         captured_input(&fixture).await,
@@ -992,17 +992,15 @@ async fn inactive_window_stays_eligible_but_session_switch_and_replacement_drop_
 async fn linked_inactive_window_is_eligible_by_stable_window_identity() {
     let fixture = create_fixture("clipboard-linked-source").await;
     enable_get_clipboard(&fixture.handler, "request").await;
-    let linked = fixture
-        .handler
-        .create_session("clipboard-linked-client")
-        .await;
-    fixture
-        .handler
-        .handle_ok(LinkWindowRequest::fixture((
+    let linked = SessionSpec::create(&fixture.handler, "clipboard-linked-client").await;
+    TestRequest::send_ok(
+        &fixture.handler,
+        LinkWindowRequest::fixture((
             WindowTarget::with_window(fixture.session.clone(), 0),
             WindowTarget::with_window(linked.clone(), 1),
-        )))
-        .await;
+        )),
+    )
+    .await;
     {
         let state = fixture.handler.state.lock().await;
         let source_window = state
@@ -1045,10 +1043,11 @@ async fn pane_generation_change_drops_late_response() {
     .await;
     recv_clipboard_query(&fixture.handler, 302, &mut control_rx).await;
 
-    fixture
-        .handler
-        .handle_ok(RespawnPaneRequest::fixture(fixture.target.clone()))
-        .await;
+    TestRequest::send_ok(
+        &fixture.handler,
+        RespawnPaneRequest::fixture(fixture.target.clone()),
+    )
+    .await;
     feed_clipboard_response(&fixture.handler, 302, b"\x1b]52;c;c3RhbGU=\x07").await;
     assert!(captured_input(&fixture).await.is_empty());
 }

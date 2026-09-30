@@ -1,11 +1,12 @@
 use super::*;
+use crate::test_fixtures::{SessionSpec, TestRequest};
 
 #[tokio::test]
 async fn send_prefix_reports_the_configured_prefix_key() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
 
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
 
     let response = handler
         .handle(Request::SendPrefix(SendPrefixRequest {
@@ -39,14 +40,16 @@ async fn bind_key_without_a_command_requires_an_existing_binding() {
 async fn bind_key_without_a_command_updates_note_and_repeat_in_place() {
     let handler = RequestHandler::new();
 
-    handler
-        .handle_ok(BindKeyRequest {
+    TestRequest::send_ok(
+        &handler,
+        BindKeyRequest {
             note: Some("updated note".to_owned()),
             repeat: true,
             command: None,
             ..Fixture::fixture(("prefix", "C-b", std::iter::empty::<&str>()))
-        })
-        .await;
+        },
+    )
+    .await;
 
     let listed = handler
         .handle(Request::ListKeys(Box::new(ListKeysRequest {
@@ -84,7 +87,7 @@ async fn list_keys_notes_render_effective_prefix_column() {
             ..Fixture::fixture(("root", "F12", ["display-message", "root"]))
         },
     ] {
-        handler.handle_ok(request).await;
+        TestRequest::send_ok(&handler, request).await;
     }
 
     let listed = handler
@@ -205,7 +208,7 @@ async fn repeating_non_repeat_lookup_restarts_in_the_default_table() {
     let alpha = session_name("alpha");
     let requester_pid = std::process::id();
 
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
 
     let _control_rx = handler.attach_client(requester_pid, &alpha).await;
 
@@ -228,7 +231,7 @@ async fn repeating_non_repeat_lookup_restarts_in_the_default_table() {
             ))
         },
     ] {
-        handler.handle_ok(request).await;
+        TestRequest::send_ok(&handler, request).await;
     }
 
     let switched = handler
@@ -267,7 +270,7 @@ async fn prefix_timeout_clears_the_prefix_table_without_waiting_for_the_next_key
     let alpha = session_name("alpha");
     let requester_pid = std::process::id();
 
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
 
     handler
         .set_option(ScopeSelector::Global, OptionName::PrefixTimeout, "25")
@@ -310,7 +313,7 @@ async fn repeat_timeout_clears_custom_key_tables_without_waiting_for_the_next_ke
     let alpha = session_name("alpha");
     let requester_pid = std::process::id();
 
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
 
     handler
         .set_option(
@@ -322,13 +325,15 @@ async fn repeat_timeout_clears_custom_key_tables_without_waiting_for_the_next_ke
 
     let _control_rx = handler.attach_client(requester_pid, &alpha).await;
 
-    handler
-        .handle_ok(BindKeyRequest {
+    TestRequest::send_ok(
+        &handler,
+        BindKeyRequest {
             note: Some("repeat".to_owned()),
             repeat: true,
             ..Fixture::fixture(("my-table", "r", ["set-buffer", "-b", "repeat-hit", "yes"]))
-        })
-        .await;
+        },
+    )
+    .await;
 
     let switched = handler
         .handle(Request::SwitchClientExt(SwitchClientExtRequest {
@@ -400,10 +405,12 @@ async fn unbind_key_all_removes_active_bindings_without_dropping_default_tables(
     };
     assert_eq!(response.match_count, 0);
 
-    handler
-        .handle_ok(BindKeyRequest {
+    TestRequest::send_ok(
+        &handler,
+        BindKeyRequest {
             note: Some("user".to_owned()),
             ..Fixture::fixture(("prefix", "User1000", ["send-prefix"]))
-        })
-        .await;
+        },
+    )
+    .await;
 }

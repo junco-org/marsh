@@ -12,7 +12,7 @@ use tokio::sync::mpsc;
 
 use crate::control::ControlServerEvent;
 use crate::handler::test_support::open_mode_tree;
-use crate::test_fixtures::{wait_until, Fixture};
+use crate::test_fixtures::{wait_until, Fixture, SessionSpec, TestRequest};
 
 const ENVIRONMENT_HELPER: &str = "RMUX_TEST_SWITCH_ATOMICITY_ENVIRONMENT_HELPER";
 const SWITCH_SIZE: TerminalSize = TerminalSize {
@@ -309,8 +309,8 @@ async fn control_switch_accepts_the_canonical_list_clients_name() {
     let handler = RequestHandler::new();
     let alpha = session_name("switch-canonical-control-alpha");
     let beta = session_name("switch-canonical-control-beta");
-    handler.create_session(&alpha).await;
-    handler.create_session(&beta).await;
+    SessionSpec::create(&handler, &alpha).await;
+    SessionSpec::create(&handler, &beta).await;
     let control_pid = 94_450;
     let (_control_id, mut event_rx) = handler
         .register_control_for_test(control_pid, Some(&alpha))
@@ -345,10 +345,10 @@ async fn closed_attach_switch_rolls_back_environment_geometry_selection_touch_an
     let handler = RequestHandler::new();
     let alpha = session_name("switch-atomic-attach-alpha");
     let beta = session_name("switch-atomic-attach-beta");
-    handler.create_session(&alpha).await;
-    handler.create_session(&beta).await;
+    SessionSpec::create(&handler, &alpha).await;
+    SessionSpec::create(&handler, &beta).await;
     silence_automatic_rename(&handler, &beta).await;
-    handler.handle_ok(SplitWindowRequest::fixture(&alpha)).await;
+    TestRequest::send_ok(&handler, SplitWindowRequest::fixture(&alpha)).await;
     let target_window = create_runtime_window(&handler, &beta).await;
     let requester = spawn_environment_child("switch-atomic-attach-after").await;
     let attach_pid = requester.0.id();
@@ -442,8 +442,8 @@ async fn receiver_close_after_precheck_uses_runtime_rollback_for_the_residual_ra
     let handler = RequestHandler::new();
     let alpha = session_name("switch-atomic-race-alpha");
     let beta = session_name("switch-atomic-race-beta");
-    handler.create_session(&alpha).await;
-    handler.create_session(&beta).await;
+    SessionSpec::create(&handler, &alpha).await;
+    SessionSpec::create(&handler, &beta).await;
     silence_automatic_rename(&handler, &beta).await;
     let target_window = create_runtime_window(&handler, &beta).await;
     let requester = spawn_environment_child("switch-atomic-race-after").await;
@@ -539,8 +539,8 @@ async fn full_switch_backlog_closes_and_removes_attach_before_runtime_mutation()
     let handler = RequestHandler::new();
     let alpha = session_name("switch-atomic-backlog-alpha");
     let beta = session_name("switch-atomic-backlog-beta");
-    handler.create_session(&alpha).await;
-    handler.create_session(&beta).await;
+    SessionSpec::create(&handler, &alpha).await;
+    SessionSpec::create(&handler, &beta).await;
     let target_window = create_runtime_window(&handler, &beta).await;
     let requester = spawn_environment_child("switch-atomic-backlog-host").await;
     let attach_pid = requester.0.id();
@@ -605,9 +605,9 @@ async fn successful_attach_switch_applies_mode_tree_dismissal_after_delivery() {
     let handler = RequestHandler::new();
     let alpha = session_name("switch-atomic-mode-tree-alpha");
     let beta = session_name("switch-atomic-mode-tree-beta");
-    handler.create_session(&alpha).await;
-    handler.create_session(&beta).await;
-    handler.handle_ok(SplitWindowRequest::fixture(&alpha)).await;
+    SessionSpec::create(&handler, &alpha).await;
+    SessionSpec::create(&handler, &beta).await;
+    TestRequest::send_ok(&handler, SplitWindowRequest::fixture(&alpha)).await;
 
     let requester = spawn_environment_child("switch-atomic-mode-tree-host").await;
     let attach_pid = requester.0.id();
@@ -688,9 +688,9 @@ async fn concurrent_switch_recomputes_mode_tree_source_under_commit_locks() {
     let handler = RequestHandler::new();
     let alpha = session_name("switch-atomic-concurrent-alpha");
     let beta = session_name("switch-atomic-concurrent-beta");
-    handler.create_session(&alpha).await;
-    handler.create_session(&beta).await;
-    handler.handle_ok(SplitWindowRequest::fixture(&beta)).await;
+    SessionSpec::create(&handler, &alpha).await;
+    SessionSpec::create(&handler, &beta).await;
+    TestRequest::send_ok(&handler, SplitWindowRequest::fixture(&beta)).await;
     let requester = spawn_environment_child("switch-atomic-concurrent-host").await;
     let attach_pid = requester.0.id();
     let mut control_rx = handler.attach_client(attach_pid, &alpha).await;
@@ -785,8 +785,8 @@ async fn closed_control_switch_preserves_environment_selection_and_touch() {
     let handler = RequestHandler::new();
     let alpha = session_name("switch-atomic-control-alpha");
     let beta = session_name("switch-atomic-control-beta");
-    handler.create_session(&alpha).await;
-    handler.create_session(&beta).await;
+    SessionSpec::create(&handler, &alpha).await;
+    SessionSpec::create(&handler, &beta).await;
     silence_automatic_rename(&handler, &beta).await;
     let target_window = create_runtime_window(&handler, &beta).await;
     let alpha_id = handler
@@ -891,8 +891,8 @@ async fn control_switch_resize_failure_preserves_session_identity_and_event_stre
     let handler = RequestHandler::new();
     let alpha = session_name("switch-atomic-resize-alpha");
     let beta = session_name("switch-atomic-resize-beta");
-    handler.create_session(&alpha).await;
-    handler.create_session(&beta).await;
+    SessionSpec::create(&handler, &alpha).await;
+    SessionSpec::create(&handler, &beta).await;
     silence_automatic_rename(&handler, &beta).await;
     let target_window = create_runtime_window(&handler, &beta).await;
     let (alpha_id, before_session) = {
@@ -970,8 +970,8 @@ async fn control_switch_success_commits_environment_touch_selection_and_event() 
     let handler = RequestHandler::new();
     let alpha = session_name("switch-success-control-alpha");
     let beta = session_name("switch-success-control-beta");
-    handler.create_session(&alpha).await;
-    handler.create_session(&beta).await;
+    SessionSpec::create(&handler, &alpha).await;
+    SessionSpec::create(&handler, &beta).await;
     let target_window = create_runtime_window(&handler, &beta).await;
     let requester = spawn_environment_child("switch-success-control-after").await;
     let control_pid = requester.0.id();
@@ -1054,10 +1054,10 @@ async fn attach_identity_replacement_after_size_selection_commits_no_target_muta
     let handler = RequestHandler::new();
     let alpha = session_name("switch-atomic-replace-alpha");
     let beta = session_name("switch-atomic-replace-beta");
-    handler.create_session(&alpha).await;
-    handler.create_session(&beta).await;
+    SessionSpec::create(&handler, &alpha).await;
+    SessionSpec::create(&handler, &beta).await;
     silence_automatic_rename(&handler, &beta).await;
-    handler.handle_ok(SplitWindowRequest::fixture(&alpha)).await;
+    TestRequest::send_ok(&handler, SplitWindowRequest::fixture(&alpha)).await;
     let target_window = create_runtime_window(&handler, &beta).await;
     let requester = spawn_environment_child("switch-atomic-replace-after").await;
     let attach_pid = requester.0.id();

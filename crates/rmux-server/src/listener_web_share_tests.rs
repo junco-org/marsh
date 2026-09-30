@@ -13,7 +13,7 @@ use tokio::sync::watch;
 
 use super::connection_test_support::{read_test_response, spawn_connection, write_test_request};
 use crate::handler::{RequestHandler, UndeliveredWebShareGuard};
-use crate::test_fixtures::{unique_temp_path, wait_until, Fixture};
+use crate::test_fixtures::{unique_temp_path, wait_until, Fixture, SessionSpec, TestRequest};
 
 #[tokio::test]
 async fn client_disconnect_cancels_web_share_tunnel_start() -> io::Result<()> {
@@ -42,7 +42,7 @@ async fn client_disconnect_cancels_web_share_tunnel_start() -> io::Result<()> {
 
     let handler = Arc::new(RequestHandler::new());
     handler.mark_web_listener_available();
-    let session_name = handler.create_session("disconnect-tunnel").await;
+    let session_name = SessionSpec::create(&handler, "disconnect-tunnel").await;
     let (mut client, _shutdown_tx, mut connection_task) = spawn_test_connection(&handler)?;
     write_test_request(
         &mut client,
@@ -81,7 +81,7 @@ async fn client_disconnect_cancels_web_share_tunnel_start() -> io::Result<()> {
 async fn undelivered_web_share_response_is_rolled_back() {
     let handler = Arc::new(RequestHandler::new());
     handler.mark_web_listener_available();
-    let session_name = handler.create_session("undelivered-share").await;
+    let session_name = SessionSpec::create(&handler, "undelivered-share").await;
     let response = handler
         .handle(create_web_share_request(session_name, None))
         .await;
@@ -106,7 +106,7 @@ async fn undelivered_web_share_response_is_rolled_back() {
 async fn disconnect_after_share_creation_before_hooks_rolls_back() -> io::Result<()> {
     let handler = Arc::new(RequestHandler::new());
     handler.mark_web_listener_available();
-    let session_name = handler.create_session("disconnect-after-create").await;
+    let session_name = SessionSpec::create(&handler, "disconnect-after-create").await;
     let pause = handler.install_web_share_delivery_pause();
     let (mut client, _shutdown_tx, connection_task) = spawn_test_connection(&handler)?;
 
@@ -130,7 +130,7 @@ async fn disconnect_after_share_creation_before_hooks_rolls_back() -> io::Result
 async fn delivered_share_disarms_pre_hook_rollback() -> io::Result<()> {
     let handler = Arc::new(RequestHandler::new());
     handler.mark_web_listener_available();
-    let session_name = handler.create_session("delivered-after-hooks").await;
+    let session_name = SessionSpec::create(&handler, "delivered-after-hooks").await;
     let pause = handler.install_web_share_delivery_pause();
     let (mut client, _shutdown_tx, connection_task) = spawn_test_connection(&handler)?;
 
@@ -159,9 +159,7 @@ async fn delivered_share_disarms_pre_hook_rollback() -> io::Result<()> {
 }
 
 async fn list_web_shares(handler: &RequestHandler) -> Vec<rmux_proto::WebShareSummary> {
-    let response = handler
-        .handle_ok(WebShareRequest::List(ListWebSharesRequest))
-        .await;
+    let response = TestRequest::send_ok(handler, WebShareRequest::List(ListWebSharesRequest)).await;
     let rmux_proto::WebShareResponse::List(list) = *response else {
         panic!("expected web-share list payload");
     };

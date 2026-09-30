@@ -1,5 +1,5 @@
 use super::*;
-use crate::test_fixtures::Sizeless;
+use crate::test_fixtures::{SessionSpec, Sizeless, TestRequest};
 
 const CLIENT_SESSION_FORMAT: &str =
     "#{session_id}|#{session_name}|#{client_session}|#{client_control_mode}";
@@ -26,7 +26,7 @@ async fn list_clients(handler: &RequestHandler, format: &str, filter: Option<&st
 async fn list_clients_uses_stable_session_identity_for_attach_and_control_formats() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    handler.create_session(Sizeless(&alpha)).await;
+    SessionSpec::create(&handler, Sizeless(&alpha)).await;
 
     let session_id = handler.session_id_for_test(&alpha).await;
     let attach_pid = 93_401;
@@ -60,12 +60,14 @@ async fn list_clients_uses_stable_session_identity_for_attach_and_control_format
     );
 
     let renamed = session_name("renamed");
-    handler
-        .handle_ok(RenameSessionRequest {
+    TestRequest::send_ok(
+        &handler,
+        RenameSessionRequest {
             target: alpha,
             new_name: renamed,
-        })
-        .await;
+        },
+    )
+    .await;
     assert_eq!(
         list_clients(&handler, CLIENT_SESSION_FORMAT, None).await,
         format!(

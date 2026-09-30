@@ -7,6 +7,7 @@
 use super::*;
 
 use crate::pane_io::replay_client_visible_payloads;
+use crate::test_fixtures::TestRequest;
 
 pub(super) const TITLE_OPEN: &str = "\u{1b}]0;";
 pub(super) const TITLE_CLOSE: char = '\u{7}';
@@ -31,12 +32,14 @@ pub(super) async fn enable_osc7(handler: &RequestHandler) {
         OptionName::TerminalFeatures,
         "xterm*:osc7",
     );
-    handler
-        .handle_ok(SetOptionRequest {
+    TestRequest::send_ok(
+        handler,
+        SetOptionRequest {
             mode: SetOptionMode::Append,
             ..Fixture::fixture(features)
-        })
-        .await;
+        },
+    )
+    .await;
 }
 
 /// Attaches `attach_pid` to `session` from a terminal that advertises the title capability.

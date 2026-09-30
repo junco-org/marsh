@@ -1,4 +1,5 @@
 use super::*;
+use crate::test_fixtures::SessionSpec;
 
 #[tokio::test]
 async fn parsed_queue_accepts_tmux_swap_window_flag_clusters() {
@@ -29,7 +30,7 @@ async fn parsed_queue_accepts_tmux_swap_window_flag_clusters() {
 #[tokio::test]
 async fn parsed_queue_does_not_expand_the_swap_window_flag_surface() {
     let handler = RequestHandler::new();
-    let alpha = handler.create_session("alpha").await;
+    let alpha = SessionSpec::create(&handler, "alpha").await;
     handler
         .create_window(NewWindowRequest {
             name: Some("one".to_owned()),
@@ -61,7 +62,7 @@ struct SwapClusterCase {
 
 async fn assert_parsed_swap_cluster(case: SwapClusterCase) {
     let handler = RequestHandler::new();
-    let session_name = handler.create_session(case.session).await;
+    let session_name = SessionSpec::create(&handler, case.session).await;
 
     handler
         .create_window(NewWindowRequest {

@@ -1,4 +1,5 @@
 use super::*;
+use crate::test_fixtures::{SessionSpec, TestRequest};
 use rmux_proto::{BindKeyRequest, ListKeysRequest};
 
 async fn set_command_alias(handler: &RequestHandler, alias: &str) {
@@ -98,7 +99,7 @@ async fn internal_canonical_execution_does_not_expand_aliases_again() {
 async fn internal_canonical_execution_accepts_explicit_target_context() {
     let handler = RequestHandler::new();
     let alpha = session_name("canonical-target");
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
 
     let response = handler
         .handle(
@@ -174,9 +175,7 @@ async fn runtime_command_alias_option_drives_hook_registration_parser() {
     handler
         .set_global_hook(HookName::AfterSetBuffer, "sbuf from-hook")
         .await;
-    handler
-        .handle_ok(SetBufferRequest::fixture(("origin", b"origin")))
-        .await;
+    TestRequest::send_ok(&handler, SetBufferRequest::fixture(("origin", b"origin"))).await;
 
     let output = handler.handle(show_buffer_request("aliased")).await;
     assert_eq!(
@@ -202,9 +201,11 @@ async fn runtime_command_alias_option_drives_hook_registration_parser() {
             .await,
         Response::SourceFile(rmux_proto::SourceFileResponse::no_output())
     );
-    handler
-        .handle_ok(SetBufferRequest::fixture(("source-origin", b"origin")))
-        .await;
+    TestRequest::send_ok(
+        &handler,
+        SetBufferRequest::fixture(("source-origin", b"origin")),
+    )
+    .await;
     let output = handler.handle(show_buffer_request("aliased")).await;
     assert_eq!(
         output
@@ -247,9 +248,7 @@ async fn runtime_command_alias_option_drives_binding_payload_parsers() {
         ),
         ("F11", vec!["sbuf from-protocol-string".to_owned()]),
     ] {
-        handler
-            .handle_ok(BindKeyRequest::fixture(("root", key, command)))
-            .await;
+        TestRequest::send_ok(&handler, BindKeyRequest::fixture(("root", key, command))).await;
     }
 
     let parsed = handler

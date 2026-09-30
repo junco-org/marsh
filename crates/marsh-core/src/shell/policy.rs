@@ -10,16 +10,16 @@ use super::completion::{Completion, Finalize};
 use super::execution::ExecutedCommand;
 use super::session::{Authority, Session};
 use super::{ShellError, ShellErrorKind};
+pub(super) use junco_policy::{Action, Event, Principal, Resource};
+use junco_policy::{Bump, GitPolicy, PolicyDecision};
 use marsh_lib::RecoverPoison as _;
 use marsh_wal::CommitOp;
-pub(super) use rust_validator::{Action, Event, Principal, Resource};
-use rust_validator::{Bump, GitPolicy, PolicyDecision};
 
 /// One refused capability, with the policy's explanation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Denial {
     /// The rejected request.
-    pub event: rust_validator::Event,
+    pub event: junco_policy::Event,
     /// The precondition that failed.
     pub failed_precondition: String,
     /// Policy-provided ways to make the request legal.

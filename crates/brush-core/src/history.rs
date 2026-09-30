@@ -167,6 +167,9 @@ impl History {
 
     /// Flushes the history to backing storage (if relevant).
     ///
+    /// The file is opened as given (a relative path against the process's working directory);
+    /// the open is not reported to any execution observer.
+    ///
     /// # Arguments
     ///
     /// * `history_file_path` - The path to the history file.
@@ -181,6 +184,24 @@ impl History {
         unsaved_items_only: bool,
         write_timestamps: bool,
     ) -> Result<(), error::Error> {
+        self.flush_with(
+            |options| options.open(history_file_path.as_ref()),
+            append,
+            unsaved_items_only,
+            write_timestamps,
+        )
+    }
+
+    /// Like [`flush`](Self::flush), but opens the history file through `open_history_file`
+    /// with the options `flush` would use; the shell passes an opener that resolves the path
+    /// and reports the open to its execution observer.
+    pub(crate) fn flush_with(
+        &mut self,
+        open_history_file: impl FnOnce(&std::fs::OpenOptions) -> std::io::Result<std::fs::File>,
+        append: bool,
+        unsaved_items_only: bool,
+        write_timestamps: bool,
+    ) -> Result<(), error::Error> {
         // Open the file
         let mut file_options = std::fs::File::options();
 
@@ -190,7 +211,7 @@ impl History {
             file_options.write(true).truncate(true);
         }
 
-        let mut file = file_options.create(true).open(history_file_path.as_ref())?;
+        let mut file = open_history_file(file_options.create(true))?;
 
         for item_id in &self.items {
             if let Some(item) = self.id_map.get_mut(item_id) {

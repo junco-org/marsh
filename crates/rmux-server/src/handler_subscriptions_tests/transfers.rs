@@ -4,7 +4,7 @@ use rmux_proto::{
     SwapWindowRequest, UnlinkWindowRequest, WindowTarget,
 };
 
-use crate::test_fixtures::Grouped;
+use crate::test_fixtures::{Grouped, SessionSpec, TestRequest};
 
 use super::*;
 
@@ -52,35 +52,28 @@ async fn break_rekeys_existing_pane_output_subscription() {
 #[tokio::test]
 async fn swap_between_group_aliases_rekeys_subscription_to_linked_runtime_owner() {
     let handler = RequestHandler::new();
-    let owner = handler
-        .create_session("subscription-group-swap-owner")
-        .await;
-    handler.handle_ok(SplitWindowRequest::fixture(&owner)).await;
-    let linked_owner = handler
-        .create_session("subscription-group-swap-linked")
-        .await;
-    handler
-        .handle_ok(SplitWindowRequest::fixture(&linked_owner))
-        .await;
-    handler
-        .handle_ok(LinkWindowRequest::fixture((
+    let owner = SessionSpec::create(&handler, "subscription-group-swap-owner").await;
+    TestRequest::send_ok(&handler, SplitWindowRequest::fixture(&owner)).await;
+    let linked_owner = SessionSpec::create(&handler, "subscription-group-swap-linked").await;
+    TestRequest::send_ok(&handler, SplitWindowRequest::fixture(&linked_owner)).await;
+    TestRequest::send_ok(
+        &handler,
+        LinkWindowRequest::fixture((
             WindowTarget::with_window(linked_owner.clone(), 0),
             WindowTarget::with_window(owner.clone(), 1),
-        )))
-        .await;
-    let peer = handler
-        .create_session(Grouped("subscription-group-swap-peer", &owner))
-        .await;
+        )),
+    )
+    .await;
+    let peer = SessionSpec::create(&handler, Grouped("subscription-group-swap-peer", &owner)).await;
     handler.wait_for_initial_panes_for_test().await;
 
     let source = PaneTarget::with_window(owner.clone(), 0, 0);
     let (subscription_id, pane_id) = subscribe_by_id(&handler, CONNECTION_ID, &source).await;
-    handler
-        .handle_ok(SwapPaneRequest::fixture((
-            source,
-            PaneTarget::with_window(peer, 1, 0),
-        )))
-        .await;
+    TestRequest::send_ok(
+        &handler,
+        SwapPaneRequest::fixture((source, PaneTarget::with_window(peer, 1, 0))),
+    )
+    .await;
 
     assert_window_owner_transfer(
         &handler,
@@ -95,33 +88,33 @@ async fn swap_between_group_aliases_rekeys_subscription_to_linked_runtime_owner(
 #[tokio::test]
 async fn unlink_window_rekeys_subscription_when_runtime_owner_slot_is_removed() {
     let handler = RequestHandler::new();
-    let owner = handler
-        .create_session(Sizeless("subscription-unlink-owner"))
-        .await;
+    let owner = SessionSpec::create(&handler, Sizeless("subscription-unlink-owner")).await;
     handler
         .create_window(NewWindowRequest {
             target_window_index: Some(1),
             ..Fixture::fixture(&owner)
         })
         .await;
-    let external = handler
-        .create_session(Sizeless("subscription-unlink-external"))
-        .await;
-    handler
-        .handle_ok(LinkWindowRequest::fixture((
+    let external = SessionSpec::create(&handler, Sizeless("subscription-unlink-external")).await;
+    TestRequest::send_ok(
+        &handler,
+        LinkWindowRequest::fixture((
             WindowTarget::with_window(owner.clone(), 0),
             WindowTarget::with_window(external.clone(), 1),
-        )))
-        .await;
+        )),
+    )
+    .await;
 
     let source = PaneTarget::with_window(owner.clone(), 0, 0);
     let (subscription_id, pane_id) = subscribe_by_id(&handler, CONNECTION_ID, &source).await;
-    handler
-        .handle_ok(UnlinkWindowRequest {
+    TestRequest::send_ok(
+        &handler,
+        UnlinkWindowRequest {
             target: WindowTarget::with_window(owner, 0),
             kill_if_last: false,
-        })
-        .await;
+        },
+    )
+    .await;
 
     assert_window_owner_transfer(
         &handler,
@@ -136,39 +129,38 @@ async fn unlink_window_rekeys_subscription_when_runtime_owner_slot_is_removed() 
 #[tokio::test]
 async fn link_window_k_rekeys_subscription_for_detached_destination_runtime() {
     let handler = RequestHandler::new();
-    let owner = handler
-        .create_session(Sizeless("subscription-link-owner"))
-        .await;
+    let owner = SessionSpec::create(&handler, Sizeless("subscription-link-owner")).await;
     handler
         .create_window(NewWindowRequest {
             target_window_index: Some(1),
             ..Fixture::fixture(&owner)
         })
         .await;
-    let external = handler
-        .create_session(Sizeless("subscription-link-external"))
-        .await;
-    let replacement = handler
-        .create_session(Sizeless("subscription-link-replacement"))
-        .await;
-    handler
-        .handle_ok(LinkWindowRequest::fixture((
+    let external = SessionSpec::create(&handler, Sizeless("subscription-link-external")).await;
+    let replacement =
+        SessionSpec::create(&handler, Sizeless("subscription-link-replacement")).await;
+    TestRequest::send_ok(
+        &handler,
+        LinkWindowRequest::fixture((
             WindowTarget::with_window(owner.clone(), 0),
             WindowTarget::with_window(external.clone(), 1),
-        )))
-        .await;
+        )),
+    )
+    .await;
 
     let source = PaneTarget::with_window(owner.clone(), 0, 0);
     let (subscription_id, pane_id) = subscribe_by_id(&handler, CONNECTION_ID, &source).await;
-    handler
-        .handle_ok(LinkWindowRequest {
+    TestRequest::send_ok(
+        &handler,
+        LinkWindowRequest {
             kill_destination: true,
             ..Fixture::fixture((
                 WindowTarget::with_window(replacement, 0),
                 WindowTarget::with_window(owner, 0),
             ))
-        })
-        .await;
+        },
+    )
+    .await;
 
     assert_window_owner_transfer(
         &handler,
@@ -183,27 +175,27 @@ async fn link_window_k_rekeys_subscription_for_detached_destination_runtime() {
 #[tokio::test]
 async fn move_window_rekeys_subscription_across_sessions() {
     let handler = RequestHandler::new();
-    let source_name = handler
-        .create_session(Sizeless("subscription-move-window-source"))
-        .await;
+    let source_name =
+        SessionSpec::create(&handler, Sizeless("subscription-move-window-source")).await;
     handler
         .create_window(NewWindowRequest {
             target_window_index: Some(1),
             ..Fixture::fixture(&source_name)
         })
         .await;
-    let target_name = handler
-        .create_session(Sizeless("subscription-move-window-target"))
-        .await;
+    let target_name =
+        SessionSpec::create(&handler, Sizeless("subscription-move-window-target")).await;
 
     let source = PaneTarget::with_window(source_name.clone(), 0, 0);
     let (subscription_id, pane_id) = subscribe_by_id(&handler, CONNECTION_ID, &source).await;
-    handler
-        .handle_ok(MoveWindowRequest::fixture((
+    TestRequest::send_ok(
+        &handler,
+        MoveWindowRequest::fixture((
             WindowTarget::with_window(source_name, 0),
             WindowTarget::with_window(target_name.clone(), 1),
-        )))
-        .await;
+        )),
+    )
+    .await;
 
     assert_window_owner_transfer(
         &handler,
@@ -218,22 +210,22 @@ async fn move_window_rekeys_subscription_across_sessions() {
 #[tokio::test]
 async fn swap_window_rekeys_subscription_across_sessions() {
     let handler = RequestHandler::new();
-    let source_name = handler
-        .create_session(Sizeless("subscription-swap-window-source"))
-        .await;
-    let target_name = handler
-        .create_session(Sizeless("subscription-swap-window-target"))
-        .await;
+    let source_name =
+        SessionSpec::create(&handler, Sizeless("subscription-swap-window-source")).await;
+    let target_name =
+        SessionSpec::create(&handler, Sizeless("subscription-swap-window-target")).await;
 
     let source = PaneTarget::with_window(source_name.clone(), 0, 0);
     let (subscription_id, pane_id) = subscribe_by_id(&handler, CONNECTION_ID, &source).await;
-    handler
-        .handle_ok(SwapWindowRequest {
+    TestRequest::send_ok(
+        &handler,
+        SwapWindowRequest {
             source: WindowTarget::with_window(source_name, 0),
             target: WindowTarget::with_window(target_name.clone(), 0),
             detached: true,
-        })
-        .await;
+        },
+    )
+    .await;
 
     assert_window_owner_transfer(
         &handler,
@@ -251,8 +243,8 @@ async fn assert_subscription_follows_transfer(case: TransferCase) {
         SessionName::new(format!("subscription-{}-source", case.label())).expect("valid source");
     let target_name =
         SessionName::new(format!("subscription-{}-target", case.label())).expect("valid target");
-    handler.create_session(Sizeless(&source_name)).await;
-    handler.create_session(Sizeless(&target_name)).await;
+    SessionSpec::create(&handler, Sizeless(&source_name)).await;
+    SessionSpec::create(&handler, Sizeless(&target_name)).await;
 
     let source_target = PaneTarget::with_window(source_name.clone(), 0, 0);
     let target_target = PaneTarget::with_window(target_name.clone(), 0, 0);

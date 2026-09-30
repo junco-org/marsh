@@ -1,4 +1,5 @@
 use super::*;
+use crate::test_fixtures::{SessionSpec, TestRequest};
 
 #[tokio::test]
 async fn source_file_lookup_parse_errors_skip_bad_file_and_continue_other_paths() {
@@ -303,7 +304,7 @@ async fn source_file_ignores_server_scope_for_non_server_options_like_tmux() {
     let root = temp_root("set-option-server-scope");
     fs::create_dir_all(&root).expect("create temp root");
     let alpha = session_name("alpha");
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
 
     let response = handler
         .handle(
@@ -343,7 +344,7 @@ async fn source_file_routes_window_show_commands_and_global_show_scope_compatibi
     let root = temp_root("show-options-compat");
     fs::create_dir_all(&root).expect("create temp root");
     let alpha = session_name("alpha");
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
 
     let response = handler
         .handle(
@@ -385,7 +386,7 @@ async fn source_file_show_options_quiet_suppresses_missing_options_with_current_
     let root = temp_root("show-options-quiet-missing");
     fs::create_dir_all(&root).expect("create temp root");
     let alpha = session_name("alpha");
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
 
     let response = handler
         .handle(
@@ -417,7 +418,7 @@ async fn source_file_set_option_p_preserves_explicit_pane_target() {
     let root = temp_root("set-option-pane-target");
     fs::create_dir_all(&root).expect("create temp root");
     let alpha = session_name("alpha");
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
 
     let response = handler
         .handle(
@@ -449,7 +450,7 @@ async fn source_file_set_option_format_expands_value_before_storage() {
     let root = temp_root("set-option-format");
     fs::create_dir_all(&root).expect("create temp root");
     let alpha = session_name("alpha");
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
 
     let response = handler
         .handle(
@@ -483,7 +484,7 @@ async fn source_file_set_option_format_expands_socket_path() {
     let root = temp_root("set-option-socket-path");
     fs::create_dir_all(&root).expect("create temp root");
     let alpha = session_name("alpha");
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
 
     let response = handler
         .handle(
@@ -633,22 +634,21 @@ async fn source_file_without_target_uses_preferred_session_for_parse_time_format
     let handler = RequestHandler::new();
     let root = temp_root("source-file-implicit-target");
     fs::create_dir_all(&root).expect("create temp root");
-    handler.create_session("alpha").await;
+    SessionSpec::create(&handler, "alpha").await;
 
-    handler
-        .handle_ok(SourceFileRequest {
-            caller_cwd: Some(root),
-            stdin: Some(
-                "%if #{==:#{session_name},alpha}\n\
-set-buffer -b implicit yes\n\
-%else\n\
-set-buffer -b implicit no\n\
-%endif\n\
-if-shell -F '#{==:#{window_index},0}' 'set-buffer -b implicit-if yes' 'set-buffer -b implicit-if no'\n"
-                    .to_owned(),
-            ),
-            ..Fixture::fixture(vec!["-".to_owned()])
-        })
+    TestRequest::send_ok(&handler, SourceFileRequest {
+        caller_cwd: Some(root),
+        stdin: Some(
+            "%if #{==:#{session_name},alpha}\n\
+    set-buffer -b implicit yes\n\
+    %else\n\
+    set-buffer -b implicit no\n\
+    %endif\n\
+    if-shell -F '#{==:#{window_index},0}' 'set-buffer -b implicit-if yes' 'set-buffer -b implicit-if no'\n"
+                .to_owned(),
+        ),
+        ..Fixture::fixture(vec!["-".to_owned()])
+    })
         .await;
 
     let state = handler.state.lock().await;

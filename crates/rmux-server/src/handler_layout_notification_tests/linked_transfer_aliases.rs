@@ -8,7 +8,7 @@ use super::{
     create_session, run_control_command, run_detached_command, settle_control_notifications,
     wait_for_buffer_text, RequestHandler,
 };
-use crate::test_fixtures::{Fixture, Grouped};
+use crate::test_fixtures::{Fixture, Grouped, SessionSpec, TestRequest};
 
 #[tokio::test]
 async fn linked_and_grouped_join_move_keep_requested_resize_alias() {
@@ -39,18 +39,20 @@ async fn assert_transfer_alias(operation: &str, family: &str) {
 
     create_session(&handler, &alpha).await;
     if family == "grouped" {
-        handler.create_session(Grouped(&beta, &alpha)).await;
+        SessionSpec::create(&handler, Grouped(&beta, &alpha)).await;
     } else {
         create_session(&handler, &beta).await;
-        handler
-            .handle_ok(LinkWindowRequest {
+        TestRequest::send_ok(
+            &handler,
+            LinkWindowRequest {
                 kill_destination: true,
                 ..Fixture::fixture((
                     WindowTarget::with_window(alpha.clone(), 0),
                     WindowTarget::with_window(beta.clone(), 0),
                 ))
-            })
-            .await;
+            },
+        )
+        .await;
     }
     let requested = alias_opposite_hashmap_first(&handler, &alpha, &beta).await;
     create_session(&handler, &source).await;
@@ -66,13 +68,15 @@ async fn assert_transfer_alias(operation: &str, family: &str) {
     .await;
     run_detached_command(&handler, &format!("set-buffer -b {buffer} ''")).await;
     let resize_hook = format!("run-shell -C 'set-buffer -b {buffer} #{{session_name}}'");
-    handler
-        .handle_ok(SetHookRequest::fixture((
+    TestRequest::send_ok(
+        &handler,
+        SetHookRequest::fixture((
             ScopeSelector::Global,
             HookName::WindowResized,
             resize_hook.as_str(),
-        )))
-        .await;
+        )),
+    )
+    .await;
 
     let control_pid = std::process::id();
     let (_, mut notifications) = handler

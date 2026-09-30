@@ -1,5 +1,5 @@
 use super::*;
-use crate::test_fixtures::{wait_for_file_contents, wait_until};
+use crate::test_fixtures::{wait_for_file_contents, wait_until, SessionSpec, TestRequest};
 use crate::test_shell::command_quote;
 use rmux_proto::BindKeyRequest;
 
@@ -7,12 +7,14 @@ const PROMPT_NEW_WINDOW_INPUT: &[u8] =
     b"\x02:new-window -- 'printf ISSUE8_WINDOW_READY; sleep 30'\r";
 
 async fn bind_attached_prompt_test_key(handler: &RequestHandler, key: &str, command: Vec<String>) {
-    handler
-        .handle_ok(BindKeyRequest {
+    TestRequest::send_ok(
+        handler,
+        BindKeyRequest {
             note: Some("attached prompt target-client regression".to_owned()),
             ..Fixture::fixture(("prefix", key, command))
-        })
-        .await;
+        },
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -113,8 +115,9 @@ async fn attached_command_prompt_can_chain_choose_tree_overlay() {
     let prompted = session_name("prompted");
     let mut control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
 
-    handler
-        .handle_ok(BindKeyRequest {
+    TestRequest::send_ok(
+        &handler,
+        BindKeyRequest {
             note: Some("prompt-then-choose-tree".to_owned()),
             ..Fixture::fixture((
                 "prefix",
@@ -126,8 +129,9 @@ async fn attached_command_prompt_can_chain_choose_tree_overlay() {
                     "new-session -d -s '%%' ; choose-tree -Zs",
                 ],
             ))
-        })
-        .await;
+        },
+    )
+    .await;
 
     handler
         .handle_attached_live_input_for_test(requester_pid, b"\x02X")
@@ -446,12 +450,14 @@ async fn attached_binding_run_shell_expands_client_name() {
     let output_path = root.join("client-name.txt");
     let shell_command = client_name_file_shell_command(&output_path);
 
-    handler
-        .handle_ok(BindKeyRequest {
+    TestRequest::send_ok(
+        &handler,
+        BindKeyRequest {
             note: Some("attached-client-name".to_owned()),
             ..Fixture::fixture(("prefix", "T", ["run-shell", "-b", &shell_command]))
-        })
-        .await;
+        },
+    )
+    .await;
 
     handler
         .handle_attached_live_input_for_test(requester_pid, b"\x02T")
@@ -481,12 +487,14 @@ async fn attached_binding_new_window_shell_command_expands_client_name() {
 
     let mut command = vec!["new-window".to_owned(), "-d".to_owned(), "--".to_owned()];
     command.extend(pane_command);
-    handler
-        .handle_ok(BindKeyRequest {
+    TestRequest::send_ok(
+        &handler,
+        BindKeyRequest {
             note: Some("attached-client-name-new-window".to_owned()),
             ..Fixture::fixture(("prefix", "V", command))
-        })
-        .await;
+        },
+    )
+    .await;
 
     handler
         .handle_attached_live_input_for_test(requester_pid, b"\x02V")
@@ -513,12 +521,14 @@ async fn attached_binding_split_window_shell_command_expands_client_name() {
 
     let mut command = vec!["split-window".to_owned(), "-d".to_owned(), "--".to_owned()];
     command.extend(pane_command);
-    handler
-        .handle_ok(BindKeyRequest {
+    TestRequest::send_ok(
+        &handler,
+        BindKeyRequest {
             note: Some("attached-client-name-split-window".to_owned()),
             ..Fixture::fixture(("prefix", "W", command))
-        })
-        .await;
+        },
+    )
+    .await;
 
     handler
         .handle_attached_live_input_for_test(requester_pid, b"\x02W")
@@ -536,8 +546,9 @@ async fn attached_binding_set_option_format_expands_client_name() {
     let alpha = session_name("alpha");
     let _control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
 
-    handler
-        .handle_ok(BindKeyRequest {
+    TestRequest::send_ok(
+        &handler,
+        BindKeyRequest {
             note: Some("attached-client-name-set-option".to_owned()),
             ..Fixture::fixture((
                 "prefix",
@@ -550,8 +561,9 @@ async fn attached_binding_set_option_format_expands_client_name() {
                     "#{client_name}:#{session_name}:#{pane_index}",
                 ],
             ))
-        })
-        .await;
+        },
+    )
+    .await;
 
     handler
         .handle_attached_live_input_for_test(requester_pid, b"\x02Y")
@@ -603,16 +615,18 @@ async fn attached_binding_source_file_preserves_client_context() {
     );
     std::fs::write(&source_path, source).expect("source-file client context config");
 
-    handler
-        .handle_ok(BindKeyRequest {
+    TestRequest::send_ok(
+        &handler,
+        BindKeyRequest {
             note: Some("attached-client-context-source-file".to_owned()),
             ..Fixture::fixture((
                 "prefix",
                 "Z",
                 ["source-file", &source_path.to_string_lossy()],
             ))
-        })
-        .await;
+        },
+    )
+    .await;
 
     handler
         .handle_attached_live_input_for_test(requester_pid, b"\x02Z")
@@ -650,12 +664,14 @@ async fn attached_binding_two_clients_get_distinct_client_names() {
     std::fs::create_dir_all(&root).expect("two-client name temp root");
     let shell_command = client_name_file_shell_command(&root.join("#{client_name}.txt"));
 
-    handler
-        .handle_ok(BindKeyRequest {
+    TestRequest::send_ok(
+        &handler,
+        BindKeyRequest {
             note: Some("attached-two-client-names".to_owned()),
             ..Fixture::fixture(("prefix", "X", ["run-shell", "-b", &shell_command]))
-        })
-        .await;
+        },
+    )
+    .await;
 
     handler
         .handle_attached_live_input_for_test(first_pid, b"\x02X")
@@ -681,8 +697,9 @@ async fn attached_binding_if_shell_condition_expands_client_name() {
     let _control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
     let buffer_name = "attached-client-name-if-shell";
 
-    handler
-        .handle_ok(BindKeyRequest {
+    TestRequest::send_ok(
+        &handler,
+        BindKeyRequest {
             note: Some("attached-client-name-if-shell".to_owned()),
             ..Fixture::fixture((
                 "prefix",
@@ -695,8 +712,9 @@ async fn attached_binding_if_shell_condition_expands_client_name() {
                     &format!("set-buffer -b {buffer_name} no"),
                 ],
             ))
-        })
-        .await;
+        },
+    )
+    .await;
 
     handler
         .handle_attached_live_input_for_test(requester_pid, b"\x02U")
@@ -713,8 +731,9 @@ async fn attached_binding_if_shell_branch_expands_client_name() {
     let alpha = session_name("alpha");
     let _control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
 
-    handler
-        .handle_ok(BindKeyRequest {
+    TestRequest::send_ok(
+        &handler,
+        BindKeyRequest {
             note: Some("attached-client-name-if-shell-branch".to_owned()),
             ..Fixture::fixture((
                 "prefix",
@@ -726,8 +745,9 @@ async fn attached_binding_if_shell_branch_expands_client_name() {
                     "set-option -g -F @if-shell-branch-client '#{client_name}'",
                 ],
             ))
-        })
-        .await;
+        },
+    )
+    .await;
 
     handler
         .handle_attached_live_input_for_test(requester_pid, b"\x02V")
@@ -749,7 +769,7 @@ async fn attached_single_switch_queue_completes_after_session_transition() {
     let alpha = session_name("single-switch-alpha");
     let beta = session_name("single-switch-beta");
     let _control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
-    handler.create_session(&beta).await;
+    SessionSpec::create(&handler, &beta).await;
     let identity = handler.active_attach_identity_for_test(requester_pid).await;
     let commands = handler
         .parse_control_commands(&format!("switch-client -t {beta}"))
@@ -856,10 +876,11 @@ async fn attached_binding_switch_client_rebases_its_command_queue() {
     let alpha = session_name("binding-switch-alpha");
     let beta = session_name("binding-switch-beta");
     let _control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
-    handler.create_session(&beta).await;
+    SessionSpec::create(&handler, &beta).await;
 
-    handler
-        .handle_ok(BindKeyRequest {
+    TestRequest::send_ok(
+        &handler,
+        BindKeyRequest {
             note: Some("switch-client-queue".to_owned()),
             ..Fixture::fixture((
                 "prefix",
@@ -878,8 +899,9 @@ async fn attached_binding_switch_client_rebases_its_command_queue() {
                     "done",
                 ],
             ))
-        })
-        .await;
+        },
+    )
+    .await;
 
     handler
         .handle_attached_live_input_for_test(requester_pid, b"\x02W")
@@ -936,7 +958,7 @@ async fn attached_switch_rebases_wrappers_but_preserves_suffix_targets() {
         let alpha = session_name(&format!("explicit-{entry_path}-alpha"));
         let beta = session_name(&format!("explicit-{entry_path}-beta"));
         let _control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
-        handler.create_session(&beta).await;
+        SessionSpec::create(&handler, &beta).await;
 
         let suffix_has_explicit_target = entry_path == "run-shell-suffix-target";
         let nested = if suffix_has_explicit_target {
@@ -1021,10 +1043,11 @@ async fn attached_run_shell_inherited_target_rebases_after_switch() {
     let alpha = session_name("inherited-run-shell-alpha");
     let beta = session_name("inherited-run-shell-beta");
     let _control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
-    handler.create_session(&beta).await;
+    SessionSpec::create(&handler, &beta).await;
 
-    handler
-        .handle_ok(BindKeyRequest {
+    TestRequest::send_ok(
+        &handler,
+        BindKeyRequest {
             note: Some("inherited run-shell target rebase".to_owned()),
             ..Fixture::fixture((
                 "prefix",
@@ -1035,8 +1058,9 @@ async fn attached_run_shell_inherited_target_rebases_after_switch() {
                     &format!("switch-client -t {beta} ; new-window -d"),
                 ],
             ))
-        })
-        .await;
+        },
+    )
+    .await;
 
     handler
         .handle_attached_live_input_for_test(requester_pid, b"\x02W")
@@ -1090,7 +1114,7 @@ async fn attached_attach_session_rebases_every_queue_entry_path() {
         let beta = session_name(&format!("attach-{entry_path}-beta"));
         let buffer_name = format!("attach-{entry_path}-tail");
         let _control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
-        handler.create_session(&beta).await;
+        SessionSpec::create(&handler, &beta).await;
 
         let nested = format!("attach-session -t {beta} ; set-buffer -b {buffer_name} done");
         let command = match entry_path {
@@ -1152,7 +1176,7 @@ async fn attached_switch_response_race_fails_closed_before_queue_continuation() 
     // the very attach the race is about is pruned before the assertions run.
     let _control_drain = tokio::spawn(async move { while control_rx.recv().await.is_some() {} });
     for session in [&beta, &gamma] {
-        handler.create_session(session).await;
+        SessionSpec::create(&handler, session).await;
     }
 
     let identity = handler.active_attach_identity_for_test(requester_pid).await;
@@ -1178,11 +1202,13 @@ async fn attached_switch_response_race_fails_closed_before_queue_continuation() 
     tokio::time::timeout(ATTACH_LIFECYCLE_TIMEOUT, pause.reached.notified())
         .await
         .expect("first switch reaches response correlation pause");
-    handler
-        .handle_ok(SwitchClientRequest {
+    TestRequest::send_ok(
+        &handler,
+        SwitchClientRequest {
             target: gamma.clone(),
-        })
-        .await;
+        },
+    )
+    .await;
     pause.release.notify_one();
 
     let error = queue
@@ -1243,12 +1269,14 @@ async fn attached_same_session_switch_race_uses_the_committed_pane_target() {
             );
         }
     });
-    handler
-        .handle_ok(SplitWindowRequest {
+    TestRequest::send_ok(
+        &handler,
+        SplitWindowRequest {
             direction: rmux_proto::SplitDirection::Horizontal,
             ..Fixture::fixture(&alpha)
-        })
-        .await;
+        },
+    )
+    .await;
     let (pane_zero_id, pane_one_id) = {
         let state = handler.state.lock().await;
         let window = state
@@ -1396,7 +1424,7 @@ async fn attached_switch_for_other_client_preserves_requester_queue_cursor() {
     let delta = session_name("other-switch-delta");
     let _requester_rx = create_attached_session(&handler, requester_pid, &alpha).await;
     for session in [&beta, &gamma, &delta] {
-        handler.create_session(session).await;
+        SessionSpec::create(&handler, session).await;
     }
     let (other_tx, _other_rx) = mpsc::unbounded_channel();
     let other_attach_id = handler
@@ -1522,10 +1550,11 @@ async fn attached_binding_allows_an_explicit_cross_session_target() {
     let alpha = session_name("binding-cross-alpha");
     let beta = session_name("binding-cross-beta");
     let _control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
-    handler.create_session(&beta).await;
+    SessionSpec::create(&handler, &beta).await;
 
-    handler
-        .handle_ok(BindKeyRequest {
+    TestRequest::send_ok(
+        &handler,
+        BindKeyRequest {
             note: Some("explicit-cross-session-target".to_owned()),
             ..Fixture::fixture((
                 "prefix",
@@ -1541,8 +1570,9 @@ async fn attached_binding_allows_an_explicit_cross_session_target() {
                     "done",
                 ],
             ))
-        })
-        .await;
+        },
+    )
+    .await;
 
     handler
         .handle_attached_live_input_for_test(requester_pid, b"\x02Y")
@@ -1562,7 +1592,7 @@ async fn attached_command_prompt_switch_client_rebases_its_continuation() {
     let alpha = session_name("prompt-switch-alpha");
     let beta = session_name("prompt-switch-beta");
     let _control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
-    handler.create_session(&beta).await;
+    SessionSpec::create(&handler, &beta).await;
 
     let input = format!(
         "\x02:switch-client -t {} ; set-buffer -b prompt-switch-tail done\r",
@@ -1589,7 +1619,7 @@ async fn attached_command_prompt_attach_session_rebases_its_continuation() {
     let alpha = session_name("prompt-attach-alpha");
     let beta = session_name("prompt-attach-beta");
     let _control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
-    handler.create_session(&beta).await;
+    SessionSpec::create(&handler, &beta).await;
 
     let input = format!(
         "\x02:attach-session -t {} ; set-buffer -b prompt-attach-tail done\r",
@@ -1733,12 +1763,14 @@ async fn attached_session_status_updates_after_external_rename() {
     let beta = session_name("beta");
     let mut control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
 
-    handler
-        .handle_ok(RenameSessionRequest {
+    TestRequest::send_ok(
+        &handler,
+        RenameSessionRequest {
             target: alpha,
             new_name: beta,
-        })
-        .await;
+        },
+    )
+    .await;
 
     let frame = wait_for_switch_frame_containing(&mut control_rx, "[beta]").await;
     assert!(

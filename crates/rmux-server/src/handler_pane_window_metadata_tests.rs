@@ -5,7 +5,7 @@ use rmux_proto::{
     SplitWindowRequest, WindowTarget,
 };
 
-use crate::test_fixtures::{Fixture, Grouped};
+use crate::test_fixtures::{Fixture, Grouped, SessionSpec, TestRequest};
 
 const USER_OPTION: &str = "@pane-transfer-window";
 const KNOWN_OPTION: &str = "monitor-silence";
@@ -67,13 +67,15 @@ async fn mark_auto_named(handler: &RequestHandler, target: &WindowTarget) {
 
 async fn run_destroying_same_session_transfer(move_pane: bool) {
     let handler = RequestHandler::new();
-    let session = handler
-        .create_session(if move_pane {
+    let session = SessionSpec::create(
+        &handler,
+        if move_pane {
             "metadata-move"
         } else {
             "metadata-join"
-        })
-        .await;
+        },
+    )
+    .await;
     handler
         .create_window(NewWindowRequest {
             target_window_index: Some(1),
@@ -132,28 +134,29 @@ async fn join_and_move_drop_destroyed_source_window_metadata() {
 #[tokio::test]
 async fn cross_session_join_drops_destroyed_source_window_metadata() {
     let handler = RequestHandler::new();
-    let source_session = handler.create_session("metadata-cross-join-source").await;
+    let source_session = SessionSpec::create(&handler, "metadata-cross-join-source").await;
     handler
         .create_window(NewWindowRequest {
             target_window_index: Some(1),
             ..Fixture::fixture(&source_session)
         })
         .await;
-    let destination_session = handler
-        .create_session("metadata-cross-join-destination")
-        .await;
+    let destination_session =
+        SessionSpec::create(&handler, "metadata-cross-join-destination").await;
     let source_window = WindowTarget::with_window(source_session.clone(), 1);
     let destination_window = WindowTarget::with_window(destination_session.clone(), 0);
     set_window_metadata(&handler, &source_window, "discarded").await;
     set_window_metadata(&handler, &destination_window, "destination").await;
     mark_auto_named(&handler, &source_window).await;
 
-    handler
-        .handle_ok(JoinPaneRequest::fixture((
+    TestRequest::send_ok(
+        &handler,
+        JoinPaneRequest::fixture((
             PaneTarget::with_window(source_session.clone(), 1, 0),
             PaneTarget::with_window(destination_session, 0, 0),
-        )))
-        .await;
+        )),
+    )
+    .await;
 
     {
         let state = handler.state.lock().await;
@@ -174,26 +177,26 @@ async fn cross_session_join_drops_destroyed_source_window_metadata() {
 #[tokio::test]
 async fn grouped_join_clears_destroyed_source_metadata_from_every_peer() {
     let handler = RequestHandler::new();
-    let owner = handler.create_session("metadata-group-owner").await;
+    let owner = SessionSpec::create(&handler, "metadata-group-owner").await;
     handler
         .create_window(NewWindowRequest {
             target_window_index: Some(1),
             ..Fixture::fixture(&owner)
         })
         .await;
-    let peer = handler
-        .create_session(Grouped("metadata-group-peer", &owner))
-        .await;
+    let peer = SessionSpec::create(&handler, Grouped("metadata-group-peer", &owner)).await;
     let source_window = WindowTarget::with_window(owner.clone(), 1);
     set_window_metadata(&handler, &source_window, "discarded").await;
     mark_auto_named(&handler, &source_window).await;
 
-    handler
-        .handle_ok(JoinPaneRequest::fixture((
+    TestRequest::send_ok(
+        &handler,
+        JoinPaneRequest::fixture((
             PaneTarget::with_window(owner.clone(), 1, 0),
             PaneTarget::with_window(owner.clone(), 0, 0),
-        )))
-        .await;
+        )),
+    )
+    .await;
 
     {
         let state = handler.state.lock().await;
@@ -225,14 +228,14 @@ async fn grouped_join_clears_destroyed_source_metadata_from_every_peer() {
 #[tokio::test]
 async fn cross_session_single_pane_break_moves_window_metadata() {
     let handler = RequestHandler::new();
-    let source_session = handler.create_session("metadata-break-source").await;
+    let source_session = SessionSpec::create(&handler, "metadata-break-source").await;
     handler
         .create_window(NewWindowRequest {
             target_window_index: Some(1),
             ..Fixture::fixture(&source_session)
         })
         .await;
-    let destination_session = handler.create_session("metadata-break-destination").await;
+    let destination_session = SessionSpec::create(&handler, "metadata-break-destination").await;
     let source_window = WindowTarget::with_window(source_session.clone(), 1);
     let destination_window = WindowTarget::with_window(destination_session.clone(), 1);
     set_window_metadata(&handler, &source_window, "moved").await;
@@ -250,12 +253,14 @@ async fn cross_session_single_pane_break_moves_window_metadata() {
         .silence_timer_snapshot_for_test(&source_window)
         .is_some());
 
-    handler
-        .handle_ok(BreakPaneRequest::fixture((
+    TestRequest::send_ok(
+        &handler,
+        BreakPaneRequest::fixture((
             PaneTarget::with_window(source_session.clone(), 1, 0),
             &destination_window,
-        )))
-        .await;
+        )),
+    )
+    .await;
 
     {
         let state = handler.state.lock().await;
@@ -292,21 +297,23 @@ async fn cross_session_single_pane_break_moves_window_metadata() {
 #[tokio::test]
 async fn cross_session_single_pane_break_explicit_name_clears_automatic_tracking() {
     let handler = RequestHandler::new();
-    let source_session = handler.create_session("named-break-source").await;
-    let destination_session = handler.create_session("named-break-destination").await;
+    let source_session = SessionSpec::create(&handler, "named-break-source").await;
+    let destination_session = SessionSpec::create(&handler, "named-break-destination").await;
     let source_window = WindowTarget::with_window(source_session.clone(), 0);
     let destination_window = WindowTarget::with_window(destination_session.clone(), 1);
     mark_auto_named(&handler, &source_window).await;
 
-    handler
-        .handle_ok(BreakPaneRequest {
+    TestRequest::send_ok(
+        &handler,
+        BreakPaneRequest {
             name: Some("pinned".to_owned()),
             ..Fixture::fixture((
                 PaneTarget::with_window(source_session, 0, 0),
                 &destination_window,
             ))
-        })
-        .await;
+        },
+    )
+    .await;
 
     let state = handler.state.lock().await;
     let window = state
@@ -322,7 +329,7 @@ async fn cross_session_single_pane_break_explicit_name_clears_automatic_tracking
 #[tokio::test]
 async fn same_session_single_pane_break_explicit_name_clears_automatic_tracking() {
     let handler = RequestHandler::new();
-    let session = handler.create_session("named-same-break").await;
+    let session = SessionSpec::create(&handler, "named-same-break").await;
     handler
         .create_window(NewWindowRequest {
             target_window_index: Some(1),
@@ -333,15 +340,17 @@ async fn same_session_single_pane_break_explicit_name_clears_automatic_tracking(
     let destination_window = WindowTarget::with_window(session.clone(), 3);
     mark_auto_named(&handler, &source_window).await;
 
-    handler
-        .handle_ok(BreakPaneRequest {
+    TestRequest::send_ok(
+        &handler,
+        BreakPaneRequest {
             name: Some("pinned".to_owned()),
             ..Fixture::fixture((
                 PaneTarget::with_window(session.clone(), 1, 0),
                 destination_window,
             ))
-        })
-        .await;
+        },
+    )
+    .await;
 
     let state = handler.state.lock().await;
     let window = state
@@ -357,34 +366,36 @@ async fn same_session_single_pane_break_explicit_name_clears_automatic_tracking(
 #[tokio::test]
 async fn linked_last_pane_break_explicit_name_clears_family_automatic_tracking() {
     let handler = RequestHandler::new();
-    let source_session = handler.create_session("named-linked-break-source").await;
+    let source_session = SessionSpec::create(&handler, "named-linked-break-source").await;
     handler
         .create_window(NewWindowRequest {
             target_window_index: Some(1),
             ..Fixture::fixture(&source_session)
         })
         .await;
-    let linked_session = handler.create_session("named-linked-break-peer").await;
-    let destination_session = handler
-        .create_session("named-linked-break-destination")
-        .await;
+    let linked_session = SessionSpec::create(&handler, "named-linked-break-peer").await;
+    let destination_session = SessionSpec::create(&handler, "named-linked-break-destination").await;
     let source_window = WindowTarget::with_window(source_session.clone(), 1);
     let linked_window = WindowTarget::with_window(linked_session.clone(), 1);
     let destination_window = WindowTarget::with_window(destination_session.clone(), 1);
     mark_auto_named(&handler, &source_window).await;
-    handler
-        .handle_ok(LinkWindowRequest::fixture((&source_window, &linked_window)))
-        .await;
+    TestRequest::send_ok(
+        &handler,
+        LinkWindowRequest::fixture((&source_window, &linked_window)),
+    )
+    .await;
 
-    handler
-        .handle_ok(BreakPaneRequest {
+    TestRequest::send_ok(
+        &handler,
+        BreakPaneRequest {
             name: Some("pinned".to_owned()),
             ..Fixture::fixture((
                 PaneTarget::with_window(source_session, 1, 0),
                 &destination_window,
             ))
-        })
-        .await;
+        },
+    )
+    .await;
 
     let state = handler.state.lock().await;
     for target in [&destination_window, &linked_window] {
@@ -405,30 +416,34 @@ async fn linked_last_pane_break_explicit_name_clears_family_automatic_tracking()
 #[tokio::test]
 async fn linked_single_pane_break_moves_metadata_to_the_new_alias() {
     let handler = RequestHandler::new();
-    let source_session = handler.create_session("metadata-linked-source").await;
+    let source_session = SessionSpec::create(&handler, "metadata-linked-source").await;
     handler
         .create_window(NewWindowRequest {
             target_window_index: Some(1),
             ..Fixture::fixture(&source_session)
         })
         .await;
-    let linked_session = handler.create_session("metadata-linked-peer").await;
-    let destination_session = handler.create_session("metadata-linked-destination").await;
+    let linked_session = SessionSpec::create(&handler, "metadata-linked-peer").await;
+    let destination_session = SessionSpec::create(&handler, "metadata-linked-destination").await;
     let source_window = WindowTarget::with_window(source_session.clone(), 1);
     let linked_window = WindowTarget::with_window(linked_session.clone(), 1);
     let destination_window = WindowTarget::with_window(destination_session, 1);
     set_window_metadata(&handler, &source_window, "linked").await;
     mark_auto_named(&handler, &source_window).await;
-    handler
-        .handle_ok(LinkWindowRequest::fixture((&source_window, &linked_window)))
-        .await;
+    TestRequest::send_ok(
+        &handler,
+        LinkWindowRequest::fixture((&source_window, &linked_window)),
+    )
+    .await;
 
-    handler
-        .handle_ok(BreakPaneRequest::fixture((
+    TestRequest::send_ok(
+        &handler,
+        BreakPaneRequest::fixture((
             PaneTarget::with_window(source_session.clone(), 1, 0),
             &destination_window,
-        )))
-        .await;
+        )),
+    )
+    .await;
 
     let state = handler.state.lock().await;
     assert_window_metadata(&state, &destination_window, Some("linked"), Some("60"));
@@ -442,7 +457,7 @@ async fn linked_single_pane_break_moves_metadata_to_the_new_alias() {
 #[tokio::test]
 async fn same_session_single_pane_break_keeps_moving_window_metadata() {
     let handler = RequestHandler::new();
-    let session = handler.create_session("metadata-same-break").await;
+    let session = SessionSpec::create(&handler, "metadata-same-break").await;
     handler
         .create_window(NewWindowRequest {
             target_window_index: Some(1),
@@ -454,12 +469,14 @@ async fn same_session_single_pane_break_keeps_moving_window_metadata() {
     set_window_metadata(&handler, &source_window, "same-session").await;
     mark_auto_named(&handler, &source_window).await;
 
-    handler
-        .handle_ok(BreakPaneRequest::fixture((
+    TestRequest::send_ok(
+        &handler,
+        BreakPaneRequest::fixture((
             PaneTarget::with_window(session.clone(), 1, 0),
             &destination_window,
-        )))
-        .await;
+        )),
+    )
+    .await;
 
     let state = handler.state.lock().await;
     assert_window_metadata(
@@ -478,22 +495,22 @@ async fn same_session_single_pane_break_keeps_moving_window_metadata() {
 #[tokio::test]
 async fn cross_session_multi_pane_break_does_not_copy_window_metadata() {
     let handler = RequestHandler::new();
-    let source_session = handler.create_session("metadata-multi-source").await;
-    handler
-        .handle_ok(SplitWindowRequest::fixture(&source_session))
-        .await;
-    let destination_session = handler.create_session("metadata-multi-destination").await;
+    let source_session = SessionSpec::create(&handler, "metadata-multi-source").await;
+    TestRequest::send_ok(&handler, SplitWindowRequest::fixture(&source_session)).await;
+    let destination_session = SessionSpec::create(&handler, "metadata-multi-destination").await;
     let source_window = WindowTarget::with_window(source_session.clone(), 0);
     let destination_window = WindowTarget::with_window(destination_session, 1);
     set_window_metadata(&handler, &source_window, "source-only").await;
     mark_auto_named(&handler, &source_window).await;
 
-    handler
-        .handle_ok(BreakPaneRequest::fixture((
+    TestRequest::send_ok(
+        &handler,
+        BreakPaneRequest::fixture((
             PaneTarget::with_window(source_session.clone(), 0, 1),
             &destination_window,
-        )))
-        .await;
+        )),
+    )
+    .await;
 
     let state = handler.state.lock().await;
     assert_window_metadata(&state, &source_window, Some("source-only"), Some("60"));

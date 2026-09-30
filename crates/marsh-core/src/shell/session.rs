@@ -299,12 +299,15 @@ pub(super) struct SourceDomain {
     epoch: Arc<AtomicU64>,
     /// Uncertain producer quiescence, with the coverage it leaves unusable.
     failure: Mutex<Option<(PathBuf, Arc<ShellError>)>>,
+    /// The ready native tracer every shell over this source keeps alive; dropped after storage.
+    tracing: Arc<Tracing>,
 }
 impl SourceDomain {
     /// Resolves `initial` to its logical directory, policy root and source domain. Creates nothing.
     pub fn discover(
         initial: &Path,
         backend: Option<Arc<dyn Subvolumes>>,
+        tracing: Arc<Tracing>,
     ) -> Result<Discovered, ShellError> {
         let fs = backend.unwrap_or_else(|| Arc::clone(&FILESYSTEM));
         let initial = if initial.as_os_str().is_empty() {
@@ -354,6 +357,7 @@ impl SourceDomain {
                     materialized: tokio::sync::OnceCell::new(),
                     epoch: Arc::new(AtomicU64::new(0)),
                     failure: Mutex::new(None),
+                    tracing,
                 });
                 registry.domains.insert(key, Arc::downgrade(&domain));
                 domain
@@ -378,8 +382,7 @@ impl SourceDomain {
         self.materialized
             .get_or_try_init(|| async {
                 let (seed, root) = self.storage()?;
-                let tracing = Tracing::shared();
-                let scope = tracing.internal_scope()?;
+                let scope = self.tracing.internal_scope()?;
                 let _guard = scope.enter();
                 PersistenceLayer::new(seed.to_path_buf(), root.to_path_buf())
                     .materialize(self.fs.as_ref())?;
@@ -444,8 +447,7 @@ impl SourceDomain {
     /// Takes the lease and recovers durable authority into this domain's validator.
     fn recover(&self) -> Result<Arc<Session>, ShellError> {
         let (seed, root) = self.storage()?;
-        let tracing = Tracing::shared();
-        let scope = tracing.internal_scope()?;
+        let scope = self.tracing.internal_scope()?;
         let _guard = scope.enter();
         let mut persistence = PersistenceLayer::new(seed.to_path_buf(), root.to_path_buf());
         persistence.acquire()?;
@@ -496,7 +498,7 @@ impl SourceDomain {
         *self.validator.write()? = authority;
         Ok(Arc::new(Session {
             fs: Arc::clone(&self.fs),
-            tracing,
+            tracing: Arc::clone(&self.tracing),
             validator: Arc::clone(&self.validator),
             epoch: Arc::clone(&self.epoch),
             log,
@@ -585,13 +587,15 @@ impl ExecutionResources {
     }
 
     /// Queues for a route over this shell's coverage, evaluates the policy against consistent
-    /// inputs, and waits for overlapping conflicting work. Only the pure policy ever repeats.
+    /// inputs, and waits for overlapping conflicting work. Only the pure policy ever repeats, over
+    /// the same borrowed call and its once-converted action.
     ///
     /// A call made from inside another live command returns Busy instead of waiting, so no command
     /// ever waits on work that waits on it.
     pub async fn admit(
         &self,
-        command: &str,
+        tool: &(dyn std::any::Any + Send + Sync),
+        action: &Action,
         cancel: &tokio::sync::Notify,
         force: &AtomicBool,
         parent: Option<&Weak<Run>>,
@@ -634,7 +638,7 @@ impl ExecutionResources {
                     self.domain.open().await?;
                     continue;
                 }
-            } else if let Some(route) = self.decide(ticket, command)? {
+            } else if let Some(route) = self.decide(ticket, tool, action)? {
                 return Ok((admission, route));
             }
             if nested() {
@@ -659,7 +663,12 @@ impl ExecutionResources {
 
     /// Evaluates the policy once and grants its route when nothing excludes it. `Ok(None)` means
     /// the inputs changed or the route must wait; only a granted verdict leaves this function.
-    fn decide(&self, ticket: u64, command: &str) -> Result<Option<Route>, ShellError> {
+    fn decide(
+        &self,
+        ticket: u64,
+        tool: &(dyn std::any::Any + Send + Sync),
+        action: &Action,
+    ) -> Result<Option<Route>, ShellError> {
         let (sessions, revision) = {
             let registry = REGISTRY.lock().recover();
             (
@@ -673,7 +682,8 @@ impl ExecutionResources {
             .ok_or_else(|| ShellError::new(ShellErrorKind::Closed))?;
         let managed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.policy.eval(&CommandContext {
-                command,
+                tool,
+                action,
                 current,
                 sessions: &sessions,
                 validator: Arc::clone(&self.domain.validator),

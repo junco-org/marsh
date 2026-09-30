@@ -35,6 +35,7 @@
 //! `oracle-switch-frame.log`.
 
 use super::*;
+use crate::test_fixtures::{SessionSpec, TestRequest};
 
 pub(super) const CLIENT_SIZE: TerminalSize = TerminalSize {
     cols: 100,
@@ -644,19 +645,21 @@ pub(super) async fn linked_alias_sessions(
 ) -> (SessionName, SessionName) {
     let alpha = session_name("switch-frame-alpha");
     let beta = session_name("switch-frame-beta");
-    handler.create_session((&alpha, CLIENT_SIZE)).await;
-    handler.create_session((&beta, CLIENT_SIZE)).await;
+    SessionSpec::create(handler, (&alpha, CLIENT_SIZE)).await;
+    SessionSpec::create(handler, (&beta, CLIENT_SIZE)).await;
     handler.set_session_status(&alpha, source_status).await;
     handler.set_session_status(&beta, target_status).await;
-    handler
-        .handle_ok(LinkWindowRequest {
+    TestRequest::send_ok(
+        handler,
+        LinkWindowRequest {
             detached: false,
             ..Fixture::fixture((
                 WindowTarget::with_window(alpha.clone(), SOURCE_WINDOW_INDEX),
                 WindowTarget::with_window(beta.clone(), TARGET_WINDOW_INDEX),
             ))
-        })
-        .await;
+        },
+    )
+    .await;
     assert_eq!(
         active_window_index(handler, &beta).await,
         TARGET_WINDOW_INDEX,

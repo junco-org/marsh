@@ -1,4 +1,5 @@
 use super::*;
+use crate::test_fixtures::TestRequest;
 use rmux_proto::request::SwitchClientExt3Request;
 use rmux_proto::SplitWindowExtRequest;
 
@@ -21,12 +22,14 @@ impl LinkedPaneFixture {
         label: &str,
     ) -> Self {
         let linked_peer = create_session(handler, format!("{label}-linked")).await;
-        handler
-            .handle_ok(LinkWindowRequest::fixture((
+        TestRequest::send_ok(
+            handler,
+            LinkWindowRequest::fixture((
                 WindowTarget::with_window(owner.clone(), 0),
                 WindowTarget::with_window(linked_peer.clone(), 1),
-            )))
-            .await;
+            )),
+        )
+        .await;
 
         let mut state = handler.state.lock().await;
         let pane_one_id = state
@@ -70,12 +73,14 @@ async fn linked_two_pane_fixture(handler: &RequestHandler, label: &str) -> Linke
     // The default command is an interactive shell whose startup output is
     // unbounded in time. Split the quiet command every other fixture pane runs
     // so this window stops producing pane activity once its panes are up.
-    let split = handler
-        .handle_ok(SplitWindowExtRequest {
+    let split = TestRequest::send_ok(
+        handler,
+        SplitWindowExtRequest {
             command: Some(quiet_command()),
             ..Fixture::fixture(&owner)
-        })
-        .await;
+        },
+    )
+    .await;
     handler
         .wait_for_pane_startup_to_finish_for_test(&split.pane)
         .await;
@@ -196,7 +201,7 @@ async fn select_pane_synchronizes_linked_and_grouped_window_aliases() {
     drain_attach_controls(&mut control_rx).await;
 
     let pane = PaneTarget::with_window(fixture.owner.clone(), 0, 1);
-    handler.handle_ok(SelectPaneRequest::fixture(pane)).await;
+    TestRequest::send_ok(&handler, SelectPaneRequest::fixture(pane)).await;
     assert_linked_active_pane(&handler, &fixture, 1).await;
 
     assert_refresh(

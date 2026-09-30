@@ -23,35 +23,38 @@
 // modified arrows behave exactly as before.
 
 use super::*;
+use crate::test_fixtures::TestRequest;
 use std::future::Future;
 
 const PROBE: &str = "@probe180";
 
 async fn bind_repeating(handler: &RequestHandler, table: &str, key: &str, command: &[&str]) {
-    handler
-        .handle_ok(BindKeyRequest {
+    TestRequest::send_ok(
+        handler,
+        BindKeyRequest {
             repeat: true,
             ..Fixture::fixture((table, key, command.iter().copied()))
-        })
-        .await;
+        },
+    )
+    .await;
 }
 
 async fn unbind(handler: &RequestHandler, table: &str, key: &str) {
-    handler
-        .handle_ok(UnbindKeyRequest {
+    TestRequest::send_ok(
+        handler,
+        UnbindKeyRequest {
             table_name: table.to_owned(),
             key: Some(key.to_owned()),
             all: false,
             quiet: false,
-        })
-        .await;
+        },
+    )
+    .await;
 }
 
 /// Dispatch a key through the client's key table, exactly like `send-keys -K`.
 async fn dispatch_key_table(handler: &RequestHandler, target: &PaneTarget, key: &str) {
-    handler
-        .handle_ok(SendKeysExtRequest::fixture((target, [key])))
-        .await;
+    TestRequest::send_ok(handler, SendKeysExtRequest::fixture((target, [key]))).await;
 }
 
 /// Read the copy cursor row through `#{copy_cursor_y}`, the same surface the
@@ -215,31 +218,33 @@ async fn prefix_table_default_arrow_selects_the_pane_in_that_direction() {
     create_quiet_input_session(&handler, &alpha).await;
     let _control_rx = handler.attach_client(requester_pid, &alpha).await;
 
-    let split = handler
-        .handle_ok(rmux_proto::SplitWindowExtRequest {
+    let split = TestRequest::send_ok(
+        &handler,
+        rmux_proto::SplitWindowExtRequest {
             command: Some(quiet_command()),
             ..Fixture::fixture(&target)
-        })
-        .await;
+        },
+    )
+    .await;
     handler
         .wait_for_pane_startup_to_finish_for_test(&split.pane)
         .await;
 
-    let split = handler
-        .handle_ok(rmux_proto::SplitWindowExtRequest {
+    let split = TestRequest::send_ok(
+        &handler,
+        rmux_proto::SplitWindowExtRequest {
             direction: SplitDirection::Horizontal,
             command: Some(quiet_command()),
             ..Fixture::fixture(PaneTarget::new(alpha.clone(), 1))
-        })
-        .await;
+        },
+    )
+    .await;
     handler
         .wait_for_pane_startup_to_finish_for_test(&split.pane)
         .await;
 
     let selected = PaneTarget::new(alpha.clone(), 2);
-    handler
-        .handle_ok(SelectPaneRequest::fixture(&selected))
-        .await;
+    TestRequest::send_ok(&handler, SelectPaneRequest::fixture(&selected)).await;
 
     dispatch_key_table(&handler, &PaneTarget::new(alpha.clone(), 2), "C-b").await;
     dispatch_key_table(&handler, &PaneTarget::new(alpha.clone(), 2), "Up").await;
@@ -294,19 +299,21 @@ async fn prefix_table_arrow_repeat_semantics_come_from_the_binding() {
 
     // Stack three panes vertically: 0 on top, then 1, then 2.
     for source in [0u32, 1] {
-        let split = handler
-            .handle_ok(rmux_proto::SplitWindowExtRequest {
+        let split = TestRequest::send_ok(
+            &handler,
+            rmux_proto::SplitWindowExtRequest {
                 command: Some(quiet_command()),
                 ..Fixture::fixture(PaneTarget::new(alpha.clone(), source))
-            })
-            .await;
+            },
+        )
+        .await;
         handler
             .wait_for_pane_startup_to_finish_for_test(&split.pane)
             .await;
     }
 
     let bottom = PaneTarget::new(alpha.clone(), 2);
-    handler.handle_ok(SelectPaneRequest::fixture(&bottom)).await;
+    TestRequest::send_ok(&handler, SelectPaneRequest::fixture(&bottom)).await;
 
     dispatch_key_table(&handler, &bottom, "C-b").await;
     dispatch_key_table(&handler, &bottom, "Up").await;
@@ -552,7 +559,7 @@ async fn copy_mode_arrow_binding_case(mode_keys: &str, table: &str, key: &str, s
         &["set-option", "-g", PROBE, &expected],
     )
     .await;
-    handler.handle_ok(CopyModeRequest::fixture(&target)).await;
+    TestRequest::send_ok(&handler, CopyModeRequest::fixture(&target)).await;
     let before = copy_cursor_y(&handler, &target).await;
 
     type_live(&handler, requester_pid, sequence).await;
@@ -595,7 +602,7 @@ async fn copy_mode_default_arrows_still_move_the_copy_cursor() {
         let _control_rx = handler.attach_client(requester_pid, &alpha).await;
         set_mode_keys(&handler, &alpha, mode_keys).await;
         fill_transcript(&handler, &target).await;
-        handler.handle_ok(CopyModeRequest::fixture(&target)).await;
+        TestRequest::send_ok(&handler, CopyModeRequest::fixture(&target)).await;
 
         let before = copy_cursor_y(&handler, &target).await;
         assert!(before > 0, "{table} needs room to move up");
@@ -628,7 +635,7 @@ async fn copy_mode_unbound_arrow_stays_inert() {
     set_mode_keys(&handler, &alpha, "emacs").await;
     fill_transcript(&handler, &target).await;
     unbind(&handler, "copy-mode", "Up").await;
-    handler.handle_ok(CopyModeRequest::fixture(&target)).await;
+    TestRequest::send_ok(&handler, CopyModeRequest::fixture(&target)).await;
 
     let before = copy_cursor_y(&handler, &target).await;
     type_live(&handler, requester_pid, b"\x1b[A").await;
@@ -669,7 +676,7 @@ async fn copy_mode_modified_arrows_still_resolve_from_the_table() {
             &["set-option", "-g", PROBE, &expected],
         )
         .await;
-        handler.handle_ok(CopyModeRequest::fixture(&target)).await;
+        TestRequest::send_ok(&handler, CopyModeRequest::fixture(&target)).await;
 
         type_live(&handler, requester_pid, sequence).await;
 
@@ -694,7 +701,7 @@ async fn copy_mode_default_modified_arrow_still_scrolls_a_half_page() {
     let _control_rx = handler.attach_client(requester_pid, &alpha).await;
     set_mode_keys(&handler, &alpha, "emacs").await;
     fill_transcript(&handler, &target).await;
-    handler.handle_ok(CopyModeRequest::fixture(&target)).await;
+    TestRequest::send_ok(&handler, CopyModeRequest::fixture(&target)).await;
 
     let before = scroll_position(&handler, &target).await;
     type_live(&handler, requester_pid, b"\x1b[1;3A").await;
@@ -719,7 +726,7 @@ async fn copy_mode_user_binding_replaces_the_default_motion() {
     set_mode_keys(&handler, &alpha, "emacs").await;
     fill_transcript(&handler, &target).await;
     bind(&handler, "copy-mode", "Down", &["send", "-X", "cursor-up"]).await;
-    handler.handle_ok(CopyModeRequest::fixture(&target)).await;
+    TestRequest::send_ok(&handler, CopyModeRequest::fixture(&target)).await;
 
     let before = copy_cursor_y(&handler, &target).await;
     assert!(before > 0, "the copy cursor needs room to move up");
@@ -771,7 +778,7 @@ async fn copy_mode_default_q_still_cancels_through_the_table() {
     let _control_rx = handler.attach_client(requester_pid, &alpha).await;
     set_mode_keys(&handler, &alpha, "emacs").await;
     fill_transcript(&handler, &target).await;
-    handler.handle_ok(CopyModeRequest::fixture(&target)).await;
+    TestRequest::send_ok(&handler, CopyModeRequest::fixture(&target)).await;
 
     type_live(&handler, requester_pid, b"q").await;
 
@@ -846,7 +853,7 @@ async fn copy_mode_key_binding_case(mode_keys: &str, table: &str, key: &str, seq
         &["set-option", "-g", PROBE, &expected],
     )
     .await;
-    handler.handle_ok(CopyModeRequest::fixture(&target)).await;
+    TestRequest::send_ok(&handler, CopyModeRequest::fixture(&target)).await;
 
     type_live(&handler, requester_pid, sequence).await;
 
@@ -897,7 +904,7 @@ async fn copy_mode_escape_binding_wins_on_the_bare_escape_path() {
             &["set-option", "-g", PROBE, "HIT-Escape"],
         )
         .await;
-        handler.handle_ok(CopyModeRequest::fixture(&target)).await;
+        TestRequest::send_ok(&handler, CopyModeRequest::fixture(&target)).await;
 
         let mut pending_input = Vec::new();
         handler
@@ -943,7 +950,7 @@ async fn copy_mode_unbound_shim_keys_stay_inert() {
         set_mode_keys(&handler, &alpha, mode_keys).await;
         fill_transcript(&handler, &target).await;
         unbind(&handler, table, key).await;
-        handler.handle_ok(CopyModeRequest::fixture(&target)).await;
+        TestRequest::send_ok(&handler, CopyModeRequest::fixture(&target)).await;
         let before = copy_cursor_y(&handler, &target).await;
 
         type_live(&handler, requester_pid, sequence).await;
@@ -980,7 +987,7 @@ async fn copy_mode_space_defaults_match_the_measured_tmux_tables() {
         let _control_rx = handler.attach_client(requester_pid, &alpha).await;
         set_mode_keys(&handler, &alpha, mode_keys).await;
         fill_transcript(&handler, &target).await;
-        handler.handle_ok(CopyModeRequest::fixture(&target)).await;
+        TestRequest::send_ok(&handler, CopyModeRequest::fixture(&target)).await;
 
         type_live(&handler, requester_pid, b" ").await;
 
@@ -1005,7 +1012,7 @@ async fn copy_mode_emacs_c_space_begins_the_selection() {
     let _control_rx = handler.attach_client(requester_pid, &alpha).await;
     set_mode_keys(&handler, &alpha, "emacs").await;
     fill_transcript(&handler, &target).await;
-    handler.handle_ok(CopyModeRequest::fixture(&target)).await;
+    TestRequest::send_ok(&handler, CopyModeRequest::fixture(&target)).await;
 
     type_live(&handler, requester_pid, b"\x00").await;
 
@@ -1030,7 +1037,7 @@ async fn copy_mode_vi_escape_clears_the_selection_without_leaving_copy_mode() {
     let _control_rx = handler.attach_client(requester_pid, &alpha).await;
     set_mode_keys(&handler, &alpha, "vi").await;
     fill_transcript(&handler, &target).await;
-    handler.handle_ok(CopyModeRequest::fixture(&target)).await;
+    TestRequest::send_ok(&handler, CopyModeRequest::fixture(&target)).await;
 
     let mut pending_input = Vec::new();
     handler
@@ -1061,7 +1068,7 @@ async fn copy_mode_emacs_enter_is_unbound_like_tmux() {
     let _control_rx = handler.attach_client(requester_pid, &alpha).await;
     set_mode_keys(&handler, &alpha, "emacs").await;
     fill_transcript(&handler, &target).await;
-    handler.handle_ok(CopyModeRequest::fixture(&target)).await;
+    TestRequest::send_ok(&handler, CopyModeRequest::fixture(&target)).await;
     type_live(&handler, requester_pid, b"\x00").await;
     type_live(&handler, requester_pid, b"\x1b[C").await;
     assert_eq!(
@@ -1103,7 +1110,7 @@ async fn read_only_client_keys_reach_neither_the_table_nor_copy_mode() {
         &["set-option", "-g", PROBE, "HIT-readonly"],
     )
     .await;
-    handler.handle_ok(CopyModeRequest::fixture(&target)).await;
+    TestRequest::send_ok(&handler, CopyModeRequest::fixture(&target)).await;
     let before = copy_cursor_y(&handler, &target).await;
 
     type_live(&handler, requester_pid, b"q").await;
@@ -1146,7 +1153,7 @@ async fn prefix_table_wins_over_copy_mode_for_keys_the_shim_ate() {
         &["set-option", "-g", PROBE, "HIT-prefix-q"],
     )
     .await;
-    handler.handle_ok(CopyModeRequest::fixture(&target)).await;
+    TestRequest::send_ok(&handler, CopyModeRequest::fixture(&target)).await;
 
     type_live(&handler, requester_pid, b"\x02").await;
     type_live(&handler, requester_pid, b"q").await;
@@ -1194,7 +1201,7 @@ async fn copy_mode_default_ss3_arrows_still_move_the_copy_cursor() {
     let _control_rx = handler.attach_client(requester_pid, &alpha).await;
     set_mode_keys(&handler, &alpha, "emacs").await;
     fill_transcript(&handler, &target).await;
-    handler.handle_ok(CopyModeRequest::fixture(&target)).await;
+    TestRequest::send_ok(&handler, CopyModeRequest::fixture(&target)).await;
 
     let before = copy_cursor_y(&handler, &target).await;
     assert!(before > 0, "the copy cursor needs room to move up");
@@ -1226,17 +1233,19 @@ async fn detached_send_keys_x_ignores_the_key_tables() {
         &["set-option", "-g", PROBE, "HIT-Up"],
     )
     .await;
-    handler.handle_ok(CopyModeRequest::fixture(&target)).await;
+    TestRequest::send_ok(&handler, CopyModeRequest::fixture(&target)).await;
 
     let before = copy_cursor_y(&handler, &target).await;
     assert!(before > 0, "the copy cursor needs room to move up");
-    handler
-        .handle_ok(SendKeysExtRequest {
+    TestRequest::send_ok(
+        &handler,
+        SendKeysExtRequest {
             dispatch_key_table: false,
             copy_mode_command: true,
             ..Fixture::fixture((&target, ["cursor-up"]))
-        })
-        .await;
+        },
+    )
+    .await;
 
     assert_eq!(
         copy_cursor_y(&handler, &target).await,

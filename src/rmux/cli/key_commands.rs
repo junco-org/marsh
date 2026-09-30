@@ -12,7 +12,7 @@ use rmux_proto::{
     SendKeysExtRequest, UnbindKeyRequest,
 };
 
-use super::target_resolution::{resolve_optional_pane_target, run_targeted};
+use super::target_resolution::CommandTarget;
 use super::{
     ExitFailure, expect_command_output, run_command, run_command_resolved, write_command_output,
 };
@@ -31,7 +31,7 @@ pub(super) fn run_send_keys(args: SendKeysArgs, socket_path: &Path) -> Result<i3
     }
 
     if send_keys_uses_legacy_path(&args) {
-        return run_targeted(
+        return PaneTarget::run(
             socket_path,
             "send-keys",
             args.target.as_ref(),
@@ -40,7 +40,7 @@ pub(super) fn run_send_keys(args: SendKeysArgs, socket_path: &Path) -> Result<i3
     }
 
     run_command_resolved(socket_path, "send-keys", move |connection| {
-        let target = resolve_optional_pane_target(connection, args.target.as_ref())?;
+        let target = Option::<PaneTarget>::resolve(connection, args.target.as_ref(), "send-keys")?;
         send_keys_extended(connection, args, target)
     })
 }
@@ -403,7 +403,7 @@ pub(super) fn run_send_prefix(
     args: &SendPrefixArgs,
     socket_path: &Path,
 ) -> Result<i32, ExitFailure> {
-    run_targeted(
+    Option::<PaneTarget>::run(
         socket_path,
         "send-prefix",
         args.target.as_ref(),

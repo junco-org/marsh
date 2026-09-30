@@ -5,16 +5,8 @@ use rmux_proto::RmuxError;
 use tokio::sync::mpsc;
 use tokio::time::{timeout, Duration};
 
+use crate::test_fixtures::{SessionSpec, TestRequest};
 use crate::test_names::session_name;
-
-async fn create_attached_session(
-    handler: &RequestHandler,
-    requester_pid: u32,
-    name: &str,
-) -> mpsc::UnboundedReceiver<AttachControl> {
-    let session = handler.create_session(name).await;
-    handler.attach_client(requester_pid, session).await
-}
 
 async fn recv_switch_frame(control_rx: &mut mpsc::UnboundedReceiver<AttachControl>) -> String {
     loop {
@@ -51,7 +43,7 @@ fn parse_command(command: &str) -> rmux_core::command_parser::ParsedCommands {
 async fn active_command_prompt_accepts_one_megabyte_frame_with_bounded_work() {
     let handler = RequestHandler::new();
     let requester_pid = std::process::id();
-    let mut control_rx = create_attached_session(&handler, requester_pid, "prompt-bulk").await;
+    let mut control_rx = SessionSpec::create_attached(&handler, requester_pid, "prompt-bulk").await;
     let parsed = parse_command("command-prompt -b -pbulk");
     handler
         .execute_parsed_commands_for_test(requester_pid, parsed)
@@ -83,7 +75,7 @@ async fn batched_prompt_text_preserves_split_utf8_at_the_input_boundary() {
     let handler = RequestHandler::new();
     let requester_pid = std::process::id();
     let mut control_rx =
-        create_attached_session(&handler, requester_pid, "prompt-split-utf8").await;
+        SessionSpec::create_attached(&handler, requester_pid, "prompt-split-utf8").await;
     let parsed = parse_command("command-prompt -b -pbulk");
     handler
         .execute_parsed_commands_for_test(requester_pid, parsed)
@@ -117,7 +109,7 @@ async fn timed_out_partial_prompt_mouse_resolves_as_escape() {
     let handler = RequestHandler::new();
     let requester_pid = std::process::id();
     let mut control_rx =
-        create_attached_session(&handler, requester_pid, "prompt-partial-mouse").await;
+        SessionSpec::create_attached(&handler, requester_pid, "prompt-partial-mouse").await;
     let parsed = parse_command("command-prompt -b -pname");
     handler
         .execute_parsed_commands_for_test(requester_pid, parsed)
@@ -155,7 +147,7 @@ async fn timed_out_partial_prompt_mouse_resolves_as_escape() {
 async fn command_prompt_renders_prompt_and_executes_substituted_command() {
     let handler = RequestHandler::new();
     let requester_pid = std::process::id();
-    let mut control_rx = create_attached_session(&handler, requester_pid, "alpha").await;
+    let mut control_rx = SessionSpec::create_attached(&handler, requester_pid, "alpha").await;
     let parsed = parse_command("command-prompt -pname { display-message -p -- 'value=%%' }");
     let handler_task = handler.clone();
     let join = tokio::spawn(async move {
@@ -185,7 +177,8 @@ async fn rename_session_rekeys_the_active_prompt_execution_context() {
     let requester_pid = std::process::id();
     let alpha = session_name("prompt-rename-alpha");
     let beta = session_name("prompt-rename-beta");
-    let mut control_rx = create_attached_session(&handler, requester_pid, alpha.as_str()).await;
+    let mut control_rx =
+        SessionSpec::create_attached(&handler, requester_pid, alpha.as_str()).await;
     let parsed = parse_command("command-prompt -pgo { display-message -p '#{session_name}' }");
     let context = super::scripting_support::QueueExecutionContext::without_caller_cwd()
         .with_implicit_current_target(Some(rmux_proto::Target::Pane(rmux_proto::PaneTarget::new(
@@ -200,12 +193,14 @@ async fn rename_session_rekeys_the_active_prompt_execution_context() {
     });
     let _ = recv_switch_frame_containing(&mut control_rx, "go ").await;
 
-    handler
-        .handle_ok(rmux_proto::RenameSessionRequest {
+    TestRequest::send_ok(
+        &handler,
+        rmux_proto::RenameSessionRequest {
             target: alpha,
             new_name: beta.clone(),
-        })
-        .await;
+        },
+    )
+    .await;
     handler
         .handle_attached_live_input_for_test(requester_pid, b"\r")
         .await
@@ -222,7 +217,7 @@ async fn rename_session_rekeys_the_active_prompt_execution_context() {
 async fn command_prompt_default_label_uses_first_template_command_name() {
     let handler = RequestHandler::new();
     let requester_pid = std::process::id();
-    let mut control_rx = create_attached_session(&handler, requester_pid, "alpha").await;
+    let mut control_rx = SessionSpec::create_attached(&handler, requester_pid, "alpha").await;
     let parsed = parse_command("command-prompt -I'#W' { rename-window -- '%%' }");
     let handler_task = handler.clone();
     let join = tokio::spawn(async move {
@@ -251,7 +246,7 @@ async fn command_prompt_default_label_uses_first_template_command_name() {
 async fn command_prompt_multi_prompt_substitutes_percent_indices() {
     let handler = RequestHandler::new();
     let requester_pid = std::process::id();
-    let mut control_rx = create_attached_session(&handler, requester_pid, "alpha").await;
+    let mut control_rx = SessionSpec::create_attached(&handler, requester_pid, "alpha").await;
     let parsed = parse_command(
         "command-prompt -pfirst,second { display-message -p -- 'first=%1 second=%2 default=%%' }",
     );
@@ -287,7 +282,7 @@ async fn command_prompt_multi_prompt_substitutes_percent_indices() {
 async fn confirm_before_accepts_enter_with_default_yes_and_skips_on_decline() {
     let handler = RequestHandler::new();
     let requester_pid = std::process::id();
-    let mut control_rx = create_attached_session(&handler, requester_pid, "alpha").await;
+    let mut control_rx = SessionSpec::create_attached(&handler, requester_pid, "alpha").await;
     let parsed = parse_command("confirm-before -y -psure { display-message -p -- 'confirmed' }");
     let handler_task = handler.clone();
     let accept_join = tokio::spawn(async move {
@@ -334,7 +329,7 @@ async fn confirm_before_accepts_enter_with_default_yes_and_skips_on_decline() {
 #[tokio::test]
 async fn prompt_commands_return_tmux_style_errors_for_unknown_target_clients() {
     let handler = RequestHandler::new();
-    handler.create_session("alpha").await;
+    SessionSpec::create(&handler, "alpha").await;
 
     let prompt_error = handler
         .execute_parsed_commands_for_test(
@@ -365,7 +360,7 @@ async fn prompt_commands_return_tmux_style_errors_for_unknown_target_clients() {
 async fn second_prompt_request_returns_immediately_while_prompt_is_active() {
     let handler = RequestHandler::new();
     let requester_pid = std::process::id();
-    let mut control_rx = create_attached_session(&handler, requester_pid, "alpha").await;
+    let mut control_rx = SessionSpec::create_attached(&handler, requester_pid, "alpha").await;
     let first = parse_command("command-prompt -pfirst { display-message -p -- 'first=%%' }");
     let handler_task = handler.clone();
     let first_join = tokio::spawn(async move {
@@ -402,7 +397,7 @@ async fn second_prompt_request_returns_immediately_while_prompt_is_active() {
 async fn show_prompt_history_renders_tmux_sections_in_prompt_type_order() {
     let handler = RequestHandler::new();
     let requester_pid = std::process::id();
-    let mut control_rx = create_attached_session(&handler, requester_pid, "alpha").await;
+    let mut control_rx = SessionSpec::create_attached(&handler, requester_pid, "alpha").await;
 
     let parsed = parse_command("command-prompt -pcommand { display-message -p -- 'command=%%' }");
     let handler_task = handler.clone();
@@ -471,7 +466,7 @@ async fn show_prompt_history_renders_tmux_sections_in_prompt_type_order() {
 async fn clear_prompt_history_clears_selected_type_without_touching_others() {
     let handler = RequestHandler::new();
     let requester_pid = std::process::id();
-    let mut control_rx = create_attached_session(&handler, requester_pid, "alpha").await;
+    let mut control_rx = SessionSpec::create_attached(&handler, requester_pid, "alpha").await;
 
     let parsed = parse_command("command-prompt -pcommand { display-message -p -- 'command=%%' }");
     let handler_task = handler.clone();

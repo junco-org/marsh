@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use super::RequestHandler;
-use crate::test_fixtures::{unique_temp_path, wait_until, Fixture};
+use crate::test_fixtures::{unique_temp_path, wait_until, Fixture, SessionSpec, TestRequest};
 use rmux_core::{GridRenderOptions, ScreenCaptureRange};
 use rmux_proto::types::OptionScopeSelector;
 use rmux_proto::ListBuffersRequest;
@@ -54,9 +54,7 @@ fn save_buffer_request(
 #[tokio::test]
 async fn target_action_capture_resolves_raw_target_server_side() {
     let handler = RequestHandler::new();
-    handler
-        .create_session(("alpha", TerminalSize { cols: 20, rows: 4 }))
-        .await;
+    SessionSpec::create(&handler, ("alpha", TerminalSize { cols: 20, rows: 4 })).await;
     let target = PaneTarget::with_window(session_name("alpha"), 0, 0);
     handler
         .replace_transcript_for_test(
@@ -103,9 +101,7 @@ async fn target_action_capture_resolves_raw_target_server_side() {
 #[tokio::test]
 async fn direct_and_target_action_capture_join_stop_at_active_alternate_boundary() {
     let handler = RequestHandler::new();
-    handler
-        .create_session(("alpha", TerminalSize { cols: 8, rows: 2 }))
-        .await;
+    SessionSpec::create(&handler, ("alpha", TerminalSize { cols: 8, rows: 2 })).await;
     let target = PaneTarget::with_window(session_name("alpha"), 0, 0);
     handler
         .replace_transcript_for_test(
@@ -165,7 +161,7 @@ async fn direct_and_target_action_capture_join_stop_at_active_alternate_boundary
 async fn named_capture_buffer_keeps_dch_field_boundary_like_tmux_3_7b() {
     let handler = RequestHandler::new();
     let size = TerminalSize { cols: 12, rows: 8 };
-    handler.create_session(("mutations", size)).await;
+    SessionSpec::create(&handler, ("mutations", size)).await;
     let target = PaneTarget::with_window(session_name("mutations"), 0, 0);
     handler
         .replace_transcript_for_test(
@@ -176,14 +172,16 @@ async fn named_capture_buffer_keeps_dch_field_boundary_like_tmux_3_7b() {
         )
         .await;
 
-    let response = handler
-        .handle_ok(CapturePaneRequest {
+    let response = TestRequest::send_ok(
+        &handler,
+        CapturePaneRequest {
             print: false,
             buffer_name: Some("mutation-consumer".to_owned()),
             join_wrapped: true,
             ..Fixture::fixture(target)
-        })
-        .await;
+        },
+    )
+    .await;
     assert_eq!(response.buffer_name.as_deref(), Some("mutation-consumer"));
 
     let shown = handler
@@ -213,12 +211,14 @@ async fn named_capture_buffer_keeps_dch_field_boundary_like_tmux_3_7b() {
 }
 
 async fn send_marker(handler: &RequestHandler, target: PaneTarget, marker: &str) {
-    handler
-        .handle_ok(SendKeysRequest {
+    TestRequest::send_ok(
+        handler,
+        SendKeysRequest {
             target,
             keys: vec![marker_print_command(marker), "Enter".to_owned()],
-        })
-        .await;
+        },
+    )
+    .await;
 }
 
 fn marker_print_command(marker: &str) -> String {
@@ -230,8 +230,7 @@ async fn wait_for_capture(handler: &RequestHandler, target: PaneTarget, marker: 
         Duration::from_secs(10),
         Duration::from_millis(20),
         async || {
-            let stdout = handler
-                .handle_ok(CapturePaneRequest::fixture(&target))
+            let stdout = TestRequest::send_ok(handler, CapturePaneRequest::fixture(&target))
                 .await
                 .command_output()
                 .expect("capture-pane -p returns command output")
@@ -259,7 +258,7 @@ async fn capture_pane_prints_transcript_without_creating_buffer() {
     let target = PaneTarget::with_window(session_name("alpha"), 0, 0);
     let marker = "handler_capture_print_marker";
 
-    handler.create_session("alpha").await;
+    SessionSpec::create(&handler, "alpha").await;
     send_marker(&handler, target.clone(), marker).await;
 
     let output = wait_for_capture(&handler, target, marker).await;
@@ -277,17 +276,19 @@ async fn capture_pane_writes_named_buffer() {
     let target = PaneTarget::with_window(session_name("alpha"), 0, 0);
     let marker = "handler_capture_buffer_marker";
 
-    handler.create_session("alpha").await;
+    SessionSpec::create(&handler, "alpha").await;
     send_marker(&handler, target.clone(), marker).await;
     wait_for_capture(&handler, target.clone(), marker).await;
 
-    let response = handler
-        .handle_ok(CapturePaneRequest {
+    let response = TestRequest::send_ok(
+        &handler,
+        CapturePaneRequest {
             print: false,
             buffer_name: Some("capture-buffer".to_owned()),
             ..Fixture::fixture(target)
-        })
-        .await;
+        },
+    )
+    .await;
     assert_eq!(response.buffer_name.as_deref(), Some("capture-buffer"));
     assert!(response.command_output().is_none());
 
@@ -306,7 +307,7 @@ async fn capture_pane_do_not_trim_uses_tmux_cell_capacity() {
     let target = PaneTarget::with_window(session_name("capacity"), 0, 0);
     let size = TerminalSize { cols: 20, rows: 6 };
 
-    handler.create_session(("capacity", size)).await;
+    SessionSpec::create(&handler, ("capacity", size)).await;
     handler
         .replace_transcript_for_test(&target, size, b"a\r\nabcde\r\nabcdefghij\r\n")
         .await;
@@ -330,9 +331,7 @@ async fn capture_pane_do_not_trim_uses_tmux_cell_capacity() {
 async fn alternate_screen_off_keeps_program_output_on_main_screen() {
     let handler = RequestHandler::new();
     let target = PaneTarget::with_window(session_name("altscreen"), 0, 0);
-    handler
-        .create_session(("altscreen", TerminalSize { cols: 20, rows: 5 }))
-        .await;
+    SessionSpec::create(&handler, ("altscreen", TerminalSize { cols: 20, rows: 5 })).await;
 
     handler
         .set_option_by_name(OptionScopeSelector::WindowGlobal, "alternate-screen", "off")
@@ -438,9 +437,7 @@ async fn load_buffer_failure_does_not_mutate_existing_buffer() {
     let handler = RequestHandler::new();
     let missing_path = unique_temp_path("load-missing");
 
-    handler
-        .handle_ok(SetBufferRequest::fixture(("stable", b"original")))
-        .await;
+    TestRequest::send_ok(&handler, SetBufferRequest::fixture(("stable", b"original"))).await;
 
     let response = handler
         .handle(Request::LoadBuffer(Box::new(load_buffer_request(
@@ -504,9 +501,7 @@ async fn save_buffer_writes_server_file() {
     let handler = RequestHandler::new();
     let path = unique_temp_path("save-success");
 
-    handler
-        .handle_ok(SetBufferRequest::fixture(("saved", b"save me")))
-        .await;
+    TestRequest::send_ok(&handler, SetBufferRequest::fixture(("saved", b"save me"))).await;
 
     let response = handler
         .handle(Request::SaveBuffer(save_buffer_request(
@@ -541,9 +536,7 @@ async fn save_buffer_waiting_on_fifo_does_not_block_other_requests() {
             String::from_utf8_lossy(&output.stderr)
         );
 
-        handler
-            .handle_ok(SetBufferRequest::fixture(("saved", b"fifo data")))
-            .await;
+        TestRequest::send_ok(&handler, SetBufferRequest::fixture(("saved", b"fifo data"))).await;
 
         let reader_path = path.clone();
         let reader = std::thread::spawn(move || {
@@ -585,9 +578,11 @@ async fn save_buffer_resolves_relative_path_against_request_cwd() {
     let nested_dir = root.join("nested");
     std::fs::create_dir_all(&nested_dir).expect("create nested dir");
 
-    handler
-        .handle_ok(SetBufferRequest::fixture(("saved", b"relative save")))
-        .await;
+    TestRequest::send_ok(
+        &handler,
+        SetBufferRequest::fixture(("saved", b"relative save")),
+    )
+    .await;
 
     let response = handler
         .handle(Request::SaveBuffer(save_buffer_request(
@@ -613,9 +608,7 @@ async fn save_buffer_failure_does_not_mutate_existing_buffer() {
     let handler = RequestHandler::new();
     let path = unique_temp_path("missing-parent").join("out.txt");
 
-    handler
-        .handle_ok(SetBufferRequest::fixture(("stable", b"original")))
-        .await;
+    TestRequest::send_ok(&handler, SetBufferRequest::fixture(("stable", b"original"))).await;
 
     let response = handler
         .handle(Request::SaveBuffer(save_buffer_request(

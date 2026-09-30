@@ -3,12 +3,12 @@ use std::path::Path;
 use rmux_client::ClientError;
 use rmux_client::connect;
 use rmux_client::{ConnectResult, connect_or_absent};
-use rmux_proto::RmuxError;
 use rmux_proto::{ListSessionsRequest, RMUX_WIRE_VERSION};
+use rmux_proto::{RmuxError, SessionName};
 
 use super::{
-    ExitFailure, StartupOptions, connect_with_startserver, expect_command_output,
-    resolve_session_target_or_current, run_command, run_command_resolved, run_payload_command,
+    CommandTarget, ExitFailure, StartupOptions, connect_with_startserver, expect_command_output,
+    run_command, run_command_resolved, run_payload_command,
 };
 use super::{expect_command_success, write_command_output};
 use crate::cli_args::{ClientTargetArgs, ServerAccessArgs, SessionTargetArgs};
@@ -124,8 +124,7 @@ pub(super) fn run_lock_session(
     socket_path: &Path,
 ) -> Result<i32, ExitFailure> {
     run_command_resolved(socket_path, "lock-session", move |connection| {
-        let target =
-            resolve_session_target_or_current(connection, args.target.as_ref(), "lock-session")?;
+        let target = SessionName::resolve(connection, args.target.as_ref(), "lock-session")?;
         connection.lock_session(target).map_err(ExitFailure::from)
     })
 }

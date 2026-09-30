@@ -10,7 +10,7 @@ use rmux_proto::{
     SplitWindowRequest, TerminalSize, WindowTarget,
 };
 
-use crate::test_fixtures::Fixture;
+use crate::test_fixtures::{Fixture, SessionSpec, TestRequest};
 use crate::test_names::session_name;
 
 async fn rendered_window_layouts(handler: &RequestHandler, target: PaneTarget) -> (String, String) {
@@ -48,13 +48,15 @@ async fn resize_pane_zoom_toggles_the_target_window() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
 
-    handler.create_session(&alpha).await;
-    handler
-        .handle_ok(SplitWindowRequest {
+    SessionSpec::create(&handler, &alpha).await;
+    TestRequest::send_ok(
+        &handler,
+        SplitWindowRequest {
             direction: SplitDirection::Horizontal,
             ..Fixture::fixture(&alpha)
-        })
-        .await;
+        },
+    )
+    .await;
 
     let response = handler
         .handle(Request::ResizePane(ResizePaneRequest {
@@ -90,19 +92,21 @@ async fn visible_layout_and_layout_change_follow_zoom_for_inactive_windows() {
     let window_target = WindowTarget::with_window(alpha.clone(), 0);
     let pane_target = PaneTarget::with_window(alpha.clone(), 0, 0);
 
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
 
     let (single_layout, single_visible_layout) =
         rendered_window_layouts(&handler, pane_target.clone()).await;
     assert_eq!(single_layout, "b25d,80x24,0,0,0");
     assert_eq!(single_visible_layout, single_layout);
 
-    handler
-        .handle_ok(ResizePaneRequest {
+    TestRequest::send_ok(
+        &handler,
+        ResizePaneRequest {
             target: pane_target.clone(),
             adjustment: ResizePaneAdjustment::Zoom,
-        })
-        .await;
+        },
+    )
+    .await;
     assert!(
         !handler
             .state
@@ -116,17 +120,19 @@ async fn visible_layout_and_layout_change_follow_zoom_for_inactive_windows() {
         "tmux does not zoom a single-pane window"
     );
 
-    handler.handle_ok(SplitWindowRequest::fixture(&alpha)).await;
+    TestRequest::send_ok(&handler, SplitWindowRequest::fixture(&alpha)).await;
     let (split_layout, split_visible_layout) =
         rendered_window_layouts(&handler, pane_target.clone()).await;
     assert_eq!(split_visible_layout, split_layout);
 
-    handler
-        .handle_ok(ResizePaneRequest {
+    TestRequest::send_ok(
+        &handler,
+        ResizePaneRequest {
             target: pane_target.clone(),
             adjustment: ResizePaneAdjustment::Zoom,
-        })
-        .await;
+        },
+    )
+    .await;
     let (zoomed_layout, zoomed_visible_layout) =
         rendered_window_layouts(&handler, pane_target.clone()).await;
     assert_eq!(zoomed_layout, split_layout);
@@ -146,9 +152,7 @@ async fn visible_layout_and_layout_change_follow_zoom_for_inactive_windows() {
             ..Fixture::fixture(&alpha)
         })
         .await;
-    handler
-        .handle_ok(SelectWindowRequest { target: new_window })
-        .await;
+    TestRequest::send_ok(&handler, SelectWindowRequest { target: new_window }).await;
 
     let (inactive_layout, inactive_visible_layout) =
         rendered_window_layouts(&handler, pane_target.clone()).await;
@@ -161,12 +165,14 @@ async fn visible_layout_and_layout_change_follow_zoom_for_inactive_windows() {
         format!("%layout-change @{window_id} {split_layout} b25d,80x24,0,0,0 -Z")
     );
 
-    handler
-        .handle_ok(ResizePaneRequest {
+    TestRequest::send_ok(
+        &handler,
+        ResizePaneRequest {
             target: pane_target.clone(),
             adjustment: ResizePaneAdjustment::Zoom,
-        })
-        .await;
+        },
+    )
+    .await;
     let (unzoomed_layout, unzoomed_visible_layout) =
         rendered_window_layouts(&handler, pane_target).await;
     assert_eq!(unzoomed_layout, split_layout);
@@ -184,15 +190,15 @@ async fn display_panes_sends_overlay_to_attached_session_without_waiting_for_cle
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
 
-    handler
-        .create_session((&alpha, TerminalSize::new(8, 4)))
-        .await;
-    handler
-        .handle_ok(SplitWindowRequest {
+    SessionSpec::create(&handler, (&alpha, TerminalSize::new(8, 4))).await;
+    TestRequest::send_ok(
+        &handler,
+        SplitWindowRequest {
             direction: SplitDirection::Horizontal,
             ..Fixture::fixture(&alpha)
-        })
-        .await;
+        },
+    )
+    .await;
     let mut control_rx = handler.attach_client(42, &alpha).await;
 
     let response = handler

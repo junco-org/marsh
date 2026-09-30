@@ -30,6 +30,7 @@ use super::switch_frame_geometry::{
     frame_geometry, linked_aliases_with_policy, window_content_size, CLIENT_SIZE,
     SOURCE_WINDOW_INDEX, STATUS_OFF, TARGET_WINDOW_INDEX,
 };
+use crate::test_fixtures::{SessionSpec, TestRequest};
 
 /// The moving client's geometry. It registers first, so under `latest` it is
 /// the older vote right up to the moment it switches.
@@ -92,7 +93,7 @@ async fn attached_switch_credits_the_destination_recency_exactly_once() {
     // up ahead of it, which is what makes the credit demonstrably this command's
     // rather than something it already carried.
     let witness = session_name("combined-switch-witness");
-    handler.create_session((&witness, CLIENT_SIZE)).await;
+    SessionSpec::create(&handler, (&witness, CLIENT_SIZE)).await;
     let alpha_before = session_recency(&handler, &alpha).await;
     let beta_before = session_recency(&handler, &beta).await;
     let witness_before = session_recency(&handler, &witness).await;
@@ -322,12 +323,14 @@ async fn rename_between_switch_selection_and_commit_preserves_both_orders() {
         tokio::time::timeout(ATTACH_LIFECYCLE_TIMEOUT, pause.reached.notified())
             .await
             .expect("the switch reaches its selection pause");
-        handler
-            .handle_ok(RenameSessionRequest {
+        TestRequest::send_ok(
+            &handler,
+            RenameSessionRequest {
                 target: alpha.clone(),
                 new_name: renamed.clone(),
-            })
-            .await;
+            },
+        )
+        .await;
         // The rename refreshes the family it renamed and enqueues a frame of
         // its own, at the geometry the shared window still has. Drain it here,
         // while the command is still parked, so the frame examined below is the

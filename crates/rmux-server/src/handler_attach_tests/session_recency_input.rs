@@ -22,6 +22,7 @@
 //! instead of erasing it.
 
 use super::*;
+use crate::test_fixtures::{SessionSpec, TestRequest};
 use rmux_core::{TargetFindContext, TargetFindFlags, TargetFindType, UnresolvedTarget};
 
 /// One arbitrary but fixed second shared by every session in a fixture.
@@ -99,7 +100,7 @@ async fn interaction_fixture(
 ) -> (RequestHandler, mpsc::UnboundedReceiver<AttachControl>) {
     let handler = RequestHandler::new();
     let control_rx = create_quiet_attached_session(&handler, attach_pid, &session_name(USED)).await;
-    handler.create_session(Quiet(SPARE)).await;
+    SessionSpec::create(&handler, Quiet(SPARE)).await;
     pin_public_seconds(&handler).await;
     assert_eq!(
         default_session(&handler).await,
@@ -158,7 +159,7 @@ async fn a_locally_consumed_mode_key_advances_targetless_session_recency() {
     );
 
     // Only now is the rival created, so copy mode itself cannot be the cause.
-    handler.create_session(Quiet(SPARE)).await;
+    SessionSpec::create(&handler, Quiet(SPARE)).await;
     pin_public_seconds(&handler).await;
     assert_eq!(default_session(&handler).await, session_name(SPARE));
 
@@ -195,9 +196,7 @@ async fn successful_pane_input_advances_targetless_session_recency() {
 async fn synchronized_pane_input_advances_the_session_at_the_admission_boundary() {
     let attach_pid = std::process::id();
     let (handler, _control_rx) = interaction_fixture(attach_pid).await;
-    handler
-        .handle_ok(SplitWindowRequest::fixture(session_name(USED)))
-        .await;
+    TestRequest::send_ok(&handler, SplitWindowRequest::fixture(session_name(USED))).await;
     handler
         .set_option(
             ScopeSelector::Window(WindowTarget::with_window(session_name(USED), 0)),
@@ -224,17 +223,19 @@ async fn synchronized_pane_input_advances_the_session_at_the_admission_boundary(
 async fn switching_a_client_advances_the_target_session_recency() {
     let attach_pid = std::process::id();
     let handler = RequestHandler::new();
-    handler.create_session(Quiet(USED)).await;
-    handler.create_session(Quiet(SPARE)).await;
+    SessionSpec::create(&handler, Quiet(USED)).await;
+    SessionSpec::create(&handler, Quiet(SPARE)).await;
     let _control_rx = handler.attach_client(attach_pid, SPARE).await;
     pin_public_seconds(&handler).await;
     assert_eq!(default_session(&handler).await, session_name(SPARE));
 
-    handler
-        .handle_ok(SwitchClientRequest {
+    TestRequest::send_ok(
+        &handler,
+        SwitchClientRequest {
             target: session_name(USED),
-        })
-        .await;
+        },
+    )
+    .await;
     pin_public_seconds(&handler).await;
 
     // tmux 3.7b updates session activity when a client switches into a
@@ -262,7 +263,7 @@ async fn read_only_fixture(
     attach_pid: u32,
 ) -> (RequestHandler, mpsc::UnboundedReceiver<AttachControl>) {
     let handler = RequestHandler::new();
-    handler.create_session(Quiet(USED)).await;
+    SessionSpec::create(&handler, Quiet(USED)).await;
     let (control_tx, control_rx) = mpsc::unbounded_channel();
     handler
         .register_attach_with_closing(
@@ -274,7 +275,7 @@ async fn read_only_fixture(
             crate::client_flags::ClientFlags::READONLY,
         )
         .await;
-    handler.create_session(Quiet(SPARE)).await;
+    SessionSpec::create(&handler, Quiet(SPARE)).await;
     (handler, control_rx)
 }
 
@@ -355,8 +356,8 @@ async fn input_must_not_advance_a_same_name_session_recreated_under_the_client()
 async fn a_live_attach_registration_credits_the_session_it_attached_to() {
     let attach_pid = std::process::id();
     let handler = RequestHandler::new();
-    handler.create_session(Quiet(USED)).await;
-    handler.create_session(Quiet(SPARE)).await;
+    SessionSpec::create(&handler, Quiet(USED)).await;
+    SessionSpec::create(&handler, Quiet(SPARE)).await;
     pin_public_seconds(&handler).await;
     assert_eq!(
         default_session(&handler).await,
@@ -379,8 +380,8 @@ async fn a_live_attach_registration_credits_the_session_it_attached_to() {
 async fn attach_registration_must_not_credit_a_same_name_replacement_session() {
     let attach_pid = std::process::id();
     let handler = Arc::new(RequestHandler::new());
-    handler.create_session(Quiet(USED)).await;
-    handler.create_session(Quiet(SPARE)).await;
+    SessionSpec::create(&handler, Quiet(USED)).await;
+    SessionSpec::create(&handler, Quiet(SPARE)).await;
     let original_id = handler.session_id_for_test(USED).await;
 
     // Registration publishes the attach, releases the state lock, and only then
@@ -432,8 +433,8 @@ async fn attach_registration_must_not_credit_a_same_name_replacement_session() {
 async fn attach_registration_must_not_credit_a_client_that_finished_first() {
     let attach_pid = std::process::id();
     let handler = Arc::new(RequestHandler::new());
-    handler.create_session(Quiet(USED)).await;
-    handler.create_session(Quiet(SPARE)).await;
+    SessionSpec::create(&handler, Quiet(USED)).await;
+    SessionSpec::create(&handler, Quiet(SPARE)).await;
 
     let pause = handler.install_attach_registration_activity_pause();
     let (control_tx, _control_rx) = mpsc::unbounded_channel();
@@ -474,8 +475,8 @@ async fn attach_registration_must_not_credit_a_client_that_finished_first() {
 async fn attach_registration_credit_follows_a_rename_of_the_same_session_lifetime() {
     let attach_pid = std::process::id();
     let handler = Arc::new(RequestHandler::new());
-    handler.create_session(Quiet(USED)).await;
-    handler.create_session(Quiet(SPARE)).await;
+    SessionSpec::create(&handler, Quiet(USED)).await;
+    SessionSpec::create(&handler, Quiet(SPARE)).await;
     let attached_id = handler.session_id_for_test(USED).await;
 
     let pause = handler.install_attach_registration_activity_pause();
@@ -494,12 +495,14 @@ async fn attach_registration_credit_follows_a_rename_of_the_same_session_lifetim
     // lifetime and the attach both survive; only the key it is stored under
     // moves, which is the one thing the captured name can no longer follow.
     let renamed = session_name(RENAMED_USED);
-    handler
-        .handle_ok(RenameSessionRequest {
+    TestRequest::send_ok(
+        &handler,
+        RenameSessionRequest {
             target: session_name(USED),
             new_name: renamed.clone(),
-        })
-        .await;
+        },
+    )
+    .await;
     assert_eq!(
         handler.session_id_for_test(RENAMED_USED).await,
         attached_id,
@@ -521,12 +524,12 @@ async fn attach_registration_credit_follows_a_rename_of_the_same_session_lifetim
 async fn detaching_does_not_advance_targetless_session_recency() {
     let attach_pid = std::process::id();
     let handler = RequestHandler::new();
-    handler.create_session(Quiet(USED)).await;
+    SessionSpec::create(&handler, Quiet(USED)).await;
     let (control_tx, _control_rx) = mpsc::unbounded_channel();
     let attach_id = handler
         .register_attach(attach_pid, session_name(USED), control_tx)
         .await;
-    handler.create_session(Quiet(SPARE)).await;
+    SessionSpec::create(&handler, Quiet(SPARE)).await;
     pin_public_seconds(&handler).await;
     assert_eq!(default_session(&handler).await, session_name(SPARE));
 
@@ -540,17 +543,19 @@ async fn detaching_does_not_advance_targetless_session_recency() {
 #[tokio::test]
 async fn explicit_send_keys_to_a_detached_session_does_not_advance_its_recency() {
     let handler = RequestHandler::new();
-    handler.create_session(Quiet(USED)).await;
-    handler.create_session(Quiet(SPARE)).await;
+    SessionSpec::create(&handler, Quiet(USED)).await;
+    SessionSpec::create(&handler, Quiet(SPARE)).await;
     pin_public_seconds(&handler).await;
     assert_eq!(default_session(&handler).await, session_name(SPARE));
 
-    handler
-        .handle_ok(SendKeysRequest {
+    TestRequest::send_ok(
+        &handler,
+        SendKeysRequest {
             target: PaneTarget::new(session_name(USED), 0),
             keys: vec!["x".to_owned()],
-        })
-        .await;
+        },
+    )
+    .await;
     pin_public_seconds(&handler).await;
 
     // tmux 3.7b measured: `send-keys` to a detached session left its

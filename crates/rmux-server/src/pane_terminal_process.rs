@@ -36,7 +36,7 @@ use std::time::Duration;
 use rmux_core::{PaneGeometry, PaneId};
 use rmux_proto::{ProcessCommand, RmuxError, SessionName, TerminalSize};
 
-use marsh_core::shellmux::{CommandOptions, JobIo, ShellId, SpawnOptions, TerminalGeometry};
+use marsh_core::shellmux::{CommandOptions, JobIo, SpawnOptions, TerminalGeometry};
 
 use crate::io::{Route, ShellHandle, ShellIo};
 use crate::terminal::{validate_process_command, TerminalProfile};
@@ -287,17 +287,6 @@ pub(crate) struct PaneTerminalRequest {
     pub(crate) command: Option<ProcessCommand>,
     /// The surface the job's bytes belong to.
     pub(crate) route: PaneRoute,
-    /// The shell id to open under, for a caller that already parsed one.
-    ///
-    /// `None` for every ordinary rmux pane: the engine allocates from its own anonymous series.
-    pub(crate) shell_id: Option<ShellId>,
-    /// Whether the job's lifetime is the engine's decision rather than rmux's.
-    ///
-    /// `false` for ordinary panes, whose explicit one-shot command closes the pane when it ends.
-    /// `true` for a job created through the shell prompt's `&` and directory forms, where core's
-    /// anonymous-job rules — automatic closure, cancellable by `keep` — are the semantics the
-    /// user asked for and rmux must not override.
-    pub(crate) follow_mux_lifetime: bool,
 }
 
 /// Opens one pane's terminal as a managed job, and routes it to that pane.
@@ -322,11 +311,9 @@ pub(crate) struct PaneTerminalRequest {
 /// with `close_on_finish` and gets no prompt.
 ///
 /// The line is admitted separately from the creation, because creation no longer takes one at
-/// all. An ordinary pane's closure therefore belongs to its *command*, which `keep` may not
-/// revoke — so selecting a fast one-shot pane between its last byte and its verdict cannot
-/// quietly make it permanent. [`PaneTerminalRequest::follow_mux_lifetime`] is the one case that
-/// wants core's cancellable automatic closure instead, and says so through
-/// [`SpawnOptions::automatic_close`](marsh_core::shellmux::SpawnOptions::automatic_close).
+/// all. A pane's closure therefore belongs to its *command*, which `keep` may not revoke — so
+/// selecting a fast one-shot pane between its last byte and its verdict cannot quietly make it
+/// permanent.
 ///
 /// # Errors
 ///
@@ -346,18 +333,12 @@ pub(crate) async fn open_pane_terminal(
         runtime_window_name,
         command,
         route,
-        shell_id,
-        follow_mux_lifetime,
     } = request;
     validate_process_command(command.as_ref())?;
     let line = profile.pane_workload_line(command.as_ref())?;
     let environment = profile.shell_environment()?;
     // The profile's own directory, as a host path; the core discovers the seed it lies in.
     let size = pane_terminal_size(geometry);
-    // A pane whose lifetime the engine owns keeps core's anonymous-shell rules: it reclaims
-    // itself once its line ends, and `keep` may cancel that. Every ordinary pane closes because
-    // its own one-shot command said so, which `keep` may not revoke.
-    let automatic_close = follow_mux_lifetime && shell_id.is_none() && line.is_some();
     let options = SpawnOptions {
         io: JobIo::Terminal {
             geometry: Some(TerminalGeometry {
@@ -366,12 +347,12 @@ pub(crate) async fn open_pane_terminal(
             }),
         },
         environment: Some(environment),
-        automatic_close,
+        ..SpawnOptions::default()
     };
 
     let admission = io.admission_lock().lock().await;
     let handle = io
-        .open_shell(profile.cwd(), shell_id, options)
+        .open_shell(profile.cwd(), None, options)
         .await
         .map_err(|error| {
             RmuxError::spawn_failed(format!(
@@ -398,9 +379,8 @@ pub(crate) async fn open_pane_terminal(
                     &handle,
                     line,
                     CommandOptions {
-                        // An engine-owned pane already reclaims itself; every other one closes
-                        // because this command said so.
-                        close_on_finish: !automatic_close,
+                        // The pane closes because this command said so.
+                        close_on_finish: true,
                         on_accept: None,
                     },
                 )

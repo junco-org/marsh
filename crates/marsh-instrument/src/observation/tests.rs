@@ -6,6 +6,7 @@
     clippy::zombie_processes
 )]
 
+use std::collections::HashSet;
 use super::*;
 use lurk_cli::syscall_info::SyscallArg;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -17,7 +18,6 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::Duration;
 
-const FILTER: &str = "trace=%file,%desc,%process,%memory,%fstat,%fstatfs";
 const TEST: &str = "observation::tests::native_observer_regressions";
 
 struct Delivery {
@@ -59,37 +59,36 @@ impl Trace {
     }
 }
 
-fn args() -> Args {
-    Args {
-        follow_forks: true,
-        expr: vec![FILTER.into()],
-        ..Args::default()
-    }
-}
-
+/// Seizes one command parked on its stdin, releases it, and records every delivery.
 fn trace(command: &mut Command, mut react: impl FnMut(&Delivery)) -> Trace {
     let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .spawn()
         .unwrap();
-    let mut observer = Observer::attach(Pid::from_raw(child.id().cast_signed()), &args()).unwrap();
-    child.stdin.take().unwrap().write_all(b"go\n").unwrap();
+    let pid = Pid::from_raw(child.id().cast_signed());
+    let mut observer = Observer::new(
+        Observer::selection().unwrap(),
+        Arc::new(Sequence::default()),
+        pid,
+    );
+    let stopped = observer.seize(pid).unwrap().expect("a parked child");
     let mut deliveries = Vec::new();
-    observer
-        .run(|sequence, tid, status, event, call| {
-            let delivery = Delivery {
-                sequence,
-                tid,
-                status: WaitStatus::from_raw(tid, status)?,
-                event,
-                call,
-            };
-            react(&delivery);
-            deliveries.push(delivery);
-            Ok(())
-        })
-        .unwrap();
+    let mut observe = |sequence, tid, status, event, call| {
+        let delivery = Delivery {
+            sequence,
+            tid,
+            status: WaitStatus::from_raw(tid, status)?,
+            event,
+            call,
+        };
+        react(&delivery);
+        deliveries.push(delivery);
+        Ok(())
+    };
+    observer.stop(pid, stopped, &mut observe).unwrap();
+    child.stdin.take().unwrap().write_all(b"go\n").unwrap();
+    observer.run(&mut observe).unwrap();
     Trace(deliveries)
 }
 
@@ -407,7 +406,12 @@ fn memory_at_page_edges() {
         .map(|value| value.parse().unwrap())
         .collect();
     let tid = Pid::from_raw(child.id().cast_signed());
-    let mut observer = Observer::attach(tid, &args()).unwrap();
+    let mut observer = Observer::new(
+        Observer::selection().unwrap(),
+        Arc::new(Sequence::default()),
+        tid,
+    );
+    let stopped = observer.seize(tid).unwrap().expect("a parked fixture");
     let address = locations[0] + locations[1] - locations[2];
     assert_eq!(
         crate::capture::read_path(tid, address).unwrap(),
@@ -431,29 +435,10 @@ fn memory_at_page_edges() {
     );
     assert!(crate::capture::read_flags(tid, locations[0] + locations[1] - 7).is_err());
     // Release the fresh executable, then let the same observer own every exit notification.
+    let mut ignore = |_, _, _, _, _| Ok(());
+    observer.stop(tid, stopped, &mut ignore).unwrap();
     child.stdin.take().unwrap().write_all(b"x").unwrap();
-    observer.run(|_, _, _, _, _| Ok(())).unwrap();
-}
-
-/// A task listed under the host can exit before the observer reaches it, and a busy host does so
-/// constantly. Seizing it then finds nothing, which is no failure to attach: the task is simply
-/// no longer part of the host, so it is skipped rather than ending the whole observation.
-#[test]
-fn a_task_gone_before_its_seizure_is_skipped() {
-    let mut child = Command::new("/bin/true").spawn().unwrap();
-    let gone = Pid::from_raw(child.id().cast_signed());
-    child.wait().unwrap();
-    let mut observer = Observer {
-        selected: SysnoSet::empty(),
-        tasks: HashMap::new(),
-        initial: Vec::new(),
-        sequence: 0,
-    };
-    assert!(
-        !observer.seize(gone, Options::empty()).unwrap(),
-        "a vanished task owes no initial stop"
-    );
-    assert!(observer.tasks.is_empty(), "and is not tracked");
+    observer.run(&mut ignore).unwrap();
 }
 
 #[test]

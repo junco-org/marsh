@@ -5,12 +5,13 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex, Weak};
 
+use crate::builtins::BuiltinContext;
 use crate::shellmux::error::MuxError;
 use crate::shellmux::frontend::{FrontendEvent, ShellFrontend, lock_frontend, notify};
 use crate::shellmux::ids::{JobDir, Principal, ShellId};
 use crate::shellmux::jobs::{ShellRegistry, validate_size};
 use crate::shellmux::types::MuxProfile;
-use crate::{OpenFile, ShellBuilder, ShellEnvironment, ShellFd};
+use crate::{Action, MarshTool, OpenFile, ShellBuilder, ShellEnvironment, ShellFd};
 use tokio::sync::Notify;
 
 /// Presentation identity and logical source location of one shell instance.
@@ -94,9 +95,37 @@ impl ShellMux {
         self.profile.builtins.contains_key(name) || matches!(name, "git" | "exec")
     }
 
+    /// Builds a transient shell at `directory` with this mux's builder and profile policy, runs
+    /// one tool call through it as [`crate::Shell::run_tool`] does, and closes it. The shell has
+    /// no streams and is not a job; it is named by its principal.
+    pub async fn run_tool<T: MarshTool, R: Send + 'static>(
+        self: &Arc<Self>,
+        directory: &Path,
+        tool: T,
+        operation: impl FnOnce(&BuiltinContext) -> R + Send + 'static,
+    ) -> Result<R, MuxError>
+    where
+        for<'a> &'a T: Into<Action>,
+    {
+        if self.is_closing() {
+            return Err(MuxError::ShuttingDown);
+        }
+        let shell = self
+            .build_shell(None, directory, HashMap::new(), None)
+            .await?;
+        let outcome = shell.run_tool(tool, operation).await;
+        let closed = shell.close(false).await;
+        match (outcome, closed) {
+            (Err(error), _) | (Ok(_), Err(error)) => Err(error.into()),
+            (Ok(value), Ok(())) => Ok(value),
+        }
+    }
+
+    /// Builds a shell with this mux's builder and profile; `id` is the display name a job
+    /// reserved, and a shell without one is named by its principal.
     pub(crate) async fn build_shell(
         &self,
-        id: ShellId,
+        id: Option<ShellId>,
         directory: &Path,
         fds: HashMap<ShellFd, OpenFile>,
         environment: Option<ShellEnvironment>,
@@ -120,7 +149,7 @@ impl ShellMux {
             builder = builder.builtin(name.clone(), registration.clone());
         }
         // Startup already routes under the name the mux reserved.
-        builder.sandbox_id = Some(id);
+        builder.sandbox_id = id;
         Ok(Arc::new(Box::pin(builder.build()).await?))
     }
 }

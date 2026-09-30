@@ -7,7 +7,9 @@ use crate::format_runtime::render_runtime_template;
 use crate::outer_terminal::{OuterTerminal, OuterTerminalContext};
 use crate::pane_io::{pane_output_channel, AttachControl, AttachTarget};
 use crate::server_access::current_owner_uid;
-use crate::test_fixtures::{quiet_command, wait_until, Fixture, Grouped, Quiet};
+use crate::test_fixtures::{
+    quiet_command, wait_until, Fixture, Grouped, Quiet, SessionSpec, TestRequest,
+};
 use crate::test_names::session_name;
 use rmux_core::{
     AlertFlags, OptionStore, PaneGeometry, PaneId, WINDOW_ACTIVITY, WINLINK_ACTIVITY, WINLINK_BELL,
@@ -32,12 +34,14 @@ const ACTIVITY_BASELINE_SETTLE: Duration = Duration::from_millis(1200);
 const ACTIVITY_BASELINE_TIMEOUT: Duration = Duration::from_secs(10);
 
 async fn split_quiet_window(handler: &RequestHandler, session: &SessionName) {
-    let split = handler
-        .handle_ok(SplitWindowExtRequest {
+    let split = TestRequest::send_ok(
+        handler,
+        SplitWindowExtRequest {
             command: Some(quiet_command()),
             ..Fixture::fixture(session)
-        })
-        .await;
+        },
+    )
+    .await;
     handler
         .wait_for_pane_startup_to_finish_for_test(&split.pane)
         .await;
@@ -530,7 +534,7 @@ fn drain_clipboard_writes(receiver: &mut mpsc::UnboundedReceiver<AttachControl>)
 #[tokio::test]
 async fn pane_alert_event_sets_bell_and_activity_flags_and_emits_alert_hooks() {
     let handler = RequestHandler::new();
-    let session = handler.create_session("alerts").await;
+    let session = SessionSpec::create(&handler, "alerts").await;
     let window = handler.create_window(&session).await;
     handler
         .set_option(
@@ -580,9 +584,8 @@ async fn pane_alert_event_sets_bell_and_activity_flags_and_emits_alert_hooks() {
 #[tokio::test]
 async fn pane_alert_batch_coalesces_bell_across_two_panes_in_one_window() {
     let handler = RequestHandler::new();
-    let session = handler
-        .create_started_session(Quiet("alerts-window-bell-coalescing"))
-        .await;
+    let session =
+        SessionSpec::create_started(&handler, Quiet("alerts-window-bell-coalescing")).await;
     split_quiet_window(&handler, &session).await;
     handler
         .set_option(
@@ -649,9 +652,7 @@ async fn pane_alert_callback_can_be_invoked_from_reader_thread() {
     // callback invoked below. In particular, an interactive login shell can
     // publish an initial title/activity event concurrently and consume the
     // one-shot activity alert before the synthetic reader-thread event runs.
-    let session = handler
-        .create_started_session(Quiet("alerts-reader-thread"))
-        .await;
+    let session = SessionSpec::create_started(&handler, Quiet("alerts-reader-thread")).await;
     handler
         .set_option(
             ScopeSelector::Window(WindowTarget::with_window(session.clone(), 0)),
@@ -693,9 +694,7 @@ async fn pane_alert_callback_can_be_invoked_from_reader_thread() {
 #[tokio::test]
 async fn pane_title_change_output_emits_lifecycle_hook_event() {
     let handler = RequestHandler::new();
-    let session = handler
-        .create_started_session(Quiet("pane-title-hook"))
-        .await;
+    let session = SessionSpec::create_started(&handler, Quiet("pane-title-hook")).await;
     let pane_id = {
         let state = handler.state.lock().await;
         state
@@ -719,9 +718,7 @@ async fn pane_title_change_output_emits_lifecycle_hook_event() {
 #[tokio::test]
 async fn pane_state_title_alert_ignores_stale_generation() {
     let handler = RequestHandler::new();
-    let session = handler
-        .create_started_session(Quiet("pane-title-state-generation"))
-        .await;
+    let session = SessionSpec::create_started(&handler, Quiet("pane-title-state-generation")).await;
     let target = PaneTarget::with_window(session.clone(), 0, 0);
     let (pane_id, generation) = {
         let state = handler.state.lock().await;
@@ -839,7 +836,7 @@ async fn pane_state_title_alert_ignores_stale_generation() {
 #[tokio::test]
 async fn pane_state_reports_pane_option_unset_from_handler() {
     let handler = RequestHandler::new();
-    let session = handler.create_session("pane-option-unset-handler").await;
+    let session = SessionSpec::create(&handler, "pane-option-unset-handler").await;
     let target = PaneTarget::with_window(session.clone(), 0, 0);
     let pane_id = {
         let state = handler.state.lock().await;
@@ -874,8 +871,9 @@ async fn pane_state_reports_pane_option_unset_from_handler() {
         )
         .await;
 
-    handler
-        .handle_ok(SetOptionByNameRequest {
+    TestRequest::send_ok(
+        &handler,
+        SetOptionByNameRequest {
             scope: OptionScopeSelector::Pane(target),
             name: "@agent.state".to_owned(),
             value: None,
@@ -885,8 +883,9 @@ async fn pane_state_reports_pane_option_unset_from_handler() {
             unset_pane_overrides: false,
             format: false,
             format_target: None,
-        })
-        .await;
+        },
+    )
+    .await;
 
     let cursor = handler
         .handle_pane_state_cursor(
@@ -918,7 +917,7 @@ async fn pane_state_reports_pane_option_unset_from_handler() {
 #[tokio::test]
 async fn pane_state_reports_related_pane_option_unset_from_window_mass_unset() {
     let handler = RequestHandler::new();
-    let session = handler.create_session("pane-option-related-unset").await;
+    let session = SessionSpec::create(&handler, "pane-option-related-unset").await;
     let target = PaneTarget::with_window(session.clone(), 0, 0);
     let window = WindowTarget::with_window(session.clone(), 0);
     let pane_id = {
@@ -957,8 +956,9 @@ async fn pane_state_reports_related_pane_option_unset_from_window_mass_unset() {
         .set_option_by_name(OptionScopeSelector::Pane(target), "@agent.state", "pane")
         .await;
 
-    handler
-        .handle_ok(SetOptionByNameRequest {
+    TestRequest::send_ok(
+        &handler,
+        SetOptionByNameRequest {
             scope: OptionScopeSelector::Window(window),
             name: "@agent.state".to_owned(),
             value: None,
@@ -968,8 +968,9 @@ async fn pane_state_reports_related_pane_option_unset_from_window_mass_unset() {
             unset_pane_overrides: true,
             format: false,
             format_target: None,
-        })
-        .await;
+        },
+    )
+    .await;
 
     let cursor = handler
         .handle_pane_state_cursor(
@@ -1001,9 +1002,7 @@ async fn pane_state_reports_related_pane_option_unset_from_window_mass_unset() {
 #[tokio::test]
 async fn pane_output_updates_activity_for_originating_pane_only() {
     let handler = RequestHandler::new();
-    let session = handler
-        .create_started_session(Quiet("pane-output-activity"))
-        .await;
+    let session = SessionSpec::create_started(&handler, Quiet("pane-output-activity")).await;
     split_quiet_window(&handler, &session).await;
     let before = wait_for_two_pane_activity_to_settle(&handler, &session).await;
 
@@ -1028,22 +1027,18 @@ async fn pane_output_updates_activity_for_originating_pane_only() {
 #[tokio::test]
 async fn pane_output_synchronizes_activity_across_linked_and_grouped_aliases() {
     let handler = RequestHandler::new();
-    let source = handler
-        .create_started_session(Quiet("linked-activity-source"))
-        .await;
+    let source = SessionSpec::create_started(&handler, Quiet("linked-activity-source")).await;
     split_quiet_window(&handler, &source).await;
-    let owner = handler
-        .create_started_session(Quiet("linked-activity-owner"))
-        .await;
-    let peer = handler
-        .create_session(Grouped("linked-activity-peer", &owner))
-        .await;
+    let owner = SessionSpec::create_started(&handler, Quiet("linked-activity-owner")).await;
+    let peer = SessionSpec::create(&handler, Grouped("linked-activity-peer", &owner)).await;
     let source_target = WindowTarget::with_window(source.clone(), 0);
     let owner_target = WindowTarget::with_window(owner, 1);
     let peer_target = WindowTarget::with_window(peer, 1);
-    handler
-        .handle_ok(LinkWindowRequest::fixture((&source_target, &owner_target)))
-        .await;
+    TestRequest::send_ok(
+        &handler,
+        LinkWindowRequest::fixture((&source_target, &owner_target)),
+    )
+    .await;
 
     let targets = [source_target, owner_target, peer_target];
     let mut before = Vec::new();
@@ -1086,9 +1081,7 @@ async fn pane_output_synchronizes_activity_across_linked_and_grouped_aliases() {
 #[tokio::test]
 async fn pane_set_clipboard_output_emits_hook_without_activity() {
     let handler = RequestHandler::new();
-    let session = handler
-        .create_started_session(Quiet("pane-clipboard-hook"))
-        .await;
+    let session = SessionSpec::create_started(&handler, Quiet("pane-clipboard-hook")).await;
     handler
         .set_option_by_name(OptionScopeSelector::ServerGlobal, "set-clipboard", "on")
         .await;
@@ -1123,9 +1116,7 @@ async fn pane_set_clipboard_output_emits_hook_without_activity() {
 #[tokio::test]
 async fn pane_set_clipboard_hook_requires_set_clipboard_on() {
     let handler = RequestHandler::new();
-    let session = handler
-        .create_started_session(Quiet("pane-clipboard-external"))
-        .await;
+    let session = SessionSpec::create_started(&handler, Quiet("pane-clipboard-external")).await;
     handler
         .set_global_hook(
             HookName::PaneSetClipboard,
@@ -1161,9 +1152,7 @@ async fn inbound_osc52_write_creates_paste_buffer_under_set_clipboard_on() {
     // application's inbound OSC 52 write lands in a paste buffer a detached
     // client keeps and `list-buffers` shows (issue #91).
     let handler = RequestHandler::new();
-    let session = handler
-        .create_started_session(Quiet("osc52-buffer-on"))
-        .await;
+    let session = SessionSpec::create_started(&handler, Quiet("osc52-buffer-on")).await;
     handler
         .set_option_by_name(OptionScopeSelector::ServerGlobal, "set-clipboard", "on")
         .await;
@@ -1191,9 +1180,7 @@ async fn inbound_osc52_write_creates_paste_buffer_under_set_clipboard_on() {
 #[tokio::test]
 async fn osc52_buffer_lifecycle_precedes_the_prepared_pane_alert_batch() {
     let handler = RequestHandler::new();
-    let session = handler
-        .create_started_session(Quiet("osc52-lifecycle-order"))
-        .await;
+    let session = SessionSpec::create_started(&handler, Quiet("osc52-lifecycle-order")).await;
     handler
         .set_option_by_name(OptionScopeSelector::ServerGlobal, "set-clipboard", "on")
         .await;
@@ -1244,12 +1231,8 @@ async fn osc52_buffer_lifecycle_precedes_the_prepared_pane_alert_batch() {
 #[tokio::test]
 async fn inbound_osc52_before_last_pane_eof_keeps_buffer_and_hook() {
     let handler = RequestHandler::new();
-    let session = handler
-        .create_started_session(Quiet("osc52-before-eof"))
-        .await;
-    let _keeper = handler
-        .create_started_session(Quiet("osc52-before-eof-keeper"))
-        .await;
+    let session = SessionSpec::create_started(&handler, Quiet("osc52-before-eof")).await;
+    let _keeper = SessionSpec::create_started(&handler, Quiet("osc52-before-eof-keeper")).await;
     handler
         .set_option_by_name(OptionScopeSelector::ServerGlobal, "set-clipboard", "on")
         .await;
@@ -1350,9 +1333,7 @@ async fn inbound_osc52_write_creates_no_buffer_without_set_clipboard_on() {
     // Under the `external` default tmux ignores an application's inbound OSC 52
     // entirely (input_osc_52 requires set-clipboard == 2), so no buffer appears.
     let handler = RequestHandler::new();
-    let session = handler
-        .create_started_session(Quiet("osc52-buffer-external"))
-        .await;
+    let session = SessionSpec::create_started(&handler, Quiet("osc52-buffer-external")).await;
     handler
         .set_option_by_name(
             OptionScopeSelector::ServerGlobal,
@@ -1391,12 +1372,8 @@ async fn inactive_visible_pane_osc52_targets_each_attached_client_once() {
     // pane to the outer terminal. The active pane's own output ring is not the
     // only eligible source.
     let handler = RequestHandler::new();
-    let session = handler
-        .create_started_session(Quiet("osc52-inactive-visible"))
-        .await;
-    let unrelated = handler
-        .create_started_session(Quiet("osc52-inactive-unrelated"))
-        .await;
+    let session = SessionSpec::create_started(&handler, Quiet("osc52-inactive-visible")).await;
+    let unrelated = SessionSpec::create_started(&handler, Quiet("osc52-inactive-unrelated")).await;
     split_quiet_window(&handler, &session).await;
     handler
         .set_option_by_name(OptionScopeSelector::ServerGlobal, "set-clipboard", "on")
@@ -1439,9 +1416,7 @@ async fn inactive_visible_pane_osc52_targets_each_attached_client_once() {
 #[tokio::test]
 async fn active_pane_osc52_does_not_enqueue_a_second_clipboard_write() {
     let handler = RequestHandler::new();
-    let session = handler
-        .create_started_session(Quiet("osc52-active-single-path"))
-        .await;
+    let session = SessionSpec::create_started(&handler, Quiet("osc52-active-single-path")).await;
     handler
         .set_option_by_name(OptionScopeSelector::ServerGlobal, "set-clipboard", "on")
         .await;
@@ -1469,9 +1444,7 @@ async fn active_pane_osc52_does_not_enqueue_a_second_clipboard_write() {
 #[tokio::test]
 async fn non_current_window_osc52_is_not_relayed_to_attached_clients() {
     let handler = RequestHandler::new();
-    let session = handler
-        .create_started_session(Quiet("osc52-hidden-window"))
-        .await;
+    let session = SessionSpec::create_started(&handler, Quiet("osc52-hidden-window")).await;
     let hidden_window = handler.create_started_window(Quiet(&session)).await;
     handler
         .set_option_by_name(OptionScopeSelector::ServerGlobal, "set-clipboard", "on")
@@ -1500,9 +1473,8 @@ async fn non_current_window_osc52_is_not_relayed_to_attached_clients() {
 async fn inactive_pane_osc52_relay_requires_set_clipboard_on() {
     for (offset, option) in ["external", "off"].into_iter().enumerate() {
         let handler = RequestHandler::new();
-        let session = handler
-            .create_started_session(Quiet(&format!("osc52-relay-{option}")))
-            .await;
+        let session =
+            SessionSpec::create_started(&handler, Quiet(&format!("osc52-relay-{option}"))).await;
         split_quiet_window(&handler, &session).await;
         handler
             .set_option_by_name(OptionScopeSelector::ServerGlobal, "set-clipboard", option)
@@ -1537,12 +1509,9 @@ async fn inactive_pane_osc52_relay_requires_set_clipboard_on() {
 #[tokio::test]
 async fn inactive_pane_osc52_is_enqueued_before_a_following_session_switch() {
     let handler = RequestHandler::new();
-    let source = handler
-        .create_started_session(Quiet("osc52-switch-source"))
-        .await;
-    let destination = handler
-        .create_started_session(Quiet("osc52-switch-destination"))
-        .await;
+    let source = SessionSpec::create_started(&handler, Quiet("osc52-switch-source")).await;
+    let destination =
+        SessionSpec::create_started(&handler, Quiet("osc52-switch-destination")).await;
     split_quiet_window(&handler, &source).await;
     handler
         .set_option_by_name(OptionScopeSelector::ServerGlobal, "set-clipboard", "on")
@@ -1616,9 +1585,7 @@ async fn inactive_pane_osc52_is_enqueued_before_a_following_session_switch() {
 #[tokio::test]
 async fn busy_attach_lock_drops_osc52_relay_without_a_deferred_retry() {
     let handler = RequestHandler::new();
-    let session = handler
-        .create_started_session(Quiet("osc52-busy-routing"))
-        .await;
+    let session = SessionSpec::create_started(&handler, Quiet("osc52-busy-routing")).await;
     split_quiet_window(&handler, &session).await;
     handler
         .set_option_by_name(OptionScopeSelector::ServerGlobal, "set-clipboard", "on")
@@ -1652,9 +1619,7 @@ async fn busy_attach_lock_drops_osc52_relay_without_a_deferred_retry() {
 #[tokio::test]
 async fn inactive_pane_osc52_disconnects_a_non_draining_attach_at_the_backlog_limit() {
     let handler = RequestHandler::new();
-    let session = handler
-        .create_started_session(Quiet("osc52-bounded-backlog"))
-        .await;
+    let session = SessionSpec::create_started(&handler, Quiet("osc52-bounded-backlog")).await;
     split_quiet_window(&handler, &session).await;
     handler
         .set_option_by_name(OptionScopeSelector::ServerGlobal, "set-clipboard", "on")
@@ -1719,9 +1684,7 @@ async fn inactive_pane_osc52_disconnects_a_non_draining_attach_at_the_backlog_li
 #[tokio::test]
 async fn inactive_pane_osc52_backlog_disconnect_runs_attach_cleanup_once() {
     let handler = RequestHandler::new();
-    let session = handler
-        .create_started_session(Quiet("osc52-backlog-cleanup"))
-        .await;
+    let session = SessionSpec::create_started(&handler, Quiet("osc52-backlog-cleanup")).await;
     split_quiet_window(&handler, &session).await;
     handler
         .set_option_by_name(OptionScopeSelector::ServerGlobal, "set-clipboard", "on")
@@ -1818,9 +1781,7 @@ async fn inactive_pane_osc52_backlog_disconnect_runs_attach_cleanup_once() {
 #[tokio::test]
 async fn inactive_pane_osc52_closed_channel_still_finishes_attach_cleanup() {
     let handler = RequestHandler::new();
-    let session = handler
-        .create_started_session(Quiet("osc52-send-cleanup"))
-        .await;
+    let session = SessionSpec::create_started(&handler, Quiet("osc52-send-cleanup")).await;
     split_quiet_window(&handler, &session).await;
     handler
         .set_option_by_name(OptionScopeSelector::ServerGlobal, "set-clipboard", "on")
@@ -1867,9 +1828,7 @@ async fn inactive_pane_osc52_closed_channel_still_finishes_attach_cleanup() {
 #[tokio::test]
 async fn inactive_pane_osc52_backlog_is_bounded_by_encoded_bytes() {
     let handler = RequestHandler::new();
-    let session = handler
-        .create_started_session(Quiet("osc52-byte-bounded-backlog"))
-        .await;
+    let session = SessionSpec::create_started(&handler, Quiet("osc52-byte-bounded-backlog")).await;
     split_quiet_window(&handler, &session).await;
     handler
         .set_option_by_name(OptionScopeSelector::ServerGlobal, "set-clipboard", "on")
@@ -1933,24 +1892,20 @@ async fn inactive_pane_osc52_backlog_is_bounded_by_encoded_bytes() {
 #[tokio::test]
 async fn select_pane_does_not_synthesize_focus_lifecycle_hooks() {
     let handler = RequestHandler::new();
-    let session = handler
-        .create_started_session(Quiet("pane-focus-hooks"))
-        .await;
+    let session = SessionSpec::create_started(&handler, Quiet("pane-focus-hooks")).await;
     split_quiet_window(&handler, &session).await;
-    handler
-        .handle_ok(SelectPaneRequest::fixture(PaneTarget::with_window(
-            session.clone(),
-            0,
-            0,
-        )))
-        .await;
+    TestRequest::send_ok(
+        &handler,
+        SelectPaneRequest::fixture(PaneTarget::with_window(session.clone(), 0, 0)),
+    )
+    .await;
 
     let mut lifecycle = handler.subscribe_lifecycle_events();
-    handler
-        .handle_ok(SelectPaneRequest::fixture(PaneTarget::with_window(
-            session, 0, 1,
-        )))
-        .await;
+    TestRequest::send_ok(
+        &handler,
+        SelectPaneRequest::fixture(PaneTarget::with_window(session, 0, 1)),
+    )
+    .await;
 
     recv_lifecycle_hook(&mut lifecycle, HookName::WindowPaneChanged).await;
     assert_no_lifecycle_hooks(
@@ -1965,9 +1920,7 @@ async fn select_pane_does_not_synthesize_focus_lifecycle_hooks() {
 #[tokio::test]
 async fn pane_alert_callback_coalesces_inactive_pane_refreshes_by_session() {
     let handler = RequestHandler::new();
-    let session = handler
-        .create_started_session(Quiet("inactive-output-refresh"))
-        .await;
+    let session = SessionSpec::create_started(&handler, Quiet("inactive-output-refresh")).await;
     handler
         .set_option(
             ScopeSelector::Window(WindowTarget::with_window(session.clone(), 0)),
@@ -2052,9 +2005,7 @@ async fn pane_alert_callback_coalesces_inactive_pane_refreshes_by_session() {
 #[tokio::test]
 async fn pane_mouse_mode_alert_refreshes_the_active_attached_pane() {
     let handler = RequestHandler::new();
-    let session = handler
-        .create_started_session(Quiet("active-mouse-mode-refresh"))
-        .await;
+    let session = SessionSpec::create_started(&handler, Quiet("active-mouse-mode-refresh")).await;
     let pane_id = {
         let mut state = handler.state.lock().await;
         state
@@ -2108,7 +2059,7 @@ async fn pane_mouse_mode_alert_refreshes_the_active_attached_pane() {
 #[tokio::test]
 async fn pane_alert_event_updates_automatic_window_name_without_disabling_auto_rename() {
     let handler = RequestHandler::new();
-    let session = handler.create_started_session(Quiet("alerts-name")).await;
+    let session = SessionSpec::create_started(&handler, Quiet("alerts-name")).await;
     handler
         .set_option(
             ScopeSelector::Window(WindowTarget::with_window(session.clone(), 0)),
@@ -2157,9 +2108,7 @@ async fn pane_alert_event_updates_automatic_window_name_without_disabling_auto_r
 #[tokio::test]
 async fn pane_alert_event_respects_automatic_rename_off() {
     let handler = RequestHandler::new();
-    let session = handler
-        .create_started_session(Quiet("alerts-name-off"))
-        .await;
+    let session = SessionSpec::create_started(&handler, Quiet("alerts-name-off")).await;
     let target = WindowTarget::with_window(session.clone(), 0);
     handler
         .set_option(
@@ -2204,11 +2153,9 @@ async fn pane_alert_event_respects_automatic_rename_off() {
 #[tokio::test]
 async fn pane_alert_event_updates_grouped_session_window_names() {
     let handler = RequestHandler::new();
-    let alpha = handler
-        .create_started_session(Quiet("alerts-group-alpha"))
-        .await;
+    let alpha = SessionSpec::create_started(&handler, Quiet("alerts-group-alpha")).await;
     let beta = session_name("alerts-group-beta");
-    handler.create_session(Grouped(&beta, &alpha)).await;
+    SessionSpec::create(&handler, Grouped(&beta, &alpha)).await;
     handler
         .set_option(
             ScopeSelector::Window(WindowTarget::with_window(alpha.clone(), 0)),
@@ -2268,7 +2215,7 @@ async fn pane_alert_event_updates_grouped_session_window_names() {
 #[tokio::test]
 async fn shell_input_updates_window_name_and_foreground_process_formats() {
     let handler = RequestHandler::new();
-    let session = handler.create_session("alerts-foreground").await;
+    let session = SessionSpec::create(&handler, "alerts-foreground").await;
     let target = PaneTarget::with_window(session.clone(), 0, 0);
     let expected_path = std::fs::canonicalize("/tmp")
         .unwrap_or_else(|_| std::path::PathBuf::from("/tmp"))
@@ -2276,12 +2223,14 @@ async fn shell_input_updates_window_name_and_foreground_process_formats() {
         .into_owned();
     let expected = format!("sleep|{expected_path}|sleep");
 
-    handler
-        .handle_ok(SendKeysRequest {
+    TestRequest::send_ok(
+        &handler,
+        SendKeysRequest {
             target: target.clone(),
             keys: vec!["cd /tmp && exec sleep 120".to_owned(), "Enter".to_owned()],
-        })
-        .await;
+        },
+    )
+    .await;
 
     wait_until(
         Duration::from_secs(30),
@@ -2311,7 +2260,7 @@ async fn shell_input_updates_window_name_and_foreground_process_formats() {
 #[tokio::test]
 async fn visual_bell_modes_dispatch_overlay_write_and_action_gating() {
     let handler = RequestHandler::new();
-    let session = handler.create_session("visual").await;
+    let session = SessionSpec::create(&handler, "visual").await;
     let other_window = handler.create_window(&session).await;
     let (control_tx, mut control_rx) = mpsc::unbounded_channel();
     let _attach_id = handler
@@ -2384,7 +2333,7 @@ async fn visual_bell_modes_dispatch_overlay_write_and_action_gating() {
 #[tokio::test]
 async fn silence_monitor_sets_flags_after_idle() {
     let handler = RequestHandler::new();
-    let session = handler.create_session("silence").await;
+    let session = SessionSpec::create(&handler, "silence").await;
     let window = handler.create_window(&session).await;
     handler
         .set_option(
@@ -2414,11 +2363,9 @@ async fn silence_monitor_sets_flags_after_idle() {
 #[tokio::test]
 async fn grouped_window_silence_option_synchronizes_runtime_timers_for_every_alias() {
     let handler = RequestHandler::new();
-    let owner = handler
-        .create_started_session(Quiet("silence-group-owner"))
-        .await;
+    let owner = SessionSpec::create_started(&handler, Quiet("silence-group-owner")).await;
     let peer = session_name("silence-group-peer");
-    handler.create_session(Grouped(&peer, &owner)).await;
+    SessionSpec::create(&handler, Grouped(&peer, &owner)).await;
 
     handler
         .set_option(
@@ -2457,9 +2404,7 @@ async fn grouped_window_silence_option_synchronizes_runtime_timers_for_every_ali
 #[tokio::test]
 async fn new_group_peer_inherits_existing_silence_deadline() {
     let handler = RequestHandler::new();
-    let owner = handler
-        .create_started_session(Quiet("silence-deadline-owner"))
-        .await;
+    let owner = SessionSpec::create_started(&handler, Quiet("silence-deadline-owner")).await;
     handler
         .set_option(ScopeSelector::Global, OptionName::MonitorSilence, "60")
         .await;
@@ -2469,9 +2414,7 @@ async fn new_group_peer_inherits_existing_silence_deadline() {
         .expect("owner silence timer is armed")
         .1;
 
-    let peer = handler
-        .create_session(Grouped("silence-deadline-peer", &owner))
-        .await;
+    let peer = SessionSpec::create(&handler, Grouped("silence-deadline-peer", &owner)).await;
     let peer_deadline = handler
         .silence_timer_snapshot_for_test(&WindowTarget::with_window(peer, 0))
         .expect("new peer silence timer is inherited")
@@ -2483,9 +2426,7 @@ async fn new_group_peer_inherits_existing_silence_deadline() {
 #[tokio::test]
 async fn new_group_peer_does_not_rearm_expired_silence_state() {
     let handler = RequestHandler::new();
-    let owner = handler
-        .create_started_session(Quiet("silence-expired-owner"))
-        .await;
+    let owner = SessionSpec::create_started(&handler, Quiet("silence-expired-owner")).await;
     handler
         .set_option(ScopeSelector::Global, OptionName::MonitorSilence, "60")
         .await;
@@ -2500,9 +2441,7 @@ async fn new_group_peer_does_not_rearm_expired_silence_state() {
         .silence_timer_snapshot_for_test(&owner_target)
         .is_none());
 
-    let peer = handler
-        .create_session(Grouped("silence-expired-peer", &owner))
-        .await;
+    let peer = SessionSpec::create(&handler, Grouped("silence-expired-peer", &owner)).await;
     assert!(handler
         .silence_timer_snapshot_for_test(&WindowTarget::with_window(peer, 0))
         .is_none());
@@ -2511,15 +2450,15 @@ async fn new_group_peer_does_not_rearm_expired_silence_state() {
 #[tokio::test]
 async fn new_group_peer_inherits_duplicate_alias_timer_state_by_slot() {
     let handler = RequestHandler::new();
-    let owner = handler
-        .create_started_session(Quiet("silence-duplicate-owner"))
-        .await;
-    handler
-        .handle_ok(LinkWindowRequest::fixture((
+    let owner = SessionSpec::create_started(&handler, Quiet("silence-duplicate-owner")).await;
+    TestRequest::send_ok(
+        &handler,
+        LinkWindowRequest::fixture((
             WindowTarget::with_window(owner.clone(), 0),
             WindowTarget::with_window(owner.clone(), 1),
-        )))
-        .await;
+        )),
+    )
+    .await;
     handler
         .set_option(ScopeSelector::Global, OptionName::MonitorSilence, "60")
         .await;
@@ -2536,9 +2475,7 @@ async fn new_group_peer_inherits_duplicate_alias_timer_state_by_slot() {
         .expect("second duplicate timer remains armed")
         .1;
 
-    let peer = handler
-        .create_session(Grouped("silence-duplicate-peer", &owner))
-        .await;
+    let peer = SessionSpec::create(&handler, Grouped("silence-duplicate-peer", &owner)).await;
     assert!(handler
         .silence_timer_snapshot_for_test(&WindowTarget::with_window(peer.clone(), 0))
         .is_none());
@@ -2554,13 +2491,9 @@ async fn new_group_peer_inherits_duplicate_alias_timer_state_by_slot() {
 #[tokio::test]
 async fn new_window_insertion_preserves_group_timer_deadlines_and_arms_new_peers() {
     let handler = RequestHandler::new();
-    let owner = handler
-        .create_started_session(Quiet("silence-new-window-owner"))
-        .await;
+    let owner = SessionSpec::create_started(&handler, Quiet("silence-new-window-owner")).await;
     let _ = handler.create_started_window(Quiet(&owner)).await;
-    let peer = handler
-        .create_session(Grouped("silence-new-window-peer", &owner))
-        .await;
+    let peer = SessionSpec::create(&handler, Grouped("silence-new-window-peer", &owner)).await;
 
     handler
         .set_option(ScopeSelector::Global, OptionName::MonitorSilence, "60")
@@ -2659,24 +2592,17 @@ async fn new_window_insertion_preserves_group_timer_deadlines_and_arms_new_peers
 
 async fn assert_grouped_mixed_renumber_preserves_silence_timers(label: &str, unlink: bool) {
     let handler = RequestHandler::new();
-    let owner = handler
-        .create_started_session(Quiet(&format!("{label}-owner")))
-        .await;
+    let owner = SessionSpec::create_started(&handler, Quiet(&format!("{label}-owner"))).await;
     let _ = handler.create_started_window(Quiet(&owner)).await;
     let _ = handler.create_started_window(Quiet(&owner)).await;
-    let peer = handler
-        .create_session(Grouped(&format!("{label}-peer"), &owner))
-        .await;
-    let external = handler
-        .create_started_session(Quiet(&format!("{label}-external")))
-        .await;
+    let peer = SessionSpec::create(&handler, Grouped(&format!("{label}-peer"), &owner)).await;
+    let external = SessionSpec::create_started(&handler, Quiet(&format!("{label}-external"))).await;
     let external_alias = WindowTarget::with_window(external, 1);
-    handler
-        .handle_ok(LinkWindowRequest::fixture((
-            WindowTarget::with_window(owner.clone(), 2),
-            &external_alias,
-        )))
-        .await;
+    TestRequest::send_ok(
+        &handler,
+        LinkWindowRequest::fixture((WindowTarget::with_window(owner.clone(), 2), &external_alias)),
+    )
+    .await;
 
     handler
         .set_option(
@@ -2798,15 +2724,9 @@ async fn grouped_mixed_renumber_kill_and_unlink_preserve_every_silence_timer() {
 #[tokio::test]
 async fn link_window_arms_silence_timer_for_non_syntactic_group_peer() {
     let handler = RequestHandler::new();
-    let owner = handler
-        .create_started_session(Quiet("silence-link-owner"))
-        .await;
-    let peer = handler
-        .create_session(Grouped("silence-link-peer", &owner))
-        .await;
-    let source = handler
-        .create_started_session(Quiet("silence-link-source"))
-        .await;
+    let owner = SessionSpec::create_started(&handler, Quiet("silence-link-owner")).await;
+    let peer = SessionSpec::create(&handler, Grouped("silence-link-peer", &owner)).await;
+    let source = SessionSpec::create_started(&handler, Quiet("silence-link-source")).await;
     let source_target = WindowTarget::with_window(source.clone(), 0);
     let owner_target = WindowTarget::with_window(owner.clone(), 1);
     let peer_target = WindowTarget::with_window(peer.clone(), 1);
@@ -2824,9 +2744,11 @@ async fn link_window_arms_silence_timer_for_non_syntactic_group_peer() {
         "the grouped peer must not have a timer before its linked window exists"
     );
 
-    handler
-        .handle_ok(LinkWindowRequest::fixture((&source_target, &owner_target)))
-        .await;
+    TestRequest::send_ok(
+        &handler,
+        LinkWindowRequest::fixture((&source_target, &owner_target)),
+    )
+    .await;
 
     for target in [source_target, owner_target, peer_target] {
         assert!(
@@ -2839,18 +2761,10 @@ async fn link_window_arms_silence_timer_for_non_syntactic_group_peer() {
 #[tokio::test]
 async fn link_window_rearms_existing_silence_timer_for_non_syntactic_group_peer() {
     let handler = RequestHandler::new();
-    let owner = handler
-        .create_started_session(Quiet("silence-relink-owner"))
-        .await;
-    let peer = handler
-        .create_session(Grouped("silence-relink-peer", &owner))
-        .await;
-    let source = handler
-        .create_started_session(Quiet("silence-relink-source"))
-        .await;
-    let unrelated = handler
-        .create_started_session(Quiet("silence-relink-unrelated"))
-        .await;
+    let owner = SessionSpec::create_started(&handler, Quiet("silence-relink-owner")).await;
+    let peer = SessionSpec::create(&handler, Grouped("silence-relink-peer", &owner)).await;
+    let source = SessionSpec::create_started(&handler, Quiet("silence-relink-source")).await;
+    let unrelated = SessionSpec::create_started(&handler, Quiet("silence-relink-unrelated")).await;
     let source_target = WindowTarget::with_window(source.clone(), 0);
     let owner_target = WindowTarget::with_window(owner.clone(), 0);
     let peer_target = WindowTarget::with_window(peer.clone(), 0);
@@ -2890,12 +2804,14 @@ async fn link_window_rearms_existing_silence_timer_for_non_syntactic_group_peer(
         "source option setup must not rearm the unrelated group peer"
     );
 
-    handler
-        .handle_ok(LinkWindowRequest {
+    TestRequest::send_ok(
+        &handler,
+        LinkWindowRequest {
             kill_destination: true,
             ..Fixture::fixture((source_target, owner_target))
-        })
-        .await;
+        },
+    )
+    .await;
 
     let next_peer_generation = handler
         .silence_timer_generation_for_test(&peer_target)
@@ -2914,12 +2830,9 @@ async fn link_window_rearms_existing_silence_timer_for_non_syntactic_group_peer(
 #[tokio::test]
 async fn link_window_does_not_rearm_unrelated_same_session_silence_timer() {
     let handler = RequestHandler::new();
-    let destination = handler
-        .create_started_session(Quiet("silence-same-session-destination"))
-        .await;
-    let source = handler
-        .create_started_session(Quiet("silence-same-session-source"))
-        .await;
+    let destination =
+        SessionSpec::create_started(&handler, Quiet("silence-same-session-destination")).await;
+    let source = SessionSpec::create_started(&handler, Quiet("silence-same-session-source")).await;
     let unrelated_target = WindowTarget::with_window(destination.clone(), 0);
     let link_target = handler.create_window(&destination).await;
     let source_target = WindowTarget::with_window(source, 0);
@@ -2942,12 +2855,14 @@ async fn link_window_does_not_rearm_unrelated_same_session_silence_timer() {
         .silence_timer_generation_for_test(&unrelated_target)
         .expect("unrelated same-session timer is initially armed");
 
-    handler
-        .handle_ok(LinkWindowRequest {
+    TestRequest::send_ok(
+        &handler,
+        LinkWindowRequest {
             kill_destination: true,
             ..Fixture::fixture((source_target, &link_target))
-        })
-        .await;
+        },
+    )
+    .await;
 
     assert_eq!(
         handler.silence_timer_generation_for_test(&unrelated_target),
@@ -2965,12 +2880,9 @@ async fn link_window_does_not_rearm_unrelated_same_session_silence_timer() {
 #[tokio::test]
 async fn link_window_before_preserves_unchanged_and_reindexed_silence_deadlines() {
     let handler = RequestHandler::new();
-    let destination = handler
-        .create_started_session(Quiet("silence-before-destination"))
-        .await;
-    let source = handler
-        .create_started_session(Quiet("silence-before-source"))
-        .await;
+    let destination =
+        SessionSpec::create_started(&handler, Quiet("silence-before-destination")).await;
+    let source = SessionSpec::create_started(&handler, Quiet("silence-before-source")).await;
     let unchanged_target = WindowTarget::with_window(destination.clone(), 0);
     let shifted_target = handler.create_started_window(Quiet(&destination)).await;
     let source_target = WindowTarget::with_window(source, 0);
@@ -3003,12 +2915,14 @@ async fn link_window_before_preserves_unchanged_and_reindexed_silence_deadlines(
         .silence_timer_snapshot_for_test(&shifted_target)
         .expect("shifted timer is armed");
 
-    handler
-        .handle_ok(LinkWindowRequest {
+    TestRequest::send_ok(
+        &handler,
+        LinkWindowRequest {
             before: true,
             ..Fixture::fixture((source_target, shifted_target))
-        })
-        .await;
+        },
+    )
+    .await;
 
     assert_eq!(
         handler.silence_timer_snapshot_for_test(&unchanged_target),
@@ -3028,12 +2942,9 @@ async fn link_window_before_preserves_unchanged_and_reindexed_silence_deadlines(
 #[tokio::test]
 async fn link_window_after_moves_silence_expiry_to_new_target_without_delay() {
     let handler = RequestHandler::new();
-    let destination = handler
-        .create_started_session(Quiet("silence-after-destination"))
-        .await;
-    let source = handler
-        .create_started_session(Quiet("silence-after-source"))
-        .await;
+    let destination =
+        SessionSpec::create_started(&handler, Quiet("silence-after-destination")).await;
+    let source = SessionSpec::create_started(&handler, Quiet("silence-after-source")).await;
     let after_anchor = WindowTarget::with_window(destination.clone(), 0);
     let shifted_target = handler.create_started_window(Quiet(&destination)).await;
 
@@ -3062,12 +2973,14 @@ async fn link_window_after_moves_silence_expiry_to_new_target_without_delay() {
         .expect("timer to shift is still armed before the link")
         .1;
 
-    handler
-        .handle_ok(LinkWindowRequest {
+    TestRequest::send_ok(
+        &handler,
+        LinkWindowRequest {
             after: true,
             ..Fixture::fixture((WindowTarget::with_window(source, 0), after_anchor))
-        })
-        .await;
+        },
+    )
+    .await;
 
     assert_eq!(
         handler.silence_timer_generation_for_test(&shifted_target),
@@ -3120,9 +3033,8 @@ async fn link_window_after_moves_silence_expiry_to_new_target_without_delay() {
 #[tokio::test]
 async fn deferred_alert_plan_does_not_block_intervening_lifecycle_publication() {
     let handler = RequestHandler::new();
-    let session = handler
-        .create_started_session(Quiet("deferred-alert-lifecycle-order"))
-        .await;
+    let session =
+        SessionSpec::create_started(&handler, Quiet("deferred-alert-lifecycle-order")).await;
     let alerted = handler.create_started_window(Quiet(&session)).await;
     handler
         .set_option(
@@ -3169,13 +3081,10 @@ async fn deferred_alert_plan_does_not_block_intervening_lifecycle_publication() 
 #[tokio::test]
 async fn prepared_alert_hook_follows_reindexed_window_identity() {
     let handler = RequestHandler::new();
-    let destination = handler
-        .create_started_session(Quiet("alert-hook-reindex-destination"))
-        .await;
+    let destination =
+        SessionSpec::create_started(&handler, Quiet("alert-hook-reindex-destination")).await;
     let alerted = handler.create_started_window(Quiet(&destination)).await;
-    let source = handler
-        .create_started_session(Quiet("alert-hook-reindex-source"))
-        .await;
+    let source = SessionSpec::create_started(&handler, Quiet("alert-hook-reindex-source")).await;
     handler
         .set_option(
             ScopeSelector::Window(alerted.clone()),
@@ -3192,19 +3101,18 @@ async fn prepared_alert_hook_follows_reindexed_window_identity() {
             .expect("alerted window exists before reindex")
             .id()
     };
-    handler
-        .handle_ok(SetHookMutationRequest {
-            scope: ScopeSelector::Window(alerted.clone()),
-            hook: HookName::AlertActivity,
-            command: Some(format!(
-                "if-shell -F '#{{==:#{{window_id}}:#{{window_index}}:#{{hook_window}},{alerted_window_id}:2:{alerted_window_id}}}' 'set-buffer -b stable-alert ok' 'set-buffer -b stable-alert bad'"
-            )),
-            lifecycle: HookLifecycle::Persistent,
-            append: false,
-            unset: false,
-            run_immediately: false,
-            index: None,
-        })
+    TestRequest::send_ok(&handler, SetHookMutationRequest {
+        scope: ScopeSelector::Window(alerted.clone()),
+        hook: HookName::AlertActivity,
+        command: Some(format!(
+            "if-shell -F '#{{==:#{{window_id}}:#{{window_index}}:#{{hook_window}},{alerted_window_id}:2:{alerted_window_id}}}' 'set-buffer -b stable-alert ok' 'set-buffer -b stable-alert bad'"
+        )),
+        lifecycle: HookLifecycle::Persistent,
+        append: false,
+        unset: false,
+        run_immediately: false,
+        index: None,
+    })
         .await;
     let plans = {
         let mut state = handler.state.lock().await;
@@ -3212,15 +3120,17 @@ async fn prepared_alert_hook_follows_reindexed_window_identity() {
     };
     assert_eq!(plans.len(), 1, "activity materializes one alert plan");
 
-    handler
-        .handle_ok(LinkWindowRequest {
+    TestRequest::send_ok(
+        &handler,
+        LinkWindowRequest {
             after: true,
             ..Fixture::fixture((
                 WindowTarget::with_window(source, 0),
                 WindowTarget::with_window(destination.clone(), 0),
             ))
-        })
-        .await;
+        },
+    )
+    .await;
     {
         let state = handler.state.lock().await;
         let session = state
@@ -3255,13 +3165,10 @@ async fn prepared_alert_hook_follows_reindexed_window_identity() {
 #[tokio::test]
 async fn prepared_alert_hooks_fail_closed_after_stable_window_is_replaced() {
     let handler = RequestHandler::new();
-    let destination = handler
-        .create_started_session(Quiet("alert-hook-replace-destination"))
-        .await;
+    let destination =
+        SessionSpec::create_started(&handler, Quiet("alert-hook-replace-destination")).await;
     let alerted = handler.create_started_window(Quiet(&destination)).await;
-    let source = handler
-        .create_started_session(Quiet("alert-hook-replace-source"))
-        .await;
+    let source = SessionSpec::create_started(&handler, Quiet("alert-hook-replace-source")).await;
     handler
         .set_option(
             ScopeSelector::Window(alerted.clone()),
@@ -3297,8 +3204,9 @@ async fn prepared_alert_hooks_fail_closed_after_stable_window_is_replaced() {
         ),
         ("set-buffer -b stale-alert-dispatch ran".to_owned(), true),
     ] {
-        handler
-            .handle_ok(SetHookMutationRequest {
+        TestRequest::send_ok(
+            &handler,
+            SetHookMutationRequest {
                 scope: ScopeSelector::Window(alerted.clone()),
                 hook: HookName::AlertActivity,
                 command: Some(command),
@@ -3307,8 +3215,9 @@ async fn prepared_alert_hooks_fail_closed_after_stable_window_is_replaced() {
                 unset: false,
                 run_immediately: false,
                 index: None,
-            })
-            .await;
+            },
+        )
+        .await;
     }
 
     let plans = {
@@ -3343,17 +3252,14 @@ async fn prepared_alert_hooks_fail_closed_after_stable_window_is_replaced() {
 #[tokio::test]
 async fn concurrent_relative_links_serialize_model_and_timer_rekeys() {
     let handler = RequestHandler::new();
-    let destination = handler
-        .create_started_session(Quiet("silence-concurrent-links-destination"))
-        .await;
+    let destination =
+        SessionSpec::create_started(&handler, Quiet("silence-concurrent-links-destination")).await;
     let first_shifted = handler.create_started_window(Quiet(&destination)).await;
     let second_shifted = handler.create_started_window(Quiet(&destination)).await;
-    let source_one = handler
-        .create_started_session(Quiet("silence-concurrent-links-source-one"))
-        .await;
-    let source_two = handler
-        .create_started_session(Quiet("silence-concurrent-links-source-two"))
-        .await;
+    let source_one =
+        SessionSpec::create_started(&handler, Quiet("silence-concurrent-links-source-one")).await;
+    let source_two =
+        SessionSpec::create_started(&handler, Quiet("silence-concurrent-links-source-two")).await;
 
     for target in [&first_shifted, &second_shifted] {
         handler
@@ -3443,13 +3349,10 @@ async fn concurrent_relative_links_serialize_model_and_timer_rekeys() {
 #[tokio::test]
 async fn activity_waiting_on_relative_link_resets_the_rekeyed_timer() {
     let handler = RequestHandler::new();
-    let destination = handler
-        .create_started_session(Quiet("silence-link-activity-destination"))
-        .await;
+    let destination =
+        SessionSpec::create_started(&handler, Quiet("silence-link-activity-destination")).await;
     let shifted = handler.create_started_window(Quiet(&destination)).await;
-    let source = handler
-        .create_started_session(Quiet("silence-link-activity-source"))
-        .await;
+    let source = SessionSpec::create_started(&handler, Quiet("silence-link-activity-source")).await;
     handler
         .set_option(
             ScopeSelector::Window(shifted.clone()),
@@ -3518,13 +3421,11 @@ async fn activity_waiting_on_relative_link_resets_the_rekeyed_timer() {
 #[tokio::test]
 async fn expired_silence_flag_follows_window_across_reindex() {
     let handler = RequestHandler::new();
-    let destination = handler
-        .create_started_session(Quiet("silence-expiry-reindex-destination"))
-        .await;
+    let destination =
+        SessionSpec::create_started(&handler, Quiet("silence-expiry-reindex-destination")).await;
     let shifted = handler.create_started_window(Quiet(&destination)).await;
-    let source = handler
-        .create_started_session(Quiet("silence-expiry-reindex-source"))
-        .await;
+    let source =
+        SessionSpec::create_started(&handler, Quiet("silence-expiry-reindex-source")).await;
 
     // Keep the timer on an independent current-thread runtime so its expiry
     // can hold the model lock while this test coordinates a concurrent link.
@@ -3619,9 +3520,7 @@ async fn expired_silence_flag_follows_window_across_reindex() {
 #[tokio::test]
 async fn activity_clears_persistent_silence_and_allows_second_expiry() {
     let handler = RequestHandler::new();
-    let session = handler
-        .create_started_session(Quiet("silence-persistent-reset"))
-        .await;
+    let session = SessionSpec::create_started(&handler, Quiet("silence-persistent-reset")).await;
     let target = handler.create_started_window(Quiet(&session)).await;
     handler
         .set_option(
@@ -3663,20 +3562,18 @@ async fn activity_clears_persistent_silence_and_allows_second_expiry() {
 #[tokio::test]
 async fn window_alias_activity_resets_silence_timers_for_entire_family() {
     let handler = RequestHandler::new();
-    let owner = handler
-        .create_started_session(Quiet("silence-reset-owner"))
-        .await;
+    let owner = SessionSpec::create_started(&handler, Quiet("silence-reset-owner")).await;
     let peer = session_name("silence-reset-peer");
-    handler.create_session(Grouped(&peer, &owner)).await;
-    let linked = handler
-        .create_started_session(Quiet("silence-reset-linked"))
-        .await;
-    handler
-        .handle_ok(LinkWindowRequest::fixture((
+    SessionSpec::create(&handler, Grouped(&peer, &owner)).await;
+    let linked = SessionSpec::create_started(&handler, Quiet("silence-reset-linked")).await;
+    TestRequest::send_ok(
+        &handler,
+        LinkWindowRequest::fixture((
             WindowTarget::with_window(owner.clone(), 0),
             WindowTarget::with_window(linked.clone(), 1),
-        )))
-        .await;
+        )),
+    )
+    .await;
     let family_targets = [
         WindowTarget::with_window(owner.clone(), 0),
         WindowTarget::with_window(peer.clone(), 0),
@@ -3751,7 +3648,7 @@ async fn window_alias_activity_resets_silence_timers_for_entire_family() {
 #[tokio::test]
 async fn show_messages_formats_log_and_terminal_info_and_prunes_to_limit() {
     let handler = RequestHandler::new();
-    let session = handler.create_session("messages").await;
+    let session = SessionSpec::create(&handler, "messages").await;
     let (control_tx, _control_rx) = mpsc::unbounded_channel();
     let _attach_id = handler
         .register_attach(77, session.clone(), control_tx)
@@ -3817,7 +3714,7 @@ async fn show_messages_formats_log_and_terminal_info_and_prunes_to_limit() {
 #[tokio::test]
 async fn show_messages_log_is_available_without_current_client() {
     let handler = RequestHandler::new();
-    let _session = handler.create_session("messages-detached").await;
+    let _session = SessionSpec::create(&handler, "messages-detached").await;
     {
         let mut state = handler.state.lock().await;
         state.add_message("detached log entry");
@@ -3854,7 +3751,7 @@ async fn show_messages_log_is_available_without_current_client() {
 #[tokio::test]
 async fn format_variables_focus_clearing_and_alert_navigation_follow_winlink_flags() {
     let handler = RequestHandler::new();
-    let session = handler.create_session("formats").await;
+    let session = SessionSpec::create(&handler, "formats").await;
     let window_one = handler.create_window(&session).await;
     let window_two = handler.create_window(&session).await;
 
@@ -3940,7 +3837,7 @@ async fn format_variables_focus_clearing_and_alert_navigation_follow_winlink_fla
 #[tokio::test]
 async fn activity_deduplication_skips_second_alert_on_same_winlink() {
     let handler = RequestHandler::new();
-    let session = handler.create_session("dedup").await;
+    let session = SessionSpec::create(&handler, "dedup").await;
     let window = handler.create_window(&session).await;
     handler
         .set_option(
@@ -3980,7 +3877,7 @@ async fn activity_deduplication_skips_second_alert_on_same_winlink() {
 #[tokio::test]
 async fn action_none_blocks_all_delivery() {
     let handler = RequestHandler::new();
-    let session = handler.create_session("none-action").await;
+    let session = SessionSpec::create(&handler, "none-action").await;
     let (control_tx, mut control_rx) = mpsc::unbounded_channel();
     let _attach_id = handler
         .register_attach(55, session.clone(), control_tx)
@@ -4014,7 +3911,7 @@ async fn action_none_blocks_all_delivery() {
 #[tokio::test]
 async fn action_none_on_non_current_window_still_sets_winlink_flags() {
     let handler = RequestHandler::new();
-    let session = handler.create_session("none-noncurr").await;
+    let session = SessionSpec::create(&handler, "none-noncurr").await;
     let other_window = handler.create_window(&session).await;
     let (control_tx, mut control_rx) = mpsc::unbounded_channel();
     let _attach_id = handler
@@ -4071,7 +3968,7 @@ async fn action_none_on_non_current_window_still_sets_winlink_flags() {
 #[tokio::test]
 async fn empty_session_alerts_when_no_windows_are_alerted() {
     let handler = RequestHandler::new();
-    let session = handler.create_session("empty-alerts").await;
+    let session = SessionSpec::create(&handler, "empty-alerts").await;
     let _window = handler.create_window(&session).await;
 
     let rendered = {
@@ -4086,7 +3983,7 @@ async fn empty_session_alerts_when_no_windows_are_alerted() {
 #[tokio::test]
 async fn next_window_alert_errors_when_no_alerted_windows_exist() {
     let handler = RequestHandler::new();
-    let session = handler.create_session("no-alert-nav").await;
+    let session = SessionSpec::create(&handler, "no-alert-nav").await;
     let _window = handler.create_window(&session).await;
 
     let response = handler
@@ -4109,7 +4006,7 @@ async fn next_window_alert_errors_when_no_alerted_windows_exist() {
 #[tokio::test]
 async fn alert_message_logged_even_without_attached_clients() {
     let handler = RequestHandler::new();
-    let session = handler.create_session("detached-log").await;
+    let session = SessionSpec::create(&handler, "detached-log").await;
     let window = handler.create_window(&session).await;
 
     handler
@@ -4142,7 +4039,7 @@ async fn alert_message_logged_even_without_attached_clients() {
 #[tokio::test]
 async fn kill_window_clears_alert_flags_for_removed_window() {
     let handler = RequestHandler::new();
-    let session = handler.create_session("kill-alert").await;
+    let session = SessionSpec::create(&handler, "kill-alert").await;
     let window = handler.create_window(&session).await;
 
     {
@@ -4154,12 +4051,14 @@ async fn kill_window_clears_alert_flags_for_removed_window() {
         session_obj.add_winlink_alert_flags(window.window_index(), WINLINK_BELL);
     }
 
-    handler
-        .handle_ok(KillWindowRequest {
+    TestRequest::send_ok(
+        &handler,
+        KillWindowRequest {
             target: window.clone(),
             kill_all_others: false,
-        })
-        .await;
+        },
+    )
+    .await;
 
     let state = handler.state.lock().await;
     let session_obj = state.sessions.session(&session).expect("session exists");
@@ -4180,7 +4079,7 @@ async fn kill_window_clears_alert_flags_for_removed_window() {
 #[tokio::test]
 async fn silence_deduplication_skips_second_silence_on_same_winlink() {
     let handler = RequestHandler::new();
-    let session = handler.create_session("silence-dedup").await;
+    let session = SessionSpec::create(&handler, "silence-dedup").await;
     let window = handler.create_window(&session).await;
     handler
         .set_option(
@@ -4214,7 +4113,7 @@ async fn silence_deduplication_skips_second_silence_on_same_winlink() {
 #[tokio::test]
 async fn show_messages_invalid_target_client_returns_error() {
     let handler = RequestHandler::new();
-    let _session = handler.create_session("bad-target").await;
+    let _session = SessionSpec::create(&handler, "bad-target").await;
 
     let response = handler
         .handle(Request::ShowMessages(ShowMessagesRequest {
@@ -4232,7 +4131,7 @@ async fn show_messages_invalid_target_client_returns_error() {
 #[tokio::test]
 async fn show_messages_message_log_resolves_target_client() {
     let handler = RequestHandler::new();
-    let _session = handler.create_session("bad-message-target").await;
+    let _session = SessionSpec::create(&handler, "bad-message-target").await;
 
     let response = handler
         .handle(Request::ShowMessages(ShowMessagesRequest {
@@ -4252,7 +4151,7 @@ async fn show_messages_message_log_resolves_target_client() {
 #[tokio::test]
 async fn select_window_clears_alert_flags_on_newly_selected_window() {
     let handler = RequestHandler::new();
-    let session = handler.create_session("select-clear").await;
+    let session = SessionSpec::create(&handler, "select-clear").await;
     let window_one = handler.create_window(&session).await;
 
     {

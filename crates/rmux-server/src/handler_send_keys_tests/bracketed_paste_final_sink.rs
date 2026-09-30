@@ -14,6 +14,7 @@
 use std::time::Instant;
 
 use super::*;
+use crate::test_fixtures::TestRequest;
 use crate::test_shell::final_sink::{
     create_final_sink_session, describe_missing_bracketed_mode, observe_pane_output,
     split_final_sink_pane, FinalSinkSlot,
@@ -238,7 +239,7 @@ async fn assert_mixed_synchronized_final_sink(label: &str, active_pane: u32) {
     assert_eq!(aware_target, PaneTarget::with_window(session.clone(), 0, 0));
 
     let pane = PaneTarget::with_window(session.clone(), 0, active_pane);
-    handler.handle_ok(SelectPaneRequest::fixture(pane)).await;
+    TestRequest::send_ok(&handler, SelectPaneRequest::fixture(pane)).await;
     set_synchronize_panes(&handler, &session).await;
 
     let requester_pid = attach_to(&handler, &session).await;

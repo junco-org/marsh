@@ -54,6 +54,7 @@ use std::sync::Arc;
 use super::*;
 use crate::client_flags::ClientFlags;
 use crate::outer_terminal::OuterTerminalContext;
+use crate::test_fixtures::{SessionSpec, TestRequest};
 
 const STATUS_TWO: &str = "2";
 const STATUS_OFF: &str = "off";
@@ -77,7 +78,7 @@ async fn resize_window_smallest_takes_the_status_rows_off_the_outer_client_termi
 /// content, never the client's outer 80x24.
 async fn status_two_single_client_case(adjustment: ResizeWindowAdjustment) {
     let handler = RequestHandler::new();
-    let alpha = handler.create_session(("alpha", SESSION_SIZE)).await;
+    let alpha = SessionSpec::create(&handler, ("alpha", SESSION_SIZE)).await;
     let target = WindowTarget::with_window(alpha.clone(), 0);
     handler.set_session_status(&alpha, STATUS_TWO).await;
     let _client = attach_declared_client(&handler, 60_100, &alpha, TerminalSize::new(80, 24)).await;
@@ -96,7 +97,7 @@ async fn status_two_single_client_case(adjustment: ResizeWindowAdjustment) {
 #[tokio::test]
 async fn resize_window_ranks_clients_by_their_content_rows() {
     let handler = RequestHandler::new();
-    let alpha = handler.create_session(("alpha", SESSION_SIZE)).await;
+    let alpha = SessionSpec::create(&handler, ("alpha", SESSION_SIZE)).await;
     let target = WindowTarget::with_window(alpha.clone(), 0);
     handler.set_session_status(&alpha, STATUS_TWO).await;
     let _small = attach_declared_client(&handler, 60_110, &alpha, TerminalSize::new(80, 24)).await;
@@ -127,7 +128,7 @@ async fn resize_window_ranks_clients_by_their_content_rows() {
 #[tokio::test]
 async fn resize_window_takes_each_dimension_from_its_own_client() {
     let handler = RequestHandler::new();
-    let alpha = handler.create_session(("alpha", SESSION_SIZE)).await;
+    let alpha = SessionSpec::create(&handler, ("alpha", SESSION_SIZE)).await;
     let target = WindowTarget::with_window(alpha.clone(), 0);
     handler.set_session_status(&alpha, STATUS_OFF).await;
     let _wide = attach_declared_client(&handler, 60_120, &alpha, TerminalSize::new(100, 20)).await;
@@ -172,7 +173,7 @@ async fn resize_window_gives_no_sizing_authority_to_an_ineligible_client() {
         IneligibleClient::StaleSessionIdentity,
     ] {
         let handler = RequestHandler::new();
-        let alpha = handler.create_session(("alpha", SESSION_SIZE)).await;
+        let alpha = SessionSpec::create(&handler, ("alpha", SESSION_SIZE)).await;
         let target = WindowTarget::with_window(alpha.clone(), 0);
         handler.set_session_status(&alpha, STATUS_OFF).await;
         let _eligible = attach_declared_client(&handler, 60_130, &alpha, eligible_size).await;
@@ -214,7 +215,7 @@ async fn resize_window_gives_no_sizing_authority_to_an_ineligible_client() {
 #[tokio::test]
 async fn resize_window_still_ranks_the_eligible_neighbours_of_an_ignored_client() {
     let handler = RequestHandler::new();
-    let alpha = handler.create_session(("alpha", SESSION_SIZE)).await;
+    let alpha = SessionSpec::create(&handler, ("alpha", SESSION_SIZE)).await;
     let target = WindowTarget::with_window(alpha.clone(), 0);
     handler.set_session_status(&alpha, STATUS_OFF).await;
     let _ignored = attach_flagged_client(
@@ -257,7 +258,7 @@ async fn resize_window_without_an_eligible_client_falls_back_to_the_session_term
         ResizeWindowAdjustment::SmallestLinkedSession,
     ] {
         let handler = RequestHandler::new();
-        let alpha = handler.create_session(("alpha", SESSION_SIZE)).await;
+        let alpha = SessionSpec::create(&handler, ("alpha", SESSION_SIZE)).await;
         let target = WindowTarget::with_window(alpha.clone(), 0);
         handler.set_session_status(&alpha, STATUS_OFF).await;
         let _ignored = attach_flagged_client(
@@ -284,17 +285,19 @@ async fn resize_window_without_an_eligible_client_falls_back_to_the_session_term
 #[tokio::test]
 async fn resize_window_selects_a_client_attached_to_a_linked_session() {
     let handler = RequestHandler::new();
-    let alpha = handler.create_session(("alpha", SESSION_SIZE)).await;
-    let beta = handler.create_session(("beta", SESSION_SIZE)).await;
+    let alpha = SessionSpec::create(&handler, ("alpha", SESSION_SIZE)).await;
+    let beta = SessionSpec::create(&handler, ("beta", SESSION_SIZE)).await;
     let target = WindowTarget::with_window(alpha.clone(), 0);
     handler.set_session_status(&alpha, STATUS_TWO).await;
     handler.set_session_status(&beta, STATUS_TWO).await;
-    handler
-        .handle_ok(LinkWindowRequest {
+    TestRequest::send_ok(
+        &handler,
+        LinkWindowRequest {
             detached: false,
             ..Fixture::fixture((&target, WindowTarget::with_window(beta.clone(), 1)))
-        })
-        .await;
+        },
+    )
+    .await;
     let _client = attach_declared_client(&handler, 60_160, &beta, TerminalSize::new(100, 40)).await;
 
     pin_window_size(&handler, &target).await;
@@ -457,7 +460,7 @@ async fn resize_window_converts_a_session_group_alias_client_with_its_own_status
             ResizeWindowAdjustment::SmallestLinkedSession,
         ] {
             let handler = RequestHandler::new();
-            let alpha = handler.create_session(("alpha", SESSION_SIZE)).await;
+            let alpha = SessionSpec::create(&handler, ("alpha", SESSION_SIZE)).await;
             let beta = session_name("beta");
             let target = WindowTarget::with_window(alpha.clone(), 0);
             handler
@@ -588,19 +591,21 @@ async fn crossed_status_sessions(
     linked_status: &str,
     linked_size: TerminalSize,
 ) -> (SessionName, SessionName) {
-    let alpha = handler.create_session(("alpha", SESSION_SIZE)).await;
-    let beta = handler.create_session(("beta", linked_size)).await;
+    let alpha = SessionSpec::create(handler, ("alpha", SESSION_SIZE)).await;
+    let beta = SessionSpec::create(handler, ("beta", linked_size)).await;
     handler.set_session_status(&alpha, target_status).await;
     handler.set_session_status(&beta, linked_status).await;
-    handler
-        .handle_ok(LinkWindowRequest {
+    TestRequest::send_ok(
+        handler,
+        LinkWindowRequest {
             detached: false,
             ..Fixture::fixture((
                 WindowTarget::with_window(alpha.clone(), 0),
                 WindowTarget::with_window(beta.clone(), 1),
             ))
-        })
-        .await;
+        },
+    )
+    .await;
     (alpha, beta)
 }
 
@@ -729,14 +734,16 @@ async fn assert_inferred_client_size(handler: &RequestHandler, pid: u32, expecte
 /// Pins the window at [`PINNED_SIZE`], which also parks `window-size` on `manual`
 /// so only the command under test can move it again.
 async fn pin_window_size(handler: &RequestHandler, target: &WindowTarget) {
-    handler
-        .handle_ok(ResizeWindowRequest {
+    TestRequest::send_ok(
+        handler,
+        ResizeWindowRequest {
             target: target.clone(),
             width: Some(PINNED_SIZE.cols),
             height: Some(PINNED_SIZE.rows),
             adjustment: None,
-        })
-        .await;
+        },
+    )
+    .await;
     assert_eq!(window_size(handler, target).await, PINNED_SIZE);
 }
 
@@ -745,14 +752,16 @@ async fn apply_adjustment(
     target: &WindowTarget,
     adjustment: ResizeWindowAdjustment,
 ) {
-    handler
-        .handle_ok(ResizeWindowRequest {
+    TestRequest::send_ok(
+        handler,
+        ResizeWindowRequest {
             target: target.clone(),
             width: None,
             height: None,
             adjustment: Some(adjustment),
-        })
-        .await;
+        },
+    )
+    .await;
 }
 
 async fn window_size(handler: &RequestHandler, target: &WindowTarget) -> TerminalSize {

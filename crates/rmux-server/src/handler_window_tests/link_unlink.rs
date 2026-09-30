@@ -1,17 +1,20 @@
 use super::*;
 
+use crate::test_fixtures::TestRequest;
 use rmux_proto::{
     LinkWindowResponse, OptionScopeSelector, PaneOptionSetRequest, SendKeysRequest,
     SetOptionByNameRequest,
 };
 
 async fn assert_send_keys_succeeds(handler: &RequestHandler, target: PaneTarget) {
-    handler
-        .handle_ok(SendKeysRequest {
+    TestRequest::send_ok(
+        handler,
+        SendKeysRequest {
             target,
             keys: vec!["x".to_owned()],
-        })
-        .await;
+        },
+    )
+    .await;
 }
 
 async fn assert_pane_output_observes(
@@ -70,11 +73,13 @@ async fn grouped_unlink_k_preserves_each_session_local_fallback_identity() {
                     // records 0 as its local last window. On the regression
                     // base RMUX has already copied the owner's target, making
                     // the same command a no-op with no fallback history.
-                    handler
-                        .handle_ok(SelectWindowRequest {
+                    TestRequest::send_ok(
+                        &handler,
+                        SelectWindowRequest {
                             target: WindowTarget::with_window(peer.clone(), target_index),
-                        })
-                        .await;
+                        },
+                    )
+                    .await;
                 }
 
                 for session_name in [&owner, &peer] {
@@ -103,12 +108,14 @@ async fn grouped_unlink_k_preserves_each_session_local_fallback_identity() {
                     (owner_expected, peer_expected)
                 };
 
-                handler
-                    .handle_ok(UnlinkWindowRequest {
+                TestRequest::send_ok(
+                    &handler,
+                    UnlinkWindowRequest {
                         target: WindowTarget::with_window(owner.clone(), target_index),
                         kill_if_last: true,
-                    })
-                    .await;
+                    },
+                )
+                .await;
 
                 let state = handler.state.lock().await;
                 assert_eq!(
@@ -159,15 +166,17 @@ async fn link_window_refreshes_attached_non_syntactic_group_peer_output_receiver
     let mut control_rx = handler.attach_client(42, &peer).await;
     drain_attach_controls(&mut control_rx).await;
 
-    handler
-        .handle_ok(LinkWindowRequest {
+    TestRequest::send_ok(
+        &handler,
+        LinkWindowRequest {
             kill_destination: true,
             ..Fixture::fixture((
                 WindowTarget::with_window(source.clone(), 0),
                 WindowTarget::with_window(owner, 0),
             ))
-        })
-        .await;
+        },
+    )
+    .await;
 
     let control = timeout(Duration::from_secs(2), control_rx.recv())
         .await
@@ -209,15 +218,17 @@ async fn scrollbar_options_resize_shared_runtime_and_refresh_linked_alias() {
         let owner = create_session(&handler, format!("scrollbar-option-owner-{suffix}")).await;
         let alias = create_session(&handler, format!("scrollbar-option-alias-{suffix}")).await;
 
-        handler
-            .handle_ok(LinkWindowRequest {
+        TestRequest::send_ok(
+            &handler,
+            LinkWindowRequest {
                 kill_destination: true,
                 ..Fixture::fixture((
                     WindowTarget::with_window(owner.clone(), 0),
                     WindowTarget::with_window(alias.clone(), 0),
                 ))
-            })
-            .await;
+            },
+        )
+        .await;
         if kind == "sdk" {
             handler
                 .set_option(
@@ -314,12 +325,14 @@ async fn link_window_k_rejects_same_window_identity_through_group_peer_atomicall
     let peer = create_grouped_session(&handler, "link-self-peer", &owner).await;
     let external = create_session(&handler, "link-self-external").await;
 
-    handler
-        .handle_ok(LinkWindowRequest::fixture((
+    TestRequest::send_ok(
+        &handler,
+        LinkWindowRequest::fixture((
             WindowTarget::with_window(owner.clone(), 0),
             WindowTarget::with_window(external.clone(), 1),
-        )))
-        .await;
+        )),
+    )
+    .await;
 
     let (before_sessions, before_targets, stable_window_id) = {
         let state = handler.state.lock().await;
@@ -461,15 +474,17 @@ async fn link_window_k_between_distinct_grouped_window_ids_remains_supported() {
     };
 
     // Distinct grouped WindowIds must remain replaceable.
-    handler
-        .handle_ok(LinkWindowRequest {
+    TestRequest::send_ok(
+        &handler,
+        LinkWindowRequest {
             kill_destination: true,
             ..Fixture::fixture((
                 WindowTarget::with_window(peer.clone(), 1),
                 WindowTarget::with_window(owner.clone(), 0),
             ))
-        })
-        .await;
+        },
+    )
+    .await;
 
     {
         let state = handler.state.lock().await;
@@ -518,12 +533,14 @@ async fn unlink_window_via_group_peer_refreshes_exact_family_and_removes_exact_t
             ..Fixture::fixture(&owner)
         })
         .await;
-    handler
-        .handle_ok(LinkWindowRequest::fixture((
+    TestRequest::send_ok(
+        &handler,
+        LinkWindowRequest::fixture((
             WindowTarget::with_window(owner.clone(), 0),
             WindowTarget::with_window(external.clone(), 1),
-        )))
-        .await;
+        )),
+    )
+    .await;
 
     let mut control_rx = handler.attach_client(43, &owner).await;
     drain_attach_controls(&mut control_rx).await;
@@ -549,12 +566,14 @@ async fn unlink_window_via_group_peer_refreshes_exact_family_and_removes_exact_t
         .map(|target| handler.silence_timer_snapshot_for_test(target))
         .collect::<Vec<_>>();
 
-    let unlinked = handler
-        .handle_ok(UnlinkWindowRequest {
+    let unlinked = TestRequest::send_ok(
+        &handler,
+        UnlinkWindowRequest {
             target: WindowTarget::with_window(peer.clone(), 0),
             kill_if_last: false,
-        })
-        .await;
+        },
+    )
+    .await;
     assert_eq!(unlinked.target, WindowTarget::with_window(peer.clone(), 1));
 
     let control = timeout(Duration::from_secs(2), control_rx.recv())
@@ -618,15 +637,17 @@ async fn link_window_shares_runtime_tracks_linked_sessions_and_unlinks_cleanly()
     let alpha = create_session(&handler, "alpha").await;
     let beta = create_session(&handler, "beta").await;
 
-    let linked = handler
-        .handle_ok(LinkWindowRequest {
+    let linked = TestRequest::send_ok(
+        &handler,
+        LinkWindowRequest {
             detached: false,
             ..Fixture::fixture((
                 WindowTarget::with_window(alpha.clone(), 0),
                 WindowTarget::with_window(beta.clone(), 1),
             ))
-        })
-        .await;
+        },
+    )
+    .await;
     assert_eq!(linked.target, WindowTarget::with_window(beta.clone(), 1));
 
     {
@@ -663,12 +684,14 @@ async fn link_window_shares_runtime_tracks_linked_sessions_and_unlinks_cleanly()
         .await;
     assert_eq!(String::from_utf8_lossy(&linked_formats), "1:2:alpha,beta\n");
 
-    let renamed = handler
-        .handle_ok(RenameWindowRequest {
+    let renamed = TestRequest::send_ok(
+        &handler,
+        RenameWindowRequest {
             target: WindowTarget::with_window(beta.clone(), 1),
             name: "logs".to_owned(),
-        })
-        .await;
+        },
+    )
+    .await;
     assert_eq!(renamed.target, WindowTarget::with_window(beta.clone(), 1));
 
     {
@@ -688,12 +711,14 @@ async fn link_window_shares_runtime_tracks_linked_sessions_and_unlinks_cleanly()
         assert_eq!(beta_window.name(), Some("logs"));
     }
 
-    let unlinked = handler
-        .handle_ok(UnlinkWindowRequest {
+    let unlinked = TestRequest::send_ok(
+        &handler,
+        UnlinkWindowRequest {
             target: WindowTarget::with_window(beta.clone(), 1),
             kill_if_last: false,
-        })
-        .await;
+        },
+    )
+    .await;
     assert_eq!(unlinked.target, WindowTarget::with_window(beta.clone(), 0));
 
     let state = handler.state.lock().await;
@@ -725,15 +750,17 @@ async fn linked_session_formats_include_session_group_peers() {
     let gamma = create_session(&handler, "gamma").await;
     create_grouped_session(&handler, "delta", &gamma).await;
 
-    let linked = handler
-        .handle_ok(LinkWindowRequest {
+    let linked = TestRequest::send_ok(
+        &handler,
+        LinkWindowRequest {
             detached: false,
             ..Fixture::fixture((
                 WindowTarget::with_window(alpha.clone(), 0),
                 WindowTarget::with_window(gamma.clone(), 1),
             ))
-        })
-        .await;
+        },
+    )
+    .await;
     assert_eq!(linked.target, WindowTarget::with_window(gamma, 1));
 
     let linked_formats = handler
@@ -756,22 +783,26 @@ async fn linked_windows_survive_runtime_owner_session_rename() {
     let beta = create_session(&handler, "beta").await;
     let gamma = session_name("gamma");
 
-    handler
-        .handle_ok(LinkWindowRequest {
+    TestRequest::send_ok(
+        &handler,
+        LinkWindowRequest {
             detached: false,
             ..Fixture::fixture((
                 WindowTarget::with_window(alpha.clone(), 0),
                 WindowTarget::with_window(beta.clone(), 1),
             ))
-        })
-        .await;
+        },
+    )
+    .await;
 
-    handler
-        .handle_ok(RenameSessionRequest {
+    TestRequest::send_ok(
+        &handler,
+        RenameSessionRequest {
             target: alpha,
             new_name: gamma.clone(),
-        })
-        .await;
+        },
+    )
+    .await;
 
     {
         let state = handler.state.lock().await;
@@ -788,16 +819,18 @@ async fn linked_windows_survive_runtime_owner_session_rename() {
     }
 
     // Linked list-panes must survive the owner rename.
-    let list = handler
-        .handle_ok(ListPanesRequest {
+    let list = TestRequest::send_ok(
+        &handler,
+        ListPanesRequest {
             target: beta,
             target_window_index: Some(1),
             format: Some("#{session_name}:#{window_index}:#{pane_index}".to_owned()),
             filter: None,
             sort_order: None,
             reversed: false,
-        })
-        .await;
+        },
+    )
+    .await;
     assert_eq!(String::from_utf8_lossy(list.output.stdout()), "beta:1:0\n");
 }
 
@@ -818,16 +851,18 @@ async fn link_window_relative_same_destination_slot_makes_room_like_tmux() {
             .expect("source pane should exist")
     };
 
-    let response = handler
-        .handle_ok(LinkWindowRequest {
+    let response = TestRequest::send_ok(
+        &handler,
+        LinkWindowRequest {
             after: true,
             detached: false,
             ..Fixture::fixture((
                 WindowTarget::with_window(alpha.clone(), 1),
                 WindowTarget::with_window(alpha.clone(), 0),
             ))
-        })
-        .await;
+        },
+    )
+    .await;
 
     assert_eq!(
         response,
@@ -855,23 +890,27 @@ async fn linked_windows_survive_runtime_owner_session_removal_after_rename() {
     let beta = create_session(&handler, "beta").await;
     let gamma = session_name("gamma");
 
-    handler
-        .handle_ok(LinkWindowRequest {
+    TestRequest::send_ok(
+        &handler,
+        LinkWindowRequest {
             detached: false,
             ..Fixture::fixture((
                 WindowTarget::with_window(alpha.clone(), 0),
                 WindowTarget::with_window(beta.clone(), 1),
             ))
-        })
-        .await;
-    handler
-        .handle_ok(RenameSessionRequest {
+        },
+    )
+    .await;
+    TestRequest::send_ok(
+        &handler,
+        RenameSessionRequest {
             target: alpha,
             new_name: gamma.clone(),
-        })
-        .await;
+        },
+    )
+    .await;
 
-    handler.handle_ok(KillSessionRequest::fixture(&gamma)).await;
+    TestRequest::send_ok(&handler, KillSessionRequest::fixture(&gamma)).await;
 
     {
         let state = handler.state.lock().await;
@@ -891,16 +930,18 @@ async fn linked_windows_survive_runtime_owner_session_removal_after_rename() {
     }
 
     // Linked list-panes must survive the owner removal.
-    let list = handler
-        .handle_ok(ListPanesRequest {
+    let list = TestRequest::send_ok(
+        &handler,
+        ListPanesRequest {
             target: beta,
             target_window_index: Some(1),
             format: Some("#{session_name}:#{window_index}:#{pane_index}".to_owned()),
             filter: None,
             sort_order: None,
             reversed: false,
-        })
-        .await;
+        },
+    )
+    .await;
     assert_eq!(String::from_utf8_lossy(list.output.stdout()), "beta:1:0\n");
 }
 
@@ -911,19 +952,23 @@ async fn unlink_window_runtime_owner_transfers_runtime_to_surviving_alias() {
     insert_window(&handler, &owner, 1).await;
     let external = create_session(&handler, "unlink-runtime-external").await;
 
-    handler
-        .handle_ok(LinkWindowRequest::fixture((
+    TestRequest::send_ok(
+        &handler,
+        LinkWindowRequest::fixture((
             WindowTarget::with_window(owner.clone(), 0),
             WindowTarget::with_window(external.clone(), 1),
-        )))
-        .await;
+        )),
+    )
+    .await;
 
-    handler
-        .handle_ok(UnlinkWindowRequest {
+    TestRequest::send_ok(
+        &handler,
+        UnlinkWindowRequest {
             target: WindowTarget::with_window(owner.clone(), 0),
             kill_if_last: false,
-        })
-        .await;
+        },
+    )
+    .await;
 
     {
         let state = handler.state.lock().await;
@@ -946,22 +991,26 @@ async fn link_window_k_runtime_owner_transfers_replaced_runtime_to_surviving_ali
     let external = create_session(&handler, "link-k-runtime-external").await;
     let replacement = create_session(&handler, "link-k-runtime-replacement").await;
 
-    handler
-        .handle_ok(LinkWindowRequest::fixture((
+    TestRequest::send_ok(
+        &handler,
+        LinkWindowRequest::fixture((
             WindowTarget::with_window(owner.clone(), 0),
             WindowTarget::with_window(external.clone(), 1),
-        )))
-        .await;
+        )),
+    )
+    .await;
 
-    handler
-        .handle_ok(LinkWindowRequest {
+    TestRequest::send_ok(
+        &handler,
+        LinkWindowRequest {
             kill_destination: true,
             ..Fixture::fixture((
                 WindowTarget::with_window(replacement.clone(), 0),
                 WindowTarget::with_window(owner.clone(), 0),
             ))
-        })
-        .await;
+        },
+    )
+    .await;
 
     {
         let state = handler.state.lock().await;
@@ -984,14 +1033,16 @@ async fn killing_grouped_runtime_owner_preserves_external_linked_alias() {
     let peer = create_grouped_session(&handler, "group-kill-runtime-peer", &owner).await;
     let external = create_session(&handler, "group-kill-runtime-external").await;
 
-    handler
-        .handle_ok(LinkWindowRequest::fixture((
+    TestRequest::send_ok(
+        &handler,
+        LinkWindowRequest::fixture((
             WindowTarget::with_window(owner.clone(), 0),
             WindowTarget::with_window(external.clone(), 1),
-        )))
-        .await;
+        )),
+    )
+    .await;
 
-    handler.handle_ok(KillSessionRequest::fixture(&owner)).await;
+    TestRequest::send_ok(&handler, KillSessionRequest::fixture(&owner)).await;
 
     {
         let state = handler.state.lock().await;
@@ -1020,7 +1071,7 @@ async fn link_window_shares_pane_base_index_with_linked_slots() {
     let alpha = create_session(&handler, "alpha").await;
     let beta = create_session(&handler, "beta").await;
 
-    handler.handle_ok(SplitWindowRequest::fixture(&alpha)).await;
+    TestRequest::send_ok(&handler, SplitWindowRequest::fixture(&alpha)).await;
     handler
         .set_option(
             ScopeSelector::Window(WindowTarget::with_window(alpha.clone(), 0)),
@@ -1028,26 +1079,30 @@ async fn link_window_shares_pane_base_index_with_linked_slots() {
             "1",
         )
         .await;
-    handler
-        .handle_ok(LinkWindowRequest {
+    TestRequest::send_ok(
+        &handler,
+        LinkWindowRequest {
             detached: false,
             ..Fixture::fixture((
                 WindowTarget::with_window(alpha.clone(), 0),
                 WindowTarget::with_window(beta.clone(), 1),
             ))
-        })
-        .await;
+        },
+    )
+    .await;
 
-    let list = handler
-        .handle_ok(ListPanesRequest {
+    let list = TestRequest::send_ok(
+        &handler,
+        ListPanesRequest {
             target: beta.clone(),
             target_window_index: Some(1),
             format: Some("#{pane_index}".to_owned()),
             filter: None,
             sort_order: None,
             reversed: false,
-        })
-        .await;
+        },
+    )
+    .await;
     assert_eq!(
         String::from_utf8_lossy(list.output.stdout()),
         "1\n2\n",
@@ -1077,12 +1132,14 @@ async fn linked_window_id_resolution_prefers_current_session_slot() {
     let alpha = create_session(&handler, "alpha").await;
     let beta = create_session(&handler, "beta").await;
 
-    handler
-        .handle_ok(LinkWindowRequest::fixture((
+    TestRequest::send_ok(
+        &handler,
+        LinkWindowRequest::fixture((
             WindowTarget::with_window(alpha.clone(), 0),
             WindowTarget::with_window(beta.clone(), 1),
-        )))
-        .await;
+        )),
+    )
+    .await;
 
     let window_id = {
         let state = handler.state.lock().await;
@@ -1118,12 +1175,14 @@ async fn unlink_window_kill_if_last_deletes_an_unshared_window_slot() {
     let alpha = create_session(&handler, "alpha").await;
     insert_window(&handler, &alpha, 1).await;
 
-    let unlinked = handler
-        .handle_ok(UnlinkWindowRequest {
+    let unlinked = TestRequest::send_ok(
+        &handler,
+        UnlinkWindowRequest {
             target: WindowTarget::with_window(alpha.clone(), 1),
             kill_if_last: true,
-        })
-        .await;
+        },
+    )
+    .await;
     assert_eq!(
         unlinked.target,
         WindowTarget::with_window(alpha.clone(), 0),
@@ -1148,25 +1207,28 @@ async fn unlink_only_linked_window_destroys_the_empty_session() {
     let owner = create_session(&handler, "unlink-only-window-owner").await;
     let alias = create_session(&handler, "unlink-only-window-alias").await;
 
-    handler
-        .handle_ok(LinkWindowRequest::fixture((
+    TestRequest::send_ok(
+        &handler,
+        LinkWindowRequest::fixture((
             WindowTarget::with_window(owner.clone(), 0),
             WindowTarget::with_window(alias.clone(), 9),
-        )))
-        .await;
-    handler
-        .handle_ok(KillWindowRequest::fixture(WindowTarget::with_window(
-            alias.clone(),
-            0,
-        )))
-        .await;
+        )),
+    )
+    .await;
+    TestRequest::send_ok(
+        &handler,
+        KillWindowRequest::fixture(WindowTarget::with_window(alias.clone(), 0)),
+    )
+    .await;
 
-    handler
-        .handle_ok(UnlinkWindowRequest {
+    TestRequest::send_ok(
+        &handler,
+        UnlinkWindowRequest {
             target: WindowTarget::with_window(alias.clone(), 9),
             kill_if_last: false,
-        })
-        .await;
+        },
+    )
+    .await;
 
     let state = handler.state.lock().await;
     assert!(
@@ -1189,18 +1251,19 @@ async fn unlink_only_linked_window_preserves_a_concurrently_added_window() {
     let owner = create_session(&handler, "unlink-race-owner").await;
     let alias = create_session(&handler, "unlink-race-alias").await;
 
-    handler
-        .handle_ok(LinkWindowRequest::fixture((
+    TestRequest::send_ok(
+        &handler,
+        LinkWindowRequest::fixture((
             WindowTarget::with_window(owner.clone(), 0),
             WindowTarget::with_window(alias.clone(), 9),
-        )))
-        .await;
-    handler
-        .handle_ok(KillWindowRequest::fixture(WindowTarget::with_window(
-            alias.clone(),
-            0,
-        )))
-        .await;
+        )),
+    )
+    .await;
+    TestRequest::send_ok(
+        &handler,
+        KillWindowRequest::fixture(WindowTarget::with_window(alias.clone(), 0)),
+    )
+    .await;
 
     let pause = handler.install_kill_session_selection_identity_pause(alias.clone());
     let unlink_handler = std::sync::Arc::clone(&handler);
@@ -1292,12 +1355,14 @@ async fn unlink_window_kill_if_last_rekeys_renumbered_silence_timers_without_del
         ]
     };
 
-    let unlinked = handler
-        .handle_ok(UnlinkWindowRequest {
+    let unlinked = TestRequest::send_ok(
+        &handler,
+        UnlinkWindowRequest {
             target: targets[0].clone(),
             kill_if_last: true,
-        })
-        .await;
+        },
+    )
+    .await;
     assert_eq!(
         unlinked.target,
         WindowTarget::with_window(alpha.clone(), 1),
@@ -1353,22 +1418,26 @@ async fn unlink_window_restores_previous_last_window_flag_after_active_link_remo
     insert_window(&handler, &alpha, 2).await;
 
     for window_index in [1, 0] {
-        handler
-            .handle_ok(SelectWindowRequest {
+        TestRequest::send_ok(
+            &handler,
+            SelectWindowRequest {
                 target: WindowTarget::with_window(alpha.clone(), window_index),
-            })
-            .await;
+            },
+        )
+        .await;
     }
 
-    handler
-        .handle_ok(LinkWindowRequest {
+    TestRequest::send_ok(
+        &handler,
+        LinkWindowRequest {
             detached: false,
             ..Fixture::fixture((
                 WindowTarget::with_window(alpha.clone(), 0),
                 WindowTarget::with_window(alpha.clone(), 9),
             ))
-        })
-        .await;
+        },
+    )
+    .await;
     {
         let state = handler.state.lock().await;
         assert_eq!(state.window_link_count(&alpha, 0), 2);
@@ -1378,12 +1447,14 @@ async fn unlink_window_restores_previous_last_window_flag_after_active_link_remo
             vec![alpha.clone()]
         );
     }
-    handler
-        .handle_ok(UnlinkWindowRequest {
+    TestRequest::send_ok(
+        &handler,
+        UnlinkWindowRequest {
             target: WindowTarget::with_window(alpha.clone(), 9),
             kill_if_last: true,
-        })
-        .await;
+        },
+    )
+    .await;
 
     let state = handler.state.lock().await;
     let session = state.sessions.session(&alpha).expect("alpha should exist");

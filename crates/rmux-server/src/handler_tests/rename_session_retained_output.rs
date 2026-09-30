@@ -9,15 +9,17 @@ use rmux_proto::{
 
 use crate::handler::exited_output_support::RetainedExitedPaneIdentities;
 use crate::pane_io::pane_output_channel_with_limits;
-use crate::test_fixtures::Grouped;
+use crate::test_fixtures::{Grouped, SessionSpec, TestRequest};
 
 async fn rename(handler: &RequestHandler, old_name: SessionName, new_name: SessionName) {
-    let renamed = handler
-        .handle_ok(RenameSessionRequest {
+    let renamed = TestRequest::send_ok(
+        handler,
+        RenameSessionRequest {
             target: old_name,
             new_name: new_name.clone(),
-        })
-        .await;
+        },
+    )
+    .await;
     assert_eq!(renamed.session_name, new_name);
 }
 
@@ -64,7 +66,7 @@ async fn rename_session_rekeys_retained_output_for_late_replay() {
     let handler = RequestHandler::new();
     let alpha = session_name("retained-rename-alpha");
     let beta = session_name("retained-rename-beta");
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
     let session_id = handler.session_id_for_test(&alpha).await;
     let pane_id = PaneId::new(90_001);
     let old_target = PaneTarget::with_window(alpha.clone(), 0, 91);
@@ -101,7 +103,7 @@ async fn retained_output_captured_before_rename_but_inserted_afterward_is_normal
     let handler = RequestHandler::new();
     let alpha = session_name("retained-late-alpha");
     let beta = session_name("retained-late-beta");
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
     let session_id = handler.session_id_for_test(&alpha).await;
     rename(&handler, alpha.clone(), beta.clone()).await;
 
@@ -142,8 +144,8 @@ async fn grouped_alias_and_runtime_owner_renames_rekey_distinct_retained_identit
     let peer = session_name("retained-group-peer");
     let renamed_owner = session_name("retained-group-owner-renamed");
     let renamed_peer = session_name("retained-group-peer-renamed");
-    handler.create_session(&owner).await;
-    handler.create_session(Grouped(&peer, &owner)).await;
+    SessionSpec::create(&handler, &owner).await;
+    SessionSpec::create(&handler, Grouped(&peer, &owner)).await;
     let owner_id = handler.session_id_for_test(&owner).await;
     let peer_id = handler.session_id_for_test(&peer).await;
     let pane_id = PaneId::new(90_003);

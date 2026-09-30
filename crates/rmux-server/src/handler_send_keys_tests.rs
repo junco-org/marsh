@@ -5,7 +5,7 @@ use crate::input_keys::{
 };
 use crate::mouse::{AttachedMouseEvent, MouseLocation};
 use crate::pane_io::AttachControl;
-use crate::test_fixtures::{quiet_command, wait_until, Fixture, Quiet};
+use crate::test_fixtures::{quiet_command, wait_until, Fixture, Quiet, SessionSpec, TestRequest};
 use rmux_core::{input::mode, key_string_lookup_string};
 use rmux_proto::{
     BindKeyRequest, CopyModeRequest, DisplayMessageExtRequest, ErrorResponse, HookName,
@@ -92,32 +92,32 @@ async fn create_send_keys_test_session(
     handler
         .store_option_for_test(ScopeSelector::Global, OptionName::DefaultShell, "/bin/bash")
         .await;
-    handler.create_session(session).await;
+    SessionSpec::create(handler, session).await;
 }
 
 // Like create_send_keys_test_session but the pane runs an inert, silent command
 // and we block until its terminal has finished starting, so a subsequent
 // transcript write is the only content in the pane.
 async fn create_quiet_input_session(handler: &RequestHandler, session: &rmux_proto::SessionName) {
-    handler.create_started_session(Quiet(session)).await;
+    SessionSpec::create_started(handler, Quiet(session)).await;
 }
 
 /// Splits the active pane of `session` side by side (`split-window -h`).
 async fn split_window_horizontally(handler: &RequestHandler, session: &rmux_proto::SessionName) {
-    handler
-        .handle_ok(SplitWindowRequest {
+    TestRequest::send_ok(
+        handler,
+        SplitWindowRequest {
             direction: SplitDirection::Horizontal,
             ..Fixture::fixture(session)
-        })
-        .await;
+        },
+    )
+    .await;
 }
 
 /// Binds `key` in `table` to `command`, without a note or repeat.
 async fn bind(handler: &RequestHandler, table: &str, key: &str, command: &[&str]) {
     let command = command.iter().copied();
-    handler
-        .handle_ok(BindKeyRequest::fixture((table, key, command)))
-        .await;
+    TestRequest::send_ok(handler, BindKeyRequest::fixture((table, key, command))).await;
 }
 
 /// Read a user option back the way the issue reporter did (`show-options -gv`).

@@ -1,7 +1,7 @@
 use super::RequestHandler;
 use crate::control::ControlServerEvent;
 use crate::pane_io::AttachControl;
-use crate::test_fixtures::Fixture;
+use crate::test_fixtures::{Fixture, SessionSpec, TestRequest};
 use rmux_core::{input::mode, GridRenderOptions, ScreenCaptureRange};
 use rmux_proto::request::NewSessionExtRequest;
 use rmux_proto::{
@@ -18,13 +18,15 @@ pub(super) async fn create_session(
     size: TerminalSize,
 ) -> PaneTarget {
     let ready_marker = "RCREADY";
-    let session_name = handler
-        .create_session(NewSessionExtRequest {
+    let session_name = SessionSpec::create(
+        handler,
+        NewSessionExtRequest {
             size: Some(size),
             command: Some(quiet_clock_command(ready_marker)),
             ..Fixture::fixture(name)
-        })
-        .await;
+        },
+    )
+    .await;
     let target = PaneTarget::with_window(session_name, 0, 0);
     wait_for_transcript_containing(
         handler,
@@ -257,21 +259,25 @@ async fn clock_tick_keeps_an_active_transient_message_visible() {
     let requester_pid = std::process::id();
     let mut control_rx = handler.attach_client(requester_pid, &session_name).await;
 
-    handler
-        .handle_ok(ClockModeRequest {
+    TestRequest::send_ok(
+        &handler,
+        ClockModeRequest {
             target: Some(target),
-        })
-        .await;
+        },
+    )
+    .await;
     let _ = next_overlay(&mut control_rx).await;
     while control_rx.try_recv().is_ok() {}
 
-    handler
-        .handle_ok(DisplayMessageRequest {
+    TestRequest::send_ok(
+        &handler,
+        DisplayMessageRequest {
             target: Some(Target::Session(session_name.clone())),
             print: false,
             ..Fixture::fixture("still-visible")
-        })
-        .await;
+        },
+    )
+    .await;
     let message = next_transient_overlay(&mut control_rx).await;
     assert!(String::from_utf8_lossy(&message.frame).contains("still-visible"));
 
@@ -299,15 +305,17 @@ async fn refresh_client_replays_active_clock_after_base_switch() {
     let mut control_rx = handler
         .attach_client(requester_pid, target.session_name())
         .await;
-    handler
-        .handle_ok(ClockModeRequest {
+    TestRequest::send_ok(
+        &handler,
+        ClockModeRequest {
             target: Some(target),
-        })
-        .await;
+        },
+    )
+    .await;
     let _ = next_overlay(&mut control_rx).await;
     while control_rx.try_recv().is_ok() {}
 
-    handler.handle_ok(RefreshClientRequest::fixture(None)).await;
+    TestRequest::send_ok(&handler, RefreshClientRequest::fixture(None)).await;
 
     let mut saw_switch = false;
     let mut replayed_clock = None;
@@ -336,11 +344,13 @@ async fn clock_mode_updates_pane_formats_and_exits_on_any_keypress() {
         .attach_client(requester_pid, target.session_name())
         .await;
 
-    handler
-        .handle_ok(ClockModeRequest {
+    TestRequest::send_ok(
+        &handler,
+        ClockModeRequest {
             target: Some(target.clone()),
-        })
-        .await;
+        },
+    )
+    .await;
     let _ = next_overlay(&mut control_rx).await;
 
     assert_eq!(
@@ -393,11 +403,13 @@ async fn clock_mode_exit_restores_underlying_hidden_cursor_state() {
         assert_eq!(screen.mode & mode::MODE_CURSOR, 0);
     }
 
-    handler
-        .handle_ok(ClockModeRequest {
+    TestRequest::send_ok(
+        &handler,
+        ClockModeRequest {
             target: Some(target.clone()),
-        })
-        .await;
+        },
+    )
+    .await;
     let _ = next_overlay(&mut control_rx).await;
 
     handler
@@ -436,11 +448,13 @@ async fn clock_mode_exit_restores_visible_line_content() {
         transcript.append_bytes(b"\x1b[31mred\r\nmore");
     }
 
-    handler
-        .handle_ok(ClockModeRequest {
+    TestRequest::send_ok(
+        &handler,
+        ClockModeRequest {
             target: Some(target.clone()),
-        })
-        .await;
+        },
+    )
+    .await;
     let _ = next_overlay(&mut control_rx).await;
 
     handler
@@ -487,13 +501,15 @@ async fn clock_mode_fires_hooks_and_control_notifications_on_entry_and_exit() {
         )
     };
 
-    handler
-        .handle_ok(SetHookRequest::fixture((
+    TestRequest::send_ok(
+        &handler,
+        SetHookRequest::fixture((
             ScopeSelector::Pane(target.clone()),
             HookName::PaneModeChanged,
             "set-buffer -b pane-mode-hook ok",
-        )))
-        .await;
+        )),
+    )
+    .await;
 
     let response = dispatch_as(
         &handler,

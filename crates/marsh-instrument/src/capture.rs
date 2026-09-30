@@ -81,6 +81,7 @@ pub(crate) struct Captured {
     descriptors: Vec<(usize, Option<FileTarget>)>,
     cwd: Option<FileTarget>,
     flags: Option<u64>,
+    submissions: Option<Vec<u8>>,
     failure: Option<io::Error>,
 }
 
@@ -98,6 +99,7 @@ impl Captured {
             descriptors: Vec::with_capacity(roles.descriptors.count_ones() as usize),
             cwd: None,
             flags: None,
+            submissions: None,
             failure: None,
         };
         for (index, kind) in types.into_iter().enumerate() {
@@ -165,6 +167,19 @@ impl Captured {
         Ok(captured)
     }
 
+    /// The entry-time identity of a descriptor argument.
+    pub(crate) fn descriptor(&self, index: usize) -> Option<&FileTarget> {
+        self.descriptors
+            .iter()
+            .find(|(position, _)| *position == index)
+            .and_then(|(_, target)| target.as_ref())
+    }
+
+    /// Records the opcodes an `io_uring_enter` found pending at its entry.
+    pub(crate) fn submit(&mut self, submissions: Option<Vec<u8>>) {
+        self.submissions = submissions;
+    }
+
     /// Retains only the first capture failure; it matters only if the call succeeds.
     fn keep<T>(&mut self, result: io::Result<T>) -> Option<T> {
         match result {
@@ -221,6 +236,7 @@ impl Captured {
             paths: self.paths,
             descriptors: self.descriptors,
             flags: self.flags,
+            submissions: self.submissions,
         })
     }
 }
@@ -274,9 +290,12 @@ const fn bare_path(syscall: Sysno, index: usize) -> bool {
 
 fn returns_fd(syscall: Sysno, args: &SyscallArgs) -> bool {
     match syscall {
-        Sysno::openat | Sysno::openat2 | Sysno::dup | Sysno::dup3 | Sysno::open_by_handle_at => {
-            true
-        }
+        Sysno::openat
+        | Sysno::openat2
+        | Sysno::dup
+        | Sysno::dup3
+        | Sysno::open_by_handle_at
+        | Sysno::io_uring_setup => true,
         #[cfg(target_arch = "x86_64")]
         Sysno::open | Sysno::creat | Sysno::dup2 => true,
         Sysno::fcntl => {
@@ -288,7 +307,7 @@ fn returns_fd(syscall: Sysno, args: &SyscallArgs) -> bool {
 
 /// Feeds tracee bytes from `address` to `take` until it declines one more. Aligned peeks do not
 /// touch the next page when the final wanted byte lies at the end of this one.
-fn read_bytes(
+pub(crate) fn read_bytes(
     tid: Pid,
     address: u64,
     wraps: &str,
@@ -316,7 +335,7 @@ fn read_bytes(
     }
 }
 
-/// A register or pointer value as `usize`: lossless, because marsh-trace builds only for the
+/// A register or pointer value as `usize`: lossless, because observation builds only for the
 /// 64-bit ABIs `NATIVE_ARCH` names.
 #[expect(
     clippy::cast_possible_truncation,
@@ -363,7 +382,7 @@ pub(crate) fn read_flags(tid: Pid, address: u64) -> io::Result<u64> {
 
 /// Identifies `/proc/<process>/fd/<fd>` from its link bytes, metadata and fdinfo mount, in that
 /// order. Metadata comes from `pinned` when supplied, otherwise by following the link.
-fn resolve_fd(
+pub(crate) fn resolve_fd(
     process: &dyn Display,
     fd: i32,
     pinned: Option<&std::fs::File>,

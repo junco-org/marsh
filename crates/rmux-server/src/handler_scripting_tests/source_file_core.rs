@@ -1,6 +1,6 @@
 use super::*;
 use crate::handler::scripting_support::install_queue_exact_target_capture_pause;
-use crate::test_fixtures::Grouped;
+use crate::test_fixtures::{Grouped, SessionSpec, TestRequest};
 
 /// `show-environment -g name` (`-h` when `hidden`).
 fn show_env_request(name: &str, hidden: bool) -> Request {
@@ -57,13 +57,15 @@ async fn compact_short_options_execute_from_source_file() {
 async fn compact_hidden_select_pane_style_executes_from_source_file() {
     let handler = RequestHandler::new();
     let alpha = session_name("source-compact-select-style");
-    handler.create_session(&alpha).await;
-    handler
-        .handle_ok(SplitWindowRequest {
+    SessionSpec::create(&handler, &alpha).await;
+    TestRequest::send_ok(
+        &handler,
+        SplitWindowRequest {
             direction: SplitDirection::Horizontal,
             ..Fixture::fixture(PaneTarget::with_window(alpha.clone(), 0, 0))
-        })
-        .await;
+        },
+    )
+    .await;
 
     let root = temp_root("compact-hidden-select-style");
     write_config(
@@ -162,7 +164,7 @@ fn source_file_preserves_target_client_and_show_hooks_flags() {
 async fn source_file_preserves_target_client_and_show_hooks_flags_body() {
     let handler = RequestHandler::new();
     let alpha = session_name("source-target-client");
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
     let mut control_rx = handler.attach_client(202, alpha).await;
     while control_rx.try_recv().is_ok() {}
 
@@ -229,7 +231,7 @@ async fn source_file_target_client_follows_the_same_registration_after_switch() 
     let before_switch = session_name("source-display-client-before-switch");
     let after_switch = session_name("source-display-client-after-switch");
     for name in [&before_switch, &after_switch] {
-        handler.create_session(name).await;
+        SessionSpec::create(&handler, name).await;
     }
 
     let attach_pid = 91_943;
@@ -291,7 +293,7 @@ async fn source_file_background_run_shell_preserves_its_implicit_target() {
     let alpha = session_name("source-background-target-alpha");
     let beta = session_name("source-background-target-beta");
     let expected_window_name = "source-background-fixed-target";
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
 
     // The sourced file's directory NAMES the seed the queued `run-shell` publishes into, so it
     // has to live in this handler's. A host temp path is outside every seed and the source fails
@@ -320,7 +322,7 @@ async fn source_file_background_run_shell_preserves_its_implicit_target() {
         String::from_utf8_lossy(&sourced.stderr)
     );
 
-    handler.create_session(&beta).await;
+    SessionSpec::create(&handler, &beta).await;
 
     wait_for_active_window_name(&handler, &alpha, expected_window_name).await;
     let state = handler.state.lock().await;
@@ -898,12 +900,14 @@ async fn internal_runtime_expansion_skips_source_only_flag_validation_without_ex
 #[tokio::test]
 async fn internal_parse_time_assignments_apply_visible_and_hidden_values() {
     let handler = RequestHandler::new();
-    handler
-        .handle_ok(SourceFileRequest {
+    TestRequest::send_ok(
+        &handler,
+        SourceFileRequest {
             stdin: Some("FOO=bar ; %hidden SECRET=shh".to_owned()),
             ..Fixture::fixture([INTERNAL_PARSE_TIME_ASSIGNMENTS_PATH])
-        })
-        .await;
+        },
+    )
+    .await;
     assert!(matches!(
         handler.handle(show_env_request("FOO", false)).await,
         Response::ShowEnvironment(_)
@@ -1304,7 +1308,7 @@ async fn source_file_quiet_suppresses_missing_file_and_glob_miss() {
 async fn source_file_format_expands_path_against_target_context() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
 
     let root = temp_root("format-path");
     let config = root.join("alpha.conf");
@@ -1335,7 +1339,7 @@ async fn source_file_format_expands_path_against_target_context() {
 async fn source_file_if_condition_uses_target_format_context_at_parse_time() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
 
     let root = temp_root("if-target-format");
     write_config(
@@ -1399,7 +1403,7 @@ async fn nested_source_file_format_expansion_sees_current_file() {
 #[tokio::test]
 async fn nested_source_file_format_path_inherits_current_target() {
     let handler = RequestHandler::new();
-    handler.create_session("s").await;
+    SessionSpec::create(&handler, "s").await;
 
     let root = temp_root("nested-format-option-path");
     write_config(
@@ -1436,7 +1440,7 @@ async fn queued_source_file_accepts_compact_format_target_with_attached_value() 
     let alpha = session_name("alpha");
     let beta = session_name("beta");
     for session in [&alpha, &beta] {
-        handler.create_session(session).await;
+        SessionSpec::create(&handler, session).await;
     }
 
     let root = temp_root("source-file-compact-format-target");
@@ -1484,7 +1488,7 @@ async fn queued_source_file_target_finder_uses_active_indexed_pane() {
     }
 
     let beta = session_name("beta");
-    handler.create_session(&beta).await;
+    SessionSpec::create(&handler, &beta).await;
     handler
         .create_window(NewWindowRequest {
             name: Some("active".to_owned()),
@@ -1492,24 +1496,26 @@ async fn queued_source_file_target_finder_uses_active_indexed_pane() {
             ..Fixture::fixture(&beta)
         })
         .await;
-    handler
-        .handle_ok(SplitWindowRequest {
+    TestRequest::send_ok(
+        &handler,
+        SplitWindowRequest {
             direction: SplitDirection::Horizontal,
             ..Fixture::fixture(PaneTarget::with_window(beta.clone(), 5, 0))
-        })
-        .await;
-    handler
-        .handle_ok(rmux_proto::SelectWindowRequest {
+        },
+    )
+    .await;
+    TestRequest::send_ok(
+        &handler,
+        rmux_proto::SelectWindowRequest {
             target: WindowTarget::with_window(beta.clone(), 5),
-        })
-        .await;
-    handler
-        .handle_ok(SelectPaneRequest::fixture(PaneTarget::with_window(
-            beta.clone(),
-            5,
-            1,
-        )))
-        .await;
+        },
+    )
+    .await;
+    TestRequest::send_ok(
+        &handler,
+        SelectPaneRequest::fixture(PaneTarget::with_window(beta.clone(), 5, 1)),
+    )
+    .await;
 
     let root = temp_root("source-file-active-indexed-pane");
     write_config(
@@ -1616,7 +1622,7 @@ async fn queued_source_file_preserves_assignment_order_across_multi_paths() {
 async fn queued_display_message_accepts_compact_print_and_commands_flags() {
     let handler = RequestHandler::new();
     let alpha = session_name("display-compact-pc");
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
 
     let parsed = CommandParser::new()
         .parse("display-message -pC '#{session_name}'")
@@ -1640,7 +1646,7 @@ async fn source_file_set_window_option_alias_uses_explicit_window_target_metadat
     let alpha = session_name("alpha");
     let beta = session_name("beta");
     for session in [&alpha, &beta] {
-        handler.create_session(session).await;
+        SessionSpec::create(&handler, session).await;
     }
     for (session, name) in [(&alpha, "one"), (&alpha, "named"), (&beta, "other")] {
         handler
@@ -1742,7 +1748,7 @@ async fn source_file_resolves_announced_window_and_pane_target_metadata() {
     let alpha = session_name("metadata-alpha");
     let beta = session_name("metadata-beta");
     for session in [&alpha, &beta] {
-        handler.create_session(session).await;
+        SessionSpec::create(&handler, session).await;
     }
     handler
         .create_window(NewWindowRequest {
@@ -1751,13 +1757,11 @@ async fn source_file_resolves_announced_window_and_pane_target_metadata() {
             ..Fixture::fixture(&alpha)
         })
         .await;
-    handler
-        .handle_ok(SplitWindowRequest::fixture(PaneTarget::with_window(
-            alpha.clone(),
-            0,
-            0,
-        )))
-        .await;
+    TestRequest::send_ok(
+        &handler,
+        SplitWindowRequest::fixture(PaneTarget::with_window(alpha.clone(), 0, 0)),
+    )
+    .await;
     handler
         .set_option(
             ScopeSelector::Window(WindowTarget::with_window(alpha.clone(), 1)),
@@ -1827,7 +1831,7 @@ async fn source_file_resolves_announced_window_and_pane_target_metadata() {
 async fn nested_source_file_preserves_implicit_target_canfail_behavior() {
     let handler = RequestHandler::new();
     for session in ["alpha", "beta"] {
-        handler.create_session(session).await;
+        SessionSpec::create(&handler, session).await;
     }
 
     let root = temp_root("nested-source-implicit-canfail");
@@ -2063,7 +2067,7 @@ async fn source_file_continues_after_runtime_errors_and_reports_error() {
 async fn source_file_new_window_k_validates_environment_before_replacing_target() {
     let handler = RequestHandler::new();
     let alpha = session_name("source-new-window-k-env-validation");
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
     handler
         .create_window(NewWindowRequest {
             name: Some("protected".to_owned()),
@@ -2225,7 +2229,7 @@ async fn source_file_sets_server_option_without_explicit_scope_or_target() {
 async fn source_file_sets_bare_server_option_with_current_runtime_target() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
     let root = temp_root("server-option-current-target");
     write_config(
         &root.join("server.conf"),
@@ -2393,18 +2397,16 @@ async fn source_file_set_option_quiet_does_not_suppress_bad_values() {
 #[tokio::test]
 async fn source_file_grouped_new_window_insertion_preserves_and_arms_silence_timers() {
     let handler = RequestHandler::new();
-    let owner = handler
-        .create_session(Quiet("source-new-window-timer-owner"))
-        .await;
-    handler
-        .handle_ok(LinkWindowRequest::fixture((
+    let owner = SessionSpec::create(&handler, Quiet("source-new-window-timer-owner")).await;
+    TestRequest::send_ok(
+        &handler,
+        LinkWindowRequest::fixture((
             WindowTarget::with_window(owner.clone(), 0),
             WindowTarget::with_window(owner.clone(), 1),
-        )))
-        .await;
-    let peer = handler
-        .create_session(Grouped("source-new-window-timer-peer", &owner))
-        .await;
+        )),
+    )
+    .await;
+    let peer = SessionSpec::create(&handler, Grouped("source-new-window-timer-peer", &owner)).await;
 
     handler
         .set_option(ScopeSelector::Global, OptionName::MonitorSilence, "60")

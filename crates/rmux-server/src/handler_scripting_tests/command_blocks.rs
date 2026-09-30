@@ -1,4 +1,5 @@
 use super::*;
+use crate::test_fixtures::SessionSpec;
 
 #[test]
 fn parsed_list_keys_accepts_attached_sort_order_format_and_reverse() {
@@ -29,7 +30,7 @@ fn parsed_list_keys_accepts_attached_sort_order_format_and_reverse() {
 #[tokio::test]
 async fn parsed_list_panes_accepts_filter_sort_order_and_reverse() {
     let handler = RequestHandler::new();
-    handler.create_session("alpha").await;
+    SessionSpec::create(&handler, "alpha").await;
     let state = handler.state.lock().await;
     let parsed = parse_request_from_parts(
         "list-panes".to_owned(),
@@ -66,7 +67,7 @@ async fn parsed_list_panes_accepts_filter_sort_order_and_reverse() {
 async fn parsed_list_windows_applies_filter_sort_order_and_reverse() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
     handler
         .create_window(NewWindowRequest {
             detached: false,
@@ -96,7 +97,7 @@ async fn parsed_list_windows_applies_filter_sort_order_and_reverse() {
 #[tokio::test]
 async fn parsed_set_option_scope_flags_use_tmux_precedence_and_natural_tables() {
     let handler = RequestHandler::new();
-    handler.create_session("alpha").await;
+    SessionSpec::create(&handler, "alpha").await;
 
     let parsed = CommandParser::new()
         .parse("set-option -s -p @scope server")
@@ -309,7 +310,7 @@ async fn parsed_queue_set_hook_accepts_command_blocks() {
 async fn parsed_queue_set_hook_resolves_relative_targets_before_block_parse() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
 
     let parsed = CommandParser::new()
         .parse("set-hook -t . after-new-window { display-message -p -- hook-block }")
@@ -329,7 +330,7 @@ async fn parsed_queue_set_hook_resolves_relative_targets_before_block_parse() {
 async fn parsed_queue_set_hook_session_target_uses_hook_natural_window_scope() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
 
     let parsed = CommandParser::new()
         .parse("set-hook -t alpha window-renamed { display-message -p -- renamed }")
@@ -357,7 +358,7 @@ async fn parsed_queue_set_hook_session_target_uses_hook_natural_window_scope() {
 async fn parsed_hook_commands_resolve_implicit_current_scopes() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha-implicit-hooks");
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
 
     let state = handler.state.lock().await;
     let current = TargetFindContext::new(Some(Target::Pane(PaneTarget::with_window(

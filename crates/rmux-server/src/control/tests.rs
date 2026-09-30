@@ -30,7 +30,9 @@ use crate::handler::{
 };
 use crate::outer_terminal::OuterTerminalContext;
 use crate::server_access::{current_owner_uid, AccessMode};
-use crate::test_fixtures::{unique_temp_path, wait_until, Fixture, Sizeless};
+use crate::test_fixtures::{
+    unique_temp_path, wait_until, Fixture, SessionSpec, Sizeless, TestRequest,
+};
 use crate::test_names::session_name;
 use rmux_os::identity::UserIdentity;
 use rmux_proto::{
@@ -754,9 +756,8 @@ async fn pane_output_lag_terminates_control_mode_explicitly() {
 #[tokio::test]
 async fn pane_subscriptions_reject_a_recreated_same_name_session() {
     let handler = RequestHandler::new();
-    let session_name = handler
-        .create_session(Sizeless("control-subscription-identity"))
-        .await;
+    let session_name =
+        SessionSpec::create(&handler, Sizeless("control-subscription-identity")).await;
     let replacement_output = handler
         .control_session_panes(&session_name)
         .await
@@ -819,12 +820,11 @@ async fn notifications_wait_until_after_the_active_command_block() {
         ))
         .await
         .expect("notification send succeeds");
-    handler
-        .handle_ok(WaitForRequest::fixture((
-            "control-test-block",
-            WaitForMode::Signal,
-        )))
-        .await;
+    TestRequest::send_ok(
+        &handler,
+        WaitForRequest::fixture(("control-test-block", WaitForMode::Signal)),
+    )
+    .await;
 
     let rendered = format!("{begin_prefix}{}", control.transcript().await);
     let end_index = rendered.find("%end ").expect("end guard present");
@@ -888,9 +888,8 @@ fn control_message_test_config(label: &str, contents: &str) -> std::path::PathBu
 #[tokio::test]
 async fn admitted_display_messages_are_owned_by_their_exact_control_guards() {
     let handler = Arc::new(RequestHandler::new());
-    let session_name = handler
-        .create_session(Sizeless("control-message-guard-pipeline"))
-        .await;
+    let session_name =
+        SessionSpec::create(&handler, Sizeless("control-message-guard-pipeline")).await;
 
     let commands = [
         "display-message -- SYNC-FIRST-A",
@@ -1147,9 +1146,7 @@ async fn immediate_run_shell_commands_get_one_child_guard_per_nesting_level() {
     // Fresh tmux 3.7b oracle: each run-shell -C level closes its current
     // guard before the inserted callback begins in a new guard.
     let handler = Arc::new(RequestHandler::new());
-    handler
-        .create_session(Sizeless("control-message-run-shell-nesting"))
-        .await;
+    SessionSpec::create(&handler, Sizeless("control-message-run-shell-nesting")).await;
 
     let commands = [
         "run-shell -C 'display-message -- RUN-C-NEST-1'",
@@ -1179,9 +1176,7 @@ async fn immediate_run_shell_commands_get_one_child_guard_per_nesting_level() {
 #[tokio::test]
 async fn immediate_run_shell_callback_error_gets_its_own_child_guard() {
     let handler = Arc::new(RequestHandler::new());
-    handler
-        .create_session(Sizeless("control-message-run-shell-error"))
-        .await;
+    SessionSpec::create(&handler, Sizeless("control-message-run-shell-error")).await;
 
     let commands = ["run-shell -C 'display-message -- RUN-C-BEFORE-ERROR ; \
          kill-pane -t missing-run-session:0.0'"];
@@ -1200,9 +1195,8 @@ async fn delayed_run_shell_control_message_remains_asynchronous_product_divergen
     // control guard. RMUX did not do so before W13-M30, and this fix must not
     // annex that delayed notification to the already-closed parent guard.
     let handler = Arc::new(RequestHandler::new());
-    let session_name = handler
-        .create_session(Sizeless("control-message-guard-delayed"))
-        .await;
+    let session_name =
+        SessionSpec::create(&handler, Sizeless("control-message-guard-delayed")).await;
 
     let requester_pid = 42_432;
     let (server_event_tx, server_events) = mpsc::channel(CONTROL_SERVER_EVENT_CAPACITY);
@@ -1451,9 +1445,11 @@ async fn eof_queued_if_shell_cancels_only_a_selected_wait_frame_product_divergen
 async fn eof_queued_ready_wait_consumes_signal_and_finishes_its_frame() {
     let handler = Arc::new(RequestHandler::new());
     let channel = "eof-queued-ready-wait";
-    handler
-        .handle_ok(WaitForRequest::fixture((channel, WaitForMode::Signal)))
-        .await;
+    TestRequest::send_ok(
+        &handler,
+        WaitForRequest::fixture((channel, WaitForMode::Signal)),
+    )
+    .await;
     assert_eq!(handler.wait_for_counts(channel), (0, 0, true));
 
     drain_queued_frame_after_eof(
@@ -1503,9 +1499,11 @@ async fn eof_queued_free_lock_acquires_and_finishes_its_frame() {
     )
     .await;
 
-    handler
-        .handle_ok(WaitForRequest::fixture((channel, WaitForMode::Unlock)))
-        .await;
+    TestRequest::send_ok(
+        &handler,
+        WaitForRequest::fixture((channel, WaitForMode::Unlock)),
+    )
+    .await;
     assert_eq!(handler.wait_for_counts(channel), (0, 0, false));
 }
 
@@ -2068,9 +2066,7 @@ async fn completed_unattached_initial_command_exits_with_stdin_open_and_discards
 #[tokio::test]
 async fn immediate_socket_eof_preserves_fast_attach_query_payloads_and_guards() {
     let handler = Arc::new(RequestHandler::new());
-    let session_name = handler
-        .create_session(Sizeless("eof-fast-multi-frame"))
-        .await;
+    let session_name = SessionSpec::create(&handler, Sizeless("eof-fast-multi-frame")).await;
     let mut control = ControlClient::open(&handler, 4243, b"", 0);
 
     let frames = format!(
@@ -2124,9 +2120,8 @@ async fn immediate_socket_eof_preserves_fast_attach_query_payloads_and_guards() 
 async fn plain_control_eof_keeps_ready_existing_session_attach_before_exit() {
     let handler = Arc::new(RequestHandler::new());
     let requester_pid = 42_431;
-    let session_name = handler
-        .create_session(Sizeless("plain-control-eof-attach-race"))
-        .await;
+    let session_name =
+        SessionSpec::create(&handler, Sizeless("plain-control-eof-attach-race")).await;
 
     let (event_tx, event_rx) = mpsc::channel(CONTROL_SERVER_EVENT_CAPACITY);
     let (identity, closing) =
@@ -2183,9 +2178,8 @@ async fn control_control_eof_reconciles_ready_session_change_before_exit() {
     // so the biased-select ordering is deterministic.
     let handler = Arc::new(RequestHandler::new());
     let requester_pid = 42_430;
-    let session_name = handler
-        .create_session(Sizeless("control-control-eof-session-race"))
-        .await;
+    let session_name =
+        SessionSpec::create(&handler, Sizeless("control-control-eof-session-race")).await;
     let pane_output = handler
         .control_session_panes(&session_name)
         .await
@@ -2252,9 +2246,7 @@ async fn control_control_eof_reconciles_ready_session_change_before_exit() {
         String::from_utf8_lossy(&rendered)
     );
 
-    handler
-        .handle_ok(KillSessionRequest::fixture(session_name))
-        .await;
+    TestRequest::send_ok(&handler, KillSessionRequest::fixture(session_name)).await;
     rendered.extend(control.read_to_eof().await);
     control.join().await;
     assert!(
@@ -2350,12 +2342,11 @@ async fn pending_control_command_waits_for_completion_without_execution_timeout(
     let begin_prefix = control.read_begin_prefix().await;
     wait_for_waiter(&handler, "control-timeout-block").await;
     tokio::time::sleep(Duration::from_millis(650)).await;
-    handler
-        .handle_ok(WaitForRequest::fixture((
-            "control-timeout-block",
-            WaitForMode::Signal,
-        )))
-        .await;
+    TestRequest::send_ok(
+        &handler,
+        WaitForRequest::fixture(("control-timeout-block", WaitForMode::Signal)),
+    )
+    .await;
 
     let rendered = format!("{begin_prefix}{}", control.transcript().await);
     assert!(
@@ -2481,9 +2472,11 @@ async fn eof_transition_is_not_starved_by_continuous_server_events() {
 async fn eof_cancels_selected_lock_waiter_without_releasing_the_lock_owner() {
     let handler = Arc::new(RequestHandler::new());
     let lock_channel = "control-eof-lock-block";
-    handler
-        .handle_ok(WaitForRequest::fixture((lock_channel, WaitForMode::Lock)))
-        .await;
+    TestRequest::send_ok(
+        &handler,
+        WaitForRequest::fixture((lock_channel, WaitForMode::Lock)),
+    )
+    .await;
 
     let input =
         format!("wait-for -L {lock_channel} ; set-buffer -b eof-active-after-lock must-not-run\n");
@@ -2519,9 +2512,11 @@ async fn eof_cancels_selected_lock_waiter_without_releasing_the_lock_owner() {
     )
     .await;
 
-    handler
-        .handle_ok(WaitForRequest::fixture((lock_channel, WaitForMode::Unlock)))
-        .await;
+    TestRequest::send_ok(
+        &handler,
+        WaitForRequest::fixture((lock_channel, WaitForMode::Unlock)),
+    )
+    .await;
     assert_eq!(handler.wait_for_counts(lock_channel), (0, 0, false));
 }
 

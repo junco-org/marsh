@@ -20,6 +20,7 @@ use tokio::time::{timeout, Duration};
 
 use crate::test_fixtures::{
     quiet_command, unique_temp_path, wait_for_file_contents, wait_until, Fixture, Owned,
+    SessionSpec, TestRequest,
 };
 use crate::test_names::session_name;
 use crate::test_shell::sh_quote_path;
@@ -96,13 +97,15 @@ fn window_respawn_probe_line_matches(line: &str, expected: &(&str, &str, &str)) 
 
 /// Creates the detached 120x40 session `name`, whose first pane runs [`quiet_command`].
 async fn create_session(handler: &RequestHandler, name: impl Owned<SessionName>) -> SessionName {
-    handler
-        .create_session(NewSessionExtRequest {
+    SessionSpec::create(
+        handler,
+        NewSessionExtRequest {
             size: Some(WINDOW_TEST_SIZE),
             command: Some(quiet_command()),
             ..Fixture::fixture(name)
-        })
-        .await
+        },
+    )
+    .await
 }
 
 /// Creates the detached 120x40 session `name` in the group of `group`; its pane runs the shell.
@@ -111,13 +114,15 @@ async fn create_grouped_session(
     name: impl Owned<SessionName>,
     group: impl Owned<SessionName>,
 ) -> SessionName {
-    handler
-        .create_session(NewSessionExtRequest {
+    SessionSpec::create(
+        handler,
+        NewSessionExtRequest {
             size: Some(WINDOW_TEST_SIZE),
             group_target: Some(group.owned()),
             ..Fixture::fixture(name)
-        })
-        .await
+        },
+    )
+    .await
 }
 
 async fn enable_global_monitor_silence(handler: &RequestHandler) {
@@ -154,8 +159,6 @@ async fn insert_window(handler: &RequestHandler, session_name: &SessionName, win
                 environment_overrides: None,
                 respawn_shell: None,
                 respawn_environment: None,
-                shell_id: None,
-                follow_mux_lifetime: false,
             },
         )
         .await
@@ -168,12 +171,14 @@ async fn link_duplicate_window(
     source_index: u32,
     destination_index: u32,
 ) {
-    handler
-        .handle_ok(LinkWindowRequest::fixture((
+    TestRequest::send_ok(
+        handler,
+        LinkWindowRequest::fixture((
             WindowTarget::with_window(session_name.clone(), source_index),
             WindowTarget::with_window(session_name.clone(), destination_index),
-        )))
-        .await;
+        )),
+    )
+    .await;
 }
 
 fn assert_refresh(control: AttachControl) {

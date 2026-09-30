@@ -219,6 +219,13 @@ impl Snapshot {
         }
     }
 
+    /// Marks the active command's evidence incomplete, so it is never published.
+    pub fn fail_evidence(&self, cause: String) {
+        if let Some((_, evidence)) = &mut self.state.lock().recover().evidence {
+            evidence.failure.get_or_insert(cause);
+        }
+    }
+
     pub fn take_evidence(&self, run: TraceRun) -> Result<CommandEvidence, ShellError> {
         let mut state = self.state.lock().recover();
         let Some((active, mut evidence)) = state.evidence.take() else {

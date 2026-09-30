@@ -4,10 +4,9 @@
 //! is a separate type: these cases are the ones a pseudoterminal would only make slower and less
 //! deterministic to observe.
 
-use marsh_core::shellmux::repl;
 use rmux_core::Utf8Config;
 
-use super::{caret, kill_line, Action, Advance, Editing};
+use super::{caret, Action, Advance, Editing};
 
 /// What the prompt would have done with a finished line.
 #[derive(Debug, PartialEq, Eq)]
@@ -220,13 +219,7 @@ fn input_after_a_submitted_line_is_handed_over_exactly_once() {
 
 #[test]
 fn an_unfinished_line_is_continued_as_it_was_typed() {
-    // The parser trims, and the trimmed text is what runs — but it is not what the *next* line
-    // is appended to, because the spaces are inside the quote.
-    assert_eq!(
-        repl::parse("echo 'a  "),
-        repl::Input::Foreground("echo 'a".to_owned())
-    );
-
+    // The spaces are inside the quote, so the next line is appended to the untrimmed buffer.
     let mut line = Editing::default();
     line.pending.extend_from_slice(b"echo 'a  \r");
     assert_eq!(line.advance().action, Some(Action::Submit));
@@ -263,16 +256,6 @@ fn a_lone_escape_is_left_for_the_escape_time_timer() {
     line.pending.extend_from_slice(b"[C");
     line.advance();
     assert!(line.pending.is_empty());
-}
-
-#[test]
-fn kill_becomes_a_quoted_managed_invocation() {
-    assert_eq!(
-        kill_line(&["-9".to_owned(), "12 34".to_owned()]),
-        "kill '-9' '12 34'",
-        "each argument is quoted on its own so the shell does not re-split it"
-    );
-    assert_eq!(kill_line(&[]), "kill");
 }
 
 #[test]

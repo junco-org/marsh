@@ -17,6 +17,7 @@ use super::set_titles_support::{
     attach_title_capable_client, delivered_titles, remembered_title, set_global,
 };
 use super::*;
+use crate::test_fixtures::SessionSpec;
 
 const SWITCH_TITLE_FORMAT: &str = "TARGET=#S|CLIENT=#{client_session}|N=#{client_name}";
 
@@ -27,8 +28,8 @@ async fn arm_two_sessions(
     alpha: &rmux_proto::SessionName,
     beta: &rmux_proto::SessionName,
 ) {
-    handler.create_session(alpha).await;
-    handler.create_session(beta).await;
+    SessionSpec::create(handler, alpha).await;
+    SessionSpec::create(handler, beta).await;
     // The reviewer's reproduction: no periodic redraw may repair the frame.
     set_global(handler, OptionName::StatusInterval, "0").await;
     set_global(handler, OptionName::SetTitlesString, SWITCH_TITLE_FORMAT).await;

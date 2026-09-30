@@ -1,14 +1,12 @@
 use super::*;
-use crate::test_fixtures::{Fixture, Sizeless};
+use crate::test_fixtures::{Fixture, SessionSpec, Sizeless, TestRequest};
 
 #[tokio::test]
 async fn mutate_session_rolls_back_when_the_mutation_returns_an_error() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
 
-    handler
-        .create_session((&alpha, TerminalSize::new(120, 40)))
-        .await;
+    SessionSpec::create(&handler, (&alpha, TerminalSize::new(120, 40))).await;
 
     let previous_session = {
         let state = handler.state.lock().await;
@@ -66,7 +64,7 @@ async fn rename_session_missing_source_returns_session_not_found() {
 async fn rename_session_to_existing_name_returns_duplicate_session() {
     let handler = RequestHandler::new();
     for name in ["alpha", "beta"] {
-        handler.create_session(Sizeless(name)).await;
+        SessionSpec::create(&handler, Sizeless(name)).await;
     }
 
     let response = handler
@@ -96,7 +94,7 @@ async fn rename_session_to_existing_name_returns_duplicate_session() {
 #[tokio::test]
 async fn rename_session_to_same_name_returns_success_without_mutation() {
     let handler = RequestHandler::new();
-    handler.create_session(Sizeless("alpha")).await;
+    SessionSpec::create(&handler, Sizeless("alpha")).await;
 
     let response = handler
         .handle(Request::RenameSession(RenameSessionRequest {
@@ -124,7 +122,7 @@ async fn rename_session_to_same_name_returns_success_without_mutation() {
 #[tokio::test]
 async fn rename_session_happy_path_migrates_session() {
     let handler = RequestHandler::new();
-    handler.create_session(Sizeless("alpha")).await;
+    SessionSpec::create(&handler, Sizeless("alpha")).await;
 
     let renamed = handler
         .handle(Request::RenameSession(RenameSessionRequest {
@@ -161,7 +159,7 @@ async fn rename_session_happy_path_migrates_session() {
 #[tokio::test]
 async fn rename_session_resolves_unique_prefix_targets() {
     let handler = RequestHandler::new();
-    handler.create_session(Sizeless("alpha")).await;
+    SessionSpec::create(&handler, Sizeless("alpha")).await;
 
     let renamed = handler
         .handle(Request::RenameSession(RenameSessionRequest {
@@ -191,7 +189,7 @@ async fn rename_session_fails_closed_when_source_name_is_recreated_after_resolut
     let handler = RequestHandler::new();
     let alpha = session_name("rename-identity-alpha");
     let beta = session_name("rename-identity-beta");
-    handler.create_session(Sizeless(&alpha)).await;
+    SessionSpec::create(&handler, Sizeless(&alpha)).await;
     let old_session_id = handler.session_id_for_test(&alpha).await;
 
     let pause = handler.install_rename_session_identity_pause(alpha.clone());
@@ -208,8 +206,8 @@ async fn rename_session_fails_closed_when_source_name_is_recreated_after_resolut
     });
 
     pause.reached.notified().await;
-    handler.handle_ok(KillSessionRequest::fixture(&alpha)).await;
-    handler.create_session(Sizeless(&alpha)).await;
+    TestRequest::send_ok(&handler, KillSessionRequest::fixture(&alpha)).await;
+    SessionSpec::create(&handler, Sizeless(&alpha)).await;
     let new_session_id = handler.session_id_for_test(&alpha).await;
     assert_ne!(new_session_id, old_session_id);
     pause.release.notify_one();
@@ -236,7 +234,7 @@ async fn rename_session_serializes_timer_rekey_before_source_name_reuse() {
     handler
         .set_option(ScopeSelector::Global, OptionName::MonitorSilence, "60")
         .await;
-    handler.create_session(Sizeless(&alpha)).await;
+    SessionSpec::create(&handler, Sizeless(&alpha)).await;
     let old_target = rmux_proto::WindowTarget::with_window(alpha.clone(), 0);
     let old_snapshot = handler
         .silence_timer_snapshot_for_test(&old_target)
@@ -321,14 +319,14 @@ async fn stale_timer_expiry_and_cancel_fail_closed_after_session_name_reuse() {
     handler
         .set_option(ScopeSelector::Global, OptionName::MonitorSilence, "60")
         .await;
-    handler.create_session(Sizeless(&alpha)).await;
+    SessionSpec::create(&handler, Sizeless(&alpha)).await;
     let target = rmux_proto::WindowTarget::with_window(alpha.clone(), 0);
     let old_identity = handler
         .silence_timer_identity_for_test(&target)
         .expect("old incarnation timer identity exists");
 
-    handler.handle_ok(KillSessionRequest::fixture(&alpha)).await;
-    handler.create_session(Sizeless(&alpha)).await;
+    TestRequest::send_ok(&handler, KillSessionRequest::fixture(&alpha)).await;
+    SessionSpec::create(&handler, Sizeless(&alpha)).await;
     let new_identity = handler
         .silence_timer_identity_for_test(&target)
         .expect("new incarnation timer identity exists");

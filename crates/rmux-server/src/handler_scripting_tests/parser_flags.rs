@@ -1,5 +1,6 @@
 use super::*;
 
+use crate::test_fixtures::{SessionSpec, TestRequest};
 use rmux_proto::{RenameWindowRequest, SendKeysExtRequest};
 
 const UNKNOWN_FLAG_COMMANDS: [(&str, &str); 13] = [
@@ -147,13 +148,15 @@ fn server_tail_parsers_preserve_explicit_dash_prefixed_positionals() {
 }
 
 async fn create_stable_session(handler: &RequestHandler, name: &SessionName) -> u32 {
-    handler.create_session(name).await;
-    handler
-        .handle_ok(RenameWindowRequest {
+    SessionSpec::create(handler, name).await;
+    TestRequest::send_ok(
+        handler,
+        RenameWindowRequest {
             target: WindowTarget::with_window(name.clone(), 0),
             name: "stable-window".to_owned(),
-        })
-        .await;
+        },
+    )
+    .await;
 
     let state = handler.state.lock().await;
     let pane_id = state

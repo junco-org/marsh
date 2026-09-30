@@ -9,13 +9,13 @@ use rmux_proto::{
     SplitWindowRequest, WindowTarget,
 };
 
-use crate::test_fixtures::Fixture;
+use crate::test_fixtures::{Fixture, SessionSpec, TestRequest};
 use crate::test_names::session_name;
 
 #[tokio::test]
 async fn show_options_returns_command_output_for_session_and_server_scopes() {
     let handler = RequestHandler::new();
-    handler.create_session("alpha").await;
+    SessionSpec::create(&handler, "alpha").await;
 
     handler
         .set_option(
@@ -63,7 +63,7 @@ async fn show_options_returns_command_output_for_session_and_server_scopes() {
 #[tokio::test]
 async fn show_options_without_a_omits_inherited_values() {
     let handler = RequestHandler::new();
-    handler.create_session("alpha").await;
+    SessionSpec::create(&handler, "alpha").await;
 
     let response = handler
         .handle(Request::ShowOptions(ShowOptionsRequest {
@@ -85,7 +85,7 @@ async fn show_options_without_a_omits_inherited_values() {
 #[tokio::test]
 async fn show_options_global_scope_resolves_named_defaults_without_a_marker() {
     let handler = RequestHandler::new();
-    handler.create_session("alpha").await;
+    SessionSpec::create(&handler, "alpha").await;
 
     let response = handler
         .handle(Request::ShowOptions(ShowOptionsRequest {
@@ -107,7 +107,7 @@ async fn show_options_global_scope_resolves_named_defaults_without_a_marker() {
 #[tokio::test]
 async fn show_options_a_marks_inherited_values() {
     let handler = RequestHandler::new();
-    handler.create_session("alpha").await;
+    SessionSpec::create(&handler, "alpha").await;
 
     let response = handler
         .handle(Request::ShowOptions(ShowOptionsRequest {
@@ -129,7 +129,7 @@ async fn show_options_a_marks_inherited_values() {
 #[tokio::test]
 async fn show_options_h_appends_hooks_and_named_hooks_do_not_require_h() {
     let handler = RequestHandler::new();
-    handler.create_session("alpha").await;
+    SessionSpec::create(&handler, "alpha").await;
     {
         let mut state = handler.state.lock().await;
         state
@@ -204,7 +204,7 @@ async fn show_options_h_appends_hooks_and_named_hooks_do_not_require_h() {
 #[tokio::test]
 async fn show_options_a_marks_inherited_hook_bindings() {
     let handler = RequestHandler::new();
-    handler.create_session("alpha").await;
+    SessionSpec::create(&handler, "alpha").await;
     {
         let mut state = handler.state.lock().await;
         state
@@ -240,7 +240,7 @@ async fn show_options_a_marks_inherited_hook_bindings() {
 #[tokio::test]
 async fn show_environment_returns_sorted_exact_scope_command_output() {
     let handler = RequestHandler::new();
-    handler.create_session("alpha").await;
+    SessionSpec::create(&handler, "alpha").await;
 
     for (scope, name, value) in [
         (ScopeSelector::Global, "COLORTERM", "truecolor"),
@@ -250,16 +250,18 @@ async fn show_environment_returns_sorted_exact_scope_command_output() {
             "screen-256color",
         ),
     ] {
-        handler
-            .handle_ok(SetEnvironmentRequest {
+        TestRequest::send_ok(
+            &handler,
+            SetEnvironmentRequest {
                 scope,
                 name: name.to_owned(),
                 value: value.to_owned(),
                 mode: None,
                 hidden: false,
                 format: false,
-            })
-            .await;
+            },
+        )
+        .await;
     }
 
     let response = handler
@@ -300,7 +302,7 @@ async fn show_environment_returns_sorted_exact_scope_command_output() {
 #[tokio::test]
 async fn base_index_controls_future_window_allocation() {
     let handler = RequestHandler::new();
-    handler.create_session("alpha").await;
+    SessionSpec::create(&handler, "alpha").await;
 
     handler
         .set_option(
@@ -316,7 +318,7 @@ async fn base_index_controls_future_window_allocation() {
 #[tokio::test]
 async fn show_options_window_global_scope_is_a_valid_explicit_request() {
     let handler = RequestHandler::new();
-    handler.create_session("alpha").await;
+    SessionSpec::create(&handler, "alpha").await;
 
     let response = handler
         .handle(Request::ShowOptions(ShowOptionsRequest {
@@ -334,7 +336,7 @@ async fn show_options_window_global_scope_is_a_valid_explicit_request() {
 #[tokio::test]
 async fn show_environment_rejects_window_scope_requests() {
     let handler = RequestHandler::new();
-    handler.create_session("alpha").await;
+    SessionSpec::create(&handler, "alpha").await;
 
     assert_eq!(
         handler
@@ -356,7 +358,7 @@ async fn show_environment_rejects_window_scope_requests() {
 #[tokio::test]
 async fn show_environment_returns_empty_output_when_no_variables_are_set() {
     let handler = RequestHandler::new();
-    handler.create_session("alpha").await;
+    SessionSpec::create(&handler, "alpha").await;
 
     let response = handler
         .handle(Request::ShowEnvironment(ShowEnvironmentRequest {
@@ -461,7 +463,7 @@ async fn show_options_for_nonexistent_session_returns_session_not_found() {
 #[tokio::test]
 async fn show_options_at_window_scope_resolves_window_then_session_then_global() {
     let handler = RequestHandler::new();
-    handler.create_session("alpha").await;
+    SessionSpec::create(&handler, "alpha").await;
 
     // Set a window-scope option at the window level
     handler
@@ -549,7 +551,7 @@ async fn show_hooks_global_window_scope_returns_window_default_values_when_unset
 #[tokio::test]
 async fn kill_window_removes_window_and_pane_option_overrides() {
     let handler = RequestHandler::new();
-    handler.create_session("alpha").await;
+    SessionSpec::create(&handler, "alpha").await;
 
     // Create a second window so kill-window doesn't fail (need at least 1)
     handler.create_window("alpha").await;
@@ -573,11 +575,11 @@ async fn kill_window_removes_window_and_pane_option_overrides() {
         .await;
 
     // Kill window 0
-    handler
-        .handle_ok(KillWindowRequest::fixture(WindowTarget::new(session_name(
-            "alpha",
-        ))))
-        .await;
+    TestRequest::send_ok(
+        &handler,
+        KillWindowRequest::fixture(WindowTarget::new(session_name("alpha"))),
+    )
+    .await;
 
     // Verify window and pane options are cleaned up
     let state = handler.state.lock().await;
@@ -600,12 +602,10 @@ async fn kill_window_removes_window_and_pane_option_overrides() {
 #[tokio::test]
 async fn kill_pane_removes_pane_option_overrides() {
     let handler = RequestHandler::new();
-    handler.create_session("alpha").await;
+    SessionSpec::create(&handler, "alpha").await;
 
     // Split to create a second pane
-    handler
-        .handle_ok(SplitWindowRequest::fixture(session_name("alpha")))
-        .await;
+    TestRequest::send_ok(&handler, SplitWindowRequest::fixture(session_name("alpha"))).await;
 
     // Set a pane option on pane 1
     handler
@@ -617,12 +617,14 @@ async fn kill_pane_removes_pane_option_overrides() {
         .await;
 
     // Kill pane 1
-    handler
-        .handle_ok(rmux_proto::KillPaneRequest {
+    TestRequest::send_ok(
+        &handler,
+        rmux_proto::KillPaneRequest {
             target: PaneTarget::new(session_name("alpha"), 1),
             kill_all_except: false,
-        })
-        .await;
+        },
+    )
+    .await;
 
     // Verify pane option is cleaned up
     let state = handler.state.lock().await;
@@ -639,16 +641,18 @@ async fn kill_pane_removes_pane_option_overrides() {
 async fn show_environment_shell_format_escapes_special_characters() {
     let handler = RequestHandler::new();
 
-    handler
-        .handle_ok(SetEnvironmentRequest {
+    TestRequest::send_ok(
+        &handler,
+        SetEnvironmentRequest {
             scope: ScopeSelector::Global,
             name: "TRICKY".to_owned(),
             value: r#"$HOME "quoted" `cmd` back\slash"#.to_owned(),
             mode: None,
             hidden: false,
             format: false,
-        })
-        .await;
+        },
+    )
+    .await;
 
     let response = handler
         .handle(Request::ShowEnvironment(ShowEnvironmentRequest {
@@ -673,26 +677,30 @@ async fn show_environment_shell_format_escapes_special_characters() {
 async fn show_environment_shell_format_cleared_entry_prints_unset() {
     let handler = RequestHandler::new();
 
-    handler
-        .handle_ok(SetEnvironmentRequest {
+    TestRequest::send_ok(
+        &handler,
+        SetEnvironmentRequest {
             scope: ScopeSelector::Global,
             name: "STALE".to_owned(),
             value: "old".to_owned(),
             mode: None,
             hidden: false,
             format: false,
-        })
-        .await;
-    handler
-        .handle_ok(SetEnvironmentRequest {
+        },
+    )
+    .await;
+    TestRequest::send_ok(
+        &handler,
+        SetEnvironmentRequest {
             scope: ScopeSelector::Global,
             name: "STALE".to_owned(),
             value: String::new(),
             mode: Some(SetEnvironmentMode::Clear),
             hidden: false,
             format: false,
-        })
-        .await;
+        },
+    )
+    .await;
 
     let response = handler
         .handle(Request::ShowEnvironment(ShowEnvironmentRequest {
@@ -713,19 +721,21 @@ async fn show_environment_shell_format_cleared_entry_prints_unset() {
 #[tokio::test]
 async fn show_environment_hidden_variable_round_trip() {
     let handler = RequestHandler::new();
-    handler.create_session("alpha").await;
+    SessionSpec::create(&handler, "alpha").await;
 
     // Set a hidden variable.
-    handler
-        .handle_ok(SetEnvironmentRequest {
+    TestRequest::send_ok(
+        &handler,
+        SetEnvironmentRequest {
             scope: ScopeSelector::Session(session_name("alpha")),
             name: "SECRET".to_owned(),
             value: "classified".to_owned(),
             mode: Some(SetEnvironmentMode::Set),
             hidden: true,
             format: false,
-        })
-        .await;
+        },
+    )
+    .await;
 
     // Normal show-environment should suppress hidden entries.
     let response = handler
@@ -837,7 +847,7 @@ async fn set_environment_clear_and_unset_validation() {
 #[tokio::test]
 async fn set_option_at_window_scope_rejects_nonexistent_window() {
     let handler = RequestHandler::new();
-    handler.create_session("alpha").await;
+    SessionSpec::create(&handler, "alpha").await;
 
     assert_eq!(
         handler

@@ -31,7 +31,9 @@ use tokio::time::sleep;
 
 const ATTACH_LIFECYCLE_TIMEOUT: Duration = Duration::from_secs(5);
 
-use crate::test_fixtures::{Fixture, Grouped, Quiet, DEFAULT_SHELL_WINDOW_NAME};
+use crate::test_fixtures::{
+    Fixture, Grouped, Quiet, SessionSpec, TestRequest, DEFAULT_SHELL_WINDOW_NAME,
+};
 use crate::test_names::session_name;
 
 fn default_shell_pane_status() -> String {
@@ -157,7 +159,7 @@ async fn create_attached_session(
     handler
         .store_option_for_test(ScopeSelector::Global, OptionName::DefaultShell, "/bin/bash")
         .await;
-    handler.create_session(session).await;
+    SessionSpec::create(handler, session).await;
     handler.attach_client(requester_pid, session).await
 }
 
@@ -176,19 +178,21 @@ async fn create_attached_session_in_utf8_locale(
     handler
         .store_option_for_test(ScopeSelector::Global, OptionName::DefaultShell, "/bin/bash")
         .await;
-    handler
-        .create_session(NewSessionRequest {
+    SessionSpec::create(
+        handler,
+        NewSessionRequest {
             environment: utf8_locale::fixture_environment(),
             ..Fixture::fixture(session)
-        })
-        .await;
+        },
+    )
+    .await;
     handler.attach_client(requester_pid, session).await
 }
 
 #[tokio::test]
 async fn web_render_refreshes_are_marked_pending_before_building_switches() {
     let handler = RequestHandler::new();
-    let session = handler.create_session("web-refresh-coalesce").await;
+    let session = SessionSpec::create(&handler, "web-refresh-coalesce").await;
 
     let (control_tx, mut control_rx) = mpsc::unbounded_channel();
     handler
@@ -217,7 +221,7 @@ async fn web_render_refreshes_are_marked_pending_before_building_switches() {
 #[tokio::test]
 async fn refresh_attached_session_removes_clients_over_backlog_limit() {
     let handler = RequestHandler::new();
-    let session = handler.create_session("refresh-backlog").await;
+    let session = SessionSpec::create(&handler, "refresh-backlog").await;
 
     let (control_tx, mut control_rx) = mpsc::unbounded_channel();
     let control_backlog = Arc::new(AtomicUsize::new(
@@ -256,12 +260,14 @@ async fn create_line_exiting_attached_session(
     session: &SessionName,
 ) -> mpsc::UnboundedReceiver<AttachControl> {
     let marker = format!("RMUX_LINE_EXIT_READY_{}", std::process::id());
-    handler
-        .create_session(NewSessionExtRequest {
+    SessionSpec::create(
+        handler,
+        NewSessionExtRequest {
             command: Some(line_exiting_command(&marker)),
             ..Fixture::fixture(session)
-        })
-        .await;
+        },
+    )
+    .await;
     let target = PaneTarget::new(session.clone(), 0);
     wait_for_capture_containing(
         handler,
@@ -281,7 +287,7 @@ async fn create_quiet_attached_session(
     requester_pid: u32,
     session: &SessionName,
 ) -> mpsc::UnboundedReceiver<AttachControl> {
-    handler.create_session(Quiet(session)).await;
+    SessionSpec::create(handler, Quiet(session)).await;
     handler.attach_client(requester_pid, session).await
 }
 
@@ -310,29 +316,33 @@ fn quiet_ready_command(marker: &str) -> Vec<String> {
 }
 
 async fn active_panes(handler: &RequestHandler, session: &SessionName) -> String {
-    let response = handler
-        .handle_ok(ListPanesRequest {
+    let response = TestRequest::send_ok(
+        handler,
+        ListPanesRequest {
             target: session.clone(),
             format: Some("#{pane_index}:#{pane_active}".to_owned()),
             filter: None,
             sort_order: None,
             reversed: false,
             target_window_index: None,
-        })
-        .await;
+        },
+    )
+    .await;
     String::from_utf8(response.output.stdout().to_vec()).expect("list-panes stdout is utf-8")
 }
 
 async fn active_windows(handler: &RequestHandler, session: &SessionName) -> String {
-    let response = handler
-        .handle_ok(ListWindowsRequest {
+    let response = TestRequest::send_ok(
+        handler,
+        ListWindowsRequest {
             target: session.clone(),
             format: Some("#{window_index}:#{window_active}".to_owned()),
             filter: None,
             sort_order: None,
             reversed: false,
-        })
-        .await;
+        },
+    )
+    .await;
     String::from_utf8(response.output.stdout().to_vec()).expect("list-windows stdout is utf-8")
 }
 
@@ -359,8 +369,9 @@ async fn select_layout(handler: &RequestHandler, session: &SessionName, layout: 
 }
 
 async fn pane_mode_status(handler: &RequestHandler, session: &SessionName) -> String {
-    let response = handler
-        .handle_ok(ListPanesRequest {
+    let response = TestRequest::send_ok(
+        handler,
+        ListPanesRequest {
             target: session.clone(),
             format: Some(
                 "#{pane_in_mode}:#{pane_mode}:#{search_present}:#{selection_present}".to_owned(),
@@ -369,8 +380,9 @@ async fn pane_mode_status(handler: &RequestHandler, session: &SessionName) -> St
             sort_order: None,
             reversed: false,
             target_window_index: None,
-        })
-        .await;
+        },
+    )
+    .await;
     String::from_utf8(response.output.stdout().to_vec()).expect("list-panes stdout is utf-8")
 }
 
@@ -410,8 +422,7 @@ async fn recv_overlay_frame(
 }
 
 async fn capture_pane_print(handler: &RequestHandler, target: PaneTarget) -> String {
-    let output = handler
-        .handle_ok(CapturePaneRequest::fixture(target))
+    let output = TestRequest::send_ok(handler, CapturePaneRequest::fixture(target))
         .await
         .output
         .expect("capture-pane -p should return command output");
@@ -441,12 +452,14 @@ async fn wait_for_capture_containing(
 
 async fn prepare_attached_shell_prompt(handler: &RequestHandler, target: &PaneTarget) {
     for command in attached_shell_prompt_commands() {
-        handler
-            .handle_ok(SendKeysRequest {
+        TestRequest::send_ok(
+            handler,
+            SendKeysRequest {
                 target: target.clone(),
                 keys: vec![command, "Enter".to_owned()],
-            })
-            .await;
+            },
+        )
+        .await;
     }
     wait_for_capture_containing(
         handler,

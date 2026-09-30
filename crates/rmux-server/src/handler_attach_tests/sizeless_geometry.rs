@@ -23,6 +23,7 @@
 //! it exactly once per reconciliation.
 
 use super::*;
+use crate::test_fixtures::{SessionSpec, TestRequest};
 
 const TERMINAL_SIZE: TerminalSize = TerminalSize { cols: 80, rows: 24 };
 const TWO_LINE_CONTENT_SIZE: TerminalSize = TerminalSize { cols: 80, rows: 22 };
@@ -142,7 +143,7 @@ async fn sizeless_attach_switch_carries_the_outer_terminal_anchor() {
     let alpha = session_name("sizeless-switch-alpha");
     let beta = session_name("sizeless-switch-beta");
     let sizeless_pid = 92_131;
-    handler.create_session((&beta, TERMINAL_SIZE)).await;
+    SessionSpec::create(&handler, (&beta, TERMINAL_SIZE)).await;
     handler.set_session_status(&beta, "2").await;
     let _declared_rx = seed_two_line_status_geometry(&handler, &alpha, 92_130).await;
 
@@ -177,7 +178,7 @@ async fn sizeless_attach_destroy_rehoming_carries_the_outer_terminal_anchor() {
     let handler = RequestHandler::new();
     let alpha = session_name("sizeless-destroy-alpha");
     let beta = session_name("sizeless-destroy-beta");
-    handler.create_session((&beta, TERMINAL_SIZE)).await;
+    SessionSpec::create(&handler, (&beta, TERMINAL_SIZE)).await;
     handler.set_session_status(&beta, "2").await;
     let _declared_rx = seed_two_line_status_geometry(&handler, &alpha, 92_140).await;
     handler
@@ -191,7 +192,7 @@ async fn sizeless_attach_destroy_rehoming_carries_the_outer_terminal_anchor() {
     let mut sizeless_rx = register_sizeless_attach(&handler, 92_141, &alpha).await;
     while sizeless_rx.try_recv().is_ok() {}
 
-    handler.handle_ok(KillSessionRequest::fixture(&alpha)).await;
+    TestRequest::send_ok(&handler, KillSessionRequest::fixture(&alpha)).await;
 
     assert_eq!(
         session_terminal_size(&handler, &beta).await,
@@ -457,7 +458,7 @@ async fn seed_two_line_status_geometry(
     session: &SessionName,
     declared_pid: u32,
 ) -> mpsc::UnboundedReceiver<AttachControl> {
-    handler.create_session((session, TERMINAL_SIZE)).await;
+    SessionSpec::create(handler, (session, TERMINAL_SIZE)).await;
     handler.set_session_status(session, "2").await;
     let (_attach_id, mut control_rx) =
         register_sized_attach(handler, declared_pid, session, TERMINAL_SIZE).await;

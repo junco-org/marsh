@@ -1,4 +1,5 @@
 use super::*;
+use crate::test_fixtures::TestRequest;
 
 #[derive(Clone, Copy)]
 enum PromptCase {
@@ -181,15 +182,15 @@ async fn detached_prompts_drop_mouse_target_but_foreground_prompts_preserve_it()
         let name = format!("prompt-target-{}", case.label());
         let (handler, session, current) = mouse_fixture(&name).await;
         let _control_rx = handler.attach_client(std::process::id(), &session).await;
-        handler
-            .handle_ok(SplitWindowRequest {
+        TestRequest::send_ok(
+            &handler,
+            SplitWindowRequest {
                 direction: SplitDirection::Horizontal,
                 ..Fixture::fixture(&session)
-            })
-            .await;
-        handler
-            .handle_ok(SelectPaneRequest::fixture(&current))
-            .await;
+            },
+        )
+        .await;
+        TestRequest::send_ok(&handler, SelectPaneRequest::fixture(&current)).await;
 
         let mouse_target = PaneTarget::with_window(session.clone(), 0, 1);
         let context = QueueExecutionContext::without_caller_cwd()

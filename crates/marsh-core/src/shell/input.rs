@@ -11,8 +11,8 @@ use brush_interactive::{
 use super::execution::Run;
 use super::session::ExecutionResources;
 use super::{
-    Command, ExecutionResult, Live, Shared, Shell, ShellError, ShellErrorKind, Span, SpanRoute,
-    UIOptions,
+    Action, Command, ExecutionResult, Live, Shared, Shell, ShellCommand, ShellError,
+    ShellErrorKind, Span, SpanRoute, UIOptions,
 };
 
 pub(super) async fn run(shell: &Shell, options: UIOptions) -> Result<ExecutionResult, ShellError> {
@@ -21,7 +21,7 @@ pub(super) async fn run(shell: &Shell, options: UIOptions) -> Result<ExecutionRe
             "the blocking editor requires a multi-thread runtime",
         ));
     }
-    shell.execute(Command::Interactive(options)).await
+    shell.execute(Command::Interactive(options), None).await
 }
 
 struct Adapter<'a> {
@@ -42,6 +42,10 @@ impl Adapter<'_> {
         text: &str,
     ) -> Result<(), ShellError> {
         let owner = self.owner;
+        let tool = ShellCommand {
+            command: text.to_owned(),
+        };
+        let action: Action = (&tool).into();
         let span = tokio::task::block_in_place(|| {
             owner.runtime.block_on(async {
                 let mut interpreter = shell.lock().await;
@@ -49,7 +53,8 @@ impl Adapter<'_> {
                     .begin_span(
                         &mut *interpreter,
                         &mut *self.resources,
-                        text,
+                        &tool,
+                        &action,
                         self.parent.as_ref(),
                         None,
                     )
@@ -57,7 +62,7 @@ impl Adapter<'_> {
             })
         })?;
         if matches!(span.route, SpanRoute::Managed(_)) {
-            text.clone_into(&mut self.command);
+            self.command = tool.command;
         }
         self.pending = Some(span);
         Ok(())
@@ -139,10 +144,19 @@ fn complete<SE: brush_core::ShellExtensions>(
     line: &str,
     cursor: usize,
 ) -> Result<Completions, brush_interactive::ShellError> {
+    let tool = ShellCommand {
+        command: line.to_owned(),
+    };
+    let action: Action = (&tool).into();
     let span = tokio::task::block_in_place(|| {
-        owner
-            .runtime
-            .block_on(owner.begin_span(interpreter, resources, line, parent, None))
+        owner.runtime.block_on(owner.begin_span(
+            interpreter,
+            resources,
+            &tool,
+            &action,
+            parent,
+            None,
+        ))
     });
     let span = match span {
         Ok(span) => span,
@@ -157,7 +171,7 @@ fn complete<SE: brush_core::ShellExtensions>(
         }
     };
     let command = if matches!(span.route, SpanRoute::Managed(_)) {
-        line.to_owned()
+        tool.command
     } else {
         String::new()
     };
@@ -199,11 +213,16 @@ pub(super) async fn run_owned(
     options: UIOptions,
     parent: Option<Weak<Run>>,
 ) -> Result<ExecutionResult, ShellError> {
+    let tool = ShellCommand {
+        command: String::new(),
+    };
+    let action: Action = (&tool).into();
     let span = owner
         .begin_span(
             &mut live.interpreter,
             &mut live.resources,
-            "",
+            &tool,
+            &action,
             parent.as_ref(),
             None,
         )

@@ -18,18 +18,15 @@
 //! scheduled here run in the order they were spawned on one runtime.
 
 use std::future::Future;
-use std::path::PathBuf;
 use std::sync::Arc;
 
-use marsh_core::shellmux::{CommandCompletion, JobEnd, OutputChannel, Sandbox, ShellId};
+use marsh_core::shellmux::{CommandCompletion, JobEnd, OutputChannel, Sandbox};
 use marsh_core::{ExecutionResult, ShellError, ShellErrorKind};
-use rmux_core::LifecycleEvent;
-use rmux_proto::{ProcessCommand, RmuxError, SessionName, WindowTarget};
 
-use super::{prepare_lifecycle_event_if_enabled, RequestHandler, SelectionTransitionSnapshot};
+use super::RequestHandler;
 use crate::io::{ShellHandle, ShellIo};
 use crate::pane_io::PaneExitEvent;
-use crate::pane_terminals::{HandlerState, NewWindowOptions, WindowSpawnOptions};
+use crate::pane_terminals::HandlerState;
 
 impl RequestHandler {
     /// Binds this daemon's shell facade, once, at the start of [`crate::listener::serve`].
@@ -123,8 +120,8 @@ impl RequestHandler {
     /// A native `switch` chose a shell; select the rmux pane that presents it.
     ///
     /// This is the native-to-rmux half of selection synchronisation. Only [`ShellIo::switch`]
-    /// moves the facade's current shell, so anything found here was chosen deliberately — by the
-    /// pane prompt's `fg`, by a library consumer, or by this daemon's own opposite-direction push.
+    /// moves the facade's current shell, so anything found here was chosen deliberately — by a
+    /// library consumer, or by this daemon's own opposite-direction push.
     ///
     /// That last case is why the claim is taken before anything else: the push stored the
     /// identity it was about to install, so its own echo arrives here, matches, and stops. The
@@ -431,9 +428,10 @@ impl RequestHandler {
     /// exited with, so the two can be read together.
     ///
     /// Two surfaces consume the verdict directly rather than through this log, and both arrive
-    /// with their own slices: the interactive shell prompt renders it through `repl::report_lines`
-    /// into the job's own terminal, and `display-popup -E`/`-EE` decides its close policy from the
-    /// completed command's status in `handler_overlay/popup_job.rs`.
+    /// with their own slices: the interactive shell prompt renders it through
+    /// `managed_workload::report_line` into the job's own terminal, and `display-popup -E`/`-EE`
+    /// decides its close policy from the completed command's status in
+    /// `handler_overlay/popup_job.rs`.
     pub(crate) fn note_shell_command_finished(&self, completion: &Arc<CommandCompletion>) {
         if completion.is_published() {
             return;
@@ -576,165 +574,6 @@ impl RequestHandler {
         );
         self.refresh_attached_session(&adopted.session_name).await;
     }
-
-    /// Opens a window for a job the shell prompt asked for, beside the prompt that asked.
-    ///
-    /// `sd NAME DIR` and a trailing `&` create a job, and a job with no surface is one the user
-    /// cannot see, select or type into. This runs the same three-step window creation
-    /// `new-window` runs — plan under the state lock, open the job with that lock released,
-    /// commit against the pane identity the plan reserved — so a prompt-created window gets
-    /// rmux's ordinary profile, environment, layout and naming rather than a second, thinner
-    /// creation path beside it.
-    ///
-    /// It exists as a method on the handler because a prompt task holds a [`ShellIo`] and a
-    /// [`ShellHandle`] and nothing else; every entry into that transaction is a
-    /// [`HandlerState`] method, and [`ShellIo::handler`] is the one way back to the state that
-    /// owns them.
-    ///
-    /// Five things are deliberately not what `new-window` does:
-    ///
-    /// * **The session is resolved from the prompt's own job**, not named by a client, because
-    ///   there is no client: the new window belongs beside the window the line was typed in. The
-    ///   route's pane is resolved to the runtime session that owns it *now*, so a prompt whose
-    ///   pane has since been moved or linked still opens beside itself.
-    /// * **The window is detached**, and nothing here selects it or calls
-    ///   [`ShellIo::switch`](crate::io::ShellIo::switch). `sd` and `&` add a job; they do not
-    ///   move the user to it. `fg` is the line that does.
-    /// * **`follow_mux_lifetime` is `true`**, so the shell is opened with core's cancellable
-    ///   `automatic_close` rather than its line carrying `close_on_finish`. That is what
-    ///   preserves the engine's anonymous-shell rules the user asked for: an unnamed `&` closes
-    ///   itself when its command ends, and `keep` can still cancel that closure. A one-shot
-    ///   command's own closure would take `keep` away.
-    /// * **`default-command` is not applied.** The prompt's own grammar already says what to
-    ///   run: `&` carries a command and `sd` carries none. Substituting rmux's configured
-    ///   command would run something nobody typed, and for an unnamed `sd` it would turn an idle
-    ///   prompt job into a self-closing one-shot.
-    /// * **No `after-new-window` hook is queued.** Inline hooks are drained by the request
-    ///   dispatch that queued them, and a line typed at a prompt is not a request; queueing one
-    ///   here would attribute it to whichever client command happened to run next.
-    ///
-    /// # Errors
-    ///
-    /// Fails when the directory escapes the prompt's seed or names nothing in it, when the
-    /// prompt's own pane no longer has a session to open beside, and for every reason planning,
-    /// opening or committing a window fails. A window whose job never opened is rolled back, so
-    /// a failure leaves no empty window on screen.
-    pub(crate) async fn spawn_repl_window(
-        &self,
-        io: &ShellIo,
-        prompt: &ShellHandle,
-        shell_id: Option<ShellId>,
-        dir: &str,
-        cmd: Option<&str>,
-    ) -> Result<ShellId, RmuxError> {
-        let start_directory = repl_start_directory(prompt, dir)?;
-        let command = cmd.map(|cmd| ProcessCommand::Shell(cmd.to_owned()));
-        // A named job's name is its identity, so the window wears it and stops renaming itself
-        // after whatever it happens to be running. An unnamed `&` has no name yet — the engine
-        // allocates one during the spawn, after the plan — so it keeps rmux's automatic naming.
-        let window_name = shell_id.as_ref().map(|id| id.as_str().to_owned());
-        let socket_path = self.socket_path();
-        // One sentence for the one thing that can be wrong here: the prompt has outlived the
-        // window it was typed in, so there is nothing for a new window to appear beside.
-        let orphaned = || {
-            RmuxError::Server(format!(
-                "{}: this job has no window to open another beside",
-                prompt.id().reference()
-            ))
-        };
-        let Some((route_session, pane_id, generation)) = io.route_for(prompt.sandbox()) else {
-            return Err(orphaned());
-        };
-
-        // The job is opened between the two locked phases below, with the request mutex released,
-        // for the reason `handle_new_window` states: opening one awaits a shell build, a snapshot
-        // creation and the facade's admission lock, and awaiting any of those under the daemon's
-        // request mutex stalls every other session and inverts against the adoption path.
-        let creation = io.pane_creation_transaction().await;
-        let (session_name, planned, timer_mutation, selection_before) = {
-            let mut state = self.state.lock().await;
-            let session_name = prompt_window_session(&state, &route_session, pane_id, generation)
-                .ok_or_else(orphaned)?;
-            let timer_sessions = state.sessions.session_group_members(&session_name);
-            let timer_mutation =
-                self.plan_window_mutation_silence_timers_locked(&state, timer_sessions);
-            let selection_before = SelectionTransitionSnapshot::capture(&state);
-            let planned = state.plan_window(
-                &session_name,
-                NewWindowOptions {
-                    name: window_name,
-                    detached: true,
-                    spawn: WindowSpawnOptions {
-                        start_directory: Some(&start_directory),
-                        command: command.as_ref(),
-                        socket_path: &socket_path,
-                        spawn_environment: None,
-                        environment_overrides: None,
-                        respawn_shell: None,
-                        respawn_environment: None,
-                        shell_id,
-                        follow_mux_lifetime: true,
-                    },
-                },
-            )?;
-            (session_name, planned, timer_mutation, selection_before)
-        };
-        let opened = planned.open().await;
-
-        let (opened_id, lifecycle_events) = {
-            let mut state = self.state.lock().await;
-            let (commit, terminal_commit, prepared) = match opened {
-                Ok(opened) => opened,
-                Err((commit, error)) => {
-                    state.roll_back_planned_window(commit);
-                    return Err(error);
-                }
-            };
-            let opened_id = prepared.shell_id().clone();
-            let response = state.commit_planned_window(commit, prepared, terminal_commit)?;
-            let mut timer_targets = Vec::new();
-            for timer_session_name in state.sessions.session_group_members(&session_name) {
-                let Some(session) = state.sessions.session(&timer_session_name) else {
-                    continue;
-                };
-                timer_targets.extend(session.windows().keys().copied().map(|window_index| {
-                    WindowTarget::with_window(timer_session_name.clone(), window_index)
-                }));
-            }
-            self.apply_window_mutation_silence_timers_locked(
-                &state,
-                timer_mutation,
-                Vec::new(),
-                &[],
-                timer_targets,
-            );
-            // Detached creation cannot move a session's active window, so this normally prepares
-            // nothing. It stays because it is the check, not the effect: if a group or link
-            // synchronization did move one, the clients watching have to be told.
-            let mut lifecycle_events = selection_before
-                .prepare_session_window_changes(&mut state, std::slice::from_ref(&session_name));
-            lifecycle_events.extend(prepare_lifecycle_event_if_enabled(
-                &mut state,
-                &LifecycleEvent::WindowLinked {
-                    session_name: session_name.clone(),
-                    target: Some(response.target),
-                },
-            ));
-            (opened_id, lifecycle_events)
-        };
-
-        // The transaction ends with the commit. What follows emits lifecycle events and refreshes
-        // attached clients, and either can run a user hook that itself creates a pane — which would
-        // take this same non-reentrant mutex while its own call stack still holds the guard. That
-        // deadlocks with every worker idle, which is exactly how it presents.
-        drop(creation);
-
-        for event in lifecycle_events {
-            self.emit_prepared(event).await;
-        }
-        self.refresh_attached_session(&session_name).await;
-        Ok(opened_id)
-    }
 }
 
 /// The runtime session that currently owns `pane`, starting from the session its route named.
@@ -754,58 +593,6 @@ fn resolve_runtime_pane(
     generation: u64,
 ) -> Option<rmux_proto::SessionName> {
     state.resolve_pane_event_runtime_session(session, pane, Some(generation))
-}
-
-/// The visible session a prompt's own pane is in right now.
-///
-/// Two steps, and neither is skippable. The route records the session the pane was *created* in
-/// and the generation it was created at, so [`resolve_runtime_pane`] answers which runtime
-/// session owns that pane today — a pane that has since been moved, linked or respawned is
-/// resolved against its own generation rather than against a name that has moved on. A runtime
-/// session is not an addressable one, though: window creation is applied to the session a user
-/// names, so the runtime answer is turned back into the visible session that presents the pane.
-///
-/// `None` when the pane no longer exists anywhere, which is a prompt outliving its own window.
-fn prompt_window_session(
-    state: &HandlerState,
-    route_session: &SessionName,
-    pane: rmux_core::PaneId,
-    generation: u64,
-) -> Option<SessionName> {
-    let runtime = resolve_runtime_pane(state, route_session, pane, generation)?;
-    state
-        .pane_target_for_runtime_pane(&runtime, pane)
-        .map(|target| target.session_name().clone())
-}
-
-/// The host path a prompt's seed-relative directory names, for the profile to be resolved over.
-///
-/// The prompt speaks in seed-relative directories — that is what `repl::job_dir` produces — while
-/// [`ShellIo::open_shell`](crate::io::ShellIo::open_shell) takes host paths. The root a leading `/` names
-/// is the **originating shell's** seed, not the daemon's default directory: a pane backed by one
-/// seed must not have `sd /src` silently open a job somewhere else.
-///
-/// Normalization is the mux's own lexical grammar, so a `..` that climbs past the root is refused
-/// before any path is built from it rather than escaping onto the host filesystem.
-///
-/// The existence check is here because the profile's own directory resolution is built to *fall
-/// back* when nobody named a directory, and a typed one must name itself in its diagnostic.
-/// Without this the message for `sd api nope` would name the fallback instead of `nope`.
-///
-/// # Errors
-///
-/// Fails when the directory escapes the seed and when it names nothing inside it.
-fn repl_start_directory(job: &ShellHandle, dir: &str) -> Result<PathBuf, RmuxError> {
-    let Some(relative) = marsh_core::shellmux::repl::seed_relative(dir) else {
-        return Err(RmuxError::Server(format!("{dir}: escapes the seed")));
-    };
-    let requested = job.sandbox().seed.join(relative);
-    if !requested.is_dir() {
-        return Err(RmuxError::Server(format!(
-            "{dir}: no such directory in the seed"
-        )));
-    }
-    Ok(requested)
 }
 
 /// The status an unchanged rmux client sees for a closed shell-backed pane.

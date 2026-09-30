@@ -822,6 +822,7 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
         // passes through as a literal rather than triggering failglob.
         let expansion = pattern
             .expand(
+                self.shell.execution_observer(),
                 self.shell.working_dir(),
                 Some(&patterns::Pattern::accept_all_expand_filter),
                 &options,

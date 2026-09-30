@@ -21,14 +21,14 @@ use super::json_output::{
 };
 use super::target_resolution::{
     LISTING_FIELD_SEPARATOR, connect_cli, filtered_listing_line, parse_spec,
-    resolve_active_window_index, response_failure, run_targeted, wrong_target_kind,
+    resolve_active_window_index, response_failure, wrong_target_kind,
 };
 use super::{
-    ExitFailure, expect_command_output, list_session_names, resolve_current_pane_target,
-    resolve_current_session_target, resolve_existing_window_target_or_current,
-    resolve_session_target_or_current, resolve_session_target_spec, resolve_target_spec,
-    resolve_window_index_target_or_current_session, resolve_window_target_or_current,
-    resolve_window_target_spec, run_command_resolved, unexpected_response, write_lines_output,
+    CommandTarget, ExitFailure, expect_command_output, list_session_names,
+    resolve_current_pane_target, resolve_current_session_target,
+    resolve_existing_window_target_or_current, resolve_session_target_spec, resolve_target_spec,
+    resolve_window_index_target_or_current_session, resolve_window_target_spec,
+    run_command_resolved, unexpected_response, write_lines_output,
 };
 use crate::cli_args::{
     AlertSessionTargetArgs, KillWindowArgs, LinkWindowArgs, ListWindowsArgs, MoveWindowArgs,
@@ -48,8 +48,7 @@ pub(super) fn run_link_window(
     socket_path: &Path,
 ) -> Result<i32, ExitFailure> {
     run_command_resolved(socket_path, "link-window", move |connection| {
-        let source =
-            resolve_window_target_or_current(connection, args.source.as_ref(), "link-window")?;
+        let source = WindowTarget::resolve(connection, args.source.as_ref(), "link-window")?;
         let target = resolve_link_window_target(
             connection,
             args.target.as_ref(),
@@ -82,7 +81,7 @@ fn resolve_link_window_target(
         if after || before {
             return resolve_window_placement_anchor_target(connection, None, command_name);
         }
-        let session_name = resolve_session_target_or_current(connection, None, command_name)?;
+        let session_name = SessionName::resolve_fallback(connection, command_name)?;
         let index = first_available_window_index(connection, &session_name)?;
         return Ok(WindowTarget::with_window(session_name, index));
     };
@@ -134,7 +133,7 @@ fn resolve_window_destination_target(
         return Ok(target);
     }
     if let Some(index) = parse_bare_window_index(target.raw())? {
-        let session_name = resolve_session_target_or_current(connection, None, command_name)?;
+        let session_name = SessionName::resolve_fallback(connection, command_name)?;
         return Ok(WindowTarget::with_window(session_name, index));
     }
     if let Some(Target::Window(target)) = target.exact() {
@@ -166,7 +165,7 @@ fn resolve_exact_current_window_name_destination(
     if !link_target_is_bare_session_candidate(raw_target) {
         return Ok(None);
     }
-    let session_name = resolve_session_target_or_current(connection, None, command_name)?;
+    let session_name = SessionName::resolve_fallback(connection, command_name)?;
     find_window_by_name(connection, &session_name, raw_target)
 }
 
@@ -206,7 +205,7 @@ fn resolve_bare_relative_window_target(
     let Some(offset) = parse_bare_relative_window_offset(raw_target)? else {
         return Ok(None);
     };
-    let current = resolve_window_target_or_current(connection, None, command_name)?;
+    let current = WindowTarget::resolve_fallback(connection, command_name)?;
     let index = apply_window_index_offset(current.window_index(), offset)?;
     Ok(Some(WindowTarget::with_window(
         current.session_name().clone(),
@@ -221,7 +220,7 @@ fn resolve_window_placement_anchor_target(
     command_name: &str,
 ) -> Result<WindowTarget, ExitFailure> {
     let Some(target) = target else {
-        return resolve_window_target_or_current(connection, None, command_name);
+        return WindowTarget::resolve_fallback(connection, command_name);
     };
 
     match signed_window_target_session_part(target.raw()) {
@@ -232,7 +231,7 @@ fn resolve_window_placement_anchor_target(
             Ok(WindowTarget::with_window(session_name, window_index))
         }
         Some(SignedWindowSession::Current) => {
-            resolve_window_target_or_current(connection, None, command_name)
+            WindowTarget::resolve_fallback(connection, command_name)
         }
         None => resolve_window_target_spec(connection, target, false),
     }
@@ -379,8 +378,7 @@ pub(super) fn run_move_window(
             };
             (None, target)
         } else {
-            let source =
-                resolve_window_target_or_current(connection, args.source.as_ref(), "move-window")?;
+            let source = WindowTarget::resolve(connection, args.source.as_ref(), "move-window")?;
             let target = resolve_move_window_destination(connection, args.target.as_ref())?;
             (Some(source), MoveWindowTarget::Window(target))
         };
@@ -399,8 +397,7 @@ pub(super) fn run_move_window(
 /// Performs `move-window` insertion before or after an anchor window.
 fn run_move_window_relative(args: &MoveWindowArgs, socket_path: &Path) -> Result<i32, ExitFailure> {
     let mut connection = connect_cli(socket_path)?;
-    let source =
-        resolve_window_target_or_current(&mut connection, args.source.as_ref(), "move-window")?;
+    let source = WindowTarget::resolve(&mut connection, args.source.as_ref(), "move-window")?;
     let target = resolve_window_placement_anchor_target(
         &mut connection,
         args.target.as_ref(),
@@ -457,7 +454,7 @@ fn resolve_window_source_or_marked_or_current(
     match resolve_window_target_spec(connection, &parse_spec("{marked}")?, false) {
         Ok(target) => Ok(target),
         Err(error) if error.message().contains("{marked}") => {
-            resolve_window_target_or_current(connection, None, "swap-window")
+            WindowTarget::resolve_fallback(connection, "swap-window")
         }
         Err(error) => Err(error),
     }
@@ -468,7 +465,7 @@ pub(super) fn run_rotate_window(
     args: &RotateWindowArgs,
     socket_path: &Path,
 ) -> Result<i32, ExitFailure> {
-    run_targeted(
+    WindowTarget::run(
         socket_path,
         "rotate-window",
         args.target.as_ref(),
@@ -499,7 +496,7 @@ pub(super) fn run_resize_window(
     } else {
         None
     };
-    run_targeted(
+    WindowTarget::run(
         socket_path,
         "resize-window",
         args.target.as_ref(),
@@ -512,7 +509,7 @@ pub(super) fn run_respawn_window(
     args: RespawnWindowArgs,
     socket_path: &Path,
 ) -> Result<i32, ExitFailure> {
-    run_targeted(
+    WindowTarget::run(
         socket_path,
         "respawn-window",
         args.target.as_ref(),
@@ -853,7 +850,7 @@ pub(super) fn run_kill_window(
     args: &KillWindowArgs,
     socket_path: &Path,
 ) -> Result<i32, ExitFailure> {
-    run_targeted(
+    WindowTarget::run(
         socket_path,
         "kill-window",
         args.target.as_ref(),
@@ -868,7 +865,7 @@ pub(super) fn run_select_window(
 ) -> Result<i32, ExitFailure> {
     if args.next || args.previous || args.last {
         let target = args.target.as_ref();
-        return run_targeted(
+        return SessionName::run(
             socket_path,
             "select-window",
             target,
@@ -885,8 +882,7 @@ pub(super) fn run_select_window(
     }
 
     run_command_resolved(socket_path, "select-window", move |connection| {
-        let target =
-            resolve_window_target_or_current(connection, args.target.as_ref(), "select-window")?;
+        let target = WindowTarget::resolve(connection, args.target.as_ref(), "select-window")?;
         if args.toggle_last && window_target_is_current(connection, &target)? {
             return connection
                 .last_window(target.session_name().clone())
@@ -913,7 +909,7 @@ pub(super) fn run_rename_window(
     socket_path: &Path,
 ) -> Result<i32, ExitFailure> {
     // Backslashes are doubled so the new name survives format interpretation.
-    run_targeted(
+    WindowTarget::run(
         socket_path,
         "rename-window",
         args.target.as_ref(),
@@ -926,7 +922,7 @@ pub(super) fn run_next_window(
     args: &AlertSessionTargetArgs,
     socket_path: &Path,
 ) -> Result<i32, ExitFailure> {
-    run_targeted(
+    SessionName::run(
         socket_path,
         "next-window",
         args.target.as_ref(),
@@ -939,7 +935,7 @@ pub(super) fn run_previous_window(
     args: &AlertSessionTargetArgs,
     socket_path: &Path,
 ) -> Result<i32, ExitFailure> {
-    run_targeted(
+    SessionName::run(
         socket_path,
         "previous-window",
         args.target.as_ref(),
@@ -952,7 +948,7 @@ pub(super) fn run_last_window(
     args: &SessionTargetArgs,
     socket_path: &Path,
 ) -> Result<i32, ExitFailure> {
-    run_targeted(
+    SessionName::run(
         socket_path,
         "last-window",
         args.target.as_ref(),
@@ -993,7 +989,7 @@ pub(super) fn run_list_windows(
     let targets = if args.all_sessions {
         list_session_names(&mut connection)?
     } else {
-        vec![resolve_session_target_or_current(
+        vec![SessionName::resolve(
             &mut connection,
             args.target.as_ref(),
             "list-windows",

@@ -1,5 +1,6 @@
 use super::*;
 use crate::handler::test_support::spawn_accounted_attach_control_drain;
+use crate::test_fixtures::TestRequest;
 
 const SIZE: TerminalSize = TerminalSize { cols: 20, rows: 5 };
 
@@ -35,7 +36,7 @@ async fn fixture(
     let _control_drain =
         spawn_accounted_attach_control_drain(&handler, requester_pid, control_rx).await;
 
-    handler.handle_ok(CopyModeRequest::fixture(&target)).await;
+    TestRequest::send_ok(&handler, CopyModeRequest::fixture(&target)).await;
 
     let pane_id = {
         let state = handler.state.lock().await;
@@ -125,7 +126,7 @@ async fn install_scrollback(handler: &RequestHandler, target: &PaneTarget) {
     handler
         .replace_transcript_for_test(target, SIZE, contents.as_bytes())
         .await;
-    handler.handle_ok(CopyModeRequest::fixture(target)).await;
+    TestRequest::send_ok(handler, CopyModeRequest::fixture(target)).await;
 }
 
 async fn send_copy_command(
@@ -264,16 +265,18 @@ async fn live_mouse_binding_uses_its_originating_event() {
     // cell and ends at the current drag cell.
     let (handler, session, target, pane_id, requester_pid) = fixture("mouse-origin-binding").await;
     reset_keyboard_cursor(&handler, &target).await;
-    handler
-        .handle_ok(BindKeyRequest {
+    TestRequest::send_ok(
+        &handler,
+        BindKeyRequest {
             note: Some("issue-125-origin".to_owned()),
             ..Fixture::fixture((
                 "copy-mode-vi",
                 "MouseDrag1Pane",
                 ["send-keys", "-X", "begin-selection"],
             ))
-        })
-        .await;
+        },
+    )
+    .await;
 
     handler
         .handle_attached_live_input_for_test(requester_pid, b"\x1b[<0;5;2M")

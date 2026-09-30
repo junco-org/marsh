@@ -500,6 +500,9 @@ fn a_snapshot_directory_opens_a_shell_on_its_original_seed() {
     let root = scratch.path().canonicalize().expect("canonical scratch");
     let seed = root.join("seed");
     fs::create_dir_all(seed.join("src")).expect("seed tree");
+    // The public sandbox root is the Git work-tree root (or the initial directory outside Git),
+    // so `seed` is a work tree like every other test seed.
+    git2::Repository::init(&seed).expect("initialize seed work tree");
     let filesystem = std::sync::Arc::new(marsh_btrfs::fake::CopyTree::new());
     filesystem.register(&seed);
 
@@ -518,14 +521,14 @@ fn a_snapshot_directory_opens_a_shell_on_its_original_seed() {
             marsh_core::shellmux::TerminalGeometry { rows: 24, cols: 80 },
             tokio::runtime::Handle::current(),
             root.join("rmux.sock"),
-            // A managed job, so its snapshot is one the daemon actually took.
+            // A managed job, so the command below runs in a snapshot the daemon actually takes.
             |mut profile, frontend| {
                 profile.sandbox_policy = marsh_core::SandboxPolicy::allow();
                 marsh_core::test_support::mux(profile, frontend, filesystem)
             },
         )
         .expect("open the test engine");
-        // A real job, so the snapshot the daemon has to recognize is one it actually took.
+        // A real shell, whose reported directory is its public logical cwd, not a snapshot path.
         let pane = io
             .open_shell(
                 &seed.join("src"),
@@ -549,7 +552,7 @@ fn a_snapshot_directory_opens_a_shell_on_its_original_seed() {
                 marsh_core::shellmux::SpawnOptions::default(),
             )
             .await
-            .expect("open a shell from inside the pane's snapshot");
+            .expect("open a shell on the pane's logical directory");
         // The completed verdict: `Ok` is an approved publication and nothing else.
         let completion = mapped
             .run_command(
@@ -557,7 +560,7 @@ fn a_snapshot_directory_opens_a_shell_on_its_original_seed() {
                 marsh_core::shellmux::CommandOptions::default(),
             )
             .await
-            .expect("the mapped shell publishes into the original seed");
+            .expect("the mapped shell's command completes");
         assert!(completion.is_published(), "{:?}", completion);
 
         let answer = (pane.sandbox().seed.clone(), mapped.sandbox().seed.clone());
@@ -568,11 +571,11 @@ fn a_snapshot_directory_opens_a_shell_on_its_original_seed() {
     assert_eq!(pane_seed, seed);
     assert_eq!(
         mapped_seed, seed,
-        "a path inside a job's snapshot names the seed that snapshot was taken from"
+        "a shell opened on a job's logical directory reports the same seed"
     );
     assert_eq!(
         fs::read(seed.join("src/mapped.txt")).expect("the published file"),
         b"mapped",
-        "the write landed in the original seed, under the directory the snapshot stood for"
+        "the write landed in the original seed, under the logical directory"
     );
 }

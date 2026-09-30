@@ -18,6 +18,7 @@
 //! only observing that one happened.
 
 use super::*;
+use crate::test_fixtures::TestRequest;
 
 const PROBE: &str = "@probe-combined-input";
 const CREDIT_PID: u32 = 94_401;
@@ -64,15 +65,17 @@ async fn an_unbound_copy_mode_key_still_counts_as_session_use() {
     set_mode_keys(&handler, &alpha, "emacs").await;
     // Leave the key with no binding at all: there is no hardcoded fallback
     // behind the table any more, so this key can only be swallowed.
-    handler
-        .handle_ok(UnbindKeyRequest {
+    TestRequest::send_ok(
+        &handler,
+        UnbindKeyRequest {
             table_name: "copy-mode".to_owned(),
             key: Some("Enter".to_owned()),
             all: false,
             quiet: true,
-        })
-        .await;
-    handler.handle_ok(CopyModeRequest::fixture(&target)).await;
+        },
+    )
+    .await;
+    TestRequest::send_ok(&handler, CopyModeRequest::fixture(&target)).await;
 
     let sequence_before = client_activity_sequence(&handler, CREDIT_PID).await;
     let activity_before = session_activity_at(&handler, &alpha).await;
@@ -128,7 +131,7 @@ async fn a_synthesized_copy_mode_escape_credits_activity_exactly_once() {
             &["set-option", "-g", PROBE, "HIT-Escape"],
         )
         .await;
-        handler.handle_ok(CopyModeRequest::fixture(&target)).await;
+        TestRequest::send_ok(&handler, CopyModeRequest::fixture(&target)).await;
 
         let sequence_before = client_activity_sequence(&handler, CREDIT_PID).await;
 

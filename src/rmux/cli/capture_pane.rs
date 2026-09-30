@@ -1,14 +1,14 @@
 use std::path::Path;
 
 use rmux_client::Connection;
-use rmux_proto::{CapturePaneRequest, CapturePaneTargetActionRequest, Response};
+use rmux_proto::{CapturePaneRequest, CapturePaneTargetActionRequest, PaneTarget, Response};
 
 use crate::cli_args::{CapturePaneArgs, TargetSpec};
 
 use super::target_resolution::connect_cli;
 use super::{
-    ExitFailure, capture_target_action_needs_legacy_retry, cli_target_actions_enabled,
-    resolve_pane_target_or_current,
+    CommandTarget, ExitFailure, capture_target_action_needs_legacy_retry,
+    cli_target_actions_enabled,
 };
 
 /// A validated `capture-pane` invocation held until a target and transport are chosen.
@@ -59,11 +59,7 @@ fn build_capture_pane_request(
 ) -> Result<CapturePaneRequest, ExitFailure> {
     let request = pending.request;
     Ok(CapturePaneRequest {
-        target: resolve_pane_target_or_current(
-            connection,
-            pending.target.as_ref(),
-            "capture-pane",
-        )?,
+        target: PaneTarget::resolve(connection, pending.target.as_ref(), "capture-pane")?,
         start: request.start,
         end: request.end,
         print: request.print,

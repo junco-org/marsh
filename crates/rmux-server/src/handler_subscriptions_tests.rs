@@ -13,7 +13,7 @@ use rmux_proto::{
 use crate::daemon::ShutdownHandle;
 use crate::handler::exited_output_support::RetainedExitedPaneIdentities;
 use crate::pane_io::pane_output_channel_with_limits;
-use crate::test_fixtures::{Fixture, Sizeless};
+use crate::test_fixtures::{Fixture, SessionSpec, Sizeless, SubscribeRequest};
 
 use super::{lag_dto, OutputSubscriptionState, RequestHandler, MAX_LAG_RECENT_BYTES};
 use crate::handler::PendingShutdownReason;
@@ -73,7 +73,7 @@ async fn subscribe_by_id(
 ) -> (PaneOutputSubscriptionId, PaneId) {
     let pane_id = pane_id_for_target(handler, target).await;
     let request = SubscribePaneOutputRefRequest::fixture((target.session_name(), pane_id));
-    let subscribed = handler.subscribe_ok(connection_id, request).await;
+    let subscribed = SubscribeRequest::subscribe_ok(handler, connection_id, request).await;
     (subscribed.subscription_id, pane_id)
 }
 
@@ -218,7 +218,7 @@ async fn live_subscription_commit_serializes_with_session_rename_rekey() {
     let alpha = SessionName::new("subscription-rename-alpha").expect("valid session name");
     let beta = SessionName::new("subscription-rename-beta").expect("valid session name");
     let target = PaneTarget::with_window(alpha.clone(), 0, 0);
-    handler.create_session(Sizeless(&alpha)).await;
+    SessionSpec::create(&handler, Sizeless(&alpha)).await;
 
     let previous_key = {
         let state = handler.state.lock().await;

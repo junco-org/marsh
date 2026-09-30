@@ -14,7 +14,7 @@ use rmux_proto::{
 
 use crate::pane_io::{PaneExitEvent, PaneInvalidationReason, PaneOutputSender};
 use crate::pane_transcript::SharedPaneTranscript;
-use crate::test_fixtures::{quiet_command, Fixture};
+use crate::test_fixtures::{quiet_command, Fixture, SessionSpec, SubscribeRequest, TestRequest};
 use crate::test_names::session_name;
 
 use super::{validate_raw_rebase_size, RequestHandler};
@@ -34,13 +34,15 @@ const CONNECTION_ID: u64 = 41;
 async fn test_pane(
     handler: &RequestHandler,
 ) -> (PaneTarget, PaneOutputSender, SharedPaneTranscript) {
-    let session = handler
-        .create_started_session(NewSessionExtRequest {
+    let session = SessionSpec::create_started(
+        handler,
+        NewSessionExtRequest {
             size: Some(TerminalSize { cols: 12, rows: 4 }),
             command: Some(quiet_command()),
             ..Fixture::fixture("pane-stream")
-        })
-        .await;
+        },
+    )
+    .await;
     let target = PaneTarget::with_window(session, 0, 0);
     let (output, transcript) = {
         let state = handler.state.lock().await;
@@ -139,15 +141,15 @@ async fn subscribe_with_snapshot(
     mode: PaneStreamMode,
     include_snapshot: bool,
 ) -> SubscribePaneStreamResponse {
-    handler
-        .subscribe_ok(
-            CONNECTION_ID,
-            SubscribePaneStreamRequest {
-                include_snapshot,
-                ..Fixture::fixture((target, mode))
-            },
-        )
-        .await
+    SubscribeRequest::subscribe_ok(
+        handler,
+        CONNECTION_ID,
+        SubscribePaneStreamRequest {
+            include_snapshot,
+            ..Fixture::fixture((target, mode))
+        },
+    )
+    .await
 }
 
 async fn cursor(
@@ -1424,9 +1426,7 @@ async fn kill_pane_drains_buffered_stream_events_before_typed_end() {
 async fn kill_pane_all_except_drains_the_removed_pane_stream() {
     let handler = RequestHandler::new();
     let (target, output, transcript) = test_pane(&handler).await;
-    handler
-        .handle_ok(SplitWindowRequest::fixture(&target))
-        .await;
+    TestRequest::send_ok(&handler, SplitWindowRequest::fixture(&target)).await;
 
     // Killing every pane except the split sibling leaves the window and the
     // session alive, so only the removed pane's staged source can project its
@@ -1593,9 +1593,7 @@ async fn assert_exit_commit_keeps_stream_source_available(
     let handler = Arc::new(RequestHandler::new());
     let (target, output, transcript) = test_pane(handler.as_ref()).await;
     if keep_session {
-        handler
-            .handle_ok(SplitWindowRequest::fixture(&target))
-            .await;
+        TestRequest::send_ok(&handler, SplitWindowRequest::fixture(&target)).await;
     }
     let subscribed =
         subscribe_with_snapshot(handler.as_ref(), &target, mode, mode == PaneStreamMode::Raw).await;
@@ -1936,12 +1934,14 @@ async fn raw_subscription_response_uses_rekeyed_session_after_concurrent_rename(
         id
     };
 
-    handler
-        .handle_ok(RenameSessionRequest {
+    TestRequest::send_ok(
+        &handler,
+        RenameSessionRequest {
             target: source.target.session_name().clone(),
             new_name: renamed_session.clone(),
-        })
-        .await;
+        },
+    )
+    .await;
 
     let response = handler.finish_raw_subscription(
         CONNECTION_ID,
@@ -1986,12 +1986,14 @@ async fn existing_surface_response_uses_rekeyed_session_after_concurrent_rename(
         id
     };
 
-    handler
-        .handle_ok(RenameSessionRequest {
+    TestRequest::send_ok(
+        &handler,
+        RenameSessionRequest {
             target: source.target.session_name().clone(),
             new_name: renamed_session.clone(),
-        })
-        .await;
+        },
+    )
+    .await;
 
     let response = handler.finish_existing_surface_subscription(CONNECTION_ID, reserved_id, source);
     let Response::SubscribePaneStream(response) = response else {
@@ -2057,12 +2059,14 @@ async fn waiting_surface_response_uses_rekeyed_session_after_concurrent_rename()
         "surface waiter must reserve its stream before the rename"
     );
 
-    handler
-        .handle_ok(RenameSessionRequest {
+    TestRequest::send_ok(
+        &handler,
+        RenameSessionRequest {
             target: target.session_name().clone(),
             new_name: renamed_session.clone(),
-        })
-        .await;
+        },
+    )
+    .await;
     handler
         .subscriptions
         .lock()
@@ -2099,12 +2103,14 @@ async fn draining_surface_source_uses_rekeyed_session_after_concurrent_rename() 
     };
     handler.stage_exited_pane_stream_source(source.key.clone(), source.clone());
 
-    handler
-        .handle_ok(RenameSessionRequest {
+    TestRequest::send_ok(
+        &handler,
+        RenameSessionRequest {
             target: source.target.session_name().clone(),
             new_name: renamed_session.clone(),
-        })
-        .await;
+        },
+    )
+    .await;
     let current_key = handler
         .pane_output_subscription_key_for_test(reserved_id)
         .expect("subscription survives rename");

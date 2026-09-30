@@ -26,6 +26,10 @@
 //! ordinary application launch replaces whatever daemon owns the endpoint it selected, while a
 //! control command, a `-c` workload and `-N` reuse it.
 //!
+//! So is the prompt a commandless pane runs, typed at through the same binary's `send-keys`: a
+//! finished line reaches that pane's shell exactly as typed, with no command grammar of the
+//! prompt's own in between, and `exit` is the shell's builtin like any other word.
+//!
 //! The fixture is the [`Host`] [`tests/rmux.rs`](./rmux.rs) uses: a fake btrfs
 //! ([`marsh_btrfs::fake::CopyTree`]) under a temporary directory and one host per test. Every test
 //! is `#[serial]` because builtin instrumentation is process-global and because the shell a test
@@ -35,14 +39,18 @@ mod common;
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::Arc;
+use std::task::Poll;
 use std::time::{Duration, Instant};
 
+use brush_core::escape::{QuoteMode, quote_if_needed};
 use common::rmux::{Host, frontend, pipes, saw};
 use common::run;
+use marsh::ShellErrorKind;
 use marsh::rmux::IoEvent;
-use marsh::shellmux::{CommandOptions, ShellId};
+use marsh::shellmux::{CommandCompletion, CommandHandle, CommandOptions, ShellId};
 use marsh_btrfs::Subvolumes;
 use marsh_btrfs::fake::CopyTree;
 use serial_test::serial;
@@ -178,7 +186,8 @@ impl Drop for CliProcess {
     }
 }
 
-/// A [`CopyTree`] whose *next* subvolume deletion can be stopped in the middle and resumed.
+/// A [`CopyTree`] whose *next* subvolume deletion, writable snapshot or read-only snapshot can be
+/// stopped in the middle and resumed.
 ///
 /// Engine release reclaims each job's snapshot before it gives the seed's lease back, and that
 /// reclamation is the only observable point strictly *inside* teardown. Holding it open turns a
@@ -186,32 +195,91 @@ impl Drop for CliProcess {
 /// closed the seed is provably still held, so whatever the endpoint looks like at that instant is
 /// what a replacement would find.
 ///
-/// The gate is one-shot and starts unarmed, so no ordinary reclamation is affected.
+/// The snapshot gates do the same for a command's own phases. A shell's first managed command
+/// takes its writable view before any of its work can run, and a command that wrote anything
+/// freezes that view read-only after its producers have finished and before its publication is
+/// sealed. Holding either one is a command that is provably *not* executing, however long it
+/// takes.
+///
+/// Every gate is one-shot and starts unarmed, so no ordinary operation is affected.
 #[derive(Default)]
 struct PausingCopyTree {
-    /// The real behaviour; every operation but one is this backend's.
+    /// The real behaviour; every operation but the gated ones is this backend's.
     inner: CopyTree,
-    /// The armed gate: how the deletion announces it arrived, and what it waits on.
-    delete_pause: std::sync::Mutex<
-        Option<(
-            tokio::sync::oneshot::Sender<()>,
-            std::sync::mpsc::Receiver<()>,
-        )>,
-    >,
+    /// The armed deletion gate.
+    delete_pause: Gate,
+    /// The armed writable-snapshot gate.
+    snapshot_pause: Gate,
+    /// The armed read-only-snapshot gate.
+    readonly_pause: Gate,
+}
+
+/// One armed gate: how the operation announces it arrived, and what it waits on.
+type Gate = std::sync::Mutex<
+    Option<(
+        tokio::sync::oneshot::Sender<()>,
+        std::sync::mpsc::Receiver<()>,
+    )>,
+>;
+
+/// Arms `gate`, returning the arrival notification and the release it waits for.
+fn arm(
+    gate: &Gate,
+) -> (
+    tokio::sync::oneshot::Receiver<()>,
+    std::sync::mpsc::Sender<()>,
+) {
+    let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    *gate.lock().expect("arm the gate") = Some((reached_tx, resume_rx));
+    (reached_rx, resume_tx)
+}
+
+/// Holds the calling operation at `gate` when it is armed, until it is released.
+fn pass(gate: &Gate) {
+    // Out of the mutex before waiting: the gate is one-shot, and holding the lock across the wait
+    // would stall every later operation of the same kind behind this one.
+    let armed = gate
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    if let Some((reached, resume)) = armed {
+        let _ = reached.send(());
+        // A release *or* a dropped sender ends the wait, so an unwinding test cannot strand this
+        // blocking worker.
+        let _ = resume.recv();
+    }
 }
 
 impl PausingCopyTree {
-    /// Arms the gate, returning the arrival notification and the release it waits for.
+    /// Arms the deletion gate.
     fn pause_next_delete(
         &self,
     ) -> (
         tokio::sync::oneshot::Receiver<()>,
         std::sync::mpsc::Sender<()>,
     ) {
-        let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
-        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
-        *self.delete_pause.lock().expect("arm the deletion gate") = Some((reached_tx, resume_rx));
-        (reached_rx, resume_tx)
+        arm(&self.delete_pause)
+    }
+
+    /// Arms the writable-snapshot gate.
+    fn pause_next_snapshot(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        arm(&self.snapshot_pause)
+    }
+
+    /// Arms the read-only-snapshot gate.
+    fn pause_next_readonly(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        arm(&self.readonly_pause)
     }
 }
 
@@ -237,27 +305,17 @@ impl Subvolumes for PausingCopyTree {
     }
 
     fn snapshot(&self, src: &Path, dest: &Path) -> Result<(), marsh_btrfs::Error> {
+        pass(&self.snapshot_pause);
         self.inner.snapshot(src, dest)
     }
 
     fn snapshot_readonly(&self, src: &Path, dest: &Path) -> Result<(), marsh_btrfs::Error> {
+        pass(&self.readonly_pause);
         self.inner.snapshot_readonly(src, dest)
     }
 
     fn delete_subvolume(&self, path: &Path) -> Result<(), marsh_btrfs::Error> {
-        // Out of the mutex before waiting: the gate is one-shot, and holding the lock across the
-        // wait would stall every later reclamation behind this one.
-        let armed = self
-            .delete_pause
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-        if let Some((reached, resume)) = armed {
-            let _ = reached.send(());
-            // A release *or* a dropped sender ends the wait, so an unwinding test cannot strand
-            // this blocking worker.
-            let _ = resume.recv();
-        }
+        pass(&self.delete_pause);
         self.inner.delete_subvolume(path)
     }
 }
@@ -439,17 +497,6 @@ async fn relayed_stdin_reaches_the_workload_and_final_output_survives_exit() {
 async fn application_startup_replaces_the_daemon_but_control_commands_do_not() {
     let mut host = Host::new().await;
 
-    // The pane's first managed command starts the process-wide tracer unless a managed view
-    // already holds it. That start must not race the capture-pane polling below, whose clients
-    // this process keeps forking, so an idle managed shell holds the tracer across it.
-    let warm = marsh_core::test_support::shell_builder(Arc::clone(&host.fs))
-        .working_dir(host.seed.clone())
-        .sandbox_policy(marsh::SandboxPolicy::allow())
-        .build()
-        .await
-        .expect("build the tracer-holding shell");
-    run(&warm, ":").await;
-
     // A real session with a pane parked on `cat`: the marker is printed by the pane, and the two
     // `printf` pieces keep an echo of the command itself from being mistaken for its output.
     host.succeeds(
@@ -478,10 +525,6 @@ async fn application_startup_replaces_the_daemon_but_control_commands_do_not() {
         ))
     })
     .await;
-    // The pane's own managed view holds the tracer from here on.
-    warm.close(false)
-        .await
-        .expect("close the tracer-holding shell");
 
     for (label, args) in [
         ("an explicit control command", vec!["list-sessions"]),
@@ -935,6 +978,98 @@ async fn added_job_id(host: &Host, before: &[String]) -> String {
     .await
 }
 
+/// Opens a commandless session, whose pane runs the prompt, and returns that pane's shell id.
+async fn open_prompt(host: &Host, session: &str) -> String {
+    let before = host.job_ids();
+    host.succeeds(
+        &["-N", "new-session", "-d", "-s", session],
+        &format!("{session} is created"),
+    )
+    .await;
+    added_job_id(host, &before).await
+}
+
+/// Types `keys` at `session`'s prompt and returns the verdict of the line it admits into
+/// `job_id` as `expected_command`.
+///
+/// Subscribed before the keys are sent, so the acceptance cannot slip past between the two. The
+/// text only picks the receipt out of the stream; what the line actually did is for the caller
+/// to prove from what it left behind.
+async fn submit_typed(
+    host: &Host,
+    session: &str,
+    job_id: &str,
+    keys: &[&str],
+    expected_command: &str,
+) -> Arc<CommandCompletion> {
+    let mut events = host.io.observe().events;
+    let mut args = vec!["-N", "send-keys", "-t", session, "--"];
+    args.extend_from_slice(keys);
+    host.succeeds(&args, &format!("{keys:?} is typed at {session}"))
+        .await;
+    let accepted = tokio::time::timeout(TIMEOUT, async {
+        loop {
+            let envelope = events
+                .recv()
+                .await
+                .expect("the observer keeps up with the bus")
+                .expect("the bus stays open while the host runs");
+            if let IoEvent::CommandAccepted { command } = &envelope.event
+                && command.shell().id.as_str() == job_id
+                && command.text() == expected_command
+            {
+                return command.clone();
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{session} never admitted {expected_command:?} into {job_id}"));
+    tokio::time::timeout(TIMEOUT, accepted.wait())
+        .await
+        .unwrap_or_else(|_| panic!("{expected_command:?} never reached a verdict"))
+        .expect("the admitted line concludes")
+}
+
+/// Requires `completion` to have exited zero and been published.
+fn assert_published(completion: &CommandCompletion, line: &str) {
+    assert!(
+        completion.exit_code() == Some(0) && completion.is_published(),
+        "{line:?} exits zero and publishes: {completion:?}"
+    );
+}
+
+/// The contents a published line left at `file` in the first seed.
+fn published(host: &Host, file: &str) -> String {
+    std::fs::read_to_string(host.seed(file))
+        .unwrap_or_else(|error| panic!("{file} was published: {error}"))
+}
+
+/// The daemon's job identities and every pane's placement and selection, compared whole.
+///
+/// Sorted, so a listing of the same panes in another order is not a change. Both active flags are
+/// included, so a selection that moved without any pane being added still is one.
+async fn topology(host: &Host) -> (Vec<String>, Vec<String>) {
+    let listed = host
+        .run_cli(
+            &[
+                "-N",
+                "list-panes",
+                "-a",
+                "-F",
+                "#{session_name}:#{window_index}:#{pane_index}:#{pane_active}:#{window_active}",
+            ],
+            b"",
+        )
+        .await;
+    assert_eq!(listed.code, 0, "list-panes answers: {}", listed.stderr);
+    let mut panes: Vec<String> = String::from_utf8_lossy(&listed.stdout)
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    panes.sort();
+    (host.job_ids(), panes)
+}
+
 /// A typed `exit` closes the pane it was typed in, with the status its own builtin computed.
 ///
 /// The prompt used to answer `exit` itself and throw its argument away, so a typed `exit 7` closed
@@ -1094,5 +1229,703 @@ async fn a_typed_exit_uses_builtin_status_and_closes_only_its_pane() {
     )
     .await;
 
+    host.shutdown().await;
+}
+
+/// The words the prompt used to answer itself are ordinary command names.
+///
+/// Each is shadowed by a shell function, and function lookup precedes every builtin, so a marker
+/// holding the function's own argument count and arguments proves the typed line reached the
+/// shell whole: the prompt neither answered it, nor re-split or re-quoted its words, nor opened a
+/// window for it.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn prompt_command_names_reach_shell_functions() {
+    const NAMES: [&str; 7] = ["jobs", "fg", "bg", "stop", "kill", "sd", "sda"];
+    let host = Host::new().await;
+    let job = open_prompt(&host, "raw-names").await;
+    let layout = topology(&host).await;
+
+    for name in NAMES {
+        let declaration =
+            format!("function {name} {{ printf '%s\\n' \"{name}:$#\" \"$@\" > called-{name}; }}");
+        let defined = submit_typed(
+            &host,
+            "raw-names",
+            &job,
+            &[declaration.as_str(), "Enter"],
+            &declaration,
+        )
+        .await;
+        assert_published(&defined, &declaration);
+    }
+    let assignment = "payload='two words'";
+    let assigned = submit_typed(&host, "raw-names", &job, &[assignment, "Enter"], assignment).await;
+    assert_published(&assigned, assignment);
+
+    let bare = submit_typed(&host, "raw-names", &job, &["jobs", "Enter"], "jobs").await;
+    assert_published(&bare, "jobs");
+    assert_eq!(published(&host, "called-jobs"), "jobs:0\n");
+    for name in &NAMES[1..] {
+        let line = format!("{name} \"$payload\"");
+        let called = submit_typed(&host, "raw-names", &job, &[line.as_str(), "Enter"], &line).await;
+        assert_published(&called, &line);
+        assert_eq!(
+            published(&host, &format!("called-{name}")),
+            format!("{name}:1\ntwo words\n"),
+            "`{name}` ran the function with the expanded, unsplit argument"
+        );
+    }
+
+    assert_eq!(
+        topology(&host).await,
+        layout,
+        "no line opened, closed or selected a job, pane or window"
+    );
+    host.shutdown().await;
+}
+
+/// `kill` is the shell's own and expands its words, and an open quote after `fg` continues.
+///
+/// The prompt used to rebuild `kill` from whitespace-split, single-quoted tokens, so `"$sig"`
+/// never expanded and `>` was an argument rather than a redirection; and it answered `fg`
+/// itself, so the first Enter below would have selected a job rather than waiting for the quote
+/// to close. `kill -l` names a signal without sending one, so nothing here signals anything.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn prompt_expands_kill_and_continues_former_control_words() {
+    let host = Host::new().await;
+    let job = open_prompt(&host, "raw-syntax").await;
+    let layout = topology(&host).await;
+
+    let assignment = "sig=15";
+    let assigned = submit_typed(
+        &host,
+        "raw-syntax",
+        &job,
+        &[assignment, "Enter"],
+        assignment,
+    )
+    .await;
+    assert_published(&assigned, assignment);
+    let kill = "kill -l \"$sig\" > kill-listed";
+    let listed = submit_typed(&host, "raw-syntax", &job, &[kill, "Enter"], kill).await;
+    assert_published(&listed, kill);
+    assert_eq!(
+        published(&host, "kill-listed"),
+        "TERM\n",
+        "the builtin got the expanded signal number, and its output the redirection"
+    );
+
+    let declaration = "function fg { printf '%s' \"$1\" > multiline-fg; }";
+    let defined = submit_typed(
+        &host,
+        "raw-syntax",
+        &job,
+        &[declaration, "Enter"],
+        declaration,
+    )
+    .await;
+    assert_published(&defined, declaration);
+
+    let multiline = "fg \"two  \nwords\"";
+    let continued = submit_typed(
+        &host,
+        "raw-syntax",
+        &job,
+        &["fg \"two  ", "Enter", "words\"", "Enter"],
+        multiline,
+    )
+    .await;
+    assert_published(&continued, multiline);
+    assert_eq!(
+        published(&host, "multiline-fg"),
+        "two  \nwords",
+        "the quoted argument kept its spaces and its line break"
+    );
+
+    assert_eq!(
+        topology(&host).await,
+        layout,
+        "no line opened, closed or selected a job, pane or window"
+    );
+    host.shutdown().await;
+}
+
+/// Every spelling of a trailing `&` is the shell's own asynchronous list.
+///
+/// `&NAME` and `&"NAME"` used to name a new job in a window of its own. To the shell they are an
+/// asynchronous command followed by the command `NAME`, and the asynchronous one is a task of the
+/// line that started it: its output is published with that line's verdict, on the same shell.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn prompt_ampersands_use_native_shell_tasks() {
+    let host = Host::new().await;
+    let job = open_prompt(&host, "raw-async").await;
+    let layout = topology(&host).await;
+
+    let declaration = "function after_amp { printf '%s\\n' called >> amp-calls; }";
+    let defined = submit_typed(
+        &host,
+        "raw-async",
+        &job,
+        &[declaration, "Enter"],
+        declaration,
+    )
+    .await;
+    assert_published(&defined, declaration);
+
+    for (line, file, contents) in [
+        ("printf plain > amp-plain &", "amp-plain", "plain"),
+        ("printf bare > amp-bare &after_amp", "amp-bare", "bare"),
+        (
+            "printf quoted > amp-quoted &\"after_amp\"",
+            "amp-quoted",
+            "quoted",
+        ),
+    ] {
+        let completion = submit_typed(&host, "raw-async", &job, &[line, "Enter"], line).await;
+        assert_published(&completion, line);
+        assert_eq!(
+            published(&host, file),
+            contents,
+            "{line:?}'s asynchronous command"
+        );
+    }
+    assert_eq!(
+        published(&host, "amp-calls"),
+        "called\ncalled\n",
+        "the word after each named `&` ran as a command, once each"
+    );
+
+    assert_eq!(
+        topology(&host).await,
+        layout,
+        "no line opened, closed or selected a job, pane or window"
+    );
+    host.shutdown().await;
+}
+
+/// A denied line's diagnostic is shown exactly once, whichever way its pane then closes.
+///
+/// Two renderers own the same verdict: the prompt draws it through its lease and records that it
+/// did, and the job's retirement draws the verdict its job ended with. `report-idle`'s verdict
+/// reaches the prompt, which is then closed by an end of input without a second command: that
+/// graceful stop concludes no command, so the job ends carrying no verdict and a pane status of
+/// zero, and the prompt's copy must be the only one. `report-exit`'s denied line closes its own
+/// shell, so the job ends with that verdict and only retirement can render it. A lost or doubled
+/// handoff is a count other than one in the dead pane's retained history.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn prompt_denial_is_reported_once_when_pane_closes() {
+    let host = Host::new().await;
+    // Published through the facade, so the typed lines below meet a path another shell owns.
+    let setup = run(&host.io, "printf owner > report-owned").await;
+    assert_published(&setup.completion, "printf owner > report-owned");
+    // `-J` joins wrapped rows and `-S -` reaches back through the whole history, so a diagnostic
+    // scrolled off the visible screen or wider than it is still one match.
+    let capture = async |session: &str| {
+        let captured = host
+            .run_cli(
+                &["-N", "capture-pane", "-p", "-J", "-S", "-", "-t", session],
+                b"",
+            )
+            .await;
+        assert_eq!(
+            captured.code, 0,
+            "{session} is capturable: {}",
+            captured.stderr
+        );
+        String::from_utf8(captured.stdout).expect("the captured pane is UTF-8")
+    };
+
+    for (session, line, closes_itself) in [
+        ("report-idle", "printf rejected > report-owned", false),
+        (
+            "report-exit",
+            "printf rejected > report-owned; exit 0",
+            true,
+        ),
+    ] {
+        let job_id = open_prompt(&host, session).await;
+        let shell = host
+            .io
+            .shell(&ShellId::from(job_id.as_str()))
+            .expect("the prompt's shell is addressable");
+        host.succeeds(
+            &[
+                "-N",
+                "set-option",
+                "-w",
+                "-t",
+                session,
+                "remain-on-exit",
+                "on",
+            ],
+            &format!("remain-on-exit on is set on {session}"),
+        )
+        .await;
+
+        let denied = submit_typed(&host, session, &job_id, &[line, "Enter"], line).await;
+        assert_eq!(denied.exit_code(), Some(0), "{line:?} exits zero natively");
+        let Err(error) = denied.result.as_ref() else {
+            panic!("{line:?} is refused rather than published: {denied:?}");
+        };
+        assert!(
+            matches!(error.kind(), marsh::ShellErrorKind::Denied { .. }),
+            "{line:?} is a policy denial: {error}"
+        );
+        assert_eq!(
+            published(&host, "report-owned"),
+            "owner",
+            "the seed keeps the owning shell's bytes"
+        );
+        // The typed line never contains this, so an echoed command cannot satisfy it.
+        let rendered = error.to_string();
+        let header = format!(
+            "{}: {}",
+            denied.shell.id.reference(),
+            rendered.lines().next().unwrap_or_default()
+        );
+
+        if !closes_itself {
+            poll(async || {
+                let screen = capture(session).await;
+                match screen.matches(&header).count() {
+                    0 => Err(format!("{session} never showed {header:?}: {screen:?}")),
+                    1 => Ok(()),
+                    _ => panic!("{session} showed {header:?} more than once: {screen:?}"),
+                }
+            })
+            .await;
+            assert!(
+                host.job_ids().contains(&job_id),
+                "{session}'s shell outlives the verdict its prompt showed"
+            );
+            // End of input on the empty prompt: no second command, so the denied line stays the
+            // job's last completion when retirement looks at it.
+            host.succeeds(
+                &["-N", "send-keys", "-t", session, "--", "C-d"],
+                &format!("end of input is typed at {session}"),
+            )
+            .await;
+        }
+
+        let end = tokio::time::timeout(TIMEOUT, shell.wait_closed())
+            .await
+            .unwrap_or_else(|_| panic!("{session}'s shell never closed"))
+            .expect("the closure resolves");
+        // A denied line with a zero native exit is a failed pane; a stop with no verdict is not.
+        let (verdict, status) = if closes_itself {
+            (Some(denied.id), "1:1")
+        } else {
+            (None, "1:0")
+        };
+        assert_eq!(
+            end.completion.as_ref().map(|completion| completion.id),
+            verdict,
+            "{session}'s closure carries the verdict retirement may render"
+        );
+        let dead = poll(async || {
+            let shown = host
+                .run_cli(
+                    &[
+                        "-N",
+                        "display-message",
+                        "-p",
+                        "-t",
+                        session,
+                        "#{pane_dead}:#{pane_dead_status}",
+                    ],
+                    b"",
+                )
+                .await;
+            let text = String::from_utf8_lossy(&shown.stdout).trim_end().to_owned();
+            if shown.code == 0 && text.starts_with("1:") && !host.job_ids().contains(&job_id) {
+                return Ok(text);
+            }
+            Err(format!(
+                "{session}'s pane never died with its job retired (exit {}): {text:?} / {}",
+                shown.code, shown.stderr
+            ))
+        })
+        .await;
+        assert_eq!(
+            dead, status,
+            "{session}'s pane status is its closing verdict's gated status"
+        );
+
+        let screen = capture(session).await;
+        assert_eq!(
+            screen.matches(&header).count(),
+            1,
+            "{session}'s retained history shows the verdict exactly once: {screen:?}"
+        );
+        assert_eq!(
+            published(&host, "report-owned"),
+            "owner",
+            "the seed keeps the owning shell's bytes"
+        );
+    }
+
+    host.shutdown().await;
+}
+
+/// The pane every pipe-close test pipes.
+const PIPE_TARGET: &str = "pipe-close:0.0";
+
+/// How long a pipe-close test holds its command in a phase that is not execution.
+///
+/// Longer than both of the close's escalation windows together, so a close that timed setup or
+/// publication as though it were a consumer ignoring end of file would already have forced it.
+const HOLD: Duration = Duration::from_secs(1);
+
+/// Opens the `pipe-close` session and waits for its pane's own command to print.
+///
+/// The pane's view is prepared by then, so the next snapshot a gate catches is the pipe's.
+async fn open_piped_pane(host: &Host) {
+    host.succeeds(
+        &[
+            "-N",
+            "new-session",
+            "-d",
+            "-s",
+            "pipe-close",
+            "printf '%s%s\\n' PIPE_ READY; cat >/dev/null",
+        ],
+        "the piped pane's session is created",
+    )
+    .await;
+    poll(async || {
+        let pane = host
+            .run_cli(&["-N", "capture-pane", "-p", "-t", "pipe-close"], b"")
+            .await;
+        if String::from_utf8_lossy(&pane.stdout).contains("PIPE_READY") {
+            return Ok(());
+        }
+        Err(format!(
+            "the piped pane never reached its marker (exit {}): {:?} / {}",
+            pane.code,
+            String::from_utf8_lossy(&pane.stdout),
+            pane.stderr
+        ))
+    })
+    .await;
+}
+
+/// `text` as one shell word.
+fn sh_word(text: &str) -> String {
+    quote_if_needed(text, QuoteMode::SingleQuote).into_owned()
+}
+
+/// `script` run by `/bin/sh`, as the one command string `pipe-pane` takes.
+fn sh_command(script: &str) -> String {
+    format!("/bin/sh -c {}", sh_word(script))
+}
+
+/// A pipe command that logs into the seed, acknowledges at `ready` outside it, then reads its
+/// input to end of file.
+fn cooperative_logger(ready: &Path) -> String {
+    sh_command(&format!(
+        "printf kept > pipe-close-log; printf ready > {}; cat >/dev/null",
+        sh_word(&ready.to_string_lossy())
+    ))
+}
+
+/// Opens `command` as the pane's pipe and returns the receipt of the command it admitted, picked
+/// out by the seed file only its text names.
+async fn open_pipe(host: &Host, command: &str, log: &str) -> CommandHandle {
+    host.succeeds(
+        &["-N", "pipe-pane", "-O", "-t", PIPE_TARGET, command],
+        "the pipe opens",
+    )
+    .await;
+    host.io
+        .snapshot()
+        .state
+        .commands
+        .into_iter()
+        .find(|command| command.text().contains(log))
+        .unwrap_or_else(|| panic!("the pipe command writing {log} is admitted"))
+}
+
+/// Closes the pane's pipe through an explicitly empty command.
+async fn close_pipe(host: &Host) -> CliOutcome {
+    host.run_cli(&["-N", "pipe-pane", "-t", PIPE_TARGET, ""], b"")
+        .await
+}
+
+/// Drives `close` alongside `work`, failing if the close finishes first; `when` names the phase
+/// the command was supposed to be held in.
+async fn while_closing<T>(
+    close: Pin<&mut impl Future<Output = CliOutcome>>,
+    work: impl Future<Output = T>,
+    when: &str,
+) -> T {
+    tokio::select! {
+        biased;
+        closed = close => panic!(
+            "the close finished {when} (exit {}): {}",
+            closed.code, closed.stderr
+        ),
+        value = work => value,
+    }
+}
+
+/// Waits for an armed storage gate to be reached.
+async fn gate_reached(reached: tokio::sync::oneshot::Receiver<()>) {
+    tokio::time::timeout(TIMEOUT, reached)
+        .await
+        .expect("the pipe command reaches the storage gate")
+        .expect("the storage gate is not dropped before it is reached");
+}
+
+/// Closes the pane's pipe while its command is held at an armed storage gate, releasing the gate
+/// only after [`HOLD`]; `phase` names what the gate holds.
+///
+/// The close is polled throughout and must not finish while the gate is held. The pane reports
+/// its pipe gone as soon as the close is requested, because the registered pipe is removed before
+/// its verdict is awaited — and nothing is in the seed yet, because nothing was approved.
+async fn close_while_held(
+    host: &Host,
+    reached: tokio::sync::oneshot::Receiver<()>,
+    resume: std::sync::mpsc::Sender<()>,
+    phase: &str,
+) -> CliOutcome {
+    let held = format!("while {phase} was held");
+    let close = close_pipe(host);
+    tokio::pin!(close);
+    while_closing(
+        close.as_mut(),
+        gate_reached(reached),
+        &format!("before {phase} was reached"),
+    )
+    .await;
+    assert!(
+        !host.seed("pipe-close-log").exists(),
+        "nothing is published {held}"
+    );
+    while_closing(close.as_mut(), await_pane_pipe(host, "0"), &held).await;
+    while_closing(close.as_mut(), tokio::time::sleep(HOLD), &held).await;
+    let _ = resume.send(());
+    close.await
+}
+
+/// Waits for the pane to report `expected` as its `#{pane_pipe}` flag.
+async fn await_pane_pipe(host: &Host, expected: &str) {
+    poll(async || {
+        let shown = host
+            .run_cli(
+                &["-N", "display-message", "-p", "-t", PIPE_TARGET, "#{pane_pipe}"],
+                b"",
+            )
+            .await;
+        let text = String::from_utf8_lossy(&shown.stdout).trim_end().to_owned();
+        if shown.code == 0 && text == expected {
+            return Ok(());
+        }
+        Err(format!(
+            "the pane never reported pane_pipe={expected} (exit {}): {text:?} / {}",
+            shown.code, shown.stderr
+        ))
+    })
+    .await;
+}
+
+/// Waits for a pipe command's acknowledgement at `ready`.
+async fn await_ready(ready: &Path) {
+    poll(async || match std::fs::read(ready) {
+        Ok(bytes) if bytes == b"ready" => Ok(()),
+        other => Err(format!(
+            "the pipe command never acknowledged at {}: {other:?}",
+            ready.display()
+        )),
+    })
+    .await;
+}
+
+/// The verdict `receipt` retains.
+async fn verdict(receipt: &CommandHandle) -> Arc<CommandCompletion> {
+    tokio::time::timeout(TIMEOUT, receipt.wait())
+        .await
+        .expect("the pipe command reaches a verdict")
+        .expect("the pipe command concludes")
+}
+
+/// Requires `completion` to have been interrupted, which discards whatever it staged.
+fn assert_interrupted(completion: &CommandCompletion) {
+    assert!(
+        !completion.is_published()
+            && matches!(
+                completion.result.as_ref(),
+                Err(error) if matches!(error.kind(), ShellErrorKind::Interrupted)
+            ),
+        "the pipe command is interrupted and unpublished: {completion:?}"
+    );
+}
+
+/// Closing a pipe whose command is still being prepared waits for it to run, not for a timer.
+///
+/// End of file bounds a command that is *executing*; one that has not started cannot have
+/// ignored it. The writable view the pipe's shell takes before its first command runs is held
+/// past both escalation windows, and the close still has to end in that command reading to its
+/// end of file and publishing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn pipe_pane_close_waits_for_preparation() {
+    let fs = Arc::new(PausingCopyTree::default());
+    let host = Host::with(Arc::clone(&fs) as Arc<dyn Subvolumes>).await;
+    open_piped_pane(&host).await;
+    let ready = host.scratch.path().join("pipe-ready");
+
+    // Armed once the pane's own view exists, so it catches the pipe shell's.
+    let (reached, resume) = fs.pause_next_snapshot();
+    let receipt = open_pipe(&host, &cooperative_logger(&ready), "pipe-close-log").await;
+
+    let closed = close_while_held(&host, reached, resume, "the pipe's view").await;
+    assert_eq!(
+        closed.code, 0,
+        "the close reports the pipe's approved verdict: {}",
+        closed.stderr
+    );
+    assert_published(&*verdict(&receipt).await, receipt.text());
+    assert_eq!(
+        std::fs::read(host.seed("pipe-close-log")).ok().as_deref(),
+        Some(b"kept".as_slice()),
+        "the pipe command's log is published"
+    );
+    await_pane_pipe(&host, "0").await;
+    host.shutdown().await;
+}
+
+/// Closing a pipe whose command is being published waits for the verdict, not for a timer.
+///
+/// The command has already written its log and read to end of file; what is held is the
+/// read-only freeze of its view that precedes the seal. That work is the command's approval
+/// being processed, not a consumer ignoring its input, and forcing it would discard a log the
+/// command finished writing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn pipe_pane_close_waits_for_publication() {
+    let fs = Arc::new(PausingCopyTree::default());
+    let host = Host::with(Arc::clone(&fs) as Arc<dyn Subvolumes>).await;
+    open_piped_pane(&host).await;
+    let ready = host.scratch.path().join("pipe-ready");
+    let receipt = open_pipe(&host, &cooperative_logger(&ready), "pipe-close-log").await;
+    await_ready(&ready).await;
+
+    // The command's baseline was frozen before it could acknowledge, so the next read-only
+    // snapshot is its publication's.
+    let (reached, resume) = fs.pause_next_readonly();
+    let closed = close_while_held(&host, reached, resume, "the pipe's publication").await;
+    assert_eq!(
+        closed.code, 0,
+        "the close reports the pipe's approved verdict: {}",
+        closed.stderr
+    );
+    assert_published(&*verdict(&receipt).await, receipt.text());
+    assert_eq!(
+        std::fs::read(host.seed("pipe-close-log")).ok().as_deref(),
+        Some(b"kept".as_slice()),
+        "the pipe command's log is published"
+    );
+    await_pane_pipe(&host, "0").await;
+    host.shutdown().await;
+}
+
+/// A pipe command that ignores both end of file and `SIGTERM` is still forced, and discarded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn pipe_pane_close_forces_an_uncooperative_command() {
+    let host = Host::with(Arc::new(PausingCopyTree::default())).await;
+    open_piped_pane(&host).await;
+    let ready = host.scratch.path().join("pipe-ready");
+    let stubborn = sh_command(&format!(
+        "trap '' TERM; printf private > stubborn-pipe-log; printf ready > {}; \
+         while :; do /bin/sleep 60; done",
+        sh_word(&ready.to_string_lossy())
+    ));
+    let receipt = open_pipe(&host, &stubborn, "stubborn-pipe-log").await;
+    await_ready(&ready).await;
+
+    let closed = close_pipe(&host).await;
+    assert_ne!(
+        closed.code, 0,
+        "a forced close is reported as a failure: {}",
+        String::from_utf8_lossy(&closed.stdout)
+    );
+    assert_interrupted(&*verdict(&receipt).await);
+    assert!(
+        !host.seed("stubborn-pipe-log").exists(),
+        "nothing the forced command staged is published"
+    );
+    await_pane_pipe(&host, "0").await;
+    host.shutdown().await;
+}
+
+/// An explicit forced stop still beats a publication that has not been sealed.
+///
+/// Closing a pipe no longer times finalization, but teardown keeps its right to discard it: a
+/// force accepted while the publication's freeze is held must end in an interrupted command and
+/// no log.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn forced_stop_still_discards_pipe_publication() {
+    let fs = Arc::new(PausingCopyTree::default());
+    let host = Host::with(Arc::clone(&fs) as Arc<dyn Subvolumes>).await;
+    open_piped_pane(&host).await;
+    let ready = host.scratch.path().join("pipe-ready");
+    let receipt = open_pipe(&host, &cooperative_logger(&ready), "pipe-close-log").await;
+    // Resolved once: a replacement generation under the same name is not this command's shell.
+    let logger = host
+        .io
+        .shell(&receipt.shell().id)
+        .expect("the pipe command's shell is visible");
+    await_ready(&ready).await;
+
+    let (reached, resume) = fs.pause_next_readonly();
+    let closed = {
+        let close = close_pipe(&host);
+        tokio::pin!(close);
+        while_closing(
+            close.as_mut(),
+            gate_reached(reached),
+            "before the pipe's publication was frozen",
+        )
+        .await;
+
+        // Polled to its first suspension on this, its bound runtime: the cancellation is decided
+        // inline before the stop waits for the held command to let go of its shell.
+        let stop = host.io.stop(&logger, true);
+        tokio::pin!(stop);
+        let first = std::future::poll_fn(|context| Poll::Ready(stop.as_mut().poll(context))).await;
+        let accepted = first.is_pending();
+        let visible = host.io.job(&receipt.shell().id).is_some();
+        // Released before anything that could unwind, so no storage worker is left parked.
+        let _ = resume.send(());
+        drop(resume);
+        assert!(
+            accepted,
+            "the forced stop waits for the held publication: {first:?}"
+        );
+        assert!(
+            !visible,
+            "the forced stop was accepted while the publication was held"
+        );
+
+        stop.await.expect("the forced stop succeeds");
+        close.await
+    };
+    assert_ne!(
+        closed.code, 0,
+        "a discarded close is reported as a failure: {}",
+        String::from_utf8_lossy(&closed.stdout)
+    );
+    assert_interrupted(&*verdict(&receipt).await);
+    assert!(
+        !host.seed("pipe-close-log").exists(),
+        "the discarded command's log is not published"
+    );
+    await_pane_pipe(&host, "0").await;
     host.shutdown().await;
 }

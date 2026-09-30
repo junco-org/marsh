@@ -3,15 +3,15 @@ use std::path::{Path, PathBuf};
 use rmux_client::{ClientContext, ClientContextParent, detect_context, detect_parent};
 use rmux_proto::request::{AttachSessionExt2Request, SwitchClientExt3Request};
 use rmux_proto::request::{KillSessionRequest, ListSessionsRequest, NewSessionExtRequest};
-use rmux_proto::{ClientTerminalContext, Response};
+use rmux_proto::{ClientTerminalContext, Response, SessionName};
 
 use super::json_output::{list_sessions_json_format, write_list_sessions_json};
-use super::target_resolution::{connect_cli, response_failure, run_targeted};
+use super::target_resolution::{connect_cli, response_failure};
 use super::{
-    ExitFailure, StartupOptions, build_terminal_size, connect_with_startserver,
+    CommandTarget, ExitFailure, StartupOptions, build_terminal_size, connect_with_startserver,
     expect_command_output, expect_command_success, optional_client_flags,
-    resolve_current_session_target, resolve_session_target_or_current, resolve_session_target_spec,
-    run_payload_command, write_command_output,
+    resolve_current_session_target, resolve_session_target_spec, run_payload_command,
+    write_command_output,
 };
 use super::{
     attach_with_connection, current_terminal_size, require_attach_terminal,
@@ -216,9 +216,8 @@ pub(super) fn run_kill_session(
     socket_path: &Path,
 ) -> Result<i32, ExitFailure> {
     let mut connection = connect_cli(socket_path)?;
-    let target =
-        resolve_session_target_or_current(&mut connection, args.target.as_ref(), "kill-session")
-            .map_err(normalize_session_lookup_error)?;
+    let target = SessionName::resolve(&mut connection, args.target.as_ref(), "kill-session")
+        .map_err(normalize_session_lookup_error)?;
     let response = connection
         .kill_session(KillSessionRequest {
             target,
@@ -246,7 +245,7 @@ pub(super) fn run_rename_session(
     args: RenameSessionArgs,
     socket_path: &Path,
 ) -> Result<i32, ExitFailure> {
-    run_targeted(
+    SessionName::run(
         socket_path,
         "rename-session",
         args.target.as_ref(),

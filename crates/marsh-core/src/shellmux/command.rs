@@ -2,9 +2,11 @@
 
 use super::error::MuxError;
 use super::mux::Sandbox;
+use crate::shell::ExecutionProgress;
 use crate::{ExecutionResult, ShellError};
 use marsh_lib::{WaitState, wait_for_completion};
 use std::sync::Arc;
+use std::time::Duration;
 
 /// Monotonic command identity within one mux lifetime.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -77,6 +79,8 @@ pub struct CommandHandle {
     pub(crate) shell: Sandbox,
     pub(crate) text: Arc<str>,
     pub(crate) state: tokio::sync::watch::Receiver<WaitState<CommandCompletion, WaitError>>,
+    /// Where this command's execution, once it begins, can be bounded.
+    pub(crate) execution: ExecutionProgress,
 }
 impl CommandHandle {
     /// Identity of the admitted command.
@@ -99,6 +103,33 @@ impl CommandHandle {
     pub async fn wait(&self) -> Result<Arc<CommandCompletion>, WaitError> {
         let mut state = self.state.clone();
         wait_for_completion(&mut state, || WaitError::Aborted).await
+    }
+    /// Ends a command whose input has already been ended, and waits for its actual verdict.
+    ///
+    /// This is an active termination operation, and only execution is timed. Admission and view
+    /// preparation run to completion first. Once the command's producers are running they get
+    /// `grace` to finish on their own, then `SIGTERM` and `grace` again, and are then cancelled —
+    /// which discards the command — provided one of them is still alive to end. Producers that
+    /// already ended are never discarded because the native service is late to confirm it. Once
+    /// they have finished, authorization and publication are awaited whatever they take, so the
+    /// answer is the command's own verdict, never a timeout.
+    ///
+    /// Dropping the returned future stops its timers and cancels nothing. The timers need an
+    /// enabled Tokio time driver on the polling runtime.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::wait`].
+    pub async fn finish_with_grace(
+        &self,
+        grace: Duration,
+    ) -> Result<Arc<CommandCompletion>, WaitError> {
+        tokio::select! {
+            biased;
+            verdict = self.wait() => return verdict,
+            () = self.execution.finish_with_grace(grace) => {}
+        }
+        self.wait().await
     }
 }
 

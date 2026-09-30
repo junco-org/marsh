@@ -12,14 +12,14 @@ use super::super::control_support::{
 };
 use super::*;
 use crate::control::ControlServerEvent;
-use crate::test_fixtures::Fixture;
+use crate::test_fixtures::{Fixture, SessionSpec, TestRequest};
 
 #[tokio::test]
 async fn control_queue_attach_rejects_recreated_same_name_session() {
     let handler = RequestHandler::new();
     let requester_pid = 93_771;
     let session_name = SessionName::new("control-queue-attach-aba").expect("valid session name");
-    handler.create_session(&session_name).await;
+    SessionSpec::create(&handler, &session_name).await;
     let original_session_id = handler.session_id_for_test(&session_name).await;
     let request = Request::AttachSession(AttachSessionRequest {
         target: session_name.clone(),
@@ -36,10 +36,8 @@ async fn control_queue_attach_rejects_recreated_same_name_session() {
 
     let (control_id, _control_events) =
         handler.register_control_for_test(requester_pid, None).await;
-    handler
-        .handle_ok(KillSessionRequest::fixture(&session_name))
-        .await;
-    handler.create_session(&session_name).await;
+    TestRequest::send_ok(&handler, KillSessionRequest::fixture(&session_name)).await;
+    SessionSpec::create(&handler, &session_name).await;
     let replacement_session_id = handler.session_id_for_test(&session_name).await;
     assert_ne!(replacement_session_id, original_session_id);
 
@@ -90,9 +88,11 @@ async fn control_queue_stops_when_its_registration_disappears() {
     wait_for_waiter(&handler, wait_channel).await;
 
     handler.finish_control(requester_pid, control_id).await;
-    handler
-        .handle_ok(WaitForRequest::fixture((wait_channel, WaitForMode::Signal)))
-        .await;
+    TestRequest::send_ok(
+        &handler,
+        WaitForRequest::fixture((wait_channel, WaitForMode::Signal)),
+    )
+    .await;
 
     let result = queued.await.expect("control queue joins");
     assert!(
@@ -126,9 +126,11 @@ async fn control_queue_stops_when_the_same_pid_is_registered_again() {
     let (replacement_control_id, _replacement_events) =
         handler.register_control_for_test(requester_pid, None).await;
     assert_ne!(replacement_control_id, old_control_id);
-    handler
-        .handle_ok(WaitForRequest::fixture((wait_channel, WaitForMode::Signal)))
-        .await;
+    TestRequest::send_ok(
+        &handler,
+        WaitForRequest::fixture((wait_channel, WaitForMode::Signal)),
+    )
+    .await;
 
     let result = queued.await.expect("control queue joins");
     assert!(
@@ -266,9 +268,11 @@ async fn control_eof_ready_lock_grant_wins_same_turn_cancellation() {
     let handler = RequestHandler::new();
     let requester_pid = 93_782;
     let channel = "control-eof-ready-lock-race";
-    handler
-        .handle_ok(WaitForRequest::fixture((channel, WaitForMode::Lock)))
-        .await;
+    TestRequest::send_ok(
+        &handler,
+        WaitForRequest::fixture((channel, WaitForMode::Lock)),
+    )
+    .await;
     let (control_id, _control_events) =
         handler.register_control_for_test(requester_pid, None).await;
     let identity = ControlClientIdentity::new(requester_pid, control_id);
@@ -312,9 +316,11 @@ async fn control_eof_ready_lock_grant_wins_same_turn_cancellation() {
     );
     drop(state);
 
-    handler
-        .handle_ok(WaitForRequest::fixture((channel, WaitForMode::Unlock)))
-        .await;
+    TestRequest::send_ok(
+        &handler,
+        WaitForRequest::fixture((channel, WaitForMode::Unlock)),
+    )
+    .await;
     assert_eq!(handler.wait_for_counts(channel), (0, 0, false));
     handler.finish_control(requester_pid, control_id).await;
 }
@@ -346,7 +352,7 @@ async fn stale_attach_outcome_cannot_bind_a_reused_control_pid() {
     let requester_pid = 93_775;
     let session_name =
         SessionName::new("control-outcome-attach-pid-aba").expect("valid session name");
-    handler.create_session(&session_name).await;
+    SessionSpec::create(&handler, &session_name).await;
     let request = Request::AttachSession(AttachSessionRequest {
         target: session_name.clone(),
     });
@@ -413,13 +419,15 @@ async fn control_queue_new_session_rejects_same_name_replacement_before_attach()
     let requester_pid = 93_778;
     let session_name =
         SessionName::new("control-queue-new-session-aba").expect("valid session name");
-    handler
-        .handle_ok(SetHookRequest::fixture((
+    TestRequest::send_ok(
+        &handler,
+        SetHookRequest::fixture((
             ScopeSelector::Global,
             HookName::AfterNewSession,
             "set-environment -g CONTROL_NEW_SESSION_HOOK ran",
-        )))
-        .await;
+        )),
+    )
+    .await;
     let pause = handler.install_created_session_control_attach_pause(session_name.clone());
     let (control_id, mut control_events) =
         handler.register_control_for_test(requester_pid, None).await;
@@ -437,13 +445,11 @@ async fn control_queue_new_session_rejects_same_name_replacement_before_attach()
         .await
         .expect("new-session reaches the pre-attach pause");
     let original_session_id = handler.session_id_for_test(&session_name).await;
-    handler
-        .handle_ok(KillSessionRequest::fixture(&session_name))
-        .await;
+    TestRequest::send_ok(&handler, KillSessionRequest::fixture(&session_name)).await;
     crate::hook_runtime::with_hook_execution(
         crate::hook_runtime::HookExecutionContext::lifecycle(HookName::SessionClosed),
         Vec::new(),
-        handler.create_session(&session_name),
+        SessionSpec::create(&handler, &session_name),
     )
     .await;
     let replacement_session_id = handler.session_id_for_test(&session_name).await;
@@ -516,7 +522,7 @@ async fn control_queue_new_session_attach_existing_rejects_same_name_replacement
     let requester_pid = 93_779;
     let session_name =
         SessionName::new("control-queue-new-session-attach-aba").expect("valid session name");
-    handler.create_session(&session_name).await;
+    SessionSpec::create(&handler, &session_name).await;
     let original_session_id = handler.session_id_for_test(&session_name).await;
     let pause = handler.install_created_session_control_attach_pause(session_name.clone());
     let (control_id, mut control_events) =
@@ -534,10 +540,8 @@ async fn control_queue_new_session_attach_existing_rejects_same_name_replacement
     tokio::time::timeout(Duration::from_secs(1), pause.reached.notified())
         .await
         .expect("attach-if-exists reaches the pre-attach pause");
-    handler
-        .handle_ok(KillSessionRequest::fixture(&session_name))
-        .await;
-    handler.create_session(&session_name).await;
+    TestRequest::send_ok(&handler, KillSessionRequest::fixture(&session_name)).await;
+    SessionSpec::create(&handler, &session_name).await;
     let replacement_session_id = handler.session_id_for_test(&session_name).await;
     let replacement_window_id = handler.active_window_id_for_test(&session_name).await;
     assert_ne!(replacement_session_id, original_session_id);
@@ -656,14 +660,16 @@ async fn control_queue_new_session_attach_existing_binds_captured_identity() {
     let requester_pid = 93_781;
     let session_name =
         SessionName::new("control-queue-new-session-attach").expect("valid session name");
-    handler.create_session(&session_name).await;
-    handler
-        .handle_ok(SetHookRequest::fixture((
+    SessionSpec::create(&handler, &session_name).await;
+    TestRequest::send_ok(
+        &handler,
+        SetHookRequest::fixture((
             ScopeSelector::Global,
             HookName::AfterNewSession,
             "set-environment -g CONTROL_ATTACH_EXISTING_HOOK ran",
-        )))
-        .await;
+        )),
+    )
+    .await;
     let expected_session_id = handler.session_id_for_test(&session_name).await;
     let expected_window_id = handler.active_window_id_for_test(&session_name).await;
     let (control_id, mut control_events) =

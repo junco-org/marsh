@@ -1,5 +1,5 @@
 use super::*;
-use crate::test_fixtures::wait_until;
+use crate::test_fixtures::{wait_until, SessionSpec, TestRequest};
 
 pub(super) async fn send_attached_copy_mode_command(
     handler: &RequestHandler,
@@ -52,7 +52,7 @@ async fn attached_copy_mode_emacs_slash_is_unbound_and_not_forwarded() {
             b"P0-LINE-12\r\n",
         )
         .await;
-    handler.handle_ok(CopyModeRequest::fixture(&target)).await;
+    TestRequest::send_ok(&handler, CopyModeRequest::fixture(&target)).await;
     assert_eq!(
         pane_mode_status(&handler, &alpha).await,
         "1:copy-mode:0:0\n"
@@ -92,7 +92,7 @@ async fn attached_copy_mode_emacs_ctrl_s_opens_search_prompt() {
             b"P0-LINE-12\r\n",
         )
         .await;
-    handler.handle_ok(CopyModeRequest::fixture(target)).await;
+    TestRequest::send_ok(&handler, CopyModeRequest::fixture(target)).await;
 
     handler
         .handle_attached_live_input_for_test(requester_pid, b"\x13P0-LINE-12\r")
@@ -117,7 +117,7 @@ async fn attached_copy_mode_vi_search_and_selection_keys_resolve_from_the_table(
         .await;
 
     set_vi_mode_keys(&handler, &alpha).await;
-    handler.handle_ok(CopyModeRequest::fixture(&target)).await;
+    TestRequest::send_ok(&handler, CopyModeRequest::fixture(&target)).await;
     assert!(handler
         .target_is_in_copy_mode(&target)
         .await
@@ -145,7 +145,7 @@ async fn attached_copy_mode_q_exits_and_refreshes_normal_surface() {
         )
         .await;
     set_vi_mode_keys(&handler, &alpha).await;
-    handler.handle_ok(CopyModeRequest::fixture(&target)).await;
+    TestRequest::send_ok(&handler, CopyModeRequest::fixture(&target)).await;
     assert_eq!(
         pane_mode_status(&handler, &alpha).await,
         "1:copy-mode:0:0\n"
@@ -184,7 +184,7 @@ async fn attached_copy_mode_exit_refreshes_every_client_on_shared_pane() {
     let target = PaneTarget::new(alpha.clone(), 0);
 
     set_vi_mode_keys(&handler, &alpha).await;
-    handler.handle_ok(CopyModeRequest::fixture(target)).await;
+    TestRequest::send_ok(&handler, CopyModeRequest::fixture(target)).await;
     drain_attach_controls(&mut first_rx);
     drain_attach_controls(&mut second_rx);
 
@@ -216,7 +216,7 @@ async fn assert_grouped_copy_mode_refresh_fanout(label: &str, automatic_rename: 
     let alpha = session_name(&format!("copy-group-{label}-alpha"));
     let beta = session_name(&format!("copy-group-{label}-beta"));
     let mut first_rx = create_quiet_attached_session(&handler, first_pid, &alpha).await;
-    handler.create_session(Grouped(&beta, &alpha)).await;
+    SessionSpec::create(&handler, Grouped(&beta, &alpha)).await;
     let mut second_rx = handler.attach_client(second_pid, &beta).await;
 
     if !automatic_rename {
@@ -233,7 +233,7 @@ async fn assert_grouped_copy_mode_refresh_fanout(label: &str, automatic_rename: 
     drain_attach_controls(&mut second_rx);
 
     let target = PaneTarget::new(alpha.clone(), 0);
-    handler.handle_ok(CopyModeRequest::fixture(target)).await;
+    TestRequest::send_ok(&handler, CopyModeRequest::fixture(target)).await;
     assert_eq!(
         pane_mode_status(&handler, &alpha).await,
         "1:copy-mode:0:0\n"
@@ -296,16 +296,18 @@ async fn attached_copy_mode_refreshes_clients_on_linked_window_aliases() {
     let linked = session_name("copy-linked-peer");
     let mut owner_rx = create_quiet_attached_session(&handler, owner_pid, &owner).await;
     let mut linked_rx = create_quiet_attached_session(&handler, linked_pid, &linked).await;
-    handler
-        .handle_ok(LinkWindowRequest {
+    TestRequest::send_ok(
+        &handler,
+        LinkWindowRequest {
             kill_destination: true,
             detached: false,
             ..Fixture::fixture((
                 WindowTarget::with_window(owner.clone(), 0),
                 WindowTarget::with_window(linked.clone(), 0),
             ))
-        })
-        .await;
+        },
+    )
+    .await;
     handler
         .set_option(
             ScopeSelector::Window(WindowTarget::with_window(owner.clone(), 0)),
@@ -317,9 +319,11 @@ async fn attached_copy_mode_refreshes_clients_on_linked_window_aliases() {
     drain_attach_controls(&mut owner_rx);
     drain_attach_controls(&mut linked_rx);
 
-    handler
-        .handle_ok(CopyModeRequest::fixture(PaneTarget::new(owner.clone(), 0)))
-        .await;
+    TestRequest::send_ok(
+        &handler,
+        CopyModeRequest::fixture(PaneTarget::new(owner.clone(), 0)),
+    )
+    .await;
     recv_matching_attach_control(&mut owner_rx, "linked copy-mode entry owner", |control| {
         matches!(control, AttachControl::Switch(_))
     })
@@ -361,7 +365,7 @@ async fn attached_copy_mode_copies_selection_to_buffer_and_exits_cleanly() {
             b"alpha\r\nneedle value\r\nomega\r\n",
         )
         .await;
-    handler.handle_ok(CopyModeRequest::fixture(&target)).await;
+    TestRequest::send_ok(&handler, CopyModeRequest::fixture(&target)).await;
     assert_eq!(
         pane_mode_status(&handler, &alpha).await,
         "1:copy-mode:0:0\n"
@@ -424,7 +428,7 @@ async fn attached_copy_mode_updates_automatic_window_name_on_entry_and_exit() {
         normal_status.ends_with("|0|\n"),
         "normal pane status should report no active mode, got {normal_status:?}"
     );
-    handler.handle_ok(CopyModeRequest::fixture(&target)).await;
+    TestRequest::send_ok(&handler, CopyModeRequest::fixture(&target)).await;
     assert_eq!(
         display_target_format(
             &handler,
@@ -490,7 +494,7 @@ async fn attached_copy_mode_escape_exits_and_clears_mode_state() {
     let alpha = session_name("alpha");
     let mut control_rx = create_quiet_attached_session(&handler, requester_pid, &alpha).await;
     let target = PaneTarget::new(alpha.clone(), 0);
-    handler.handle_ok(CopyModeRequest::fixture(&target)).await;
+    TestRequest::send_ok(&handler, CopyModeRequest::fixture(&target)).await;
     assert_eq!(
         pane_mode_status(&handler, &alpha).await,
         "1:copy-mode:0:0\n"
@@ -533,12 +537,14 @@ async fn attached_copy_mode_u_refresh_renders_history_backing() {
         .await;
     drain_attach_controls(&mut control_rx);
 
-    handler
-        .handle_ok(CopyModeRequest {
+    TestRequest::send_ok(
+        &handler,
+        CopyModeRequest {
             page_up: true,
             ..Fixture::fixture(&target)
-        })
-        .await;
+        },
+    )
+    .await;
 
     let frame = recv_render_frame(&mut control_rx, "copy-mode -u refresh").await;
     assert!(
@@ -567,7 +573,7 @@ async fn attached_copy_mode_refresh_renders_tmux_position_indicator() {
         .await;
     drain_attach_controls(&mut control_rx);
 
-    handler.handle_ok(CopyModeRequest::fixture(target)).await;
+    TestRequest::send_ok(&handler, CopyModeRequest::fixture(target)).await;
 
     let frame = recv_render_frame(&mut control_rx, "copy-mode refresh").await;
     assert!(

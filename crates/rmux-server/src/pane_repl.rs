@@ -37,15 +37,13 @@
 //! The line editing here is [`PromptBuffer`], the same text/cursor/kill/history state rmux's
 //! command prompt edits, and the keys are decoded by the same decoder an attached client's input
 //! goes through. What belongs to this prompt alone is what genuinely differs from a status-line
-//! prompt: a pseudoterminal to paint on, a shell to ask whether a line is finished, and the mux
-//! grammar a submitted line is resolved against.
+//! prompt: a pseudoterminal to paint on, and a shell to ask whether a line is finished. A finished
+//! line is handed to that shell exactly as typed; the prompt has no command grammar of its own.
 
 use std::io::Write as _;
 use std::time::Duration;
 
-use marsh_core::shellmux::{
-    jobctl, repl, CommandOptions, IdleTerminal, JobIo, JobView, MuxError, ShellId,
-};
+use marsh_core::shellmux::{CommandOptions, IdleTerminal, MuxError};
 use rmux_core::{text_width, Utf8Config};
 
 use crate::handler::pane_support::pane_prompt_input::decode_prompt_input_event;
@@ -105,10 +103,10 @@ struct Prompt {
     /// What is being typed, and what has arrived but not decoded yet.
     line: Editing,
     /// What the last command left to say, owed to the terminal before the next prompt.
-    report: Vec<String>,
+    report: Option<String>,
     /// Which command the pending report belongs to, so the job's close does not render it again.
     ///
-    /// Marked only once every line has actually reached the slave. A verdict marked before the
+    /// Marked only once the report has actually reached the slave. A verdict marked before the
     /// write succeeded would be suppressed at close having never been shown at all, which is worse
     /// than showing it twice.
     report_command: Option<marsh_core::shellmux::CommandId>,
@@ -136,9 +134,9 @@ struct Editing {
     history: Vec<String>,
     /// The already-accepted lines of an unfinished construct, each ending in its own newline.
     ///
-    /// The *original* edit buffer, never the parser's trimmed command text: a line whose quote is
-    /// still open owns its trailing spaces, and re-submitting a trimmed copy would run a different
-    /// command from the one that was typed.
+    /// The *original* edit buffer, never a trimmed copy: a line whose quote is still open owns
+    /// its trailing spaces, and re-submitting a trimmed copy would run a different command from
+    /// the one that was typed.
     continuation: String,
     /// Bytes read from the terminal that have not decoded into an event yet.
     ///
@@ -155,10 +153,10 @@ struct Editing {
 
 /// How one editing session ended.
 enum Session {
-    /// A complete line was submitted; what it parsed to, and whatever was typed after its Enter.
+    /// A complete line was submitted: its exact text, and whatever was typed after its Enter.
     Submitted {
-        /// The parsed line, resolved before anything ran.
-        input: repl::Input,
+        /// The line exactly as typed, continuation lines included, for the shell to parse.
+        command: String,
         /// Raw bytes that arrived in the same read, after the Enter.
         suffix: Vec<u8>,
     },
@@ -374,7 +372,7 @@ impl Prompt {
             io,
             job,
             line: Editing::default(),
-            report: Vec::new(),
+            report: None,
             report_command: None,
             rendered_rows: 0,
             bracketed: false,
@@ -394,8 +392,8 @@ impl Prompt {
             self.release(lease).await;
 
             match session {
-                Session::Submitted { input, suffix } => {
-                    if self.run(input, suffix).await.is_break() {
+                Session::Submitted { command, suffix } => {
+                    if self.submit(command, suffix).await.is_break() {
                         return;
                     }
                 }
@@ -454,20 +452,17 @@ impl Prompt {
         }
         self.bracketed = true;
 
-        let pending = std::mem::take(&mut self.report);
+        let pending = self.report.take();
         let rendered = self.report_command.take();
-        for line in pending {
-            if lease
-                .write_all(format!("{line}\r\n").as_bytes())
-                .await
-                .is_err()
-            {
+        if let Some(mut report) = pending {
+            report.push_str("\r\n");
+            if lease.write_all(report.as_bytes()).await.is_err() {
                 // Nothing is marked: the verdict never reached the slave, so the job's close must
                 // still render it. Marking here would suppress a report the user never saw.
                 return Session::Closed;
             }
         }
-        // Only now, with every line on the slave. The job's close renders a verdict the prompt did
+        // Only now, with the report on the slave. The job's close renders a verdict the prompt did
         // not manage to show, and suppresses one it did.
         if let Some(command) = rendered {
             self.io
@@ -542,58 +537,48 @@ impl Prompt {
                     let _ = lease.write_all(b"\r\n").await;
                     return Some(Session::Eof);
                 }
-                Some(Action::Submit) => match self.submit_line(lease).await {
-                    Submission::Session(session) => return Some(session),
-                    Submission::Reprompt => {}
-                },
+                Some(Action::Submit) => {
+                    if let Some(session) = self.submit_line(lease).await {
+                        return Some(session);
+                    }
+                }
             }
         }
     }
 
     /// Decides what a finished line means: run it, or keep taking more of it.
-    async fn submit_line(&mut self, lease: &IdleTerminal) -> Submission {
+    ///
+    /// `Some` ends the editing session. `None` means the line was empty or unfinished and the
+    /// prompt has been painted again on the same lease.
+    async fn submit_line(&mut self, lease: &IdleTerminal) -> Option<Session> {
         if lease.write_all(b"\r\n").await.is_err() {
-            return Submission::Session(Session::Closed);
+            return Some(Session::Closed);
         }
         self.rendered_rows = 0;
 
         let full = self.line.take_submitted();
-        let input = repl::parse(&full);
-        // Only a real command line can be unfinished. A frontend builtin has its own grammar, and
-        // asking brush whether `jobs` is complete would answer about a different `jobs`.
-        let command = match &input {
-            repl::Input::Foreground(cmd) | repl::Input::Background { cmd, .. } => Some(cmd.clone()),
-            _ => None,
-        };
-        if let Some(command) = command {
-            if matches!(
-                self.io.input_is_complete(&self.job, &command).await,
-                Ok(false)
-            ) {
+        // An empty line prompts again without admitting a job.
+        if !full.trim().is_empty() {
+            // Only a definite "unfinished" keeps the line open. Any other answer submits it, so a
+            // malformed line is diagnosed by the shell that runs it rather than by this prompt.
+            if matches!(self.io.input_is_complete(&self.job, &full).await, Ok(false)) {
                 // The verbatim buffer, newline included: a construct that lost its line breaks —
                 // or the spaces inside its open quote — would be a different command.
                 self.line.continue_with(full);
-                if self.paint(lease, true).await.is_err() {
-                    return Submission::Session(Session::Closed);
-                }
-                return Submission::Reprompt;
+            } else {
+                prompt_buffer::history_push(&mut self.line.history, full.trim(), HISTORY_LIMIT);
+                return Some(Session::Submitted {
+                    command: full,
+                    // Anything typed after the Enter is not this prompt's any more.
+                    suffix: std::mem::take(&mut self.line.pending),
+                });
             }
         }
 
-        if matches!(input, repl::Input::Empty) {
-            // Nothing was typed. Prompt again without admitting a job.
-            if self.paint(lease, true).await.is_err() {
-                return Submission::Session(Session::Closed);
-            }
-            return Submission::Reprompt;
+        if self.paint(lease, true).await.is_err() {
+            return Some(Session::Closed);
         }
-
-        prompt_buffer::history_push(&mut self.line.history, full.trim(), HISTORY_LIMIT);
-        Submission::Session(Session::Submitted {
-            input,
-            // Anything typed after the Enter is not this prompt's any more.
-            suffix: std::mem::take(&mut self.line.pending),
-        })
+        None
     }
 
     /// Paints the prompt and the line being edited, and puts the caret where it belongs.
@@ -639,10 +624,11 @@ impl Prompt {
     /// What this prompt writes before the line.
     fn prompt_text(&self) -> String {
         if self.line.continuation.is_empty() {
+            let dir = &self.job.sandbox().dir;
             format!(
                 "{} {}> ",
                 self.job.id().reference(),
-                jobctl::dir_label(self.job.sandbox())
+                if dir.is_root() { "." } else { dir.as_str() }
             )
         } else {
             "> ".to_owned()
@@ -657,37 +643,13 @@ impl Prompt {
         }
     }
 
-    /// Runs whatever the submitted line turned out to be.
+    /// Submits one command line into this pane's own shell and waits for its verdict.
     ///
     /// No lease is held here: the command owns the terminal, its mode and its size while it runs.
     /// Whatever there is to report is kept for the next acquisition, which is what puts it on the
     /// slave after the command's own output rather than racing it.
     ///
     /// `Break` ends the driver: this pane's shell is going away.
-    async fn run(&mut self, input: repl::Input, suffix: Vec<u8>) -> std::ops::ControlFlow<()> {
-        let report = match input {
-            // Resolved in `submit_line`; reaching here would mean a job for nothing.
-            repl::Input::Empty => Vec::new(),
-            repl::Input::Invalid(message) => vec![message],
-            repl::Input::Jobs => self.jobs_table(),
-            repl::Input::Fg(name) => self.foreground(name.as_deref()).await,
-            repl::Input::Stop(args) => self.stop_job(&args).await,
-            // Never `jobctl::kill`: a signal asked for as a workload command is workload, and
-            // sending it from the frontend would skip admission, instrumentation and the gate
-            // that every other line goes through.
-            repl::Input::Kill(args) => return self.submit(kill_line(&args), suffix).await,
-            repl::Input::SpawnDir { name, dir } => self.spawn_job(name, Some(&dir), None).await,
-            repl::Input::Background { cmd, name } => self.spawn_job(name, None, Some(&cmd)).await,
-            repl::Input::Foreground(cmd) => return self.submit(cmd, suffix).await,
-        };
-
-        // Nothing was admitted, so the bytes typed after the Enter are still this prompt's.
-        self.line.pending = suffix;
-        self.report = report;
-        std::ops::ControlFlow::Continue(())
-    }
-
-    /// Submits one command line into this pane's own shell and waits for its verdict.
     async fn submit(&mut self, cmd: String, suffix: Vec<u8>) -> std::ops::ControlFlow<()> {
         // The admission, not the completion. This prompt still owes the program the input typed
         // behind its line, and waiting for the verdict first would deadlock anything reading
@@ -702,7 +664,8 @@ impl Prompt {
                 // Nothing runs, so the typeahead belongs to the next prompt rather than to a
                 // command that was never admitted.
                 self.line.pending = suffix;
-                self.report = vec![format!("{}: {error}", self.job.id().reference())];
+                self.report = Some(format!("{}: {error}", self.job.id().reference()));
+                self.report_command = None;
                 return std::ops::ControlFlow::Continue(());
             }
         };
@@ -725,167 +688,23 @@ impl Prompt {
             // getting a verdict, and inventing one would be worse than saying nothing.
             return std::ops::ControlFlow::Continue(());
         };
+        // A job that was already closing when the verdict arrived has no terminal left to prompt
+        // on: reopening one to print a single line would draw a prompt into a pane that is going
+        // away. Nothing is kept for it here either. A closing job's verdict is rendered by the
+        // terminal delivery worker, which derives it from the job's own `JobEnd::completion`
+        // immediately before it emits the pane's end of file. Depositing from this side made the
+        // outcome depend on whether `command.wait()` returned before or after that worker looked —
+        // the report appeared, or was silently dropped, according to a race nobody could see.
+        if self.io.job(self.job.id()).is_none_or(|view| view.closing) {
+            return std::ops::ControlFlow::Break(());
+        }
         // Every outcome that is not an ordinary publication is reported: a denial and a discard
         // are both things the user must see, because the command may have exited zero and still
-        // changed nothing.
-        let report = repl::report_lines(self.job.id(), &completion.result);
-        self.deliver(report, Some(completion.id)).await
+        // changed nothing. An open job gets it on its own terminal, before the next prompt.
+        self.report = crate::managed_workload::report_line(self.job.id(), &completion.result);
+        self.report_command = Some(completion.id);
+        std::ops::ControlFlow::Continue(())
     }
-
-    /// Puts a verdict where it can still be read.
-    ///
-    /// An open job gets it on its own terminal, before the next prompt. A job that was already
-    /// closing when the verdict arrived has no terminal left to prompt on: reopening one to print
-    /// a single line would draw a prompt into a pane that is going away, so the report is left
-    /// for the job's own retirement to append through the same transcript publisher every other
-    /// byte of that pane went through.
-    async fn deliver(
-        &mut self,
-        report: Vec<String>,
-        command: Option<marsh_core::shellmux::CommandId>,
-    ) -> std::ops::ControlFlow<()> {
-        let closing = self
-            .io
-            .job(self.job.id())
-            .is_none_or(|view: JobView| view.closing);
-        if !closing {
-            self.report = report;
-            self.report_command = command;
-            return std::ops::ControlFlow::Continue(());
-        }
-
-        // Nothing is deposited here. A closing job's verdict is rendered by the terminal delivery
-        // worker, which derives it from the job's own `JobEnd::completion` immediately before it
-        // emits the pane's end of file. Depositing from this side made the outcome depend on
-        // whether `command.wait()` returned before or after that worker looked — the report
-        // appeared, or was silently dropped, according to a race nobody could see.
-        drop(report);
-        std::ops::ControlFlow::Break(())
-    }
-
-    /// The job table, rendered exactly as the console builtin renders it.
-    fn jobs_table(&self) -> Vec<String> {
-        let mut rendered = Vec::new();
-        self.io.print_jobs(&mut rendered);
-        String::from_utf8_lossy(&rendered)
-            .lines()
-            .map(str::to_owned)
-            .collect()
-    }
-
-    /// Makes another job the selected one.
-    async fn foreground(&self, name: Option<&str>) -> Vec<String> {
-        let target = match name {
-            Some(name) => ShellId::from(name),
-            // The most recently created job a user can actually be attached to. A pipe helper is
-            // real work with a real principal and no terminal, so selecting one would hand the
-            // foreground to something that has no keyboard.
-            None => match self
-                .io
-                .jobs()
-                .into_iter()
-                .rfind(|view| matches!(view.io, JobIo::Terminal { .. }) && !view.closing)
-            {
-                Some(view) => view.id,
-                None => return vec!["fg: no current job".to_owned()],
-            },
-        };
-        let handle = match self.io.shell(&target) {
-            Ok(handle) => handle,
-            Err(error) => return vec![format!("fg: {error}")],
-        };
-        match self.io.switch(&handle).await {
-            Ok(view) => vec![format!("{} selected", view.id.reference())],
-            Err(error) => vec![format!("fg: {error}")],
-        }
-    }
-
-    /// Opens a new job in a window of its own, optionally with a command, without waiting for it.
-    ///
-    /// `dir` is a directory as typed, resolved against where this job's shell currently stands;
-    /// `None` opens the new job right there.
-    ///
-    /// The window is what makes the job usable. A job with a snapshot and a principal and no
-    /// surface cannot be seen, selected or typed into, so both forms go through
-    /// [`RequestHandler::spawn_repl_window`](crate::handler::RequestHandler::spawn_repl_window):
-    /// the same plan/open/commit transaction `new-window` runs, in this job's own session,
-    /// detached, carrying the parsed id and the engine's own lifetime rules.
-    ///
-    /// A prompt holds a facade and a handle, not handler state, so [`ShellIo::handler`] is the
-    /// way in. When no handler is bound there is no session to open a window in, and that is
-    /// reported rather than papered over: opening the job through the facade alone would answer
-    /// `%3 started` for a job with nowhere to appear.
-    async fn spawn_job(
-        &self,
-        name: Option<String>,
-        dir: Option<&str>,
-        cmd: Option<&str>,
-    ) -> Vec<String> {
-        if let Some(name) = &name {
-            if !repl::valid_name(name) {
-                return vec![format!("sd: {name}: not a usable job name")];
-            }
-        }
-        let base = match self.source_relative_cwd() {
-            Ok(base) => base,
-            Err(message) => return vec![message],
-        };
-        let dir = match dir {
-            Some(dir) => repl::job_dir(&base, dir),
-            None => base,
-        };
-        let Some(handler) = self.io.handler() else {
-            return vec!["sd: this server has no sessions to open a window in".to_owned()];
-        };
-        match handler
-            .spawn_repl_window(&self.io, &self.job, name.map(ShellId::from), &dir, cmd)
-            .await
-        {
-            Ok(id) => vec![format!("{} started", id.reference())],
-            Err(error) => vec![format!("sd: {error}")],
-        }
-    }
-
-    /// Logical cwd relative to the source. A cwd outside that source is never silently rebased.
-    fn source_relative_cwd(&self) -> Result<String, String> {
-        let Some(view) = self.io.job(self.job.id()) else {
-            return Err(format!("sd: {}: no such job", self.job.id().reference()));
-        };
-        match view.working_directory.strip_prefix(&view.sandbox.seed) {
-            Ok(relative) => relative
-                .to_str()
-                .map(str::to_owned)
-                .ok_or_else(|| "sd: current directory is not UTF-8".to_owned()),
-            Err(_) => Err(format!(
-                "sd: {}: current directory is outside this job's source",
-                view.working_directory.display()
-            )),
-        }
-    }
-
-    /// Closes a named job, gracefully or by force.
-    async fn stop_job(&self, args: &[String]) -> Vec<String> {
-        let parsed = match repl::parse_stop(args) {
-            Ok(parsed) => parsed,
-            Err(message) => return vec![message],
-        };
-        let handle = match self.io.shell(&ShellId::from(parsed.job.as_str())) {
-            Ok(handle) => handle,
-            Err(error) => return vec![format!("stop: {error}")],
-        };
-        match self.io.stop(&handle, parsed.force).await {
-            Ok(()) => Vec::new(),
-            Err(error) => vec![format!("stop: {error}")],
-        }
-    }
-}
-
-/// What a finished line decided.
-enum Submission {
-    /// The editing session is over.
-    Session(Session),
-    /// The line is unfinished or empty: prompt again on the same lease.
-    Reprompt,
 }
 
 /// A repaint when something changed, nothing when it did not.
@@ -895,23 +714,6 @@ const fn changed(changed: bool) -> Step {
     } else {
         Step::Idle
     }
-}
-
-/// The managed `kill` invocation a typed `kill` becomes.
-///
-/// Each argument is quoted on its own, so the job control grammar's tokens reach the builtin as
-/// the words that were typed rather than being re-split, re-globbed or expanded by the shell that
-/// runs the line.
-fn kill_line(args: &[String]) -> String {
-    let mut line = String::from("kill");
-    for arg in args {
-        line.push(' ');
-        line.push_str(&brush_core::escape::force_quote(
-            arg,
-            brush_core::escape::QuoteMode::SingleQuote,
-        ));
-    }
-    line
 }
 
 /// Where the caret sits: rows below the first painted row, and columns across.
@@ -960,7 +762,3 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 #[cfg(test)]
 #[path = "pane_repl/tests.rs"]
 mod tests;
-
-#[cfg(test)]
-#[path = "pane_repl/window_tests.rs"]
-mod window_tests;

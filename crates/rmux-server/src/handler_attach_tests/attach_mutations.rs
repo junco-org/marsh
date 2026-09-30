@@ -1,4 +1,5 @@
 use super::*;
+use crate::test_fixtures::{SessionSpec, TestRequest};
 
 #[tokio::test]
 async fn attached_session_mutations_emit_refresh_switches() {
@@ -6,17 +7,17 @@ async fn attached_session_mutations_emit_refresh_switches() {
     let requester_pid = std::process::id();
     let alpha = session_name("alpha");
 
-    handler
-        .create_session((&alpha, TerminalSize::new(120, 40)))
-        .await;
+    SessionSpec::create(&handler, (&alpha, TerminalSize::new(120, 40))).await;
     let mut control_rx = handler.attach_client(requester_pid, &alpha).await;
 
-    let split = handler
-        .handle_ok(SplitWindowRequest {
+    let split = TestRequest::send_ok(
+        &handler,
+        SplitWindowRequest {
             direction: rmux_proto::SplitDirection::Horizontal,
             ..Fixture::fixture(&alpha)
-        })
-        .await;
+        },
+    )
+    .await;
     assert_eq!(
         split,
         rmux_proto::SplitWindowResponse {
@@ -57,9 +58,11 @@ async fn attached_session_mutations_emit_refresh_switches() {
     let layout_frame = recv_render_frame(&mut control_rx, "layout refresh").await;
     assert!(layout_frame.contains('│'));
 
-    let selected_pane = handler
-        .handle_ok(SelectPaneRequest::fixture(PaneTarget::new(alpha, 1)))
-        .await;
+    let selected_pane = TestRequest::send_ok(
+        &handler,
+        SelectPaneRequest::fixture(PaneTarget::new(alpha, 1)),
+    )
+    .await;
     assert_eq!(
         selected_pane,
         rmux_proto::SelectPaneResponse {
@@ -79,15 +82,17 @@ async fn switch_client_updates_the_tracked_session_for_follow_up_refreshes() {
     let beta = session_name("beta");
 
     for session in [&alpha, &beta] {
-        handler.create_session(session).await;
+        SessionSpec::create(&handler, session).await;
     }
 
-    handler
-        .handle_ok(SplitWindowRequest {
+    TestRequest::send_ok(
+        &handler,
+        SplitWindowRequest {
             direction: rmux_proto::SplitDirection::Horizontal,
             ..Fixture::fixture(&beta)
-        })
-        .await;
+        },
+    )
+    .await;
     let mut control_rx = handler.attach_client(requester_pid, alpha).await;
 
     let switched = handler
@@ -144,7 +149,7 @@ async fn choose_tree_renders_after_cli_switch_client() {
     let beta = session_name("beta");
     let mut control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
 
-    handler.create_session(&beta).await;
+    SessionSpec::create(&handler, &beta).await;
     drain_attach_controls(&mut control_rx);
 
     let switched = handler
@@ -184,7 +189,7 @@ async fn terminal_feature_mutations_refresh_attached_targets_with_client_context
     let requester_pid = 42;
     let alpha = session_name("alpha");
 
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
 
     let (control_tx, mut control_rx) = mpsc::unbounded_channel();
     let _attach_id = handler
@@ -196,16 +201,18 @@ async fn terminal_feature_mutations_refresh_attached_targets_with_client_context
         )
         .await;
 
-    handler
-        .handle_ok(SetOptionRequest {
+    TestRequest::send_ok(
+        &handler,
+        SetOptionRequest {
             mode: SetOptionMode::Append,
             ..Fixture::fixture((
                 ScopeSelector::Global,
                 OptionName::TerminalFeatures,
                 "xterm*:sync",
             ))
-        })
-        .await;
+        },
+    )
+    .await;
 
     let target = recv_switch_target(&mut control_rx, "terminal feature refresh").await;
     assert!(target.outer_terminal.features_string().contains("sync"));
@@ -221,7 +228,7 @@ async fn allow_passthrough_mutations_refresh_attached_targets() {
     let requester_pid = 43;
     let alpha = session_name("alpha");
 
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
 
     let (control_tx, mut control_rx) = mpsc::unbounded_channel();
     let _attach_id = handler
@@ -254,7 +261,7 @@ async fn allow_passthrough_enables_sixel_for_sixel_terminals() {
     let requester_pid = 43;
     let alpha = session_name("alpha");
 
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
 
     let (control_tx, mut control_rx) = mpsc::unbounded_channel();
     let _attach_id = handler
@@ -283,7 +290,7 @@ async fn allow_passthrough_all_shares_the_active_pane_gate() {
     let requester_pid = 43;
     let alpha = session_name("alpha");
 
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
 
     let (control_tx, mut control_rx) = mpsc::unbounded_channel();
     let _attach_id = handler
@@ -313,7 +320,7 @@ async fn kitty_passthrough_is_disabled_while_active_pane_is_in_copy_mode() {
     let requester_pid = 43;
     let alpha = session_name("alpha");
 
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
 
     let (control_tx, mut control_rx) = mpsc::unbounded_channel();
     let _attach_id = handler
@@ -334,9 +341,11 @@ async fn kitty_passthrough_is_disabled_while_active_pane_is_in_copy_mode() {
         "kitty passthrough should be available before modal pane modes"
     );
 
-    handler
-        .handle_ok(CopyModeRequest::fixture(PaneTarget::new(alpha, 0)))
-        .await;
+    TestRequest::send_ok(
+        &handler,
+        CopyModeRequest::fixture(PaneTarget::new(alpha, 0)),
+    )
+    .await;
 
     let target = recv_switch_target(&mut control_rx, "copy-mode refresh").await;
     assert!(
@@ -354,7 +363,7 @@ async fn different_requester_pids_can_control_the_sole_active_attach() {
     let beta = session_name("beta");
 
     for session in [&alpha, &beta] {
-        handler.create_session(session).await;
+        SessionSpec::create(&handler, session).await;
     }
 
     let mut control_rx = handler.attach_client(owner_pid, &alpha).await;
@@ -404,18 +413,20 @@ async fn rename_session_preserves_ambiguity_rules_for_switch_and_detach() {
     let gamma = session_name("gamma");
 
     for session in [&alpha, &beta] {
-        handler.create_session(session).await;
+        SessionSpec::create(&handler, session).await;
     }
 
     let _first_rx = handler.attach_client(101, &alpha).await;
     let _second_rx = handler.attach_client(202, &alpha).await;
 
-    handler
-        .handle_ok(RenameSessionRequest {
+    TestRequest::send_ok(
+        &handler,
+        RenameSessionRequest {
             target: alpha,
             new_name: gamma,
-        })
-        .await;
+        },
+    )
+    .await;
 
     let switched = handler
         .dispatch(

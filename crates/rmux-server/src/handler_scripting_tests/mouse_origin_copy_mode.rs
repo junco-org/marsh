@@ -1,4 +1,5 @@
 use super::*;
+use crate::test_fixtures::{SessionSpec, TestRequest};
 
 fn failing_pipe_command() -> &'static str {
     "exit 7"
@@ -169,19 +170,19 @@ async fn assert_mouse_target_queue_case(
     expected_pane: u32,
 ) -> rmux_proto::CommandOutput {
     let (handler, session, current_target) = fixture(name).await;
-    handler
-        .handle_ok(SplitWindowRequest {
+    TestRequest::send_ok(
+        &handler,
+        SplitWindowRequest {
             direction: SplitDirection::Horizontal,
             ..Fixture::fixture(&current_target)
-        })
-        .await;
+        },
+    )
+    .await;
     let mouse_target = PaneTarget::with_window(session.clone(), 0, 1);
     handler
         .wait_for_pane_startup_to_finish_for_test(&mouse_target)
         .await;
-    handler
-        .handle_ok(SelectPaneRequest::fixture(&current_target))
-        .await;
+    TestRequest::send_ok(&handler, SelectPaneRequest::fixture(&current_target)).await;
 
     let root = sourced.then(|| temp_root(name));
     let queued_command = match root.as_ref() {
@@ -479,13 +480,15 @@ async fn foreground_display_panes_action_preserves_its_mouse_origin() {
 async fn display_panes_rekeys_mouse_origin_outside_the_target_client_session() {
     let (handler, alpha, alpha_target) = fixture("mouse-display-panes-origin-alpha").await;
     let beta = session_name("mouse-display-panes-client-beta");
-    handler
-        .create_started_session(NewSessionExtRequest {
+    SessionSpec::create_started(
+        &handler,
+        NewSessionExtRequest {
             size: Some(TerminalSize { cols: 20, rows: 6 }),
             command: Some(quiet_command()),
             ..Fixture::fixture(&beta)
-        })
-        .await;
+        },
+    )
+    .await;
 
     let _alpha_control_rx = prepare_copy_mode_fixture(&handler, &alpha, &alpha_target).await;
     let requester_pid = std::process::id();
@@ -507,12 +510,14 @@ async fn display_panes_rekeys_mouse_origin_outside_the_target_client_session() {
     wait_for_display_panes_state(&handler).await;
 
     let renamed_alpha = session_name("mouse-display-panes-origin-renamed");
-    handler
-        .handle_ok(rmux_proto::RenameSessionRequest {
+    TestRequest::send_ok(
+        &handler,
+        rmux_proto::RenameSessionRequest {
             target: alpha,
             new_name: renamed_alpha.clone(),
-        })
-        .await;
+        },
+    )
+    .await;
     {
         let active_attach = handler.active_attach.lock().await;
         let active = &active_attach.by_pid[&requester_pid];

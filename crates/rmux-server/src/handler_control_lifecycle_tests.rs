@@ -5,7 +5,7 @@ use std::time::Duration;
 use super::{QueuedLifecycleEvent, RequestHandler};
 use crate::control::{ControlServerEvent, CONTROL_SERVER_EVENT_CAPACITY};
 use crate::pane_io::{AttachControl, PaneExitEvent};
-use crate::test_fixtures::{Fixture, Grouped};
+use crate::test_fixtures::{Fixture, Grouped, SessionSpec, TestRequest};
 use crate::test_names::session_name;
 use rmux_core::{command_parser::CommandParser, LifecycleEvent};
 use rmux_proto::{
@@ -23,7 +23,7 @@ async fn same_pid_control_replacement_emits_one_client_detached_for_old_identity
 
     let handler = RequestHandler::new();
     let session = session_name("same-pid-control-replacement");
-    handler.create_session(&session).await;
+    SessionSpec::create(&handler, &session).await;
     let (_, mut keepalive) = handler
         .register_utf8_control_for_test(KEEPALIVE_PID, Some(&session))
         .await;
@@ -92,7 +92,7 @@ async fn same_pid_control_replacement_destroys_the_old_unattached_session() {
 
     let handler = RequestHandler::new();
     let session = session_name("same-pid-replacement-destroy-unattached");
-    handler.create_session(&session).await;
+    SessionSpec::create(&handler, &session).await;
     let session_id = handler.session_id_for_test(&session).await;
     handler
         .store_option_for_test(
@@ -187,7 +187,7 @@ async fn finished_control_identity_is_not_lost_before_same_pid_replacement() {
 
     let handler = RequestHandler::new();
     let session = session_name("finished-control-before-same-pid-replacement");
-    handler.create_session(&session).await;
+    SessionSpec::create(&handler, &session).await;
     let (_, mut keepalive) = handler
         .register_utf8_control_for_test(KEEPALIVE_PID, Some(&session))
         .await;
@@ -235,7 +235,7 @@ async fn finish_control_does_not_duplicate_an_explicit_client_detached_event() {
 
     let handler = RequestHandler::new();
     let session = session_name("control-explicit-detach-once");
-    handler.create_session(&session).await;
+    SessionSpec::create(&handler, &session).await;
     let (_, mut keepalive) = handler
         .register_utf8_control_for_test(KEEPALIVE_PID, Some(&session))
         .await;
@@ -300,7 +300,7 @@ async fn explicit_control_detach_claim_prevents_same_pid_replacement_duplicate()
 
     let handler = RequestHandler::new();
     let session = session_name("explicit-detach-before-control-replacement");
-    handler.create_session(&session).await;
+    SessionSpec::create(&handler, &session).await;
     let (_, mut keepalive) = handler
         .register_utf8_control_for_test(KEEPALIVE_PID, Some(&session))
         .await;
@@ -364,7 +364,7 @@ async fn target_session_detach_does_not_duplicate_a_claimed_control_event() {
 
     let handler = RequestHandler::new();
     let session = session_name("target-session-claimed-control-detach");
-    handler.create_session(&session).await;
+    SessionSpec::create(&handler, &session).await;
     let (_, _control_events) = handler
         .register_utf8_control_for_test(CONTROL_PID, Some(&session))
         .await;
@@ -423,7 +423,7 @@ async fn target_session_detach_pins_each_control_session_identity() {
 
     let handler = RequestHandler::new();
     let session = session_name("target-session-stable-control-detach");
-    handler.create_session(&session).await;
+    SessionSpec::create(&handler, &session).await;
     let (_, _first_events) = handler
         .register_utf8_control_for_test(FIRST_PID, Some(&session))
         .await;
@@ -475,7 +475,7 @@ async fn rename_session_commits_control_identity_before_a_concurrent_kill() {
     let handler = RequestHandler::new();
     let alpha = session_name("rename-control-atomic-alpha");
     let beta = session_name("rename-control-atomic-beta");
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
     let requester_pid = 42_456;
     let (_, mut events) = handler
         .register_utf8_control_for_test(requester_pid, Some(&alpha))
@@ -653,8 +653,8 @@ async fn kill_session_publishes_teardown_before_destroy_rehome_without_deadlock(
     let handler = RequestHandler::new();
     let survivor = session_name("kill-session-order-survivor");
     let destroyed = session_name("kill-session-order-destroyed");
-    handler.create_session(&survivor).await;
-    handler.create_session(&destroyed).await;
+    SessionSpec::create(&handler, &survivor).await;
+    SessionSpec::create(&handler, &destroyed).await;
     handler
         .set_detach_on_destroy_for_test(&destroyed, "off")
         .await;
@@ -685,7 +685,7 @@ async fn kill_session_all_except_rehomes_every_removed_session_after_teardown() 
     let alpha = session_name("kill-all-except-alpha");
     let beta = session_name("kill-all-except-beta");
     for session in [&survivor, &alpha, &beta] {
-        handler.create_session(session).await;
+        SessionSpec::create(&handler, session).await;
     }
     handler.set_detach_on_destroy_for_test(&alpha, "off").await;
     handler.set_detach_on_destroy_for_test(&beta, "off").await;
@@ -725,8 +725,8 @@ async fn kill_window_publishes_teardown_before_destroy_rehome_without_deadlock()
     let handler = RequestHandler::new();
     let survivor = session_name("kill-window-order-survivor");
     let destroyed = session_name("kill-window-order-destroyed");
-    handler.create_session(&survivor).await;
-    handler.create_session(&destroyed).await;
+    SessionSpec::create(&handler, &survivor).await;
+    SessionSpec::create(&handler, &destroyed).await;
     handler
         .set_detach_on_destroy_for_test(&destroyed, "off")
         .await;
@@ -757,21 +757,22 @@ async fn kill_window_all_others_rehomes_clients_from_destroyed_linked_alias() {
     let handler = RequestHandler::new();
     let survivor = session_name("kill-window-linked-survivor");
     let alias = session_name("kill-window-linked-alias");
-    handler.create_session(&survivor).await;
+    SessionSpec::create(&handler, &survivor).await;
     let linked_window = handler.create_window(&survivor).await;
-    handler.create_session(&alias).await;
-    handler
-        .handle_ok(LinkWindowRequest::fixture((
-            linked_window,
-            WindowTarget::with_window(alias.clone(), 1),
-        )))
-        .await;
-    handler
-        .handle_ok(KillWindowRequest {
+    SessionSpec::create(&handler, &alias).await;
+    TestRequest::send_ok(
+        &handler,
+        LinkWindowRequest::fixture((linked_window, WindowTarget::with_window(alias.clone(), 1))),
+    )
+    .await;
+    TestRequest::send_ok(
+        &handler,
+        KillWindowRequest {
             target: WindowTarget::with_window(alias.clone(), 0),
             kill_all_others: false,
-        })
-        .await;
+        },
+    )
+    .await;
     handler.set_detach_on_destroy_for_test(&alias, "off").await;
 
     let (_, mut control_events) = handler
@@ -780,12 +781,14 @@ async fn kill_window_all_others_rehomes_clients_from_destroyed_linked_alias() {
     let _ = drain_control_events(&mut control_events);
     let mut attach_events = handler.attach_client(43_068, &alias).await;
 
-    handler
-        .handle_ok(KillWindowRequest {
+    TestRequest::send_ok(
+        &handler,
+        KillWindowRequest {
             target: WindowTarget::with_window(survivor.clone(), 0),
             kill_all_others: true,
-        })
-        .await;
+        },
+    )
+    .await;
     assert!(handler
         .state
         .lock()
@@ -802,8 +805,8 @@ async fn move_window_publishes_prepared_order_before_destroy_rehome_without_dead
     let handler = RequestHandler::new();
     let destination = session_name("move-window-order-destination");
     let source = session_name("move-window-order-source");
-    handler.create_session(&destination).await;
-    handler.create_session(&source).await;
+    SessionSpec::create(&handler, &destination).await;
+    SessionSpec::create(&handler, &source).await;
     handler.set_detach_on_destroy_for_test(&source, "off").await;
     let _attach_rx = handler.attach_client(43_062, &source).await;
     let mut lifecycle_events = handler.subscribe_lifecycle_events();
@@ -834,8 +837,8 @@ async fn destroy_control_switch_queues_committed_session_change_after_target_dis
     let handler = RequestHandler::new();
     let source = session_name("destroy-control-event-source");
     let target = session_name("destroy-control-event-target");
-    handler.create_session(&source).await;
-    handler.create_session(&target).await;
+    SessionSpec::create(&handler, &source).await;
+    SessionSpec::create(&handler, &target).await;
     let requester_pid = 43_041;
     let (_, mut control_events) = handler
         .register_utf8_control_for_test(requester_pid, Some(&source))
@@ -897,8 +900,8 @@ async fn natural_last_pane_exit_rehomes_control_and_attach_after_session_teardow
     let handler = RequestHandler::new();
     let survivor = session_name("natural-rehome-survivor");
     let source = session_name("natural-rehome-source");
-    handler.create_session(&survivor).await;
-    handler.create_session(&source).await;
+    SessionSpec::create(&handler, &survivor).await;
+    SessionSpec::create(&handler, &source).await;
     handler.wait_for_initial_panes_for_test().await;
     handler.set_detach_on_destroy_for_test(&source, "off").await;
     let (_, mut control_events) = handler
@@ -948,11 +951,9 @@ async fn natural_grouped_last_pane_exit_rehomes_each_client_after_family_teardow
     let handler = RequestHandler::new();
     let survivor = session_name("natural-group-rehome-survivor");
     let owner = session_name("natural-group-rehome-owner");
-    handler.create_session(&survivor).await;
-    handler.create_session(&owner).await;
-    let peer = handler
-        .create_session(Grouped("natural-group-rehome-peer", &owner))
-        .await;
+    SessionSpec::create(&handler, &survivor).await;
+    SessionSpec::create(&handler, &owner).await;
+    let peer = SessionSpec::create(&handler, Grouped("natural-group-rehome-peer", &owner)).await;
     handler.wait_for_initial_panes_for_test().await;
     handler.set_detach_on_destroy_for_test(&owner, "off").await;
     handler.set_detach_on_destroy_for_test(&peer, "off").await;
@@ -1009,7 +1010,7 @@ async fn control_destroy_switch_honors_each_detach_on_destroy_policy() {
         let middle = session_name(&format!("m-{case_index}"));
         let zulu = session_name(&format!("z-{case_index}"));
         for session_name in [&alpha, &zulu, &middle] {
-            handler.create_session(session_name).await;
+            SessionSpec::create(&handler, session_name).await;
         }
         handler
             .set_detach_on_destroy_for_test(&middle, policy)
@@ -1064,7 +1065,7 @@ async fn no_detached_uses_one_destroy_snapshot_for_control_and_attach() {
     let beta = session_name("dual-destroy-beta");
     let gamma = session_name("dual-destroy-gamma");
     for session_name in [&source, &beta, &gamma] {
-        handler.create_session(session_name).await;
+        SessionSpec::create(&handler, session_name).await;
     }
     handler
         .set_detach_on_destroy_for_test(&source, "no-detached")
@@ -1119,8 +1120,8 @@ async fn pane_kill_entry_paths_rehome_control_before_session_closed() {
         let suffix = if by_id { "by-id" } else { "target" };
         let survivor = session_name(&format!("pane-destroy-survivor-{suffix}"));
         let destroyed = session_name(&format!("pane-destroy-source-{suffix}"));
-        handler.create_session(&survivor).await;
-        handler.create_session(&destroyed).await;
+        SessionSpec::create(&handler, &survivor).await;
+        SessionSpec::create(&handler, &destroyed).await;
         handler
             .set_detach_on_destroy_for_test(&destroyed, "off")
             .await;
@@ -1162,8 +1163,8 @@ async fn pane_transfer_rehomes_control_before_source_session_closed() {
     let handler = RequestHandler::new();
     let destination = session_name("control-join-destination");
     let source = session_name("control-join-source");
-    handler.create_session(&destination).await;
-    handler.create_session(&source).await;
+    SessionSpec::create(&handler, &destination).await;
+    SessionSpec::create(&handler, &source).await;
     handler.set_detach_on_destroy_for_test(&source, "off").await;
     let requester_pid = 43_200;
     let (_, mut events) = handler
@@ -1196,8 +1197,8 @@ async fn move_pane_rehomes_source_control_after_session_teardown() {
     let handler = RequestHandler::new();
     let destination = session_name("control-move-pane-destination");
     let source = session_name("control-move-pane-source");
-    handler.create_session(&destination).await;
-    handler.create_session(&source).await;
+    SessionSpec::create(&handler, &destination).await;
+    SessionSpec::create(&handler, &source).await;
     handler.set_detach_on_destroy_for_test(&source, "off").await;
     let requester_pid = 43_202;
     let (_, mut events) = handler
@@ -1243,8 +1244,8 @@ async fn move_window_rehomes_control_before_source_session_closed() {
     let handler = RequestHandler::new();
     let destination = session_name("control-move-window-destination");
     let source = session_name("control-move-window-source");
-    handler.create_session(&destination).await;
-    handler.create_session(&source).await;
+    SessionSpec::create(&handler, &destination).await;
+    SessionSpec::create(&handler, &source).await;
     handler.set_detach_on_destroy_for_test(&source, "off").await;
     let requester_pid = 43_201;
     let (_, mut events) = handler
@@ -1277,11 +1278,9 @@ async fn kill_group_rehomes_controls_from_every_destroyed_alias() {
     let handler = RequestHandler::new();
     let survivor = session_name("control-group-survivor");
     let owner = session_name("control-group-owner");
-    handler.create_session(&survivor).await;
-    handler.create_session(&owner).await;
-    let peer = handler
-        .create_session(Grouped("control-group-peer", &owner))
-        .await;
+    SessionSpec::create(&handler, &survivor).await;
+    SessionSpec::create(&handler, &owner).await;
+    let peer = SessionSpec::create(&handler, Grouped("control-group-peer", &owner)).await;
     handler.set_detach_on_destroy_for_test(&owner, "off").await;
     handler.set_detach_on_destroy_for_test(&peer, "off").await;
     let (_, mut owner_events) = handler
@@ -1316,7 +1315,7 @@ async fn control_client_exits_when_its_target_session_is_killed() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
     let requester_pid = 4242;
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
     let (_, mut rx) = handler
         .register_utf8_control_for_test(requester_pid, Some(&alpha))
         .await;
@@ -1338,7 +1337,7 @@ async fn hook_execution_kill_session_still_exits_control_without_requeueing_hook
     let handler = RequestHandler::new();
     let alpha = session_name("hook-control-close-alpha");
     let requester_pid = 42_457;
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
     let (_, mut rx) = handler
         .register_utf8_control_for_test(requester_pid, Some(&alpha))
         .await;
@@ -1373,7 +1372,7 @@ async fn closing_control_queue_rejects_follow_on_mutation_after_session_name_reu
     let alpha = session_name("closing-control-queue-alpha");
     let requester_pid = 42_458;
     let wait_channel = "closing-control-queue-wait";
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
     let original_session_id = handler.session_id_for_test(&alpha).await;
     let (_, mut rx) = handler
         .register_utf8_control_for_test(requester_pid, Some(&alpha))
@@ -1391,15 +1390,17 @@ async fn closing_control_queue_rejects_follow_on_mutation_after_session_name_reu
     });
     wait_until_wait_for_count(&handler, wait_channel, 1).await;
 
-    handler.handle_ok(KillSessionRequest::fixture(&alpha)).await;
+    TestRequest::send_ok(&handler, KillSessionRequest::fixture(&alpha)).await;
     assert_has_exit(&drain_control_events(&mut rx));
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
     let replacement_session_id = handler.session_id_for_test(&alpha).await;
     assert_ne!(replacement_session_id, original_session_id);
 
-    handler
-        .handle_ok(WaitForRequest::fixture((wait_channel, WaitForMode::Signal)))
-        .await;
+    TestRequest::send_ok(
+        &handler,
+        WaitForRequest::fixture((wait_channel, WaitForMode::Signal)),
+    )
+    .await;
     let result = queued.await.expect("control queue task joins");
     assert!(
         result.error.is_some(),
@@ -1420,7 +1421,7 @@ async fn nonclosing_control_queue_revalidates_session_id_before_implicit_mutatio
     let handler = RequestHandler::new();
     let alpha = session_name("stale-control-candidate-alpha");
     let requester_pid = 42_459;
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
     let (_, _rx) = handler
         .register_utf8_control_for_test(requester_pid, Some(&alpha))
         .await;
@@ -1477,7 +1478,7 @@ async fn control_client_exits_when_its_last_window_destroys_the_session() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
     let requester_pid = 4243;
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
     let (_, mut rx) = handler
         .register_utf8_control_for_test(requester_pid, Some(&alpha))
         .await;
@@ -1511,8 +1512,8 @@ async fn control_client_stays_open_when_another_session_is_killed() {
     let alpha = session_name("alpha");
     let beta = session_name("beta");
     let requester_pid = 4244;
-    handler.create_session(&alpha).await;
-    handler.create_session(&beta).await;
+    SessionSpec::create(&handler, &alpha).await;
+    SessionSpec::create(&handler, &beta).await;
     let (_, mut rx) = handler
         .register_utf8_control_for_test(requester_pid, Some(&alpha))
         .await;
@@ -1534,7 +1535,7 @@ async fn control_client_stays_open_when_non_last_window_is_killed() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
     let requester_pid = 4245;
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
     let target = handler.create_window(&alpha).await;
     let (_, mut rx) = handler
         .register_utf8_control_for_test(requester_pid, Some(&alpha))
@@ -1564,12 +1565,12 @@ async fn stale_control_session_identity_cannot_bind_to_recreated_name() {
     let handler = RequestHandler::new();
     let alpha = session_name("control-set-identity-alpha");
     let requester_pid = 42_451;
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
     let old_session_id = handler.session_id_for_test(&alpha).await;
     let (_, _event_rx) = handler.register_control_for_test(requester_pid, None).await;
 
-    handler.handle_ok(KillSessionRequest::fixture(&alpha)).await;
-    handler.create_session(&alpha).await;
+    TestRequest::send_ok(&handler, KillSessionRequest::fixture(&alpha)).await;
+    SessionSpec::create(&handler, &alpha).await;
 
     assert_eq!(
         handler
@@ -1592,15 +1593,15 @@ async fn stale_control_session_identity_cannot_bind_to_recreated_name() {
 async fn stale_session_closed_cleanup_preserves_control_for_recreated_identity() {
     let handler = RequestHandler::new();
     let alpha = session_name("control-close-identity-alpha");
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
     let old_session_id = handler.session_id_for_test(&alpha).await;
     let (_, mut old_rx) = handler
         .register_utf8_control_for_test(42_452, Some(&alpha))
         .await;
     let _ = drain_control_events(&mut old_rx);
 
-    handler.handle_ok(KillSessionRequest::fixture(&alpha)).await;
-    handler.create_session(&alpha).await;
+    TestRequest::send_ok(&handler, KillSessionRequest::fixture(&alpha)).await;
+    SessionSpec::create(&handler, &alpha).await;
     let new_session_id = handler.session_id_for_test(&alpha).await;
     assert_ne!(new_session_id, old_session_id);
     let (_, mut new_rx) = handler
@@ -1632,7 +1633,7 @@ async fn late_control_rename_preserves_control_for_recreated_source_name() {
     let handler = RequestHandler::new();
     let alpha = session_name("control-rename-identity-alpha");
     let beta = session_name("control-rename-identity-beta");
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
     let old_session_id = handler.session_id_for_test(&alpha).await;
     let (_, mut old_rx) = handler
         .register_utf8_control_for_test(42_454, Some(&alpha))
@@ -1645,7 +1646,7 @@ async fn late_control_rename_preserves_control_for_recreated_source_name() {
             .rename_session(&alpha, &beta)
             .expect("model rename succeeds");
     }
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
     let new_session_id = handler.session_id_for_test(&alpha).await;
     let (_, mut new_rx) = handler
         .register_utf8_control_for_test(42_455, Some(&alpha))
@@ -1684,7 +1685,7 @@ async fn failed_session_exit_finishes_stale_identity_without_destroying_recreate
     let handler = RequestHandler::new();
     let alpha = session_name("control-finish-identity-alpha");
     let requester_pid = 42_456;
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
     let old_session_id = handler.session_id_for_test(&alpha).await;
     let (control_id, mut event_rx) = handler.register_control_for_test(requester_pid, None).await;
     handler
@@ -1694,8 +1695,8 @@ async fn failed_session_exit_finishes_stale_identity_without_destroying_recreate
     let _ = drain_control_events(&mut event_rx);
     drop(event_rx);
 
-    handler.handle_ok(KillSessionRequest::fixture(&alpha)).await;
-    handler.create_session(&alpha).await;
+    TestRequest::send_ok(&handler, KillSessionRequest::fixture(&alpha)).await;
+    SessionSpec::create(&handler, &alpha).await;
     let new_session_id = handler.session_id_for_test(&alpha).await;
     handler
         .store_option_for_test(

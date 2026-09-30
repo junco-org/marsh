@@ -1,4 +1,5 @@
 use super::*;
+use crate::test_fixtures::TestRequest;
 
 /// The id of pane 0 in window `window` of `session`, if both exist.
 fn first_pane_id(
@@ -31,13 +32,15 @@ async fn swap_window_preserves_group_peer_selection_by_winlink_index() {
                 .expect("peer window selection succeeds");
         }
 
-        handler
-            .handle_ok(SwapWindowRequest {
+        TestRequest::send_ok(
+            &handler,
+            SwapWindowRequest {
                 source: WindowTarget::with_window(owner.clone(), 0),
                 target: WindowTarget::with_window(owner, 1),
                 detached,
-            })
-            .await;
+            },
+        )
+        .await;
 
         let state = handler.state.lock().await;
         let peer_session = state.sessions.session(&peer).expect("group peer survives");
@@ -65,13 +68,15 @@ async fn swap_window_permutes_group_peer_duplicate_alias_alerts_without_selectio
         assert!(peer_session.add_winlink_alert_flags(1, rmux_core::WINLINK_BELL));
     }
 
-    handler
-        .handle_ok(SwapWindowRequest {
+    TestRequest::send_ok(
+        &handler,
+        SwapWindowRequest {
             source: WindowTarget::with_window(owner.clone(), 0),
             target: WindowTarget::with_window(owner, 1),
             detached: true,
-        })
-        .await;
+        },
+    )
+    .await;
 
     let state = handler.state.lock().await;
     let peer_session = state.sessions.session(&peer).expect("group peer survives");
@@ -112,13 +117,15 @@ async fn swap_window_preserves_unrelated_and_grouped_peer_silence_deadlines() {
         .silence_timer_identity_for_test(&beta_two)
         .expect("second grouped timer has identity");
 
-    handler
-        .handle_ok(SwapWindowRequest {
+    TestRequest::send_ok(
+        &handler,
+        SwapWindowRequest {
             source: WindowTarget::with_window(alpha.clone(), 1),
             target: WindowTarget::with_window(alpha, 2),
             detached: false,
-        })
-        .await;
+        },
+    )
+    .await;
 
     assert_eq!(
         handler.silence_timer_snapshot_for_test(&unrelated),
@@ -172,13 +179,15 @@ async fn swap_window_swaps_distinct_duplicate_alias_silence_deadlines() {
         .silence_timer_snapshot_for_test(&second)
         .expect("second duplicate alias timer is armed");
 
-    handler
-        .handle_ok(SwapWindowRequest {
+    TestRequest::send_ok(
+        &handler,
+        SwapWindowRequest {
             source: first.clone(),
             target: second.clone(),
             detached: true,
-        })
-        .await;
+        },
+    )
+    .await;
 
     let first_after = handler
         .silence_timer_snapshot_for_test(&first)
@@ -225,13 +234,15 @@ async fn swap_window_across_sessions_preserves_silence_deadlines_and_identities(
     let alpha_session_id = handler.session_id_for_test(&alpha).await;
     let beta_session_id = handler.session_id_for_test(&beta).await;
 
-    handler
-        .handle_ok(SwapWindowRequest {
+    TestRequest::send_ok(
+        &handler,
+        SwapWindowRequest {
             source: source.clone(),
             target: target.clone(),
             detached: true,
-        })
-        .await;
+        },
+    )
+    .await;
 
     assert_eq!(
         handler.silence_timer_snapshot_for_test(&unrelated),
@@ -321,13 +332,15 @@ async fn swap_window_across_sessions_moves_silence_alert_and_expired_timer_with_
             .is_empty());
     }
 
-    handler
-        .handle_ok(SwapWindowRequest {
+    TestRequest::send_ok(
+        &handler,
+        SwapWindowRequest {
             source: source.clone(),
             target: target.clone(),
             detached: false,
-        })
-        .await;
+        },
+    )
+    .await;
 
     let (alpha_session_id, beta_session_id) = {
         let state = handler.state.lock().await;
@@ -398,13 +411,15 @@ async fn swap_window_with_d_selects_the_swapped_slots_across_sessions() {
 
     // Both sessions have active_window at 0 by default.
     assert_eq!(
-        handler
-            .handle_ok(SwapWindowRequest {
+        TestRequest::send_ok(
+            &handler,
+            SwapWindowRequest {
                 source: WindowTarget::with_window(alpha.clone(), 2),
                 target: WindowTarget::with_window(beta.clone(), 4),
                 detached: true,
-            })
-            .await,
+            }
+        )
+        .await,
         rmux_proto::SwapWindowResponse {
             source: WindowTarget::with_window(alpha.clone(), 2),
             target: WindowTarget::with_window(beta.clone(), 4),
@@ -431,13 +446,15 @@ async fn swap_window_without_d_preserves_active_slots_across_sessions() {
     insert_window(&handler, &beta, 4).await;
 
     assert_eq!(
-        handler
-            .handle_ok(SwapWindowRequest {
+        TestRequest::send_ok(
+            &handler,
+            SwapWindowRequest {
                 source: WindowTarget::with_window(alpha.clone(), 2),
                 target: WindowTarget::with_window(beta.clone(), 4),
                 detached: false,
-            })
-            .await,
+            }
+        )
+        .await,
         rmux_proto::SwapWindowResponse {
             source: WindowTarget::with_window(alpha.clone(), 2),
             target: WindowTarget::with_window(beta.clone(), 4),
@@ -462,21 +479,25 @@ async fn swap_window_across_sessions_swaps_linked_slot_metadata() {
     let beta = create_session(&handler, "beta").await;
     let gamma = create_session(&handler, "gamma").await;
 
-    handler
-        .handle_ok(LinkWindowRequest::fixture((
+    TestRequest::send_ok(
+        &handler,
+        LinkWindowRequest::fixture((
             WindowTarget::with_window(alpha.clone(), 0),
             WindowTarget::with_window(gamma.clone(), 1),
-        )))
-        .await;
+        )),
+    )
+    .await;
 
     assert_eq!(
-        handler
-            .handle_ok(SwapWindowRequest {
+        TestRequest::send_ok(
+            &handler,
+            SwapWindowRequest {
                 source: WindowTarget::with_window(alpha.clone(), 0),
                 target: WindowTarget::with_window(beta.clone(), 0),
                 detached: false,
-            })
-            .await,
+            }
+        )
+        .await,
         rmux_proto::SwapWindowResponse {
             source: WindowTarget::with_window(alpha.clone(), 0),
             target: WindowTarget::with_window(beta.clone(), 0),
@@ -494,12 +515,14 @@ async fn swap_window_across_sessions_swaps_linked_slot_metadata() {
         );
     }
 
-    handler
-        .handle_ok(RenameWindowRequest {
+    TestRequest::send_ok(
+        &handler,
+        RenameWindowRequest {
             target: WindowTarget::with_window(gamma.clone(), 1),
             name: "logs".to_owned(),
-        })
-        .await;
+        },
+    )
+    .await;
 
     let state = handler.state.lock().await;
     assert_ne!(
@@ -540,21 +563,25 @@ async fn swap_window_from_linked_slot_preserves_runtime_owners() {
     let gamma_pane_id =
         first_pane_id(&*handler.state.lock().await, &gamma, 0).expect("gamma pane should exist");
 
-    handler
-        .handle_ok(LinkWindowRequest::fixture((
+    TestRequest::send_ok(
+        &handler,
+        LinkWindowRequest::fixture((
             WindowTarget::with_window(alpha.clone(), 0),
             WindowTarget::with_window(beta.clone(), 1),
-        )))
-        .await;
+        )),
+    )
+    .await;
 
     assert_eq!(
-        handler
-            .handle_ok(SwapWindowRequest {
+        TestRequest::send_ok(
+            &handler,
+            SwapWindowRequest {
                 source: WindowTarget::with_window(beta.clone(), 1),
                 target: WindowTarget::with_window(gamma.clone(), 0),
                 detached: false,
-            })
-            .await,
+            }
+        )
+        .await,
         rmux_proto::SwapWindowResponse {
             source: WindowTarget::with_window(beta.clone(), 1),
             target: WindowTarget::with_window(gamma.clone(), 0),
@@ -582,12 +609,14 @@ async fn swap_window_resize_failure_preserves_link_occurrences() {
     let beta = create_session(&handler, "beta").await;
     let gamma = create_session(&handler, "gamma").await;
 
-    handler
-        .handle_ok(LinkWindowRequest::fixture((
+    TestRequest::send_ok(
+        &handler,
+        LinkWindowRequest::fixture((
             WindowTarget::with_window(alpha.clone(), 0),
             WindowTarget::with_window(beta.clone(), 1),
-        )))
-        .await;
+        )),
+    )
+    .await;
 
     let (stable_alpha, stable_beta, stable_gamma) = {
         let mut state = handler.state.lock().await;
@@ -668,13 +697,15 @@ async fn swap_window_from_group_peer_swaps_runtime_state() {
         first_pane_id(&*handler.state.lock().await, &gamma, 0).expect("gamma pane should exist");
 
     assert_eq!(
-        handler
-            .handle_ok(SwapWindowRequest {
+        TestRequest::send_ok(
+            &handler,
+            SwapWindowRequest {
                 source: WindowTarget::with_window(beta.clone(), 0),
                 target: WindowTarget::with_window(gamma.clone(), 0),
                 detached: false,
-            })
-            .await,
+            }
+        )
+        .await,
         rmux_proto::SwapWindowResponse {
             source: WindowTarget::with_window(beta.clone(), 0),
             target: WindowTarget::with_window(gamma.clone(), 0),
@@ -709,21 +740,25 @@ async fn swap_window_from_group_peer_linked_source_moves_link_metadata_to_target
         )
     };
 
-    handler
-        .handle_ok(LinkWindowRequest::fixture((
+    TestRequest::send_ok(
+        &handler,
+        LinkWindowRequest::fixture((
             WindowTarget::with_window(alpha.clone(), 0),
             WindowTarget::with_window(gamma.clone(), 1),
-        )))
-        .await;
+        )),
+    )
+    .await;
 
     assert_eq!(
-        handler
-            .handle_ok(SwapWindowRequest {
+        TestRequest::send_ok(
+            &handler,
+            SwapWindowRequest {
                 source: WindowTarget::with_window(beta.clone(), 0),
                 target: WindowTarget::with_window(delta.clone(), 0),
                 detached: true,
-            })
-            .await,
+            }
+        )
+        .await,
         rmux_proto::SwapWindowResponse {
             source: WindowTarget::with_window(beta.clone(), 0),
             target: WindowTarget::with_window(delta.clone(), 0),
@@ -762,21 +797,25 @@ async fn swap_window_from_group_peer_linked_target_moves_link_metadata_to_source
         )
     };
 
-    handler
-        .handle_ok(LinkWindowRequest::fixture((
+    TestRequest::send_ok(
+        &handler,
+        LinkWindowRequest::fixture((
             WindowTarget::with_window(gamma.clone(), 0),
             WindowTarget::with_window(delta.clone(), 1),
-        )))
-        .await;
+        )),
+    )
+    .await;
 
     assert_eq!(
-        handler
-            .handle_ok(SwapWindowRequest {
+        TestRequest::send_ok(
+            &handler,
+            SwapWindowRequest {
                 source: WindowTarget::with_window(beta.clone(), 0),
                 target: WindowTarget::with_window(gamma.clone(), 0),
                 detached: true,
-            })
-            .await,
+            }
+        )
+        .await,
         rmux_proto::SwapWindowResponse {
             source: WindowTarget::with_window(beta.clone(), 0),
             target: WindowTarget::with_window(gamma.clone(), 0),
@@ -805,21 +844,25 @@ async fn rotate_window_synchronizes_every_linked_alias() {
     let handler = RequestHandler::new();
     let alpha = create_session(&handler, "rotate-linked-alpha").await;
     let beta = create_session(&handler, "rotate-linked-beta").await;
-    handler.handle_ok(SplitWindowRequest::fixture(&alpha)).await;
-    handler
-        .handle_ok(LinkWindowRequest::fixture((
+    TestRequest::send_ok(&handler, SplitWindowRequest::fixture(&alpha)).await;
+    TestRequest::send_ok(
+        &handler,
+        LinkWindowRequest::fixture((
             WindowTarget::with_window(alpha.clone(), 0),
             WindowTarget::with_window(beta.clone(), 1),
-        )))
-        .await;
+        )),
+    )
+    .await;
 
-    handler
-        .handle_ok(RotateWindowRequest {
+    TestRequest::send_ok(
+        &handler,
+        RotateWindowRequest {
             target: WindowTarget::with_window(alpha.clone(), 0),
             direction: RotateWindowDirection::Up,
             restore_zoom: false,
-        })
-        .await;
+        },
+    )
+    .await;
 
     let state = handler.state.lock().await;
     let alpha_window = state
@@ -840,8 +883,8 @@ async fn rotate_window_updates_the_active_pane_after_reordering_the_window() {
     let handler = RequestHandler::new();
     let alpha = create_session(&handler, "alpha").await;
 
-    handler.handle_ok(SplitWindowRequest::fixture(&alpha)).await;
-    handler.handle_ok(SplitWindowRequest::fixture(&alpha)).await;
+    TestRequest::send_ok(&handler, SplitWindowRequest::fixture(&alpha)).await;
+    TestRequest::send_ok(&handler, SplitWindowRequest::fixture(&alpha)).await;
     let previous_pane_ids = {
         let state = handler.state.lock().await;
         state
@@ -857,13 +900,15 @@ async fn rotate_window_updates_the_active_pane_after_reordering_the_window() {
     };
 
     assert_eq!(
-        handler
-            .handle_ok(RotateWindowRequest {
+        TestRequest::send_ok(
+            &handler,
+            RotateWindowRequest {
                 target: WindowTarget::with_window(alpha.clone(), 0),
                 direction: RotateWindowDirection::Up,
                 restore_zoom: false,
-            })
-            .await,
+            }
+        )
+        .await,
         rmux_proto::RotateWindowResponse {
             target: WindowTarget::with_window(alpha.clone(), 0),
         }
@@ -904,8 +949,8 @@ async fn rotate_window_down_selects_the_previous_pane_in_window_order() {
     let handler = RequestHandler::new();
     let alpha = create_session(&handler, "alpha").await;
 
-    handler.handle_ok(SplitWindowRequest::fixture(&alpha)).await;
-    handler.handle_ok(SplitWindowRequest::fixture(&alpha)).await;
+    TestRequest::send_ok(&handler, SplitWindowRequest::fixture(&alpha)).await;
+    TestRequest::send_ok(&handler, SplitWindowRequest::fixture(&alpha)).await;
     let previous_pane_ids = {
         let state = handler.state.lock().await;
         state
@@ -921,13 +966,15 @@ async fn rotate_window_down_selects_the_previous_pane_in_window_order() {
     };
 
     assert_eq!(
-        handler
-            .handle_ok(RotateWindowRequest {
+        TestRequest::send_ok(
+            &handler,
+            RotateWindowRequest {
                 target: WindowTarget::with_window(alpha.clone(), 0),
                 direction: RotateWindowDirection::Down,
                 restore_zoom: false,
-            })
-            .await,
+            }
+        )
+        .await,
         rmux_proto::RotateWindowResponse {
             target: WindowTarget::with_window(alpha.clone(), 0),
         }
@@ -1019,15 +1066,17 @@ async fn move_window_same_source_and_destination_is_noop_without_kill() {
     let alpha = create_session(&handler, "alpha").await;
 
     assert_eq!(
-        handler
-            .handle_ok(MoveWindowRequest {
+        TestRequest::send_ok(
+            &handler,
+            MoveWindowRequest {
                 detached: false,
                 ..Fixture::fixture((
                     WindowTarget::with_window(alpha.clone(), 0),
                     WindowTarget::with_window(alpha.clone(), 0),
                 ))
-            })
-            .await,
+            }
+        )
+        .await,
         rmux_proto::MoveWindowResponse {
             session_name: alpha.clone(),
             target: Some(WindowTarget::with_window(alpha.clone(), 0)),
@@ -1062,15 +1111,17 @@ async fn move_window_same_index_noop_does_not_consume_link_hooks() {
             .expect("window-linked hook set succeeds");
     }
 
-    handler
-        .handle_ok(MoveWindowRequest {
+    TestRequest::send_ok(
+        &handler,
+        MoveWindowRequest {
             detached: false,
             ..Fixture::fixture((
                 WindowTarget::with_window(alpha.clone(), 0),
                 WindowTarget::with_window(alpha.clone(), 0),
             ))
-        })
-        .await;
+        },
+    )
+    .await;
     let state = handler.state.lock().await;
     assert_eq!(
         state.hooks.global_command(HookName::WindowUnlinked),

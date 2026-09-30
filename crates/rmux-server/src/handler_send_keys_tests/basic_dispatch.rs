@@ -1,12 +1,12 @@
 use super::*;
-use crate::test_fixtures::Sizeless;
+use crate::test_fixtures::{SessionSpec, Sizeless, TestRequest};
 
 #[tokio::test]
 async fn send_keys_writes_resolved_bytes_to_the_correct_pane() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
 
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
 
     let response = handler
         .handle(Request::SendKeys(SendKeysRequest {
@@ -118,7 +118,7 @@ async fn send_keys_plain_input_uses_copy_mode_until_copy_mode_exits() {
     create_send_keys_test_session(&handler, &alpha).await;
     let capture = RawPaneInputProbe::start(&handler, &alpha, "send-keys-copy-mode", 1).await;
 
-    handler.handle_ok(CopyModeRequest::fixture(&target)).await;
+    TestRequest::send_ok(&handler, CopyModeRequest::fixture(&target)).await;
 
     let response = handler
         .handle(Request::SendKeys(SendKeysRequest {
@@ -131,16 +131,18 @@ async fn send_keys_plain_input_uses_copy_mode_until_copy_mode_exits() {
         Response::SendKeys(SendKeysResponse { key_count: 2 })
     );
 
-    let response = handler
-        .handle_ok(ListPanesRequest {
+    let response = TestRequest::send_ok(
+        &handler,
+        ListPanesRequest {
             target: alpha,
             format: Some("#{pane_in_mode}".to_owned()),
             filter: None,
             sort_order: None,
             reversed: false,
             target_window_index: None,
-        })
-        .await;
+        },
+    )
+    .await;
     assert_eq!(response.command_output().stdout(), b"0\n");
     capture.assert_contents(&handler, b"X").await;
 }
@@ -150,7 +152,7 @@ async fn send_keys_with_empty_keys_returns_zero_count() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
 
-    handler.create_session(Sizeless(&alpha)).await;
+    SessionSpec::create(&handler, Sizeless(&alpha)).await;
 
     let response = handler
         .handle(Request::SendKeys(SendKeysRequest {
@@ -198,7 +200,7 @@ async fn send_keys_reset_terminal_updates_transcript_without_writing_to_child() 
     let alpha = session_name("alpha");
     let target = PaneTarget::new(alpha.clone(), 0);
 
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
 
     {
         let state = handler.state.lock().await;
@@ -287,7 +289,7 @@ async fn send_keys_to_missing_pane_returns_error() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
 
-    handler.create_session(Sizeless(&alpha)).await;
+    SessionSpec::create(&handler, Sizeless(&alpha)).await;
 
     let response = handler
         .handle(Request::SendKeys(SendKeysRequest {
@@ -303,7 +305,7 @@ async fn pane_broadcast_input_reports_per_target_successes_and_failures() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
 
-    handler.create_session(Sizeless(&alpha)).await;
+    SessionSpec::create(&handler, Sizeless(&alpha)).await;
 
     let missing_target = PaneTargetRef::by_id(alpha.clone(), PaneId::new(999));
     let response = handler
@@ -343,13 +345,15 @@ async fn pane_broadcast_input_reports_per_target_successes_and_failures() {
 async fn bind_key_and_list_keys_round_trip_through_the_handler() {
     let handler = RequestHandler::new();
 
-    handler
-        .handle_ok(BindKeyRequest {
+    TestRequest::send_ok(
+        &handler,
+        BindKeyRequest {
             note: Some("test note".to_owned()),
             repeat: true,
             ..Fixture::fixture(("root", "C-a", ["display-message", "hello"]))
-        })
-        .await;
+        },
+    )
+    .await;
 
     let listed = handler
         .handle(Request::ListKeys(Box::new(list_keys_request(Some("root")))))
@@ -369,16 +373,18 @@ async fn send_keys_k_dispatches_prefix_table_bindings() {
     let alpha = session_name("alpha");
     let requester_pid = std::process::id();
 
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
 
     let _control_rx = handler.attach_client(requester_pid, &alpha).await;
 
-    handler
-        .handle_ok(BindKeyRequest {
+    TestRequest::send_ok(
+        &handler,
+        BindKeyRequest {
             note: Some("prefix-hit".to_owned()),
             ..Fixture::fixture(("prefix", "x", ["set-buffer", "-b", "prefix-hit", "yes"]))
-        })
-        .await;
+        },
+    )
+    .await;
 
     let dispatched = handler
         .handle(Request::SendKeysExt(SendKeysExtRequest::fixture((
@@ -408,22 +414,26 @@ async fn send_keys_k_binding_task_preserves_disabled_hook_context() {
     let alpha = session_name("hook-binding-alpha");
     let requester_pid = std::process::id();
 
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
     let _control_rx = handler.attach_client(requester_pid, &alpha).await;
 
-    handler
-        .handle_ok(SetHookRequest::fixture((
+    TestRequest::send_ok(
+        &handler,
+        SetHookRequest::fixture((
             ScopeSelector::Global,
             HookName::AfterNewWindow,
             "set-buffer -b nested-hook fired",
-        )))
-        .await;
-    handler
-        .handle_ok(BindKeyRequest {
+        )),
+    )
+    .await;
+    TestRequest::send_ok(
+        &handler,
+        BindKeyRequest {
             note: Some("create-with-hooks-disabled".to_owned()),
             ..Fixture::fixture(("prefix", "x", ["new-window", "-d"]))
-        })
-        .await;
+        },
+    )
+    .await;
 
     let dispatched = crate::hook_runtime::with_hook_execution(
         crate::hook_runtime::HookExecutionContext::command(HookName::AfterNewWindow),
@@ -472,16 +482,18 @@ async fn switch_client_t_sets_custom_key_table_for_next_k_dispatch() {
     let alpha = session_name("alpha");
     let requester_pid = std::process::id();
 
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
 
     let _control_rx = handler.attach_client(requester_pid, &alpha).await;
 
-    handler
-        .handle_ok(BindKeyRequest {
+    TestRequest::send_ok(
+        &handler,
+        BindKeyRequest {
             note: Some("custom".to_owned()),
             ..Fixture::fixture(("my-table", "j", ["set-buffer", "-b", "custom-hit", "ok"]))
-        })
-        .await;
+        },
+    )
+    .await;
 
     let switched = handler
         .handle(Request::SwitchClientExt(SwitchClientExtRequest {
@@ -519,20 +531,22 @@ async fn send_keys_k_prefix_precedes_a_transient_key_table() {
     let alpha = session_name("prefix-precedes-transient-k");
     let requester_pid = std::process::id();
 
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
 
     let _control_rx = handler.attach_client(requester_pid, &alpha).await;
 
-    handler
-        .handle_ok(BindKeyRequest {
+    TestRequest::send_ok(
+        &handler,
+        BindKeyRequest {
             note: Some("must lose to the prefix key".to_owned()),
             ..Fixture::fixture((
                 "my-table",
                 "C-b",
                 ["set-buffer", "-b", "wrong-table-hit", "yes"],
             ))
-        })
-        .await;
+        },
+    )
+    .await;
 
     let switched = handler
         .handle(Request::SwitchClientExt(SwitchClientExtRequest {
@@ -589,7 +603,7 @@ async fn send_keys_k_uses_copy_mode_bindings_until_copy_mode_exits() {
     let requester_pid = std::process::id();
     let target = PaneTarget::new(alpha.clone(), 0);
 
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
 
     let _control_rx = handler.attach_client(requester_pid, &alpha).await;
 
@@ -661,7 +675,7 @@ async fn send_keys_k_uses_copy_mode_vi_bindings_when_mode_keys_is_vi() {
     let requester_pid = std::process::id();
     let target = PaneTarget::new(alpha.clone(), 0);
 
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
 
     let _control_rx = handler.attach_client(requester_pid, &alpha).await;
 

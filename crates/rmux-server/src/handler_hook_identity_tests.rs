@@ -2,7 +2,7 @@ use super::pane_group_transfer_tests::{
     create_grouped_session, create_session, pane_id, split_session,
 };
 use super::{prepare_lifecycle_event, RequestHandler};
-use crate::test_fixtures::Fixture;
+use crate::test_fixtures::{Fixture, TestRequest};
 use rmux_core::LifecycleEvent;
 use rmux_proto::{
     BreakPaneRequest, HookLifecycle, HookName, JoinPaneRequest, KillPaneRequest, LinkWindowRequest,
@@ -65,13 +65,15 @@ async fn grouped_pane_aliases_share_set_show_unset_and_one_shot() {
     let peer_target = PaneTarget::with_window(peer.clone(), 0, 1);
     let command = "display-message identity-pane";
 
-    handler
-        .handle_ok(SetHookRequest::fixture((
+    TestRequest::send_ok(
+        &handler,
+        SetHookRequest::fixture((
             ScopeSelector::Pane(peer_target.clone()),
             HookName::PaneExited,
             command,
-        )))
-        .await;
+        )),
+    )
+    .await;
     let expected = format!("pane-exited[0] {command}\n").into_bytes();
     assert_eq!(
         shown_hook(
@@ -92,8 +94,9 @@ async fn grouped_pane_aliases_share_set_show_unset_and_one_shot() {
         expected
     );
 
-    handler
-        .handle_ok(SetHookMutationRequest {
+    TestRequest::send_ok(
+        &handler,
+        SetHookMutationRequest {
             command: None,
             unset: true,
             ..Fixture::fixture((
@@ -101,8 +104,9 @@ async fn grouped_pane_aliases_share_set_show_unset_and_one_shot() {
                 HookName::PaneExited,
                 "",
             ))
-        })
-        .await;
+        },
+    )
+    .await;
     assert!(shown_hook(
         &handler,
         ScopeSelector::Pane(peer_target.clone()),
@@ -111,16 +115,18 @@ async fn grouped_pane_aliases_share_set_show_unset_and_one_shot() {
     .await
     .is_empty());
 
-    handler
-        .handle_ok(SetHookRequest {
+    TestRequest::send_ok(
+        &handler,
+        SetHookRequest {
             lifecycle: HookLifecycle::OneShot,
             ..Fixture::fixture((
                 ScopeSelector::Pane(owner_target.clone()),
                 HookName::PaneDied,
                 "display-message identity-once",
             ))
-        })
-        .await;
+        },
+    )
+    .await;
     let (pane_id, window_id) = {
         let state = handler.state.lock().await;
         let session = state.sessions.session(&owner).expect("owner exists");
@@ -155,22 +161,26 @@ async fn linked_and_grouped_window_aliases_share_one_binding() {
     let handler = RequestHandler::new();
     let owner = create_session(&handler, "hook-id-window-owner").await;
     let linked = create_session(&handler, "hook-id-window-linked").await;
-    handler
-        .handle_ok(LinkWindowRequest::fixture((
+    TestRequest::send_ok(
+        &handler,
+        LinkWindowRequest::fixture((
             WindowTarget::with_window(linked.clone(), 0),
             WindowTarget::with_window(owner.clone(), 1),
-        )))
-        .await;
+        )),
+    )
+    .await;
     let peer = create_grouped_session(&handler, "hook-id-window-peer", &owner).await;
     let command = "display-message identity-window";
 
-    handler
-        .handle_ok(SetHookRequest::fixture((
+    TestRequest::send_ok(
+        &handler,
+        SetHookRequest::fixture((
             ScopeSelector::Window(WindowTarget::with_window(peer.clone(), 1)),
             HookName::WindowLayoutChanged,
             command,
-        )))
-        .await;
+        )),
+    )
+    .await;
     let expected = format!("window-layout-changed[0] {command}\n").into_bytes();
     for target in [
         WindowTarget::with_window(owner.clone(), 1),
@@ -188,8 +198,9 @@ async fn linked_and_grouped_window_aliases_share_one_binding() {
         );
     }
 
-    handler
-        .handle_ok(SetHookMutationRequest {
+    TestRequest::send_ok(
+        &handler,
+        SetHookMutationRequest {
             command: None,
             unset: true,
             ..Fixture::fixture((
@@ -197,8 +208,9 @@ async fn linked_and_grouped_window_aliases_share_one_binding() {
                 HookName::WindowLayoutChanged,
                 "",
             ))
-        })
-        .await;
+        },
+    )
+    .await;
     assert!(shown_hook(
         &handler,
         ScopeSelector::Window(WindowTarget::with_window(owner, 1)),
@@ -215,13 +227,15 @@ async fn explicit_pane_scope_for_window_hook_uses_containing_window_identity() {
     let pane_target = PaneTarget::with_window(session_name.clone(), 0, 0);
     let command = "display-message pane-addressed-window-hook";
 
-    handler
-        .handle_ok(SetHookRequest::fixture((
+    TestRequest::send_ok(
+        &handler,
+        SetHookRequest::fixture((
             ScopeSelector::Pane(pane_target.clone()),
             HookName::WindowLayoutChanged,
             command,
-        )))
-        .await;
+        )),
+    )
+    .await;
     assert_eq!(
         shown_hook(
             &handler,
@@ -256,13 +270,15 @@ async fn filtered_session_show_uses_the_same_natural_identity_as_set() {
         ),
         (HookName::PaneModeChanged, "display-message natural-pane"),
     ] {
-        handler
-            .handle_ok(SetHookMutationRequest::fixture((
+        TestRequest::send_ok(
+            &handler,
+            SetHookMutationRequest::fixture((
                 ScopeSelector::Session(session_name.clone()),
                 hook,
                 command,
-            )))
-            .await;
+            )),
+        )
+        .await;
         assert_eq!(
             shown_hook(&handler, ScopeSelector::Session(session_name.clone()), hook).await,
             format!("{}[0] {command}\n", hook.as_str()).into_bytes()
@@ -300,34 +316,42 @@ async fn pane_bindings_follow_identity_through_swap_rotate_break_join_and_move()
         let state = handler.state.lock().await;
         pane_id(&state, &source, 0, 1)
     };
-    handler
-        .handle_ok(SetHookRequest::fixture((
+    TestRequest::send_ok(
+        &handler,
+        SetHookRequest::fixture((
             ScopeSelector::Pane(PaneTarget::with_window(source.clone(), 0, 0)),
             HookName::PaneExited,
             "display-message first-pane",
-        )))
-        .await;
-    handler
-        .handle_ok(SetHookRequest::fixture((
+        )),
+    )
+    .await;
+    TestRequest::send_ok(
+        &handler,
+        SetHookRequest::fixture((
             ScopeSelector::Pane(PaneTarget::with_window(source.clone(), 0, 1)),
             HookName::PaneExited,
             "display-message second-pane",
-        )))
-        .await;
+        )),
+    )
+    .await;
 
-    handler
-        .handle_ok(SwapPaneRequest::fixture((
+    TestRequest::send_ok(
+        &handler,
+        SwapPaneRequest::fixture((
             PaneTarget::with_window(source.clone(), 0, 0),
             PaneTarget::with_window(source.clone(), 0, 1),
-        )))
-        .await;
-    handler
-        .handle_ok(RotateWindowRequest {
+        )),
+    )
+    .await;
+    TestRequest::send_ok(
+        &handler,
+        RotateWindowRequest {
             target: WindowTarget::with_window(source.clone(), 0),
             direction: RotateWindowDirection::Down,
             restore_zoom: false,
-        })
-        .await;
+        },
+    )
+    .await;
     {
         let state = handler.state.lock().await;
         assert_eq!(
@@ -345,21 +369,22 @@ async fn pane_bindings_follow_identity_through_swap_rotate_break_join_and_move()
     }
 
     let second_target = pane_target_for_id(&handler, &source, second_id).await;
-    handler
-        .handle_ok(BreakPaneRequest::fixture((
-            second_target,
-            WindowTarget::with_window(source.clone(), 1),
-        )))
-        .await;
+    TestRequest::send_ok(
+        &handler,
+        BreakPaneRequest::fixture((second_target, WindowTarget::with_window(source.clone(), 1))),
+    )
+    .await;
 
     let join_destination = create_session(&handler, "hook-id-transfer-join").await;
     let moved = pane_target_for_id(&handler, &source, second_id).await;
-    handler
-        .handle_ok(JoinPaneRequest::fixture((
+    TestRequest::send_ok(
+        &handler,
+        JoinPaneRequest::fixture((
             moved,
             PaneTarget::with_window(join_destination.clone(), 0, 0),
-        )))
-        .await;
+        )),
+    )
+    .await;
     let joined = pane_target_for_id(&handler, &join_destination, second_id).await;
     assert_eq!(
         shown_hook(
@@ -372,12 +397,14 @@ async fn pane_bindings_follow_identity_through_swap_rotate_break_join_and_move()
     );
 
     let move_destination = create_session(&handler, "hook-id-transfer-move").await;
-    handler
-        .handle_ok(MovePaneRequest::fixture((
+    TestRequest::send_ok(
+        &handler,
+        MovePaneRequest::fixture((
             joined,
             PaneTarget::with_window(move_destination.clone(), 0, 0),
-        )))
-        .await;
+        )),
+    )
+    .await;
     let moved = pane_target_for_id(&handler, &move_destination, second_id).await;
     assert_eq!(
         shown_hook(&handler, ScopeSelector::Pane(moved), HookName::PaneExited,).await,
@@ -393,20 +420,24 @@ async fn pane_binding_survives_before_split_and_new_pane_kill() {
         let state = handler.state.lock().await;
         pane_id(&state, &session_name, 0, 0)
     };
-    handler
-        .handle_ok(SetHookRequest::fixture((
+    TestRequest::send_ok(
+        &handler,
+        SetHookRequest::fixture((
             ScopeSelector::Pane(PaneTarget::with_window(session_name.clone(), 0, 0)),
             HookName::PaneExited,
             "display-message original-pane",
-        )))
-        .await;
+        )),
+    )
+    .await;
 
-    handler
-        .handle_ok(SplitWindowRequest {
+    TestRequest::send_ok(
+        &handler,
+        SplitWindowRequest {
             before: true,
             ..Fixture::fixture(PaneTarget::with_window(session_name.clone(), 0, 0))
-        })
-        .await;
+        },
+    )
+    .await;
     let new_id = {
         let state = handler.state.lock().await;
         state
@@ -421,12 +452,14 @@ async fn pane_binding_survives_before_split_and_new_pane_kill() {
             .expect("split pane exists")
             .id()
     };
-    handler
-        .handle_ok(KillPaneRequest {
+    TestRequest::send_ok(
+        &handler,
+        KillPaneRequest {
             target: pane_target_for_id(&handler, &session_name, new_id).await,
             kill_all_except: false,
-        })
-        .await;
+        },
+    )
+    .await;
 
     let original_target = pane_target_for_id(&handler, &session_name, original_id).await;
     assert_eq!(
@@ -452,21 +485,25 @@ async fn kill_pane_last_pane_dispatches_session_local_session_closed_hook() {
     let session_name = create_session(&handler, "hook-id-kill-pane-session").await;
     handler.wait_for_initial_panes_for_test().await;
     let command = "display-message kill-pane-session-closed";
-    handler
-        .handle_ok(SetHookRequest::fixture((
+    TestRequest::send_ok(
+        &handler,
+        SetHookRequest::fixture((
             ScopeSelector::Session(session_name.clone()),
             HookName::SessionClosed,
             command,
-        )))
-        .await;
+        )),
+    )
+    .await;
     let mut events = handler.subscribe_lifecycle_events();
 
-    handler
-        .handle_ok(KillPaneRequest {
+    TestRequest::send_ok(
+        &handler,
+        KillPaneRequest {
             target: PaneTarget::with_window(session_name.clone(), 0, 0),
             kill_all_except: false,
-        })
-        .await;
+        },
+    )
+    .await;
 
     let closed = std::iter::from_fn(|| events.try_recv().ok())
         .find(|event| {
@@ -497,13 +534,15 @@ async fn pane_kill_by_id_last_pane_dispatches_session_local_session_closed_hook(
         pane_id(&state, &session_name, 0, 0)
     };
     let command = "display-message pane-kill-session-closed";
-    handler
-        .handle_ok(SetHookRequest::fixture((
+    TestRequest::send_ok(
+        &handler,
+        SetHookRequest::fixture((
             ScopeSelector::Session(session_name.clone()),
             HookName::SessionClosed,
             command,
-        )))
-        .await;
+        )),
+    )
+    .await;
     let mut events = handler.subscribe_lifecycle_events();
 
     let response = handler
@@ -539,47 +578,55 @@ async fn linked_group_last_pane_kill_preserves_local_hooks_and_consumes_global_o
     let owner = create_session(&handler, "hook-id-kill-family-owner").await;
     let peer = create_grouped_session(&handler, "hook-id-kill-family-peer", &owner).await;
     let alias = create_session(&handler, "hook-id-kill-family-alias").await;
-    handler
-        .handle_ok(LinkWindowRequest {
+    TestRequest::send_ok(
+        &handler,
+        LinkWindowRequest {
             kill_destination: true,
             ..Fixture::fixture((
                 WindowTarget::with_window(owner.clone(), 0),
                 WindowTarget::with_window(alias.clone(), 0),
             ))
-        })
-        .await;
+        },
+    )
+    .await;
     handler.wait_for_initial_panes_for_test().await;
 
     let owner_command = "display-message kill-family-owner";
     let peer_command = "display-message kill-family-peer";
     let global_command = "display-message kill-family-global-once";
     for (session_name, command) in [(&owner, owner_command), (&peer, peer_command)] {
-        handler
-            .handle_ok(SetHookRequest::fixture((
+        TestRequest::send_ok(
+            &handler,
+            SetHookRequest::fixture((
                 ScopeSelector::Session(session_name.clone()),
                 HookName::SessionClosed,
                 command,
-            )))
-            .await;
+            )),
+        )
+        .await;
     }
-    handler
-        .handle_ok(SetHookRequest {
+    TestRequest::send_ok(
+        &handler,
+        SetHookRequest {
             lifecycle: HookLifecycle::OneShot,
             ..Fixture::fixture((
                 ScopeSelector::Global,
                 HookName::SessionClosed,
                 global_command,
             ))
-        })
-        .await;
+        },
+    )
+    .await;
     let mut events = handler.subscribe_lifecycle_events();
 
-    handler
-        .handle_ok(KillPaneRequest {
+    TestRequest::send_ok(
+        &handler,
+        KillPaneRequest {
             target: PaneTarget::with_window(alias.clone(), 0, 0),
             kill_all_except: false,
-        })
-        .await;
+        },
+    )
+    .await;
 
     let closed = std::iter::from_fn(|| events.try_recv().ok())
         .filter(|event| matches!(&event.event, LifecycleEvent::SessionClosed { .. }))
@@ -626,26 +673,30 @@ async fn failed_linked_pane_kill_preserves_session_closed_one_shot() {
     let owner = create_session(&handler, "hook-id-kill-error-owner").await;
     split_session(&handler, &owner).await;
     let alias = create_session(&handler, "hook-id-kill-error-alias").await;
-    handler
-        .handle_ok(LinkWindowRequest {
+    TestRequest::send_ok(
+        &handler,
+        LinkWindowRequest {
             kill_destination: true,
             ..Fixture::fixture((
                 WindowTarget::with_window(owner.clone(), 0),
                 WindowTarget::with_window(alias.clone(), 0),
             ))
-        })
-        .await;
+        },
+    )
+    .await;
     handler.wait_for_initial_panes_for_test().await;
-    handler
-        .handle_ok(SetHookRequest {
+    TestRequest::send_ok(
+        &handler,
+        SetHookRequest {
             lifecycle: HookLifecycle::OneShot,
             ..Fixture::fixture((
                 ScopeSelector::Session(alias.clone()),
                 HookName::SessionClosed,
                 "display-message failed-kill-one-shot",
             ))
-        })
-        .await;
+        },
+    )
+    .await;
     {
         let mut state = handler.state.lock().await;
         state.fail_next_resize_for_test();
@@ -677,16 +728,18 @@ async fn retried_pane_exit_teardown_dispatches_the_one_shot_pane_exited_hook_onc
     let exiting = PaneTarget::with_window(session.clone(), 0, 1);
     // pane-exited dispatches in the scope of the pane that survives the exit.
     let surviving = PaneTarget::with_window(session.clone(), 0, 0);
-    handler
-        .handle_ok(SetHookRequest {
+    TestRequest::send_ok(
+        &handler,
+        SetHookRequest {
             lifecycle: HookLifecycle::OneShot,
             ..Fixture::fixture((
                 ScopeSelector::Pane(surviving.clone()),
                 HookName::PaneExited,
                 "display-message exited-one-shot",
             ))
-        })
-        .await;
+        },
+    )
+    .await;
 
     let mut events = handler.subscribe_lifecycle_events();
     let (exiting_pane_id, generation) = {

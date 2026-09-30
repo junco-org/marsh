@@ -19,8 +19,8 @@ pub mod shellmux;
 pub mod test_support;
 
 pub use shell::{
-    CommandContext, Denial, ExecutionParameters, ExecutionResult, OpenFile, PolicyValidator,
-    Principal, ProfileLoadBehavior, RcLoadBehavior, SandboxPolicy, Shell, ShellBuilder,
-    ShellEnvironment, ShellError, ShellErrorKind, ShellFd, ShellVariable, Signal, SourceInfo,
-    UIOptions, builtins,
+    Action, CommandContext, Denial, ExecutionParameters, ExecutionResult, MarshTool, OpenFile,
+    PolicyValidator, Principal, ProfileLoadBehavior, RcLoadBehavior, SandboxPolicy, Shell,
+    ShellBuilder, ShellCommand, ShellEnvironment, ShellError, ShellErrorKind, ShellFd,
+    ShellVariable, Signal, SourceInfo, UIOptions, builtins,
 };

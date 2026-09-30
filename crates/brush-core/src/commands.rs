@@ -16,7 +16,7 @@ use crate::{
     ErrorKind, ExecutionControlFlow, ExecutionExitCode, ExecutionParameters, ExecutionResult,
     Shell, ShellFd, builtins, commands, env, error, escape,
     extensions::{self, ExecutionObserver as _, ExternalCommandSpawner as _, ShellExtensions},
-    functions,
+    functions, hostfs,
     interp::{self, Execute, ProcessGroupPolicy},
     openfiles::{self, OpenFile, OpenFiles},
     pathsearch, processes,
@@ -394,8 +394,13 @@ impl<'a, SE: extensions::ShellExtensions> SimpleCommand<'a, SE> {
             // All else failed; if we were given path directories to search, try to look through
             // them for a matching executable. Otherwise, use our default search logic.
             let path = if let Some(path_dirs) = &self.path_dirs {
-                pathsearch::search_for_executable(path_dirs.iter(), self.command_name.as_str())
-                    .next()
+                pathsearch::search_for_executable_observed(
+                    self.shell.execution_observer(),
+                    self.shell.working_dir(),
+                    path_dirs.iter(),
+                    self.command_name.as_str(),
+                )
+                .next()
             } else {
                 self.shell
                     .find_first_executable_in_path_using_cache(&self.command_name)
@@ -672,7 +677,10 @@ pub(crate) fn execute_external_command(
             }
 
             if spawn_err.kind() == std::io::ErrorKind::NotFound {
-                if !context.shell.working_dir().exists() {
+                if !hostfs::exists(
+                    context.shell.execution_observer(),
+                    context.shell.working_dir(),
+                ) {
                     Err(
                         error::ErrorKind::WorkingDirMissing(context.shell.working_dir().to_owned())
                             .into(),

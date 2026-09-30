@@ -1,4 +1,5 @@
 use super::*;
+use crate::test_fixtures::TestRequest;
 
 #[tokio::test]
 async fn move_window_with_d_keeps_the_next_window_active_when_moving_the_current_slot() {
@@ -17,12 +18,14 @@ async fn move_window_with_d_keeps_the_next_window_active_when_moving_the_current
     }
 
     assert_eq!(
-        handler
-            .handle_ok(MoveWindowRequest::fixture((
+        TestRequest::send_ok(
+            &handler,
+            MoveWindowRequest::fixture((
                 WindowTarget::with_window(alpha.clone(), 0),
                 WindowTarget::with_window(alpha.clone(), 4),
-            )))
-            .await,
+            ))
+        )
+        .await,
         rmux_proto::MoveWindowResponse {
             session_name: alpha.clone(),
             target: Some(WindowTarget::with_window(alpha.clone(), 4)),
@@ -46,13 +49,15 @@ async fn swap_window_same_source_and_destination_is_a_noop() {
     insert_window(&handler, &alpha, 2).await;
 
     assert_eq!(
-        handler
-            .handle_ok(SwapWindowRequest {
+        TestRequest::send_ok(
+            &handler,
+            SwapWindowRequest {
                 source: WindowTarget::with_window(alpha.clone(), 2),
                 target: WindowTarget::with_window(alpha.clone(), 2),
                 detached: false,
-            })
-            .await,
+            }
+        )
+        .await,
         rmux_proto::SwapWindowResponse {
             source: WindowTarget::with_window(alpha.clone(), 2),
             target: WindowTarget::with_window(alpha.clone(), 2),
@@ -80,13 +85,15 @@ async fn swap_window_without_d_preserves_active_slot() {
     // Without -d, tmux preserves the active winlink. Here it already points to
     // index 2, so active remains 2 while the swapped content changes.
     assert_eq!(
-        handler
-            .handle_ok(SwapWindowRequest {
+        TestRequest::send_ok(
+            &handler,
+            SwapWindowRequest {
                 source: WindowTarget::with_window(alpha.clone(), 2),
                 target: WindowTarget::with_window(alpha.clone(), 5),
                 detached: false,
-            })
-            .await,
+            }
+        )
+        .await,
         rmux_proto::SwapWindowResponse {
             source: WindowTarget::with_window(alpha.clone(), 2),
             target: WindowTarget::with_window(alpha.clone(), 5),
@@ -107,13 +114,15 @@ async fn swap_window_without_d_preserves_active_when_active_is_elsewhere() {
     insert_window(&handler, &alpha, 5).await;
 
     // Active is at window 0 (default). Source=2, target=5.
-    handler
-        .handle_ok(SwapWindowRequest {
+    TestRequest::send_ok(
+        &handler,
+        SwapWindowRequest {
             source: WindowTarget::with_window(alpha.clone(), 2),
             target: WindowTarget::with_window(alpha.clone(), 5),
             detached: false,
-        })
-        .await;
+        },
+    )
+    .await;
 
     // Without -d, tmux preserves the active winlink at 0.
     let state = handler.state.lock().await;
@@ -130,13 +139,15 @@ async fn swap_window_with_d_selects_target_window_within_session() {
     insert_window(&handler, &alpha, 5).await;
 
     // Active is at window 0 (default). Source=2, target=5.
-    handler
-        .handle_ok(SwapWindowRequest {
+    TestRequest::send_ok(
+        &handler,
+        SwapWindowRequest {
             source: WindowTarget::with_window(alpha.clone(), 2),
             target: WindowTarget::with_window(alpha.clone(), 5),
             detached: true,
-        })
-        .await;
+        },
+    )
+    .await;
 
     // With -d, tmux selects the destination winlink after swapping.
     let state = handler.state.lock().await;
@@ -152,13 +163,15 @@ async fn move_window_reindex_with_source_ignores_source_and_preserves_active_win
     insert_window(&handler, &alpha, 2).await;
 
     assert_eq!(
-        handler
-            .handle_ok(MoveWindowRequest {
+        TestRequest::send_ok(
+            &handler,
+            MoveWindowRequest {
                 renumber: true,
                 detached: false,
                 ..Fixture::fixture((WindowTarget::with_window(alpha.clone(), 2), &alpha))
-            })
-            .await,
+            }
+        )
+        .await,
         rmux_proto::MoveWindowResponse {
             session_name: alpha.clone(),
             target: None,
@@ -190,15 +203,17 @@ async fn move_window_across_sessions_removes_source_session_when_moving_its_last
     };
 
     assert_eq!(
-        handler
-            .handle_ok(MoveWindowRequest {
+        TestRequest::send_ok(
+            &handler,
+            MoveWindowRequest {
                 detached: false,
                 ..Fixture::fixture((
                     WindowTarget::with_window(alpha.clone(), 0),
                     WindowTarget::with_window(beta.clone(), 5),
                 ))
-            })
-            .await,
+            }
+        )
+        .await,
         rmux_proto::MoveWindowResponse {
             session_name: beta.clone(),
             target: Some(WindowTarget::with_window(beta.clone(), 5)),
@@ -267,11 +282,13 @@ async fn swap_window_allows_cross_session_swap_between_different_groups() {
     insert_window(&handler, &alpha, 1).await;
     insert_window(&handler, &beta, 1).await;
 
-    handler
-        .handle_ok(SwapWindowRequest {
+    TestRequest::send_ok(
+        &handler,
+        SwapWindowRequest {
             source: WindowTarget::with_window(alpha.clone(), 0),
             target: WindowTarget::with_window(beta.clone(), 0),
             detached: false,
-        })
-        .await;
+        },
+    )
+    .await;
 }

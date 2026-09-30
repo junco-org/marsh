@@ -1,5 +1,6 @@
 use super::relative_group_transactions::{assert_markers, marker, set_marker};
 use super::*;
+use crate::test_fixtures::TestRequest;
 
 #[tokio::test]
 async fn move_window_before_preserves_duplicate_linked_winlink_metadata() {
@@ -13,15 +14,17 @@ async fn move_window_before_preserves_duplicate_linked_winlink_metadata() {
     set_marker(&handler, &alpha, 1, "linked").await;
     set_marker(&handler, &alpha, 3, "mover").await;
 
-    handler
-        .handle_ok(MoveWindowRequest {
+    TestRequest::send_ok(
+        &handler,
+        MoveWindowRequest {
             before: true,
             ..Fixture::fixture((
                 WindowTarget::with_window(alpha.clone(), 3),
                 WindowTarget::with_window(alpha.clone(), 0),
             ))
-        })
-        .await;
+        },
+    )
+    .await;
 
     let state = handler.state.lock().await;
     assert_markers(
@@ -61,15 +64,17 @@ async fn grouped_move_window_keeps_window_options_with_shared_windows() {
         assert_eq!(marker(&state, &owner, 1), Some("anchor-updated".to_owned()));
     }
 
-    handler
-        .handle_ok(MoveWindowRequest {
+    TestRequest::send_ok(
+        &handler,
+        MoveWindowRequest {
             before: true,
             ..Fixture::fixture((
                 WindowTarget::with_window(owner.clone(), 2),
                 WindowTarget::with_window(owner.clone(), 0),
             ))
-        })
-        .await;
+        },
+    )
+    .await;
 
     let state = handler.state.lock().await;
     for session_name in [&owner, &peer] {
@@ -121,15 +126,17 @@ async fn link_window_before_rekeys_existing_window_metadata() {
     }
     set_marker(&handler, &beta, 0, "linked").await;
 
-    handler
-        .handle_ok(LinkWindowRequest {
+    TestRequest::send_ok(
+        &handler,
+        LinkWindowRequest {
             before: true,
             ..Fixture::fixture((
                 WindowTarget::with_window(beta, 0),
                 WindowTarget::with_window(alpha.clone(), 0),
             ))
-        })
-        .await;
+        },
+    )
+    .await;
 
     let state = handler.state.lock().await;
     assert_markers(

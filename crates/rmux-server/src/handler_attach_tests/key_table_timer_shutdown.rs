@@ -2,6 +2,7 @@ use std::time::Instant;
 
 use super::*;
 use crate::handler::attach_support::ActiveAttachIdentity;
+use crate::test_fixtures::TestRequest;
 
 async fn arm_prefix_timer(
     handler: &RequestHandler,
@@ -343,8 +344,9 @@ async fn stale_dispatch_cannot_rearm_repeat_after_table_switch() {
     let attach_pid = std::process::id();
     let _control_rx = create_attached_session(&handler, attach_pid, &session).await;
     let identity = handler.active_attach_identity_for_test(attach_pid).await;
-    handler
-        .handle_ok(rmux_proto::BindKeyRequest {
+    TestRequest::send_ok(
+        &handler,
+        rmux_proto::BindKeyRequest {
             note: Some("dispatch generation CAS regression".to_owned()),
             repeat: true,
             ..Fixture::fixture((
@@ -352,8 +354,9 @@ async fn stale_dispatch_cannot_rearm_repeat_after_table_switch() {
                 "r",
                 ["set-buffer", "-b", "dispatch-generation-cas", "hit"],
             ))
-        })
-        .await;
+        },
+    )
+    .await;
     let lookup_generation =
         set_key_table_for_timer(&handler, identity, &session, "old-repeat", Instant::now()).await;
 

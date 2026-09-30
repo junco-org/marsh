@@ -15,6 +15,7 @@ mod extendedtests;
 pub mod extensions;
 pub mod functions;
 pub mod history;
+mod hostfs;
 pub mod int_utils;
 pub mod interfaces;
 mod interp;

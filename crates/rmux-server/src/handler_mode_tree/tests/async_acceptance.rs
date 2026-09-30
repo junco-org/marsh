@@ -4,6 +4,7 @@ use super::super::mode_tree_model::{
     ChooseTreeTarget, ModeTreeActionIdentity, ModeTreeDeferredAction,
 };
 use crate::handler::prompt_support::PromptInputEvent;
+use crate::test_fixtures::{SessionSpec, TestRequest};
 use rmux_proto::{
     CopyModeRequest, DeleteBufferRequest, HookName, KillSessionRequest, KillWindowRequest,
     LinkWindowRequest, MoveWindowRequest, NewWindowRequest, RefreshClientRequest,
@@ -21,15 +22,13 @@ async fn choose_buffer_action_fixture(
 ) {
     let handler = RequestHandler::new();
     let session_name = SessionName::new(label).expect("valid session");
-    handler.create_session(&session_name).await;
+    SessionSpec::create(&handler, &session_name).await;
     for (name, content) in [
         ("stale", b"old".to_vec()),
         ("delete-me", b"delete".to_vec()),
         ("keep", b"safe".to_vec()),
     ] {
-        handler
-            .handle_ok(SetBufferRequest::fixture((name, content)))
-            .await;
+        TestRequest::send_ok(&handler, SetBufferRequest::fixture((name, content))).await;
     }
 
     let attach_pid = std::process::id().saturating_add(attach_pid_offset);
@@ -49,13 +48,15 @@ async fn zoomed_choose_tree_fixture(
 ) {
     let handler = RequestHandler::new();
     let session_name = SessionName::new(label).expect("valid session");
-    handler.create_session(&session_name).await;
-    handler
-        .handle_ok(SplitWindowRequest {
+    SessionSpec::create(&handler, &session_name).await;
+    TestRequest::send_ok(
+        &handler,
+        SplitWindowRequest {
             direction: SplitDirection::Horizontal,
             ..Fixture::fixture(PaneTarget::with_window(session_name.clone(), 0, 0))
-        })
-        .await;
+        },
+    )
+    .await;
     let attach_pid = std::process::id().saturating_add(attach_pid_offset);
     let control_rx = handler.attach_client(attach_pid, &session_name).await;
     open_mode_tree(&handler, attach_pid, &["choose-tree", "-Z"]).await;
@@ -102,19 +103,23 @@ async fn mode_tree_build_and_mouse_use_the_host_split_geometry() {
     // evicted part-way through — which is what the "choose-buffer remains active" failure was
     // actually reporting: not a dismissed mode tree, a removed client.
     let _drain = tokio::spawn(async move { while control_rx.recv().await.is_some() {} });
-    handler
-        .handle_ok(SplitWindowRequest {
+    TestRequest::send_ok(
+        &handler,
+        SplitWindowRequest {
             direction: SplitDirection::Horizontal,
             ..Fixture::fixture(PaneTarget::with_window(session_name.clone(), 0, 0))
-        })
-        .await;
+        },
+    )
+    .await;
 
-    handler
-        .handle_ok(SplitWindowRequest {
+    TestRequest::send_ok(
+        &handler,
+        SplitWindowRequest {
             direction: SplitDirection::Vertical,
             ..Fixture::fixture(PaneTarget::with_window(session_name.clone(), 0, 0))
-        })
-        .await;
+        },
+    )
+    .await;
 
     let mut mode = with_mode_tree(&handler, attach_pid, |mode| mode.clone()).await;
     mode.preview_mode = PreviewMode::Off;
@@ -233,12 +238,14 @@ async fn mode_tree_mouse_uses_content_rows_below_top_status() {
         .await;
 
     for index in 0..24 {
-        handler
-            .handle_ok(SetBufferRequest::fixture((
+        TestRequest::send_ok(
+            &handler,
+            SetBufferRequest::fixture((
                 format!("mouse-row-{index:02}"),
                 vec![u8::try_from(index).expect("test index fits in u8")],
-            )))
-            .await;
+            )),
+        )
+        .await;
     }
 
     let mut mode = with_mode_tree(&handler, attach_pid, |mode| mode.clone()).await;
@@ -295,17 +302,18 @@ async fn mode_tree_mouse_uses_content_rows_below_top_status() {
 }
 
 async fn replace_stale_buffer(handler: &RequestHandler) {
-    handler
-        .handle_ok(DeleteBufferRequest {
+    TestRequest::send_ok(
+        handler,
+        DeleteBufferRequest {
             name: Some("stale".to_owned()),
-        })
-        .await;
-    handler
-        .handle_ok(SetBufferRequest::fixture((
-            "stale",
-            b"replacement".to_vec(),
-        )))
-        .await;
+        },
+    )
+    .await;
+    TestRequest::send_ok(
+        handler,
+        SetBufferRequest::fixture(("stale", b"replacement".to_vec())),
+    )
+    .await;
 }
 
 async fn choose_buffer_item_id(
@@ -786,20 +794,24 @@ async fn choose_buffer_confirmation_uses_captured_buffer_instances() {
 async fn choose_tree_kill_pane_drains_after_kill_pane_inline_hook() {
     let handler = RequestHandler::new();
     let alpha = SessionName::new("choose-tree-after-kill").expect("valid session");
-    handler.create_session(&alpha).await;
-    handler
-        .handle_ok(SplitWindowRequest {
+    SessionSpec::create(&handler, &alpha).await;
+    TestRequest::send_ok(
+        &handler,
+        SplitWindowRequest {
             direction: SplitDirection::Horizontal,
             ..Fixture::fixture(&alpha)
-        })
-        .await;
-    handler
-        .handle_ok(SetHookRequest::fixture((
+        },
+    )
+    .await;
+    TestRequest::send_ok(
+        &handler,
+        SetHookRequest::fixture((
             ScopeSelector::Global,
             HookName::AfterKillPane,
             "set-buffer -b tree-after-kill fired",
-        )))
-        .await;
+        )),
+    )
+    .await;
     let (session_id, window_id, window_occurrence_id, pane_id, pane_output_generation) = {
         let mut state = handler.state.lock().await;
         state.ensure_live_window_link_occurrences();
@@ -843,14 +855,16 @@ async fn choose_tree_kill_pane_drains_after_kill_pane_inline_hook() {
 async fn choose_tree_tagged_pane_kills_follow_stable_ids_after_renumbering() {
     let handler = RequestHandler::new();
     let alpha = SessionName::new("choose-tree-tagged-stable-panes").expect("valid session");
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
     for _ in 0..2 {
-        handler
-            .handle_ok(SplitWindowRequest {
+        TestRequest::send_ok(
+            &handler,
+            SplitWindowRequest {
                 direction: SplitDirection::Horizontal,
                 ..Fixture::fixture(&alpha)
-            })
-            .await;
+            },
+        )
+        .await;
     }
 
     let (session_id, window_id, window_occurrence_id, pane_targets, surviving_pane_id) = {
@@ -922,7 +936,7 @@ async fn choose_tree_tagged_link_aliases_do_not_abort_later_distinct_kills() {
     let beta = SessionName::new("choose-tree-link-beta").expect("valid session");
     let gamma = SessionName::new("choose-tree-link-gamma").expect("valid session");
     for session in [&alpha, &beta, &gamma] {
-        handler.create_session(session).await;
+        SessionSpec::create(&handler, session).await;
     }
     for session in [&alpha, &gamma] {
         handler
@@ -932,12 +946,14 @@ async fn choose_tree_tagged_link_aliases_do_not_abort_later_distinct_kills() {
             })
             .await;
     }
-    handler
-        .handle_ok(LinkWindowRequest::fixture((
+    TestRequest::send_ok(
+        &handler,
+        LinkWindowRequest::fixture((
             WindowTarget::with_window(alpha.clone(), 0),
             WindowTarget::with_window(beta.clone(), 1),
-        )))
-        .await;
+        )),
+    )
+    .await;
 
     let actions = {
         let mut state = handler.state.lock().await;
@@ -996,12 +1012,12 @@ async fn choose_tree_tagged_link_aliases_do_not_abort_later_distinct_kills() {
 async fn choose_tree_stale_session_action_fails_closed_after_name_reuse() {
     let handler = RequestHandler::new();
     let alpha = SessionName::new("choose-tree-session-aba").expect("valid session");
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
     let old_session_id = handler.session_id_for_test(&alpha).await;
     let stale_action = ModeTreeAction::session_tree_target(alpha.clone(), old_session_id);
 
-    handler.handle_ok(KillSessionRequest::fixture(&alpha)).await;
-    handler.create_session(&alpha).await;
+    TestRequest::send_ok(&handler, KillSessionRequest::fixture(&alpha)).await;
+    SessionSpec::create(&handler, &alpha).await;
     let replacement_session_id = handler.session_id_for_test(&alpha).await;
     assert_ne!(replacement_session_id, old_session_id);
 
@@ -1027,17 +1043,15 @@ async fn choose_tree_tagged_kill_skips_stale_identity_and_finishes_live_batch() 
     let handler = RequestHandler::new();
     let stale_name = SessionName::new("a-choose-tree-stale-batch").expect("valid session");
     let live_name = SessionName::new("z-choose-tree-live-batch").expect("valid session");
-    handler.create_session(&stale_name).await;
-    handler.create_session(&live_name).await;
+    SessionSpec::create(&handler, &stale_name).await;
+    SessionSpec::create(&handler, &live_name).await;
     let stale_id = handler.session_id_for_test(&stale_name).await;
     let live_id = handler.session_id_for_test(&live_name).await;
     let stale_action = ModeTreeAction::session_tree_target(stale_name.clone(), stale_id);
     let live_action = ModeTreeAction::session_tree_target(live_name.clone(), live_id);
 
-    handler
-        .handle_ok(KillSessionRequest::fixture(&stale_name))
-        .await;
-    handler.create_session(&stale_name).await;
+    TestRequest::send_ok(&handler, KillSessionRequest::fixture(&stale_name)).await;
+    SessionSpec::create(&handler, &stale_name).await;
     let replacement_id = handler.session_id_for_test(&stale_name).await;
     assert_ne!(replacement_id, stale_id);
 
@@ -1068,8 +1082,8 @@ async fn choose_tree_kill_current_does_not_fall_back_after_session_aba() {
     let handler = RequestHandler::new();
     let host = SessionName::new("choose-tree-aba-host").expect("valid session");
     let alpha = SessionName::new("choose-tree-aba-target").expect("valid session");
-    handler.create_session(&host).await;
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &host).await;
+    SessionSpec::create(&handler, &alpha).await;
     let old_session_id = handler.session_id_for_test(&alpha).await;
 
     let attach_pid = std::process::id().saturating_add(41);
@@ -1080,8 +1094,8 @@ async fn choose_tree_kill_current_does_not_fall_back_after_session_aba() {
     })
     .await;
 
-    handler.handle_ok(KillSessionRequest::fixture(&alpha)).await;
-    handler.create_session(&alpha).await;
+    TestRequest::send_ok(&handler, KillSessionRequest::fixture(&alpha)).await;
+    SessionSpec::create(&handler, &alpha).await;
     let replacement_session_id = handler.session_id_for_test(&alpha).await;
     assert_ne!(replacement_session_id, old_session_id);
 
@@ -1105,7 +1119,7 @@ async fn choose_tree_kill_current_does_not_fall_back_after_session_aba() {
 async fn choose_tree_stale_window_action_fails_closed_after_index_reuse() {
     let handler = RequestHandler::new();
     let alpha = SessionName::new("choose-tree-window-aba").expect("valid session");
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
     handler
         .create_window(NewWindowRequest {
             target_window_index: Some(1),
@@ -1132,12 +1146,11 @@ async fn choose_tree_stale_window_action_fails_closed_after_index_reuse() {
         old_window_occurrence_id,
     );
 
-    handler
-        .handle_ok(KillWindowRequest::fixture(WindowTarget::with_window(
-            alpha.clone(),
-            1,
-        )))
-        .await;
+    TestRequest::send_ok(
+        &handler,
+        KillWindowRequest::fixture(WindowTarget::with_window(alpha.clone(), 1)),
+    )
+    .await;
     handler
         .create_window(NewWindowRequest {
             target_window_index: Some(1),
@@ -1175,7 +1188,7 @@ async fn rename_session_rekeys_active_choose_tree_host_before_refresh() {
     let handler = RequestHandler::new();
     let original = SessionName::new("choose-tree-rename-original").expect("valid session");
     let renamed = SessionName::new("choose-tree-rename-renamed").expect("valid session");
-    handler.create_session(&original).await;
+    SessionSpec::create(&handler, &original).await;
 
     let attach_pid = std::process::id().saturating_add(652);
     let _control_rx = handler.attach_client(attach_pid, &original).await;
@@ -1190,12 +1203,14 @@ async fn rename_session_rekeys_active_choose_tree_host_before_refresh() {
     })
     .await;
 
-    handler
-        .handle_ok(RenameSessionRequest {
+    TestRequest::send_ok(
+        &handler,
+        RenameSessionRequest {
             target: original,
             new_name: renamed.clone(),
-        })
-        .await;
+        },
+    )
+    .await;
 
     {
         let active_attach = handler.active_attach.lock().await;
@@ -1250,13 +1265,13 @@ async fn rename_session_rekeys_active_choose_tree_host_before_refresh() {
 async fn refresh_client_replays_active_mode_tree_after_base_switch() {
     let handler = RequestHandler::new();
     let session = SessionName::new("refresh-client-mode-tree").expect("valid session");
-    handler.create_session(&session).await;
+    SessionSpec::create(&handler, &session).await;
     let attach_pid = std::process::id();
     let mut control_rx = handler.attach_client(attach_pid, session).await;
     open_mode_tree(&handler, attach_pid, &["choose-tree", "-s"]).await;
     while control_rx.try_recv().is_ok() {}
 
-    handler.handle_ok(RefreshClientRequest::fixture(None)).await;
+    TestRequest::send_ok(&handler, RefreshClientRequest::fixture(None)).await;
 
     let mut saw_switch = false;
     let mut replayed_tree = None;
@@ -1294,7 +1309,7 @@ async fn choose_tree_identity_guard_fixture(
 ) {
     let handler = RequestHandler::new();
     let session_name = SessionName::new(label).expect("valid session");
-    handler.create_session(&session_name).await;
+    SessionSpec::create(&handler, &session_name).await;
     handler
         .create_window(NewWindowRequest {
             target_window_index: Some(1),
@@ -1354,8 +1369,8 @@ async fn choose_tree_session_switch_resizes_the_target_for_the_attached_client()
     let handler = RequestHandler::new();
     let host = SessionName::new("choose-tree-resize-host").expect("valid session");
     let target = SessionName::new("choose-tree-resize-target").expect("valid session");
-    handler.create_session(&host).await;
-    handler.create_session(&target).await;
+    SessionSpec::create(&handler, &host).await;
+    SessionSpec::create(&handler, &target).await;
     let target_session_id = handler.session_id_for_test(&target).await;
 
     let attach_pid = std::process::id().saturating_add(654);
@@ -1521,8 +1536,8 @@ async fn choose_tree_default_switch_rejects_a_reconnected_host_at_the_commit_loc
     let handler = RequestHandler::new();
     let host = SessionName::new("choose-tree-host-generation-alpha").expect("valid session");
     let target = SessionName::new("choose-tree-host-generation-beta").expect("valid session");
-    handler.create_session(&host).await;
-    handler.create_session(&target).await;
+    SessionSpec::create(&handler, &host).await;
+    SessionSpec::create(&handler, &target).await;
     let target_session_id = handler.session_id_for_test(&target).await;
 
     let attach_pid = std::process::id().saturating_add(651);
@@ -1596,7 +1611,7 @@ async fn choose_tree_zw_runs_direct_command_only_on_accept() {
     let attach_pid = std::process::id();
     let alpha = SessionName::new("alpha").expect("valid session");
 
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
 
     let _control_rx = handler.attach_client(attach_pid, &alpha).await;
 
@@ -1633,7 +1648,7 @@ async fn choose_client_from_unattached_request_activates_mode_tree_on_all_attach
     let handler = RequestHandler::new();
     let alpha = SessionName::new("alpha").expect("valid session");
 
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
 
     let first_pid = std::process::id();
     let second_pid = first_pid.saturating_add(1);
@@ -1699,12 +1714,14 @@ async fn mode_tree_commands_without_attached_client_mark_target_pane_mode() {
     ] {
         let handler = RequestHandler::new();
         let alpha = SessionName::new("alpha").expect("valid session");
-        handler.create_session(&alpha).await;
+        SessionSpec::create(&handler, &alpha).await;
 
         if needs_buffer {
-            handler
-                .handle_ok(SetBufferRequest::fixture(("buf", b"hello".to_vec())))
-                .await;
+            TestRequest::send_ok(
+                &handler,
+                SetBufferRequest::fixture(("buf", b"hello".to_vec())),
+            )
+            .await;
         }
 
         open_mode_tree(
@@ -1730,9 +1747,7 @@ async fn mode_tree_temporarily_hides_modal_scrollbar_and_restores_copy_mode_geom
     let handler = RequestHandler::new();
     let alpha = SessionName::new("mode-tree-modal-stack").expect("valid session");
     let target = rmux_proto::PaneTarget::with_window(alpha.clone(), 0, 0);
-    handler
-        .create_session((&alpha, TerminalSize::new(20, 8)))
-        .await;
+    SessionSpec::create(&handler, (&alpha, TerminalSize::new(20, 8))).await;
     for (scope, option, value) in [
         (
             ScopeSelector::Session(alpha.clone()),
@@ -1752,7 +1767,7 @@ async fn mode_tree_temporarily_hides_modal_scrollbar_and_restores_copy_mode_geom
     ] {
         handler.set_option(scope, option, value).await;
     }
-    handler.handle_ok(CopyModeRequest::fixture(&target)).await;
+    TestRequest::send_ok(&handler, CopyModeRequest::fixture(&target)).await;
 
     assert_eq!(handler.pane_terminal_size_for_test(&target).await.cols, 17);
 
@@ -1797,7 +1812,7 @@ async fn choose_tree_zw_defers_parse_errors_until_accept() {
     let attach_pid = std::process::id();
     let alpha = SessionName::new("alpha").expect("valid session");
 
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
 
     let _control_rx = handler.attach_client(attach_pid, alpha).await;
 
@@ -1914,7 +1929,7 @@ async fn customize_unset_revalidates_requester_at_option_mutation_lock() {
 
     let handler = RequestHandler::new();
     let session_name = SessionName::new("customize-option-requester-aba").expect("valid session");
-    handler.create_session(&session_name).await;
+    SessionSpec::create(&handler, &session_name).await;
     handler
         .set_option(
             ScopeSelector::Session(session_name.clone()),
@@ -1992,7 +2007,7 @@ async fn customize_unset_revalidates_requester_at_option_mutation_lock() {
 async fn customize_key_mutations_reject_a_replaced_requester() {
     let handler = RequestHandler::new();
     let session_name = SessionName::new("customize-key-requester-aba").expect("valid session");
-    handler.create_session(&session_name).await;
+    SessionSpec::create(&handler, &session_name).await;
     let attach_pid = std::process::id().saturating_add(908);
     let _control_rx = handler.attach_client(attach_pid, &session_name).await;
     open_mode_tree(&handler, attach_pid, &["customize-mode"]).await;
@@ -2116,7 +2131,7 @@ async fn mode_tree_dismisses_after_host_respawn_and_restores_zoom() {
         zoomed_choose_tree_fixture(label, 904).await;
     let target = PaneTarget::with_window(session_name.clone(), 0, 1);
 
-    handler.handle_ok(RespawnPaneRequest::fixture(target)).await;
+    TestRequest::send_ok(&handler, RespawnPaneRequest::fixture(target)).await;
 
     assert!(handler
         .handle_mode_tree_key_event(attach_pid, PromptInputEvent::Char('q'))
@@ -2246,7 +2261,7 @@ async fn moved_mode_tree_host_fixture(
             ..Fixture::fixture(&source)
         })
         .await;
-    handler.create_session(&destination).await;
+    SessionSpec::create(&handler, &destination).await;
     let (moved_window_id, moved_pane_id) = {
         let state = handler.state.lock().await;
         let window = state
@@ -2260,12 +2275,14 @@ async fn moved_mode_tree_host_fixture(
         )
     };
 
-    handler
-        .handle_ok(MoveWindowRequest::fixture((
+    TestRequest::send_ok(
+        &handler,
+        MoveWindowRequest::fixture((
             WindowTarget::with_window(source.clone(), 0),
             WindowTarget::with_window(destination.clone(), 1),
-        )))
-        .await;
+        )),
+    )
+    .await;
     let moved_target = {
         let state = handler.state.lock().await;
         let window = state
@@ -2347,13 +2364,14 @@ async fn mode_tree_moved_host_cleanup_does_not_mutate_a_recreated_source_slot() 
         })
         .await;
     drain_moved_mode_tree_controls(&mut fixture);
-    fixture
-        .handler
-        .handle_ok(SplitWindowRequest {
+    TestRequest::send_ok(
+        &fixture.handler,
+        SplitWindowRequest {
             direction: SplitDirection::Horizontal,
             ..Fixture::fixture(PaneTarget::with_window(fixture.source.clone(), 0, 0))
-        })
-        .await;
+        },
+    )
+    .await;
     drain_moved_mode_tree_controls(&mut fixture);
     let replacement_target = PaneTarget::with_window(fixture.source.clone(), 0, 1);
     let replacement_window_id = fixture
@@ -2367,13 +2385,14 @@ async fn mode_tree_moved_host_cleanup_does_not_mutate_a_recreated_source_slot() 
         .expect("replacement source window exists")
         .id();
     assert_ne!(replacement_window_id, fixture.moved_window_id);
-    fixture
-        .handler
-        .handle_ok(ResizePaneRequest {
+    TestRequest::send_ok(
+        &fixture.handler,
+        ResizePaneRequest {
             target: replacement_target,
             adjustment: rmux_proto::ResizePaneAdjustment::Zoom,
-        })
-        .await;
+        },
+    )
+    .await;
     drain_moved_mode_tree_controls(&mut fixture);
 
     assert!(fixture
@@ -2410,13 +2429,15 @@ async fn mode_tree_dismisses_after_host_pane_renumber_without_rezooming() {
     let label = "mode-tree-renumbered-host-pane";
     let (handler, session_name, attach_pid, _control_rx) =
         zoomed_choose_tree_fixture(label, 907).await;
-    handler
-        .handle_ok(RotateWindowRequest {
+    TestRequest::send_ok(
+        &handler,
+        RotateWindowRequest {
             target: WindowTarget::with_window(session_name.clone(), 0),
             direction: rmux_proto::RotateWindowDirection::Down,
             restore_zoom: false,
-        })
-        .await;
+        },
+    )
+    .await;
 
     assert!(handler
         .handle_mode_tree_key_event(attach_pid, PromptInputEvent::Escape)
@@ -2452,7 +2473,7 @@ async fn mode_tree_activation_rejects_a_same_pid_replacement_without_zoom_leak()
     let handler = RequestHandler::new();
     let session_name =
         SessionName::new("mode-tree-activation-attach-identity").expect("valid session");
-    handler.create_session(&session_name).await;
+    SessionSpec::create(&handler, &session_name).await;
     let attach_pid = std::process::id().saturating_add(905);
     let _old_rx = handler.attach_client(attach_pid, &session_name).await;
     let command = parse_mode_tree(&["choose-tree", "-Z"]);

@@ -1,5 +1,6 @@
 use super::*;
 use crate::pane_terminals::HandlerState;
+use crate::test_fixtures::TestRequest;
 use rmux_proto::OptionScopeSelector;
 
 const MARKER: &str = "@relative-marker";
@@ -92,12 +93,14 @@ async fn link_owner_window_to_external(
     prefix: &str,
 ) -> SessionName {
     let external = create_session(handler, format!("{prefix}-external")).await;
-    handler
-        .handle_ok(LinkWindowRequest::fixture((
+    TestRequest::send_ok(
+        handler,
+        LinkWindowRequest::fixture((
             WindowTarget::with_window(owner.clone(), 1),
             WindowTarget::with_window(external.clone(), 1),
-        )))
-        .await;
+        )),
+    )
+    .await;
     external
 }
 
@@ -116,15 +119,17 @@ async fn grouped_relative_move_via_peer_rekeys_canonical_window_metadata() {
     let external = link_owner_window_to_external(&handler, &owner, "peer-move").await;
     mark_auto_named(&handler, &owner, 2).await;
 
-    handler
-        .handle_ok(MoveWindowRequest {
+    TestRequest::send_ok(
+        &handler,
+        MoveWindowRequest {
             before: true,
             ..Fixture::fixture((
                 WindowTarget::with_window(peer.clone(), 2),
                 WindowTarget::with_window(peer.clone(), 0),
             ))
-        })
-        .await;
+        },
+    )
+    .await;
 
     let state = handler.state.lock().await;
     for session_name in [&owner, &peer] {
@@ -185,15 +190,17 @@ async fn grouped_relative_link_via_peer_rekeys_canonical_window_metadata() {
     set_marker(&handler, &source, 0, "incoming").await;
     mark_auto_named(&handler, &owner, 2).await;
 
-    handler
-        .handle_ok(LinkWindowRequest {
+    TestRequest::send_ok(
+        &handler,
+        LinkWindowRequest {
             before: true,
             ..Fixture::fixture((
                 WindowTarget::with_window(source.clone(), 0),
                 WindowTarget::with_window(peer.clone(), 0),
             ))
-        })
-        .await;
+        },
+    )
+    .await;
 
     let state = handler.state.lock().await;
     for session_name in [&owner, &peer] {
@@ -234,15 +241,17 @@ async fn grouped_relative_link_after_sparse_last_window_via_peer_succeeds() {
         );
     }
 
-    handler
-        .handle_ok(LinkWindowRequest {
+    TestRequest::send_ok(
+        &handler,
+        LinkWindowRequest {
             after: true,
             ..Fixture::fixture((
                 WindowTarget::with_window(source.clone(), 0),
                 WindowTarget::with_window(peer.clone(), 10),
             ))
-        })
-        .await;
+        },
+    )
+    .await;
 
     let state = handler.state.lock().await;
     let source_window_id = state
@@ -341,15 +350,17 @@ async fn relative_link_preserves_sparse_source_slot_outside_shift_range() {
     set_marker(&handler, &alpha, 10, "source").await;
     mark_auto_named(&handler, &alpha, 10).await;
 
-    handler
-        .handle_ok(LinkWindowRequest {
+    TestRequest::send_ok(
+        &handler,
+        LinkWindowRequest {
             before: true,
             ..Fixture::fixture((
                 WindowTarget::with_window(alpha.clone(), 10),
                 WindowTarget::with_window(alpha.clone(), 0),
             ))
-        })
-        .await;
+        },
+    )
+    .await;
 
     let state = handler.state.lock().await;
     assert_eq!(marker(&state, &alpha, 0), Some("source".to_owned()));

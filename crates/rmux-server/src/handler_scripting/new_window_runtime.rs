@@ -281,8 +281,6 @@ impl RequestHandler {
                             environment_overrides: environment.as_deref(),
                             respawn_shell: None,
                             respawn_environment: None,
-                            shell_id: None,
-                            follow_mux_lifetime: false,
                         },
                     },
                 ) {

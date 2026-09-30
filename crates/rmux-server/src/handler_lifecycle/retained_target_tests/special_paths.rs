@@ -2,10 +2,10 @@ use std::time::Duration;
 
 use super::*;
 use crate::handler::scripting_support::install_queue_exact_target_capture_pause;
-use crate::test_fixtures::{unique_temp_path, wait_until};
+use crate::test_fixtures::{unique_temp_path, wait_until, SessionSpec, TestRequest};
 
 async fn session_with_spare_window(handler: &RequestHandler, name: &str) -> SessionName {
-    let session_name = handler.create_session(name).await;
+    let session_name = SessionSpec::create(handler, name).await;
     handler
         .state
         .lock()
@@ -139,7 +139,7 @@ async fn source_file_rejects_retired_and_replaced_lifecycle_targets() {
 async fn source_file_missing_explicit_target_cuts_the_outer_lifecycle_lease() {
     let handler = RequestHandler::new();
     let alpha = session_with_spare_window(&handler, "special-source-missing-alpha").await;
-    let beta = handler.create_session("special-source-missing-beta").await;
+    let beta = SessionSpec::create(&handler, "special-source-missing-beta").await;
     let requester_pid = std::process::id();
     let _control_rx = handler.attach_client(requester_pid, &beta).await;
     let (current_target, lease) = retained_alert_binding(&handler, &alpha).await;
@@ -220,7 +220,7 @@ async fn run_shell_command_modes_reject_retired_and_replaced_lifecycle_targets()
 async fn explicit_if_shell_target_cuts_the_lifecycle_lease_and_pins_beta() {
     let handler = RequestHandler::new();
     let alpha = session_with_spare_window(&handler, "special-explicit-alpha").await;
-    let beta = handler.create_session("special-explicit-beta").await;
+    let beta = SessionSpec::create(&handler, "special-explicit-beta").await;
     let (current_target, lease) = retained_alert_binding(&handler, &alpha).await;
     retire_window_zero(&handler, &alpha, false).await;
 
@@ -249,7 +249,7 @@ async fn explicit_if_shell_target_cuts_the_lifecycle_lease_and_pins_beta() {
 async fn explicit_if_shell_target_rejects_same_name_slot_replacement() {
     let handler = RequestHandler::new();
     let alpha = session_with_spare_window(&handler, "special-explicit-aba-alpha").await;
-    let beta = handler.create_session("special-explicit-aba-beta").await;
+    let beta = SessionSpec::create(&handler, "special-explicit-aba-beta").await;
     let (current_target, lease) = retained_alert_binding(&handler, &alpha).await;
     let pause = install_queue_exact_target_capture_pause(&handler, "if-shell");
     let queued_handler = handler.clone();
@@ -317,9 +317,7 @@ async fn special_mutations_reject_a_respawned_pane_with_the_same_pane_id() {
     ];
     for (command_name, command, buffer) in cases {
         let handler = RequestHandler::new();
-        let session_name = handler
-            .create_session(format!("{command_name}-respawn"))
-            .await;
+        let session_name = SessionSpec::create(&handler, format!("{command_name}-respawn")).await;
         let (current_target, lease) = retained_alert_binding(&handler, &session_name).await;
         let pause = install_queue_exact_target_capture_pause(&handler, command_name);
         let queued_handler = handler.clone();
@@ -334,12 +332,14 @@ async fn special_mutations_reject_a_respawned_pane_with_the_same_pane_id() {
                 .await
         });
         pause.wait_until_reached().await;
-        handler
-            .handle_ok(RespawnPaneRequest {
+        TestRequest::send_ok(
+            &handler,
+            RespawnPaneRequest {
                 command: Some(vec![crate::test_shell::stdin_discard_command()]),
                 ..Fixture::fixture(PaneTarget::with_window(session_name.clone(), 0, 0))
-            })
-            .await;
+            },
+        )
+        .await;
         pause.release.notify_one();
         let error = queued
             .await

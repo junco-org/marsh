@@ -14,6 +14,7 @@ use super::*;
 
 use super::sizeless_geometry::{attached_client_size_is_inferred, register_sizeless_attach};
 use super::switch_frame_geometry::{attach_generation_id, window_content_size};
+use crate::test_fixtures::{SessionSpec, TestRequest};
 
 // This module's own pid block, distinct from every sibling module's.
 const SIZELESS_PID: u32 = 94_301;
@@ -73,7 +74,7 @@ async fn pin_public_times(handler: &RequestHandler, sessions: &[&SessionName]) {
 async fn promoting_an_inferred_client_size_does_not_touch_session_recency() {
     let handler = RequestHandler::new();
     let session = session_name("combined-promotion");
-    handler.create_session((&session, ANCHOR_SIZE)).await;
+    SessionSpec::create(&handler, (&session, ANCHOR_SIZE)).await;
     // A status line makes outer terminal geometry and content geometry differ,
     // which is the whole reason the inferred anchor is typed in the first place.
     handler.set_session_status(&session, "2").await;
@@ -125,8 +126,8 @@ async fn registration_credits_recency_once_across_a_concurrent_same_pid_replacem
     let handler = Arc::new(RequestHandler::new());
     let used = session_name("combined-used");
     let rival = session_name("combined-rival");
-    handler.create_session((&used, ANCHOR_SIZE)).await;
-    handler.create_session((&rival, ANCHOR_SIZE)).await;
+    SessionSpec::create(&handler, (&used, ANCHOR_SIZE)).await;
+    SessionSpec::create(&handler, (&rival, ANCHOR_SIZE)).await;
 
     // Park the first registration on M39's own credit seam, after publication
     // and before the credit.
@@ -214,7 +215,7 @@ async fn destroy_rehome_orders_clients_by_captured_size_sequence_and_sessions_by
     let older = session_name("combined-a-older");
     let newer = session_name("combined-z-newer");
     for session in [&doomed, &older, &newer] {
-        handler.create_session((session, ANCHOR_SIZE)).await;
+        SessionSpec::create(&handler, (session, ANCHOR_SIZE)).await;
         // No status line, so a client's outer terminal geometry and the
         // window's content geometry are the same number and the assertion below
         // reads as the client that owns the window.
@@ -273,7 +274,7 @@ async fn destroy_rehome_orders_clients_by_captured_size_sequence_and_sessions_by
     drain_attach_controls(&mut first_rx);
     drain_attach_controls(&mut second_rx);
 
-    handler.handle_ok(KillSessionRequest::fixture(doomed)).await;
+    TestRequest::send_ok(&handler, KillSessionRequest::fixture(doomed)).await;
 
     // Sessions ranked by recency: both clients land on the survivor that was
     // used last, not the one that sorts first or was created first.

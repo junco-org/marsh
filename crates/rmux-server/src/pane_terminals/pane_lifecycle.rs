@@ -244,15 +244,6 @@ impl PreparedWindowTerminal {
         (self.terminal, self.output, self.lifecycle)
     }
 
-    /// The job the open produced, for a caller that has to name it back to whoever asked.
-    ///
-    /// Read before the commit consumes this, because the name is the only part of the answer the
-    /// caller could not already know: the shell prompt's anonymous `&` asks the engine to
-    /// allocate one, and `%3 started` has to say which one it got.
-    pub(crate) fn shell_id(&self) -> &marsh_core::shellmux::ShellId {
-        self.terminal.handle().id()
-    }
-
     /// The output generation the plan reserved and this job's route was installed with.
     ///
     /// Read by a commit that has to verify the pane's identity *before* its own teardown starts,
@@ -357,8 +348,6 @@ impl HandlerState {
                     pane: pane.id(),
                     generation,
                 },
-                shell_id: spawn.shell_id.clone(),
-                follow_mux_lifetime: spawn.follow_mux_lifetime,
             },
             io,
             runtime_session_name,
@@ -752,8 +741,6 @@ impl HandlerState {
                         pane: pane.id,
                         generation,
                     },
-                    shell_id: None,
-                    follow_mux_lifetime: false,
                 },
                 io,
                 runtime_session_name,
@@ -1516,8 +1503,6 @@ impl HandlerState {
                         pane: pane_id,
                         generation,
                     },
-                    shell_id: None,
-                    follow_mux_lifetime: false,
                 },
                 io,
                 runtime_session_name: runtime_session_name.clone(),

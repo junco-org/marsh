@@ -13,6 +13,7 @@
 
 mod common;
 
+use std::borrow::Cow;
 use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
@@ -20,12 +21,12 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use common::{Controlled, Seed, TIMEOUT, controlled, denied, join, launch, run, scratch};
+use junco_policy::{Event, PolicyDecision, Resource};
 use marsh::{
-    CommandContext, ExecutionResult, RcLoadBehavior, SandboxPolicy, Shell, ShellBuilder,
-    ShellError, ShellErrorKind, ShellVariable, SourceInfo,
+    Action, CommandContext, ExecutionResult, MarshTool, RcLoadBehavior, SandboxPolicy, Shell,
+    ShellBuilder, ShellCommand, ShellError, ShellErrorKind, ShellVariable, SourceInfo,
 };
 use marsh_btrfs::fake::CopyTree;
-use rust_validator::{Action, Event, PolicyDecision, Resource};
 use serial_test::serial;
 use tempfile::TempDir;
 
@@ -136,7 +137,8 @@ fn infrastructure<T>(result: Result<T, ShellError>) {
 const EXACT: &str = "printf  scoped > marker; printf 'READY\\n'; read release # keep\n";
 
 fn exact(ctx: &CommandContext<'_>) -> bool {
-    ctx.command == EXACT
+    ctx.tool_as::<ShellCommand>()
+        .is_some_and(|shell| shell.command == EXACT)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -811,7 +813,11 @@ async fn every_entry_point_is_routed() {
 
 /// Panics when the accepted command names the sentinel; otherwise the default verdict.
 fn panicky(ctx: &CommandContext<'_>) -> bool {
-    assert!(!ctx.command.contains("PANIC"), "predicate sentinel");
+    assert!(
+        !ctx.tool_as::<ShellCommand>()
+            .is_some_and(|shell| shell.command.contains("PANIC")),
+        "predicate sentinel"
+    );
     SandboxPolicy::SharedSource.eval(ctx)
 }
 
@@ -1145,4 +1151,164 @@ async fn a_retained_context_never_reaches_a_later_view() {
         }
     }
     a.close(false).await.unwrap();
+}
+
+/// A tool call that edits.
+struct Stamp;
+impl From<&Stamp> for Action {
+    fn from(_: &Stamp) -> Self {
+        Self::Edit
+    }
+}
+impl From<Stamp> for Action {
+    fn from(tool: Stamp) -> Self {
+        Self::from(&tool)
+    }
+}
+impl MarshTool for Stamp {
+    fn description(&self) -> Cow<'_, str> {
+        Cow::Borrowed("stamp")
+    }
+}
+
+/// A tool call that only reads.
+struct Inspect;
+impl From<&Inspect> for Action {
+    fn from(_: &Inspect) -> Self {
+        Self::Read
+    }
+}
+impl From<Inspect> for Action {
+    fn from(tool: Inspect) -> Self {
+        Self::from(&tool)
+    }
+}
+impl MarshTool for Inspect {
+    fn description(&self) -> Cow<'_, str> {
+        Cow::Borrowed("inspect")
+    }
+}
+
+/// Managed exactly for calls that may write. A tool call is still its original value after
+/// admission erased its type, beside the action converted from it.
+fn writes(ctx: &CommandContext<'_>) -> bool {
+    if ctx.tool_as::<ShellCommand>().is_none() {
+        assert_eq!(
+            ctx.tool_as::<Stamp>().is_some(),
+            ctx.action == &Action::Edit
+        );
+        assert_eq!(
+            ctx.tool_as::<Inspect>().is_some(),
+            ctx.action == &Action::Read
+        );
+    }
+    ctx.action.is_write()
+}
+
+/// Replaces `path` in `ctx`'s view with `bytes`, through the context's reported I/O.
+fn stamp(ctx: &marsh::builtins::BuiltinContext, path: &str, bytes: &[u8]) {
+    ctx.open(
+        Path::new(path),
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true),
+    )
+    .unwrap()
+    .write_all(bytes)
+    .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn tool_calls_route_by_their_action_and_publish_their_effects() {
+    let seed = Seed::new("a.txt", "seed\n");
+    let shell = seed
+        .builder()
+        .sandbox_policy(SandboxPolicy::Base(writes))
+        .build()
+        .await
+        .unwrap();
+    let source = seed.source.join("b.txt");
+    let (physical, logical) = shell
+        .run_tool(Stamp, |ctx| {
+            stamp(ctx, "b.txt", b"tool\n");
+            ctx.remove_file(Path::new("a.txt")).unwrap();
+            let physical = ctx.physical_path(Path::new("b.txt")).unwrap();
+            let logical = ctx.logical_path(&physical).unwrap();
+            (physical, logical)
+        })
+        .await
+        .unwrap();
+    assert_ne!(physical, source, "an edit runs in the private snapshot");
+    assert_eq!(logical, source);
+    assert_eq!(
+        seed.bytes("b.txt"),
+        b"tool\n",
+        "published when the call returns"
+    );
+    assert!(!seed.source.join("a.txt").exists(), "so is its removal");
+
+    let (physical, logical, bytes) = shell
+        .run_tool(Inspect, |ctx| {
+            let physical = ctx.physical_path(Path::new("b.txt")).unwrap();
+            let logical = ctx.logical_path(&physical).unwrap();
+            let bytes = std::fs::read(&physical).unwrap();
+            (physical, logical, bytes)
+        })
+        .await
+        .unwrap();
+    assert_eq!(physical, source, "a read runs directly against the source");
+    assert_eq!(logical, source);
+    assert_eq!(bytes, b"tool\n");
+    shell.close(false).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn a_direct_tool_call_acts_on_the_source() {
+    let seed = Seed::new("a.txt", "seed\n");
+    let shell = seed
+        .builder()
+        .sandbox_policy(SandboxPolicy::forbid())
+        .build()
+        .await
+        .unwrap();
+    let source = seed.source.join("b.txt");
+    let (physical, logical) = shell
+        .run_tool(Stamp, |ctx| {
+            stamp(ctx, "b.txt", b"direct\n");
+            let physical = ctx.physical_path(Path::new("b.txt")).unwrap();
+            let logical = ctx.logical_path(&physical).unwrap();
+            (physical, logical)
+        })
+        .await
+        .unwrap();
+    assert_eq!(physical, source);
+    assert_eq!(logical, source);
+    assert_eq!(seed.bytes("b.txt"), b"direct\n");
+    shell.close(false).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn a_denied_tool_call_publishes_nothing_and_drops_its_result() {
+    let seed = Seed::new("src/a.txt", "seed\n");
+    let shell = seed.managed_builder().build().await.unwrap();
+    let peer = seed.managed_builder().build().await.unwrap();
+    run(&peer, "/bin/cat src/a.txt >/dev/null").await;
+    let error = shell
+        .run_tool(Stamp, |ctx| {
+            stamp(ctx, "src/a.txt", b"T");
+            "stamped"
+        })
+        .await
+        .expect_err("the peer's read denies the edit");
+    assert!(
+        matches!(error.kind(), ShellErrorKind::Denied { .. }),
+        "{error}"
+    );
+    assert_eq!(seed.bytes("src/a.txt"), b"seed\n");
+    shell.close(false).await.unwrap();
+    peer.close(false).await.unwrap();
 }

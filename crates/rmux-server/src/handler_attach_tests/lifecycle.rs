@@ -1,4 +1,5 @@
 use super::*;
+use crate::test_fixtures::SessionSpec;
 
 const ATTACHED_EXIT_INPUT: &[u8] = b"exit\r";
 
@@ -183,7 +184,7 @@ async fn attached_last_pane_exit_honors_detach_on_destroy_off() {
     let requester_pid = std::process::id();
     let beta = session_name("pane-exit-destroy-beta");
     let alpha = session_name("pane-exit-destroy-alpha");
-    handler.create_session(Quiet(&beta)).await;
+    SessionSpec::create(&handler, Quiet(&beta)).await;
     let mut control_rx =
         create_line_exiting_attached_session(&handler, requester_pid, &alpha).await;
     handler

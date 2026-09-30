@@ -1,4 +1,9 @@
 //! Path searching utilities.
+//!
+//! The public [`search_for_executable`] probes the filesystem without reporting anything. The
+//! shell's own searches use the crate-internal observed variants, which resolve relative
+//! search directories against the shell's working directory and report every probe to the
+//! execution observer as a host filesystem access.
 
 use std::{
     collections::VecDeque,
@@ -6,7 +11,7 @@ use std::{
 };
 
 use crate::sys;
-use crate::sys::fs::PathExt;
+use crate::{extensions::ExecutionObserver, hostfs};
 
 /// Encapsulates the result of a path search.
 pub struct ExecutablePathSearch<PI, N> {
@@ -40,15 +45,52 @@ where
     }
 }
 
-pub(crate) struct ExecutablePathPrefixSearch<PI> {
+/// An executable search whose probes are reported to an execution observer.
+pub(crate) struct ObservedExecutablePathSearch<'o, O, PI, N> {
+    observer: &'o O,
+    working_dir: &'o Path,
+    paths: VecDeque<PI>,
+    filename: N,
+}
+
+impl<O, PI, N> Iterator for ObservedExecutablePathSearch<'_, O, PI, N>
+where
+    O: ExecutionObserver,
+    PI: AsRef<Path>,
+    N: AsRef<Path>,
+{
+    type Item = PathBuf;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while let Some(path) = self.paths.pop_front() {
+            let path = PathBuf::from(path.as_ref()).join(self.filename.as_ref());
+            // Probe the absolute form (a relative search directory is relative to the shell's
+            // working directory), reporting each probe; yield the candidate as found. Skip
+            // directories outright, then check that the path is executable.
+            let probed = self.working_dir.join(&path);
+            if hostfs::is_dir(self.observer, &probed) {
+                continue;
+            }
+            if hostfs::executable(self.observer, &probed) {
+                return Some(path);
+            }
+        }
+        None
+    }
+}
+
+pub(crate) struct ExecutablePathPrefixSearch<'o, O, PI> {
+    observer: &'o O,
+    working_dir: &'o Path,
     paths: VecDeque<PI>,
     queued_items: VecDeque<PathBuf>,
     filename_prefix: String,
     case_insensitive: bool,
 }
 
-impl<PI> Iterator for ExecutablePathPrefixSearch<PI>
+impl<O, PI> Iterator for ExecutablePathPrefixSearch<'_, O, PI>
 where
+    O: ExecutionObserver,
     PI: AsRef<Path>,
 {
     type Item = PathBuf;
@@ -61,8 +103,10 @@ where
 
         while let Some(path) = self.paths.pop_front() {
             let path = PathBuf::from(path.as_ref());
+            // As above: enumerate and probe the absolute form, yield entries as found.
+            let probed_dir = self.working_dir.join(&path);
 
-            if let Ok(readdir) = path.read_dir() {
+            if let Ok(readdir) = hostfs::read_dir(self.observer, &probed_dir) {
                 for entry in readdir.flatten() {
                     if let Ok(mut filename) = entry.file_name().into_string() {
                         if self.case_insensitive {
@@ -74,15 +118,11 @@ where
                         }
                     }
 
-                    let entry_path = entry.path();
-                    if let Ok(file_type) = entry.file_type() {
-                        if file_type.is_file() && entry_path.executable() {
-                            self.queued_items.push_back(entry_path);
-                            continue;
-                        }
-                        if file_type.is_symlink() && entry_path.executable() {
-                            self.queued_items.push_back(entry_path);
-                        }
+                    if let Ok(file_type) = entry.file_type()
+                        && (file_type.is_file() || file_type.is_symlink())
+                        && hostfs::executable(self.observer, &entry.path())
+                    {
+                        self.queued_items.push_back(path.join(entry.file_name()));
                     }
                 }
             }
@@ -96,6 +136,9 @@ where
 }
 
 /// Search for the given executable name in the provided paths.
+///
+/// Probes are made as given (relative paths against the process's working directory) and are
+/// not reported to any execution observer.
 ///
 /// # Arguments
 ///
@@ -113,12 +156,44 @@ where
     }
 }
 
-pub(crate) fn search_for_executable_with_prefix<P, PI>(
+/// Search for the given executable name in the provided paths, reporting each probe to
+/// `observer` as a host filesystem access.
+///
+/// # Arguments
+///
+/// * `observer` - The execution observer to report probes to.
+/// * `working_dir` - The directory relative search paths are resolved against.
+/// * `paths` - An iterator over the paths to search.
+/// * `filename` - The name of the executable file to search for.
+pub(crate) fn search_for_executable_observed<'o, O, P, PI, N>(
+    observer: &'o O,
+    working_dir: &'o Path,
+    paths: P,
+    filename: N,
+) -> ObservedExecutablePathSearch<'o, O, PI, N>
+where
+    O: ExecutionObserver,
+    P: Iterator<Item = PI>,
+    PI: AsRef<Path>,
+    N: AsRef<Path>,
+{
+    ObservedExecutablePathSearch {
+        observer,
+        working_dir,
+        paths: paths.collect(),
+        filename,
+    }
+}
+
+pub(crate) fn search_for_executable_with_prefix<'o, O, P, PI>(
+    observer: &'o O,
+    working_dir: &'o Path,
     paths: P,
     filename_prefix: &str,
     case_insensitive: bool,
-) -> ExecutablePathPrefixSearch<PI>
+) -> ExecutablePathPrefixSearch<'o, O, PI>
 where
+    O: ExecutionObserver,
     P: Iterator<Item = PI>,
     PI: AsRef<Path>,
 {
@@ -129,6 +204,8 @@ where
     };
 
     ExecutablePathPrefixSearch {
+        observer,
+        working_dir,
         paths: paths.collect(),
         queued_items: VecDeque::new(),
         filename_prefix: stored_prefix,

@@ -1,6 +1,7 @@
 use std::time::Instant;
 
 use super::*;
+use crate::test_fixtures::TestRequest;
 
 #[tokio::test]
 async fn prefix_timer_follows_stable_session_identity_across_rename() {
@@ -44,12 +45,14 @@ async fn prefix_timer_follows_stable_session_identity_across_rename() {
         .await
         .expect("timer reaches expiry boundary before rename");
 
-    handler
-        .handle_ok(RenameSessionRequest {
+    TestRequest::send_ok(
+        &handler,
+        RenameSessionRequest {
             target: original,
             new_name: renamed.clone(),
-        })
-        .await;
+        },
+    )
+    .await;
 
     expiry_pause.release.notify_one();
     tokio::time::timeout(ATTACH_LIFECYCLE_TIMEOUT, timer)
@@ -187,7 +190,7 @@ async fn switch_table_apply_rejects_attach_rehomed_after_session_resolution() {
         .await
         .expect("switch-client -T pauses after resolving alpha identity");
 
-    handler.handle_ok(KillSessionRequest::fixture(alpha)).await;
+    TestRequest::send_ok(&handler, KillSessionRequest::fixture(alpha)).await;
     {
         let active_attach = handler.active_attach.lock().await;
         let rehomed = active_attach

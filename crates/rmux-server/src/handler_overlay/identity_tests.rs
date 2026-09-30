@@ -9,7 +9,7 @@ use rmux_proto::{
 };
 use tokio::time::{timeout, Duration};
 
-use crate::test_fixtures::Fixture;
+use crate::test_fixtures::{Fixture, SessionSpec, TestRequest};
 use crate::test_names::session_name;
 
 async fn execute_overlay(
@@ -31,8 +31,8 @@ async fn client_selector_and_explicit_pane_target_keep_distinct_identities() {
     let beta = session_name("overlay-selector-beta");
     let alpha_pid = 971_001;
     let beta_pid = 971_002;
-    handler.create_session(&alpha).await;
-    handler.create_session(&beta).await;
+    SessionSpec::create(&handler, &alpha).await;
+    SessionSpec::create(&handler, &beta).await;
     let _alpha_rx = handler.attach_client(alpha_pid, &alpha).await;
     let _beta_rx = handler.attach_client(beta_pid, &beta).await;
 
@@ -82,7 +82,7 @@ async fn same_pid_replacement_during_client_resolution_cannot_receive_menu() {
     let handler = RequestHandler::new();
     let alpha = session_name("overlay-client-aba");
     let pid = 971_011;
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
     let _old_rx = handler.attach_client(pid, &alpha).await;
     let pause = install_managed_client_resolution_pause(pid);
     let parsed = handler
@@ -118,7 +118,7 @@ async fn menu_action_is_discarded_after_target_pane_respawn() {
     let handler = RequestHandler::new();
     let alpha = session_name("overlay-pane-respawn");
     let pid = 971_021;
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
     // The respawn below refreshes this attached session, and a simulated
     // transport that never reads its controls saturates the client's bounded
     // control backlog. Production then closes and removes the overloaded
@@ -133,12 +133,14 @@ async fn menu_action_is_discarded_after_target_pane_respawn() {
         .await
         .expect("menu opens");
 
-    handler
-        .handle_ok(RespawnPaneRequest {
+    TestRequest::send_ok(
+        &handler,
+        RespawnPaneRequest {
             command: Some(vec![crate::test_shell::stdin_discard_command()]),
             ..Fixture::fixture(PaneTarget::with_window(alpha.clone(), 0, 0))
-        })
-        .await;
+        },
+    )
+    .await;
     assert!(
         handler.current_live_attach_input(client_identity).await,
         "the respawn must not disconnect the serviced client"
@@ -200,7 +202,7 @@ async fn popup_is_discarded_after_same_window_is_unlinked_and_relinked() {
     let alias = session_name("overlay-relink-alias");
     let pid = 971_031;
     for session in [&host, &owner, &alias] {
-        handler.create_session(session).await;
+        SessionSpec::create(&handler, session).await;
     }
     let _control_rx = handler.attach_client(pid, &host).await;
     handler
@@ -210,12 +212,14 @@ async fn popup_is_discarded_after_same_window_is_unlinked_and_relinked() {
         })
         .await;
     let owner_window = WindowTarget::with_window(owner.clone(), 0);
-    handler
-        .handle_ok(LinkWindowRequest {
+    TestRequest::send_ok(
+        &handler,
+        LinkWindowRequest {
             kill_destination: true,
             ..Fixture::fixture((&owner_window, WindowTarget::with_window(alias.clone(), 0)))
-        })
-        .await;
+        },
+    )
+    .await;
     execute_overlay(
         &handler,
         pid,
@@ -224,18 +228,22 @@ async fn popup_is_discarded_after_same_window_is_unlinked_and_relinked() {
     .await
     .expect("popup opens on linked pane");
 
-    handler
-        .handle_ok(UnlinkWindowRequest {
+    TestRequest::send_ok(
+        &handler,
+        UnlinkWindowRequest {
             target: WindowTarget::with_window(alias.clone(), 0),
             kill_if_last: false,
-        })
-        .await;
-    handler
-        .handle_ok(LinkWindowRequest {
+        },
+    )
+    .await;
+    TestRequest::send_ok(
+        &handler,
+        LinkWindowRequest {
             before: true,
             ..Fixture::fixture((&owner_window, WindowTarget::with_window(alias.clone(), 1)))
-        })
-        .await;
+        },
+    )
+    .await;
 
     let mut pending = Vec::new();
     let outcome = handler
@@ -255,8 +263,8 @@ async fn overlay_command_context_rejects_a_same_name_session_replacement_after_v
     let host = session_name("overlay-command-host");
     let target = session_name("overlay-command-target");
     let pid = 971_041;
-    handler.create_session(&host).await;
-    handler.create_session(&target).await;
+    SessionSpec::create(&handler, &host).await;
+    SessionSpec::create(&handler, &target).await;
     let _control_rx = handler.attach_client(pid, &host).await;
     let client = handler.active_attach_identity_for_test(pid).await;
     let target = Target::Session(target);
@@ -277,10 +285,8 @@ async fn overlay_command_context_rejects_a_same_name_session_replacement_after_v
         identity.command_context(QueueExecutionContext::without_caller_cwd(), target.clone());
 
     let target_name = target.session_name().clone();
-    handler
-        .handle_ok(KillSessionRequest::fixture(&target_name))
-        .await;
-    handler.create_session(&target_name).await;
+    TestRequest::send_ok(&handler, KillSessionRequest::fixture(&target_name)).await;
+    SessionSpec::create(&handler, &target_name).await;
 
     let commands = handler
         .parse_control_commands("set-buffer -b overlay-command-aba fired")

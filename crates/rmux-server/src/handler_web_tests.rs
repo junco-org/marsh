@@ -12,12 +12,12 @@ use rmux_proto::{
 use tokio::io::AsyncWriteExt;
 use tokio::time::{sleep, timeout, Duration, Instant};
 
-use crate::test_fixtures::{operator_token, spectator_token, Fixture};
+use crate::test_fixtures::{operator_token, spectator_token, Fixture, SessionSpec, TestRequest};
 
 #[tokio::test]
 async fn shutdown_rejects_web_pane_text_key_and_session_mutations() {
     let handler = RequestHandler::new();
-    let session_name = handler.create_session("web-shutdown-rejected").await;
+    let session_name = SessionSpec::create(&handler, "web-shutdown-rejected").await;
     let session_id = handler.session_id_for_test(&session_name).await;
     let created = create_share(
         &handler,
@@ -116,7 +116,7 @@ async fn shutdown_rejects_web_pane_text_key_and_session_mutations() {
 #[tokio::test]
 async fn shutdown_drains_a_web_session_mutation_admitted_before_close() {
     let handler = RequestHandler::new();
-    let session_name = handler.create_session("web-shutdown-drain").await;
+    let session_name = SessionSpec::create(&handler, "web-shutdown-drain").await;
     let session_target = crate::web::WebSessionTarget::new(
         session_name.clone(),
         handler.session_id_for_test(&session_name).await,
@@ -174,7 +174,7 @@ async fn shutdown_drains_a_web_session_mutation_admitted_before_close() {
 #[tokio::test]
 async fn web_new_window_uses_shared_initial_name_primitive_when_automatic_rename_is_off() {
     let handler = RequestHandler::new();
-    let session_name = handler.create_session("web-initial-window-name").await;
+    let session_name = SessionSpec::create(&handler, "web-initial-window-name").await;
     handler
         .set_option(ScopeSelector::Global, OptionName::AutomaticRename, "off")
         .await;
@@ -204,13 +204,13 @@ async fn web_new_window_uses_shared_initial_name_primitive_when_automatic_rename
 #[tokio::test]
 async fn web_share_create_starts_lazy_listener() {
     let handler = handler_with_automatic_web_port();
-    let session_name = handler.create_session("lazy-start").await;
+    let session_name = SessionSpec::create(&handler, "lazy-start").await;
 
-    let response = handler
-        .handle_ok(WebShareRequest::Create(share_request(
-            WebShareScope::Session(session_name),
-        )))
-        .await;
+    let response = TestRequest::send_ok(
+        &handler,
+        WebShareRequest::Create(share_request(WebShareScope::Session(session_name))),
+    )
+    .await;
 
     assert!(matches!(
         *response,
@@ -222,9 +222,11 @@ async fn web_share_create_starts_lazy_listener() {
 async fn web_share_config_starts_lazy_listener() {
     let handler = handler_with_automatic_web_port();
 
-    let response = handler
-        .handle_ok(WebShareRequest::Config(rmux_proto::WebShareConfigRequest))
-        .await;
+    let response = TestRequest::send_ok(
+        &handler,
+        WebShareRequest::Config(rmux_proto::WebShareConfigRequest),
+    )
+    .await;
 
     let rmux_proto::WebShareResponse::Config(config) = *response else {
         panic!("expected web-share config response");
@@ -241,9 +243,11 @@ async fn implicit_web_share_port_falls_back_when_default_is_busy() {
             .expect("web settings"),
     );
 
-    let response = handler
-        .handle_ok(WebShareRequest::Config(rmux_proto::WebShareConfigRequest))
-        .await;
+    let response = TestRequest::send_ok(
+        &handler,
+        WebShareRequest::Config(rmux_proto::WebShareConfigRequest),
+    )
+    .await;
 
     let rmux_proto::WebShareResponse::Config(config) = *response else {
         panic!("expected web-share config response");
@@ -255,16 +259,18 @@ async fn implicit_web_share_port_falls_back_when_default_is_busy() {
 #[tokio::test]
 async fn concurrent_web_share_create_waits_for_lazy_listener_start() {
     let handler = handler_with_automatic_web_port();
-    let alpha = handler.create_session("lazy-alpha").await;
-    let beta = handler.create_session("lazy-beta").await;
+    let alpha = SessionSpec::create(&handler, "lazy-alpha").await;
+    let beta = SessionSpec::create(&handler, "lazy-beta").await;
 
     let (left, right) = tokio::join!(
-        handler.handle_ok(WebShareRequest::Create(share_request(
-            WebShareScope::Session(alpha)
-        ))),
-        handler.handle_ok(WebShareRequest::Create(share_request(
-            WebShareScope::Session(beta)
-        ))),
+        TestRequest::send_ok(
+            &handler,
+            WebShareRequest::Create(share_request(WebShareScope::Session(alpha)))
+        ),
+        TestRequest::send_ok(
+            &handler,
+            WebShareRequest::Create(share_request(WebShareScope::Session(beta)))
+        ),
     );
 
     assert!(matches!(*left, rmux_proto::WebShareResponse::Created(_)));
@@ -277,7 +283,7 @@ async fn failed_lazy_listener_start_does_not_create_share() {
     let blocker = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind blocker");
     let port = blocker.local_addr().expect("blocker addr").port();
     let handler = handler_with_web_port(port);
-    let session_name = handler.create_session("lazy-bind-failure").await;
+    let session_name = SessionSpec::create(&handler, "lazy-bind-failure").await;
 
     let response = handler
         .handle(Request::WebShare(Box::new(WebShareRequest::Create(
@@ -297,7 +303,7 @@ async fn failed_lazy_listener_start_does_not_create_share() {
 #[tokio::test]
 async fn web_share_create_resolves_slot_target_to_stable_pane_id() {
     let handler = RequestHandler::new();
-    let session_name = handler.create_session("alpha").await;
+    let session_name = SessionSpec::create(&handler, "alpha").await;
     let created = create_share(
         &handler,
         share_request(WebShareScope::Pane(
@@ -322,7 +328,7 @@ async fn web_share_create_resolves_slot_target_to_stable_pane_id() {
 #[tokio::test]
 async fn stopped_ttl_share_wakes_its_expiry_waiter() {
     let handler = RequestHandler::new();
-    let session_name = handler.create_session("ttl-stop-wakeup").await;
+    let session_name = SessionSpec::create(&handler, "ttl-stop-wakeup").await;
     let created = create_share(
         &handler,
         CreateWebShareRequest {
@@ -336,11 +342,13 @@ async fn stopped_ttl_share_wakes_its_expiry_waiter() {
         .expiry_revoke_receiver(&created.share_id)
         .expect("TTL share has an expiry cancellation receiver");
 
-    let stopped = handler
-        .handle_ok(WebShareRequest::Stop(StopWebShareRequest {
+    let stopped = TestRequest::send_ok(
+        &handler,
+        WebShareRequest::Stop(StopWebShareRequest {
             share_id: created.share_id,
-        }))
-        .await;
+        }),
+    )
+    .await;
     assert!(matches!(
         stopped.as_ref(),
         rmux_proto::WebShareResponse::Stopped(stopped) if stopped.stopped
@@ -358,7 +366,7 @@ async fn stopped_ttl_share_wakes_its_expiry_waiter() {
 #[tokio::test]
 async fn tunnel_completion_revalidation_rejects_a_removed_target() {
     let handler = RequestHandler::new();
-    let session_name = handler.create_session("web-stale-target").await;
+    let session_name = SessionSpec::create(&handler, "web-stale-target").await;
     let resolved = handler
         .resolve_create_web_share(share_request(WebShareScope::Pane(
             PaneTarget::new(session_name.clone(), 0).into(),
@@ -366,9 +374,7 @@ async fn tunnel_completion_revalidation_rejects_a_removed_target() {
         .await
         .expect("initial target resolves");
 
-    handler
-        .handle_ok(KillSessionRequest::fixture(session_name))
-        .await;
+    TestRequest::send_ok(&handler, KillSessionRequest::fixture(session_name)).await;
 
     let state = handler.state.lock().await;
     assert!(validate_resolved_web_target(&state, resolved.target()).is_err());
@@ -379,7 +385,7 @@ async fn tunnel_completion_revalidation_rejects_a_removed_target() {
 #[tokio::test]
 async fn web_session_share_drains_initial_attach_output() {
     let handler = RequestHandler::new();
-    let session_name = handler.create_session("websession").await;
+    let session_name = SessionSpec::create(&handler, "websession").await;
     let created = create_share(
         &handler,
         CreateWebShareRequest {
@@ -412,7 +418,7 @@ async fn web_session_share_drains_initial_attach_output() {
 #[tokio::test]
 async fn web_pane_stream_resnapshots_instead_of_forwarding_cross_boundary_rep() {
     let handler = RequestHandler::new();
-    let session_name = handler.create_session("web-pane-rep").await;
+    let session_name = SessionSpec::create(&handler, "web-pane-rep").await;
     let target = PaneTarget::new(session_name.clone(), 0);
     let (output, transcript) = {
         let state = handler.state.lock().await;
@@ -487,7 +493,7 @@ async fn web_pane_stream_resnapshots_instead_of_forwarding_cross_boundary_rep() 
 #[tokio::test]
 async fn web_pane_snapshot_never_replays_scrolled_off_history() {
     let handler = RequestHandler::new();
-    let session_name = handler.create_session("web-pane-scrollback").await;
+    let session_name = SessionSpec::create(&handler, "web-pane-scrollback").await;
     let target = PaneTarget::new(session_name.clone(), 0);
     let (output, transcript) = {
         let state = handler.state.lock().await;
@@ -537,7 +543,7 @@ async fn web_pane_snapshot_never_replays_scrolled_off_history() {
 #[tokio::test]
 async fn web_session_attach_renders_rep_from_authoritative_screen_state() {
     let handler = RequestHandler::new();
-    let session_name = handler.create_session("web-session-rep").await;
+    let session_name = SessionSpec::create(&handler, "web-session-rep").await;
     let target = PaneTarget::new(session_name.clone(), 0);
     let (output, transcript) = {
         let state = handler.state.lock().await;
@@ -589,7 +595,7 @@ async fn web_session_last_exit_drains_before_daemon_shutdown() {
     let handler = RequestHandler::new();
     let (shutdown_handle, mut shutdown_rx) = ShutdownHandle::new();
     handler.install_shutdown_handle(shutdown_handle);
-    let session_name = handler.create_session("websession-exit-drain").await;
+    let session_name = SessionSpec::create(&handler, "websession-exit-drain").await;
     let created = create_share(
         &handler,
         share_request(WebShareScope::Session(session_name.clone())),
@@ -622,9 +628,7 @@ async fn web_session_last_exit_drains_before_daemon_shutdown() {
         .expect("fill the bounded in-process attach transport");
     tokio::task::yield_now().await;
 
-    handler
-        .handle_ok(KillSessionRequest::fixture(session_name))
-        .await;
+    TestRequest::send_ok(&handler, KillSessionRequest::fixture(session_name)).await;
     assert!(
         !handler.request_shutdown_if_pending(),
         "web attach wire drain must defer exit-empty shutdown"
@@ -684,7 +688,7 @@ async fn web_session_attach_reader_emits_resize_events() {
 #[tokio::test]
 async fn web_session_operator_registers_writable_attach() {
     let handler = RequestHandler::new();
-    let session_name = handler.create_session("websession-write").await;
+    let session_name = SessionSpec::create(&handler, "websession-write").await;
     let created = create_share(
         &handler,
         CreateWebShareRequest {
@@ -717,7 +721,7 @@ async fn web_session_operator_registers_writable_attach() {
 #[tokio::test]
 async fn web_session_operator_without_browser_size_keeps_status_aware_geometry() {
     let handler = RequestHandler::new();
-    let session_name = handler.create_session("websession-sizeless-operator").await;
+    let session_name = SessionSpec::create(&handler, "websession-sizeless-operator").await;
     seed_two_line_status_geometry(&handler, &session_name, 81_001).await;
 
     let created = create_share(
@@ -753,7 +757,7 @@ async fn web_session_operator_without_browser_size_keeps_status_aware_geometry()
 #[tokio::test]
 async fn web_session_spectator_share_attach_ignores_browser_size() {
     let handler = RequestHandler::new();
-    let session_name = handler.create_session("websession-read-size").await;
+    let session_name = SessionSpec::create(&handler, "websession-read-size").await;
     let created = create_share(
         &handler,
         share_request(WebShareScope::Session(session_name.clone())),
@@ -782,7 +786,7 @@ async fn web_session_spectator_share_attach_ignores_browser_size() {
 #[tokio::test]
 async fn web_session_snapshot_tracks_canonical_session_size() {
     let handler = RequestHandler::new();
-    let session_name = handler.create_session("websession-snapshot-size").await;
+    let session_name = SessionSpec::create(&handler, "websession-snapshot-size").await;
     let created = create_share(
         &handler,
         share_request(WebShareScope::Session(session_name.clone())),
@@ -819,9 +823,7 @@ async fn web_session_snapshot_tracks_canonical_session_size() {
 #[tokio::test]
 async fn web_session_snapshot_uses_content_geometry_without_reapplying_status_rows() {
     let handler = RequestHandler::new();
-    let session_name = handler
-        .create_started_session("websession-content-geometry")
-        .await;
+    let session_name = SessionSpec::create_started(&handler, "websession-content-geometry").await;
     {
         let mut state = handler.state.lock().await;
         state
@@ -834,9 +836,7 @@ async fn web_session_snapshot_uses_content_geometry_without_reapplying_status_ro
             })
             .expect("content geometry resize succeeds");
     }
-    handler
-        .handle_ok(SplitWindowRequest::fixture(&session_name))
-        .await;
+    TestRequest::send_ok(&handler, SplitWindowRequest::fixture(&session_name)).await;
     let bottom_target = PaneTarget::with_window(session_name.clone(), 0, 1);
     handler
         .wait_for_pane_startup_to_finish_for_test(&bottom_target)
@@ -928,7 +928,7 @@ async fn web_session_snapshot_uses_content_geometry_without_reapplying_status_ro
 #[tokio::test]
 async fn web_share_expiry_kills_session_after_unix_second_rounding_window() {
     let handler = RequestHandler::new();
-    let session_name = handler.create_session("websession-expire").await;
+    let session_name = SessionSpec::create(&handler, "websession-expire").await;
     create_share(
         &handler,
         CreateWebShareRequest {
@@ -959,7 +959,7 @@ async fn web_share_expiry_kills_session_after_unix_second_rounding_window() {
 #[tokio::test]
 async fn kill_session_prunes_web_session_share_before_name_reuse() {
     let handler = RequestHandler::new();
-    let session_name = handler.create_session("websession").await;
+    let session_name = SessionSpec::create(&handler, "websession").await;
     let created = create_share(
         &handler,
         CreateWebShareRequest {
@@ -972,16 +972,14 @@ async fn kill_session_prunes_web_session_share_before_name_reuse() {
     .await;
     let operator_token = operator_token(&created);
 
-    handler
-        .handle_ok(KillSessionRequest::fixture(&session_name))
-        .await;
+    TestRequest::send_ok(&handler, KillSessionRequest::fixture(&session_name)).await;
 
     assert!(
         list_shares(&handler).await.is_empty(),
         "shares for a removed session should be pruned"
     );
 
-    handler.create_session(&session_name).await;
+    SessionSpec::create(&handler, &session_name).await;
 
     let error = handler
         .open_web_share(&operator_token, None)
@@ -994,7 +992,7 @@ async fn kill_session_prunes_web_session_share_before_name_reuse() {
 #[tokio::test]
 async fn kill_session_pane_prune_preserves_recreated_name_share() {
     let handler = RequestHandler::new();
-    let session_name = handler.create_session("web-pane-session-aba").await;
+    let session_name = SessionSpec::create(&handler, "web-pane-session-aba").await;
     let (original_session_id, original_pane_id) = {
         let state = handler.state.lock().await;
         let session = state
@@ -1032,7 +1030,9 @@ async fn kill_session_pane_prune_preserves_recreated_name_share() {
     let recreate_handler = handler.clone();
     let recreate_session_name = session_name.clone();
     let recreate =
-        tokio::spawn(async move { recreate_handler.create_session(recreate_session_name).await });
+        tokio::spawn(
+            async move { SessionSpec::create(&recreate_handler, recreate_session_name).await },
+        );
     let (replacement_session_id, replacement_pane_id) = timeout(Duration::from_secs(5), async {
         loop {
             let replacement = {
@@ -1098,8 +1098,8 @@ async fn kill_session_pane_prune_preserves_recreated_name_share() {
 #[tokio::test]
 async fn kill_session_revokes_origin_pane_share_when_real_winlink_survives() {
     let handler = RequestHandler::new();
-    let owner = handler.create_session("web-pane-linked-owner").await;
-    let survivor = handler.create_session("web-pane-linked-survivor").await;
+    let owner = SessionSpec::create(&handler, "web-pane-linked-owner").await;
+    let survivor = SessionSpec::create(&handler, "web-pane-linked-survivor").await;
     let pane_id = {
         let state = handler.state.lock().await;
         state
@@ -1119,14 +1119,16 @@ async fn kill_session_revokes_origin_pane_share_when_real_winlink_survives() {
     .await;
     let token = spectator_token(&created);
 
-    handler
-        .handle_ok(LinkWindowRequest::fixture((
+    TestRequest::send_ok(
+        &handler,
+        LinkWindowRequest::fixture((
             WindowTarget::with_window(owner.clone(), 0),
             WindowTarget::with_window(survivor.clone(), 1),
-        )))
-        .await;
+        )),
+    )
+    .await;
 
-    handler.handle_ok(KillSessionRequest::fixture(owner)).await;
+    TestRequest::send_ok(&handler, KillSessionRequest::fixture(owner)).await;
 
     {
         let state = handler.state.lock().await;
@@ -1148,7 +1150,7 @@ async fn kill_session_revokes_origin_pane_share_when_real_winlink_survives() {
 #[tokio::test]
 async fn killing_last_pane_prunes_web_session_share() {
     let handler = RequestHandler::new();
-    let session_name = handler.create_session("websession-kill-pane").await;
+    let session_name = SessionSpec::create(&handler, "websession-kill-pane").await;
     let created = create_share(
         &handler,
         share_request(WebShareScope::Session(session_name.clone())),
@@ -1156,12 +1158,14 @@ async fn killing_last_pane_prunes_web_session_share() {
     .await;
     let spectator_token = spectator_token(&created);
 
-    handler
-        .handle_ok(KillPaneRequest {
+    TestRequest::send_ok(
+        &handler,
+        KillPaneRequest {
             target: PaneTarget::new(session_name.clone(), 0),
             kill_all_except: false,
-        })
-        .await;
+        },
+    )
+    .await;
 
     assert!(
         list_shares(&handler).await.is_empty(),
@@ -1179,13 +1183,15 @@ async fn killing_last_pane_prunes_web_session_share() {
 #[tokio::test]
 async fn killing_one_shared_pane_revokes_only_its_stable_share() {
     let handler = RequestHandler::new();
-    let session_name = handler.create_session("web-pane-kill").await;
-    handler
-        .handle_ok(SplitWindowRequest {
+    let session_name = SessionSpec::create(&handler, "web-pane-kill").await;
+    TestRequest::send_ok(
+        &handler,
+        SplitWindowRequest {
             direction: SplitDirection::Horizontal,
             ..Fixture::fixture(&session_name)
-        })
-        .await;
+        },
+    )
+    .await;
     let pane_id = {
         let state = handler.state.lock().await;
         state
@@ -1207,12 +1213,14 @@ async fn killing_one_shared_pane_revokes_only_its_stable_share() {
     .await;
     let token = spectator_token(&created);
 
-    handler
-        .handle_ok(KillPaneRequest {
+    TestRequest::send_ok(
+        &handler,
+        KillPaneRequest {
             target: PaneTarget::with_window(session_name, 0, 1),
             kill_all_except: false,
-        })
-        .await;
+        },
+    )
+    .await;
     assert!(list_shares(&handler).await.is_empty());
     assert!(handler.open_web_share(&token, None).await.is_err());
 }
@@ -1220,21 +1228,25 @@ async fn killing_one_shared_pane_revokes_only_its_stable_share() {
 #[tokio::test]
 async fn web_kill_pane_drains_after_kill_pane_inline_hook() {
     let handler = RequestHandler::new();
-    let session_name = handler.create_session("web-after-kill-hook").await;
-    let hook_target = handler.create_session("web-after-kill-hook-target").await;
-    handler
-        .handle_ok(SplitWindowRequest {
+    let session_name = SessionSpec::create(&handler, "web-after-kill-hook").await;
+    let hook_target = SessionSpec::create(&handler, "web-after-kill-hook-target").await;
+    TestRequest::send_ok(
+        &handler,
+        SplitWindowRequest {
             direction: SplitDirection::Horizontal,
             ..Fixture::fixture(&session_name)
-        })
-        .await;
-    handler
-        .handle_ok(SetHookRequest::fixture((
+        },
+    )
+    .await;
+    TestRequest::send_ok(
+        &handler,
+        SetHookRequest::fixture((
             ScopeSelector::Session(session_name.clone()),
             HookName::AfterKillPane,
             format!("new-window -d -t {hook_target}").as_str(),
-        )))
-        .await;
+        )),
+    )
+    .await;
     let session_target = crate::web::WebSessionTarget::new(
         session_name.clone(),
         handler.session_id_for_test(&session_name).await,
@@ -1261,12 +1273,10 @@ async fn web_kill_pane_drains_after_kill_pane_inline_hook() {
 #[tokio::test]
 async fn web_session_identity_guard_preserves_recreated_name() {
     let handler = RequestHandler::new();
-    let session_name = handler.create_session("web-session-identity-aba").await;
+    let session_name = SessionSpec::create(&handler, "web-session-identity-aba").await;
     let stale_session_id = handler.session_id_for_test(&session_name).await;
-    handler
-        .handle_ok(KillSessionRequest::fixture(&session_name))
-        .await;
-    handler.create_session(&session_name).await;
+    TestRequest::send_ok(&handler, KillSessionRequest::fixture(&session_name)).await;
+    SessionSpec::create(&handler, &session_name).await;
 
     let response = super::super::web_request_identity::with_expected_session_identity(
         session_name.clone(),
@@ -1290,7 +1300,7 @@ async fn web_session_identity_guard_preserves_recreated_name() {
 #[tokio::test]
 async fn web_window_identity_guard_preserves_recreated_slot() {
     let handler = RequestHandler::new();
-    let session_name = handler.create_session("web-window-identity-aba").await;
+    let session_name = SessionSpec::create(&handler, "web-window-identity-aba").await;
     handler
         .create_window(NewWindowRequest {
             target_window_index: Some(1),
@@ -1301,12 +1311,11 @@ async fn web_window_identity_guard_preserves_recreated_slot() {
     let stale_window_id = handler
         .window_id_for_test(&WindowTarget::with_window(session_name.clone(), 1))
         .await;
-    handler
-        .handle_ok(KillWindowRequest::fixture(WindowTarget::with_window(
-            session_name.clone(),
-            1,
-        )))
-        .await;
+    TestRequest::send_ok(
+        &handler,
+        KillWindowRequest::fixture(WindowTarget::with_window(session_name.clone(), 1)),
+    )
+    .await;
     handler
         .create_window(NewWindowRequest {
             target_window_index: Some(1),
@@ -1338,7 +1347,7 @@ async fn web_window_identity_guard_preserves_recreated_slot() {
 #[tokio::test]
 async fn renaming_session_rekeys_stable_pane_share() {
     let handler = RequestHandler::new();
-    let session_name = handler.create_session("web-pane-old").await;
+    let session_name = SessionSpec::create(&handler, "web-pane-old").await;
     let renamed = SessionName::new("web-pane-new").expect("valid session name");
     let created = create_share(
         &handler,
@@ -1349,12 +1358,14 @@ async fn renaming_session_rekeys_stable_pane_share() {
     .await;
     let token = spectator_token(&created);
 
-    handler
-        .handle_ok(RenameSessionRequest {
+    TestRequest::send_ok(
+        &handler,
+        RenameSessionRequest {
             target: session_name,
             new_name: renamed.clone(),
-        })
-        .await;
+        },
+    )
+    .await;
     let shares = list_shares(&handler).await;
     assert!(matches!(
         shares.as_slice(),
@@ -1367,7 +1378,7 @@ async fn renaming_session_rekeys_stable_pane_share() {
 #[tokio::test]
 async fn open_pane_stream_follows_session_rename_by_stable_identity() {
     let handler = RequestHandler::new();
-    let session_name = handler.create_session("web-pane-stream-old").await;
+    let session_name = SessionSpec::create(&handler, "web-pane-stream-old").await;
     let renamed = SessionName::new("web-pane-stream-new").expect("valid session name");
     let created = create_share(
         &handler,
@@ -1385,12 +1396,14 @@ async fn open_pane_stream_follows_session_rename_by_stable_identity() {
         panic!("expected pane stream");
     };
 
-    handler
-        .handle_ok(RenameSessionRequest {
+    TestRequest::send_ok(
+        &handler,
+        RenameSessionRequest {
             target: session_name,
             new_name: renamed.clone(),
-        })
-        .await;
+        },
+    )
+    .await;
 
     let current = handler
         .current_web_pane_target(pane.session_id(), pane.target())
@@ -1405,7 +1418,7 @@ async fn open_pane_stream_follows_session_rename_by_stable_identity() {
 #[tokio::test]
 async fn kill_session_on_expire_follows_renamed_session_id() {
     let handler = RequestHandler::new();
-    let session_name = handler.create_session("websession-expiry").await;
+    let session_name = SessionSpec::create(&handler, "websession-expiry").await;
     let renamed_session = SessionName::new("websession-expiry-renamed").expect("valid session");
     create_share(
         &handler,
@@ -1418,12 +1431,14 @@ async fn kill_session_on_expire_follows_renamed_session_id() {
     )
     .await;
 
-    handler
-        .handle_ok(RenameSessionRequest {
+    TestRequest::send_ok(
+        &handler,
+        RenameSessionRequest {
             target: session_name.clone(),
             new_name: renamed_session.clone(),
-        })
-        .await;
+        },
+    )
+    .await;
 
     timeout(Duration::from_secs(10), async {
         loop {
@@ -1448,13 +1463,15 @@ async fn kill_session_on_expire_follows_renamed_session_id() {
 #[tokio::test]
 async fn web_session_select_pane_uses_explicit_pane_id() {
     let handler = RequestHandler::new();
-    let session_name = handler.create_session("websession-select-pane").await;
-    handler
-        .handle_ok(SplitWindowRequest {
+    let session_name = SessionSpec::create(&handler, "websession-select-pane").await;
+    TestRequest::send_ok(
+        &handler,
+        SplitWindowRequest {
             direction: SplitDirection::Horizontal,
             ..Fixture::fixture(&session_name)
-        })
-        .await;
+        },
+    )
+    .await;
     let right_pane_id = {
         let state = handler.state.lock().await;
         state
@@ -1510,7 +1527,7 @@ async fn web_session_select_pane_uses_explicit_pane_id() {
 #[tokio::test]
 async fn web_session_operator_resize_reaches_attached_session() {
     let handler = RequestHandler::new();
-    let session_name = handler.create_session("websession-browser-resize").await;
+    let session_name = SessionSpec::create(&handler, "websession-browser-resize").await;
     let created = create_share(
         &handler,
         CreateWebShareRequest {
@@ -1579,9 +1596,7 @@ fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
 #[tokio::test]
 async fn web_session_pane_scroll_frame_degrades_when_recovery_metadata_is_bounded_out() {
     let handler = RequestHandler::new();
-    let session_name = handler
-        .create_started_session("websession-scroll-hyperlinks")
-        .await;
+    let session_name = SessionSpec::create_started(&handler, "websession-scroll-hyperlinks").await;
     let session_id = handler.session_id_for_test(&session_name).await;
     let target = PaneTarget::with_window(session_name.clone(), 0, 0);
     let (pane_id, transcript) = {
@@ -1650,9 +1665,7 @@ async fn web_session_pane_scroll_frame_degrades_when_recovery_metadata_is_bounde
 #[tokio::test]
 async fn web_session_snapshot_degrades_for_a_copy_mode_pane_with_bounded_out_metadata() {
     let handler = RequestHandler::new();
-    let session_name = handler
-        .create_started_session("websession-copy-hyperlinks")
-        .await;
+    let session_name = SessionSpec::create_started(&handler, "websession-copy-hyperlinks").await;
     let session_id = handler.session_id_for_test(&session_name).await;
     let target = PaneTarget::with_window(session_name.clone(), 0, 0);
     let transcript = {
@@ -1670,7 +1683,7 @@ async fn web_session_snapshot_degrades_for_a_copy_mode_pane_with_bounded_out_met
         .lock()
         .expect("transcript lock")
         .append_bytes(format!("\x1b]8;;{uri}\x1b\\X\x1b]8;;\x1b\\").as_bytes());
-    handler.handle_ok(CopyModeRequest::fixture(target)).await;
+    TestRequest::send_ok(&handler, CopyModeRequest::fixture(target)).await;
 
     let session_target = crate::web::WebSessionTarget::new(session_name, session_id);
     let snapshot = handler
@@ -1745,7 +1758,7 @@ async fn create_share(
 ) -> WebShareCreatedResponse {
     handler.mark_web_listener_available();
     let rmux_proto::WebShareResponse::Created(created) =
-        *handler.handle_ok(WebShareRequest::Create(request)).await
+        *TestRequest::send_ok(handler, WebShareRequest::Create(request)).await
     else {
         panic!("expected created web-share response");
     };
@@ -1791,9 +1804,8 @@ fn unused_web_port() -> u16 {
 }
 
 async fn list_shares(handler: &RequestHandler) -> Vec<rmux_proto::WebShareSummary> {
-    let rmux_proto::WebShareResponse::List(listed) = *handler
-        .handle_ok(WebShareRequest::List(ListWebSharesRequest))
-        .await
+    let rmux_proto::WebShareResponse::List(listed) =
+        *TestRequest::send_ok(handler, WebShareRequest::List(ListWebSharesRequest)).await
     else {
         panic!("expected listed web-share response");
     };

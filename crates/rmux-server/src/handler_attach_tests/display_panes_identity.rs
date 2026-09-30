@@ -1,6 +1,7 @@
 use super::*;
 
 use crate::handler::scripting_support::QueueExecutionContext;
+use crate::test_fixtures::TestRequest;
 
 async fn arm_display_panes(
     handler: &RequestHandler,
@@ -64,27 +65,27 @@ async fn display_panes_default_selection_rejects_a_relinked_window_occurrence() 
     let requester_pid = std::process::id();
     let session = session_name("display-panes-relinked-occurrence");
     let _control_rx = create_attached_session(&handler, requester_pid, &session).await;
-    handler
-        .handle_ok(SplitWindowRequest::fixture(&session))
-        .await;
-    handler
-        .handle_ok(SelectPaneRequest::fixture(PaneTarget::with_window(
-            session.clone(),
-            0,
-            0,
-        )))
-        .await;
-    handler
-        .handle_ok(LinkWindowRequest::fixture((
+    TestRequest::send_ok(&handler, SplitWindowRequest::fixture(&session)).await;
+    TestRequest::send_ok(
+        &handler,
+        SelectPaneRequest::fixture(PaneTarget::with_window(session.clone(), 0, 0)),
+    )
+    .await;
+    TestRequest::send_ok(
+        &handler,
+        LinkWindowRequest::fixture((
             WindowTarget::with_window(session.clone(), 0),
             WindowTarget::with_window(session.clone(), 2),
-        )))
-        .await;
-    handler
-        .handle_ok(SelectWindowRequest {
+        )),
+    )
+    .await;
+    TestRequest::send_ok(
+        &handler,
+        SelectWindowRequest {
             target: WindowTarget::with_window(session.clone(), 2),
-        })
-        .await;
+        },
+    )
+    .await;
 
     arm_display_panes(&handler, requester_pid, session.clone(), None, None).await;
     let label = displayed_label_for_pane(&handler, requester_pid, 1).await;
@@ -124,9 +125,7 @@ async fn display_panes_command_rejects_a_reused_pane_slot() {
     let requester_pid = std::process::id();
     let session = session_name("display-panes-pane-slot-aba");
     let _control_rx = create_attached_session(&handler, requester_pid, &session).await;
-    handler
-        .handle_ok(SplitWindowRequest::fixture(&session))
-        .await;
+    TestRequest::send_ok(&handler, SplitWindowRequest::fixture(&session)).await;
     arm_display_panes(
         &handler,
         requester_pid,
@@ -139,16 +138,17 @@ async fn display_panes_command_rejects_a_reused_pane_slot() {
 
     tokio::time::timeout(
         std::time::Duration::from_secs(5),
-        handler.handle_ok(rmux_proto::KillPaneRequest {
-            target: PaneTarget::with_window(session.clone(), 0, 1),
-            kill_all_except: false,
-        }),
+        TestRequest::send_ok(
+            &handler,
+            rmux_proto::KillPaneRequest {
+                target: PaneTarget::with_window(session.clone(), 0, 1),
+                kill_all_except: false,
+            },
+        ),
     )
     .await
     .expect("kill-pane must not wait behind its prepared selection notifications");
-    handler
-        .handle_ok(SplitWindowRequest::fixture(&session))
-        .await;
+    TestRequest::send_ok(&handler, SplitWindowRequest::fixture(&session)).await;
 
     let result = handler
         .handle_attached_live_input_for_test(requester_pid, label.as_bytes())
@@ -173,11 +173,11 @@ async fn display_panes_command_rejects_a_respawned_pane_generation() {
     .await;
     let label = displayed_label_for_pane(&handler, requester_pid, 0).await;
 
-    handler
-        .handle_ok(rmux_proto::RespawnPaneRequest::fixture(
-            PaneTarget::with_window(session, 0, 0),
-        ))
-        .await;
+    TestRequest::send_ok(
+        &handler,
+        rmux_proto::RespawnPaneRequest::fixture(PaneTarget::with_window(session, 0, 0)),
+    )
+    .await;
 
     let result = handler
         .handle_attached_live_input_for_test(requester_pid, label.as_bytes())
@@ -220,9 +220,11 @@ async fn display_panes_target_client_does_not_bypass_the_queued_lifecycle_lease(
         .expect("targeted display-panes arms while the lease is live");
     let label = displayed_label_for_pane(&handler, target_pid, 0).await;
 
-    handler
-        .handle_ok(rmux_proto::RespawnPaneRequest::fixture(lifecycle_target))
-        .await;
+    TestRequest::send_ok(
+        &handler,
+        rmux_proto::RespawnPaneRequest::fixture(lifecycle_target),
+    )
+    .await;
 
     let result = handler
         .handle_attached_live_input_for_test(target_pid, label.as_bytes())

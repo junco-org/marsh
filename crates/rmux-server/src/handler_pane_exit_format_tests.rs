@@ -2,7 +2,7 @@ use super::RequestHandler;
 use rmux_proto::{OptionName, PaneTarget, RespawnPaneRequest, ScopeSelector};
 use tokio::time::Duration;
 
-use crate::test_fixtures::{wait_until, Fixture};
+use crate::test_fixtures::{wait_until, Fixture, SessionSpec, TestRequest};
 use crate::test_names::session_name;
 
 #[tokio::test]
@@ -11,7 +11,7 @@ async fn display_message_pane_dead_observes_exited_child_promptly() {
     let alpha = session_name("alpha");
     let target = PaneTarget::with_window(alpha.clone(), 0, 0);
 
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
     handler
         .set_option(
             ScopeSelector::Pane(target.clone()),
@@ -19,12 +19,14 @@ async fn display_message_pane_dead_observes_exited_child_promptly() {
             "on",
         )
         .await;
-    handler
-        .handle_ok(RespawnPaneRequest {
+    TestRequest::send_ok(
+        &handler,
+        RespawnPaneRequest {
             command: Some(vec!["true".to_owned()]),
             ..Fixture::fixture(&target)
-        })
-        .await;
+        },
+    )
+    .await;
 
     wait_until(
         Duration::from_secs(5),

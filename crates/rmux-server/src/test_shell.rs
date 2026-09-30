@@ -13,10 +13,6 @@ pub(crate) fn sh_quote_path(path: &Path) -> String {
 }
 
 pub(crate) fn stdin_discard_command() -> String {
-    platform_stdin_discard_command()
-}
-
-fn platform_stdin_discard_command() -> String {
     "cat >/dev/null".to_owned()
 }
 

@@ -1,4 +1,5 @@
 use super::*;
+use crate::test_fixtures::TestRequest;
 
 #[tokio::test]
 async fn live_attach_bracketed_paste_strips_wrappers_when_pane_mode_is_off() {
@@ -73,9 +74,11 @@ async fn live_attach_bracketed_paste_is_consumed_without_pane_leak_in_copy_mode(
     let requester_pid = std::process::id();
 
     create_quiet_input_session(&handler, &alpha).await;
-    handler
-        .handle_ok(CopyModeRequest::fixture(PaneTarget::new(alpha.clone(), 0)))
-        .await;
+    TestRequest::send_ok(
+        &handler,
+        CopyModeRequest::fixture(PaneTarget::new(alpha.clone(), 0)),
+    )
+    .await;
 
     let _control_rx = handler.attach_client(requester_pid, &alpha).await;
 
@@ -99,9 +102,11 @@ async fn live_attach_chunked_bracketed_paste_is_consumed_without_pane_leak_in_co
     let requester_pid = std::process::id();
 
     create_quiet_input_session(&handler, &alpha).await;
-    handler
-        .handle_ok(CopyModeRequest::fixture(PaneTarget::new(alpha.clone(), 0)))
-        .await;
+    TestRequest::send_ok(
+        &handler,
+        CopyModeRequest::fixture(PaneTarget::new(alpha.clone(), 0)),
+    )
+    .await;
 
     let _control_rx = handler.attach_client(requester_pid, &alpha).await;
 

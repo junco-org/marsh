@@ -146,12 +146,11 @@ use startup::{
     startup_config_from_cli, startup_config_from_top_level_scan,
 };
 use target_resolution::{
-    list_session_names, listed_pane_index_matches_target, resolve_current_pane_target,
-    resolve_current_session_target, resolve_existing_window_target_or_current,
-    resolve_pane_target_or_current, resolve_pane_target_spec, resolve_session_target_or_current,
+    CommandTarget, list_session_names, listed_pane_index_matches_target,
+    resolve_current_pane_target, resolve_current_session_target,
+    resolve_existing_window_target_or_current, resolve_pane_target_spec,
     resolve_session_target_spec, resolve_target_spec,
-    resolve_window_index_target_or_current_session, resolve_window_target_or_current,
-    resolve_window_target_spec,
+    resolve_window_index_target_or_current_session, resolve_window_target_spec,
 };
 use terminal_size::{build_terminal_size, current_terminal_size};
 use top_level::{

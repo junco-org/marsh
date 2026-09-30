@@ -139,7 +139,16 @@ impl ExecutionParameters {
             openfiles::OpenFileEntry::NotSpecified => {
                 // We didn't have this fd specified one way or the other; we fallback
                 // to what's represented in the shell's open files.
-                shell.persistent_open_files().try_fd(fd).cloned()
+                let file = shell.persistent_open_files().try_fd(fd).cloned();
+                if let Some(openfiles::OpenFile::File(kept)) = &file {
+                    extensions::ExecutionObserver::host_access(
+                        shell.execution_observer(),
+                        extensions::HostAccess::Descriptor {
+                            fd: std::os::fd::AsRawFd::as_raw_fd(kept),
+                        },
+                    );
+                }
+                file
             }
         }
     }
@@ -1691,7 +1700,10 @@ pub(crate) async fn setup_redirect(
                             {
                                 // First check to see if the path points to an existing regular
                                 // file.
-                                if !expanded_file_path.is_file() {
+                                if !crate::hostfs::is_file(
+                                    shell.execution_observer(),
+                                    &expanded_file_path,
+                                ) {
                                     options.create(true);
                                 } else {
                                     options.create_new(true);

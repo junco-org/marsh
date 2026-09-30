@@ -1,5 +1,6 @@
 use super::*;
 use crate::handler::overlay_support::ClientOverlayState;
+use crate::test_fixtures::{SessionSpec, TestRequest};
 
 async fn open_help(
     handler: &RequestHandler,
@@ -453,7 +454,7 @@ async fn attached_help_rename_rekeys_and_switch_closes_instead_of_rerouting() {
     let beta = session_name("help-beta");
     let gamma = session_name("help-gamma");
     let mut control_rx = create_attached_session(&handler, attach_pid, &alpha).await;
-    handler.create_session(&beta).await;
+    SessionSpec::create(&handler, &beta).await;
     drain_attach_controls(&mut control_rx);
 
     let _ = open_help(&handler, attach_pid, &mut control_rx).await;
@@ -466,12 +467,14 @@ async fn attached_help_rename_rekeys_and_switch_closes_instead_of_rerouting() {
     )
     .await;
     let offset_before = help_scroll_state(&handler, attach_pid).await.0;
-    handler
-        .handle_ok(RenameSessionRequest {
+    TestRequest::send_ok(
+        &handler,
+        RenameSessionRequest {
             target: alpha,
             new_name: gamma.clone(),
-        })
-        .await;
+        },
+    )
+    .await;
     {
         let active_attach = handler.active_attach.lock().await;
         let active = &active_attach.by_pid[&attach_pid];

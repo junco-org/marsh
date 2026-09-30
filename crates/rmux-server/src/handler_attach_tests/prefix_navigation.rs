@@ -1,4 +1,5 @@
 use super::*;
+use crate::test_fixtures::TestRequest;
 
 #[tokio::test]
 async fn attached_prefix_right_dispatches_select_pane_right() {
@@ -6,18 +7,19 @@ async fn attached_prefix_right_dispatches_select_pane_right() {
     let requester_pid = std::process::id();
     let alpha = session_name("alpha");
     let _control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
-    handler
-        .handle_ok(SplitWindowRequest {
+    TestRequest::send_ok(
+        &handler,
+        SplitWindowRequest {
             direction: rmux_proto::SplitDirection::Horizontal,
             ..Fixture::fixture(&alpha)
-        })
-        .await;
-    handler
-        .handle_ok(SelectPaneRequest::fixture(PaneTarget::new(
-            alpha.clone(),
-            0,
-        )))
-        .await;
+        },
+    )
+    .await;
+    TestRequest::send_ok(
+        &handler,
+        SelectPaneRequest::fixture(PaneTarget::new(alpha.clone(), 0)),
+    )
+    .await;
 
     handler
         .handle_attached_live_input_for_test(requester_pid, b"\x02\x1b[C")
@@ -99,12 +101,14 @@ async fn attached_prefix_o_cycles_to_the_next_pane() {
     let requester_pid = std::process::id();
     let alpha = session_name("alpha");
     let _control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
-    handler
-        .handle_ok(SplitWindowRequest {
+    TestRequest::send_ok(
+        &handler,
+        SplitWindowRequest {
             direction: rmux_proto::SplitDirection::Horizontal,
             ..Fixture::fixture(&alpha)
-        })
-        .await;
+        },
+    )
+    .await;
 
     handler
         .handle_attached_live_input_for_test(requester_pid, b"\x02o")
@@ -138,7 +142,7 @@ async fn attached_prefix_meta_digits_select_tmux_layout_presets() {
         }
     });
     for _ in 0..2 {
-        handler.handle_ok(SplitWindowRequest::fixture(&alpha)).await;
+        TestRequest::send_ok(&handler, SplitWindowRequest::fixture(&alpha)).await;
     }
 
     for (bytes, expected_layout, starting_layout) in [
@@ -190,7 +194,7 @@ async fn attached_select_layout_main_horizontal_binding_command_executes() {
     let alpha = session_name("alpha");
     let _control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
     for _ in 0..2 {
-        handler.handle_ok(SplitWindowRequest::fixture(&alpha)).await;
+        TestRequest::send_ok(&handler, SplitWindowRequest::fixture(&alpha)).await;
     }
     select_layout(&handler, &alpha, LayoutName::Tiled).await;
 
@@ -216,7 +220,7 @@ async fn attached_prefix_meta_digit_dispatch_survives_escape_split_across_reads(
     let alpha = session_name("alpha");
     let _control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
     for _ in 0..2 {
-        handler.handle_ok(SplitWindowRequest::fixture(&alpha)).await;
+        TestRequest::send_ok(&handler, SplitWindowRequest::fixture(&alpha)).await;
     }
 
     select_layout(&handler, &alpha, LayoutName::Tiled).await;
@@ -255,7 +259,7 @@ async fn attached_prefix_space_cycles_next_layout_using_current_window_target() 
     let alpha = session_name("alpha");
     let _control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
     for _ in 0..2 {
-        handler.handle_ok(SplitWindowRequest::fixture(&alpha)).await;
+        TestRequest::send_ok(&handler, SplitWindowRequest::fixture(&alpha)).await;
     }
 
     select_layout(&handler, &alpha, LayoutName::Tiled).await;
@@ -278,7 +282,7 @@ async fn attached_prefix_q_emits_a_display_panes_overlay() {
     let requester_pid = std::process::id();
     let alpha = session_name("alpha");
     let mut control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
-    handler.handle_ok(SplitWindowRequest::fixture(&alpha)).await;
+    TestRequest::send_ok(&handler, SplitWindowRequest::fixture(&alpha)).await;
     drain_attach_controls(&mut control_rx);
 
     handler

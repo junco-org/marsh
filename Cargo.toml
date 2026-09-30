@@ -23,11 +23,6 @@ name = "rmux"
 path = "src/rmux/main.rs"
 bench = false
 
-[[bin]]
-name = "marsh-trace"
-path = "src/trace/main.rs"
-bench = false
-
 [features]
 default = ["web"]
 web = ["rmux-server/web"]
@@ -80,7 +75,7 @@ brush-builtins.workspace = true
 marsh-btrfs = { path = "crates/marsh-btrfs", features = ["fake"] }
 marsh-wal = { path = "crates/marsh-wal" }
 # Routing predicates that query a source's shared authority name its events directly.
-junco-rust-validator = { path = "../junco-policy" }
+junco-policy = { path = "../junco-policy" }
 # The WAL smoke's own transaction metadata derives its serde implementations.
 serde = { version = "1", features = ["derive"] }
 git2 = { version = "0.21", default-features = false, features = ["vendored-libgit2"] }

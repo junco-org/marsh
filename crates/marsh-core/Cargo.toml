@@ -44,16 +44,15 @@ libc = "0.2"
 nix = { version = "0.31.2", features = ["fs", "term"] }
 # The capability policy every staged line is checked against before it is published. The sibling
 # checkout is the authored source of the action predicates the git builtin classifies with.
-junco-rust-validator = { path = "../../../junco-policy" }
+junco-policy = { path = "../../../junco-policy" }
 
 [dev-dependencies]
 marsh-btrfs = { path = "../marsh-btrfs", features = ["fake"] }
-marsh-instrument = { path = "../marsh-instrument", features = ["testing"] }
 tempfile = "3.27.0"
 hex = "0.4"
 serial_test = "3"
 sha1 = "0.10"
-tokio = { version = "1.52.3", features = ["macros", "time"] }
+tokio = { version = "1.52.3", features = ["macros", "test-util", "time"] }
 
 [lints]
 workspace = true

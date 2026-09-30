@@ -1,5 +1,6 @@
 use super::*;
 
+use crate::test_fixtures::{SessionSpec, TestRequest};
 use rmux_core::PaneGeometry;
 use rmux_proto::{LayoutName, SelectLayoutRequest, SelectLayoutTarget};
 
@@ -12,14 +13,16 @@ enum OracleApplication {
 async fn select_layout_fixture(name: &str) -> (RequestHandler, SessionName) {
     let handler = RequestHandler::new();
     let session = session_name(name);
-    handler.create_session(&session).await;
+    SessionSpec::create(&handler, &session).await;
 
-    handler
-        .handle_ok(SplitWindowRequest {
+    TestRequest::send_ok(
+        &handler,
+        SplitWindowRequest {
             direction: SplitDirection::Horizontal,
             ..Fixture::fixture(PaneTarget::with_window(session.clone(), 0, 0))
-        })
-        .await;
+        },
+    )
+    .await;
 
     let selected = handler
         .handle(Request::SelectLayout(SelectLayoutRequest {
@@ -312,12 +315,14 @@ async fn run_shell_commands_select_layout_cluster_body() {
             OracleApplication::Repeated,
         ),
     ] {
-        handler
-            .handle_ok(RunShellRequest {
+        TestRequest::send_ok(
+            &handler,
+            RunShellRequest {
                 as_commands: true,
                 ..Fixture::fixture(command)
-            })
-            .await;
+            },
+        )
+        .await;
         assert_oracle_layout(&handler, &session, application).await;
         assert_buffer(&handler, buffer).await;
     }

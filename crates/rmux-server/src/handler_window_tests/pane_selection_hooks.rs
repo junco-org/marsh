@@ -1,11 +1,10 @@
 use super::*;
+use crate::test_fixtures::TestRequest;
 
 async fn selection_hook_fixture(label: &str) -> (RequestHandler, SessionName) {
     let handler = RequestHandler::new();
     let session = create_session(&handler, label).await;
-    handler
-        .handle_ok(SplitWindowRequest::fixture(&session))
-        .await;
+    TestRequest::send_ok(&handler, SplitWindowRequest::fixture(&session)).await;
     handler
         .state
         .lock()
@@ -57,11 +56,11 @@ async fn direct_select_hook_requires_an_active_pane_change() {
     let (handler, session) = selection_hook_fixture("hook-direct-change").await;
     install_after_select_probe(&handler, "hook-direct-change").await;
 
-    handler
-        .handle_ok(SelectPaneRequest::fixture(PaneTarget::with_window(
-            session, 0, 1,
-        )))
-        .await;
+    TestRequest::send_ok(
+        &handler,
+        SelectPaneRequest::fixture(PaneTarget::with_window(session, 0, 1)),
+    )
+    .await;
     assert_probe(&handler, "hook-direct-change", true).await;
 }
 
@@ -91,13 +90,15 @@ async fn direct_select_noop_title_and_input_mutations_do_not_run_hook() {
             "fixture active pane changed before {label}"
         );
 
-        handler
-            .handle_ok(SelectPaneRequest {
+        TestRequest::send_ok(
+            &handler,
+            SelectPaneRequest {
                 title,
                 input_disabled,
                 ..Fixture::fixture(PaneTarget::with_window(session, 0, target_pane))
-            })
-            .await;
+            },
+        )
+        .await;
         assert_probe(&handler, &buffer_name, false).await;
     }
 }

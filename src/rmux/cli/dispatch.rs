@@ -4,7 +4,7 @@ use std::path::Path;
 use rmux_client::{ClientError, Connection};
 use rmux_proto::{
     ClientTerminalContext, CopyModeRequest, ErrorResponse, INTERNAL_PARSE_TIME_ASSIGNMENTS_PATH,
-    LayoutName, Response, SelectLayoutTarget, WindowTarget,
+    LayoutName, PaneTarget, Response, SelectLayoutTarget, SessionName, WindowTarget,
 };
 
 use super::attach_transport::{
@@ -43,10 +43,7 @@ use super::server_commands::{
 use super::session_commands::{
     run_has_session, run_kill_session, run_list_sessions, run_new_session, run_rename_session,
 };
-use super::target_resolution::{
-    connect_cli, resolve_canfail_pane_target_spec, resolve_optional_pane_target,
-    resolve_window_target_or_current, run_targeted,
-};
+use super::target_resolution::{CommandTarget, connect_cli, resolve_canfail_pane_target_spec};
 use super::web_commands::run_web_share;
 use super::window_commands::{
     run_kill_window, run_last_window, run_link_window, run_list_windows, run_move_window,
@@ -377,7 +374,7 @@ fn dispatch(
         Command::BreakPane(args) => run_break_pane(args, socket_path),
         Command::PipePane(args) => run_pipe_pane(args, socket_path),
         Command::RespawnPane(args) => run_respawn_pane(args, socket_path),
-        Command::KillPane(args) => run_targeted(
+        Command::KillPane(args) => PaneTarget::run(
             socket_path,
             "kill-pane",
             args.target.as_ref(),
@@ -387,13 +384,13 @@ fn dispatch(
             let target = args.target.as_ref();
             match (args.mode(), args.layout) {
                 (None, None) => run_select_layout_noop(target, socket_path),
-                (None, Some(layout)) => run_targeted(
+                (None, Some(layout)) => WindowTarget::run(
                     socket_path,
                     "select-layout",
                     target,
                     |connection, window| select_named_layout(connection, window, layout),
                 ),
-                (Some(mode), layout) => run_targeted(
+                (Some(mode), layout) => WindowTarget::run(
                     socket_path,
                     "select-layout",
                     target,
@@ -401,7 +398,7 @@ fn dispatch(
                 ),
             }
         }
-        Command::NextLayout(args) => run_targeted(
+        Command::NextLayout(args) => WindowTarget::run(
             socket_path,
             "next-layout",
             args.target.as_ref(),
@@ -409,7 +406,7 @@ fn dispatch(
         ),
         Command::PreviousLayout(args) => {
             let target = args.target.as_ref();
-            run_targeted(
+            WindowTarget::run(
                 socket_path,
                 "previous-layout",
                 target,
@@ -419,7 +416,7 @@ fn dispatch(
         Command::ResizePane(args) => run_resize_pane(&args, socket_path),
         Command::DisplayPanes(args) => {
             let template = args.template_command();
-            run_targeted(socket_path, "display-panes", None, |connection, session| {
+            SessionName::run(socket_path, "display-panes", None, |connection, session| {
                 connection.display_panes_target_client(
                     session,
                     args.duration_ms,
@@ -434,8 +431,10 @@ fn dispatch(
         Command::SelectPane(args) => run_select_pane(args, socket_path),
         Command::CopyMode(args) => {
             run_command_resolved(socket_path, "copy-mode", move |connection| {
-                let target = resolve_optional_pane_target(connection, args.target.as_ref())?;
-                let source = resolve_optional_pane_target(connection, args.source.as_ref())?;
+                let target =
+                    Option::<PaneTarget>::resolve(connection, args.target.as_ref(), "copy-mode")?;
+                let source =
+                    Option::<PaneTarget>::resolve(connection, args.source.as_ref(), "copy-mode")?;
                 connection
                     .copy_mode(CopyModeRequest {
                         target,
@@ -451,7 +450,7 @@ fn dispatch(
                     .map_err(ExitFailure::from)
             })
         }
-        Command::ClockMode(args) => run_targeted(
+        Command::ClockMode(args) => Option::<PaneTarget>::run(
             socket_path,
             "clock-mode",
             args.target.as_ref(),
@@ -551,7 +550,7 @@ fn dispatch(
         }
         Command::PasteBuffer(args) => {
             let target = args.target.as_ref();
-            run_targeted(socket_path, "paste-buffer", target, |connection, pane| {
+            PaneTarget::run(socket_path, "paste-buffer", target, |connection, pane| {
                 connection.paste_buffer(
                     args.name,
                     pane,
@@ -589,7 +588,7 @@ fn dispatch(
         }
         Command::ClearHistory(args) => {
             let target = args.target.as_ref();
-            run_targeted(socket_path, "clear-history", target, |connection, pane| {
+            PaneTarget::run(socket_path, "clear-history", target, |connection, pane| {
                 connection.clear_history(pane, args.reset_hyperlinks)
             })
         }
@@ -717,7 +716,7 @@ fn run_select_layout_noop(
     socket_path: &Path,
 ) -> Result<i32, ExitFailure> {
     let mut connection = connect_cli(socket_path)?;
-    resolve_window_target_or_current(&mut connection, target, "select-layout")?;
+    WindowTarget::resolve(&mut connection, target, "select-layout")?;
     Ok(0)
 }
 

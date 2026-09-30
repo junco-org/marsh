@@ -1,4 +1,5 @@
 use super::*;
+use crate::test_fixtures::{SessionSpec, TestRequest};
 
 async fn create_window_listing_fixture(handler: &RequestHandler) {
     for (session, size, first_name, second_name) in [
@@ -18,13 +19,15 @@ async fn create_window_listing_fixture(handler: &RequestHandler) {
             "berry",
         ),
     ] {
-        let session = handler.create_session((session, size)).await;
-        handler
-            .handle_ok(rmux_proto::RenameWindowRequest {
+        let session = SessionSpec::create(handler, (session, size)).await;
+        TestRequest::send_ok(
+            handler,
+            rmux_proto::RenameWindowRequest {
                 target: WindowTarget::with_window(session.clone(), 0),
                 name: first_name.to_owned(),
-            })
-            .await;
+            },
+        )
+        .await;
         handler
             .create_window(NewWindowRequest {
                 name: Some(second_name.to_owned()),

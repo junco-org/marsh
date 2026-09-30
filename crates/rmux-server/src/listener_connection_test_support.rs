@@ -11,7 +11,7 @@ use super::*;
 
 use rmux_proto::{NewSessionExtRequest, PaneTarget, TerminalSize};
 
-use crate::test_fixtures::{quiet_command, Fixture};
+use crate::test_fixtures::{quiet_command, Fixture, SessionSpec};
 
 /// Async client end of the connection under test.
 pub(super) type TestClientStream = LocalStream;
@@ -122,12 +122,14 @@ pub(super) async fn start_quiet_pane_sized(
     name: &str,
     size: TerminalSize,
 ) -> PaneTarget {
-    let session = handler
-        .create_started_session(NewSessionExtRequest {
+    let session = SessionSpec::create_started(
+        handler,
+        NewSessionExtRequest {
             size: Some(size),
             command: Some(quiet_command()),
             ..Fixture::fixture(name)
-        })
-        .await;
+        },
+    )
+    .await;
     PaneTarget::with_window(session, 0, 0)
 }

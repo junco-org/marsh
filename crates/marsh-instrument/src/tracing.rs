@@ -1,31 +1,43 @@
-//! Shell attribution over native observation callbacks. No syscall decoder lives here.
+//! Shell attribution over in-process native observation. No syscall decoder lives here.
+//!
+//! Linux lets a process trace its own descendants but never its own threads. Every command a
+//! managed run spawns is therefore seized, before it can run anything of its own, by a tracer
+//! thread of this process that owns exactly that command's process tree; the interpreter's own
+//! filesystem accesses arrive instead as host records it reports right after making them. Both
+//! are attributed through the scopes the host enters on its threads.
 
-use std::collections::{HashMap, HashSet, VecDeque};
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
+use std::io::{self, Read, Write};
 use std::marker::PhantomData;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::os::unix::net::UnixStream;
-use std::os::unix::process::CommandExt;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::Syscall;
+use crate::capture::proc_field;
+use crate::host::{HostCall, records};
+use crate::observation::{Observer, Sequence, alive, creation, rekey};
+use lurk_cli::syscall_info::{RetCode, SyscallArgs, SyscallInfo};
 use marsh_lib::{CheckedAdvance, RecoverPoison as _};
 use nix::errno::Errno;
 use nix::sys::ptrace::Event;
+use nix::sys::signal::Signal;
 use nix::sys::wait::WaitStatus;
 use nix::unistd::Pid;
-use syscalls::Sysno;
+use syscalls::{Sysno, SysnoSet};
 
-use crate::capture::proc_field;
-use crate::helper::{FRAME_LIMIT, PRELUDE};
-use crate::observation::{alive, creation, rekey};
+/// The published generation; a weak that no longer upgrades admits a new one.
+static SHARED: Mutex<Option<Weak<Tracing>>> = Mutex::new(None);
 
-const DEADLINE: Duration = Duration::from_secs(10);
-static SHARED: Mutex<Weak<Tracing>> = Mutex::new(Weak::new());
+thread_local! {
+    /// Scopes entered on this host thread, innermost last: service, scope and attribution.
+    static ENTERED: RefCell<Vec<(usize, ScopeId, Option<Target>)>> =
+        const { RefCell::new(Vec::new()) };
+}
 
 /// Opaque registration identity. Never reused within a service.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -35,7 +47,7 @@ pub struct RootId(u64);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct InvocationId(u64);
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct ScopeId(u64);
 
 /// One evaluation's attribution identity, separate from native syscall evidence.
@@ -54,7 +66,7 @@ impl TraceRun {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Target {
     run: TraceRun,
     builtin: Option<InvocationId>,
@@ -65,26 +77,10 @@ struct Root {
     observe: Arc<dyn Fn(TraceRun, Option<InvocationId>, Syscall) -> io::Result<()> + Send + Sync>,
 }
 
-/// A process identity pinned in the helper before its stopped task resumed.
+/// A traced process's identity, pinned while one of its tasks was stopped.
 struct ProcessLease {
     descriptor: OwnedFd,
-    group: Option<Pid>,
-}
-impl ProcessLease {
-    fn receive(descriptor: OwnedFd) -> io::Result<Self> {
-        let group = proc_field::<i32>(
-            format!("/proc/self/fdinfo/{}", descriptor.as_raw_fd()),
-            "Pid:",
-        )?
-        .ok_or_else(|| io::Error::other("helper supplied a non-pidfd identity"))?;
-        if group == 0 || group < -1 {
-            return Err(io::Error::other("invalid pidfd identity"));
-        }
-        Ok(Self {
-            descriptor,
-            group: (group > 0).then(|| Pid::from_raw(group)),
-        })
-    }
+    group: Pid,
 }
 
 /// A stop buffered until its thread's creator is known: sequence, status, event and record.
@@ -92,39 +88,31 @@ type Early = (u64, i32, Option<u64>, Option<Syscall>);
 
 #[derive(Default)]
 struct Thread {
-    stack: Vec<(ScopeId, Option<Target>)>,
     inherited: Option<Target>,
-    host: bool,
     known_parent: bool,
     process: Option<ProcessLease>,
     pending: Option<(u64, Option<Target>)>,
     classify_after: Option<u64>,
     early: Vec<Early>,
+    /// Whether the task's last stop was a job-control (group) stop.
+    job_stopped: bool,
 }
 
 impl Thread {
-    fn target(&self) -> Option<Target> {
-        self.stack
-            .last()
-            .map_or(self.inherited, |(_, target)| *target)
-    }
-
-    /// Kills a non-host producer through its pinned process identity.
+    /// Kills the task's process through its pinned identity.
     fn kill(&self) -> io::Result<()> {
-        if !self.host
-            && let Some(process) = &self.process
-        {
+        if let Some(process) = &self.process {
             signal_process(&process.descriptor, libc::SIGKILL)?;
         }
         Ok(())
     }
 }
 
+/// A workload scope's native order window.
 struct Scope {
-    target: Option<Target>,
+    target: Target,
     first: Option<u64>,
     last: Option<u64>,
-    retired: bool,
 }
 
 #[derive(Default)]
@@ -141,7 +129,6 @@ struct State {
     scopes: HashMap<ScopeId, Scope>,
     threads: HashMap<Pid, Thread>,
     deferred: HashMap<u64, Vec<(Target, Syscall)>>,
-    barriers: HashMap<u64, bool>,
     failure: Option<String>,
 }
 
@@ -180,17 +167,6 @@ impl State {
     fn cancelled(&self, target: Option<Target>) -> bool {
         target.is_some_and(|target| self.runs.get(&target.run).is_some_and(|run| run.cancelled))
     }
-
-    /// Forgets a retired internal scope once no thread's stack still holds it.
-    fn release(&mut self, id: ScopeId) {
-        if !self
-            .threads
-            .values()
-            .any(|thread| thread.stack.iter().any(|(scope, _)| *scope == id))
-        {
-            self.scopes.remove(&id);
-        }
-    }
 }
 
 /// Locks trace bookkeeping, recovering the guard from a panicked holder.
@@ -198,92 +174,68 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().recover()
 }
 
-/// The monitor thread's startup report: the helper's pinned identity and its release pipe.
-type Startup = io::Result<(Arc<OwnedFd>, std::process::ChildStdin)>;
+/// What a traced command's own process does, as its spawner needs to know it.
+#[derive(Clone, Copy, Debug)]
+pub enum ChildEvent {
+    /// The process entered a job-control stop.
+    Stopped,
+    /// The process ended; its status was reaped by the tracer.
+    Exited(std::process::ExitStatus),
+}
 
-struct Service {
-    process: Arc<OwnedFd>,
-    socket: UnixStream,
-    expected: Arc<AtomicBool>,
-    receiver: Option<std::thread::JoinHandle<()>>,
-    monitor: Option<std::thread::JoinHandle<()>>,
+/// A command spawned under observation. Its tracer reaps it: never wait on its pid elsewhere.
+pub struct TracedChild {
+    /// The process id.
+    pub pid: u32,
+    /// A pidfd pinning the process, for signalling it.
+    pub process: OwnedFd,
 }
 
 /// The host's shared native observation service; Shell owns every registration and run.
 pub struct Tracing {
-    lifecycle: Mutex<()>,
     state: Mutex<State>,
     progress: Condvar,
-    service: Mutex<Option<Service>>,
-    active: AtomicBool,
-    prefix: String,
-    #[cfg(feature = "testing")]
-    internal_records: Mutex<Option<Vec<Syscall>>>,
+    sequence: Arc<Sequence>,
+    selected: SysnoSet,
 }
 
 impl Tracing {
-    /// Shares the live service, or creates a fresh idle generation after its last owner closes.
-    pub fn shared() -> Arc<Self> {
+    /// Shares the live service, or starts a new generation once the previous one is gone.
+    ///
+    /// # Errors
+    /// Returns a live generation's recorded failure.
+    pub fn shared() -> io::Result<Arc<Self>> {
         let mut shared = lock(&SHARED);
-        if let Some(tracing) = shared.upgrade() {
-            return tracing;
+        if let Some(tracing) = shared.as_ref().and_then(Weak::upgrade) {
+            // Never drop a possibly-final owner while holding the cache.
+            drop(shared);
+            let health = lock(&tracing.state).check();
+            return health.map(|()| tracing);
         }
         let tracing = Arc::new(Self {
-            lifecycle: Mutex::new(()),
             state: Mutex::new(State::default()),
             progress: Condvar::new(),
-            service: Mutex::new(None),
-            active: AtomicBool::new(false),
-            prefix: format!("/proc/self/marsh-trace/{}-", std::process::id()),
-            #[cfg(feature = "testing")]
-            internal_records: Mutex::new(None),
+            sequence: Arc::new(Sequence::default()),
+            selected: Observer::selection()?,
         });
-        *shared = Arc::downgrade(&tracing);
-        tracing
-    }
-
-    /// Starts test-only recording of explicitly Internal-scoped native calls.
-    ///
-    /// # Errors
-    /// Refuses overlapping captures on the shared observation service.
-    #[cfg(feature = "testing")]
-    pub fn begin_internal_capture(&self) -> io::Result<()> {
-        let mut records = lock(&self.internal_records);
-        if records.is_some() {
-            return Err(io::Error::other("internal capture already active"));
-        }
-        *records = Some(Vec::new());
-        drop(records);
-        Ok(())
-    }
-
-    /// Drains prior native callbacks, disables capture and moves out its records.
-    ///
-    /// # Errors
-    /// Returns trace failures or a missing capture. Production builds expose no capture API.
-    #[cfg(feature = "testing")]
-    pub fn end_internal_capture(&self) -> io::Result<Vec<Syscall>> {
-        self.barrier(DEADLINE)?;
-        lock(&self.internal_records)
-            .take()
-            .ok_or_else(|| io::Error::other("internal capture is not active"))
+        *shared = Some(Arc::downgrade(&tracing));
+        drop(shared);
+        Ok(tracing)
     }
 
     /// Registers a physical work root and its native observation consumer.
     pub fn register_root(
-        self: &Arc<Self>,
+        &self,
         root: &Path,
         observe: Arc<
             dyn Fn(TraceRun, Option<InvocationId>, Syscall) -> io::Result<()> + Send + Sync,
         >,
     ) -> io::Result<RootId> {
-        let _lifecycle = lock(&self.lifecycle);
         let mut state = lock(&self.state);
         state.check()?;
         if state.roots.values().any(|entry| entry.path == root) {
             return Err(io::Error::other("root already registered"));
         }
-        let first = state.roots.is_empty();
         let id = RootId(state.next()?);
         state.roots.insert(
             id,
@@ -293,11 +245,6 @@ impl Tracing {
             },
         );
         drop(state);
-        if first && let Err(error) = self.start() {
-            lock(&self.state).roots.remove(&id);
-            let _ = self.stop();
-            return Err(error);
-        }
         Ok(id)
     }
 
@@ -317,38 +264,42 @@ impl Tracing {
         Ok(run)
     }
 
-    /// Allocates a workload scope. Its markers are valid only on host threads.
+    /// Allocates a workload scope: what the host does inside it, and what it spawns, is the run's.
     pub fn scope(
         self: &Arc<Self>,
         run: TraceRun,
         builtin: Option<InvocationId>,
     ) -> io::Result<TraceScope> {
-        lock(&self.state).run(run)?;
-        self.new_scope(Some(Target { run, builtin }))
-    }
-
-    /// Marks implementation work so it cannot become a command's evidence or producer.
-    pub fn internal_scope(self: &Arc<Self>) -> io::Result<TraceScope> {
-        self.new_scope(None)
-    }
-
-    fn new_scope(self: &Arc<Self>, target: Option<Target>) -> io::Result<TraceScope> {
         let mut state = lock(&self.state);
-        state.check()?;
+        state.run(run)?;
         let id = ScopeId(state.next()?);
+        let target = Target { run, builtin };
         state.scopes.insert(
             id,
             Scope {
                 target,
                 first: None,
                 last: None,
-                retired: false,
             },
         );
         drop(state);
         Ok(TraceScope {
             tracing: Arc::clone(self),
             id,
+            target: Some(target),
+        })
+    }
+
+    /// Marks implementation work so it cannot become a command's evidence or producer.
+    pub fn internal_scope(self: &Arc<Self>) -> io::Result<TraceScope> {
+        let mut state = lock(&self.state);
+        state.check()?;
+        let id = ScopeId(state.next()?);
+        drop(state);
+        Ok(TraceScope {
+            tracing: Arc::clone(self),
+            id,
+            target: None,
         })
     }
 
@@ -359,7 +310,7 @@ impl Tracing {
         state.next().map(InvocationId)
     }
 
-    /// Returns native marker orders for one invocation, after its final delivery barrier.
+    /// Returns the native order window of one invocation's entered scopes.
     pub fn invocation_orders(
         &self,
         run: TraceRun,
@@ -367,10 +318,10 @@ impl Tracing {
     ) -> io::Result<(u64, u64)> {
         let state = lock(&self.state);
         state.run(run)?;
-        let target = Some(Target {
+        let target = Target {
             run,
             builtin: Some(builtin),
-        });
+        };
         let scopes = || {
             state
                 .scopes
@@ -385,23 +336,21 @@ impl Tracing {
         orders.ok_or_else(|| io::Error::other("invocation has no completed native scope"))
     }
 
-    /// Proves prior callbacks finished. Producer quiescence is checked separately, never inferred
-    /// from a quiet interval or a drain marker.
+    /// Checks the run is still observable. Every record is classified before its producer
+    /// proceeds (a tracee stays stopped, a host thread is inside the report), so there is no
+    /// queue of undelivered callbacks to wait for.
     pub fn drain(&self, run: TraceRun) -> io::Result<()> {
-        lock(&self.state).run(run)?;
-        self.barrier(DEADLINE)
+        lock(&self.state).run(run)
     }
 
-    /// Waits for all inherited producers and their pending calls, then proves final delivery.
+    /// Waits for all inherited producers and their pending calls to end.
     pub fn quiesce(&self, run: TraceRun) -> io::Result<()> {
-        self.drain(run)?;
         let mut state = lock(&self.state);
         loop {
             state.run(run)?;
             let busy = state.threads.values().any(|thread| {
                 run.owns(thread.inherited)
                     || thread.pending.is_some_and(|(_, target)| run.owns(target))
-                    || thread.stack.iter().any(|(_, target)| run.owns(*target))
             }) || state
                 .deferred
                 .values()
@@ -413,27 +362,28 @@ impl Tracing {
             state = self.progress.wait(state).recover();
         }
         drop(state);
-        self.drain(run)
+        Ok(())
     }
 
-    /// Signals verified live descendant processes, never historical PIDs or the host itself.
+    /// Signals the run's live traced processes, never historical PIDs or the host itself.
+    ///
+    /// `SIGCONT` goes only to processes in a job-control stop. Every tracer stop notifies this
+    /// process with `SIGCHLD`, and an embedder that answers `SIGCHLD` by continuing its jobs
+    /// would otherwise keep interrupting running commands with continue notifications.
     pub fn signal(&self, run: TraceRun, signal: i32) -> io::Result<usize> {
         let state = lock(&self.state);
         if !state.runs.contains_key(&run) {
             return Err(io::Error::other("closed trace run"));
         }
         let mut signalled = HashSet::new();
-        for thread in state
-            .threads
-            .values()
-            .filter(|thread| !thread.host && run.owns(thread.inherited))
-        {
+        for thread in state.threads.values().filter(|thread| {
+            run.owns(thread.inherited) && (signal != libc::SIGCONT || thread.job_stopped)
+        }) {
             if let Some(process) = &thread.process
-                && let Some(group) = process.group
-                && !signalled.contains(&group)
+                && !signalled.contains(&process.group)
                 && signal_process(&process.descriptor, signal)?
             {
-                signalled.insert(group);
+                signalled.insert(process.group);
             }
         }
         drop(state);
@@ -445,7 +395,7 @@ impl Tracing {
         lock(&self.state).run(run)
     }
 
-    /// Cancels existing descendants and descendants whose creation callbacks are still queued.
+    /// Cancels existing descendants and descendants whose creation is still being delivered.
     pub fn cancel(&self, run: TraceRun) -> io::Result<usize> {
         if let Some(state) = lock(&self.state).runs.get_mut(&run) {
             state.cancelled = true;
@@ -453,7 +403,7 @@ impl Tracing {
         self.signal(run, libc::SIGKILL)
     }
 
-    /// Registers the owning evaluation for immediate failure notification from the pidfd monitor.
+    /// Registers the owning evaluation for immediate failure notification.
     pub fn poll_failure(
         &self,
         run: TraceRun,
@@ -480,85 +430,208 @@ impl Tracing {
         self.quiesce(run)?;
         let mut state = lock(&self.state);
         state.runs.remove(&run);
-        state.scopes.retain(|_, scope| !run.owns(scope.target));
+        state.scopes.retain(|_, scope| scope.target.run != run);
         drop(state);
         Ok(())
     }
 
-    /// Releases a root only after its runs have finished; the last root stops the helper.
+    /// Releases a root only after its runs have finished.
     pub fn unregister_root(&self, root: RootId) -> io::Result<()> {
-        let _lifecycle = lock(&self.lifecycle);
         let mut state = lock(&self.state);
         if state.runs.keys().any(|run| run.root == root) && state.failure.is_none() {
             return Err(io::Error::other("trace root still owns a run"));
         }
         // A failed service cannot prove reclamation. Its owner retains the private tree, but
-        // must still be able to close all roots and start a fresh attachment generation.
+        // must still be able to close all roots and release the failed generation.
         state.runs.retain(|run, _| run.root != root);
         state
             .roots
             .remove(&root)
             .ok_or_else(|| io::Error::other("missing trace root"))?;
-        let last = state.roots.is_empty();
         drop(state);
-        if last {
-            self.stop()?;
+        Ok(())
+    }
+
+    /// Reports one filesystem access the host interpreter performed on this thread. Outside a
+    /// workload scope it is implementation work and records nothing.
+    ///
+    /// # Errors
+    /// Fails when the access cannot be restated as evidence; the caller must refuse the run.
+    pub fn host(&self, call: HostCall<'_>) -> io::Result<()> {
+        let Some(target) = self.current() else {
+            return Ok(());
+        };
+        lock(&self.state).run(target.run)?;
+        for record in records(call, nix::unistd::gettid(), &self.sequence)? {
+            self.classify(target, record)?;
         }
         Ok(())
     }
 
-    fn barrier(&self, patience: Duration) -> io::Result<()> {
-        let id = {
-            let mut state = lock(&self.state);
-            state.check()?;
-            let id = state.next()?;
-            state.barriers.insert(id, false);
-            id
-        };
-        self.mark(id, "barrier");
-        let deadline = Instant::now() + patience;
-        let mut state = lock(&self.state);
-        loop {
-            state.check()?;
-            if state.barriers.get(&id) == Some(&true) {
-                state.barriers.remove(&id);
-                return Ok(());
-            }
-            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-                state.barriers.remove(&id);
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "native trace barrier timed out",
-                ));
-            };
-            state = self.progress.wait_timeout(state, remaining).recover().0;
+    /// Spawns `command` for the workload scope entered on this thread, traced from before it
+    /// runs anything of its own until its whole process tree has ended.
+    ///
+    /// The child parks in a handshake between its launch setup and `exec`; a dedicated tracer
+    /// thread seizes it there, and every task of its tree stays that thread's. The tracer reaps
+    /// the command, reporting it through `events`, so nothing else may wait on its pid: in one
+    /// thread group any such wait would also consume the tracer's stops.
+    ///
+    /// # Errors
+    /// Refuses outside a workload scope, a program named without a path, and launch failures.
+    pub fn spawn(
+        self: &Arc<Self>,
+        mut command: std::process::Command,
+        events: Box<dyn FnMut(ChildEvent) + Send>,
+    ) -> io::Result<TracedChild> {
+        let target = self
+            .current()
+            .ok_or_else(|| io::Error::other("a managed command spawned outside its run's scope"))?;
+        lock(&self.state).run(target.run)?;
+        // A PATH search would exec several candidates, and only the first failure is detached.
+        if !command.get_program().as_encoded_bytes().contains(&b'/') {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "a managed command needs its resolved program path",
+            ));
         }
-    }
-
-    fn mark(&self, id: u64, kind: &str) {
-        // Stack-only emission: no allocation or filesystem effect before the observed marker.
-        let mut path = [0_u8; 128];
-        let _ = write!(&mut path[..127], "{}{id}/{kind}", self.prefix);
-        let mut sink = [0_u8];
-        // SAFETY: both buffers are live; `path` remains NUL-terminated within its fixed capacity.
+        let host = nix::unistd::gettid();
+        let (request_read, request_write) = pipe()?;
+        let (release_read, release_write) = pipe()?;
+        let (pinned, identity) = std::sync::mpsc::sync_channel(1);
+        let tracing = Arc::clone(self);
+        let tracer = std::thread::Builder::new()
+            .name("marsh-tracer".into())
+            .spawn(move || {
+                tracing.trace(request_read, release_write, &pinned, target, host, events);
+            })?;
+        let (request, release) = (request_write.as_raw_fd(), release_read.as_raw_fd());
+        // SAFETY: the hook runs in the forked child and only calls async-signal-safe getpid, write
+        // and read on two descriptors the child inherited; it allocates nothing.
         unsafe {
-            libc::readlink(path.as_ptr().cast(), sink.as_mut_ptr().cast(), sink.len());
+            command.pre_exec(move || handshake(request, release));
+        }
+        let spawned = command.spawn();
+        drop(command);
+        drop((request_write, release_read));
+        match spawned {
+            Ok(child) => {
+                let pid = child.id();
+                // Dropping the std handle closes nothing the command uses and never waits.
+                drop(child);
+                let process = identity
+                    .recv()
+                    .map_err(|_| io::Error::other("tracer ended before pinning its command"))?;
+                Ok(TracedChild { pid, process })
+            }
+            Err(error) => {
+                // No command runs; the tracer ends once it has nothing left to trace.
+                let _ = tracer.join();
+                Err(error)
+            }
         }
     }
 
-    fn marker(&self, info: &Syscall) -> Option<(u64, &str)> {
-        let bytes = match info.info.syscall {
-            Sysno::readlink => info.path(0),
-            Sysno::readlinkat => info.path(1),
-            _ => None,
-        }?;
-        let suffix = bytes.strip_prefix(self.prefix.as_bytes())?;
-        let slash = suffix.iter().position(|byte| *byte == b'/')?;
-        let id = std::str::from_utf8(&suffix[..slash]).ok()?.parse().ok()?;
-        let kind = ["enter", "leave", "barrier", "retire"]
-            .into_iter()
-            .find(|kind| kind.as_bytes() == &suffix[slash + 1..])?;
-        Some((id, kind))
+    /// The attribution of the innermost scope this thread entered on this service.
+    fn current(&self) -> Option<Target> {
+        let service = std::ptr::from_ref(self) as usize;
+        ENTERED.with_borrow(|entered| {
+            entered
+                .iter()
+                .rev()
+                .find(|(owner, ..)| *owner == service)
+                .and_then(|(_, _, target)| *target)
+        })
+    }
+
+    /// One command tree's tracer thread: seize the command in its handshake, release it, then
+    /// deliver every stop of its tree until none is left.
+    fn trace(
+        self: &Arc<Self>,
+        request: OwnedFd,
+        release: OwnedFd,
+        pinned: &std::sync::mpsc::SyncSender<OwnedFd>,
+        target: Target,
+        host: Pid,
+        mut events: Box<dyn FnMut(ChildEvent) + Send>,
+    ) {
+        let mut pid = [0; 4];
+        // End of file: the launch failed before its handshake.
+        if std::fs::File::from(request).read_exact(&mut pid).is_err() {
+            return;
+        }
+        let root = Pid::from_raw(i32::from_ne_bytes(pid));
+        let mut observer = Observer::new(self.selected.clone(), Arc::clone(&self.sequence), root);
+        let result = (|| -> io::Result<()> {
+            let mut observe = |sequence, tid: Pid, status, event, info| {
+                self.deliver(sequence, tid, status, event, info)?;
+                if tid == root {
+                    report(&mut *events, status)?;
+                }
+                Ok(())
+            };
+            let Some(status) = observer.seize(root)? else {
+                return Ok(());
+            };
+            let process = open_process(root.as_raw())?;
+            pinned
+                .send(process.try_clone()?)
+                .map_err(|_| io::Error::other("spawner abandoned its command"))?;
+            self.adopt_root(root, target, host, process)?;
+            observer.stop(root, status, &mut observe)?;
+            std::fs::File::from(release).write_all(&[1])?;
+            observer.run(&mut observe)
+        })();
+        if observer.detached() {
+            lock(&self.state).threads.remove(&root);
+            self.progress.notify_all();
+        }
+        if let Err(error) = result {
+            self.fail(format!("native observation: {error}"));
+            observer.abandon(|tid, status| {
+                lock(&self.state).threads.remove(&tid);
+                if tid == root {
+                    events(ChildEvent::Exited(std::process::ExitStatus::from_raw(status)));
+                }
+            });
+            self.progress.notify_all();
+        }
+    }
+
+    /// Registers a seized command under the scope that spawned it, and hands its classifier
+    /// the fork that created it, so its inherited descriptors are the host's.
+    fn adopt_root(&self, root: Pid, target: Target, host: Pid, process: OwnedFd) -> io::Result<()> {
+        let mut state = lock(&self.state);
+        state.run(target.run)?;
+        let cancelled = state.cancelled(Some(target));
+        let thread = state.threads.entry(root).or_default();
+        thread.inherited = Some(target);
+        thread.known_parent = true;
+        thread.process = Some(ProcessLease {
+            descriptor: process,
+            group: root,
+        });
+        if cancelled {
+            thread.kill()?;
+        }
+        drop(state);
+        let fork = Syscall {
+            info: SyscallInfo {
+                typ: "SYSCALL",
+                pid: host,
+                syscall: Sysno::fork,
+                args: SyscallArgs(Vec::new()),
+                result: RetCode::Ok(root.as_raw()),
+                duration: Duration::ZERO,
+            },
+            entry_order: self.sequence.next()?,
+            cwd: None,
+            return_fd: None,
+            paths: Vec::new(),
+            descriptors: Vec::new(),
+            flags: None,
+            submissions: None,
+        };
+        self.classify(target, fork)
     }
 
     fn fail(&self, cause: impl Into<String>) {
@@ -583,7 +656,6 @@ impl Tracing {
         status: i32,
         event: Option<u64>,
         info: Option<Syscall>,
-        process: Option<ProcessLease>,
     ) -> io::Result<()> {
         let wait = WaitStatus::from_raw(tid, status).map_err(io::Error::other)?;
         let mut state = lock(&self.state);
@@ -594,20 +666,37 @@ impl Tracing {
             state.threads.remove(&tid);
             return Ok(());
         }
+        // A missing message means the task was killed at this stop; nothing is left to rekey or
+        // adopt through it.
         if matches!(wait, WaitStatus::PtraceEvent(_, _, code) if code == Event::PTRACE_EVENT_EXEC as i32)
+            && event.is_some()
         {
             let former = Self::event_thread(event, "missing exec identity")?;
             rekey(&mut state.threads, tid, former);
         }
-        Self::lease(&mut state, tid, process)?;
+        if let Some(thread) = state.threads.get_mut(&tid) {
+            thread.job_stopped = matches!(
+                wait,
+                WaitStatus::PtraceEvent(_, signal, code)
+                    if code == Event::PTRACE_EVENT_STOP as i32
+                        && matches!(
+                            signal,
+                            Signal::SIGSTOP | Signal::SIGTSTP | Signal::SIGTTIN | Signal::SIGTTOU
+                        )
+            );
+        }
+        if matches!(wait, WaitStatus::PtraceEvent(..) | WaitStatus::Stopped(..)) {
+            Self::lease(&mut state, tid)?;
+        }
         if let WaitStatus::PtraceEvent(_, _, code) = wait
             && creation(code)
+            && event.is_some()
         {
             let child = Self::event_thread(event, "missing child identity")?;
             let early = Self::adopt(&mut state, tid, child)?;
             drop(state);
             for (sequence, status, event, info) in early {
-                self.deliver(sequence, child, status, event, info, None)?;
+                self.deliver(sequence, child, status, event, info)?;
             }
             self.progress.notify_all();
             return Ok(());
@@ -620,6 +709,7 @@ impl Tracing {
         }
         if matches!(wait, WaitStatus::Exited(..) | WaitStatus::Signaled(..)) {
             state.threads.remove(&tid);
+            drop(state);
             self.progress.notify_all();
             return Ok(());
         }
@@ -634,46 +724,31 @@ impl Tracing {
         if entry != info.entry_order {
             return Err(io::Error::other("native completion entry mismatch"));
         }
-        let host = state.threads.get(&tid).is_some_and(|thread| thread.host);
-        if host && let Some((id, kind)) = self.marker(&info) {
-            Self::scope_marker(&mut state, tid, id, kind, info.entry_order)?;
-            self.progress.notify_all();
-            return Ok(());
-        }
-        #[cfg(feature = "testing")]
-        let internal = state.threads.get(&tid).is_some_and(|thread| {
-            thread
-                .stack
-                .last()
-                .is_some_and(|(_, target)| target.is_none())
-        });
         drop(state);
         if let Some(target) = target {
             self.classify(target, info)?;
-        } else {
-            #[cfg(feature = "testing")]
-            if internal && let Some(records) = lock(&self.internal_records).as_mut() {
-                records.push(info);
-            }
         }
         self.progress.notify_all();
         Ok(())
     }
 
-    /// Pins a stop's process identity on its thread, killing it when its run was cancelled.
-    fn lease(state: &mut State, tid: Pid, process: Option<ProcessLease>) -> io::Result<()> {
+    /// Pins a stopped task's process identity once, killing it when its run was cancelled.
+    fn lease(state: &mut State, tid: Pid) -> io::Result<()> {
+        let cancelled = state.cancelled(state.threads.get(&tid).and_then(|thread| thread.inherited));
         let thread = state.threads.entry(tid).or_default();
-        if let Some(process) = process {
-            thread.host = process
-                .group
-                .is_some_and(|group| group.as_raw().cast_unsigned() == std::process::id());
-            thread.known_parent |= thread.host;
-            thread.process = Some(process);
-        }
-        let inherited = thread.inherited;
-        if state.cancelled(inherited)
-            && let Some(thread) = state.threads.get(&tid)
+        if thread.process.is_none()
+            && let Some(group) = proc_field::<i32>(format!("/proc/{tid}/status"), "Tgid:")
+                .ok()
+                .flatten()
+                .filter(|group| *group > 0)
+            && let Some(descriptor) = alive_process(group)?
         {
+            thread.process = Some(ProcessLease {
+                descriptor,
+                group: Pid::from_raw(group),
+            });
+        }
+        if cancelled {
             thread.kill()?;
         }
         Ok(())
@@ -693,7 +768,7 @@ impl Tracing {
         let parent_entry = parent.and_then(|thread| thread.pending);
         let inherited = parent_entry
             .and_then(|(_, target)| target)
-            .or_else(|| parent.and_then(Thread::target));
+            .or_else(|| parent.and_then(|thread| thread.inherited));
         let cancelled = state.cancelled(inherited);
         let thread = state.threads.entry(child).or_default();
         thread.known_parent = true;
@@ -711,7 +786,7 @@ impl Tracing {
     fn note_stop(state: &mut State, tid: Pid, wait: WaitStatus, sequence: u64) -> io::Result<()> {
         let thread = state.threads.entry(tid).or_default();
         if matches!(wait, WaitStatus::PtraceSyscall(_)) {
-            let target = thread.target();
+            let target = thread.inherited;
             if thread.pending.replace((sequence, target)).is_some() {
                 return Err(io::Error::other(
                     "native entry replaced pending attribution",
@@ -720,62 +795,6 @@ impl Tracing {
         } else if matches!(wait, WaitStatus::PtraceEvent(_, _, code) if code == Event::PTRACE_EVENT_EXIT as i32)
         {
             thread.pending = None;
-        }
-        Ok(())
-    }
-
-    /// Applies one host scope marker to the barrier, scope and stack bookkeeping.
-    fn scope_marker(
-        state: &mut State,
-        tid: Pid,
-        id: u64,
-        kind: &str,
-        order: u64,
-    ) -> io::Result<()> {
-        let scope = ScopeId(id);
-        match kind {
-            "barrier" => {
-                if let Some(reached) = state.barriers.get_mut(&id) {
-                    *reached = true;
-                }
-            }
-            "enter" => {
-                let issued = state
-                    .scopes
-                    .get_mut(&scope)
-                    .ok_or_else(|| io::Error::other("unissued scope marker"))?;
-                issued.first.get_or_insert(order);
-                let target = issued.target;
-                if let Some(thread) = state.threads.get_mut(&tid) {
-                    thread.stack.push((scope, target));
-                }
-            }
-            "leave" => {
-                let popped = state
-                    .threads
-                    .get_mut(&tid)
-                    .and_then(|thread| thread.stack.pop());
-                if popped.map(|(top, _)| top) != Some(scope) {
-                    return Err(io::Error::other("non-LIFO native scope"));
-                }
-                if let Some(left) = state.scopes.get_mut(&scope) {
-                    left.last = Some(order);
-                }
-                if state
-                    .scopes
-                    .get(&scope)
-                    .is_some_and(|left| left.target.is_none() && left.retired)
-                {
-                    state.release(scope);
-                }
-            }
-            "retire" => {
-                if let Some(retired) = state.scopes.get_mut(&scope) {
-                    retired.retired = true;
-                }
-                state.release(scope);
-            }
-            _ => unreachable!(),
         }
         Ok(())
     }
@@ -823,206 +842,117 @@ impl Tracing {
         Ok(())
     }
 
-    fn start(self: &Arc<Self>) -> io::Result<()> {
-        let helper = helper_path()?;
-        let (socket, output) = UnixStream::pair()?;
-        let receiver_socket = socket.try_clone()?;
-        let expected = Arc::new(AtomicBool::new(false));
-        let weak = Arc::downgrade(self);
-        let monitor_expected = Arc::clone(&expected);
-        let (started, startup) = std::sync::mpsc::sync_channel(1);
-        // Linux binds PDEATHSIG to the creating thread, not the whole parent process. The
-        // monitor therefore creates the child and stays alive until it has reaped that child;
-        // a caller's short-lived Tokio runtime cannot kill another runtime's shared helper.
-        let monitor = std::thread::Builder::new()
-            .name("marsh-native-monitor".into())
-            .spawn(move || {
-                Self::launch_helper(&helper, output, &started, &weak, &monitor_expected);
-            })?;
-        let (process, mut release) = match startup
-            .recv()
-            .map_err(io::Error::other)
-            .and_then(std::convert::identity)
-        {
-            Ok(resources) => resources,
-            Err(error) => {
-                let _ = monitor.join();
-                return Err(error);
-            }
+    /// Records a scope boundary's order for a workload scope.
+    fn mark(&self, id: ScopeId, entering: bool) {
+        let order = match self.sequence.next() {
+            Ok(order) => order,
+            Err(error) => return self.fail(error.to_string()),
         };
-        let weak = Arc::downgrade(self);
-        let receiver_expected = Arc::clone(&expected);
-        let receiver = std::thread::Builder::new()
-            .name("marsh-native-receiver".into())
-            .spawn(move || {
-                if let Err(error) = receive(&weak, receiver_socket)
-                    && !receiver_expected.load(Ordering::Acquire)
-                {
-                    if let Some(tracing) = weak.upgrade() {
-                        tracing.fail(format!("native transport: {error}"));
-                    }
-                }
-            });
-        let (receiver, failure) =
-            receiver.map_or_else(|error| (None, Some(error)), |thread| (Some(thread), None));
-        // Install all owned resources even on receiver failure: register_root's error path
-        // stops/reaps the helper, joins the monitor and revokes its ptrace permission.
-        *lock(&self.service) = Some(Service {
-            process,
-            socket,
-            expected,
-            receiver,
-            monitor: Some(monitor),
-        });
-        if let Some(error) = failure {
-            return Err(error);
-        }
-        release.write_all(&[1])?;
-        drop(release);
-        let deadline = Instant::now() + DEADLINE;
-        loop {
-            match self.barrier(Duration::from_millis(50)) {
-                Ok(()) => {
-                    self.active.store(true, Ordering::Release);
-                    return Ok(());
-                }
-                Err(error)
-                    if error.kind() == io::ErrorKind::TimedOut && Instant::now() < deadline => {}
-                Err(error) => return Err(error),
+        if let Some(scope) = lock(&self.state).scopes.get_mut(&id) {
+            if entering {
+                scope.first.get_or_insert(order);
+            } else {
+                scope.last = Some(order);
             }
         }
-    }
-
-    /// Spawns and bootstraps the native helper on the monitor thread, then supervises it.
-    fn launch_helper(
-        helper: &Path,
-        output: UnixStream,
-        started: &std::sync::mpsc::SyncSender<Startup>,
-        weak: &Weak<Self>,
-        expected: &AtomicBool,
-    ) {
-        let mut command = std::process::Command::new(helper);
-        command
-            .args(["--host-pid", &std::process::id().to_string()])
-            .stdin(std::process::Stdio::piped())
-            .stdout(OwnedFd::from(output))
-            .stderr(std::process::Stdio::piped())
-            .process_group(0);
-        let spawned = command.spawn();
-        drop(command);
-        let mut child = match spawned {
-            Ok(child) => child,
-            Err(error) => {
-                let _ = started.send(Err(error));
-                return;
-            }
-        };
-        let bootstrap = (|| -> io::Result<_> {
-            let pid = i32::try_from(child.id()).map_err(io::Error::other)?;
-            let process = Arc::new(open_process(pid)?);
-            let release = child
-                .stdin
-                .take()
-                .ok_or_else(|| io::Error::other("missing helper release pipe"))?;
-            let diagnostics = child
-                .stderr
-                .take()
-                .ok_or_else(|| io::Error::other("missing helper diagnostics"))?;
-            // SAFETY: PR_SET_PTRACER accepts the owned child's PID and accesses no pointer.
-            Errno::result(unsafe { libc::prctl(libc::PR_SET_PTRACER, pid) })?;
-            Ok((process, release, diagnostics))
-        })();
-        let failure = match bootstrap {
-            Ok((process, release, diagnostics)) => {
-                match started.send(Ok((Arc::clone(&process), release))) {
-                    Ok(()) => {
-                        return monitor(weak, child, diagnostics, &process, expected);
-                    }
-                    Err(_) => None,
-                }
-            }
-            Err(error) => Some(error),
-        };
-        let _ = child.kill();
-        let _ = child.wait();
-        if let Some(error) = failure {
-            let _ = started.send(Err(error));
-        }
-    }
-
-    fn stop(&self) -> io::Result<()> {
-        let service = lock(&self.service).take();
-        let Some(mut service) = service else {
-            return Ok(());
-        };
-        self.active.store(false, Ordering::Release);
-        service.expected.store(true, Ordering::Release);
-        signal_process(&service.process, libc::SIGKILL)?;
-        let _ = service.socket.shutdown(std::net::Shutdown::Both);
-        let here = std::thread::current().id();
-        for thread in [service.receiver.take(), service.monitor.take()]
-            .into_iter()
-            .flatten()
-        {
-            if thread.thread().id() != here {
-                thread
-                    .join()
-                    .map_err(|_| io::Error::other("native service thread panicked"))?;
-            }
-        }
-        // SAFETY: zero revokes this process's previous precise-child ptrace permission.
-        Errno::result(unsafe { libc::prctl(libc::PR_SET_PTRACER, 0) })?;
-        let mut state = lock(&self.state);
-        state.threads.clear();
-        state.deferred.clear();
-        state.scopes.clear();
-        state.barriers.clear();
-        state.failure = None;
-        drop(state);
-        Ok(())
     }
 }
 
 impl Drop for Tracing {
     fn drop(&mut self) {
-        let _ = self.stop();
+        // Only the published generation clears its entry.
+        let mut shared = lock(&SHARED);
+        if shared
+            .as_ref()
+            .is_some_and(|weak| std::ptr::eq(weak.as_ptr(), self))
+        {
+            *shared = None;
+        }
+        drop(shared);
     }
+}
+
+/// The child's side of the launch handshake: announce its pid, then wait to be released.
+fn handshake(request: RawFd, release: RawFd) -> io::Result<()> {
+    // SAFETY: getpid has no preconditions.
+    let pid = unsafe { libc::getpid() }.to_ne_bytes();
+    let mut written = 0;
+    while written < pid.len() {
+        // SAFETY: the buffer is live for the stated length; the descriptor was inherited open.
+        let count = unsafe {
+            libc::write(
+                request,
+                pid[written..].as_ptr().cast(),
+                pid.len() - written,
+            )
+        };
+        match usize::try_from(count) {
+            Ok(count) => written += count,
+            Err(_) if Errno::last() == Errno::EINTR => {}
+            Err(_) => return Err(io::Error::last_os_error()),
+        }
+    }
+    let mut byte = 0_u8;
+    loop {
+        // SAFETY: one writable byte; the descriptor was inherited open.
+        let count = unsafe { libc::read(release, (&raw mut byte).cast(), 1) };
+        if count == 1 && byte == 1 {
+            return Ok(());
+        }
+        if count < 0 && Errno::last() == Errno::EINTR {
+            continue;
+        }
+        // The tracer refused or vanished: never run unobserved.
+        return Err(io::Error::from_raw_os_error(libc::EPERM));
+    }
+}
+
+/// Tells the spawner what a delivered stop means for its command's own process.
+fn report(events: &mut dyn FnMut(ChildEvent), status: i32) -> io::Result<()> {
+    match WaitStatus::from_raw(Pid::from_raw(0), status)? {
+        WaitStatus::Exited(..) | WaitStatus::Signaled(..) => {
+            events(ChildEvent::Exited(std::process::ExitStatus::from_raw(status)));
+        }
+        WaitStatus::PtraceEvent(_, signal, code)
+            if code == Event::PTRACE_EVENT_STOP as i32
+                && matches!(
+                    signal,
+                    Signal::SIGSTOP | Signal::SIGTSTP | Signal::SIGTTIN | Signal::SIGTTOU
+                ) =>
+        {
+            events(ChildEvent::Stopped);
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// A close-on-exec pipe: read end, write end.
+fn pipe() -> io::Result<(OwnedFd, OwnedFd)> {
+    let (read, write) = io::pipe()?;
+    Ok((read.into(), write.into()))
 }
 
 /// An issued attribution bracket; its identifier is valid only in its owning service.
 pub struct TraceScope {
     tracing: Arc<Tracing>,
     id: ScopeId,
+    target: Option<Target>,
 }
 
 impl TraceScope {
     /// Enters on this thread. The guard cannot move to another thread.
     pub fn enter(&self) -> TraceScopeGuard {
-        let enabled = self.tracing.active.load(Ordering::Acquire);
-        if enabled {
-            self.tracing.mark(self.id.0, "enter");
+        if self.target.is_some() {
+            self.tracing.mark(self.id, true);
         }
+        let service = Arc::as_ptr(&self.tracing) as usize;
+        ENTERED.with_borrow_mut(|entered| entered.push((service, self.id, self.target)));
         TraceScopeGuard {
             tracing: Arc::clone(&self.tracing),
             id: self.id,
+            workload: self.target.is_some(),
             thread: PhantomData,
-            enabled,
-        }
-    }
-}
-impl Drop for TraceScope {
-    fn drop(&mut self) {
-        let internal = lock(&self.tracing.state)
-            .scopes
-            .get(&self.id)
-            .is_some_and(|scope| scope.target.is_none());
-        if !internal {
-            return;
-        }
-        if self.tracing.active.load(Ordering::Acquire) {
-            self.tracing.mark(self.id.0, "retire");
-        } else {
-            lock(&self.tracing.state).scopes.remove(&self.id);
         }
     }
 }
@@ -1031,14 +961,18 @@ impl Drop for TraceScope {
 pub struct TraceScopeGuard {
     tracing: Arc<Tracing>,
     id: ScopeId,
+    workload: bool,
     thread: PhantomData<Rc<()>>,
-    enabled: bool,
 }
 
 impl Drop for TraceScopeGuard {
     fn drop(&mut self) {
-        if self.enabled && lock(&self.tracing.state).scopes.contains_key(&self.id) {
-            self.tracing.mark(self.id.0, "leave");
+        let popped = ENTERED.with_borrow_mut(Vec::pop);
+        if popped.map(|(_, id, _)| id) != Some(self.id) {
+            self.tracing.fail("non-LIFO trace scope");
+        }
+        if self.workload {
+            self.tracing.mark(self.id, false);
         }
     }
 }
@@ -1086,112 +1020,6 @@ impl<F: Future, S: PollScope> Future for Scoped<F, S> {
     }
 }
 
-fn helper_path() -> io::Result<PathBuf> {
-    let executable = std::env::current_exe()?;
-    let parent = executable
-        .parent()
-        .ok_or_else(|| io::Error::other("executable has no parent"))?;
-    let direct = parent.join("marsh-trace");
-    if direct.try_exists()? {
-        return Ok(direct);
-    }
-    if parent
-        .file_name()
-        .is_some_and(|name| name == "deps" || name == "examples")
-    {
-        let sibling = parent
-            .parent()
-            .ok_or_else(|| io::Error::other("missing cargo output parent"))?
-            .join("marsh-trace");
-        if sibling.try_exists()? {
-            return Ok(sibling);
-        }
-    }
-    Err(io::Error::new(
-        io::ErrorKind::NotFound,
-        "build and bundle marsh-trace beside the application",
-    ))
-}
-
-/// Delivers the helper's frames until the service is gone or the helper closes the stream.
-///
-/// A stream that closes before the prelude or between frames is no transport failure: the helper
-/// closes it only as it ends, and the pidfd monitor reports that end with the exit status and
-/// diagnostics this stream cannot carry. A stream that closes inside a frame was truncated.
-fn receive(tracing: &Weak<Tracing>, socket: UnixStream) -> io::Result<()> {
-    let mut reader = BufReader::new(NativeSocket {
-        socket,
-        descriptors: VecDeque::new(),
-    });
-    if reader.fill_buf()?.is_empty() {
-        return Ok(());
-    }
-    let mut prelude = [0; PRELUDE.len()];
-    reader.read_exact(&mut prelude)?;
-    if prelude != PRELUDE {
-        return Err(io::Error::other("incompatible native helper"));
-    }
-    let mut frame = Vec::new();
-    let mut expected = 1_u64;
-    loop {
-        frame.clear();
-        loop {
-            let buffer = reader.fill_buf()?;
-            if buffer.is_empty() {
-                if frame.is_empty() {
-                    return Ok(());
-                }
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "native stream ended inside a frame",
-                ));
-            }
-            let end = buffer
-                .iter()
-                .position(|byte| *byte == b'\n')
-                .map(|index| index + 1);
-            let count = end.unwrap_or(buffer.len());
-            if frame.len() + count > FRAME_LIMIT {
-                return Err(io::Error::other("oversized native frame"));
-            }
-            frame.extend_from_slice(&buffer[..count]);
-            reader.consume(count);
-            if end.is_some() {
-                break;
-            }
-        }
-        let (sequence, tid, status, event, info): (u64, i32, i32, Option<u64>, Option<Syscall>) =
-            serde_json::from_slice(&frame)?;
-        if sequence != expected || tid <= 0 {
-            return Err(io::Error::other("native sequence gap or invalid tid"));
-        }
-        let tid = Pid::from_raw(tid);
-        if info.as_ref().is_some_and(|info| info.info.pid != tid) {
-            return Err(io::Error::other("native record tid mismatch"));
-        }
-        let wait = WaitStatus::from_raw(tid, status).map_err(io::Error::other)?;
-        let process = crate::helper::carries_process(&wait)
-            .then(|| {
-                reader
-                    .get_mut()
-                    .descriptors
-                    .pop_front()
-                    .ok_or_else(|| {
-                        io::Error::other("native lifecycle frame lacks its pinned process handle")
-                    })
-                    .and_then(ProcessLease::receive)
-            })
-            .transpose()?;
-        expected = expected
-            .checked_add(1)
-            .ok_or_else(|| io::Error::other("native sequence exhausted"))?;
-        let Some(tracing) = tracing.upgrade() else {
-            return Ok(());
-        };
-        tracing.deliver(sequence, tid, status, event, info, process)?;
-    }
-}
-
 /// Opens a pidfd pinning the identity of live process `pid`, so a later signal cannot reach a
 /// recycled PID.
 ///
@@ -1205,6 +1033,15 @@ pub fn open_process(pid: i32) -> io::Result<OwnedFd> {
     .map_err(io::Error::other)?;
     // SAFETY: the syscall returned a fresh descriptor owned by this function.
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// A pidfd for `pid`, or `None` once it has vanished.
+fn alive_process(pid: i32) -> io::Result<Option<OwnedFd>> {
+    match open_process(pid) {
+        Ok(descriptor) => Ok(Some(descriptor)),
+        Err(error) if error.raw_os_error() == Some(libc::ESRCH) => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 /// Sends `signal` through a pidfd; answers whether the process was still alive to receive it.
@@ -1223,103 +1060,6 @@ pub fn signal_process(process: &OwnedFd, signal: i32) -> io::Result<bool> {
         )
     }))?
     .is_some())
-}
-
-/// Reads bytes and their `SCM_RIGHTS` together. Buffering plain recv calls would silently discard
-/// the pinned identities. Native JSON framing stays in `receive`, not in a second codec.
-struct NativeSocket {
-    socket: UnixStream,
-    descriptors: VecDeque<OwnedFd>,
-}
-impl Read for NativeSocket {
-    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        use rustix::net::{
-            RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, ReturnFlags, recvmsg,
-        };
-        let mut space = [std::mem::MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(253))];
-        let mut ancillary = RecvAncillaryBuffer::new(&mut space);
-        let received = rustix::io::retry_on_intr(|| {
-            recvmsg(
-                &self.socket,
-                &mut [io::IoSliceMut::new(buffer)],
-                &mut ancillary,
-                RecvFlags::CMSG_CLOEXEC,
-            )
-        })?;
-        if received.flags.contains(ReturnFlags::CTRUNC) {
-            return Err(io::Error::other("native pidfd transport truncated"));
-        }
-        for message in ancillary.drain() {
-            match message {
-                RecvAncillaryMessage::ScmRights(descriptors) => {
-                    self.descriptors.extend(descriptors);
-                }
-                _ => return Err(io::Error::other("unexpected native ancillary message")),
-            }
-        }
-        Ok(received.bytes)
-    }
-}
-
-fn monitor(
-    tracing: &Weak<Tracing>,
-    mut child: std::process::Child,
-    mut stderr: std::process::ChildStderr,
-    process: &OwnedFd,
-    expected: &AtomicBool,
-) {
-    let mut diagnostics = Vec::new();
-    let mut eof = false;
-    loop {
-        let mut fds = [
-            libc::pollfd {
-                fd: process.as_raw_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            },
-            libc::pollfd {
-                fd: if eof { -1 } else { stderr.as_raw_fd() },
-                events: libc::POLLIN,
-                revents: 0,
-            },
-        ];
-        // SAFETY: the array contains exactly two initialized pollfd structures.
-        let result = unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) };
-        if result < 0 {
-            if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-            if let Some(tracing) = tracing.upgrade() {
-                tracing.fail("native pidfd monitor failed");
-            }
-            let _ = signal_process(process, libc::SIGKILL);
-            break;
-        }
-        if fds[1].revents != 0 {
-            let mut buffer = [0; 4096];
-            match stderr.read(&mut buffer) {
-                Ok(0) => eof = true,
-                Ok(count) => {
-                    let keep = count.min(4096 - diagnostics.len());
-                    diagnostics.extend_from_slice(&buffer[..keep]);
-                }
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                Err(_) => eof = true,
-            }
-        }
-        if fds[0].revents != 0 {
-            break;
-        }
-    }
-    let status = child.wait();
-    if !expected.load(Ordering::Acquire)
-        && let Some(tracing) = tracing.upgrade()
-    {
-        tracing.fail(format!(
-            "native helper exited ({status:?}): {}",
-            String::from_utf8_lossy(&diagnostics)
-        ));
-    }
 }
 
 #[cfg(test)]

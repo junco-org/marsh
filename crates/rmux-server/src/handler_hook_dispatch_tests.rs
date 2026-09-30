@@ -6,7 +6,7 @@ use rmux_proto::{
     ScopeSelector, SetHookMutationRequest, ShowOptionsRequest, WindowTarget,
 };
 
-use crate::test_fixtures::{Fixture, Grouped};
+use crate::test_fixtures::{Fixture, Grouped, SessionSpec, TestRequest};
 use crate::test_names::session_name;
 
 async fn buffer_text(handler: &RequestHandler, name: &str) -> Option<String> {
@@ -21,21 +21,23 @@ async fn buffer_text(handler: &RequestHandler, name: &str) -> Option<String> {
 #[tokio::test]
 async fn appended_after_new_window_hooks_run_once_in_order() {
     let handler = RequestHandler::new();
-    handler.create_session("alpha").await;
+    SessionSpec::create(&handler, "alpha").await;
 
     handler
         .set_global_hook(HookName::AfterNewWindow, "set-buffer -a -b hook first")
         .await;
-    handler
-        .handle_ok(SetHookMutationRequest {
+    TestRequest::send_ok(
+        &handler,
+        SetHookMutationRequest {
             append: true,
             ..Fixture::fixture((
                 ScopeSelector::Global,
                 HookName::AfterNewWindow,
                 "set-buffer -a -b hook second",
             ))
-        })
-        .await;
+        },
+    )
+    .await;
 
     handler
         .create_window(NewWindowRequest {
@@ -57,8 +59,8 @@ async fn after_new_window_runs_distinct_kill_window_lifecycle_hooks_in_tmux_orde
     let handler = RequestHandler::new();
     let alpha = session_name("nested-lifecycle-alpha");
     let beta = session_name("nested-lifecycle-beta");
-    handler.create_session(&alpha).await;
-    handler.create_session(&beta).await;
+    SessionSpec::create(&handler, &alpha).await;
+    SessionSpec::create(&handler, &beta).await;
     handler
         .set_global_hook(
             HookName::WindowUnlinked,
@@ -97,23 +99,25 @@ async fn after_new_window_runs_distinct_kill_window_lifecycle_hooks_in_tmux_orde
 async fn same_after_hook_does_not_reenter_when_its_command_creates_a_window() {
     let handler = RequestHandler::new();
     let alpha = session_name("same-after-hook");
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
     handler
         .set_global_hook(
             HookName::AfterNewWindow,
             "set-buffer -a -b same-after-hook A",
         )
         .await;
-    handler
-        .handle_ok(SetHookMutationRequest {
+    TestRequest::send_ok(
+        &handler,
+        SetHookMutationRequest {
             append: true,
             ..Fixture::fixture((
                 ScopeSelector::Global,
                 HookName::AfterNewWindow,
                 "if-shell -F '#{==:#{session_windows},2}' 'new-window -d -t same-after-hook'",
             ))
-        })
-        .await;
+        },
+    )
+    .await;
 
     let _ = handler.create_window(&alpha).await;
 
@@ -140,24 +144,26 @@ async fn lifecycle_hook_commands_cannot_enqueue_a_second_lifecycle_generation() 
     let handler = RequestHandler::new();
     let alpha = session_name("bounded-lifecycle-alpha");
     let beta = session_name("bounded-lifecycle-beta");
-    handler.create_session(&alpha).await;
-    handler.create_session(&beta).await;
+    SessionSpec::create(&handler, &alpha).await;
+    SessionSpec::create(&handler, &beta).await;
     handler
         .set_global_hook(
             HookName::WindowUnlinked,
             "set-buffer -a -b bounded-lifecycle W",
         )
         .await;
-    handler
-        .handle_ok(SetHookMutationRequest {
+    TestRequest::send_ok(
+        &handler,
+        SetHookMutationRequest {
             append: true,
             ..Fixture::fixture((
                 ScopeSelector::Global,
                 HookName::WindowUnlinked,
                 "kill-window -t bounded-lifecycle-beta:1",
             ))
-        })
-        .await;
+        },
+    )
+    .await;
     handler
         .set_global_hook(
             HookName::SessionClosed,
@@ -188,35 +194,39 @@ async fn explicitly_run_hook_allows_one_same_lifecycle_generation() {
     let handler = RequestHandler::new();
     let alpha = session_name("same-lifecycle-alpha");
     let beta = session_name("same-lifecycle-beta");
-    handler.create_session(&alpha).await;
-    handler.create_session(&beta).await;
+    SessionSpec::create(&handler, &alpha).await;
+    SessionSpec::create(&handler, &beta).await;
     handler
         .set_global_hook(
             HookName::WindowUnlinked,
             "set-buffer -a -b same-lifecycle X",
         )
         .await;
-    handler
-        .handle_ok(SetHookMutationRequest {
+    TestRequest::send_ok(
+        &handler,
+        SetHookMutationRequest {
             append: true,
             ..Fixture::fixture((
                 ScopeSelector::Global,
                 HookName::WindowUnlinked,
                 "kill-window -t same-lifecycle-alpha:0",
             ))
-        })
-        .await;
+        },
+    )
+    .await;
     handler
         .set_global_hook(HookName::SessionClosed, "set-buffer -a -b same-lifecycle S")
         .await;
 
-    handler
-        .handle_ok(SetHookMutationRequest {
+    TestRequest::send_ok(
+        &handler,
+        SetHookMutationRequest {
             command: None,
             run_immediately: true,
             ..Fixture::fixture((ScopeSelector::Global, HookName::WindowUnlinked, ""))
-        })
-        .await;
+        },
+    )
+    .await;
 
     assert_eq!(
         buffer_text(&handler, "same-lifecycle").await.as_deref(),
@@ -235,7 +245,7 @@ async fn explicitly_run_hook_allows_one_same_lifecycle_generation() {
 async fn command_error_hook_does_not_reenter_from_a_hook_command_failure() {
     let handler = RequestHandler::new();
     let alpha = session_name("nested-command-error");
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
     handler
         .set_global_hook(
             HookName::CommandError,
@@ -248,16 +258,18 @@ async fn command_error_hook_does_not_reenter_from_a_hook_command_failure() {
             "set-buffer -a -b nested-command-error A",
         )
         .await;
-    handler
-        .handle_ok(SetHookMutationRequest {
+    TestRequest::send_ok(
+        &handler,
+        SetHookMutationRequest {
             append: true,
             ..Fixture::fixture((
                 ScopeSelector::Global,
                 HookName::AfterNewWindow,
                 "kill-window -t missing-nested-hook:0",
             ))
-        })
-        .await;
+        },
+    )
+    .await;
 
     let _ = handler.create_window(&alpha).await;
 
@@ -273,21 +285,25 @@ async fn command_error_hook_does_not_reenter_from_a_hook_command_failure() {
 async fn session_scoped_after_hook_can_run_a_distinct_session_lifecycle_hook() {
     let handler = RequestHandler::new();
     let beta = session_name("session-scoped-nested-hook");
-    handler.create_session(&beta).await;
-    handler
-        .handle_ok(SetHookMutationRequest::fixture((
+    SessionSpec::create(&handler, &beta).await;
+    TestRequest::send_ok(
+        &handler,
+        SetHookMutationRequest::fixture((
             ScopeSelector::Session(beta.clone()),
             HookName::WindowUnlinked,
             "set-buffer -a -b session-scoped-nested-hook W",
-        )))
-        .await;
-    handler
-        .handle_ok(SetHookMutationRequest::fixture((
+        )),
+    )
+    .await;
+    TestRequest::send_ok(
+        &handler,
+        SetHookMutationRequest::fixture((
             ScopeSelector::Session(beta.clone()),
             HookName::AfterNewWindow,
             "kill-window -t session-scoped-nested-hook:1",
-        )))
-        .await;
+        )),
+    )
+    .await;
 
     let _ = handler.create_window(&beta).await;
 
@@ -309,15 +325,17 @@ async fn nested_linked_last_window_hooks_keep_tmux_family_order() {
     let alpha = session_name("nested-linked-alpha");
     let beta = session_name("nested-linked-beta");
     let trigger = session_name("nested-linked-trigger");
-    handler.create_session(&alpha).await;
-    handler.create_session(&beta).await;
-    handler.create_session(&trigger).await;
-    handler
-        .handle_ok(LinkWindowRequest::fixture((
+    SessionSpec::create(&handler, &alpha).await;
+    SessionSpec::create(&handler, &beta).await;
+    SessionSpec::create(&handler, &trigger).await;
+    TestRequest::send_ok(
+        &handler,
+        LinkWindowRequest::fixture((
             WindowTarget::with_window(alpha.clone(), 0),
             WindowTarget::with_window(beta.clone(), 1),
-        )))
-        .await;
+        )),
+    )
+    .await;
     handler
         .set_global_hook(HookName::WindowUnlinked, "set-buffer -a -b nested-linked W")
         .await;
@@ -344,11 +362,9 @@ async fn nested_grouped_last_window_hooks_keep_tmux_family_order() {
     let handler = RequestHandler::new();
     let alpha = session_name("nested-grouped-alpha");
     let trigger = session_name("nested-grouped-trigger");
-    handler.create_session(&alpha).await;
-    let beta = handler
-        .create_session(Grouped("nested-grouped-beta", &alpha))
-        .await;
-    handler.create_session(&trigger).await;
+    SessionSpec::create(&handler, &alpha).await;
+    let beta = SessionSpec::create(&handler, Grouped("nested-grouped-beta", &alpha)).await;
+    SessionSpec::create(&handler, &trigger).await;
     handler
         .set_global_hook(
             HookName::WindowUnlinked,
@@ -382,7 +398,7 @@ async fn nested_last_session_kill_preserves_exit_empty_shutdown() {
     let (shutdown_handle, mut shutdown_rx) = ShutdownHandle::new();
     handler.install_shutdown_handle(shutdown_handle);
     let alpha = session_name("nested-shutdown-alpha");
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
     handler
         .set_global_hook(
             HookName::WindowUnlinked,
@@ -463,19 +479,21 @@ async fn nested_last_session_kill_preserves_exit_empty_shutdown() {
 #[tokio::test]
 async fn window_resized_hook_runs_after_resize_window() {
     let handler = RequestHandler::new();
-    handler.create_session("alpha").await;
+    SessionSpec::create(&handler, "alpha").await;
     handler
         .set_global_hook(HookName::WindowResized, "set-buffer -b resized yes")
         .await;
 
-    handler
-        .handle_ok(ResizeWindowRequest {
+    TestRequest::send_ok(
+        &handler,
+        ResizeWindowRequest {
             target: WindowTarget::with_window(session_name("alpha"), 0),
             width: Some(90),
             height: Some(24),
             adjustment: None,
-        })
-        .await;
+        },
+    )
+    .await;
 
     let state = handler.state.lock().await;
     let (_, content) = state

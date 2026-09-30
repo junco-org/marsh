@@ -1,18 +1,21 @@
 use super::*;
+use crate::test_fixtures::{SessionSpec, TestRequest};
 
 #[tokio::test]
 async fn resize_window_applies_explicit_dimensions() {
     let handler = RequestHandler::new();
     let alpha = create_session(&handler, "alpha").await;
 
-    let resized = handler
-        .handle_ok(ResizeWindowRequest {
+    let resized = TestRequest::send_ok(
+        &handler,
+        ResizeWindowRequest {
             target: WindowTarget::with_window(alpha.clone(), 0),
             width: Some(60),
             height: Some(20),
             adjustment: None,
-        })
-        .await;
+        },
+    )
+    .await;
     assert_eq!(resized.target, WindowTarget::with_window(alpha.clone(), 0));
 
     let state = handler.state.lock().await;
@@ -28,14 +31,16 @@ async fn resize_window_applies_relative_adjustment() {
     let alpha = create_session(&handler, "alpha").await;
 
     // Session created with cols=120, rows=40. Shrink by 10 cols.
-    handler
-        .handle_ok(ResizeWindowRequest {
+    TestRequest::send_ok(
+        &handler,
+        ResizeWindowRequest {
             target: WindowTarget::with_window(alpha.clone(), 0),
             width: None,
             height: None,
             adjustment: Some(ResizeWindowAdjustment::Left(10)),
-        })
-        .await;
+        },
+    )
+    .await;
 
     let state = handler.state.lock().await;
     let session = state.sessions.session(&alpha).expect("alpha should exist");
@@ -49,14 +54,16 @@ async fn resize_window_applies_adjustment_after_explicit_dimensions() {
     let handler = RequestHandler::new();
     let alpha = create_session(&handler, "alpha").await;
 
-    handler
-        .handle_ok(ResizeWindowRequest {
+    TestRequest::send_ok(
+        &handler,
+        ResizeWindowRequest {
             target: WindowTarget::with_window(alpha.clone(), 0),
             width: Some(60),
             height: Some(20),
             adjustment: Some(ResizeWindowAdjustment::Down(5)),
-        })
-        .await;
+        },
+    )
+    .await;
 
     let state = handler.state.lock().await;
     let session = state.sessions.session(&alpha).expect("alpha should exist");
@@ -68,22 +75,20 @@ async fn resize_window_applies_adjustment_after_explicit_dimensions() {
 #[tokio::test]
 async fn resize_window_largest_smallest_without_attached_clients_use_target_session_size() {
     let handler = RequestHandler::new();
-    let alpha = handler
-        .create_session(("alpha", TerminalSize::new(120, 40)))
-        .await;
-    let beta = handler
-        .create_session(("beta", TerminalSize::new(80, 24)))
-        .await;
+    let alpha = SessionSpec::create(&handler, ("alpha", TerminalSize::new(120, 40))).await;
+    let beta = SessionSpec::create(&handler, ("beta", TerminalSize::new(80, 24))).await;
 
-    handler
-        .handle_ok(LinkWindowRequest {
+    TestRequest::send_ok(
+        &handler,
+        LinkWindowRequest {
             detached: false,
             ..Fixture::fixture((
                 WindowTarget::with_window(alpha.clone(), 0),
                 WindowTarget::with_window(beta.clone(), 1),
             ))
-        })
-        .await;
+        },
+    )
+    .await;
 
     for (target, expected) in [
         (
@@ -99,22 +104,26 @@ async fn resize_window_largest_smallest_without_attached_clients_use_target_sess
             ResizeWindowAdjustment::LargestLinkedSession,
             ResizeWindowAdjustment::SmallestLinkedSession,
         ] {
-            handler
-                .handle_ok(ResizeWindowRequest {
+            TestRequest::send_ok(
+                &handler,
+                ResizeWindowRequest {
                     target: target.clone(),
                     width: Some(70),
                     height: Some(20),
                     adjustment: None,
-                })
-                .await;
-            handler
-                .handle_ok(ResizeWindowRequest {
+                },
+            )
+            .await;
+            TestRequest::send_ok(
+                &handler,
+                ResizeWindowRequest {
                     target: target.clone(),
                     width: None,
                     height: None,
                     adjustment: Some(adjustment),
-                })
-                .await;
+                },
+            )
+            .await;
 
             let state = handler.state.lock().await;
             let window = state
@@ -130,39 +139,41 @@ async fn resize_window_largest_smallest_without_attached_clients_use_target_sess
 #[tokio::test]
 async fn resize_window_updates_linked_slots_and_refreshes_linked_sessions() {
     let handler = RequestHandler::new();
-    let alpha = handler
-        .create_session(("alpha", TerminalSize::new(80, 24)))
-        .await;
-    let beta = handler
-        .create_session(("beta", TerminalSize::new(120, 40)))
-        .await;
+    let alpha = SessionSpec::create(&handler, ("alpha", TerminalSize::new(80, 24))).await;
+    let beta = SessionSpec::create(&handler, ("beta", TerminalSize::new(120, 40))).await;
 
-    handler
-        .handle_ok(LinkWindowRequest {
+    TestRequest::send_ok(
+        &handler,
+        LinkWindowRequest {
             detached: false,
             ..Fixture::fixture((
                 WindowTarget::with_window(alpha.clone(), 0),
                 WindowTarget::with_window(beta.clone(), 1),
             ))
-        })
-        .await;
-    handler
-        .handle_ok(SelectWindowRequest {
+        },
+    )
+    .await;
+    TestRequest::send_ok(
+        &handler,
+        SelectWindowRequest {
             target: WindowTarget::with_window(beta.clone(), 1),
-        })
-        .await;
+        },
+    )
+    .await;
 
     let mut control_rx = handler.attach_client(42, &beta).await;
     drain_attach_controls(&mut control_rx).await;
 
-    handler
-        .handle_ok(ResizeWindowRequest {
+    TestRequest::send_ok(
+        &handler,
+        ResizeWindowRequest {
             target: WindowTarget::with_window(alpha.clone(), 0),
             width: Some(70),
             height: Some(20),
             adjustment: None,
-        })
-        .await;
+        },
+    )
+    .await;
 
     {
         let state = handler.state.lock().await;
@@ -195,23 +206,27 @@ async fn resize_window_propagates_linked_slots_to_their_session_group_peers() {
     let gamma = create_session(&handler, "gamma").await;
     let delta = create_grouped_session(&handler, "delta", &gamma).await;
 
-    handler
-        .handle_ok(LinkWindowRequest {
+    TestRequest::send_ok(
+        &handler,
+        LinkWindowRequest {
             detached: false,
             ..Fixture::fixture((
                 WindowTarget::with_window(alpha.clone(), 0),
                 WindowTarget::with_window(gamma.clone(), 1),
             ))
-        })
-        .await;
-    handler
-        .handle_ok(ResizeWindowRequest {
+        },
+    )
+    .await;
+    TestRequest::send_ok(
+        &handler,
+        ResizeWindowRequest {
             target: WindowTarget::with_window(alpha.clone(), 0),
             width: Some(111),
             height: Some(33),
             adjustment: None,
-        })
-        .await;
+        },
+    )
+    .await;
 
     let state = handler.state.lock().await;
     for (session_name, window_index) in [(&alpha, 0), (&beta, 0), (&gamma, 1), (&delta, 1)] {
@@ -231,9 +246,7 @@ async fn resize_window_propagates_linked_slots_to_their_session_group_peers() {
 #[tokio::test]
 async fn resize_window_largest_smallest_with_attached_clients_still_use_client_sizes() {
     let handler = RequestHandler::new();
-    let alpha = handler
-        .create_session(("alpha", TerminalSize::new(120, 40)))
-        .await;
+    let alpha = SessionSpec::create(&handler, ("alpha", TerminalSize::new(120, 40))).await;
 
     let _control_rx = handler.attach_client(42, &alpha).await;
     {
@@ -249,22 +262,26 @@ async fn resize_window_largest_smallest_with_attached_clients_still_use_client_s
         ResizeWindowAdjustment::LargestLinkedSession,
         ResizeWindowAdjustment::SmallestLinkedSession,
     ] {
-        handler
-            .handle_ok(ResizeWindowRequest {
+        TestRequest::send_ok(
+            &handler,
+            ResizeWindowRequest {
                 target: WindowTarget::with_window(alpha.clone(), 0),
                 width: Some(70),
                 height: Some(20),
                 adjustment: None,
-            })
-            .await;
-        handler
-            .handle_ok(ResizeWindowRequest {
+            },
+        )
+        .await;
+        TestRequest::send_ok(
+            &handler,
+            ResizeWindowRequest {
                 target: WindowTarget::with_window(alpha.clone(), 0),
                 width: None,
                 height: None,
                 adjustment: Some(adjustment),
-            })
-            .await;
+            },
+        )
+        .await;
 
         let state = handler.state.lock().await;
         let window = state
@@ -284,14 +301,16 @@ async fn resize_window_clamps_relative_adjustments_to_a_minimum_size_of_one() {
     let handler = RequestHandler::new();
     let alpha = create_session(&handler, "alpha").await;
 
-    handler
-        .handle_ok(ResizeWindowRequest {
+    TestRequest::send_ok(
+        &handler,
+        ResizeWindowRequest {
             target: WindowTarget::with_window(alpha.clone(), 0),
             width: Some(2),
             height: Some(3),
             adjustment: Some(ResizeWindowAdjustment::Left(10)),
-        })
-        .await;
+        },
+    )
+    .await;
 
     let state = handler.state.lock().await;
     let session = state.sessions.session(&alpha).expect("alpha should exist");
@@ -318,7 +337,7 @@ async fn resize_window_keeps_multi_pane_geometry_at_the_tmux_viable_minimum() {
             TerminalSize::new(3, 1),
         ),
     ] {
-        let session_name = handler.create_session((name, initial)).await;
+        let session_name = SessionSpec::create(&handler, (name, initial)).await;
 
         let split = handler
             .handle(Request::SplitWindow(SplitWindowRequest {
@@ -367,21 +386,23 @@ async fn resize_window_keeps_multi_pane_geometry_at_the_tmux_viable_minimum() {
 #[tokio::test]
 async fn select_layout_expands_a_minimum_window_to_the_named_tree_minimum() {
     let handler = RequestHandler::new();
-    let session_name = handler
-        .create_session(("select-layout-minimum", TerminalSize::new(3, 10)))
-        .await;
+    let session_name = SessionSpec::create(
+        &handler,
+        ("select-layout-minimum", TerminalSize::new(3, 10)),
+    )
+    .await;
 
-    handler
-        .handle_ok(SplitWindowRequest::fixture(&session_name))
-        .await;
-    handler
-        .handle_ok(ResizeWindowRequest {
+    TestRequest::send_ok(&handler, SplitWindowRequest::fixture(&session_name)).await;
+    TestRequest::send_ok(
+        &handler,
+        ResizeWindowRequest {
             target: WindowTarget::with_window(session_name.clone(), 0),
             width: Some(3),
             height: Some(1),
             adjustment: None,
-        })
-        .await;
+        },
+    )
+    .await;
 
     for _ in 0..2 {
         let selected = handler
@@ -469,15 +490,17 @@ async fn respawn_window_succeeds_with_kill_flag() {
     let handler = RequestHandler::new();
     let alpha = create_session(&handler, "alpha").await;
 
-    let respawned = handler
-        .handle_ok(RespawnWindowRequest {
+    let respawned = TestRequest::send_ok(
+        &handler,
+        RespawnWindowRequest {
             target: WindowTarget::with_window(alpha.clone(), 0),
             kill: true,
             start_directory: None,
             environment: None,
             command: None,
-        })
-        .await;
+        },
+    )
+    .await;
     assert_eq!(
         respawned.target,
         WindowTarget::with_window(alpha.clone(), 0)
@@ -508,15 +531,17 @@ async fn respawn_window_reuses_shell_command_cwd_and_private_environment() {
     let initial_process_command = ProcessCommand::Shell(initial_command.clone());
     let initial_environment = "RMUX_RESPAWN=initial".to_owned();
 
-    let alpha = handler
-        .create_session(NewSessionExtRequest {
+    let alpha = SessionSpec::create(
+        &handler,
+        NewSessionExtRequest {
             working_directory: Some(initial_cwd.path().to_string_lossy().into_owned()),
             size: Some(WINDOW_TEST_SIZE),
             environment: Some(vec![initial_environment.clone()]),
             process_command: Some(initial_process_command.clone()),
             ..Fixture::fixture("respawn-window-provenance")
-        })
-        .await;
+        },
+    )
+    .await;
 
     let initial_line = (initial_cwd.relative(), "initial", "initial-command");
     wait_for_window_respawn_probe(&output, &[initial_line]).await;
@@ -537,29 +562,33 @@ async fn respawn_window_reuses_shell_command_cwd_and_private_environment() {
     };
 
     let target = WindowTarget::with_window(alpha.clone(), 0);
-    handler
-        .handle_ok(RespawnWindowRequest {
+    TestRequest::send_ok(
+        &handler,
+        RespawnWindowRequest {
             target: target.clone(),
             kill: true,
             start_directory: None,
             environment: None,
             command: None,
-        })
-        .await;
+        },
+    )
+    .await;
     wait_for_window_respawn_probe(&output, &[initial_line, initial_line]).await;
 
     let override_environment = "RMUX_RESPAWN=override".to_owned();
     let override_command = window_respawn_replay_command(&output, "override-command");
     let override_process_command = ProcessCommand::Shell(override_command.clone());
-    handler
-        .handle_ok(RespawnWindowRequest {
+    TestRequest::send_ok(
+        &handler,
+        RespawnWindowRequest {
             target: target.clone(),
             kill: true,
             start_directory: Some(override_cwd.path().to_path_buf()),
             environment: Some(vec![override_environment.clone()]),
             command: Some(vec![override_command]),
-        })
-        .await;
+        },
+    )
+    .await;
     let override_line = (override_cwd.relative(), "override", "override-command");
     wait_for_window_respawn_probe(&output, &[initial_line, initial_line, override_line]).await;
     {
@@ -576,15 +605,17 @@ async fn respawn_window_reuses_shell_command_cwd_and_private_environment() {
         );
     }
 
-    handler
-        .handle_ok(RespawnWindowRequest {
+    TestRequest::send_ok(
+        &handler,
+        RespawnWindowRequest {
             target,
             kill: true,
             start_directory: None,
             environment: None,
             command: None,
-        })
-        .await;
+        },
+    )
+    .await;
     let inherited_override_line = (override_cwd.relative(), "initial", "override-command");
     wait_for_window_respawn_probe(
         &output,
@@ -615,27 +646,31 @@ async fn respawn_window_keeps_the_original_resolved_shell_after_option_changes()
 
     let target = WindowTarget::with_window(alpha.clone(), 0);
     let shell_command = window_respawn_shell_identity_command(&output, "shell");
-    handler
-        .handle_ok(RespawnWindowRequest {
+    TestRequest::send_ok(
+        &handler,
+        RespawnWindowRequest {
             target: target.clone(),
             kill: true,
             start_directory: None,
             environment: None,
             command: Some(vec![shell_command]),
-        })
-        .await;
+        },
+    )
+    .await;
     let expected_line = "sh:/bin/sh:shell\n";
     wait_for_file_contents(&output, expected_line).await;
 
-    handler
-        .handle_ok(RespawnWindowRequest {
+    TestRequest::send_ok(
+        &handler,
+        RespawnWindowRequest {
             target,
             kill: true,
             start_directory: None,
             environment: None,
             command: None,
-        })
-        .await;
+        },
+    )
+    .await;
     wait_for_file_contents(&output, &format!("{expected_line}{expected_line}")).await;
 
     let state = handler.state.lock().await;
@@ -703,20 +738,24 @@ async fn respawn_window_retains_surviving_pane_lifecycle_counters_and_redacts_en
     let respawn_secret = "RMUX_WINDOW_RESPAWN=gamma-secret".to_owned();
     let respawn_command = crate::test_shell::stdin_discard_command();
 
-    let alpha = handler
-        .create_session(NewSessionExtRequest {
+    let alpha = SessionSpec::create(
+        &handler,
+        NewSessionExtRequest {
             size: Some(WINDOW_TEST_SIZE),
             environment: Some(vec![initial_secret.clone()]),
             ..Fixture::fixture("alpha")
-        })
-        .await;
-    let split_target = handler
-        .handle_ok(SplitWindowRequest {
+        },
+    )
+    .await;
+    let split_target = TestRequest::send_ok(
+        &handler,
+        SplitWindowRequest {
             environment: Some(vec![split_secret.clone()]),
             ..Fixture::fixture(&alpha)
-        })
-        .await
-        .pane;
+        },
+    )
+    .await
+    .pane;
 
     let (surviving_pane_id, split_pane_id, previous_generation, previous_revision, previous_output) = {
         let state = handler.state.lock().await;
@@ -749,15 +788,17 @@ async fn respawn_window_retains_surviving_pane_lifecycle_counters_and_redacts_en
         )
     };
 
-    let respawned = handler
-        .handle_ok(RespawnWindowRequest {
+    let respawned = TestRequest::send_ok(
+        &handler,
+        RespawnWindowRequest {
             target: WindowTarget::with_window(alpha.clone(), 0),
             kill: true,
             start_directory: None,
             environment: Some(vec![respawn_secret.clone()]),
             command: Some(vec![respawn_command.clone()]),
-        })
-        .await;
+        },
+    )
+    .await;
     assert_eq!(
         respawned.target,
         WindowTarget::with_window(alpha.clone(), 0)
@@ -798,17 +839,16 @@ async fn respawn_window_retains_surviving_pane_lifecycle_counters_and_redacts_en
         )
     };
 
-    let listed = handler
-        .handle_ok(ListPanesRequest {
-            target: alpha.clone(),
-            target_window_index: Some(0),
-            format: Some(
-                "#{pane_id}\t#{pane_lifecycle_generation}\t#{pane_lifecycle_revision}\t#{pane_output_sequence}\t#{pane_start_command}".to_owned(),
-            ),
-            filter: None,
-            sort_order: None,
-            reversed: false,
-        })
+    let listed = TestRequest::send_ok(&handler, ListPanesRequest {
+        target: alpha.clone(),
+        target_window_index: Some(0),
+        format: Some(
+            "#{pane_id}\t#{pane_lifecycle_generation}\t#{pane_lifecycle_revision}\t#{pane_output_sequence}\t#{pane_start_command}".to_owned(),
+        ),
+        filter: None,
+        sort_order: None,
+        reversed: false,
+    })
         .await;
     let list_stdout = String::from_utf8(listed.output.stdout).expect("list-panes utf8");
     assert!(list_stdout.contains(&surviving_pane_id.to_string()));
@@ -819,8 +859,9 @@ async fn respawn_window_retains_surviving_pane_lifecycle_counters_and_redacts_en
     assert!(!list_stdout.contains(&split_secret));
     assert!(!list_stdout.contains(&respawn_secret));
 
-    let windows = handler
-        .handle_ok(ListWindowsRequest {
+    let windows = TestRequest::send_ok(
+        &handler,
+        ListWindowsRequest {
             target: alpha,
             format: Some(
                 "#{window_id}\t#{pane_id}\t#{pane_lifecycle_generation}\t#{pane_output_sequence}"
@@ -829,8 +870,9 @@ async fn respawn_window_retains_surviving_pane_lifecycle_counters_and_redacts_en
             filter: None,
             sort_order: None,
             reversed: false,
-        })
-        .await;
+        },
+    )
+    .await;
     assert_eq!(windows.windows.len(), 1);
     let windows_stdout = String::from_utf8(windows.output.stdout).expect("list-windows utf8");
     assert!(!windows_stdout.contains(&initial_secret));
@@ -844,20 +886,24 @@ async fn respawn_window_selects_target_window_like_tmux() {
     let alpha = create_session(&handler, "alpha").await;
     insert_window(&handler, &alpha, 1).await;
 
-    handler
-        .handle_ok(SelectWindowRequest {
+    TestRequest::send_ok(
+        &handler,
+        SelectWindowRequest {
             target: WindowTarget::with_window(alpha.clone(), 1),
-        })
-        .await;
-    handler
-        .handle_ok(RespawnWindowRequest {
+        },
+    )
+    .await;
+    TestRequest::send_ok(
+        &handler,
+        RespawnWindowRequest {
             target: WindowTarget::with_window(alpha.clone(), 0),
             kill: true,
             start_directory: None,
             environment: None,
             command: None,
-        })
-        .await;
+        },
+    )
+    .await;
 
     let state = handler.state.lock().await;
     let session = state.sessions.session(&alpha).expect("alpha should exist");

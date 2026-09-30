@@ -18,7 +18,9 @@ use crate::outer_terminal::OuterTerminalContext;
 use crate::pane_io::AttachControl;
 use crate::pane_terminals::seed_scratch_dir;
 use crate::server_access::AccessMode;
-use crate::test_fixtures::{quiet_command, unique_temp_path, Fixture, Quiet, TestRequest};
+use crate::test_fixtures::{
+    quiet_command, unique_temp_path, Fixture, Quiet, SessionSpec, TestRequest,
+};
 use crate::test_shell::{command_quote, sh_quote_path};
 use rmux_core::command_parser::CommandParser;
 use rmux_core::input::InputParser;
@@ -219,13 +221,15 @@ async fn register_control_client(
 /// A handler with started 20x6 quiet session `name`, and that session's first pane.
 async fn mouse_fixture(name: &str) -> (RequestHandler, SessionName, PaneTarget) {
     let handler = RequestHandler::new();
-    let session = handler
-        .create_started_session(NewSessionExtRequest {
+    let session = SessionSpec::create_started(
+        &handler,
+        NewSessionExtRequest {
             size: Some(TerminalSize { cols: 20, rows: 6 }),
             command: Some(quiet_command()),
             ..Fixture::fixture(name)
-        })
-        .await;
+        },
+    )
+    .await;
     let target = PaneTarget::with_window(session.clone(), 0, 0);
     (handler, session, target)
 }
@@ -351,10 +355,8 @@ fn background_shell_test_timeout() -> Duration {
 }
 
 async fn replace_background_identity_session(handler: &RequestHandler, session_name: SessionName) {
-    handler
-        .handle_ok(KillSessionRequest::fixture(&session_name))
-        .await;
-    handler.create_session(session_name).await;
+    TestRequest::send_ok(handler, KillSessionRequest::fixture(&session_name)).await;
+    SessionSpec::create(handler, session_name).await;
 }
 
 async fn wait_for_active_window_name(

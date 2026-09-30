@@ -17,6 +17,7 @@ use super::set_titles_support::{
     attach_sized_client, delivered_titles, remembered_title, set_global,
 };
 use super::*;
+use crate::test_fixtures::SessionSpec;
 
 /// Distinguishes the two generations by something only the client owns, so a
 /// frame delivered to the wrong one is visible rather than merely suspected.
@@ -44,7 +45,7 @@ async fn armed_session(
 ) {
     let handler = RequestHandler::new();
     let session = session_name(label);
-    handler.create_session(&session).await;
+    SessionSpec::create(&handler, &session).await;
     set_global(&handler, OptionName::SetTitlesString, GEOMETRY_TITLE_FORMAT).await;
     set_global(&handler, OptionName::SetTitles, "on").await;
 

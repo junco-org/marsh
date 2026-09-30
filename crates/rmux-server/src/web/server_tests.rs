@@ -2,7 +2,9 @@ use super::http::{path_from_target, HttpRequest};
 use super::pre_auth::{PreAuthAdmission, PreAuthQueue};
 use super::{is_fd_exhaustion, serve_admitted_connection, should_continue_accept_loop};
 use crate::handler::RequestHandler;
-use crate::test_fixtures::{operator_token, spectator_token, wait_until, Fixture, SessionSpec};
+use crate::test_fixtures::{
+    operator_token, spectator_token, wait_until, Fixture, SessionSpec, TestRequest,
+};
 use crate::web::protocol::{
     AUTH_FRAME_TIMEOUT, PANE_RECOVERY_COVERAGE_CAPABILITY, WEB_SHARE_PROTOCOL_VERSION,
 };
@@ -410,12 +412,13 @@ async fn share_websocket_auth_ready_snapshot_operator_and_revoke_loop() {
     assert_eq!(snapshot[17], 1);
 
     client.send_binary(&[0x80, b'p', b'w', b'd', b'\n']).await;
-    let stopped = host
-        .handler
-        .handle_ok(WebShareRequest::Stop(StopWebShareRequest {
+    let stopped = TestRequest::send_ok(
+        &host.handler,
+        WebShareRequest::Stop(StopWebShareRequest {
             share_id: created.share_id,
-        }))
-        .await;
+        }),
+    )
+    .await;
     assert!(matches!(*stopped, WebShareResponse::Stopped(_)));
 
     let revoked = client.read_json().await;
@@ -716,9 +719,11 @@ async fn session_share_sends_revoked_before_closing_when_session_is_killed() {
     assert_eq!(ready["type"], "ready");
     assert_eq!(ready["scope"], "session");
 
-    host.handler
-        .handle_ok(KillSessionRequest::fixture(&host.session_name))
-        .await;
+    TestRequest::send_ok(
+        &host.handler,
+        KillSessionRequest::fixture(&host.session_name),
+    )
+    .await;
 
     let revoked = client.read_json().await;
     assert_eq!(revoked["type"], "share_revoked");
@@ -814,12 +819,14 @@ async fn session_operator_browser_resize_queues_fresh_snapshot() {
 #[tokio::test]
 async fn session_operator_can_resize_pane_by_id() {
     let host = ShareHost::new("websocket-session-pane-resize").await;
-    host.handler
-        .handle_ok(SplitWindowRequest {
+    TestRequest::send_ok(
+        &host.handler,
+        SplitWindowRequest {
             direction: SplitDirection::Horizontal,
             ..Fixture::fixture(&host.session_name)
-        })
-        .await;
+        },
+    )
+    .await;
 
     let mut client = host.join(host.session_scope(), Role::Operator).await;
 
@@ -921,16 +928,17 @@ async fn session_spectator_can_select_windows_without_operator_access() {
             active_window_index(view) == Some(1)
         })
         .await;
-    let listed = host
-        .handler
-        .handle_ok(ListWindowsRequest {
+    let listed = TestRequest::send_ok(
+        &host.handler,
+        ListWindowsRequest {
             target: host.session_name.clone(),
             format: None,
             filter: None,
             sort_order: None,
             reversed: false,
-        })
-        .await;
+        },
+    )
+    .await;
     assert!(listed
         .windows
         .iter()
@@ -982,10 +990,7 @@ async fn loopback_backoff_waiters_do_not_block_another_share_over_websocket() {
     )
     .await;
     let (protected_token, protected_pin) = host.pin_share(host.pane_scope()).await;
-    let unrelated_session = host
-        .handler
-        .create_session("websocket-unrelated-wait")
-        .await;
+    let unrelated_session = SessionSpec::create(&host.handler, "websocket-unrelated-wait").await;
     let unrelated = host
         .share_as(
             WebShareScope::Pane(PaneTarget::new(unrelated_session, 0).into()),
@@ -1203,7 +1208,7 @@ impl ShareHost {
 
     async fn with_handler(handler: RequestHandler, session: impl SessionSpec) -> Self {
         let handler = Arc::new(handler);
-        let session_name = handler.create_session(session).await;
+        let session_name = SessionSpec::create(&handler, session).await;
         Self {
             handler,
             session_name,
@@ -1220,10 +1225,7 @@ impl ShareHost {
 
     async fn share(&self, request: CreateWebShareRequest) -> WebShareCreatedResponse {
         self.handler.mark_web_listener_available();
-        let response = self
-            .handler
-            .handle_ok(WebShareRequest::Create(request))
-            .await;
+        let response = TestRequest::send_ok(&self.handler, WebShareRequest::Create(request)).await;
         let WebShareResponse::Created(created) = *response else {
             panic!("expected web share creation");
         };

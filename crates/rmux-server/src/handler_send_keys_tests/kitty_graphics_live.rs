@@ -1,4 +1,5 @@
 use super::*;
+use crate::test_fixtures::TestRequest;
 
 #[tokio::test]
 async fn live_attach_kitty_graphics_apc_passes_through_unchanged_when_chunked() {
@@ -93,12 +94,14 @@ async fn live_attach_meta_underscore_dispatches_root_binding_after_escape_timeou
     let requester_pid = std::process::id();
 
     create_send_keys_test_session(&handler, &alpha).await;
-    handler
-        .handle_ok(BindKeyRequest {
+    TestRequest::send_ok(
+        &handler,
+        BindKeyRequest {
             note: Some("timed-out meta underscore".to_owned()),
             ..Fixture::fixture(("root", "M-_", ["send-keys", "-l", "B"]))
-        })
-        .await;
+        },
+    )
+    .await;
 
     let _control_rx = handler.attach_client(requester_pid, &alpha).await;
     let capture =
@@ -438,7 +441,7 @@ async fn live_attach_palette_response_is_correlated_to_the_current_pane() {
 
     let first = PaneTarget::with_window(alpha.clone(), 0, 0);
     let second = PaneTarget::with_window(alpha.clone(), 0, 1);
-    handler.handle_ok(SelectPaneRequest::fixture(&first)).await;
+    TestRequest::send_ok(&handler, SelectPaneRequest::fixture(&first)).await;
     {
         let mut state = handler.state.lock().await;
         state
@@ -450,13 +453,13 @@ async fn live_attach_palette_response_is_correlated_to_the_current_pane() {
 
     let _control_rx = handler.attach_client(requester_pid, &alpha).await;
     let response = b"\x1b]4;7;rgb:1111/2222/3333\x1b\\";
-    handler.handle_ok(SelectPaneRequest::fixture(&second)).await;
+    TestRequest::send_ok(&handler, SelectPaneRequest::fixture(&second)).await;
     handler
         .handle_attached_live_input_for_test(requester_pid, response)
         .await
         .expect("response on wrong pane is safely consumed");
 
-    handler.handle_ok(SelectPaneRequest::fixture(&first)).await;
+    TestRequest::send_ok(&handler, SelectPaneRequest::fixture(&first)).await;
     handler
         .handle_attached_live_input_for_test(requester_pid, response)
         .await
@@ -598,12 +601,14 @@ async fn ambiguous_alt_right_bracket_dispatches_root_binding_after_escape_timeou
     let requester_pid = std::process::id();
 
     create_send_keys_test_session(&handler, &alpha).await;
-    handler
-        .handle_ok(BindKeyRequest {
+    TestRequest::send_ok(
+        &handler,
+        BindKeyRequest {
             note: Some("timed-out meta right bracket".to_owned()),
             ..Fixture::fixture(("root", "M-]", ["send-keys", "-l", "R"]))
-        })
-        .await;
+        },
+    )
+    .await;
 
     let _control_rx = handler.attach_client(requester_pid, &alpha).await;
     let capture =

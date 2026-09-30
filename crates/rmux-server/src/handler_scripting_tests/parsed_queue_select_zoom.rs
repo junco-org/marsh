@@ -1,25 +1,26 @@
 use super::*;
+use crate::test_fixtures::{SessionSpec, TestRequest};
 
 async fn handler_with_split_session(name: &str) -> (RequestHandler, SessionName) {
     let handler = RequestHandler::new();
-    let session = handler.create_session(name).await;
-    handler
-        .handle_ok(SplitWindowRequest::fixture(PaneTarget::with_window(
-            session.clone(),
-            0,
-            0,
-        )))
-        .await;
+    let session = SessionSpec::create(&handler, name).await;
+    TestRequest::send_ok(
+        &handler,
+        SplitWindowRequest::fixture(PaneTarget::with_window(session.clone(), 0, 0)),
+    )
+    .await;
     (handler, session)
 }
 
 async fn zoom_pane(handler: &RequestHandler, session: &SessionName, pane_index: u32) {
-    handler
-        .handle_ok(rmux_proto::ResizePaneRequest {
+    TestRequest::send_ok(
+        handler,
+        rmux_proto::ResizePaneRequest {
             target: PaneTarget::with_window(session.clone(), 0, pane_index),
             adjustment: rmux_proto::ResizePaneAdjustment::Zoom,
-        })
-        .await;
+        },
+    )
+    .await;
 }
 
 async fn assert_zoomed_active(handler: &RequestHandler, session: &SessionName, pane_index: u32) {

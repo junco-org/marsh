@@ -7,7 +7,7 @@ use tokio::sync::mpsc;
 use super::RequestHandler;
 use crate::client_names::control_client_name;
 use crate::control::ControlServerEvent;
-use crate::test_fixtures::Fixture;
+use crate::test_fixtures::{Fixture, SessionSpec, TestRequest};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ProtocolSelectionModel {
@@ -114,22 +114,26 @@ struct SwitchFixture {
 impl SwitchFixture {
     async fn new(label: &str) -> Self {
         let handler = RequestHandler::new();
-        let source = handler.create_session(format!("{label}-source")).await;
-        let target = handler.create_session(format!("{label}-target")).await;
-        handler
-            .handle_ok(SplitWindowRequest {
+        let source = SessionSpec::create(&handler, format!("{label}-source")).await;
+        let target = SessionSpec::create(&handler, format!("{label}-target")).await;
+        TestRequest::send_ok(
+            &handler,
+            SplitWindowRequest {
                 direction: SplitDirection::Horizontal,
                 ..Fixture::fixture(PaneTarget::with_window(target.clone(), 0, 0))
-            })
-            .await;
+            },
+        )
+        .await;
         let second_window = handler.create_window(&target).await.window_index();
         assert_eq!(second_window, 1);
-        handler
-            .handle_ok(SplitWindowRequest {
+        TestRequest::send_ok(
+            &handler,
+            SplitWindowRequest {
                 direction: SplitDirection::Horizontal,
                 ..Fixture::fixture(PaneTarget::with_window(target.clone(), second_window, 0))
-            })
-            .await;
+            },
+        )
+        .await;
 
         {
             let mut state = handler.state.lock().await;

@@ -3,6 +3,7 @@ use std::time::Duration;
 use super::*;
 use crate::handler::scripting_support::install_queue_exact_target_capture_pause;
 use crate::pane_io::AttachControl;
+use crate::test_fixtures::{SessionSpec, TestRequest};
 
 #[tokio::test]
 async fn parsed_implicit_mutation_revalidates_after_slot_replacement() {
@@ -124,7 +125,7 @@ async fn implicit_pane_role_revalidates_after_same_window_slot_replacement() {
 #[tokio::test]
 async fn implicit_pane_role_rejects_respawned_output_generation() {
     let handler = RequestHandler::new();
-    let session_name = handler.create_session("retained-pane-respawn").await;
+    let session_name = SessionSpec::create(&handler, "retained-pane-respawn").await;
     let target = PaneTarget::with_window(session_name.clone(), 0, 0);
     let (pane_id, initial_generation) = {
         let state = handler.state.lock().await;
@@ -155,12 +156,14 @@ async fn implicit_pane_role_rejects_respawned_output_generation() {
     });
     pause.wait_until_reached().await;
 
-    handler
-        .handle_ok(RespawnPaneRequest {
+    TestRequest::send_ok(
+        &handler,
+        RespawnPaneRequest {
             command: Some(vec![crate::test_shell::stdin_discard_command()]),
             ..Fixture::fixture(&target)
-        })
-        .await;
+        },
+    )
+    .await;
     {
         let state = handler.state.lock().await;
         assert_eq!(
@@ -192,10 +195,8 @@ async fn implicit_pane_role_rejects_respawned_output_generation() {
 #[tokio::test]
 async fn explicit_send_keys_revalidates_before_copy_mode_effects() {
     let handler = RequestHandler::new();
-    let session_name = handler.create_session("retained-send-keys-copy-mode").await;
-    handler
-        .handle_ok(SplitWindowRequest::fixture(&session_name))
-        .await;
+    let session_name = SessionSpec::create(&handler, "retained-send-keys-copy-mode").await;
+    TestRequest::send_ok(&handler, SplitWindowRequest::fixture(&session_name)).await;
     let target = PaneTarget::with_window(session_name.clone(), 0, 0);
     let (current_target, lease) = retained_alert_binding(&handler, &session_name).await;
     let pause = install_queue_exact_target_capture_pause(&handler, "send-keys");
@@ -226,7 +227,7 @@ async fn explicit_send_keys_revalidates_before_copy_mode_effects() {
             )
             .expect("replace the explicit numeric pane slot");
     }
-    handler.handle_ok(CopyModeRequest::fixture(&target)).await;
+    TestRequest::send_ok(&handler, CopyModeRequest::fixture(&target)).await;
     pause.release.notify_one();
 
     let error = command
@@ -251,8 +252,8 @@ async fn explicit_send_keys_revalidates_before_copy_mode_effects() {
 #[tokio::test]
 async fn join_pane_explicit_source_keeps_retained_destination() {
     let handler = RequestHandler::new();
-    let alpha = handler.create_session("retained-join-destination").await;
-    let beta = handler.create_session("retained-join-source").await;
+    let alpha = SessionSpec::create(&handler, "retained-join-destination").await;
+    let beta = SessionSpec::create(&handler, "retained-join-source").await;
     let (current_target, lease) = retained_alert_binding(&handler, &alpha).await;
 
     handler
@@ -280,8 +281,8 @@ async fn join_pane_explicit_source_keeps_retained_destination() {
 #[tokio::test]
 async fn join_pane_explicit_destination_keeps_retained_source() {
     let handler = RequestHandler::new();
-    let alpha = handler.create_session("retained-join-source").await;
-    let beta = handler.create_session("retained-join-destination").await;
+    let alpha = SessionSpec::create(&handler, "retained-join-source").await;
+    let beta = SessionSpec::create(&handler, "retained-join-destination").await;
     let (current_target, lease) = retained_alert_binding(&handler, &alpha).await;
 
     handler
@@ -438,7 +439,7 @@ async fn queued_lock_session_rejects_retired_and_replaced_implicit_window() {
 #[tokio::test]
 async fn queued_new_window_relative_target_keeps_its_captured_anchor() {
     let handler = RequestHandler::new();
-    let session_name = handler.create_session("queued-new-window-relative").await;
+    let session_name = SessionSpec::create(&handler, "queued-new-window-relative").await;
     handler
         .create_window(NewWindowRequest {
             target_window_index: Some(2),
@@ -570,9 +571,7 @@ async fn queued_new_window_insert_rejects_replaced_before_and_after_anchors() {
 #[tokio::test]
 async fn queued_new_window_kill_revalidates_the_destination_at_replacement() {
     let handler = RequestHandler::new();
-    let session_name = handler
-        .create_session("queued-new-window-kill-occupant")
-        .await;
+    let session_name = SessionSpec::create(&handler, "queued-new-window-kill-occupant").await;
     handler
         .create_window(NewWindowRequest {
             name: Some("replacement".to_owned()),
@@ -664,9 +663,7 @@ async fn queued_new_window_kill_revalidates_the_destination_at_replacement() {
 #[tokio::test]
 async fn queued_new_window_kill_publishes_only_the_committed_window_identity() {
     let handler = RequestHandler::new();
-    let session_name = handler
-        .create_session("queued-new-window-transaction")
-        .await;
+    let session_name = SessionSpec::create(&handler, "queued-new-window-transaction").await;
     handler
         .set_global_hook(
             HookName::AfterNewWindow,
@@ -896,9 +893,9 @@ async fn display_message_read_revalidates_after_slot_replacement() {
 #[tokio::test]
 async fn target_client_display_follows_the_captured_registration_not_the_lifecycle_target() {
     let handler = RequestHandler::new();
-    let lifecycle = handler.create_session("display-client-lifecycle").await;
-    let before_switch = handler.create_session("display-client-before-switch").await;
-    let after_switch = handler.create_session("display-client-after-switch").await;
+    let lifecycle = SessionSpec::create(&handler, "display-client-lifecycle").await;
+    let before_switch = SessionSpec::create(&handler, "display-client-before-switch").await;
+    let after_switch = SessionSpec::create(&handler, "display-client-after-switch").await;
     let attach_pid = 91_941;
     let mut control_rx = handler.attach_client(attach_pid, before_switch).await;
     let (current_target, lease) = retained_alert_binding(&handler, &lifecycle).await;
@@ -952,15 +949,9 @@ async fn target_client_display_follows_the_captured_registration_not_the_lifecyc
 #[tokio::test]
 async fn target_client_display_rejects_a_recreated_attach_registration() {
     let handler = RequestHandler::new();
-    let lifecycle = handler
-        .create_session("display-client-recreate-lifecycle")
-        .await;
-    let original = handler
-        .create_session("display-client-recreate-original")
-        .await;
-    let replacement = handler
-        .create_session("display-client-recreate-replacement")
-        .await;
+    let lifecycle = SessionSpec::create(&handler, "display-client-recreate-lifecycle").await;
+    let original = SessionSpec::create(&handler, "display-client-recreate-original").await;
+    let replacement = SessionSpec::create(&handler, "display-client-recreate-replacement").await;
     let attach_pid = 91_942;
     let _original_rx = handler.attach_client(attach_pid, original).await;
     let (current_target, lease) = retained_alert_binding(&handler, &lifecycle).await;
@@ -1002,12 +993,8 @@ async fn capture_pane_read_revalidates_after_slot_replacement() {
 async fn explicit_target_bypasses_retired_lifecycle_role_and_remains_pinned() {
     for replace in [false, true] {
         let handler = RequestHandler::new();
-        let alpha = handler
-            .create_session(format!("retained-explicit-{replace}"))
-            .await;
-        let beta = handler
-            .create_session(format!("explicit-destination-{replace}"))
-            .await;
+        let alpha = SessionSpec::create(&handler, format!("retained-explicit-{replace}")).await;
+        let beta = SessionSpec::create(&handler, format!("explicit-destination-{replace}")).await;
         let (current_target, lease) = retained_alert_binding(&handler, &alpha).await;
         {
             let mut state = handler.state.lock().await;

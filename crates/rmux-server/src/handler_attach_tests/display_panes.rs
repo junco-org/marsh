@@ -1,13 +1,12 @@
 use super::*;
+use crate::test_fixtures::{SessionSpec, TestRequest};
 
 #[tokio::test]
 async fn attached_prefix_q_repaints_status_line_after_status_message() {
     let handler = RequestHandler::new();
     let requester_pid = std::process::id();
     let alpha = session_name("alpha");
-    handler
-        .create_session((&alpha, TerminalSize { cols: 30, rows: 6 }))
-        .await;
+    SessionSpec::create(&handler, (&alpha, TerminalSize { cols: 30, rows: 6 })).await;
     let mut control_rx = handler.attach_client(requester_pid, &alpha).await;
     drain_attach_controls(&mut control_rx);
 
@@ -64,13 +63,12 @@ async fn attached_prefix_x_during_display_panes_opens_kill_pane_prompt() {
             "60000",
         )
         .await;
-    handler.handle_ok(SplitWindowRequest::fixture(&alpha)).await;
-    handler
-        .handle_ok(SelectPaneRequest::fixture(PaneTarget::new(
-            alpha.clone(),
-            1,
-        )))
-        .await;
+    TestRequest::send_ok(&handler, SplitWindowRequest::fixture(&alpha)).await;
+    TestRequest::send_ok(
+        &handler,
+        SelectPaneRequest::fixture(PaneTarget::new(alpha.clone(), 1)),
+    )
+    .await;
     drain_attach_controls(&mut control_rx);
 
     handler
@@ -109,7 +107,7 @@ async fn attached_prefix_q_emits_a_display_panes_overlay_when_prefix_and_q_arriv
     let requester_pid = std::process::id();
     let alpha = session_name("alpha");
     let mut control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
-    handler.handle_ok(SplitWindowRequest::fixture(&alpha)).await;
+    TestRequest::send_ok(&handler, SplitWindowRequest::fixture(&alpha)).await;
     drain_attach_controls(&mut control_rx);
 
     handler
@@ -207,12 +205,14 @@ async fn rename_session_rekeys_display_panes_typed_and_template_targets() {
     );
     let _ = recv_overlay_frame(&mut control_rx, "display-panes before rename").await;
 
-    handler
-        .handle_ok(RenameSessionRequest {
+    TestRequest::send_ok(
+        &handler,
+        RenameSessionRequest {
             target: alpha,
             new_name: beta.clone(),
-        })
-        .await;
+        },
+    )
+    .await;
 
     let label = {
         let active_attach = handler.active_attach.lock().await;
@@ -273,9 +273,7 @@ async fn refresh_client_replays_active_display_panes_after_base_switch() {
     let _ = recv_overlay_frame(&mut control_rx, "display-panes before refresh-client").await;
     drain_attach_controls(&mut control_rx);
 
-    handler
-        .handle_ok(rmux_proto::RefreshClientRequest::fixture(None))
-        .await;
+    TestRequest::send_ok(&handler, rmux_proto::RefreshClientRequest::fixture(None)).await;
 
     let mut saw_switch = false;
     let mut replayed_display_panes = None;
@@ -399,9 +397,7 @@ async fn refresh_client_replay_order_matches_overlay_input_priority() {
     }
     drain_attach_controls(&mut control_rx);
 
-    handler
-        .handle_ok(rmux_proto::RefreshClientRequest::fixture(None))
-        .await;
+    TestRequest::send_ok(&handler, rmux_proto::RefreshClientRequest::fixture(None)).await;
 
     let mut saw_switch = false;
     let mut replay_order = Vec::new();
@@ -431,14 +427,12 @@ async fn display_panes_input_uses_visible_pane_base_index_labels() {
     let requester_pid = std::process::id();
     let alpha = session_name("alpha");
     let mut control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
-    handler.handle_ok(SplitWindowRequest::fixture(&alpha)).await;
-    handler
-        .handle_ok(SelectPaneRequest::fixture(PaneTarget::with_window(
-            alpha.clone(),
-            0,
-            0,
-        )))
-        .await;
+    TestRequest::send_ok(&handler, SplitWindowRequest::fixture(&alpha)).await;
+    TestRequest::send_ok(
+        &handler,
+        SelectPaneRequest::fixture(PaneTarget::with_window(alpha.clone(), 0, 0)),
+    )
+    .await;
     handler
         .set_option(
             ScopeSelector::Window(WindowTarget::with_window(alpha.clone(), 0)),
@@ -547,7 +541,7 @@ async fn attached_prefix_q_emits_a_display_panes_clear_after_the_timeout() {
             "25",
         )
         .await;
-    handler.handle_ok(SplitWindowRequest::fixture(&alpha)).await;
+    TestRequest::send_ok(&handler, SplitWindowRequest::fixture(&alpha)).await;
     drain_attach_controls(&mut control_rx);
 
     handler

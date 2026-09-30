@@ -7,8 +7,8 @@ use normalize_path::NormalizePath as _;
 use crate::{
     ExecutionParameters, ShellFd,
     env::{EnvironmentLookup, EnvironmentScope},
-    error, openfiles, pathsearch,
-    sys::{fs::PathExt as _, users},
+    error, hostfs, openfiles, pathsearch,
+    sys::users,
     variables,
 };
 
@@ -62,7 +62,7 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
     fn directory_target(&self, target_dir: &Path) -> Result<PathBuf, error::Error> {
         let abs_path = self.absolute_path(target_dir);
 
-        match std::fs::metadata(&abs_path) {
+        match hostfs::metadata(self.execution_observer(), &abs_path, true) {
             Ok(m) => {
                 if !m.is_dir() {
                     return Err(error::ErrorKind::NotADirectory(abs_path).into());
@@ -113,7 +113,12 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
         let path_var = self.env.get_str("PATH", self).unwrap_or_default();
         let paths = crate::sys::fs::split_paths(path_var.as_ref());
 
-        pathsearch::search_for_executable(paths, filename)
+        pathsearch::search_for_executable_observed(
+            self.execution_observer(),
+            self.working_dir(),
+            paths,
+            filename,
+        )
     }
 
     /// Finds executables in the shell's current default PATH, with filenames matching the
@@ -130,7 +135,13 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
         let path_var = self.env.get_str("PATH", self).unwrap_or_default();
         let paths = crate::sys::fs::split_paths(path_var.as_ref());
 
-        pathsearch::search_for_executable_with_prefix(paths, filename_prefix, case_insensitive)
+        pathsearch::search_for_executable_with_prefix(
+            self.execution_observer(),
+            self.working_dir(),
+            paths,
+            filename_prefix,
+            case_insensitive,
+        )
     }
 
     /// Determines whether the given filename is the name of an executable in one of the
@@ -146,7 +157,10 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
         let path = self.env_str("PATH").unwrap_or_default();
         for one_dir in crate::sys::fs::split_paths(path.as_ref()) {
             let candidate_path = one_dir.join(candidate_name.as_ref());
-            if candidate_path.executable() {
+            // Probe the absolute form (a relative `PATH` entry names a directory relative to the
+            // shell's working directory), but return the candidate as found.
+            if hostfs::executable(self.execution_observer(), &self.absolute_path(&candidate_path))
+            {
                 return Some(candidate_path);
             }
         }
@@ -227,7 +241,9 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
             return open_file.try_clone();
         }
 
-        Ok(options.open(path_to_open)?.into())
+        // Report the open to the execution observer (while the new descriptor is still open);
+        // neither the special-file nor the `/dev/fd` clone paths above open a host path.
+        Ok(hostfs::open(self.execution_observer(), options, &path_to_open)?.into())
     }
 
     /// Replaces the shell's currently configured open files with the given set.

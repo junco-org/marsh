@@ -8,12 +8,10 @@ mod error;
 mod frontend;
 mod idle;
 mod ids;
-pub mod jobctl;
 mod jobs;
 mod mux;
 mod pipes;
 pub mod pty;
-pub mod repl;
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod testing;

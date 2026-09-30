@@ -12,6 +12,13 @@ use marsh_lib::{CheckedAdvance, RecoverPoison as _};
 use nix_observer::unistd::Pid;
 use syscalls::Sysno;
 
+/// `IORING_SETUP_SQPOLL`: a kernel thread consumes submissions without any syscall to observe.
+const IORING_SETUP_SQPOLL: u64 = 1 << 1;
+/// `io_uring` operations with no filesystem effect: `NOP`, `POLL_ADD`, `POLL_REMOVE`, `TIMEOUT`,
+/// `TIMEOUT_REMOVE`, `ASYNC_CANCEL`, `LINK_TIMEOUT` and `EPOLL_CTL` (event-loop batching, as
+/// libuv uses).
+const EFFECTLESS_IO_URING_OPS: [u8; 8] = [0, 6, 7, 11, 12, 14, 15, 29];
+
 /// A single native call's footprint. Metadata observations never manufacture content claims.
 #[derive(Debug, Default)]
 pub(super) struct Effects {
@@ -485,9 +492,28 @@ impl Access {
                     }
                 }
             }
-            Sysno::io_uring_setup
-            | Sysno::io_uring_enter
-            | Sysno::io_uring_register
+            // A ring is observable while every submission is visible at an `io_uring_enter` stop:
+            // no kernel submission thread, and only operations with no filesystem effect.
+            Sysno::io_uring_setup => {
+                if success && captured_flags(info)? & IORING_SETUP_SQPOLL != 0 {
+                    return Err("kernel-polled io_uring submissions are unobservable".into());
+                }
+            }
+            Sysno::io_uring_enter => {
+                if integer(info, 1)? != 0 {
+                    let submissions = info
+                        .submissions
+                        .as_ref()
+                        .ok_or_else(|| "unobserved io_uring submissions".to_string())?;
+                    if let Some(opcode) = submissions
+                        .iter()
+                        .find(|opcode| !EFFECTLESS_IO_URING_OPS.contains(opcode))
+                    {
+                        return Err(format!("unsupported io_uring operation {opcode}"));
+                    }
+                }
+            }
+            Sysno::io_uring_register
             | Sysno::io_submit
             | Sysno::mount
             | Sysno::umount2

@@ -7,7 +7,7 @@ use rmux_proto::{
     ScopeSelector, SendKeysExtRequest, SendKeysResponse, SessionName, SetHookRequest, WindowTarget,
 };
 
-use crate::test_fixtures::Fixture;
+use crate::test_fixtures::{Fixture, TestRequest};
 
 const SURVIVOR_OPTION: &str = "@w13-m10-survivor";
 
@@ -74,13 +74,15 @@ async fn mark_survivor(handler: &RequestHandler, target: &WindowTarget, marker: 
             "off",
         )
         .await;
-    handler
-        .handle_ok(SetHookRequest::fixture((
+    TestRequest::send_ok(
+        handler,
+        SetHookRequest::fixture((
             ScopeSelector::Window(target.clone()),
             HookName::WindowLayoutChanged,
             format!("display-message {marker}").as_str(),
-        )))
-        .await;
+        )),
+    )
+    .await;
 
     handler.window_id_for_test(target).await
 }
@@ -283,12 +285,14 @@ async fn run_linked_case(command: TransferCommand) {
     .await;
     create_window(&handler, &source, 1, "SOURCE").await;
     create_window(&handler, &source, 2, "SURVIVOR").await;
-    handler
-        .handle_ok(LinkWindowRequest::fixture((
+    TestRequest::send_ok(
+        &handler,
+        LinkWindowRequest::fixture((
             WindowTarget::with_window(source.clone(), 1),
             WindowTarget::with_window(alias.clone(), 1),
-        )))
-        .await;
+        )),
+    )
+    .await;
     create_window(&handler, &alias, 2, "SURVIVOR").await;
     set_renumber(&handler, &source).await;
     set_renumber(&handler, &alias).await;
@@ -364,8 +368,9 @@ async fn bind_key_join_and_move_renumber_destroyed_source() {
         )
         .await;
         let _control_rx = handler.attach_client(std::process::id(), &session).await;
-        handler
-            .handle_ok(BindKeyRequest::fixture((
+        TestRequest::send_ok(
+            &handler,
+            BindKeyRequest::fixture((
                 "prefix",
                 "x",
                 [
@@ -376,8 +381,9 @@ async fn bind_key_join_and_move_renumber_destroyed_source() {
                     "-t".to_owned(),
                     format!("{session}:0.0"),
                 ],
-            )))
-            .await;
+            )),
+        )
+        .await;
 
         let response = handler
             .handle(Request::SendKeysExt(SendKeysExtRequest::fixture((

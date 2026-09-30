@@ -1127,24 +1127,6 @@ impl ShellIo {
         Ok(self.owned(job)?.keep()?)
     }
 
-    /// Writes the shell table to `out`, exactly as the console builtin renders it.
-    ///
-    /// A forwarder rather than a second renderer. `jobctl::print_jobs` takes the collection,
-    /// which this facade deliberately never hands out, so the one place that has it lends it for
-    /// the length of the call — and the interactive prompt's `jobs` output stays byte for byte
-    /// what `jobs` prints anywhere else instead of drifting into a private column layout.
-    ///
-    /// The selection marker is this facade's, because selection is this facade's: the collection
-    /// has none to lend.
-    ///
-    /// Writes nothing once the core has been released: there is no table left to print.
-    pub(crate) fn print_jobs(&self, out: &mut dyn std::io::Write) {
-        if let Some(mux) = self.service.mux_opt() {
-            let current = self.current_job().map(|view| view.id);
-            marsh_core::shellmux::jobctl::print_jobs(&mux, current.as_ref(), out);
-        }
-    }
-
     /// Selects a terminal shell as the one this front-end is looking at.
     ///
     /// Selection is presentation and lives here: the engine indexes shells by name and has

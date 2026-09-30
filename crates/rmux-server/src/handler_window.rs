@@ -237,8 +237,6 @@ impl RequestHandler {
                     environment_overrides: environment_overrides.as_deref(),
                     respawn_shell: None,
                     respawn_environment: None,
-                    shell_id: None,
-                    follow_mux_lifetime: false,
                 },
             };
             let result = match request.target_window_index {
@@ -1584,8 +1582,6 @@ impl RequestHandler {
                         environment_overrides: request.environment.as_deref(),
                         respawn_shell: None,
                         respawn_environment: None,
-                        shell_id: None,
-                        follow_mux_lifetime: false,
                     },
                 },
             ) {

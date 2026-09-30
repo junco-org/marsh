@@ -1,6 +1,6 @@
 //! Shell patterns
 
-use crate::{error, regex, sys, trace_categories};
+use crate::{error, extensions::ExecutionObserver, hostfs, regex, sys, trace_categories};
 use std::{collections::VecDeque, path::Path};
 
 /// Represents a piece of a shell pattern.
@@ -157,13 +157,17 @@ impl Pattern {
 
     /// Expands the pattern into a list of matching file paths.
     ///
+    /// Each directory enumeration is reported to `observer` as a host filesystem access.
+    ///
     /// # Arguments
     ///
+    /// * `observer` - The execution observer to report directory enumerations to.
     /// * `working_dir` - The current working directory, used for relative paths.
     /// * `path_filter` - Optionally provides a function that filters paths after expansion.
     #[expect(clippy::too_many_lines)]
     pub(crate) fn expand<PF>(
         &self,
+        observer: &impl ExecutionObserver,
         working_dir: &Path,
         path_filter: Option<&PF>,
         options: &FilenameExpansionOptions,
@@ -296,8 +300,9 @@ impl Pattern {
                         .unwrap_or(false)
                 };
 
-                let mut matching_paths_in_dir: Vec<_> = current_path
-                    .read_dir()
+                // Per-entry file types come from the enumeration itself (`d_type`); a failed
+                // open of the directory yields no matches.
+                let mut matching_paths_in_dir: Vec<_> = hostfs::read_dir(observer, &current_path)
                     .map_or_else(|_| vec![], |dir| dir.into_iter().collect())
                     .into_iter()
                     .filter_map(|result| result.ok())
@@ -964,6 +969,7 @@ mod tests {
 
         let pattern = Pattern::from("sub/*.txt").set_extended_globbing(false);
         let result = pattern.expand::<fn(&Path) -> bool>(
+            &crate::extensions::DefaultExecutionObserver,
             scratch.path(),
             None,
             &FilenameExpansionOptions::default(),
@@ -1005,6 +1011,7 @@ mod tests {
 
         let pattern = Pattern::from(abs_pattern.as_str()).set_extended_globbing(false);
         let result = pattern.expand::<fn(&Path) -> bool>(
+            &crate::extensions::DefaultExecutionObserver,
             Path::new("/"),
             None,
             &FilenameExpansionOptions::default(),

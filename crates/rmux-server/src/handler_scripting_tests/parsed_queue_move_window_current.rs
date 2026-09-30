@@ -1,4 +1,5 @@
 use super::*;
+use crate::test_fixtures::SessionSpec;
 use rmux_proto::MoveWindowTarget;
 
 #[tokio::test]
@@ -80,7 +81,7 @@ async fn move_window_trailing_colon_target_uses_first_free_index() {
     let alpha = session_name("move-colon-alpha");
     let beta = session_name("move-colon-beta");
     for session in [&alpha, &beta] {
-        handler.create_session(session).await;
+        SessionSpec::create(&handler, session).await;
     }
 
     let parsed = CommandParser::new()
@@ -134,7 +135,7 @@ async fn move_window_trailing_colon_target_uses_first_free_index() {
 
 async fn handler_with_three_windows(name: &str) -> (RequestHandler, SessionName) {
     let handler = RequestHandler::new();
-    let session = handler.create_session(name).await;
+    let session = SessionSpec::create(&handler, name).await;
     for window_name in ["b", "c"] {
         handler
             .create_window(NewWindowRequest {

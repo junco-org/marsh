@@ -48,13 +48,14 @@
 //! A command that prints, exits zero and had its writes refused is a *failure* for any caller that
 //! was going to trust the result — a cached status value, a loaded buffer, a sourced
 //! configuration, an `if-shell` predicate. [`require_published`] is how such a caller says so, and
-//! it renders the refusal with the console's own `repl::report_lines` text rather than inventing a
+//! it renders the refusal with the pane prompt's own [`report_line`] text rather than inventing a
 //! second vocabulary for denials.
 
 use std::ffi::OsStr;
 use std::path::Path;
 
 use marsh_core::shellmux::ShellId;
+use marsh_core::{ExecutionResult, ShellError};
 use rmux_proto::{ProcessCommand, RmuxError};
 
 use crate::io::{
@@ -207,35 +208,40 @@ pub(crate) fn require_published(captured: &CapturedOutput) -> Result<(), RmuxErr
     if captured.completion.is_published() {
         return Ok(());
     }
-    Err(unapproved_error(captured))
+    let mut report = completion_report(&captured.completion);
+    report.truncate(report.trim_end().len());
+    Err(RmuxError::Server(report))
 }
 
-/// The refusal diagnostic for a completion that was not published.
-pub(crate) fn unapproved_error(captured: &CapturedOutput) -> RmuxError {
-    RmuxError::Server(
-        completion_report(&captured.completion)
-            .trim_end()
-            .to_owned(),
-    )
-}
-
-/// The console's verdict text for one completion, as trailing lines.
+/// The console's verdict text for one completion, terminated by a newline.
 ///
-/// Rendered with `repl::report_lines` so a refusal reaching a user through `run-shell` output
+/// Rendered with [`report_line`] so a refusal reaching a user through `run-shell` output
 /// reads exactly like the one they would have seen at a pane prompt: the capabilities the line
 /// asked for, which were refused, and what would unblock them. A second vocabulary for the same
 /// decision would be one more thing to keep in step.
 pub(crate) fn completion_report(completion: &marsh_core::shellmux::CommandCompletion) -> String {
-    let mut lines =
-        marsh_core::shellmux::repl::report_lines(&completion.shell.id, completion.result.as_ref());
-    if lines.is_empty() {
-        lines.push(format!(
-            "{}: the shell engine refused to publish this command",
-            completion.shell.id.reference()
-        ));
+    let mut report =
+        report_line(&completion.shell.id, completion.result.as_ref()).unwrap_or_else(|| {
+            format!(
+                "{}: the shell engine refused to publish this command",
+                completion.shell.id.reference()
+            )
+        });
+    report.push('\n');
+    report
+}
+
+/// Renders a typed Shell failure without exposing storage counters or capability history.
+///
+/// `None` for a success. A failure is one diagnostic, which may itself span several lines.
+pub(crate) fn report_line(
+    id: &ShellId,
+    result: &Result<ExecutionResult, ShellError>,
+) -> Option<String> {
+    match result {
+        Ok(_) => None,
+        Err(error) => Some(format!("{}: {error}", id.reference())),
     }
-    lines.push(String::new());
-    lines.join("\n")
 }
 
 /// Maps a facade failure onto the wire error vocabulary the handlers already speak.

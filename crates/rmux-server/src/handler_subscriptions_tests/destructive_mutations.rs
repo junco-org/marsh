@@ -11,7 +11,7 @@ use rmux_proto::{
     UnlinkWindowRequest, WindowTarget,
 };
 
-use crate::test_fixtures::{Fixture, Sizeless};
+use crate::test_fixtures::{Fixture, SessionSpec, Sizeless, SubscribeRequest, TestRequest};
 
 use super::{pane_target_for_id, subscribe_by_id, RequestHandler};
 
@@ -24,17 +24,14 @@ const DRAIN_CLOSE_TIMEOUT: Duration = Duration::from_secs(10);
 #[tokio::test]
 async fn kill_session_drains_surface_frame_then_removes_destroyed_subscriptions() {
     let handler = RequestHandler::new();
-    let session = handler
-        .create_session(Sizeless("subscription-destroy-kill-session"))
-        .await;
+    let session =
+        SessionSpec::create(&handler, Sizeless("subscription-destroy-kill-session")).await;
     let target = PaneTarget::with_window(session.clone(), 0, 0);
     let (subscription_id, _) = subscribe_by_id(&handler, CONNECTION_ID, &target).await;
     let (surface_subscription_id, surface_key) = subscribe_surface_stream(&handler, &target).await;
     let tail_sequence = publish_pre_destroy_tail(&handler, &target).await;
 
-    handler
-        .handle_ok(KillSessionRequest::fixture(session))
-        .await;
+    TestRequest::send_ok(&handler, KillSessionRequest::fixture(session)).await;
 
     assert_surface_stream_drains_then_closes(
         &handler,
@@ -50,9 +47,7 @@ async fn kill_session_drains_surface_frame_then_removes_destroyed_subscriptions(
 #[tokio::test]
 async fn kill_window_drains_surface_frame_then_removes_destroyed_subscriptions() {
     let handler = RequestHandler::new();
-    let session = handler
-        .create_session(Sizeless("subscription-destroy-kill-window"))
-        .await;
+    let session = SessionSpec::create(&handler, Sizeless("subscription-destroy-kill-window")).await;
     handler
         .create_window(NewWindowRequest {
             target_window_index: Some(1),
@@ -64,11 +59,11 @@ async fn kill_window_drains_surface_frame_then_removes_destroyed_subscriptions()
     let (surface_subscription_id, surface_key) = subscribe_surface_stream(&handler, &target).await;
     let tail_sequence = publish_pre_destroy_tail(&handler, &target).await;
 
-    handler
-        .handle_ok(KillWindowRequest::fixture(WindowTarget::with_window(
-            session, 1,
-        )))
-        .await;
+    TestRequest::send_ok(
+        &handler,
+        KillWindowRequest::fixture(WindowTarget::with_window(session, 1)),
+    )
+    .await;
 
     assert_surface_stream_drains_then_closes(
         &handler,
@@ -84,9 +79,8 @@ async fn kill_window_drains_surface_frame_then_removes_destroyed_subscriptions()
 #[tokio::test]
 async fn kill_window_drains_buffered_raw_stream_bytes_before_the_typed_end() {
     let handler = RequestHandler::new();
-    let session = handler
-        .create_session(Sizeless("subscription-destroy-kill-window-raw"))
-        .await;
+    let session =
+        SessionSpec::create(&handler, Sizeless("subscription-destroy-kill-window-raw")).await;
     handler
         .create_window(NewWindowRequest {
             target_window_index: Some(1),
@@ -97,11 +91,11 @@ async fn kill_window_drains_buffered_raw_stream_bytes_before_the_typed_end() {
     let subscription_id = subscribe_raw_stream(&handler, &target).await;
     let _ = publish_pre_destroy_tail(&handler, &target).await;
 
-    handler
-        .handle_ok(KillWindowRequest::fixture(WindowTarget::with_window(
-            session, 1,
-        )))
-        .await;
+    TestRequest::send_ok(
+        &handler,
+        KillWindowRequest::fixture(WindowTarget::with_window(session, 1)),
+    )
+    .await;
 
     let events = raw_stream_events_until_end(&handler, subscription_id).await;
     let tail = events.iter().position(|event| {
@@ -127,12 +121,9 @@ async fn kill_window_drains_buffered_raw_stream_bytes_before_the_typed_end() {
 #[tokio::test]
 async fn link_window_k_drains_surface_frame_then_removes_replaced_subscriptions() {
     let handler = RequestHandler::new();
-    let source = handler
-        .create_session(Sizeless("subscription-destroy-link-source"))
-        .await;
-    let destination = handler
-        .create_session(Sizeless("subscription-destroy-link-destination"))
-        .await;
+    let source = SessionSpec::create(&handler, Sizeless("subscription-destroy-link-source")).await;
+    let destination =
+        SessionSpec::create(&handler, Sizeless("subscription-destroy-link-destination")).await;
     let destination_target = PaneTarget::with_window(destination.clone(), 0, 0);
     let (subscription_id, destination_pane_id) =
         subscribe_by_id(&handler, CONNECTION_ID, &destination_target).await;
@@ -140,15 +131,17 @@ async fn link_window_k_drains_surface_frame_then_removes_replaced_subscriptions(
         subscribe_surface_stream(&handler, &destination_target).await;
     let tail_sequence = publish_pre_destroy_tail(&handler, &destination_target).await;
 
-    handler
-        .handle_ok(LinkWindowRequest {
+    TestRequest::send_ok(
+        &handler,
+        LinkWindowRequest {
             kill_destination: true,
             ..Fixture::fixture((
                 WindowTarget::with_window(source, 0),
                 WindowTarget::with_window(destination.clone(), 0),
             ))
-        })
-        .await;
+        },
+    )
+    .await;
     assert!(
         pane_target_for_id(&handler, &destination, destination_pane_id)
             .await
@@ -170,12 +163,9 @@ async fn link_window_k_drains_surface_frame_then_removes_replaced_subscriptions(
 #[tokio::test]
 async fn move_window_k_drains_surface_frame_then_removes_replaced_subscriptions() {
     let handler = RequestHandler::new();
-    let source = handler
-        .create_session(Sizeless("subscription-destroy-move-source"))
-        .await;
-    let destination = handler
-        .create_session(Sizeless("subscription-destroy-move-destination"))
-        .await;
+    let source = SessionSpec::create(&handler, Sizeless("subscription-destroy-move-source")).await;
+    let destination =
+        SessionSpec::create(&handler, Sizeless("subscription-destroy-move-destination")).await;
     let destination_target = PaneTarget::with_window(destination.clone(), 0, 0);
     let (subscription_id, destination_pane_id) =
         subscribe_by_id(&handler, CONNECTION_ID, &destination_target).await;
@@ -183,15 +173,17 @@ async fn move_window_k_drains_surface_frame_then_removes_replaced_subscriptions(
         subscribe_surface_stream(&handler, &destination_target).await;
     let tail_sequence = publish_pre_destroy_tail(&handler, &destination_target).await;
 
-    handler
-        .handle_ok(MoveWindowRequest {
+    TestRequest::send_ok(
+        &handler,
+        MoveWindowRequest {
             kill_destination: true,
             ..Fixture::fixture((
                 WindowTarget::with_window(source, 0),
                 WindowTarget::with_window(destination.clone(), 0),
             ))
-        })
-        .await;
+        },
+    )
+    .await;
     assert!(
         pane_target_for_id(&handler, &destination, destination_pane_id)
             .await
@@ -213,9 +205,7 @@ async fn move_window_k_drains_surface_frame_then_removes_replaced_subscriptions(
 #[tokio::test]
 async fn unlink_window_k_drains_surface_frame_then_removes_destroyed_subscriptions() {
     let handler = RequestHandler::new();
-    let session = handler
-        .create_session(Sizeless("subscription-destroy-unlink"))
-        .await;
+    let session = SessionSpec::create(&handler, Sizeless("subscription-destroy-unlink")).await;
     handler
         .create_window(NewWindowRequest {
             target_window_index: Some(1),
@@ -227,12 +217,14 @@ async fn unlink_window_k_drains_surface_frame_then_removes_destroyed_subscriptio
     let (surface_subscription_id, surface_key) = subscribe_surface_stream(&handler, &target).await;
     let tail_sequence = publish_pre_destroy_tail(&handler, &target).await;
 
-    handler
-        .handle_ok(UnlinkWindowRequest {
+    TestRequest::send_ok(
+        &handler,
+        UnlinkWindowRequest {
             target: WindowTarget::with_window(session.clone(), 1),
             kill_if_last: true,
-        })
-        .await;
+        },
+    )
+    .await;
     assert!(
         pane_target_for_id(&handler, &session, pane_id)
             .await
@@ -254,19 +246,17 @@ async fn unlink_window_k_drains_surface_frame_then_removes_destroyed_subscriptio
 #[tokio::test]
 async fn linked_respawn_window_k_drains_surface_sibling_and_preserves_retained_receiver() {
     let handler = RequestHandler::new();
-    let owner = handler
-        .create_session(Sizeless("subscription-respawn-owner"))
-        .await;
-    let alias = handler
-        .create_session(Sizeless("subscription-respawn-alias"))
-        .await;
-    handler.handle_ok(SplitWindowRequest::fixture(&owner)).await;
-    handler
-        .handle_ok(LinkWindowRequest::fixture((
+    let owner = SessionSpec::create(&handler, Sizeless("subscription-respawn-owner")).await;
+    let alias = SessionSpec::create(&handler, Sizeless("subscription-respawn-alias")).await;
+    TestRequest::send_ok(&handler, SplitWindowRequest::fixture(&owner)).await;
+    TestRequest::send_ok(
+        &handler,
+        LinkWindowRequest::fixture((
             WindowTarget::with_window(owner.clone(), 0),
             WindowTarget::with_window(alias.clone(), 1),
-        )))
-        .await;
+        )),
+    )
+    .await;
 
     let pane_ids = pane_ids_for_window(&handler, &owner, 0).await;
     assert_eq!(pane_ids.len(), 2, "respawn fixture must have two panes");
@@ -301,15 +291,17 @@ async fn linked_respawn_window_k_drains_surface_sibling_and_preserves_retained_r
         "linked sibling option fixture should succeed: {option_response:?}"
     );
 
-    handler
-        .handle_ok(RespawnWindowRequest {
+    TestRequest::send_ok(
+        &handler,
+        RespawnWindowRequest {
             target: WindowTarget::with_window(owner.clone(), 0),
             kill: true,
             environment: None,
             command: None,
             start_directory: None,
-        })
-        .await;
+        },
+    )
+    .await;
 
     assert_eq!(
         pane_ids_for_window(&handler, &owner, 0).await,
@@ -438,8 +430,7 @@ async fn subscribe_raw_stream(
     target: &PaneTarget,
 ) -> PaneOutputSubscriptionId {
     let request = SubscribePaneStreamRequest::fixture((target, PaneStreamMode::Raw));
-    handler
-        .subscribe_ok(CONNECTION_ID, request)
+    SubscribeRequest::subscribe_ok(handler, CONNECTION_ID, request)
         .await
         .subscription_id
 }
@@ -449,7 +440,7 @@ async fn subscribe_surface_stream(
     target: &PaneTarget,
 ) -> (PaneOutputSubscriptionId, PaneOutputSubscriptionKey) {
     let request = SubscribePaneStreamRequest::fixture((target, PaneStreamMode::Surface));
-    let response = handler.subscribe_ok(CONNECTION_ID, request).await;
+    let response = SubscribeRequest::subscribe_ok(handler, CONNECTION_ID, request).await;
     assert!(
         matches!(response.event, PaneStreamEvent::SurfaceReset(_)),
         "surface pane stream must begin with a reset: {response:?}"

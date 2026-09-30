@@ -7,7 +7,7 @@ use rmux_proto::{
 
 use super::{LeaseResolution, LifecycleTargetLease};
 use crate::handler::RequestHandler;
-use crate::test_fixtures::Fixture;
+use crate::test_fixtures::{Fixture, SessionSpec, TestRequest};
 
 use crate::test_names::session_name;
 
@@ -35,12 +35,14 @@ fn create_session_in_state(
 }
 
 async fn set_global_activity_hook(handler: &RequestHandler, index: u32, command: &str) {
-    handler
-        .handle_ok(SetHookMutationRequest {
+    TestRequest::send_ok(
+        handler,
+        SetHookMutationRequest {
             index: Some(index),
             ..Fixture::fixture((ScopeSelector::Global, HookName::AlertActivity, command))
-        })
-        .await;
+        },
+    )
+    .await;
 }
 
 async fn retained_alert_binding(
@@ -65,8 +67,8 @@ async fn retained_alert_binding(
 #[tokio::test]
 async fn retired_alert_target_keeps_its_deferred_hook_chain_alive() {
     let handler = RequestHandler::new();
-    let session_name = handler.create_session("retained-alert-dispatch").await;
-    let fallback_session = handler.create_session("retained-alert-fallback").await;
+    let session_name = SessionSpec::create(&handler, "retained-alert-dispatch").await;
+    let fallback_session = SessionSpec::create(&handler, "retained-alert-fallback").await;
     for (index, command) in [
         (0, "rename-window stale-retired-target"),
         (1, "set-buffer -b retained-alert-dispatch continued"),
@@ -183,7 +185,7 @@ async fn live_alert_target_follows_a_surviving_window_alias_before_dispatch() {
 #[tokio::test]
 async fn replaced_alert_target_rejects_the_deferred_hook_chain() {
     let handler = RequestHandler::new();
-    let session_name = handler.create_session("retained-replaced-alert").await;
+    let session_name = SessionSpec::create(&handler, "retained-replaced-alert").await;
     set_global_activity_hook(
         &handler,
         0,

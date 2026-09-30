@@ -5,12 +5,12 @@ use rmux_proto::{
     PaneTarget, SessionName, SplitWindowExtRequest, WindowTarget,
 };
 
-use crate::test_fixtures::{Fixture, Grouped};
+use crate::test_fixtures::{Fixture, Grouped, SessionSpec, TestRequest};
 use crate::test_names::session_name;
 
 async fn create_session(handler: &RequestHandler, name: &str) -> SessionName {
     let request = NewSessionExtRequest::fixture(session_name(name));
-    handler.create_started_session(request).await
+    SessionSpec::create_started(handler, request).await
 }
 
 async fn create_duplicate_group(
@@ -18,14 +18,16 @@ async fn create_duplicate_group(
     label: &str,
 ) -> (SessionName, SessionName) {
     let owner = create_session(handler, &format!("{label}-owner")).await;
-    handler
-        .handle_ok(LinkWindowRequest::fixture((
+    TestRequest::send_ok(
+        handler,
+        LinkWindowRequest::fixture((
             WindowTarget::with_window(owner.clone(), 0),
             WindowTarget::with_window(owner.clone(), 1),
-        )))
-        .await;
+        )),
+    )
+    .await;
     let peer = session_name(&format!("{label}-peer"));
-    let peer = handler.create_session(Grouped(peer, &owner)).await;
+    let peer = SessionSpec::create(handler, Grouped(peer, &owner)).await;
     (owner, peer)
 }
 
@@ -56,13 +58,15 @@ async fn grouped_new_window_insertion_preserves_peer_duplicate_alias_winlink_fla
     let (owner, peer) = create_duplicate_group(&handler, "new-window-insert-alerts").await;
     seed_peer_duplicate_flags(&handler, &peer).await;
 
-    handler
-        .handle_ok(NewWindowRequest {
+    TestRequest::send_ok(
+        &handler,
+        NewWindowRequest {
             target_window_index: Some(0),
             insert_at_target: true,
             ..Fixture::fixture(owner)
-        })
-        .await;
+        },
+    )
+    .await;
 
     assert_peer_duplicate_flags_shifted(&handler, &peer).await;
 }
@@ -74,15 +78,17 @@ async fn grouped_link_window_insertion_preserves_peer_duplicate_alias_winlink_fl
     let source = create_session(&handler, "link-window-insert-source").await;
     seed_peer_duplicate_flags(&handler, &peer).await;
 
-    handler
-        .handle_ok(LinkWindowRequest {
+    TestRequest::send_ok(
+        &handler,
+        LinkWindowRequest {
             before: true,
             ..Fixture::fixture((
                 WindowTarget::with_window(source, 0),
                 WindowTarget::with_window(owner, 0),
             ))
-        })
-        .await;
+        },
+    )
+    .await;
 
     assert_peer_duplicate_flags_shifted(&handler, &peer).await;
 }
@@ -91,23 +97,27 @@ async fn grouped_link_window_insertion_preserves_peer_duplicate_alias_winlink_fl
 async fn grouped_break_pane_insertion_preserves_peer_duplicate_alias_winlink_flags() {
     let handler = RequestHandler::new();
     let (owner, peer) = create_duplicate_group(&handler, "group-break-insert-alerts").await;
-    handler
-        .handle_ok(SplitWindowExtRequest {
+    TestRequest::send_ok(
+        &handler,
+        SplitWindowExtRequest {
             detached: true,
             ..Fixture::fixture(PaneTarget::with_window(owner.clone(), 0, 0))
-        })
-        .await;
+        },
+    )
+    .await;
     seed_peer_duplicate_flags(&handler, &peer).await;
 
-    handler
-        .handle_ok(BreakPaneRequest {
+    TestRequest::send_ok(
+        &handler,
+        BreakPaneRequest {
             before: true,
             ..Fixture::fixture((
                 PaneTarget::with_window(owner.clone(), 1, 1),
                 WindowTarget::with_window(owner, 0),
             ))
-        })
-        .await;
+        },
+    )
+    .await;
 
     assert_peer_duplicate_flags_shifted(&handler, &peer).await;
 }
@@ -117,24 +127,28 @@ async fn assert_cross_session_break_preserves_flags(label: &str, linked_source: 
     let (owner, peer) = create_duplicate_group(&handler, label).await;
     let source = create_session(&handler, &format!("{label}-source")).await;
     if linked_source {
-        handler
-            .handle_ok(LinkWindowRequest::fixture((
+        TestRequest::send_ok(
+            &handler,
+            LinkWindowRequest::fixture((
                 WindowTarget::with_window(source.clone(), 0),
                 WindowTarget::with_window(source.clone(), 1),
-            )))
-            .await;
+            )),
+        )
+        .await;
     }
     seed_peer_duplicate_flags(&handler, &peer).await;
 
-    handler
-        .handle_ok(BreakPaneRequest {
+    TestRequest::send_ok(
+        &handler,
+        BreakPaneRequest {
             before: true,
             ..Fixture::fixture((
                 PaneTarget::with_window(source, 0, 0),
                 WindowTarget::with_window(owner, 0),
             ))
-        })
-        .await;
+        },
+    )
+    .await;
 
     assert_peer_duplicate_flags_shifted(&handler, &peer).await;
 }
@@ -154,24 +168,28 @@ async fn assert_relative_move_preserves_flags(label: &str, linked_source: bool) 
     let (owner, peer) = create_duplicate_group(&handler, label).await;
     let source = create_session(&handler, &format!("{label}-source")).await;
     if linked_source {
-        handler
-            .handle_ok(LinkWindowRequest::fixture((
+        TestRequest::send_ok(
+            &handler,
+            LinkWindowRequest::fixture((
                 WindowTarget::with_window(source.clone(), 0),
                 WindowTarget::with_window(source.clone(), 1),
-            )))
-            .await;
+            )),
+        )
+        .await;
     }
     seed_peer_duplicate_flags(&handler, &peer).await;
 
-    handler
-        .handle_ok(MoveWindowRequest {
+    TestRequest::send_ok(
+        &handler,
+        MoveWindowRequest {
             before: true,
             ..Fixture::fixture((
                 WindowTarget::with_window(source, 0),
                 WindowTarget::with_window(owner, 0),
             ))
-        })
-        .await;
+        },
+    )
+    .await;
 
     assert_peer_duplicate_flags_shifted(&handler, &peer).await;
 }

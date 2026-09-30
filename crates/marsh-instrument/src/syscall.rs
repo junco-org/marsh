@@ -45,8 +45,13 @@ pub struct Syscall {
     pub paths: Vec<(usize, Vec<u8>)>,
     /// Entry-time descriptor roles and their identities. An absent identity is not an absent role.
     pub descriptors: Vec<(usize, Option<FileTarget>)>,
-    /// First native-endian u64 of `open_how` or `clone_args`, when supplied and readable.
+    /// First native-endian u64 of `open_how` or `clone_args`, when supplied and readable; for
+    /// `io_uring_setup`, the setup flags the kernel accepted.
     pub flags: Option<u64>,
+    /// For `io_uring_enter`: the opcodes pending in its submission queue at entry, when the
+    /// ring's layout is known and its memory was readable.
+    #[serde(default)]
+    pub submissions: Option<Vec<u8>>,
 }
 
 impl Syscall {

@@ -2,6 +2,7 @@ use super::linked_pane_selection::LinkedPaneFixture;
 use super::*;
 
 use crate::handler::prompt_support::PromptInputEvent;
+use crate::test_fixtures::TestRequest;
 use rmux_core::command_parser::CommandParser;
 use rmux_proto::{
     PaneResizeRequest, ResizePaneAdjustment, ResizePaneRequest, SplitWindowExtRequest,
@@ -16,12 +17,14 @@ async fn linked_mutation_fixture(handler: &RequestHandler, label: &str) -> Linke
     let grouped_peer = create_grouped_session(handler, format!("{label}-grouped"), &owner).await;
     // Quiet, as in `linked_two_pane_fixture`: the default interactive shell's startup is
     // unbounded in time, and its activity races the pane mutations these tests commit.
-    let split = handler
-        .handle_ok(SplitWindowExtRequest {
+    let split = TestRequest::send_ok(
+        handler,
+        SplitWindowExtRequest {
             command: Some(quiet_command()),
             ..Fixture::fixture(&owner)
-        })
-        .await;
+        },
+    )
+    .await;
     handler
         .wait_for_pane_startup_to_finish_for_test(&split.pane)
         .await;
@@ -116,12 +119,14 @@ async fn cli_and_sdk_zoom_commit_linked_model_runtime_and_lifecycle_together() {
         .await
         .window_runtime_resize_count_for_test();
 
-    handler
-        .handle_ok(ResizePaneRequest {
+    TestRequest::send_ok(
+        &handler,
+        ResizePaneRequest {
             target: PaneTarget::with_window(fixture.linked_peer.clone(), 1, 1),
             adjustment: ResizePaneAdjustment::Zoom,
-        })
-        .await;
+        },
+    )
+    .await;
     assert_alias_zoom(&handler, &fixture, true, 1).await;
     assert_active_runtime_and_lifecycle_match(&handler, &fixture).await;
 
@@ -194,13 +199,15 @@ async fn split_window_zoom_commits_the_new_zoomed_window_to_every_alias() {
     let handler = RequestHandler::new();
     let fixture = linked_mutation_fixture(&handler, "linked-split-zoom").await;
 
-    let split = handler
-        .handle_ok(SplitWindowExtRequest {
+    let split = TestRequest::send_ok(
+        &handler,
+        SplitWindowExtRequest {
             command: Some(quiet_command()),
             preserve_zoom: true,
             ..Fixture::fixture(PaneTarget::with_window(fixture.linked_peer.clone(), 1, 1))
-        })
-        .await;
+        },
+    )
+    .await;
     assert_alias_windows_identical(&handler, &fixture).await;
     let state = handler.state.lock().await;
     for target in fixture.targets() {
@@ -257,12 +264,14 @@ async fn non_zoom_window_geometry_mutations_remain_transactional_across_aliases(
     let handler = RequestHandler::new();
     let fixture = linked_mutation_fixture(&handler, "linked-layout").await;
 
-    handler
-        .handle_ok(ResizePaneRequest {
+    TestRequest::send_ok(
+        &handler,
+        ResizePaneRequest {
             target: PaneTarget::with_window(fixture.linked_peer.clone(), 1, 0),
             adjustment: ResizePaneAdjustment::AbsoluteHeight { rows: 12 },
-        })
-        .await;
+        },
+    )
+    .await;
     assert_alias_windows_identical(&handler, &fixture).await;
 
     let layout = handler
@@ -273,13 +282,15 @@ async fn non_zoom_window_geometry_mutations_remain_transactional_across_aliases(
     assert!(matches!(layout, Response::NextLayout(_)), "{layout:?}");
     assert_alias_windows_identical(&handler, &fixture).await;
 
-    handler
-        .handle_ok(RotateWindowRequest {
+    TestRequest::send_ok(
+        &handler,
+        RotateWindowRequest {
             target: WindowTarget::with_window(fixture.owner.clone(), 0),
             direction: RotateWindowDirection::Down,
             restore_zoom: false,
-        })
-        .await;
+        },
+    )
+    .await;
     assert_alias_windows_identical(&handler, &fixture).await;
     assert_active_runtime_and_lifecycle_match(&handler, &fixture).await;
 }

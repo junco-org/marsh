@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use super::{clock_mode_tests::create_session, RequestHandler};
 use crate::pane_io::AttachControl;
-use crate::test_fixtures::Fixture;
+use crate::test_fixtures::{Fixture, TestRequest};
 use rmux_proto::{
     ClockModeRequest, HookName, KillSessionRequest, PaneTarget, Request, Response, ScopeSelector,
     SessionId, SetHookRequest, ShowBufferRequest, SwitchClientRequest, TerminalSize,
@@ -14,11 +14,13 @@ const TEST_TIMEOUT: Duration = Duration::from_secs(10);
 const CLOCK_SIZE: TerminalSize = TerminalSize { cols: 20, rows: 8 };
 
 async fn enter_clock_mode(handler: &RequestHandler, target: &PaneTarget) {
-    handler
-        .handle_ok(ClockModeRequest {
+    TestRequest::send_ok(
+        handler,
+        ClockModeRequest {
             target: Some(target.clone()),
-        })
-        .await;
+        },
+    )
+    .await;
 }
 
 async fn assert_clock_mode(handler: &RequestHandler, target: &PaneTarget, expected: bool) {
@@ -219,12 +221,11 @@ async fn reentered_clock_mode_supersedes_stale_exit_restore_in_commit_order() {
     enter_clock_mode(&handler, &target).await;
     while control_rx.try_recv().is_ok() {}
 
-    handler
-        .handle_ok(SetHookRequest::fixture((
-            ScopeSelector::Pane(target.clone()),
-            HookName::PaneModeChanged,
-            "if-shell -F '#{pane_in_mode}' { set-buffer -b clock-reentry-format 1 } { set-buffer -b clock-reentry-format 0 }",
-        )))
+    TestRequest::send_ok(&handler, SetHookRequest::fixture((
+        ScopeSelector::Pane(target.clone()),
+        HookName::PaneModeChanged,
+        "if-shell -F '#{pane_in_mode}' { set-buffer -b clock-reentry-format 1 } { set-buffer -b clock-reentry-format 0 }",
+    )))
         .await;
     let mut lifecycle_events = handler.subscribe_lifecycle_events();
 

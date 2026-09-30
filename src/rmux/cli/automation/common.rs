@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 use crate::cli_args::TargetSpec;
 use crate::cli_response::tmux_cli_error_message;
 
-use super::super::{ExitFailure, listed_pane_index_matches_target, resolve_pane_target_or_current};
+use super::super::{CommandTarget, ExitFailure, listed_pane_index_matches_target};
 use super::pane_exit::PaneExitStatus;
 
 pub(super) const SCHEMA_VERSION: u8 = 1;
@@ -37,7 +37,7 @@ pub(super) fn resolve_pane_ref(
     target: Option<&TargetSpec>,
     command_name: &'static str,
 ) -> Result<PaneTargetRef, ExitFailure> {
-    let slot = resolve_pane_target_or_current(connection, target, command_name)?;
+    let slot = PaneTarget::resolve(connection, target, command_name)?;
     stable_pane_ref_for_slot(connection, &slot, command_name)
 }
 

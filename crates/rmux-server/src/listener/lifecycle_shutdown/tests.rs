@@ -9,7 +9,7 @@ use tokio::sync::oneshot;
 
 use super::*;
 
-use crate::test_fixtures::Fixture;
+use crate::test_fixtures::{Fixture, SessionSpec, TestRequest};
 
 fn spawn_lifecycle_consumer(handler: &RequestHandler) -> (oneshot::Sender<()>, JoinHandle<()>) {
     let events = handler
@@ -56,7 +56,7 @@ async fn seal_final_lifecycle_boundaries(handler: &RequestHandler) {
 #[tokio::test]
 async fn full_outbox_and_stuck_hook_are_forced_at_the_shared_deadline() {
     let handler = RequestHandler::with_lifecycle_dispatch_capacity_for_test(1);
-    let session = handler.create_session("shutdown-full-outbox").await;
+    let session = SessionSpec::create(&handler, "shutdown-full-outbox").await;
     handler
         .set_global_hook(
             HookName::ClientFocusIn,
@@ -138,7 +138,7 @@ async fn full_outbox_and_stuck_hook_are_forced_at_the_shared_deadline() {
 #[tokio::test]
 async fn normal_shutdown_drains_already_accepted_and_queued_hooks() {
     let handler = RequestHandler::with_lifecycle_dispatch_capacity_for_test(1);
-    let session = handler.create_session("shutdown-normal-outbox").await;
+    let session = SessionSpec::create(&handler, "shutdown-normal-outbox").await;
     for (command, lifecycle, append) in [
         (
             "wait-for shutdown-normal-outbox-hook",
@@ -151,25 +151,26 @@ async fn normal_shutdown_drains_already_accepted_and_queued_hooks() {
             true,
         ),
     ] {
-        handler
-            .handle_ok(SetHookMutationRequest {
+        TestRequest::send_ok(
+            &handler,
+            SetHookMutationRequest {
                 lifecycle,
                 append,
                 ..Fixture::fixture((ScopeSelector::Global, HookName::ClientFocusIn, command))
-            })
-            .await;
+            },
+        )
+        .await;
     }
     let (hook_shutdown, mut hook_task) = spawn_lifecycle_consumer(&handler);
 
     emit_focus(&handler, &session, "accepted").await;
     wait_for_hook_block(&handler, "shutdown-normal-outbox-hook").await;
     emit_focus(&handler, &session, "queued").await;
-    handler
-        .handle_ok(WaitForRequest::fixture((
-            "shutdown-normal-outbox-hook",
-            WaitForMode::Signal,
-        )))
-        .await;
+    TestRequest::send_ok(
+        &handler,
+        WaitForRequest::fixture(("shutdown-normal-outbox-hook", WaitForMode::Signal)),
+    )
+    .await;
 
     let deadline = Instant::now() + Duration::from_secs(2);
     let outcome =

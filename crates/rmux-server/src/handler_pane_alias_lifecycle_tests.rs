@@ -9,22 +9,22 @@ use rmux_proto::{
     WindowTarget,
 };
 
-use crate::test_fixtures::{Fixture, Grouped};
+use crate::test_fixtures::{Fixture, Grouped, SessionSpec, SubscribeRequest, TestRequest};
 
 async fn subscribe(
     handler: &RequestHandler,
     connection_id: u64,
     target: PaneTarget,
 ) -> (PaneStateSubscriptionId, PaneId, PaneStateSnapshot) {
-    let response = handler
-        .subscribe_ok(
-            connection_id,
-            SubscribePaneStateRequest {
-                include_options: true,
-                ..Fixture::fixture(target)
-            },
-        )
-        .await;
+    let response = SubscribeRequest::subscribe_ok(
+        handler,
+        connection_id,
+        SubscribePaneStateRequest {
+            include_options: true,
+            ..Fixture::fixture(target)
+        },
+    )
+    .await;
     (
         response.subscription_id,
         response.pane_id,
@@ -107,17 +107,19 @@ fn assert_no_events(response: Response) {
 #[tokio::test]
 async fn linked_pane_aliases_share_option_get_snapshot_and_events() {
     let handler = RequestHandler::new();
-    let alpha = handler.create_session("alias-link-alpha").await;
-    let beta = handler.create_session("alias-link-beta").await;
-    handler
-        .handle_ok(LinkWindowRequest {
+    let alpha = SessionSpec::create(&handler, "alias-link-alpha").await;
+    let beta = SessionSpec::create(&handler, "alias-link-beta").await;
+    TestRequest::send_ok(
+        &handler,
+        LinkWindowRequest {
             kill_destination: true,
             ..Fixture::fixture((
                 WindowTarget::with_window(alpha.clone(), 0),
                 WindowTarget::with_window(beta.clone(), 0),
             ))
-        })
-        .await;
+        },
+    )
+    .await;
     let alpha_target = PaneTarget::with_window(alpha.clone(), 0, 0);
     let beta_target = PaneTarget::with_window(beta.clone(), 0, 0);
     let (alpha_subscription, pane_id, alpha_snapshot) =
@@ -169,7 +171,7 @@ async fn linked_pane_aliases_share_option_get_snapshot_and_events() {
 #[tokio::test]
 async fn grouped_pane_aliases_copy_existing_options_and_share_later_mutations() {
     let handler = RequestHandler::new();
-    let alpha = handler.create_session("alias-group-alpha").await;
+    let alpha = SessionSpec::create(&handler, "alias-group-alpha").await;
     let alpha_target = PaneTarget::with_window(alpha.clone(), 0, 0);
     let set = set_option(
         &handler,
@@ -179,9 +181,7 @@ async fn grouped_pane_aliases_copy_existing_options_and_share_later_mutations() 
     )
     .await;
     assert!(matches!(set, Response::PaneOptionSet(_)), "{set:?}");
-    let beta = handler
-        .create_session(Grouped("alias-group-beta", &alpha))
-        .await;
+    let beta = SessionSpec::create(&handler, Grouped("alias-group-beta", &alpha)).await;
     let beta_target = PaneTarget::with_window(beta.clone(), 0, 0);
     assert_eq!(
         get_option(
@@ -247,10 +247,8 @@ async fn grouped_pane_aliases_copy_existing_options_and_share_later_mutations() 
 #[tokio::test]
 async fn killing_group_session_alias_keeps_runtime_and_emits_no_false_closed() {
     let handler = RequestHandler::new();
-    let alpha = handler.create_session("kill-alias-alpha").await;
-    let beta = handler
-        .create_session(Grouped("kill-alias-beta", &alpha))
-        .await;
+    let alpha = SessionSpec::create(&handler, "kill-alias-alpha").await;
+    let beta = SessionSpec::create(&handler, Grouped("kill-alias-beta", &alpha)).await;
     let alpha_target = PaneTarget::with_window(alpha.clone(), 0, 0);
     let beta_target = PaneTarget::with_window(beta.clone(), 0, 0);
     let (alpha_subscription, pane_id, alpha_snapshot) =
@@ -259,7 +257,7 @@ async fn killing_group_session_alias_keeps_runtime_and_emits_no_false_closed() {
         subscribe(&handler, 1122, beta_target).await;
     assert_eq!(beta_pane_id, pane_id);
 
-    handler.handle_ok(KillSessionRequest::fixture(beta)).await;
+    TestRequest::send_ok(&handler, KillSessionRequest::fixture(beta)).await;
     {
         let state = handler.state.lock().await;
         assert!(state.sessions.contains_session(&alpha));
@@ -282,10 +280,8 @@ async fn killing_group_session_alias_keeps_runtime_and_emits_no_false_closed() {
 #[tokio::test]
 async fn deleting_last_pane_or_link_alias_preserves_the_shared_runtime() {
     let handler = RequestHandler::new();
-    let alpha = handler.create_session("delete-alias-alpha").await;
-    let beta = handler
-        .create_session(Grouped("delete-alias-beta", &alpha))
-        .await;
+    let alpha = SessionSpec::create(&handler, "delete-alias-alpha").await;
+    let beta = SessionSpec::create(&handler, Grouped("delete-alias-beta", &alpha)).await;
     let target = PaneTarget::with_window(alpha.clone(), 0, 0);
     let (subscription, pane_id, snapshot) = subscribe(&handler, 1131, target).await;
     let killed = handler
@@ -307,32 +303,36 @@ async fn deleting_last_pane_or_link_alias_preserves_the_shared_runtime() {
             .await,
     );
 
-    let link_owner = handler.create_session("delete-link-owner").await;
-    let link_peer = handler.create_session("delete-link-peer").await;
+    let link_owner = SessionSpec::create(&handler, "delete-link-owner").await;
+    let link_peer = SessionSpec::create(&handler, "delete-link-peer").await;
     handler
         .create_window(NewWindowRequest {
             target_window_index: Some(1),
             ..Fixture::fixture(&link_peer)
         })
         .await;
-    handler
-        .handle_ok(LinkWindowRequest {
+    TestRequest::send_ok(
+        &handler,
+        LinkWindowRequest {
             kill_destination: true,
             ..Fixture::fixture((
                 WindowTarget::with_window(link_owner.clone(), 0),
                 WindowTarget::with_window(link_peer.clone(), 0),
             ))
-        })
-        .await;
+        },
+    )
+    .await;
     let link_target = PaneTarget::with_window(link_owner.clone(), 0, 0);
     let (link_subscription, link_pane_id, link_snapshot) =
         subscribe(&handler, 1132, link_target).await;
-    handler
-        .handle_ok(UnlinkWindowRequest {
+    TestRequest::send_ok(
+        &handler,
+        UnlinkWindowRequest {
             target: WindowTarget::with_window(link_peer, 0),
             kill_if_last: false,
-        })
-        .await;
+        },
+    )
+    .await;
     {
         let state = handler.state.lock().await;
         state
@@ -349,11 +349,9 @@ async fn deleting_last_pane_or_link_alias_preserves_the_shared_runtime() {
 #[tokio::test]
 async fn grouped_peer_kill_pane_resize_rollback_restores_owner_runtime() {
     let handler = RequestHandler::new();
-    let owner = handler.create_session("kill-rollback-owner").await;
-    handler.handle_ok(SplitWindowRequest::fixture(&owner)).await;
-    let peer = handler
-        .create_session(Grouped("kill-rollback-peer", &owner))
-        .await;
+    let owner = SessionSpec::create(&handler, "kill-rollback-owner").await;
+    TestRequest::send_ok(&handler, SplitWindowRequest::fixture(&owner)).await;
+    let peer = SessionSpec::create(&handler, Grouped("kill-rollback-peer", &owner)).await;
 
     let (pane_id, pane_instance) = {
         let mut state = handler.state.lock().await;
@@ -425,13 +423,11 @@ async fn grouped_peer_kill_pane_resize_rollback_restores_owner_runtime() {
 #[tokio::test]
 async fn successful_respawn_pane_and_window_close_the_old_lifetime() {
     let handler = RequestHandler::new();
-    let session = handler.create_session("respawn-old-lifetime").await;
+    let session = SessionSpec::create(&handler, "respawn-old-lifetime").await;
     let target = PaneTarget::with_window(session.clone(), 0, 0);
     let (pane_subscription, pane_id, pane_snapshot) =
         subscribe(&handler, 1141, target.clone()).await;
-    handler
-        .handle_ok(RespawnPaneRequest::fixture(&target))
-        .await;
+    TestRequest::send_ok(&handler, RespawnPaneRequest::fixture(&target)).await;
     let _ = closed_revision(
         handler
             .read_pane_state_cursor_for_test(1141, pane_subscription, pane_snapshot.revision)
@@ -442,15 +438,17 @@ async fn successful_respawn_pane_and_window_close_the_old_lifetime() {
     let (window_subscription, window_pane_id, window_snapshot) =
         subscribe(&handler, 1142, target).await;
     assert_eq!(window_pane_id, pane_id);
-    handler
-        .handle_ok(RespawnWindowRequest {
+    TestRequest::send_ok(
+        &handler,
+        RespawnWindowRequest {
             target: WindowTarget::with_window(session, 0),
             kill: true,
             environment: None,
             command: None,
             start_directory: None,
-        })
-        .await;
+        },
+    )
+    .await;
     let _ = closed_revision(
         handler
             .read_pane_state_cursor_for_test(1142, window_subscription, window_snapshot.revision)
@@ -462,7 +460,7 @@ async fn successful_respawn_pane_and_window_close_the_old_lifetime() {
 #[tokio::test]
 async fn pane_respawn_keep_alive_rolls_back_on_error_and_journals_on_success() {
     let handler = RequestHandler::new();
-    let session = handler.create_session("pane-respawn-keep-alive").await;
+    let session = SessionSpec::create(&handler, "pane-respawn-keep-alive").await;
     let target = PaneTarget::with_window(session.clone(), 0, 0);
     let (old_subscription, pane_id, old_snapshot) = subscribe(&handler, 1151, target.clone()).await;
 

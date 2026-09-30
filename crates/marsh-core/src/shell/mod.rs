@@ -31,11 +31,12 @@ mod snapshot;
 mod view;
 
 pub use error::{ShellError, ShellErrorKind};
+pub use junco_policy::{Action, Principal};
 pub use policy::{Denial, PolicyValidator};
-pub use rust_validator::Principal;
-pub use sandbox_policy::{CommandContext, SandboxPolicy};
+pub use sandbox_policy::{CommandContext, MarshTool, SandboxPolicy, ShellCommand};
 pub use signal::Signal;
 
+pub(crate) use execution::ExecutionProgress;
 use execution::{ManagedExtensions, MarshExecutor, Run};
 use session::{Admission, ExecutionResources, Route, SourceDomain, fresh_principal};
 use snapshot::Snapshot;
@@ -161,17 +162,18 @@ impl ShellBuilder {
         self
     }
 
-    /// Discovers the source, joins the live-shell set, then constructs the persistent shell.
-    /// Durable storage is opened only when a command's route first needs it.
+    /// Starts the shared native tracer, discovers the source, joins the live-shell set, then
+    /// constructs the persistent shell. Durable storage is opened only when a command's route
+    /// first needs it.
     pub async fn build(mut self) -> Result<Shell, ShellError> {
         let runtime = tokio::runtime::Handle::try_current()
             .map_err(|error| ShellError::infrastructure(error.to_string()))?;
         let initial = self.options.working_dir.take().unwrap_or_default();
-        let tracing = marsh_instrument::Tracing::shared();
+        let tracing = marsh_instrument::Tracing::shared()?;
         let discovered = {
             let scope = tracing.internal_scope()?;
             let _guard = scope.enter();
-            SourceDomain::discover(&initial, self.backend)?
+            SourceDomain::discover(&initial, self.backend, Arc::clone(&tracing))?
         };
         let uid = fresh_principal()?;
         let sandbox = sandbox_record(&discovered, self.sandbox_id, &uid)?;
@@ -251,7 +253,11 @@ impl ShellBuilder {
                 finished: tokio::sync::Notify::new(),
             }),
         };
-        if startup && let Err(error) = shell.execute(Command::Startup(profile, rc)).await {
+        if startup
+            && let Err(error) = shell
+                .execute(Command::Startup(profile, rc), None)
+                .await
+        {
             // Membership ends before the caller sees the failure, not when a detached drop runs.
             let _ = shell.close(true).await;
             return Err(error);
@@ -371,7 +377,16 @@ impl Shell {
     }
     /// Executes one command exactly once. Stale work is reported, never replayed.
     pub async fn run(&self, line: &str) -> Result<ExecutionResult, ShellError> {
-        self.execute(Command::Line(line.to_owned())).await
+        self.execute(Command::Line(line.to_owned()), None).await
+    }
+    /// [`Self::run`], reporting through `progress` when its execution begins.
+    pub(crate) async fn run_with_progress(
+        &self,
+        line: &str,
+        progress: ExecutionProgress,
+    ) -> Result<ExecutionResult, ShellError> {
+        self.execute(Command::Line(line.to_owned()), Some(progress))
+            .await
     }
     /// Executes a program string with ordinary Brush source and descriptor parameters.
     pub async fn run_string<S: Into<String>>(
@@ -380,11 +395,10 @@ impl Shell {
         source: &SourceInfo,
         params: &ExecutionParameters,
     ) -> Result<ExecutionResult, ShellError> {
-        self.execute(Command::String(
-            command.into(),
-            source.clone(),
-            params.clone(),
-        ))
+        self.execute(
+            Command::String(command.into(), source.clone(), params.clone()),
+            None,
+        )
         .await
     }
     /// Executes a script in the filesystem view its route selects.
@@ -393,7 +407,7 @@ impl Shell {
         path: &Path,
         args: &[String],
     ) -> Result<ExecutionResult, ShellError> {
-        self.execute(Command::Script(path.to_path_buf(), args.to_vec()))
+        self.execute(Command::Script(path.to_path_buf(), args.to_vec()), None)
             .await
     }
     /// Sources a script without replacing the persistent shell state.
@@ -403,11 +417,10 @@ impl Shell {
         args: &[String],
         params: &ExecutionParameters,
     ) -> Result<ExecutionResult, ShellError> {
-        self.execute(Command::Source(
-            path.to_path_buf(),
-            args.to_vec(),
-            params.clone(),
-        ))
+        self.execute(
+            Command::Source(path.to_path_buf(), args.to_vec(), params.clone()),
+            None,
+        )
         .await
     }
     /// Invokes a shell function through the same boundary as a command string.
@@ -417,13 +430,46 @@ impl Shell {
         args: &[String],
         params: &ExecutionParameters,
     ) -> Result<u8, ShellError> {
-        self.execute(Command::Function(
-            name.to_owned(),
-            args.to_vec(),
-            params.clone(),
-        ))
+        self.execute(
+            Command::Function(name.to_owned(), args.to_vec(), params.clone()),
+            None,
+        )
         .await
         .map(|result| result.exit_code.into())
+    }
+    /// Runs `operation` as one accepted call of `tool`, routed by this shell's policy over the
+    /// tool and the [`Action`] it converts to, like any command.
+    ///
+    /// `operation` runs once, on a registered, trace-scoped blocking thread of the call's run. On
+    /// the managed route it sees the private snapshot: its changes are evidence only when made
+    /// through the context's I/O (`open`, `create_dir_all`, `remove_file`), are authorized and
+    /// published like a command's, and `Ok` means they were published. Any other change to the
+    /// snapshot refuses publication. Engines that read the view directly map paths with
+    /// [`builtins::BuiltinContext::physical_path`] and
+    /// [`logical_path`](builtins::BuiltinContext::logical_path). On the direct route it acts on
+    /// the source itself. A refused, failed or interrupted call drops `operation`'s result.
+    pub async fn run_tool<T, R, F>(&self, tool: T, operation: F) -> Result<R, ShellError>
+    where
+        T: MarshTool,
+        for<'a> &'a T: Into<Action>,
+        R: Send + 'static,
+        F: FnOnce(&builtins::BuiltinContext) -> R + Send + 'static,
+    {
+        let action: Action = (&tool).into();
+        let description = tool.description().into_owned();
+        let (send, receive) = std::sync::mpsc::sync_channel(1);
+        let command = Command::Tool {
+            tool: Box::new(tool),
+            action,
+            description,
+            operation: Box::new(move |context| {
+                let _ = send.send(operation(context));
+            }),
+        };
+        self.execute(command, None).await?;
+        receive
+            .try_recv()
+            .map_err(|_| ShellError::infrastructure("tool operation produced no result"))
     }
     /// Returns the shell's current ordinary execution parameters.
     pub async fn default_exec_params(&self) -> ExecutionParameters {
@@ -582,7 +628,11 @@ impl Shell {
         input::run(self, options).await
     }
 
-    async fn execute(&self, command: Command) -> Result<ExecutionResult, ShellError> {
+    async fn execute(
+        &self,
+        command: Command,
+        progress: Option<ExecutionProgress>,
+    ) -> Result<ExecutionResult, ShellError> {
         if self.is_closed() {
             return Err(ShellError::new(ShellErrorKind::Closed));
         }
@@ -599,7 +649,7 @@ impl Shell {
         let shared = Arc::clone(&self.shared);
         let (send, receive) = tokio::sync::oneshot::channel();
         self.shared.runtime.spawn(async move {
-            let result = shared.evaluate(command, parent).await;
+            let result = shared.evaluate(command, parent, progress).await;
             shared.busy.store(false, Ordering::Release);
             shared.finished.notify_waiters();
             if shared.closed.load(Ordering::Acquire) {
@@ -663,8 +713,9 @@ impl Shared {
     )]
     async fn evaluate(
         &self,
-        command: Command,
+        mut command: Command,
         parent: Option<Weak<Run>>,
+        progress: Option<ExecutionProgress>,
     ) -> Result<ExecutionResult, ShellError> {
         let mut live = self.live.lock().await;
         let live = live
@@ -673,25 +724,49 @@ impl Shared {
         if let Command::Interactive(options) = command {
             return input::run_owned(self, live, options, parent).await;
         }
-        let text = command.description();
+        // A stored tool is routed as its original concrete value; any other command is a shell
+        // span. Only these two references, never the command itself, are held across admission.
+        let mut shell_call = None;
+        let (tool, action): (&(dyn std::any::Any + Send + Sync), &Action) =
+            if let Command::Tool { tool, action, .. } = &command {
+                (tool.as_ref(), action)
+            } else {
+                let tool = ShellCommand {
+                    command: command.description().into_owned(),
+                };
+                let action: Action = (&tool).into();
+                let (tool, action) = shell_call.insert((tool, action));
+                (&*tool, &*action)
+            };
         let Span { admission, route } = self
             .begin_span(
                 &mut live.interpreter,
                 &mut live.resources,
-                &text,
+                tool,
+                action,
                 parent.as_ref(),
                 command.params(),
             )
             .await?;
+        // Admission and view preparation are over: from here the command is executing.
         let outcome = match route {
             SpanRoute::Managed(prepared) => {
-                let text = text.into_owned();
+                if let Some(progress) = &progress {
+                    progress.attach(&prepared.run);
+                }
+                let text = match (&mut command, shell_call) {
+                    (Command::Tool { description, .. }, _) => std::mem::take(description),
+                    (_, Some((tool, _))) => tool.command,
+                    (_, None) => unreachable!("non-tool command has a shell descriptor"),
+                };
                 let executed = execution::run(&mut live.interpreter, prepared, command, text).await;
                 self.exit_on(executed.result.as_ref());
                 Self::publish(&live.resources, executed)
             }
             SpanRoute::Direct(run) => {
-                drop(text);
+                if let Some(progress) = &progress {
+                    progress.attach(&run);
+                }
                 let (result, failure) =
                     execution::evaluate(&mut live.interpreter, &run, command).await;
                 self.exit_on(result.as_ref());
@@ -713,18 +788,19 @@ impl Shared {
             self.closed.store(true, Ordering::Release);
         }
     }
-    /// Admits one span, moves the interpreter into the view its route selects, and installs the
-    /// span's run as the owner of every interpreter hook.
+    /// Admits one span for `tool`, classified as `action`, moves the interpreter into the view its
+    /// route selects, and installs the span's run as the owner of every interpreter hook.
     async fn begin_span<SE: brush_core::ShellExtensions>(
         &self,
         interpreter: &mut brush_core::Shell<SE>,
         resources: &mut ExecutionResources,
-        text: &str,
+        tool: &(dyn std::any::Any + Send + Sync),
+        action: &Action,
         parent: Option<&Weak<Run>>,
         params: Option<&ExecutionParameters>,
     ) -> Result<Span, ShellError> {
         let (admission, route) = resources
-            .admit(text, &self.cancelled, &self.force, parent)
+            .admit(tool, action, &self.cancelled, &self.force, parent)
             .await?;
         let route = match route {
             Route::Managed => {
@@ -886,6 +962,9 @@ impl Shared {
     }
 }
 
+/// A tool call's work, run once on a registered, trace-scoped blocking thread of its run.
+type ToolOperation = Box<dyn FnOnce(&execution::BuiltinContext) + Send>;
+
 enum Command {
     Line(String),
     String(String, SourceInfo, ExecutionParameters),
@@ -894,15 +973,25 @@ enum Command {
     Function(String, Vec<String>, ExecutionParameters),
     Startup(ProfileLoadBehavior, RcLoadBehavior),
     Interactive(UIOptions),
+    /// An embedder's call: the original concrete tool, with the action and description taken
+    /// from it while its type was known, and the work it runs.
+    Tool {
+        tool: Box<dyn std::any::Any + Send + Sync>,
+        action: Action,
+        description: String,
+        operation: ToolOperation,
+    },
 }
 impl Command {
-    /// The accepted top-level input: the submitted text, a script path or a function name.
+    /// The accepted top-level input: the submitted text, a script path, a function name or a
+    /// tool's description.
     fn description(&self) -> Cow<'_, str> {
         match self {
             Self::Line(line) | Self::String(line, ..) => Cow::Borrowed(line),
             Self::Script(path, _) | Self::Source(path, ..) => path.to_string_lossy(),
             Self::Function(name, ..) => Cow::Borrowed(name),
             Self::Startup(..) | Self::Interactive(_) => Cow::Borrowed(""),
+            Self::Tool { description, .. } => Cow::Borrowed(description),
         }
     }
     /// Caller-supplied descriptor parameters, when the command carries any.
@@ -911,7 +1000,11 @@ impl Command {
             Self::String(_, _, params)
             | Self::Source(_, _, params)
             | Self::Function(_, _, params) => Some(params),
-            Self::Line(_) | Self::Script(..) | Self::Startup(..) | Self::Interactive(_) => None,
+            Self::Line(_)
+            | Self::Script(..)
+            | Self::Startup(..)
+            | Self::Interactive(_)
+            | Self::Tool { .. } => None,
         }
     }
     async fn evaluate(
@@ -952,6 +1045,25 @@ impl Command {
                 "interactive command must be driven by its private span coordinator".into(),
             )
             .into()),
+            Self::Tool { operation, .. } => {
+                let context = execution::current_context().ok_or_else(|| {
+                    brush_core::Error::from(brush_core::ErrorKind::InternalError(
+                        "tool operation has no command context".into(),
+                    ))
+                })?;
+                let done = context
+                    .spawn_blocking({
+                        let context = context.clone();
+                        move || operation(&context)
+                    })
+                    .map_err(execution::brush_error)?;
+                done.await.map_err(|_| {
+                    brush_core::Error::from(brush_core::ErrorKind::InternalError(
+                        "tool operation panicked".into(),
+                    ))
+                })?;
+                Ok(ExecutionResult::success())
+            }
         }
     }
 }

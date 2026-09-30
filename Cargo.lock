@@ -1737,7 +1737,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "junco-rust-validator"
+name = "junco-policy"
 version = "0.1.0"
 dependencies = [
  "bumpalo",
@@ -1970,7 +1970,7 @@ dependencies = [
  "getrandom 0.3.4",
  "git2",
  "hex",
- "junco-rust-validator",
+ "junco-policy",
  "libc",
  "marsh-btrfs",
  "marsh-core",
@@ -2020,7 +2020,7 @@ dependencies = [
  "git2",
  "glob",
  "hex",
- "junco-rust-validator",
+ "junco-policy",
  "libc",
  "lurk-cli",
  "marsh-btrfs",
@@ -2047,9 +2047,7 @@ dependencies = [
  "lurk-cli",
  "marsh-lib",
  "nix 0.30.1",
- "rustix 1.1.4",
  "serde",
- "serde_json",
  "syscalls",
  "tempfile",
 ]

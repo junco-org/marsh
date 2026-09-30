@@ -1,4 +1,5 @@
 use super::*;
+use crate::test_fixtures::{SessionSpec, TestRequest};
 use rmux_core::{input::InputParser, Screen};
 
 fn screen_with_frame(size: TerminalSize, frame: &[u8]) -> (Screen, InputParser) {
@@ -46,7 +47,7 @@ async fn create_status_off_attach(
     mpsc::UnboundedReceiver<AttachControl>,
 ) {
     let handler = RequestHandler::new();
-    let session = handler.create_session((name, size)).await;
+    let session = SessionSpec::create(&handler, (name, size)).await;
     handler
         .store_option_for_test(
             ScopeSelector::Session(session.clone()),
@@ -66,15 +67,17 @@ async fn display_status_off_message(
     duration_ms: u32,
     ignore_input: bool,
 ) {
-    handler
-        .handle_ok(DisplayMessageExtRequest {
+    TestRequest::send_ok(
+        handler,
+        DisplayMessageExtRequest {
             target: Some(Target::Session(session.clone())),
             target_client: Some(attach_pid.to_string()),
             duration_ms: Some(rmux_proto::DisplayMessageDurationMillis::new(duration_ms)),
             ignore_input,
             ..Fixture::fixture(message)
-        })
-        .await;
+        },
+    )
+    .await;
 }
 
 async fn expire_current_message(handler: &RequestHandler, attach_pid: u32) {

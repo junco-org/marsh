@@ -1,9 +1,10 @@
 use super::*;
+use crate::test_fixtures::SessionSpec;
 
 #[tokio::test]
 async fn parsed_queue_accepts_display_message_format_flag() {
     let handler = RequestHandler::new();
-    handler.create_session("alpha").await;
+    SessionSpec::create(&handler, "alpha").await;
 
     let parsed = CommandParser::new()
         .parse("display-message -p -F '#{session_name}' -t alpha")
@@ -97,7 +98,7 @@ async fn parsed_queue_display_message_reports_tmux_delay_errors() {
 #[tokio::test]
 async fn parsed_queue_display_message_accepts_compact_print_target_cluster() {
     let handler = RequestHandler::new();
-    handler.create_session("alpha").await;
+    SessionSpec::create(&handler, "alpha").await;
 
     let parsed = CommandParser::new()
         .parse("display-message -pt alpha:0.0 'hi-#{pane_index}'")
@@ -146,7 +147,7 @@ async fn parsed_queue_display_message_targets_control_client_with_initiator_cont
     let alpha = session_name("display-control-alpha");
     let detached = session_name("display-control-detached");
     for session in [&alpha, &detached] {
-        handler.create_session(session).await;
+        SessionSpec::create(&handler, session).await;
     }
     let requester_pid = 99_613;
     let (control_id, mut events) = handler
@@ -233,7 +234,7 @@ async fn parsed_queue_display_message_all_formats_uses_core_inventory() {
 async fn parsed_queue_list_panes_all_does_not_require_current_target() {
     let handler = RequestHandler::new();
     for name in ["alpha", "beta"] {
-        handler.create_session(name).await;
+        SessionSpec::create(&handler, name).await;
     }
 
     let parsed = CommandParser::new()
@@ -289,7 +290,7 @@ async fn parsed_queue_set_environment_requires_a_value() {
 #[tokio::test]
 async fn parsed_queue_set_environment_uses_current_session_by_default() {
     let handler = RequestHandler::new();
-    handler.create_session("alpha").await;
+    SessionSpec::create(&handler, "alpha").await;
 
     let parsed = CommandParser::new()
         .parse(

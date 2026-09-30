@@ -1,14 +1,13 @@
 use rmux_client::Connection;
 use rmux_proto::types::OptionScopeSelector;
-use rmux_proto::{HookName, ResolveTargetType, RmuxError, Target};
+use rmux_proto::{HookName, ResolveTargetType, RmuxError, Target, WindowTarget};
 
 use crate::cli::ExitFailure;
 use crate::cli::target_resolution::{target_session, target_window};
 use crate::cli_args::{ShowOptionsArgs, ShowOptionsCommandKind, TargetSpec};
 
 use super::super::super::{
-    resolve_current_pane_target, resolve_current_session_target, resolve_target_spec,
-    resolve_window_target_or_current,
+    CommandTarget, resolve_current_pane_target, resolve_current_session_target, resolve_target_spec,
 };
 use super::{dummy_pane_target, option_name_supports_scope};
 
@@ -139,7 +138,7 @@ impl ShowOptionsScope {
             Self::CurrentSession => {
                 resolve_current_session_target(connection).map(OptionScopeSelector::Session)
             }
-            Self::CurrentWindow => resolve_window_target_or_current(connection, None, command_name)
+            Self::CurrentWindow => WindowTarget::resolve_fallback(connection, command_name)
                 .map(OptionScopeSelector::Window),
             Self::CurrentPane => {
                 resolve_current_pane_target(connection, command_name).map(OptionScopeSelector::Pane)

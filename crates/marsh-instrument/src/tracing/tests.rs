@@ -1,224 +1,219 @@
-//! Every host attachment runs in a disposable, freshly exec'd test process.
+//! In-process tracing of spawned commands and host records, against real processes.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use super::*;
-use std::cell::RefCell;
 use std::future::poll_fn;
-use std::os::unix::ffi::OsStrExt;
 use std::panic::AssertUnwindSafe;
 use std::pin::pin;
-use std::sync::atomic::AtomicUsize;
+use std::process::Command;
 use std::sync::mpsc;
 use std::task::{Context, Poll, Waker};
 
-const OUTSIDE: &[u8] = b"outside-poll-file";
+/// Whether evidence names a file ending in `name` by path, descriptor, returned FD or cwd.
+fn mentions(evidence: &[Syscall], name: &[u8]) -> bool {
+    evidence.iter().any(|info| {
+        info.paths.iter().any(|(_, bytes)| bytes.ends_with(name))
+            || info
+                .descriptors
+                .iter()
+                .filter_map(|(_, target)| target.as_ref())
+                .chain(info.return_fd.as_ref())
+                .chain(info.cwd.as_ref())
+                .any(|target| target.path.ends_with(name))
+    })
+}
 
-fn host_scenario() {
-    let directory = tempfile::tempdir().unwrap();
-    let path = directory.path().join("native-file");
-    std::fs::write(&path, b"native bytes").unwrap();
-    let outside = directory.path().join(std::ffi::OsStr::from_bytes(OUTSIDE));
-    std::fs::write(&outside, b"outside bytes").unwrap();
-    for _ in 0..2 {
-        let service = Tracing::shared();
-        let evidence = Arc::new(Mutex::new(Vec::new()));
-        let captured = Arc::clone(&evidence);
-        // The shared helper must outlive the thread/runtime that first requested attachment.
-        let worker_service = Arc::clone(&service);
-        let root_path = directory.path().to_path_buf();
-        let root = std::thread::spawn(move || {
-            worker_service.register_root(
-                &root_path,
+/// One registered root collecting everything classified against it.
+struct Fixture {
+    service: Arc<Tracing>,
+    directory: tempfile::TempDir,
+    root: RootId,
+    seen: Arc<Mutex<Vec<Syscall>>>,
+}
+
+impl Fixture {
+    fn new() -> Self {
+        let service = Tracing::shared().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        let root = service
+            .register_root(
+                &directory.path().canonicalize().unwrap(),
                 Arc::new(move |_, _, info| {
-                    captured.lock().unwrap().push(info);
+                    lock(&sink).push(info);
                     Ok(())
                 }),
             )
-        })
-        .join()
-        .unwrap()
-        .unwrap();
-        let run = service.begin_run(root).unwrap();
-        let scope = service.scope(run, None).unwrap();
-        let forged = format!("{}{}/leave", service.prefix, scope.id.0);
-        {
-            // The scope belongs only to the two polls; the read between them is unattributed.
-            let mut polls = 0_u8;
-            let mut scoped = pin!(Scoped::new(
-                poll_fn(|_| {
-                    polls += 1;
-                    if polls == 1 {
-                        assert_eq!(std::fs::read(&path).unwrap(), b"native bytes");
-                        return Poll::Pending;
-                    }
-                    let output = std::process::Command::new("/bin/cat")
-                        .arg(&path)
-                        .output()
-                        .unwrap();
-                    assert_eq!(output.stdout, b"native bytes");
-                    let output = std::process::Command::new("python3").args(["-c",
-                    "import os,sys\ntry: os.readlink(sys.argv[1])\nexcept OSError: pass\nsys.stdout.buffer.write(open(sys.argv[2], 'rb').read())"])
-                    .arg(&forged).arg(&path).output().unwrap();
-                    assert!(output.status.success());
-                    assert_eq!(output.stdout, b"native bytes");
-                    Poll::Ready(())
-                }),
-                scope
-            ));
-            let mut context = Context::from_waker(Waker::noop());
-            assert!(scoped.as_mut().poll(&mut context).is_pending());
-            assert_eq!(std::fs::read(&outside).unwrap(), b"outside bytes");
-            assert!(scoped.as_mut().poll(&mut context).is_ready());
-        }
-        service.end_run(run).unwrap();
-        let evidence = evidence.lock().unwrap();
-        assert!(evidence.iter().any(|info| info.info.syscall == Sysno::read
-            && info.descriptors.iter().any(|(_, target)| {
-                target.as_ref().is_some_and(|target| {
-                    Path::new(std::ffi::OsStr::from_bytes(&target.path)) == path
-                })
-            })));
-        assert!(
-            evidence
-                .iter()
-                .any(|info| info.info.syscall == Sysno::execve)
-        );
-        assert!(
-            evidence
-                .iter()
-                .any(|info| info.path(0) == Some(forged.as_bytes())),
-            "external scope forgery remains ordinary evidence"
-        );
-        assert!(
-            !evidence.iter().any(|info| info
-                .paths
-                .iter()
-                .any(|(_, bytes)| bytes.ends_with(OUTSIDE))
-                || info
-                    .descriptors
-                    .iter()
-                    .filter_map(|(_, target)| target.as_ref())
-                    .chain(info.return_fd.as_ref())
-                    .chain(info.cwd.as_ref())
-                    .any(|target| target.path.ends_with(OUTSIDE))),
-            "a read between scoped polls is not attributed"
-        );
-        drop(evidence);
-        service.unregister_root(root).unwrap();
-    }
-}
-
-fn pressure(calls: usize) {
-    for _ in 0..calls {
-        let mut sink = [0_u8];
-        // SAFETY: the constant is NUL terminated and the output is a live one-byte buffer.
-        unsafe {
-            libc::readlink(
-                c"/proc/self/native-pressure".as_ptr(),
-                sink.as_mut_ptr().cast(),
-                1,
-            );
+            .unwrap();
+        Self {
+            service,
+            directory,
+            root,
+            seen,
         }
     }
-}
 
-fn blocked_scenario(overflow: bool) {
-    let directory = tempfile::tempdir().unwrap();
-    let tracing = Tracing::shared();
-    let (entered, ready) = mpsc::channel();
-    let (release, gate) = mpsc::channel();
-    let gate = Mutex::new(Some(gate));
-    let seen = Arc::new(AtomicUsize::new(0));
-    let counted = Arc::clone(&seen);
-    let root = tracing
-        .register_root(
-            directory.path(),
-            Arc::new(move |_, _, info| {
-                if info.info.syscall == Sysno::readlink {
-                    counted.fetch_add(1, Ordering::Relaxed);
-                    let taken = gate.lock().unwrap().take();
-                    if let Some(gate) = taken {
-                        entered.send(()).unwrap();
-                        gate.recv().unwrap();
-                    }
-                }
-                Ok(())
-            }),
-        )
-        .unwrap();
-    let run = tracing.begin_run(root).unwrap();
-    let scope = tracing.scope(run, None).unwrap();
-    {
+    fn path(&self, name: &str) -> PathBuf {
+        self.directory.path().canonicalize().unwrap().join(name)
+    }
+
+    /// Spawns `sh -c script` inside `scope`, returning the child and its event stream.
+    fn spawn(
+        &self,
+        scope: &TraceScope,
+        script: &str,
+    ) -> io::Result<(TracedChild, mpsc::Receiver<ChildEvent>)> {
+        let (sender, events) = mpsc::channel();
+        let mut command = Command::new("/bin/sh");
+        command.arg("-c").arg(script);
         let _guard = scope.enter();
-        pressure(1);
-        ready.recv_timeout(DEADLINE).unwrap();
-        pressure(if overflow { 40_000 } else { 4095 });
+        let child = self.service.spawn(
+            command,
+            Box::new(move |event| {
+                let _ = sender.send(event);
+            }),
+        )?;
+        Ok((child, events))
     }
-    drop(scope);
-    if overflow {
-        let deadline = Instant::now() + DEADLINE;
-        while tracing.health(run).is_ok() && Instant::now() < deadline {
-            std::thread::yield_now();
-        }
-        assert!(
-            tracing.health(run).is_err(),
-            "pidfd monitor reports queue loss while callback is blocked"
-        );
-        release.send(()).unwrap();
-        assert!(tracing.drain(run).is_err());
-        // The test owns no workload producers; release this failed test registration explicitly.
-        lock(&tracing.state).runs.remove(&run);
-    } else {
-        assert_eq!(seen.load(Ordering::Relaxed), 1);
-        release.send(()).unwrap();
-        tracing.end_run(run).unwrap();
-        assert_eq!(seen.load(Ordering::Relaxed), 4096);
+
+    fn finish(self, run: TraceRun) {
+        self.service.end_run(run).unwrap();
+        self.service.unregister_root(self.root).unwrap();
     }
-    tracing.unregister_root(root).unwrap();
-    host_scenario();
 }
 
-#[test]
-fn native_host_lifecycle_and_backpressure() {
-    if let Some(scenario) = std::env::var_os("MARSH_NATIVE_SCENARIO") {
-        match scenario.to_str().unwrap() {
-            "host" => host_scenario(),
-            "burst" => blocked_scenario(false),
-            "overflow" => blocked_scenario(true),
-            _ => panic!("unknown scenario"),
+fn exited(events: &mpsc::Receiver<ChildEvent>) -> std::process::ExitStatus {
+    loop {
+        match events.recv().expect("the tracer reports its command's end") {
+            ChildEvent::Exited(status) => return status,
+            ChildEvent::Stopped => {}
         }
-        println!("native scenario completed");
-        return;
-    }
-    for scenario in ["host", "burst", "overflow"] {
-        let test = "tracing::tests::native_host_lifecycle_and_backpressure";
-        crate::observation::tests::isolated(
-            test,
-            "MARSH_NATIVE_SCENARIO",
-            scenario,
-            Duration::from_secs(45),
-            "native scenario completed",
-        );
     }
 }
 
 #[test]
-fn transport_rejects_incomplete_invalid_and_gapped_frames() {
-    // The concurrent writer lets an oversized frame outgrow the socket buffer.
-    for frame in [
-        b"{".to_vec(),
-        b"not json\n".to_vec(),
-        b"[2,1,0,null,null]\n".to_vec(),
-        vec![b'x'; FRAME_LIMIT + 1],
-    ] {
-        let (reader, mut writer) = UnixStream::pair().unwrap();
-        let thread = std::thread::spawn(move || {
-            writer.write_all(PRELUDE).unwrap();
-            let _ = writer.write_all(&frame);
-        });
-        assert!(receive(&Weak::new(), reader).is_err());
-        thread.join().unwrap();
+fn spawned_commands_are_traced_attributed_and_reaped_in_process() {
+    let fixture = Fixture::new();
+    let run = fixture.service.begin_run(fixture.root).unwrap();
+    let scope = fixture.service.scope(run, None).unwrap();
+    let file = fixture.path("traced.txt");
+    let (child, events) = fixture
+        .spawn(&scope, &format!("printf traced > '{}'; /bin/true", file.display()))
+        .unwrap();
+    assert!(exited(&events).success());
+    fixture.service.quiesce(run).unwrap();
+    assert_eq!(std::fs::read(&file).unwrap(), b"traced");
+    let seen = std::mem::take(&mut *lock(&fixture.seen));
+    // The command's own write, and its child's exec, are evidence of the run.
+    assert!(mentions(&seen, b"traced.txt"));
+    assert!(seen.iter().any(|call| call.info.syscall == Sysno::execve
+        && call.path(0).is_some_and(|path| path.ends_with(b"/true"))));
+    // Its creation is stated first, so its descriptors are inherited from the host.
+    let first = seen.first().expect("records");
+    assert_eq!(first.info.syscall, Sysno::fork);
+    assert!(matches!(first.info.result, RetCode::Ok(pid) if pid.cast_unsigned() == child.pid));
+    // The host itself is never traced.
+    assert_eq!(
+        proc_field::<i32>("/proc/self/status", "TracerPid:").unwrap(),
+        Some(0)
+    );
+    fixture.finish(run);
+}
+
+fn probe(path: &Path) -> HostCall<'_> {
+    HostCall::Metadata {
+        path,
+        follow: true,
+        errno: None,
     }
+}
+
+#[test]
+fn host_records_count_only_inside_workload_scopes() {
+    let fixture = Fixture::new();
+    let run = fixture.service.begin_run(fixture.root).unwrap();
+    let scope = fixture.service.scope(run, None).unwrap();
+    let internal = fixture.service.internal_scope().unwrap();
+    let file = fixture.path("probed.txt");
+    std::fs::write(&file, b"x").unwrap();
+    let outside = fixture.path("outside.txt");
+    let hidden = fixture.path("internal.txt");
+    fixture.service.host(probe(&outside)).unwrap();
+    {
+        let _workload = scope.enter();
+        {
+            let _internal = internal.enter();
+            fixture.service.host(probe(&hidden)).unwrap();
+        }
+        fixture.service.host(probe(&file)).unwrap();
+        let opened = std::fs::File::open(&file).unwrap();
+        fixture
+            .service
+            .host(HostCall::Open {
+                path: &file,
+                result: Ok(opened.as_raw_fd()),
+            })
+            .unwrap();
+    }
+    let seen = std::mem::take(&mut *lock(&fixture.seen));
+    assert!(!mentions(&seen, b"outside.txt"));
+    assert!(!mentions(&seen, b"internal.txt"));
+    assert!(seen.iter().any(|call| call.info.syscall == Sysno::newfstatat
+        && call.path(1).is_some_and(|path| path.ends_with(b"probed.txt"))));
+    // A read-only open also stands for the reads made through it.
+    assert!(seen.iter().any(|call| call.info.syscall == Sysno::read
+        && call
+            .fd(0)
+            .unwrap()
+            .is_some_and(|target| target.path.ends_with(b"probed.txt"))));
+    fixture.finish(run);
+}
+
+#[test]
+fn failed_launches_and_unscoped_spawns_leave_nothing_running() {
+    let fixture = Fixture::new();
+    let run = fixture.service.begin_run(fixture.root).unwrap();
+    let scope = fixture.service.scope(run, None).unwrap();
+    let missing = {
+        let _guard = scope.enter();
+        fixture
+            .service
+            .spawn(Command::new("/nonexistent/program"), Box::new(|_| {}))
+    };
+    assert_eq!(
+        missing.err().map(|error| error.kind()),
+        Some(io::ErrorKind::NotFound)
+    );
+    let unscoped = fixture
+        .service
+        .spawn(Command::new("/bin/true"), Box::new(|_| {}));
+    assert!(unscoped.is_err());
+    let unresolved = {
+        let _guard = scope.enter();
+        fixture.service.spawn(Command::new("true"), Box::new(|_| {}))
+    };
+    assert_eq!(
+        unresolved.err().map(|error| error.kind()),
+        Some(io::ErrorKind::InvalidInput)
+    );
+    // Nothing is left attributed to the run, and it still spawns.
+    fixture.service.quiesce(run).unwrap();
+    let (_, events) = fixture.spawn(&scope, "exit 3").unwrap();
+    assert_eq!(exited(&events).code(), Some(3));
+    fixture.finish(run);
+}
+
+#[test]
+fn cancellation_kills_traced_commands() {
+    let fixture = Fixture::new();
+    let run = fixture.service.begin_run(fixture.root).unwrap();
+    let scope = fixture.service.scope(run, None).unwrap();
+    let (_, events) = fixture.spawn(&scope, "exec /bin/sleep 60").unwrap();
+    assert!(fixture.service.cancel(run).unwrap() >= 1);
+    assert_eq!(exited(&events).signal(), Some(libc::SIGKILL));
+    fixture.service.quiesce(run).unwrap();
+    fixture.finish(run);
 }
 
 thread_local! { static LABEL: RefCell<Option<&'static str>> = const { RefCell::new(None) }; }

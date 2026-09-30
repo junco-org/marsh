@@ -2,6 +2,7 @@ use std::sync::atomic::Ordering;
 
 use super::*;
 use crate::handler::prompt_support::PromptInputEvent;
+use crate::test_fixtures::SessionSpec;
 
 use super::super::mode_tree_order::client_item_id;
 
@@ -22,7 +23,7 @@ async fn client_identity_fixture(
     pid_offset: u32,
 ) -> ClientIdentityFixture {
     let session_name = SessionName::new(label).expect("valid session");
-    handler.create_session(&session_name).await;
+    SessionSpec::create(handler, &session_name).await;
 
     let host_pid = std::process::id().saturating_add(pid_offset);
     let victim_pid = host_pid.saturating_add(1);

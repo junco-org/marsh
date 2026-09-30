@@ -1,4 +1,5 @@
 use super::*;
+use crate::test_fixtures::SessionSpec;
 
 #[tokio::test]
 async fn queued_window_spawns_use_non_attached_caller_cwd() {
@@ -12,12 +13,14 @@ async fn queued_window_spawns_use_non_attached_caller_cwd() {
         fs::canonicalize(root.child("session").path()).expect("canonical session cwd");
     let caller_cwd = fs::canonicalize(root.child("caller").path()).expect("canonical caller cwd");
     let session = session_name("queued-window-caller-cwd");
-    handler
-        .create_session(NewSessionExtRequest {
+    SessionSpec::create(
+        &handler,
+        NewSessionExtRequest {
             working_directory: Some(session_cwd.to_string_lossy().into_owned()),
             ..Fixture::fixture(&session)
-        })
-        .await;
+        },
+    )
+    .await;
 
     let context = QueueExecutionContext::new(Some(caller_cwd.clone())).with_current_target(Some(
         Target::Pane(PaneTarget::with_window(session.clone(), 0, 0)),
@@ -47,12 +50,14 @@ async fn queued_window_spawns_without_caller_cwd_keep_session_cwd() {
     let session_cwd =
         fs::canonicalize(root.child("session").path()).expect("canonical session cwd");
     let session = session_name("queued-window-attached-cwd");
-    handler
-        .create_session(NewSessionExtRequest {
+    SessionSpec::create(
+        &handler,
+        NewSessionExtRequest {
             working_directory: Some(session_cwd.to_string_lossy().into_owned()),
             ..Fixture::fixture(&session)
-        })
-        .await;
+        },
+    )
+    .await;
 
     let context = QueueExecutionContext::without_caller_cwd().with_current_target(Some(
         Target::Pane(PaneTarget::with_window(session.clone(), 0, 0)),
@@ -85,12 +90,14 @@ async fn queued_window_explicit_cwd_overrides_non_attached_caller_cwd() {
     let explicit_cwd =
         fs::canonicalize(root.child("explicit").path()).expect("canonical explicit cwd");
     let session = session_name("queued-window-explicit-cwd");
-    handler
-        .create_session(NewSessionExtRequest {
+    SessionSpec::create(
+        &handler,
+        NewSessionExtRequest {
             working_directory: Some(session_cwd.to_string_lossy().into_owned()),
             ..Fixture::fixture(&session)
-        })
-        .await;
+        },
+    )
+    .await;
 
     let context = QueueExecutionContext::new(Some(caller_cwd)).with_current_target(Some(
         Target::Pane(PaneTarget::with_window(session.clone(), 0, 0)),

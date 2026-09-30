@@ -1,13 +1,16 @@
-//! Seized-only observation around lurk's native types, argument table and filter.
-//! No CLI, renderer, tracee launcher, or dependency source patch participates here.
+//! Seized-only observation of spawned descendants around lurk's native types, argument table and
+//! filter. It runs on the in-process tracer thread that seized them: the host itself is never
+//! traced, which Linux refuses within one thread group anyway. No CLI, renderer, tracee launcher,
+//! or dependency source patch participates here.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use lurk_cli::args::Args;
 use lurk_cli::syscall_info::RetCode;
-use marsh_lib::CheckedAdvance;
 use nix::errno::Errno;
 use nix::sys::ptrace::{self, Event, Options};
 use nix::sys::signal::Signal;
@@ -16,7 +19,8 @@ use nix::unistd::Pid;
 use syscalls::{Sysno, SysnoSet};
 
 use crate::Syscall;
-use crate::capture::{Captured, native_usize, proc_field};
+use crate::capture::{Captured, native_usize};
+use crate::ring::Rings;
 
 #[cfg(target_arch = "x86_64")]
 const NATIVE_ARCH: u32 = 0xC000_003E;
@@ -24,6 +28,13 @@ const NATIVE_ARCH: u32 = 0xC000_003E;
 const NATIVE_ARCH: u32 = 0xC000_00B7;
 #[cfg(target_arch = "riscv64")]
 const NATIVE_ARCH: u32 = 0xC000_00F3;
+
+const OPTIONS: Options = Options::PTRACE_O_TRACESYSGOOD
+    .union(Options::PTRACE_O_TRACEFORK)
+    .union(Options::PTRACE_O_TRACEVFORK)
+    .union(Options::PTRACE_O_TRACECLONE)
+    .union(Options::PTRACE_O_TRACEEXEC)
+    .union(Options::PTRACE_O_TRACEEXIT);
 
 type Observe<'a> = dyn FnMut(u64, Pid, i32, Option<u64>, Option<Syscall>) -> io::Result<()> + 'a;
 
@@ -42,35 +53,47 @@ struct Task {
     entry: Option<Entry>,
 }
 
+/// The service-wide delivery order shared by every tracer thread and host record.
+#[derive(Default)]
+pub(crate) struct Sequence(AtomicU64);
+
+impl Sequence {
+    pub(crate) fn next(&self) -> io::Result<u64> {
+        self.0
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                value.checked_add(1)
+            })
+            .map(|previous| previous + 1)
+            .map_err(|_| io::Error::other("native delivery sequence exhausted"))
+    }
+}
+
 pub(crate) struct Observer {
     selected: SysnoSet,
     tasks: HashMap<Pid, Task>,
-    initial: Vec<(Pid, i32, Option<u64>)>,
-    sequence: u64,
-}
-
-impl CheckedAdvance for &mut Observer {
-    type Output = u64;
-    type Error = io::Error;
-    fn value(&self) -> u64 {
-        self.sequence
-    }
-    fn advance(self, value: u64) -> u64 {
-        self.sequence = value;
-        value
-    }
-    fn exhausted() -> io::Error {
-        io::Error::other("native delivery sequence exhausted")
-    }
+    sequence: Arc<Sequence>,
+    /// The spawned command this thread seized.
+    root: Pid,
+    /// Whether `root` has replaced its launcher image.
+    root_executed: bool,
+    /// Whether `root` was released untraced after its exec failed.
+    detached: bool,
+    /// The `io_uring` rings this tree set up.
+    rings: Rings,
 }
 
 impl Observer {
-    pub(crate) fn attach(root: Pid, args: &Args) -> io::Result<Self> {
+    /// The observed syscalls: lurk's categories plus the interfaces its 0.3.14 lists predate.
+    pub(crate) fn selection() -> io::Result<SysnoSet> {
+        let args = Args {
+            follow_forks: true,
+            expr: vec!["trace=%file,%desc,%process,%memory,%fstat,%fstatfs".into()],
+            ..Args::default()
+        };
         let mut selected = args
             .create_filter()
             .map_err(io::Error::other)?
             .all_enabled();
-        // Upstream 0.3.14's category lists predate these filesystem/process interfaces.
         for syscall in [
             Sysno::openat2,
             Sysno::clone3,
@@ -85,113 +108,70 @@ impl Observer {
         ] {
             selected.insert(syscall);
         }
-        let mut observer = Self {
+        Ok(selected)
+    }
+
+    pub(crate) fn new(selected: SysnoSet, sequence: Arc<Sequence>, root: Pid) -> Self {
+        Self {
             selected,
             tasks: HashMap::new(),
-            initial: Vec::new(),
-            sequence: 0,
-        };
-        observer.seize_all(root)?;
-        Ok(observer)
+            sequence,
+            root,
+            root_executed: false,
+            detached: false,
+            rings: Rings::default(),
+        }
     }
 
-    /// Stop the entire host before admission, including threads auto-attached during enumeration.
-    /// No initial task resumes until all retained real stops have been delivered.
-    fn seize_all(&mut self, root: Pid) -> io::Result<()> {
-        let options = Options::PTRACE_O_TRACESYSGOOD
-            | Options::PTRACE_O_TRACEFORK
-            | Options::PTRACE_O_TRACEVFORK
-            | Options::PTRACE_O_TRACECLONE
-            | Options::PTRACE_O_TRACEEXEC
-            | Options::PTRACE_O_TRACEEXIT;
-        let mut waiting = HashSet::new();
-        let mut stopped = HashSet::new();
+    /// Whether the command was handed back untraced because its exec failed: the launcher then
+    /// reports that failure and reaps the process itself.
+    pub(crate) const fn detached(&self) -> bool {
+        self.detached
+    }
+
+    /// Seizes a spawned child parked in its launch handshake and stops it. Returns the raw status
+    /// of its interrupt stop, still unresumed, or `None` once the child vanished first.
+    pub(crate) fn seize(&mut self, pid: Pid) -> io::Result<Option<i32>> {
+        ptrace::seize(pid, OPTIONS)
+            .map_err(|error| io::Error::other(format!("seizing child {pid}: {error}")))?;
+        self.tasks.insert(pid, Task::default());
+        // A child that died meanwhile is still reported, and reaped, by the wait below.
+        alive(ptrace::interrupt(pid))?;
         loop {
-            for tid in list_tasks(root)? {
-                let tid = tid?;
-                if !self.tasks.contains_key(&tid) && self.seize(tid, options)? {
-                    waiting.insert(tid);
+            let mut status = 0;
+            // SAFETY: status points to one writable integer; the pid is this thread's tracee.
+            let waited = unsafe {
+                libc::waitpid(pid.as_raw(), &raw mut status, libc::__WALL | libc::__WNOTHREAD)
+            };
+            if waited < 0 {
+                match Errno::last() {
+                    Errno::EINTR => continue,
+                    error => return Err(error.into()),
                 }
             }
-            if waiting.is_empty() {
-                return Ok(());
-            }
-            while !waiting.is_empty() {
-                let (tid, status) = wait_any()?
-                    .ok_or_else(|| io::Error::other("host attachment lost its tracees"))?;
-                let wait = WaitStatus::from_raw(tid, status)?;
-                let event = match wait {
-                    WaitStatus::Exited(..) | WaitStatus::Signaled(..) => {
-                        self.tasks.remove(&tid);
-                        None
-                    }
-                    WaitStatus::PtraceEvent(_, _, code) => {
-                        let (message, other) = self.lifecycle(tid, code)?;
-                        match other {
-                            Some(child) if creation(code) => {
-                                if !stopped.contains(&child) {
-                                    waiting.insert(child);
-                                }
-                            }
-                            Some(former) => {
-                                waiting.remove(&former);
-                            }
-                            None => {}
-                        }
-                        message
-                    }
-                    WaitStatus::Continued(_) | WaitStatus::StillAlive => continue,
-                    _ => {
-                        self.tasks.entry(tid).or_default();
-                        None
-                    }
-                };
-                waiting.remove(&tid);
-                stopped.insert(tid);
-                self.initial.push((tid, status, event));
+            match WaitStatus::from_raw(pid, status)? {
+                WaitStatus::PtraceEvent(_, _, code) if code == Event::PTRACE_EVENT_STOP as i32 => {
+                    return Ok(Some(status));
+                }
+                WaitStatus::Exited(..) | WaitStatus::Signaled(..) => {
+                    self.tasks.remove(&pid);
+                    return Ok(None);
+                }
+                // A signal delivered before the interrupt: pass it on; the interrupt stays pending.
+                WaitStatus::Stopped(_, signal) => {
+                    alive(ptrace::cont(pid, signal))?;
+                }
+                _ => {
+                    alive(ptrace::cont(pid, None))?;
+                }
             }
         }
     }
 
-    /// Seizes and interrupts one listed host task, reporting whether it now owes an initial stop.
-    fn seize(&mut self, tid: Pid, options: Options) -> io::Result<bool> {
-        match ptrace::seize(tid, options) {
-            Ok(()) => match ptrace::interrupt(tid) {
-                Ok(()) | Err(Errno::ESRCH) => {}
-                Err(error) => {
-                    return Err(io::Error::other(format!(
-                        "interrupting host task {tid}: {error}"
-                    )));
-                }
-            },
-            // A concurrently cloned thread is already ours, and has an initial stop.
-            Err(Errno::EPERM) if traced_by_self(tid)? => {}
-            // A task can exit between its listing and its seizure: it is no longer part of the
-            // host, and any thread it created before exiting appears in the next listing.
-            Err(Errno::ESRCH) => return Ok(false),
-            Err(error) => {
-                return Err(io::Error::other(format!(
-                    "seizing host task {tid}: {error}"
-                )));
-            }
-        }
-        self.tasks.insert(tid, Task::default());
-        Ok(true)
-    }
-
-    pub(crate) fn run(
-        &mut self,
-        mut observe: impl FnMut(u64, Pid, i32, Option<u64>, Option<Syscall>) -> io::Result<()>,
-    ) -> io::Result<()> {
-        let initial = std::mem::take(&mut self.initial);
-        for &(tid, status, event) in &initial {
-            observe(self.next()?, tid, status, event, None)?;
-        }
-        for (tid, status, _) in initial {
-            resume_stop(tid, WaitStatus::from_raw(tid, status)?)?;
-        }
+    /// Observes every stop until this thread has no tracee left.
+    pub(crate) fn run(&mut self, observe: &mut Observe<'_>) -> io::Result<()> {
         while let Some((tid, status)) = wait_any()? {
-            self.stop(tid, status, &mut observe)?;
+            self.stop(tid, status, observe)?;
         }
         if self.tasks.is_empty() {
             Ok(())
@@ -202,12 +182,38 @@ impl Observer {
         }
     }
 
+    /// After a failure: kills every tracee and resumes whatever still stops, observing nothing,
+    /// until none is left. `exited` sees each final status; no tracee is left stopped or unreaped.
+    pub(crate) fn abandon(&mut self, mut exited: impl FnMut(Pid, i32)) {
+        for tid in self.tasks.keys() {
+            let _ = nix::sys::signal::kill(*tid, Signal::SIGKILL);
+        }
+        while let Ok(Some((tid, status))) = wait_any() {
+            if let Ok(WaitStatus::Exited(..) | WaitStatus::Signaled(..)) =
+                WaitStatus::from_raw(tid, status)
+            {
+                self.tasks.remove(&tid);
+                exited(tid, status);
+            } else {
+                // A task created after the kill above is killed on its first stop.
+                if self.tasks.insert(tid, Task::default()).is_none() {
+                    let _ = nix::sys::signal::kill(tid, Signal::SIGKILL);
+                }
+                let _ = ptrace::cont(tid, None);
+            }
+        }
+    }
+
     /// Applies a lifecycle stop to the task table, returning its message and any created or
     /// exec-displaced task.
     fn lifecycle(&mut self, tid: Pid, code: i32) -> io::Result<(Option<u64>, Option<Pid>)> {
         let message = event_message(tid, code)?;
         let exec = code == Event::PTRACE_EVENT_EXEC as i32;
-        let other = if creation(code) || exec {
+        if exec && tid == self.root {
+            self.root_executed = true;
+        }
+        // A task killed at this stop has no message left to read; its lifecycle then ends here.
+        let other = if (creation(code) || exec) && message.is_some() {
             Some(event_pid(message)?)
         } else {
             None
@@ -229,7 +235,13 @@ impl Observer {
         Ok((message, other))
     }
 
-    fn stop(&mut self, tid: Pid, status: i32, observe: &mut Observe<'_>) -> io::Result<()> {
+    /// Delivers one stop, then resumes its task.
+    pub(crate) fn stop(
+        &mut self,
+        tid: Pid,
+        status: i32,
+        observe: &mut Observe<'_>,
+    ) -> io::Result<()> {
         let wait = WaitStatus::from_raw(tid, status)?;
         let event = match wait {
             WaitStatus::PtraceSyscall(_) => return self.syscall_stop(tid, status, observe),
@@ -244,7 +256,7 @@ impl Observer {
             }
             WaitStatus::Continued(_) | WaitStatus::StillAlive => return Ok(()),
         };
-        observe(self.next()?, tid, status, event, None)?;
+        observe(self.sequence.next()?, tid, status, event, None)?;
         resume_stop(tid, wait)
     }
 
@@ -284,6 +296,9 @@ impl Observer {
                 };
                 self.exit(tid, status, result, observe)
             }
+            // The kernel no longer holds this task at a syscall stop (it was killed or woken
+            // between the wait and this query): nothing is left to record, only to release.
+            libc::PTRACE_SYSCALL_INFO_NONE => resume(tid, None),
             operation => Err(io::Error::other(format!(
                 "unexpected syscall stop kind {operation} for {tid}"
             ))),
@@ -313,8 +328,11 @@ impl Observer {
             let Some(registers) = alive(ptrace::getregs(tid))? else {
                 return Ok(());
             };
-            let capture = Captured::at_entry(tid, syscall, registers)?;
-            let order = self.next()?;
+            let mut capture = Captured::at_entry(tid, syscall, registers)?;
+            if syscall == Sysno::io_uring_enter {
+                capture.submit(self.rings.pending(tid, capture.descriptor(0)));
+            }
+            let order = self.sequence.next()?;
             self.tasks
                 .get_mut(&tid)
                 .ok_or_else(|| io::Error::other("missing entry task"))?
@@ -349,14 +367,32 @@ impl Observer {
         }
         task.in_syscall = false;
         if let Some(entry) = task.entry.take() {
-            let call = entry.capture.complete(
+            let mut call = entry.capture.complete(
                 tid,
                 entry.syscall,
                 result,
                 entry.order,
                 entry.started.elapsed(),
             )?;
-            observe(self.next()?, tid, status, None, Some(call))?;
+            if call.info.syscall == Sysno::io_uring_setup
+                && !matches!(call.info.result, RetCode::Err(_))
+            {
+                self.rings.created(tid, &mut call);
+            }
+            let failed_launch = tid == self.root
+                && !self.root_executed
+                && matches!(call.info.syscall, Sysno::execve | Sysno::execveat)
+                && matches!(call.info.result, RetCode::Err(_));
+            observe(self.sequence.next()?, tid, status, None, Some(call))?;
+            if failed_launch {
+                // The launcher now reports the errno and waits for this process itself. Only
+                // the launcher's own code runs from here, which ran untraced before the
+                // handshake too; its wait must not race this thread for the remaining stops.
+                alive(ptrace::detach(tid, None))?;
+                self.tasks.remove(&tid);
+                self.detached = true;
+                return Ok(());
+            }
         }
         resume(tid, None)
     }
@@ -381,9 +417,8 @@ fn event_message(tid: Pid, event: i32) -> io::Result<Option<u64>> {
         || event == Event::PTRACE_EVENT_EXEC as i32
         || event == Event::PTRACE_EVENT_EXIT as i32
     {
-        ptrace::getevent(tid)
-            .map(|message| Some(message.cast_unsigned()))
-            .map_err(Into::into)
+        // A killed task leaves its stop at once; ESRCH is its vanishing, not a failure.
+        alive(ptrace::getevent(tid)).map(|message| message.map(i64::cast_unsigned))
     } else {
         Ok(None)
     }
@@ -471,8 +506,10 @@ fn syscall_info(tid: Pid) -> io::Result<Option<libc::ptrace_syscall_info>> {
 fn wait_any() -> io::Result<Option<(Pid, i32)>> {
     loop {
         let mut status = 0;
-        // SAFETY: status points to one writable integer. The helper is the sole wait owner.
-        let tid = unsafe { libc::waitpid(-1, &raw mut status, libc::__WALL) };
+        // SAFETY: status points to one writable integer. `__WNOTHREAD` confines the wait to this
+        // tracer thread's own tracees; the host's other children are never touched.
+        let tid =
+            unsafe { libc::waitpid(-1, &raw mut status, libc::__WALL | libc::__WNOTHREAD) };
         if tid > 0 {
             return Ok(Some((Pid::from_raw(tid), status)));
         }
@@ -482,23 +519,6 @@ fn wait_any() -> io::Result<Option<(Pid, i32)>> {
             error => return Err(error.into()),
         }
     }
-}
-
-fn list_tasks(root: Pid) -> io::Result<impl Iterator<Item = io::Result<Pid>>> {
-    Ok(
-        std::fs::read_dir(format!("/proc/{root}/task"))?.map(|entry| {
-            let name = entry?.file_name();
-            name.to_str()
-                .and_then(|name| name.parse::<i32>().ok())
-                .filter(|tid| *tid > 0)
-                .map(Pid::from_raw)
-                .ok_or_else(|| io::Error::other("invalid procfs task identity"))
-        }),
-    )
-}
-
-fn traced_by_self(tid: Pid) -> io::Result<bool> {
-    Ok(proc_field::<u32>(format!("/proc/{tid}/status"), "TracerPid:")? == Some(std::process::id()))
 }
 
 #[cfg(test)]

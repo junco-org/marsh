@@ -81,7 +81,7 @@ async fn missing_staging_at_startup_starts_a_fresh_usable_wal() {
 #[serial]
 async fn pre_intent_failure_preserves_exit_and_rolls_back_tentative_grants() {
     use super::super::policy::{Action, Event, Resource};
-    use rust_validator::PolicyDecision;
+    use junco_policy::PolicyDecision;
     let fixture = Fixture::new();
     let shell = fixture.shell().await;
     // A live sibling keeps the source's in-memory authority across the failing shell's close.
@@ -481,106 +481,4 @@ async fn real_btrfs_redo_is_readonly_and_recovery_checks_its_fingerprint() {
     fs.delete_subvolume(&bad).unwrap();
     fs.delete_subvolume(&seed).unwrap();
     root.close().expect("remove readonly proof scratch");
-}
-
-#[tokio::test]
-#[serial]
-async fn native_internal_calls_order_intent_payload_namespace_and_end() {
-    use super::super::session::PublishMeta;
-    use lurk_cli::syscall_info::RetCode;
-    use marsh_wal::{ContentHash, JsonLog, WalRecord};
-    use std::os::unix::ffi::OsStrExt;
-    use syscalls::Sysno;
-
-    fn target(call: &marsh_instrument::Syscall) -> Option<&Path> {
-        call.fd(0)
-            .ok()
-            .flatten()
-            .map(|target| Path::new(std::ffi::OsStr::from_bytes(&target.path)))
-    }
-    let fixture = Fixture::new();
-    let shell = fixture.shell().await;
-    let log = fixture.log();
-    let tracing = Arc::clone(&session(&shell).await.tracing);
-    tracing.begin_internal_capture().unwrap();
-    let result = shell.run("printf durable > src/a.txt").await;
-    let calls = tracing.end_internal_capture().unwrap();
-    result.unwrap();
-    assert_eq!(
-        std::fs::read(fixture.seed.join("src/a.txt")).unwrap(),
-        b"durable"
-    );
-    let records = JsonLog::<WalRecord<PublishMeta>>::read(&log).unwrap();
-    let Some(WalRecord::Begin {
-        seq,
-        staging,
-        op_count,
-        meta,
-        ..
-    }) = records.first()
-    else {
-        panic!("missing intent");
-    };
-    assert_eq!(*op_count, records.len() - 2);
-    assert_eq!(&meta.principal, shell.principal());
-    assert!(matches!(records.last(), Some(WalRecord::End { seq: ended }) if ended == seq));
-    assert!(
-        records
-            .iter()
-            .any(|record| matches!(record, WalRecord::Move { to, sha1, .. }
-        if to == Path::new("src/a.txt") && sha1 == &ContentHash::of(b"durable")))
-    );
-
-    let writes: Vec<_> = calls
-        .iter()
-        .filter(|call| {
-            matches!(call.info.syscall, Sysno::write | Sysno::writev)
-                && !matches!(call.info.result, RetCode::Err(_))
-                && target(call) == Some(log.as_path())
-        })
-        .map(|call| call.entry_order)
-        .collect();
-    let syncs: Vec<_> = calls
-        .iter()
-        .filter(|call| {
-            matches!(call.info.syscall, Sysno::fsync | Sysno::fdatasync)
-                && matches!(call.info.result, RetCode::Ok(0))
-                && target(call) == Some(log.as_path())
-        })
-        .map(|call| call.entry_order)
-        .collect();
-    assert_eq!(
-        writes.len(),
-        2,
-        "one counted intent batch and one END write"
-    );
-    assert_eq!(syncs.len(), 2, "both WAL writes must be durable");
-    assert!(writes[0] < syncs[0] && syncs[0] < writes[1] && writes[1] < syncs[1]);
-    let staging = fixture.seed.join(staging.to_string());
-    let payload = calls
-        .iter()
-        .find(|call| {
-            call.info.syscall == Sysno::fsync
-                && matches!(call.info.result, RetCode::Ok(0))
-                && target(call).is_some_and(|path| path.starts_with(&staging) && path != staging)
-        })
-        .expect("staged payload fsync")
-        .entry_order;
-    let parent = fixture.seed.join("src");
-    let namespace = calls
-        .iter()
-        .find(|call| {
-            call.info.syscall == Sysno::fsync
-                && matches!(call.info.result, RetCode::Ok(0))
-                && call.entry_order > payload
-                && target(call) == Some(parent.as_path())
-        })
-        .expect("published namespace fsync")
-        .entry_order;
-    assert!(syncs[0] < payload && payload < namespace && namespace < writes[1]);
-    println!(
-        "native ordering: intent sync {} < payload fsync {payload} < namespace fsync {namespace} < END sync {}",
-        syncs[0], syncs[1]
-    );
-    close(shell).await;
 }

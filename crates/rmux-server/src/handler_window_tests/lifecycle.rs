@@ -1,4 +1,5 @@
 use super::*;
+use crate::test_fixtures::TestRequest;
 
 /// Kills window `index` of `session` alone and answers with the window left active.
 pub(super) async fn kill_window(
@@ -6,13 +7,12 @@ pub(super) async fn kill_window(
     session: &SessionName,
     index: u32,
 ) -> WindowTarget {
-    handler
-        .handle_ok(KillWindowRequest::fixture(WindowTarget::with_window(
-            session.clone(),
-            index,
-        )))
-        .await
-        .target
+    TestRequest::send_ok(
+        handler,
+        KillWindowRequest::fixture(WindowTarget::with_window(session.clone(), index)),
+    )
+    .await
+    .target
 }
 
 /// Groups beta with alpha and delta with gamma, links `alpha:0` into `gamma:1`, renames window 0
@@ -24,21 +24,25 @@ async fn assert_linked_family_rename(renamed: &str, name: &str) {
     let gamma = create_session(&handler, "gamma").await;
     let delta = create_grouped_session(&handler, "delta", &gamma).await;
 
-    handler
-        .handle_ok(LinkWindowRequest {
+    TestRequest::send_ok(
+        &handler,
+        LinkWindowRequest {
             detached: false,
             ..Fixture::fixture((
                 WindowTarget::with_window(alpha.clone(), 0),
                 WindowTarget::with_window(gamma.clone(), 1),
             ))
-        })
-        .await;
-    handler
-        .handle_ok(RenameWindowRequest {
+        },
+    )
+    .await;
+    TestRequest::send_ok(
+        &handler,
+        RenameWindowRequest {
             target: WindowTarget::with_window(session_name(renamed), 0),
             name: name.to_owned(),
-        })
-        .await;
+        },
+    )
+    .await;
 
     let state = handler.state.lock().await;
     for (session_name, window_index) in [(&alpha, 0), (&beta, 0), (&gamma, 1), (&delta, 1)] {
@@ -131,11 +135,13 @@ async fn select_window_updates_last_window_tracking() {
     let alpha = create_session(&handler, "alpha").await;
     insert_window(&handler, &alpha, 1).await;
 
-    let selected = handler
-        .handle_ok(SelectWindowRequest {
+    let selected = TestRequest::send_ok(
+        &handler,
+        SelectWindowRequest {
             target: WindowTarget::with_window(alpha.clone(), 1),
-        })
-        .await;
+        },
+    )
+    .await;
     assert_eq!(selected.target, WindowTarget::with_window(alpha.clone(), 1));
 
     let state = handler.state.lock().await;
@@ -153,12 +159,14 @@ async fn rename_window_persists_the_name_and_disables_automatic_rename() {
     let alpha = create_session(&handler, "alpha").await;
     insert_window(&handler, &alpha, 1).await;
 
-    let renamed = handler
-        .handle_ok(RenameWindowRequest {
+    let renamed = TestRequest::send_ok(
+        &handler,
+        RenameWindowRequest {
             target: WindowTarget::with_window(alpha.clone(), 1),
             name: "logs".to_owned(),
-        })
-        .await;
+        },
+    )
+    .await;
     assert_eq!(renamed.target, WindowTarget::with_window(alpha.clone(), 1));
 
     let state = handler.state.lock().await;
@@ -319,12 +327,14 @@ async fn kill_window_all_others_leaves_only_the_target_window() {
     insert_window(&handler, &alpha, 1).await;
     insert_window(&handler, &alpha, 2).await;
 
-    let killed = handler
-        .handle_ok(KillWindowRequest {
+    let killed = TestRequest::send_ok(
+        &handler,
+        KillWindowRequest {
             target: WindowTarget::with_window(alpha.clone(), 1),
             kill_all_others: true,
-        })
-        .await;
+        },
+    )
+    .await;
     assert_eq!(killed.target, WindowTarget::with_window(alpha.clone(), 1));
 
     let state = handler.state.lock().await;
@@ -538,15 +548,17 @@ async fn kill_last_linked_window_orders_target_session_before_surviving_alias() 
     let alpha = create_session(&handler, "alpha-linked-last").await;
     let beta = create_session(&handler, "beta-linked-last").await;
     insert_window(&handler, &beta, 1).await;
-    handler
-        .handle_ok(LinkWindowRequest {
+    TestRequest::send_ok(
+        &handler,
+        LinkWindowRequest {
             detached: false,
             ..Fixture::fixture((
                 WindowTarget::with_window(alpha.clone(), 0),
                 WindowTarget::with_window(beta.clone(), 2),
             ))
-        })
-        .await;
+        },
+    )
+    .await;
     let mut events = handler.subscribe_lifecycle_events();
 
     kill_window(&handler, &alpha, 0).await;

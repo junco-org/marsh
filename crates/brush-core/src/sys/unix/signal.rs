@@ -72,31 +72,31 @@ pub(crate) fn mask_sigttou() -> Result<(), error::Error> {
     Ok(())
 }
 
-pub(crate) fn poll_for_stopped_children() -> Result<bool, error::Error> {
-    let mut found_stopped = false;
-
-    loop {
-        let wait_status = waitid_all(
-            nix::sys::wait::WaitPidFlag::WUNTRACED | nix::sys::wait::WaitPidFlag::WNOHANG,
-        );
-        match wait_status {
-            Ok(nix::sys::wait::WaitStatus::Stopped(_stopped_pid, _signal)) => {
-                found_stopped = true;
-            }
-            Ok(_) => break,
-            Err(nix::errno::Errno::ECHILD) => break,
-            Err(e) => return Err(e.into()),
-        }
+/// Checks, without blocking, whether the given child has stopped, consuming that stop
+/// notification. Only ever waits on `pid` itself: a wait for any child (`P_ALL`) would also
+/// consume stops and exits of children the shell does not own, such as embedder-managed
+/// (hosted) children that a tracer in this process is ptracing.
+pub(crate) fn poll_for_stopped_child(pid: sys::process::ProcessId) -> Result<bool, error::Error> {
+    let wait_status = waitid_pid(
+        pid,
+        nix::sys::wait::WaitPidFlag::WUNTRACED | nix::sys::wait::WaitPidFlag::WNOHANG,
+    );
+    match wait_status {
+        Ok(nix::sys::wait::WaitStatus::Stopped(_stopped_pid, _signal)) => Ok(true),
+        Ok(_) | Err(nix::errno::Errno::ECHILD) => Ok(false),
+        Err(e) => Err(e.into()),
     }
-
-    Ok(found_stopped)
 }
 
 #[cfg(not(target_os = "macos"))]
-fn waitid_all(
+fn waitid_pid(
+    pid: sys::process::ProcessId,
     flags: nix::sys::wait::WaitPidFlag,
 ) -> Result<nix::sys::wait::WaitStatus, nix::errno::Errno> {
-    nix::sys::wait::waitid(nix::sys::wait::Id::All, flags)
+    nix::sys::wait::waitid(
+        nix::sys::wait::Id::Pid(nix::unistd::Pid::from_raw(pid)),
+        flags,
+    )
 }
 
 //
@@ -106,7 +106,9 @@ fn waitid_all(
 //
 
 #[cfg(target_os = "macos")]
-fn waitid_all(
+#[allow(clippy::cast_sign_loss, reason = "pids are positive")]
+fn waitid_pid(
+    pid: sys::process::ProcessId,
     flags: nix::sys::wait::WaitPidFlag,
 ) -> Result<nix::sys::wait::WaitStatus, nix::errno::Errno> {
     // SAFETY:
@@ -119,7 +121,12 @@ fn waitid_all(
     // SAFETY:
     // Code copied from nix::sys::wait implementation of waitid for other platforms.
     nix::errno::Errno::result(unsafe {
-        nix::libc::waitid(nix::libc::P_ALL, 0, &raw mut siginfo, flags.bits())
+        nix::libc::waitid(
+            nix::libc::P_PID,
+            pid as nix::libc::id_t,
+            &raw mut siginfo,
+            flags.bits(),
+        )
     })?;
 
     siginfo_to_wait_status(siginfo)

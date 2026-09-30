@@ -24,13 +24,15 @@
 //! 5. **A directory selects a seed, and a host owns only a default.** The real CLI opens a pane
 //!    with `new-session -c <sibling seed>/src`, a seed this daemon was never told about. That
 //!    pane publishes into the sibling while the `api` job goes on publishing into the first, in
-//!    the same host, at the same time; neither seed sees the other's bytes. Typing `sd b-sibling
-//!    /src` at the sibling pane's prompt opens its new job on the *sibling* seed, because the
-//!    REPL's leading `/` names the seed of the shell the line was typed in and not the daemon's
-//!    default.
-//! 6. **A typed `exit` ends exactly its own pane.** `exit 7` typed into a real prompt closes that
-//!    job with status 7 through brush's own builtin, its pane and session leave the client's pane
-//!    list, and the session beside it is still there in the same listing.
+//!    the same host, at the same time; neither seed sees the other's bytes. The real CLI's
+//!    `new-window -d -t other-seed -c <sibling seed>/src` then opens a detached window beside
+//!    that pane whose shell is on the *sibling* seed, while the pane it opened beside stays the
+//!    active one.
+//! 6. **A typed line reaches the shell as typed, and a typed `exit` ends exactly its own pane.** A
+//!    function named `fg`, once the prompt's own word, runs with its argument expanded unsplit.
+//!    Then `exit 7` typed into the same prompt closes that job with status 7 through brush's own
+//!    builtin, its pane and session leave the client's pane list, and the session beside it is
+//!    still there in the same listing.
 //!
 //! Between the outside capture and the switch, while `api` is live, it also proves the parametric
 //! extractions end to end: one protocol connection opens three raw and two surface pane streams
@@ -352,6 +354,45 @@ async fn rmux(binary: &Path, socket: &Path, args: &[&str]) -> Result<String, Fai
         .into());
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// `target`'s expansion of `format`, as the real client reports it, without surrounding space.
+async fn display(
+    binary: &Path,
+    socket: &Path,
+    target: &str,
+    format: &str,
+) -> Result<String, Failure> {
+    let text = rmux(
+        binary,
+        socket,
+        &["display-message", "-p", "-t", target, format],
+    )
+    .await?;
+    Ok(text.trim().to_owned())
+}
+
+/// Types `keys` into `target` through the real client, returning once `marker` is next printed.
+async fn send_keys_until(
+    binary: &Path,
+    socket: &Path,
+    target: &str,
+    marker: &str,
+    keys: &[&str],
+) -> Result<(), Failure> {
+    let mut args = vec![
+        "send-keys",
+        "-t",
+        target,
+        "--wait-next-text",
+        marker,
+        "--timeout",
+        "5s",
+        "--",
+    ];
+    args.extend_from_slice(keys);
+    rmux(binary, socket, &args).await?;
+    Ok(())
 }
 
 /// Runs `command` to completion within `limit`, with no standard input, returning its status
@@ -1123,7 +1164,7 @@ async fn prove_second_seed(
     println!("[wal] incompatible startup WAL reset; pane publication succeeded");
 
     prove_first_seed_still_live(io, api, &first, &second, binary, socket).await?;
-    prove_prompt_sibling(io, &b, &view.id, &second).await
+    prove_rmux_sibling(io, &b, &second, binary, socket).await
 }
 
 /// Writes the sibling seed's log as an old-schema record that recovery must discard, returning it.
@@ -1195,37 +1236,97 @@ async fn prove_first_seed_still_live(
     Ok(())
 }
 
-/// A line typed at B's prompt, not a request made of the host.
+/// A window the real client opens beside B, on B's source, without selecting it.
 ///
-/// Its leading `/` is the seed of the shell it was typed in — if it were the daemon's default,
-/// this sibling would land on the first seed instead, and the assertion below is the whole
-/// difference.
-async fn prove_prompt_sibling(
+/// `-c` names the sibling seed's source directory by its absolute logical path. Nothing about the
+/// daemon names that seed, so a shell that lands on it rather than on the host's default is the
+/// directory choosing the seed, and B keeping its active window is `-d` holding.
+async fn prove_rmux_sibling(
     io: &RmuxFrontend,
     b: &ShellHandle,
-    prompt: &ShellId,
     second: &Path,
+    binary: &Path,
+    socket: &Path,
 ) -> Result<(), Failure> {
-    until("the second seed's prompt to go idle", || async {
-        io.job(prompt)
-            .filter(|view| view.running.is_none() && !view.starting)
-            .map(|_| ())
+    let start = second.join("src");
+    let start = start.to_str().ok_or("the fixture path is not UTF-8")?;
+    let before: Vec<ShellId> = io.jobs().into_iter().map(|view| view.id).collect();
+    let b_target = pane_target(io, b).await?;
+    ensure_eq!(
+        display(binary, socket, &b_target, "#{window_active}").await?,
+        "1",
+        "B's window is the active one before anything opens beside it"
+    );
+
+    rmux(
+        binary,
+        socket,
+        &[
+            "new-window",
+            "-d",
+            "-t",
+            "other-seed",
+            "-n",
+            "b-sibling",
+            "-c",
+            start,
+        ],
+    )
+    .await?;
+
+    // Every job the command added, taken once one of them is an idle terminal shell on the
+    // sibling seed: a second addition is a failure to report, never a candidate to choose between.
+    let added = until("an idle terminal job on the second seed", || async {
+        let added: Vec<_> = io
+            .jobs()
+            .into_iter()
+            .filter(|view| !before.contains(&view.id))
+            .collect();
+        added
+            .iter()
+            .any(|view| {
+                view.sandbox.seed == second
+                    && matches!(view.io, JobIo::Terminal { .. })
+                    && view.running.is_none()
+                    && !view.starting
+            })
+            .then_some(added)
     })
     .await?;
-    io.write_input(b, b"sd b-sibling /src\r").await?;
-    let sibling_id = ShellId::from("b-sibling");
-    let sibling = until("`b-sibling` to open", || async { io.job(&sibling_id) }).await?;
+    let [sibling] = added.as_slice() else {
+        let ids: Vec<&str> = added.iter().map(|view| view.id.as_str()).collect();
+        return Err(format!("`new-window` added exactly one job, not {ids:?}").into());
+    };
+    let target = pane_target(io, &io.shell(&sibling.id)?).await?;
+    let surface = display(binary, socket, &target, "#{session_name} #{window_name}").await?;
     println!(
-        "[14] `sd b-sibling /src` at B's prompt -> seed {} dir {:?}",
+        "[14] rmux -N -S … new-window -d -t other-seed -n b-sibling -c {start} -> `{}` at \
+         {target} ({surface}) on seed {} dir {:?}",
+        sibling.id.as_str(),
         sibling.sandbox.seed.display(),
         sibling.sandbox.dir.as_str()
     );
     ensure_eq!(
+        surface,
+        "other-seed b-sibling",
+        "the new shell is presented by the window the client named"
+    );
+    ensure_eq!(
         sibling.sandbox.seed,
         second,
-        "the REPL's `/` names the originating shell's seed, never the daemon's default"
+        "`-c` selects the sibling seed, never the daemon's default"
     );
     ensure_eq!(sibling.sandbox.dir.as_str(), "src");
+    ensure_eq!(
+        display(binary, socket, &target, "#{window_active}").await?,
+        "0",
+        "the new window was opened detached"
+    );
+    ensure_eq!(
+        display(binary, socket, &b_target, "#{window_active}").await?,
+        "1",
+        "and B's window is still the active one"
+    );
 
     let sources: std::collections::BTreeSet<_> = io
         .jobs()
@@ -1297,23 +1398,33 @@ async fn prove_prompt_exit(
 
     // The echoed command line spells the marker `EXIT_ READY`, so only the line's own *output* can
     // satisfy this wait: reaching it proves the prompt runs what is typed at it.
-    rmux(
+    send_keys_until(
         binary,
         socket,
+        "exit-smoke",
+        "EXIT_READY",
+        &["printf '%s%s\\n' EXIT_ READY", "Enter"],
+    )
+    .await?;
+
+    // `fg` was a word the prompt used to answer itself. Now it is looked up by the shell, which
+    // finds this function first and expands its argument unsplit. The marker is joined only by
+    // running the function: the echoed declaration spells it `PREPARSER_ REMOVED`, and the echoed
+    // call does not spell it at all.
+    send_keys_until(
+        binary,
+        socket,
+        "exit-smoke",
+        "PREPARSER_REMOVED:two words",
         &[
-            "send-keys",
-            "-t",
-            "exit-smoke",
-            "--wait-next-text",
-            "EXIT_READY",
-            "--timeout",
-            "5s",
-            "--",
-            "printf '%s%s\\n' EXIT_ READY",
+            "function fg { printf '%s%s:%s\\n' PREPARSER_ REMOVED \"$1\"; }; payload='two words'",
+            "Enter",
+            "fg \"$payload\"",
             "Enter",
         ],
     )
     .await?;
+    println!("[grammar] ordinary shell lookup and expansion reached the pane");
 
     io.write_input(&job, b"exit 7\r").await?;
     let end = tokio::time::timeout(TIMEOUT, job.wait_closed()).await??;
@@ -1340,7 +1451,23 @@ async fn prove_prompt_exit(
         "the exited job is gone rather than idle"
     );
 
-    let listed = until("`exit-smoke` to leave the pane list", || async {
+    let listed = session_gone(binary, socket, "exit-smoke", "smoke").await?;
+    let shown: Vec<&str> = listed.lines().filter(|line| !line.is_empty()).collect();
+    println!("[exit] rmux -N -S … list-panes -a -F '#{{session_name}}' -> {shown:?}");
+    println!("[exit] status=7; target removed; survivor alive");
+    Ok(())
+}
+
+/// The real client's pane listing once it names `survivor`'s session and no longer `gone`'s.
+///
+/// The survivor is checked in the same listing, so an absent target cannot be a dead daemon.
+async fn session_gone(
+    binary: &Path,
+    socket: &Path,
+    gone: &str,
+    survivor: &str,
+) -> Result<String, Failure> {
+    until(&format!("`{gone}` to leave the pane list"), || async {
         let text = rmux(
             binary,
             socket,
@@ -1348,15 +1475,11 @@ async fn prove_prompt_exit(
         )
         .await
         .ok()?;
-        let removed = !text.lines().any(|line| line.trim() == "exit-smoke");
-        let survivor = text.lines().any(|line| line.trim() == "smoke");
-        (removed && survivor).then_some(text)
+        let removed = !text.lines().any(|line| line.trim() == gone);
+        let alive = text.lines().any(|line| line.trim() == survivor);
+        (removed && alive).then_some(text)
     })
-    .await?;
-    let shown: Vec<&str> = listed.lines().filter(|line| !line.is_empty()).collect();
-    println!("[exit] rmux -N -S … list-panes -a -F '#{{session_name}}' -> {shown:?}");
-    println!("[exit] status=7; target removed; survivor alive");
-    Ok(())
+    .await
 }
 
 /// The shell a named session's first pane runs, resolved by the surface it presents.
@@ -1585,6 +1708,16 @@ async fn fixture_shell(fixture: &Fixture, initial_dir: &Path) -> Result<marsh::S
     }
 }
 
+/// This process's kernel-reported tracer: zero when no native helper is attached.
+fn tracer_pid() -> Result<i32, Failure> {
+    let status = std::fs::read_to_string("/proc/self/status")?;
+    let value = status
+        .lines()
+        .find_map(|line| line.strip_prefix("TracerPid:"))
+        .ok_or("missing TracerPid: in /proc/self/status")?;
+    Ok(value.trim().parse()?)
+}
+
 /// Executed only in a fresh process whose PATH contains git and no tracer executable.
 ///
 /// Every shell the proof opens is retained until teardown, where each is closed even after
@@ -1627,8 +1760,20 @@ async fn prove_native_shells(
         initialized.status,
         String::from_utf8_lossy(&initialized.stderr)
     );
+    ensure_eq!(tracer_pid()?, 0);
     shells.push(fixture_shell(fixture, &fixture.seed).await?);
+    // Construction itself attaches the tracer; durable storage still waits for a managed route.
+    let helper = tracer_pid()?;
+    ensure!(helper != 0, "a built shell has no native tracer attached");
+    let state = fixture.scratch.path().join(marsh_btrfs::STATE_DIR);
+    ensure!(
+        !state.try_exists()?,
+        "building a shell materialized {}",
+        state.display()
+    );
+    println!("[tracing] shell build ready before commands");
     shells.push(fixture_shell(fixture, &fixture.seed).await?);
+    ensure_eq!(tracer_pid()?, helper);
     let [a, b] = shells.as_slice() else {
         return Err("the two initial shells were not retained".into());
     };
@@ -1666,11 +1811,27 @@ async fn prove_native_shells(
     a.run("printf same > zero-op").await?;
     // Both close before the third opens: that ordering is what makes its authority recovered.
     a.close(false).await?;
+    ensure_eq!(tracer_pid()?, helper);
     b.close(false).await?;
+    // Closed handles stay in `shells`; releasing a shell must still release its tracer.
+    until("the closed shells' native tracer to detach", || async {
+        match tracer_pid() {
+            Ok(0) => Some(Ok(())),
+            Ok(_) => None,
+            Err(error) => Some(Err(error)),
+        }
+    })
+    .await??;
     let first = a.principal().clone();
     // An idle peer keeps the reopened shell on the managed route under the default policy.
     shells.push(fixture_shell(fixture, &fixture.seed).await?);
+    let reattached = tracer_pid()?;
+    ensure!(
+        reattached != 0,
+        "a reopened shell has no native tracer attached"
+    );
     shells.push(fixture_shell(fixture, &fixture.seed).await?);
+    ensure_eq!(tracer_pid()?, reattached);
     let reopened = shells.last().ok_or("the reopened shell was not retained")?;
     ensure!(*reopened.principal() != first);
     for path in ["owned", "read-claim", "zero-op"] {
@@ -1712,6 +1873,7 @@ async fn prove_without_tracer_executables() -> Result<(), Failure> {
         .into());
     }
     let text = String::from_utf8(output.stdout)?;
+    ensure!(text.contains("[tracing] shell build ready before commands"));
     ensure!(text.contains("[lurk] native Rust tracing; no tracer executable; read claim enforced"));
     print!("{text}");
     Ok(())
@@ -2097,27 +2259,16 @@ async fn drive(
     let active = until(
         "the client to report `api`'s pane and window active",
         || async {
-            let text = rmux(
-                binary,
-                socket,
-                &[
-                    "display-message",
-                    "-p",
-                    "-t",
-                    &target,
-                    "#{pane_active} #{window_active}",
-                ],
-            )
-            .await
-            .ok()?;
-            (text.trim() == "1 1").then_some(text)
+            let text = display(binary, socket, &target, "#{pane_active} #{window_active}")
+                .await
+                .ok()?;
+            (text == "1 1").then_some(text)
         },
     )
     .await?;
     println!(
         "[6b] rmux -N -S … display-message -t {target} '#{{pane_active}} #{{window_active}}' \
-         -> {:?}",
-        active.trim()
+         -> {active:?}"
     );
 
     prove_denial(io, fixture).await?;

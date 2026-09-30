@@ -42,6 +42,7 @@ use super::switch_frame_geometry::{
     active_window_index, frame_geometry, linked_alias_sessions, window_content_size, CLIENT_SIZE,
     SOURCE_WINDOW_INDEX, STATUS_OFF, SWITCHING_PID, TARGET_WINDOW_INDEX,
 };
+use crate::test_fixtures::SessionSpec;
 
 /// The geometry the moving client owns. It registers *first*, so under `latest`
 /// it is the older vote right up to the moment it switches.
@@ -436,13 +437,15 @@ async fn grouped_alias_session(
     handler: &RequestHandler,
     group_target: &SessionName,
 ) -> SessionName {
-    let grouped = handler
-        .create_session(NewSessionExtRequest {
+    let grouped = SessionSpec::create(
+        handler,
+        NewSessionExtRequest {
             size: Some(CLIENT_SIZE),
             group_target: Some(group_target.clone()),
             ..Fixture::fixture(session_name("switch-frame-grouped"))
-        })
-        .await;
+        },
+    )
+    .await;
     handler.set_session_status(&grouped, STATUS_OFF).await;
     assert_eq!(
         active_window_index(handler, &grouped).await,

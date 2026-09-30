@@ -1,4 +1,5 @@
 use super::*;
+use crate::test_fixtures::TestRequest;
 
 async fn enter_copy_mode_with_search_seed(handler: &RequestHandler, target: &PaneTarget) -> String {
     handler
@@ -8,7 +9,7 @@ async fn enter_copy_mode_with_search_seed(handler: &RequestHandler, target: &Pan
             b"alpha beta gamma\r\nsecond beta line\r\nthird alpha marker\r\nfourth beta marker\r\nfifth beta tail\r\n",
         )
         .await;
-    handler.handle_ok(CopyModeRequest::fixture(target)).await;
+    TestRequest::send_ok(handler, CopyModeRequest::fixture(target)).await;
     copy_search_status(handler, target.clone()).await
 }
 

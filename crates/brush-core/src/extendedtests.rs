@@ -1,13 +1,11 @@
 use brush_parser::ast;
+use std::os::unix::fs::FileTypeExt;
 use std::path::Path;
 
 use crate::{
     ExecutionParameters, Shell, ShellFd, arithmetic, env, error, escape, expansion, extensions,
-    namedoptions, patterns,
-    sys::{
-        fs::{MetadataExt, PathExt},
-        users,
-    },
+    hostfs, namedoptions, patterns,
+    sys::{fs::MetadataExt, users},
     variables::{self, ArrayLiteral},
 };
 
@@ -79,51 +77,53 @@ pub(crate) fn apply_unary_predicate_to_str(
         ast::UnaryPredicate::StringHasZeroLength => Ok(operand.is_empty()),
         ast::UnaryPredicate::FileExists => {
             let path = shell.absolute_path(Path::new(operand));
-            Ok(path.exists())
+            Ok(hostfs::exists(shell.execution_observer(), &path))
         }
         ast::UnaryPredicate::FileExistsAndIsBlockSpecialFile => {
             let path = shell.absolute_path(Path::new(operand));
-            Ok(path.exists_and_is_block_device())
+            Ok(stat(shell, &path, true).is_some_and(|m| m.file_type().is_block_device()))
         }
         ast::UnaryPredicate::FileExistsAndIsCharSpecialFile => {
             let path = shell.absolute_path(Path::new(operand));
-            Ok(path.exists_and_is_char_device())
+            Ok(stat(shell, &path, true).is_some_and(|m| m.file_type().is_char_device()))
         }
         ast::UnaryPredicate::FileExistsAndIsDir => {
             let path = shell.absolute_path(Path::new(operand));
-            Ok(path.is_dir())
+            Ok(hostfs::is_dir(shell.execution_observer(), &path))
         }
         ast::UnaryPredicate::FileExistsAndIsRegularFile => {
             let path = shell.absolute_path(Path::new(operand));
-            Ok(path.is_file())
+            Ok(hostfs::is_file(shell.execution_observer(), &path))
         }
         ast::UnaryPredicate::FileExistsAndIsSetgid => {
+            const S_ISGID: u32 = 0o2000;
             let path = shell.absolute_path(Path::new(operand));
-            Ok(path.exists_and_is_setgid())
+            Ok(stat(shell, &path, true).is_some_and(|m| m.mode() & S_ISGID != 0))
         }
         ast::UnaryPredicate::FileExistsAndIsSymlink => {
             let path = shell.absolute_path(Path::new(operand));
-            Ok(path.is_symlink())
+            Ok(stat(shell, &path, false).is_some_and(|m| m.file_type().is_symlink()))
         }
         ast::UnaryPredicate::FileExistsAndHasStickyBit => {
+            const S_ISVTX: u32 = 0o1000;
             let path = shell.absolute_path(Path::new(operand));
-            Ok(path.exists_and_is_sticky_bit())
+            Ok(stat(shell, &path, true).is_some_and(|m| m.mode() & S_ISVTX != 0))
         }
         ast::UnaryPredicate::FileExistsAndIsFifo => {
             let path = shell.absolute_path(Path::new(operand));
-            Ok(path.exists_and_is_fifo())
+            Ok(stat(shell, &path, true).is_some_and(|m| m.file_type().is_fifo()))
         }
         ast::UnaryPredicate::FileExistsAndIsReadable => {
             let path = shell.absolute_path(Path::new(operand));
-            Ok(path.readable())
+            Ok(hostfs::access(
+                shell.execution_observer(),
+                &path,
+                nix::unistd::AccessFlags::R_OK,
+            ))
         }
         ast::UnaryPredicate::FileExistsAndIsNotZeroLength => {
             let path = shell.absolute_path(Path::new(operand));
-            if let Ok(metadata) = path.metadata() {
-                Ok(metadata.len() > 0)
-            } else {
-                Ok(false)
-            }
+            Ok(stat(shell, &path, true).is_some_and(|m| m.len() > 0))
         }
         ast::UnaryPredicate::FdIsOpenTerminal => {
             // Trim whitespace before parsing, matching bash behavior.
@@ -138,24 +138,27 @@ pub(crate) fn apply_unary_predicate_to_str(
             }
         }
         ast::UnaryPredicate::FileExistsAndIsSetuid => {
+            const S_ISUID: u32 = 0o4000;
             let path = shell.absolute_path(Path::new(operand));
-            Ok(path.exists_and_is_setuid())
+            Ok(stat(shell, &path, true).is_some_and(|m| m.mode() & S_ISUID != 0))
         }
         ast::UnaryPredicate::FileExistsAndIsWritable => {
             let path = shell.absolute_path(Path::new(operand));
-            Ok(path.writable())
+            Ok(hostfs::access(
+                shell.execution_observer(),
+                &path,
+                nix::unistd::AccessFlags::W_OK,
+            ))
         }
         ast::UnaryPredicate::FileExistsAndIsExecutable => {
             let path = shell.absolute_path(Path::new(operand));
-            Ok(path.executable())
+            Ok(hostfs::executable(shell.execution_observer(), &path))
         }
         ast::UnaryPredicate::FileExistsAndOwnedByEffectiveGroupId => {
             let path = shell.absolute_path(Path::new(operand));
-            if !path.exists() {
+            let Some(md) = stat(shell, &path, true) else {
                 return Ok(false);
-            }
-
-            let md = path.metadata()?;
+            };
             Ok(md.gid() == users::get_effective_gid()?)
         }
         ast::UnaryPredicate::FileExistsAndModifiedSinceLastRead => {
@@ -163,16 +166,14 @@ pub(crate) fn apply_unary_predicate_to_str(
         }
         ast::UnaryPredicate::FileExistsAndOwnedByEffectiveUserId => {
             let path = shell.absolute_path(Path::new(operand));
-            if !path.exists() {
+            let Some(md) = stat(shell, &path, true) else {
                 return Ok(false);
-            }
-
-            let md = path.metadata()?;
+            };
             Ok(md.uid() == users::get_effective_uid()?)
         }
         ast::UnaryPredicate::FileExistsAndIsSocket => {
             let path = shell.absolute_path(Path::new(operand));
-            Ok(path.exists_and_is_socket())
+            Ok(stat(shell, &path, true).is_some_and(|m| m.file_type().is_socket()))
         }
         ast::UnaryPredicate::ShellOptionEnabled => {
             let shopt_name = operand;
@@ -190,6 +191,15 @@ pub(crate) fn apply_unary_predicate_to_str(
             None => Ok(false),
         },
     }
+}
+
+/// Probes `path` (absolute) for a file test, reporting the probe; `None` when it failed.
+fn stat(
+    shell: &Shell<impl extensions::ShellExtensions>,
+    path: &Path,
+    follow: bool,
+) -> Option<std::fs::Metadata> {
+    hostfs::metadata(shell.execution_observer(), path, follow).ok()
 }
 
 #[expect(clippy::too_many_lines)]
@@ -570,9 +580,9 @@ fn left_file_is_older_or_does_not_exist_when_right_does(
         shell.absolute_path(Path::new(right.as_ref())),
     );
 
-    match (l_path.metadata(), r_path.metadata()) {
-        (Ok(m1), Ok(m2)) => Ok(m1.modified()? < m2.modified()?),
-        (Err(_), Ok(_)) => Ok(true),
+    match (stat(shell, &l_path, true), stat(shell, &r_path, true)) {
+        (Some(m1), Some(m2)) => Ok(m1.modified()? < m2.modified()?),
+        (None, Some(_)) => Ok(true),
         _ => Ok(false),
     }
 }
@@ -587,9 +597,9 @@ fn left_file_is_newer_or_exists_when_right_does_not(
         shell.absolute_path(Path::new(right.as_ref())),
     );
 
-    match (l_path.metadata(), r_path.metadata()) {
-        (Ok(m1), Ok(m2)) => Ok(m1.modified()? > m2.modified()?),
-        (Ok(_), Err(_)) => Ok(true),
+    match (stat(shell, &l_path, true), stat(shell, &r_path, true)) {
+        (Some(m1), Some(m2)) => Ok(m1.modified()? > m2.modified()?),
+        (Some(_), None) => Ok(true),
         _ => Ok(false),
     }
 }
@@ -604,9 +614,13 @@ fn files_refer_to_same_device_and_inode_numbers(
         shell.absolute_path(Path::new(right.as_ref())),
     );
 
-    if !l_path.readable() || !r_path.readable() {
+    let observer = shell.execution_observer();
+    let readable = |path: &Path| hostfs::access(observer, path, nix::unistd::AccessFlags::R_OK);
+    if !readable(&l_path) || !readable(&r_path) {
         return Ok(false);
     }
 
-    Ok(l_path.get_device_and_inode()? == r_path.get_device_and_inode()?)
+    let l_md = hostfs::metadata(observer, &l_path, true)?;
+    let r_md = hostfs::metadata(observer, &r_path, true)?;
+    Ok((l_md.dev(), l_md.ino()) == (r_md.dev(), r_md.ino()))
 }

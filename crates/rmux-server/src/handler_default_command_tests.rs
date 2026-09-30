@@ -10,7 +10,7 @@ use rmux_proto::{
 
 use super::RequestHandler;
 
-use crate::test_fixtures::{unique_temp_path, Fixture, Grouped};
+use crate::test_fixtures::{unique_temp_path, Fixture, Grouped, SessionSpec, TestRequest};
 use crate::test_names::session_name;
 
 fn tagged_stdin_discard_command(tag: &str) -> String {
@@ -61,9 +61,9 @@ async fn sdk_new_and_split_resolve_default_command_for_the_addressed_session() {
     let owner = session_name("default-command-owner");
     let alias = session_name("default-command-alias");
     let fallback = session_name("default-command-fallback");
-    handler.create_session(&owner).await;
-    handler.create_session(Grouped(&alias, &owner)).await;
-    handler.create_session(&fallback).await;
+    SessionSpec::create(&handler, &owner).await;
+    SessionSpec::create(&handler, Grouped(&alias, &owner)).await;
+    SessionSpec::create(&handler, &fallback).await;
 
     let global_command = tagged_stdin_discard_command("global");
     let owner_command = tagged_stdin_discard_command("owner");
@@ -104,8 +104,7 @@ async fn sdk_new_and_split_resolve_default_command_for_the_addressed_session() {
         Some(ProcessCommand::Shell(alias_command))
     );
 
-    let split = handler
-        .handle_ok(SplitWindowRequest::fixture(owner_window))
+    let split = TestRequest::send_ok(&handler, SplitWindowRequest::fixture(owner_window))
         .await
         .pane;
     assert_eq!(
@@ -126,8 +125,8 @@ async fn sdk_explicit_command_wins_and_local_empty_masks_global_default_command(
     let handler = RequestHandler::new();
     let alpha = session_name("default-command-explicit");
     let masked = session_name("default-command-masked");
-    handler.create_session(&alpha).await;
-    handler.create_session(&masked).await;
+    SessionSpec::create(&handler, &alpha).await;
+    SessionSpec::create(&handler, &masked).await;
     handler
         .set_option(
             ScopeSelector::Global,
@@ -178,13 +177,15 @@ async fn sdk_explicit_command_wins_and_local_empty_masks_global_default_command(
         Some(ProcessCommand::Shell(String::new()))
     );
 
-    let masked_target = handler
-        .handle_ok(SplitWindowRequest {
+    let masked_target = TestRequest::send_ok(
+        &handler,
+        SplitWindowRequest {
             direction: SplitDirection::Horizontal,
             ..Fixture::fixture(masked)
-        })
-        .await
-        .pane;
+        },
+    )
+    .await
+    .pane;
     assert_eq!(pane_process_command(&handler, &masked_target).await, None);
 }
 
@@ -199,7 +200,7 @@ async fn default_command_preserves_requested_cwd_and_respawn_provenance() {
     let cwd = crate::pane_terminals::seed_scratch_dir(&handler, "default-command-cwd")
         .path()
         .to_path_buf();
-    handler.create_session(&alpha).await;
+    SessionSpec::create(&handler, &alpha).await;
 
     let original = tagged_stdin_discard_command("original");
     handler
@@ -237,15 +238,17 @@ async fn default_command_preserves_requested_cwd_and_respawn_provenance() {
             &tagged_stdin_discard_command("changed"),
         )
         .await;
-    handler
-        .handle_ok(RespawnWindowRequest {
+    TestRequest::send_ok(
+        &handler,
+        RespawnWindowRequest {
             target: WindowTarget::with_window(alpha.clone(), target.window_index()),
             kill: true,
             start_directory: None,
             environment: None,
             command: None,
-        })
-        .await;
+        },
+    )
+    .await;
     assert_eq!(
         pane_process_command(&handler, &target).await,
         Some(ProcessCommand::Shell(original.clone()))
@@ -258,9 +261,7 @@ async fn default_command_preserves_requested_cwd_and_respawn_provenance() {
             &tagged_stdin_discard_command("changed-again"),
         )
         .await;
-    handler
-        .handle_ok(RespawnPaneRequest::fixture(&target))
-        .await;
+    TestRequest::send_ok(&handler, RespawnPaneRequest::fixture(&target)).await;
     assert_eq!(
         pane_process_command(&handler, &target).await,
         Some(ProcessCommand::Shell(original))
@@ -277,7 +278,7 @@ async fn queued_source_and_binding_paths_apply_default_command() {
     let sourced = session_name("default-command-sourced");
     let bound = session_name("default-command-bound");
     for session in [&queued, &sourced, &bound] {
-        handler.create_session(session).await;
+        SessionSpec::create(&handler, session).await;
     }
     let default_command = tagged_stdin_discard_command("entry-paths");
     handler
@@ -307,9 +308,11 @@ async fn queued_source_and_binding_paths_apply_default_command() {
         format!("new-window -d -t {sourced}\nsplit-window -d -t {sourced}:0.0\n"),
     )
     .expect("write source-file commands");
-    handler
-        .handle_ok(SourceFileRequest::fixture([config.to_string_lossy()]))
-        .await;
+    TestRequest::send_ok(
+        &handler,
+        SourceFileRequest::fixture([config.to_string_lossy()]),
+    )
+    .await;
     assert_default_command_on_new_and_split(&handler, &sourced, &default_command).await;
 
     let requester_pid = u32::MAX - 91;
@@ -334,12 +337,14 @@ async fn queued_source_and_binding_paths_apply_default_command() {
             ],
         ),
     ] {
-        handler
-            .handle_ok(BindKeyRequest {
+        TestRequest::send_ok(
+            &handler,
+            BindKeyRequest {
                 note: Some("default-command regression".to_owned()),
                 ..Fixture::fixture(("prefix", key, command))
-            })
-            .await;
+            },
+        )
+        .await;
     }
     handler
         .handle_attached_live_input_for_test(requester_pid, b"\x02N\x02S")
