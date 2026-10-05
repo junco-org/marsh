@@ -13,7 +13,9 @@ use marsh_wal::{CommitOp, Seq};
 
 use super::completion::{Completion, Finalize};
 use super::execution::Run;
-use super::policy::{Action, Event, PolicyValidator, Principal, Resource, resource_of};
+use super::policy::{
+    Action, Event, PolicyObserver, PolicyValidator, Principal, Resource, resource_of,
+};
 use super::sandbox_policy::{CommandContext, SandboxPolicy};
 use super::snapshot::{CommandNumber, Snapshot};
 use super::{ShellError, ShellErrorKind};
@@ -568,6 +570,8 @@ pub(super) struct ExecutionResources {
     pub snapshot: Option<Arc<Snapshot>>,
     pub coverage: PathBuf,
     serial: u64,
+    /// Notified of every capability decision this shell's commands reach.
+    pub policy_observer: Option<Arc<PolicyObserver>>,
 }
 impl ExecutionResources {
     pub const fn new(
@@ -575,6 +579,7 @@ impl ExecutionResources {
         coverage: PathBuf,
         principal: Principal,
         policy: SandboxPolicy,
+        policy_observer: Option<Arc<PolicyObserver>>,
     ) -> Self {
         Self {
             domain,
@@ -584,6 +589,7 @@ impl ExecutionResources {
             snapshot: None,
             coverage,
             serial: 1,
+            policy_observer,
         }
     }
 

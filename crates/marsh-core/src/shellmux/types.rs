@@ -222,6 +222,9 @@ pub struct MuxProfile {
     pub builtins: HashMap<String, crate::builtins::Registration>,
     /// The routing policy every shell of this mux is built with; each shell gets its own clone.
     pub sandbox_policy: crate::SandboxPolicy,
+    /// Notified of every capability decision any shell of this mux reaches; see
+    /// [`crate::PolicyObserver`].
+    pub policy_observer: Option<std::sync::Arc<crate::PolicyObserver>>,
 }
 
 impl std::fmt::Debug for MuxProfile {
@@ -232,6 +235,7 @@ impl std::fmt::Debug for MuxProfile {
             .debug_struct("MuxProfile")
             .field("variables", &self.environment.iter().count())
             .field("builtins", &names)
+            .field("policy_observer", &self.policy_observer.is_some())
             .finish_non_exhaustive()
     }
 }

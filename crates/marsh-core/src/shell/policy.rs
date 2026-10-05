@@ -10,10 +10,25 @@ use super::completion::{Completion, Finalize};
 use super::execution::ExecutedCommand;
 use super::session::{Authority, Session};
 use super::{ShellError, ShellErrorKind};
-pub(super) use junco_policy::{Action, Event, Principal, Resource};
-use junco_policy::{Bump, GitPolicy, PolicyDecision};
+pub(super) use junco_policy::{Action, Principal, Resource};
+use junco_policy::{Bump, GitPolicy};
+pub use junco_policy::{Event, PolicyDecision};
 use marsh_lib::RecoverPoison as _;
 use marsh_wal::CommitOp;
+
+/// Receives every capability decision `Authority::check` makes, in order, before its effect.
+/// A grant is tentative: a later denial in the same batch or a failed publication rolls it back.
+/// Called under the authority's write lock, so it must only enqueue, never block.
+pub struct PolicyObserver(Box<dyn Fn(&Event, &PolicyDecision) + Send + Sync>);
+impl PolicyObserver {
+    /// Wraps the callback each decision is passed to.
+    pub fn new(observe: impl Fn(&Event, &PolicyDecision) + Send + Sync + 'static) -> Self {
+        Self(Box::new(observe))
+    }
+    fn notify(&self, event: &Event, decision: &PolicyDecision) {
+        (self.0)(event, decision);
+    }
+}
 
 /// One refused capability, with the policy's explanation.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -87,13 +102,21 @@ impl PolicyValidator {
     }
 }
 impl Authority {
-    fn check(&mut self, events: &[Event]) -> Result<(), Vec<Denial>> {
+    fn check(
+        &mut self,
+        events: &[Event],
+        observer: Option<&PolicyObserver>,
+    ) -> Result<(), Vec<Denial>> {
         let arena = Bump::new();
         let mut policy = GitPolicy::new(&arena);
         let checkpoint = self.history.len();
         let mut denials = Vec::new();
         for event in events {
-            match policy.decide(&self.history, event) {
+            let decision = policy.decide(&self.history, event);
+            if let Some(observer) = observer {
+                observer.notify(event, &decision);
+            }
+            match decision {
                 PolicyDecision::Grant => self.history.push(event.clone()),
                 PolicyDecision::Deny {
                     failed_precondition,
@@ -138,10 +161,11 @@ impl Finalize for AuthorizedCommand<'_> {
     }
 }
 
-pub(super) fn authorize(
-    session: &Session,
+pub(super) fn authorize<'session>(
+    session: &'session Session,
     mut executed: ExecutedCommand,
-) -> Result<Completion<AuthorizedCommand<'_>>, ShellError> {
+    observer: Option<&PolicyObserver>,
+) -> Result<Completion<AuthorizedCommand<'session>>, ShellError> {
     // Every refusal carries the native status the command already produced.
     let admitted = (|| -> Result<_, ShellError> {
         if let Some(failure) = executed.failure.take() {
@@ -178,7 +202,7 @@ pub(super) fn authorize(
         let events = translate(&executed)?;
         let checkpoint = guard.history.len();
         guard
-            .check(&events)
+            .check(&events, observer)
             .map_err(|denials| ShellError::new(ShellErrorKind::Denied { denials }))?;
         Ok((guard, operations, events, checkpoint))
     })();

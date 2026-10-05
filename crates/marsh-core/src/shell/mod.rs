@@ -32,7 +32,7 @@ mod view;
 
 pub use error::{ShellError, ShellErrorKind};
 pub use junco_policy::{Action, Principal};
-pub use policy::{Denial, PolicyValidator};
+pub use policy::{Denial, Event, PolicyDecision, PolicyObserver, PolicyValidator};
 pub use sandbox_policy::{CommandContext, MarshTool, SandboxPolicy, ShellCommand};
 pub use signal::Signal;
 
@@ -51,6 +51,7 @@ pub struct ShellBuilder {
     pub(crate) backend: Option<Arc<dyn marsh_btrfs::Subvolumes>>,
     /// The display name a mux reserved; a standalone shell is named by its principal.
     pub(crate) sandbox_id: Option<ShellId>,
+    policy_observer: Option<Arc<PolicyObserver>>,
 }
 impl Default for ShellBuilder {
     fn default() -> Self {
@@ -66,6 +67,7 @@ impl Default for ShellBuilder {
             policy: SandboxPolicy::default(),
             backend: None,
             sandbox_id: None,
+            policy_observer: None,
         }
     }
 }
@@ -105,6 +107,12 @@ impl ShellBuilder {
     #[must_use]
     pub fn sandbox_policy(mut self, policy: SandboxPolicy) -> Self {
         self.policy = policy;
+        self
+    }
+    /// Observes every capability decision this shell's managed commands reach.
+    #[must_use]
+    pub fn policy_observer(mut self, observer: Option<Arc<PolicyObserver>>) -> Self {
+        self.policy_observer = observer;
         self
     }
     /// Enables normal interactive shell semantics.
@@ -182,6 +190,7 @@ impl ShellBuilder {
             discovered.coverage,
             uid.clone(),
             self.policy,
+            self.policy_observer,
         );
         let executor = MarshExecutor::new();
         let profile = self.options.profile;
@@ -895,7 +904,8 @@ impl Shared {
             );
         }
         let session = Arc::clone(&executed.prepared.snapshot.session);
-        let authorized = policy::authorize(&session, executed)?;
+        let authorized =
+            policy::authorize(&session, executed, resources.policy_observer.as_deref())?;
         publication::commit(authorized)
     }
     async fn conclude_direct(

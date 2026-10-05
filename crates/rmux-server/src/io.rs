@@ -660,6 +660,7 @@ impl ShellIo {
             environment,
             builtins,
             sandbox_policy: marsh_core::SandboxPolicy::default(),
+            policy_observer: None,
         };
 
         let mux = create_mux(profile, Arc::new(std::sync::Mutex::new(frontend)))?;
