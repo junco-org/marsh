@@ -23,8 +23,6 @@ jobs:
         shell: bash
         working-directory: marsh
     env:
-      # The sibling `junco-policy` checkout the path dependency in crates/marsh-core resolves to.
-      POLICY_SHA: 43b007c2a9f87fe2e8fb46727f88c3546dc15e72
       RUSTUP_TOOLCHAIN: nightly-2026-02-15
       CARGO_BUILD_JOBS: "1"
       CARGO_INCREMENTAL: "0"
@@ -46,14 +44,6 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           path: marsh
-          persist-credentials: false
-
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-        with:
-          repository: junco-org/junco-policy
-          ref: 43b007c2a9f87fe2e8fb46727f88c3546dc15e72
-          path: junco-policy
-          ssh-key: ${{ secrets.JUNCO_POLICY_SSH_KEY }}
           persist-credentials: false
 
       - name: Install system packages
@@ -82,7 +72,6 @@ jobs:
           mkdir -p "$CARGO_HOME" "$CARGO_TARGET_DIR"
           {
             echo "marsh_sha=$(git rev-parse HEAD)"
-            echo "policy_sha=$(git -C ../junco-policy rev-parse HEAD)"
             echo "cargo_lock_sha256=$(sha256sum Cargo.lock | cut -d' ' -f1)"
             echo "affinity=$(taskset -pc $$)"
             nproc
@@ -108,7 +97,7 @@ jobs:
         run: |
           rustc_path=$(rustup which --toolchain "$RUSTUP_TOOLCHAIN" rustc)
           toolchain_root=$(dirname "$(dirname "$rustc_path")")
-          { echo "== after cache restore"; df -B1 "$GITHUB_WORKSPACE" "$RUNNER_TEMP" "$TEST_HOME"; for p in "$CARGO_TARGET_DIR" "$CARGO_HOME" "$toolchain_root" "$REPORT" "$HOME_IMAGE" "$GITHUB_WORKSPACE/marsh" "$GITHUB_WORKSPACE/junco-policy"; do du -sb "$p"; done; } >> "$REPORT/disk.txt"
+          { echo "== after cache restore"; df -B1 "$GITHUB_WORKSPACE" "$RUNNER_TEMP" "$TEST_HOME"; for p in "$CARGO_TARGET_DIR" "$CARGO_HOME" "$toolchain_root" "$REPORT" "$HOME_IMAGE" "$GITHUB_WORKSPACE/marsh"; do du -sb "$p"; done; } >> "$REPORT/disk.txt"
           sudo systemd-run --uid="$(id -u)" --gid="$(id -g)" --wait --pipe --collect --service-type=exec --expand-environment=no \
             --working-directory="$PWD" --unit="$UNIT-build" \
             -p CPUAffinity=0-1 -p CPUQuota=200% -p CPUQuotaPeriodSec=100ms \
@@ -124,7 +113,7 @@ jobs:
             ${LANG+"--setenv=LANG=$LANG"} ${LC_ALL+"--setenv=LC_ALL=$LC_ALL"} \
             /usr/bin/time -v cargo test --workspace --locked --no-run --message-format=json \
             > "$REPORT/build-artifacts.json" 2> "$REPORT/build.log"
-          { echo "== build post"; df -B1 "$GITHUB_WORKSPACE" "$RUNNER_TEMP" "$TEST_HOME"; for p in "$CARGO_TARGET_DIR" "$CARGO_HOME" "$toolchain_root" "$REPORT" "$HOME_IMAGE" "$GITHUB_WORKSPACE/marsh" "$GITHUB_WORKSPACE/junco-policy"; do du -sb "$p"; done; } >> "$REPORT/disk.txt"
+          { echo "== build post"; df -B1 "$GITHUB_WORKSPACE" "$RUNNER_TEMP" "$TEST_HOME"; for p in "$CARGO_TARGET_DIR" "$CARGO_HOME" "$toolchain_root" "$REPORT" "$HOME_IMAGE" "$GITHUB_WORKSPACE/marsh"; do du -sb "$p"; done; } >> "$REPORT/disk.txt"
           cargo metadata --locked --no-deps --format-version 1 > "$REPORT/metadata.json"
 
       # Peak job disk: the workspace (both checkouts with target, Cargo home and reports, plus the
@@ -263,7 +252,7 @@ jobs:
           grep -E 'real btrfs subvolumes|CopyTree fallback' "$REPORT/smoke.log" || true
           rustc_path=$(rustup which --toolchain "$RUSTUP_TOOLCHAIN" rustc)
           toolchain_root=$(dirname "$(dirname "$rustc_path")")
-          { echo "== tests post"; df -B1 "$GITHUB_WORKSPACE" "$RUNNER_TEMP" "$TEST_HOME"; for p in "$CARGO_TARGET_DIR" "$CARGO_HOME" "$toolchain_root" "$REPORT" "$HOME_IMAGE" "$GITHUB_WORKSPACE/marsh" "$GITHUB_WORKSPACE/junco-policy"; do du -sb "$p"; done; } >> "$REPORT/disk.txt"
+          { echo "== tests post"; df -B1 "$GITHUB_WORKSPACE" "$RUNNER_TEMP" "$TEST_HOME"; for p in "$CARGO_TARGET_DIR" "$CARGO_HOME" "$toolchain_root" "$REPORT" "$HOME_IMAGE" "$GITHUB_WORKSPACE/marsh"; do du -sb "$p"; done; } >> "$REPORT/disk.txt"
 
       - name: Enforce final disk budget
         if: always()

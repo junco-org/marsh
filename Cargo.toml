@@ -75,7 +75,7 @@ brush-builtins.workspace = true
 marsh-btrfs = { path = "crates/marsh-btrfs", features = ["fake"] }
 marsh-wal = { path = "crates/marsh-wal" }
 # Routing predicates that query a source's shared authority name its events directly.
-junco-policy = { path = "../junco-policy" }
+junco-policy = { git = "https://github.com/junco-org/junco-policy.git" }
 # The WAL smoke's own transaction metadata derives its serde implementations.
 serde = { version = "1", features = ["derive"] }
 git2 = { version = "0.21", default-features = false, features = ["vendored-libgit2"] }
