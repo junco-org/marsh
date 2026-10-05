@@ -60,8 +60,6 @@ pub struct GitInvocation<'a, S: AsRef<str>> {
     pub subcommand: Option<&'a str>,
     /// The options between `git` and the subcommand.
     pub global_args: &'a [S],
-    /// Everything after the subcommand.
-    pub command_args: &'a [S],
 }
 
 /// Resolves `path` against `base` and normalizes it lexically.
@@ -171,27 +169,26 @@ pub(crate) fn global_options<S: AsRef<str>>(
 pub fn parse<S: AsRef<str>>(argv: &[S]) -> GitInvocation<'_, S> {
     let args = argv.get(1..).unwrap_or(&[]);
     let mut index = 0;
-    // The requested action, the word that names it, and where the words after that word begin.
-    let (action, subcommand, rest) = loop {
+    // The requested action and the word that names it.
+    let (action, subcommand) = loop {
         // A bare `git` prints its help.
         let Some(arg) = args.get(index).map(AsRef::as_ref) else {
-            break (None, None, index);
+            break (None, None);
         };
         if !arg.starts_with('-') {
-            break (classify(arg, &args[index + 1..]), Some(arg), index + 1);
+            break (classify(arg, &args[index + 1..]), Some(arg));
         }
         match global_option(arg) {
             Global::Flag => index += 1,
             Global::Value if index + 1 < args.len() => index += 2,
-            Global::Informational => break (None, Some(arg), index + 1),
-            Global::Value | Global::Unknown => break (Some(GitAction::Edit), None, index),
+            Global::Informational => break (None, Some(arg)),
+            Global::Value | Global::Unknown => break (Some(GitAction::Edit), None),
         }
     };
     GitInvocation {
         action,
         subcommand,
         global_args: &args[..index],
-        command_args: &args[rest..],
     }
 }
 
@@ -851,11 +848,6 @@ mod tests {
             let invocation = parse(argv);
             assert_eq!(&invocation.action, action, "{argv:?}");
             assert_eq!(invocation.subcommand, Some(argv[1]), "{argv:?}");
-            assert_eq!(
-                invocation.command_args,
-                &argv[2..],
-                "the raw arguments: {argv:?}"
-            );
         }
     }
 
@@ -889,7 +881,6 @@ mod tests {
         assert_eq!(invocation.action, Some(GitAction::Diff));
         assert_eq!(invocation.subcommand, Some("status"));
         assert_eq!(invocation.global_args.len(), 18);
-        assert_eq!(invocation.command_args, ["-s"]);
 
         for informational in [
             "--version",
@@ -903,7 +894,6 @@ mod tests {
             let invocation = parse(&argv);
             assert_eq!(invocation.action, None, "{informational}");
             assert_eq!(invocation.subcommand, Some(informational));
-            assert_eq!(invocation.command_args, ["status"]);
         }
         let bare = parse(&["git", "--no-pager"]);
         assert_eq!((bare.action, bare.subcommand), (None, None));
@@ -997,7 +987,6 @@ mod tests {
         assert_eq!(from_borrowed.action, from_owned.action);
         assert_eq!(from_borrowed.subcommand, from_owned.subcommand);
         assert_eq!(from_owned.global_args, ["-C", "sub"]);
-        assert_eq!(from_owned.command_args, &owned[4..]);
         assert_eq!(from_owned.action, Some(commit(Some("one\n\ntwo"))));
     }
 

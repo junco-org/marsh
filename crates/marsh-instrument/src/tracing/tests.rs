@@ -29,21 +29,31 @@ struct Fixture {
     directory: tempfile::TempDir,
     root: RootId,
     seen: Arc<Mutex<Vec<Syscall>>>,
+    /// The invocation each classified record was attributed to, by entry order.
+    owners: Arc<Mutex<HashMap<u64, Option<InvocationId>>>>,
 }
 
 impl Fixture {
     fn new() -> Self {
+        Self::with_exec(|_| None)
+    }
+
+    /// A fixture whose root tracks the execs `hooks` selects; it is given the service weakly.
+    fn with_exec(hooks: impl FnOnce(Weak<Tracing>) -> Option<ExecHooks>) -> Self {
         let service = Tracing::shared().unwrap();
         let directory = tempfile::tempdir().unwrap();
         let seen = Arc::new(Mutex::new(Vec::new()));
-        let sink = Arc::clone(&seen);
+        let owners = Arc::new(Mutex::new(HashMap::new()));
+        let (sink, owned) = (Arc::clone(&seen), Arc::clone(&owners));
         let root = service
             .register_root(
                 &directory.path().canonicalize().unwrap(),
-                Arc::new(move |_, _, info| {
+                Arc::new(move |_, owner, info: Syscall| {
+                    lock(&owned).insert(info.entry_order, owner);
                     lock(&sink).push(info);
                     Ok(())
                 }),
+                hooks(Arc::downgrade(&service)),
             )
             .unwrap();
         Self {
@@ -51,6 +61,7 @@ impl Fixture {
             directory,
             root,
             seen,
+            owners,
         }
     }
 
@@ -201,6 +212,181 @@ fn failed_launches_and_unscoped_spawns_leave_nothing_running() {
     fixture.service.quiesce(run).unwrap();
     let (_, events) = fixture.spawn(&scope, "exit 3").unwrap();
     assert_eq!(exited(&events).code(), Some(3));
+    fixture.finish(run);
+}
+
+/// What the exec hooks of a tracking fixture saw: each admitted command, whether its marker
+/// existed when it was admitted, and each end.
+#[derive(Default)]
+struct Tracked {
+    begun: Vec<(InvocationId, ExecCommand, bool)>,
+    ended: Vec<(InvocationId, Option<std::process::ExitStatus>)>,
+}
+
+/// A fixture tracking every exec of a file named `tracked` by a task no invocation owns.
+/// `marker` is checked at admission; `cancel` cancels the run from inside the begin hook.
+fn tracking(marker: PathBuf, cancel: bool) -> (Fixture, Arc<Mutex<Tracked>>) {
+    let tracked = Arc::new(Mutex::new(Tracked::default()));
+    let (begun, ended) = (Arc::clone(&tracked), Arc::clone(&tracked));
+    let fixture = Fixture::with_exec(move |service| {
+        Some(ExecHooks {
+            select: Arc::new(|_, owner, path| {
+                owner.is_none() && path.file_name().is_some_and(|name| name == "tracked")
+            }),
+            begin: Arc::new(move |run, _, command| {
+                let service = service.upgrade().expect("live service");
+                let id = service.invocation(run)?;
+                if cancel {
+                    service.cancel(run)?;
+                }
+                let absent = !marker.exists();
+                lock(&begun).begun.push((id, command, absent));
+                Ok(ExecDecision::Track(id))
+            }),
+            end: Arc::new(move |_, id, status| {
+                lock(&ended).ended.push((id, status));
+                Ok(())
+            }),
+        })
+    });
+    (fixture, tracked)
+}
+
+impl Fixture {
+    /// The owner of the first record naming a path that ends in `name`.
+    fn owner_of(&self, name: &[u8]) -> (u64, Option<InvocationId>) {
+        let entry = lock(&self.seen)
+            .iter()
+            .find(|call| call.paths.iter().any(|(_, path)| path.ends_with(name)))
+            .map_or_else(
+                || panic!("no record of {}", String::from_utf8_lossy(name)),
+                |call| call.entry_order,
+            );
+        (entry, lock(&self.owners)[&entry])
+    }
+}
+
+#[test]
+fn tracked_execs_own_their_whole_tree_until_their_end() {
+    let probe = tempfile::tempdir().unwrap();
+    let sub = probe.path().canonicalize().unwrap();
+    let (fixture, tracked) = tracking(sub.join("marker"), false);
+    let program = fixture.path("tracked");
+    std::fs::copy("/bin/sh", &program).unwrap();
+    let run = fixture.service.begin_run(fixture.root).unwrap();
+    let scope = fixture.service.scope(run, None).unwrap();
+
+    // execve of an absolute path from a changed cwd, with an environment the host lacks; a
+    // forked descendant writes too, and the caller writes after it.
+    let inner = "printf x > marker; /bin/sh -c 'printf y > child'; exit 3";
+    let (_, events) = fixture
+        .spawn(
+            &scope,
+            &format!(
+                "cd {sub}; SELECTOR=fixture {program} -c \"{inner}\" 'a b' ''; printf after > after",
+                sub = sub.display(),
+                program = program.display()
+            ),
+        )
+        .unwrap();
+    assert!(exited(&events).success());
+
+    // A non-leader thread execs; a descriptor-only execveat runs a vforking child.
+    let vfork = fixture.path("vfork.py");
+    std::fs::write(
+        &vfork,
+        "import subprocess\nsubprocess.run(['/bin/sh', '-c', 'printf v > vchild'], check=True)\n",
+    )
+    .unwrap();
+    let threaded = fixture.path("threaded.py");
+    std::fs::write(
+        &threaded,
+        format!(
+            "import os, threading\nos.chdir({sub:?})\nthreading.Thread(target=lambda: \
+             os.execv({program:?}, ['tracked', '-c', 'printf n > nonleader'])).start()\n\
+             threading.Event().wait()\n",
+            sub = sub.display().to_string(),
+            program = program.display().to_string()
+        ),
+    )
+    .unwrap();
+    let fexecve = fixture.path("fexecve.py");
+    std::fs::write(
+        &fexecve,
+        format!(
+            "import os\nfd = os.open({program:?}, os.O_RDONLY)\nos.chdir({sub:?})\n\
+             os.execve(fd, ['tracked', '-c', 'exec python3 {vfork}'], \
+             {{'SELECTOR': 'fd', 'PATH': '/usr/bin:/bin'}})\n",
+            sub = sub.display().to_string(),
+            program = program.display().to_string(),
+            vfork = vfork.display()
+        ),
+    )
+    .unwrap();
+    for script in [&threaded, &fexecve] {
+        let (_, events) = fixture
+            .spawn(&scope, &format!("exec python3 {}", script.display()))
+            .unwrap();
+        assert!(exited(&events).success());
+    }
+    fixture.service.quiesce(run).unwrap();
+
+    let tracked = std::mem::take(&mut *lock(&tracked));
+    assert_eq!(tracked.begun.len(), 3);
+    assert_eq!(
+        tracked.ended.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+        tracked.begun.iter().map(|(id, ..)| *id).collect::<Vec<_>>(),
+        "every tracked invocation ends exactly once"
+    );
+
+    let (id, command, absent) = &tracked.begun[0];
+    assert!(absent, "admitted before its first write");
+    assert_eq!(command.program, program);
+    assert_eq!(
+        command.argv,
+        [program.to_str().unwrap(), "-c", inner, "a b", ""]
+    );
+    assert!(command.environment.iter().any(|entry| entry == "SELECTOR=fixture"));
+    assert_eq!(command.cwd, sub);
+    assert_eq!(tracked.ended[0].1.and_then(|status| status.code()), Some(3));
+    assert_eq!(fixture.owner_of(b"marker").1, Some(*id));
+    assert_eq!(fixture.owner_of(b"child").1, Some(*id), "descendants stay owned");
+    let (after, owner) = fixture.owner_of(b"after");
+    assert_eq!(owner, None);
+    let (start, finish) = fixture.service.invocation_orders(run, *id).unwrap();
+    assert_eq!(start, command.entry_order);
+    assert!(after > finish, "the caller resumes only after the end hook");
+
+    let (id, command, _) = &tracked.begun[1];
+    assert_eq!(command.argv, ["tracked", "-c", "printf n > nonleader"]);
+    assert_eq!(fixture.owner_of(b"nonleader").1, Some(*id));
+
+    let (id, command, _) = &tracked.begun[2];
+    assert_eq!(command.program, program);
+    assert_eq!(command.environment, ["SELECTOR=fd", "PATH=/usr/bin:/bin"]);
+    assert_eq!(fixture.owner_of(b"vchild").1, Some(*id), "vforked children stay owned");
+    assert!(tracked.ended.iter().all(|(_, status)| status.is_some()));
+    fixture.finish(run);
+}
+
+#[test]
+fn cancelling_while_an_admitted_exec_is_held_ends_it_incomplete() {
+    let probe = tempfile::tempdir().unwrap();
+    let (fixture, tracked) = tracking(probe.path().join("marker"), true);
+    let program = fixture.path("tracked");
+    std::fs::copy("/bin/sh", &program).unwrap();
+    let run = fixture.service.begin_run(fixture.root).unwrap();
+    let scope = fixture.service.scope(run, None).unwrap();
+    let (_, events) = fixture
+        .spawn(&scope, &format!("exec {} -c 'exec /bin/sleep 60'", program.display()))
+        .unwrap();
+    assert_eq!(exited(&events).signal(), Some(libc::SIGKILL));
+    fixture.service.quiesce(run).unwrap();
+    let tracked = lock(&tracked);
+    assert_eq!(tracked.begun.len(), 1);
+    assert_eq!(tracked.ended.len(), 1);
+    assert_eq!(tracked.ended[0].1, None, "a cancelled invocation never completes");
+    drop(tracked);
     fixture.finish(run);
 }
 

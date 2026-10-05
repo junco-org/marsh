@@ -5,7 +5,7 @@ use super::execution::ManagedExtensions;
 mod exec;
 mod git;
 pub(super) mod gitcmd;
-mod gitexec;
+pub(super) mod gitexec;
 
 pub use super::execution::{BuiltinContext, DirectoryEntry, GlobPaths, ReadDir, current_context};
 pub use brush_core::builtins::{Command, DeclarationCommand, SimpleCommand};

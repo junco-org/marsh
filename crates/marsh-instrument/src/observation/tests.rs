@@ -1,6 +1,7 @@
 //! Fresh exec tracees, one isolated wait owner, and kernel-observed behavior.
 #![allow(
     clippy::unwrap_used,
+    clippy::unwrap_in_result,
     clippy::expect_used,
     clippy::panic,
     clippy::zombie_processes
@@ -26,6 +27,7 @@ struct Delivery {
     status: WaitStatus,
     event: Option<u64>,
     call: Option<Syscall>,
+    exec: Option<Result<ExecCommand, String>>,
 }
 
 struct Trace(Vec<Delivery>);
@@ -61,6 +63,20 @@ impl Trace {
 
 /// Seizes one command parked on its stdin, releases it, and records every delivery.
 fn trace(command: &mut Command, mut react: impl FnMut(&Delivery)) -> Trace {
+    observe_with(command, None, |delivery| {
+        react(delivery);
+        Resume::default()
+    })
+    .unwrap()
+}
+
+/// [`trace`], reading the execs `select` accepts and letting `react` hold and release stops.
+/// A failed observation abandons the tree, leaving nothing running.
+fn observe_with(
+    command: &mut Command,
+    select: Option<Select>,
+    mut react: impl FnMut(&Delivery) -> Resume,
+) -> io::Result<Trace> {
     let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
@@ -72,24 +88,31 @@ fn trace(command: &mut Command, mut react: impl FnMut(&Delivery)) -> Trace {
         Arc::new(Sequence::default()),
         pid,
     );
+    if let Some(select) = select {
+        observer.select_exec(select);
+    }
     let stopped = observer.seize(pid).unwrap().expect("a parked child");
     let mut deliveries = Vec::new();
-    let mut observe = |sequence, tid, status, event, call| {
+    let mut observe = |sequence, tid, status, event, call, exec: Option<io::Result<_>>| {
         let delivery = Delivery {
             sequence,
             tid,
             status: WaitStatus::from_raw(tid, status)?,
             event,
             call,
+            exec: exec.map(|exec| exec.map_err(|error| error.to_string())),
         };
-        react(&delivery);
+        let resume = react(&delivery);
         deliveries.push(delivery);
-        Ok(())
+        Ok(resume)
     };
     observer.stop(pid, stopped, &mut observe).unwrap();
     child.stdin.take().unwrap().write_all(b"go\n").unwrap();
-    observer.run(&mut observe).unwrap();
-    Trace(deliveries)
+    let result = observer.run(&mut observe);
+    if result.is_err() {
+        observer.abandon(|_, _| {});
+    }
+    result.map(|()| Trace(deliveries))
 }
 
 fn shell(script: &str) -> Trace {
@@ -434,11 +457,176 @@ fn memory_at_page_edges() {
         u64::from_ne_bytes([b'x'; 8])
     );
     assert!(crate::capture::read_flags(tid, locations[0] + locations[1] - 7).is_err());
+    // An exec array is read fail-closed: never past the budget, never through a bad pointer.
+    assert!(
+        crate::capture::read_strings(tid, 0, &mut 64)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        crate::capture::read_strings(tid, locations[0], &mut 4)
+            .unwrap_err()
+            .to_string()
+            .contains("capture limit")
+    );
+    assert!(crate::capture::read_strings(tid, locations[0], &mut (1 << 20)).is_err());
+    assert!(
+        crate::capture::read_strings(tid, locations[0] + locations[1] - 4, &mut (1 << 20)).is_err()
+    );
     // Release the fresh executable, then let the same observer own every exit notification.
-    let mut ignore = |_, _, _, _, _| Ok(());
+    let mut ignore = |_, _, _, _, _, _| Ok(Resume::default());
     observer.stop(tid, stopped, &mut ignore).unwrap();
     child.stdin.take().unwrap().write_all(b"x").unwrap();
     observer.run(&mut ignore).unwrap();
+}
+
+/// A selector for executables named `name`, counting the entries it was asked about.
+fn named(name: &'static str, asked: Arc<AtomicU64>) -> Select {
+    Box::new(move |_, path: &Path| {
+        asked.fetch_add(1, Ordering::Relaxed);
+        path.file_name().is_some_and(|file| file == name)
+    })
+}
+
+/// The successful selected execs of a trace, as their tasks saw them.
+fn executed(trace: &Trace) -> Vec<&ExecCommand> {
+    trace
+        .0
+        .iter()
+        .filter_map(|delivery| delivery.exec.as_ref())
+        .map(|exec| exec.as_ref().expect("a complete exec capture"))
+        .collect()
+}
+
+fn exec_selection(directory: &Path) {
+    let sub = directory.join("sub");
+    std::fs::create_dir_all(&sub).unwrap();
+    let program = directory.join("selected");
+    std::fs::copy("/bin/sh", &program).unwrap();
+
+    // execve of an absolute path from a changed cwd, after a failed (ENOENT) candidate;
+    // arguments with spaces and empty strings, and an environment the host does not have.
+    let asked = Arc::new(AtomicU64::new(0));
+    let script = format!(
+        "read _; cd {}; /nonexistent/selected 2>/dev/null; SELECTOR=execve exec {} -c ':' 'a b' '' c",
+        sub.display(),
+        program.display()
+    );
+    let trace = observe_with(
+        Command::new("/bin/sh").args(["-c", &script]),
+        Some(named("selected", Arc::clone(&asked))),
+        |_| Resume::default(),
+    )
+    .unwrap();
+    let commands = executed(&trace);
+    assert_eq!(commands.len(), 1, "only the exec that succeeded is admitted");
+    let command = commands[0];
+    assert_eq!(command.program, program);
+    let program_name = program.to_str().unwrap();
+    assert_eq!(command.argv, [program_name, "-c", ":", "a b", "", "c"]);
+    assert!(command.environment.iter().any(|entry| entry == "SELECTOR=execve"));
+    assert_eq!(command.cwd, sub);
+    assert!(asked.load(Ordering::Relaxed) >= 2, "the failed candidate was asked too");
+    let exec = trace
+        .0
+        .iter()
+        .find(|delivery| delivery.exec.is_some())
+        .unwrap();
+    let entry = &trace.0[usize::try_from(command.entry_order).unwrap() - 1];
+    assert!(matches!(entry.status, WaitStatus::PtraceSyscall(_)));
+    assert_eq!(command.pid, exec.tid.as_raw());
+    // The new image ran nothing before its exec was delivered.
+    assert!(
+        trace
+            .calls()
+            .filter(|call| call.info.pid == exec.tid && call.entry_order > command.entry_order)
+            .all(|call| trace.sequence(call) > exec.sequence)
+    );
+
+    // Descriptor-only execveat (fexecve): the descriptor's file is what runs.
+    let script = format!(
+        "import os, sys\nsys.stdin.readline()\nfd = os.open({program:?}, os.O_RDONLY)\n\
+         os.chdir({sub:?})\nos.execve(fd, ['selected', '-c', ':', 'x y', ''], {{'SELECTOR': 'fd'}})\n",
+        program = program.display().to_string(),
+        sub = sub.display().to_string(),
+    );
+    let trace = observe_with(
+        Command::new("python3").args(["-c", &script]),
+        Some(named("selected", Arc::new(AtomicU64::new(0)))),
+        |_| Resume::default(),
+    )
+    .unwrap();
+    let commands = executed(&trace);
+    assert_eq!(commands.len(), 1);
+    assert_eq!(commands[0].program, program);
+    assert_eq!(commands[0].argv, ["selected", "-c", ":", "x y", ""]);
+    assert_eq!(commands[0].environment, ["SELECTOR=fd"]);
+    assert_eq!(commands[0].cwd, sub);
+    assert!(trace.calls().any(|call| call.info.syscall == Sysno::execveat
+        && !matches!(call.info.result, RetCode::Err(_))));
+}
+
+fn held_stops() {
+    // A child whose first stop arrives before its creator's creation event is held until that
+    // event: nothing of it is delivered in between, and the tree still completes.
+    let mut created: HashSet<Pid> = HashSet::new();
+    let mut held: HashSet<Pid> = HashSet::new();
+    let mut released: Vec<(Pid, u64)> = Vec::new();
+    let mut seen: HashSet<Pid> = HashSet::new();
+    let trace = observe_with(
+        Command::new("/bin/sh").args(["-c", "read _; for i in 1 2 3 4 5 6; do /bin/true; done"]),
+        None,
+        |delivery| {
+            let mut resume = Resume::default();
+            if let WaitStatus::PtraceEvent(_, _, code) = delivery.status
+                && creation(code)
+                && let Some(child) = delivery.event
+            {
+                let child = Pid::from_raw(i32::try_from(child).unwrap());
+                created.insert(child);
+                if held.remove(&child) {
+                    released.push((child, delivery.sequence));
+                    resume.release.push(child);
+                }
+            }
+            let first = seen.insert(delivery.tid);
+            if first
+                && seen.len() > 1
+                && !created.contains(&delivery.tid)
+                && !matches!(delivery.status, WaitStatus::Exited(..))
+            {
+                held.insert(delivery.tid);
+                resume.hold_current = true;
+            }
+            resume
+        },
+    )
+    .unwrap();
+    assert!(held.is_empty());
+    for (child, at) in &released {
+        let held_at = trace.0.iter().find(|delivery| delivery.tid == *child).unwrap();
+        assert!(trace.0.iter().filter(|delivery| delivery.tid == *child).all(
+            |delivery| delivery.sequence == held_at.sequence || delivery.sequence > *at
+        ));
+    }
+
+    // A creator killed while its child is held can never release it: the observation fails
+    // in bounded time instead of waiting for the child forever, and nothing is left running.
+    let mut root = None;
+    let failed = observe_with(
+        Command::new("/bin/sh").args(["-c", "read _; /bin/sleep 60; /bin/true"]),
+        None,
+        |delivery| {
+            let creator = *root.get_or_insert(delivery.tid);
+            let mut resume = Resume::default();
+            if delivery.tid != creator && !matches!(delivery.status, WaitStatus::Exited(..)) {
+                resume.hold_current = true;
+                nix::sys::signal::kill(creator, Signal::SIGKILL).unwrap();
+            }
+            resume
+        },
+    );
+    assert_eq!(failed.err().unwrap().to_string(), UNCLASSIFIED);
 }
 
 #[test]
@@ -456,6 +644,8 @@ fn native_observer_regressions() {
             signals_and_descendants(directory.path(), &file);
             missing_upstream_roles(directory.path());
             memory_at_page_edges();
+            exec_selection(&directory.path().canonicalize().unwrap());
+            held_stops();
             println!("native observer scenarios completed");
             return;
         }

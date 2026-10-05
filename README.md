@@ -253,10 +253,11 @@ no streams, is not a job, and closes when the call ends.
   already happened once; the line is not reoffered or reexecuted.
 * Persistent descriptors survive unchanged work generations. Access through a descriptor or mapping
   from a necessarily retired generation fails rather than silently rebinding paths or offsets.
-* Managed Git preserves causal Stage/Commit/Checkout semantics. On the managed route,
-  direct/descendant Git and repository metadata mutations outside a successful managed invocation
-  are refused. `git add` releases an unstaged stake; a reused display name never inherits an older
-  shell instance's authority.
+* Managed Git preserves causal Stage/Commit/Checkout semantics. On the managed route, a `git`
+  executed directly or by any descendant (`/bin/git`, `sh -c 'git …'`, tool scripts) is classified
+  and authorized exactly like the builtin, with its own argv, cwd and environment; repository
+  metadata mutations outside a successful managed invocation are refused. `git add` releases an
+  unstaged stake; a reused display name never inherits an older shell instance's authority.
 * Directories, including empty directories and modes, have explicit operations. FIFO/socket/device
   publication, unsupported metadata effects and unrepresentable hard-link mutations are refused
   before intent. Directory removal is nonrecursive and replay never follows symlink ancestors.

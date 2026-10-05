@@ -1,14 +1,19 @@
 //! Stage 1: clean work generation, immutable baseline, and owned evaluation resources.
 
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::process::ExitStatus;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
-use marsh_instrument::{InvocationId, RootId, Syscall, TraceRun};
+use marsh_instrument::{
+    ExecCommand, ExecDecision, ExecHooks, InvocationId, RootId, Syscall, TraceRun,
+};
 use marsh_lib::RecoverPoison as _;
 
 use super::access::{Access, Effects};
 use super::builtins::gitcmd::GitAction;
+use super::builtins::gitexec::{self, Runner};
 use super::completion::{Completion, Finalize};
 use super::execution::Run;
 use super::session::Session;
@@ -20,7 +25,8 @@ pub(super) struct CommandEvidence {
     pub effects: Vec<(u64, Option<InvocationId>, Effects)>,
     pub git: Vec<GitEffectRecord>,
     pub failure: Option<String>,
-    git_live: usize,
+    /// Git invocations admitted and not yet finalized.
+    git_active: HashSet<InvocationId>,
     git_exclusive: bool,
 }
 
@@ -43,6 +49,8 @@ pub(super) struct SnapshotState {
     pub dirty: bool,
     access: Access,
     pub evidence: Option<(TraceRun, CommandEvidence)>,
+    /// External git invocations of the active command, between their exec and their end.
+    runners: HashMap<InvocationId, Runner>,
 }
 
 impl Snapshot {
@@ -72,9 +80,28 @@ impl Snapshot {
                 dirty: false,
                 access: Access::default(),
                 evidence: None,
+                runners: HashMap::new(),
             }),
         });
         let weak = Arc::downgrade(&snapshot);
+        let (select, begin, end) = (weak.clone(), weak.clone(), weak.clone());
+        let exec = ExecHooks {
+            select: Arc::new(move |run, owner, path| {
+                select
+                    .upgrade()
+                    .is_some_and(|snapshot| snapshot.selects_git(run, owner, path))
+            }),
+            begin: Arc::new(move |run, _, command| match begin.upgrade() {
+                Some(snapshot) => snapshot.begin_external(run, command),
+                None => Ok(ExecDecision::Continue),
+            }),
+            end: Arc::new(move |run, invocation, status| {
+                if let Some(snapshot) = end.upgrade() {
+                    snapshot.end_external(run, invocation, status);
+                }
+                Ok(())
+            }),
+        };
         let root = snapshot.session.tracing.register_root(
             snapshot.path(),
             Arc::new(move |run, builtin, info| {
@@ -83,6 +110,7 @@ impl Snapshot {
                 }
                 Ok(())
             }),
+            Some(exec),
         )?;
         snapshot
             .root
@@ -196,25 +224,6 @@ impl Snapshot {
                     evidence.failure.get_or_insert(error);
                 }
             }
-            if builtin.is_none()
-                && matches!(
-                    info.info.syscall,
-                    syscalls::Sysno::execve | syscalls::Sysno::execveat
-                )
-            {
-                let index = usize::from(info.info.syscall == syscalls::Sysno::execveat);
-                if let Some(path) = info.path(index) {
-                    use std::os::unix::ffi::OsStrExt;
-                    if Path::new(std::ffi::OsStr::from_bytes(path))
-                        .file_name()
-                        .is_some_and(|name| name == "git")
-                    {
-                        evidence.failure.get_or_insert_with(|| {
-                            "external git must use the managed builtin".into()
-                        });
-                    }
-                }
-            }
             evidence.records.push(info);
         }
     }
@@ -227,7 +236,10 @@ impl Snapshot {
     }
 
     pub fn take_evidence(&self, run: TraceRun) -> Result<CommandEvidence, ShellError> {
+        // Declared first so they drop after the lock on every path: their guards relock it.
+        let stale;
         let mut state = self.state.lock().recover();
+        stale = std::mem::take(&mut state.runners);
         let Some((active, mut evidence)) = state.evidence.take() else {
             return Err(ShellError::infrastructure("missing command evidence"));
         };
@@ -236,12 +248,14 @@ impl Snapshot {
                 "command evidence identity mismatch",
             ));
         }
-        if evidence.git_live != 0 {
+        if !evidence.git_active.is_empty() || !stale.is_empty() {
             evidence
                 .failure
                 .get_or_insert_with(|| "git invocation has not completed".into());
         }
         drop(state);
+        // Their guards settle against the snapshot's state, which is no longer locked here.
+        drop(stale);
         for git in &mut evidence.git {
             let (first, last) = self
                 .session
@@ -266,33 +280,120 @@ impl Snapshot {
         drop(state);
         paths.into_iter().collect()
     }
-    pub fn begin_git(
+    /// Admits `invocation` of `run` as a git invocation of `kind`; an exclusive one runs alone.
+    pub(crate) fn begin_git(
         self: &Arc<Self>,
+        run: TraceRun,
+        invocation: InvocationId,
         kind: GitCohortKind,
     ) -> Result<Completion<GitGuard>, String> {
-        let context = super::execution::current_context()
-            .ok_or_else(|| "git has no owning command context".to_string())?;
-        let invocation = context
-            .invocation()
-            .ok_or_else(|| "git has no builtin invocation".to_string())?;
         let mut state = self.state.lock().recover();
         let (_, evidence) = state
             .evidence
             .as_mut()
+            .filter(|(active, _)| *active == run)
             .ok_or_else(|| "git has no owning run".to_string())?;
-        if evidence.git_live != 0 && (evidence.git_exclusive || kind == GitCohortKind::Exclusive) {
+        if !evidence.git_active.is_empty()
+            && (evidence.git_exclusive || kind == GitCohortKind::Exclusive)
+        {
             evidence
                 .failure
                 .get_or_insert_with(|| "unordered overlapping git invocations".into());
             return Err("git operation overlaps another invocation".into());
         }
         evidence.git_exclusive = kind == GitCohortKind::Exclusive;
-        evidence.git_live += 1;
+        evidence.git_active.insert(invocation);
         drop(state);
         Ok(Completion::new(GitGuard {
-            snapshot: Arc::clone(self),
+            snapshot: Arc::downgrade(self),
+            run,
             invocation,
         }))
+    }
+
+    /// Runs `update` on the evidence of `run`, when it is still the active command's.
+    fn with_evidence(&self, run: TraceRun, update: impl FnOnce(&mut CommandEvidence)) {
+        if let Some((active, evidence)) = &mut self.state.lock().recover().evidence
+            && *active == run
+        {
+            update(evidence);
+        }
+    }
+
+    /// Whether an exec of `path` by `owner` in `run` is a git invocation the active command must
+    /// observe: any executable named `git`, unless it already belongs to an observed git
+    /// invocation — its own helpers and probes.
+    fn selects_git(&self, run: TraceRun, owner: Option<InvocationId>, path: &Path) -> bool {
+        if path.file_name().is_none_or(|name| name != "git") {
+            return false;
+        }
+        let state = self.state.lock().recover();
+        state.evidence.as_ref().is_some_and(|(active, evidence)| {
+            *active == run && owner.is_none_or(|owner| !evidence.git_active.contains(&owner))
+        })
+    }
+
+    /// Admits an external git exactly as the builtin is admitted, before its image runs: its
+    /// probes reproduce its own program, directory and environment. A refusal latches its
+    /// diagnostic, so nothing of the command publishes, and the process is ended.
+    fn begin_external(
+        self: &Arc<Self>,
+        run: TraceRun,
+        command: ExecCommand,
+    ) -> std::io::Result<ExecDecision> {
+        let tracing = Arc::clone(&self.session.tracing);
+        let invocation = tracing.invocation(run)?;
+        let (argv, template) = match gitexec::external(command) {
+            Ok(external) => external,
+            Err(refusal) => {
+                self.with_evidence(run, |evidence| {
+                    evidence.failure.get_or_insert_with(|| refusal.into());
+                });
+                return Ok(ExecDecision::Refuse);
+            }
+        };
+        let runner = match Runner::new(argv).prepare(template, self, tracing, run, invocation) {
+            Ok(runner) => runner,
+            Err(refusal) => {
+                self.with_evidence(run, |evidence| {
+                    evidence.failure.get_or_insert(refusal);
+                });
+                return Ok(ExecDecision::Refuse);
+            }
+        };
+        // A displaced runner settles only after the lock is released.
+        let displaced = self
+            .state
+            .lock()
+            .recover()
+            .runners
+            .insert(invocation, runner);
+        drop(displaced);
+        Ok(ExecDecision::Track(invocation))
+    }
+
+    /// Attributes an external git whose last process ended, with its own status; without one,
+    /// its observation is incomplete and it never publishes.
+    fn end_external(&self, run: TraceRun, invocation: InvocationId, status: Option<ExitStatus>) {
+        let runner = self.state.lock().recover().runners.remove(&invocation);
+        let Some(runner) = runner else {
+            self.with_evidence(run, |evidence| {
+                evidence
+                    .failure
+                    .get_or_insert_with(|| "git invocation did not finish observation".into());
+            });
+            return;
+        };
+        match status {
+            Some(status) => {
+                if let Err(failure) = runner.finish(status.success(), false) {
+                    self.with_evidence(run, |evidence| {
+                        evidence.failure.get_or_insert(failure);
+                    });
+                }
+            }
+            None => drop(runner),
+        }
     }
 }
 impl Drop for Snapshot {
@@ -406,35 +507,42 @@ pub(super) enum GitCohortKind {
     Exclusive,
 }
 
+/// One admitted git invocation of one run. It holds its snapshot weakly, and settles nothing
+/// once that run's evidence has been taken.
 pub(super) struct GitGuard {
-    snapshot: Arc<Snapshot>,
-    pub invocation: InvocationId,
+    snapshot: Weak<Snapshot>,
+    run: TraceRun,
+    invocation: InvocationId,
 }
 impl Completion<GitGuard> {
     pub fn record(mut self, record: GitEffectRecord) {
-        if let Some((_, evidence)) = &mut self.payload.snapshot.state.lock().recover().evidence {
-            evidence.git.push(record);
+        if let Some(snapshot) = self.payload.snapshot.upgrade() {
+            snapshot.with_evidence(self.payload.run, |evidence| evidence.git.push(record));
         }
         self.completed = true;
     }
 }
 impl GitGuard {
     pub fn fail(&self, message: String) {
-        if let Some((_, evidence)) = &mut self.snapshot.state.lock().recover().evidence {
-            evidence.failure.get_or_insert(message);
+        if let Some(snapshot) = self.snapshot.upgrade() {
+            snapshot.with_evidence(self.run, |evidence| {
+                evidence.failure.get_or_insert(message);
+            });
         }
     }
 }
 impl Finalize for GitGuard {
     fn finalize(&mut self, completed: bool) {
-        let mut state = self.snapshot.state.lock().recover();
-        if let Some((_, evidence)) = &mut state.evidence {
-            evidence.git_live = evidence.git_live.saturating_sub(1);
+        let Some(snapshot) = self.snapshot.upgrade() else {
+            return;
+        };
+        snapshot.with_evidence(self.run, |evidence| {
+            evidence.git_active.remove(&self.invocation);
             if !completed {
                 evidence
                     .failure
                     .get_or_insert_with(|| "git invocation did not finish observation".into());
             }
-        }
+        });
     }
 }

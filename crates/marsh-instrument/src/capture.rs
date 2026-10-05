@@ -1,11 +1,12 @@
 //! Small filesystem-role overlay on lurk's architecture table, not a second syscall table.
 
+use std::ffi::OsString;
 use std::fmt::Display;
 use std::io;
 use std::os::fd::AsRawFd;
-use std::os::unix::ffi::OsStringExt;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -18,6 +19,9 @@ use syscalls::Sysno;
 use crate::{FileTarget, Syscall};
 
 pub(crate) const PATH_LIMIT: usize = 4096;
+/// The most a selected exec's argument and environment arrays may occupy, pointer slots and
+/// terminating NULs included.
+const EXEC_CAPTURE_LIMIT: usize = 8 * 1024 * 1024;
 const WORD: u64 = std::mem::size_of::<libc::c_long>() as u64;
 
 /// Only added role information: the native value and scalar/pointer vocabulary stay upstream.
@@ -74,6 +78,18 @@ const fn roles(syscall: Sysno) -> Roles {
     }
 }
 
+/// What a selected exec runs, read from the old image while it was stopped at the call's entry.
+pub(crate) struct ExecImage {
+    /// The executable, resolved against the entry-time cwd or directory descriptor.
+    pub program: PathBuf,
+    /// The argument vector, byte for byte.
+    pub argv: Vec<OsString>,
+    /// The environment entries, byte for byte.
+    pub environment: Vec<OsString>,
+    /// The entry-time working directory.
+    pub cwd: PathBuf,
+}
+
 /// Entry capture moves directly into the completed wrapper; upstream args are not cloned.
 pub(crate) struct Captured {
     args: SyscallArgs,
@@ -83,6 +99,9 @@ pub(crate) struct Captured {
     flags: Option<u64>,
     submissions: Option<Vec<u8>>,
     failure: Option<io::Error>,
+    /// For a selected exec: what it runs, or why that could not be read. Only an exec that
+    /// succeeds ever needs it.
+    exec: Option<io::Result<ExecImage>>,
 }
 
 impl Captured {
@@ -101,6 +120,7 @@ impl Captured {
             flags: None,
             submissions: None,
             failure: None,
+            exec: None,
         };
         for (index, kind) in types.into_iter().enumerate() {
             let Some(kind) = kind else {
@@ -178,6 +198,73 @@ impl Captured {
     /// Records the opcodes an `io_uring_enter` found pending at its entry.
     pub(crate) fn submit(&mut self, submissions: Option<Vec<u8>>) {
         self.submissions = submissions;
+    }
+
+    /// The executable an `execve` or `execveat` names, resolved against its entry-time cwd or
+    /// directory descriptor; for `AT_EMPTY_PATH`, the descriptor's own file. `None` for any
+    /// other call, or a path that was not readable.
+    pub(crate) fn exec_path(&self, syscall: Sysno) -> Option<PathBuf> {
+        let os = |bytes: &[u8]| PathBuf::from(std::ffi::OsStr::from_bytes(bytes));
+        let (path, base) = match syscall {
+            Sysno::execve => (self.path(0)?, self.cwd.as_ref()),
+            Sysno::execveat => {
+                let directory = self.descriptor(0);
+                let path = self.path(1)?;
+                let flags = match self.args.0.get(4) {
+                    Some(SyscallArg::Int(flags)) => *flags,
+                    _ => 0,
+                };
+                if path.is_empty() && flags & i64::from(libc::AT_EMPTY_PATH) != 0 {
+                    return directory.map(|target| os(&target.path));
+                }
+                (path, directory)
+            }
+            _ => return None,
+        };
+        if path.first() == Some(&b'/') {
+            return Some(os(path));
+        }
+        Some(base.map_or_else(|| os(path), |base| os(&base.path).join(os(path))))
+    }
+
+    /// Reads a selected exec's argument and environment arrays and its working directory, while
+    /// the old image is still stopped at the call's entry.
+    pub(crate) fn capture_exec(
+        &mut self,
+        tid: Pid,
+        syscall: Sysno,
+        registers: libc::user_regs_struct,
+        program: PathBuf,
+    ) {
+        let (argv, environment) = if syscall == Sysno::execveat { (2, 3) } else { (1, 2) };
+        let mut budget = EXEC_CAPTURE_LIMIT;
+        let image = (|| {
+            let argv = read_strings(tid, get_arg_value(registers, argv), &mut budget)?;
+            let environment =
+                read_strings(tid, get_arg_value(registers, environment), &mut budget)?;
+            let cwd = resolve_cwd(tid)
+                .ok_or_else(|| io::Error::other("cannot resolve a selected exec's cwd"))?;
+            Ok(ExecImage {
+                program,
+                argv,
+                environment,
+                cwd: PathBuf::from(OsString::from_vec(cwd.path)),
+            })
+        })();
+        self.exec = Some(image);
+    }
+
+    /// What a selected exec runs, once the kernel has replaced the image.
+    pub(crate) const fn take_exec(&mut self) -> Option<io::Result<ExecImage>> {
+        self.exec.take()
+    }
+
+    /// The captured path at a native argument position.
+    fn path(&self, index: usize) -> Option<&[u8]> {
+        self.paths
+            .iter()
+            .find(|(position, _)| *position == index)
+            .map(|(_, path)| path.as_slice())
     }
 
     /// Retains only the first capture failure; it matters only if the call succeeds.
@@ -364,6 +451,47 @@ pub(crate) fn read_path(tid: Pid, address: u64) -> io::Result<Vec<u8>> {
         }
     })?;
     Ok(path)
+}
+
+/// A NULL-terminated array of NUL-terminated strings, as `execve` takes argv and envp. A null
+/// array is empty, as the kernel reads it. Every pointer slot and byte, terminators included,
+/// is charged to `budget`; exceeding it is an error rather than a truncation.
+pub(crate) fn read_strings(tid: Pid, array: u64, budget: &mut usize) -> io::Result<Vec<OsString>> {
+    fn charge(budget: &mut usize, bytes: usize) -> io::Result<()> {
+        *budget = budget
+            .checked_sub(bytes)
+            .ok_or_else(|| io::Error::other("exec arguments exceed the capture limit"))?;
+        Ok(())
+    }
+    let mut strings = Vec::new();
+    if array == 0 {
+        return Ok(strings);
+    }
+    let mut slot = array;
+    loop {
+        charge(budget, native_usize(WORD))?;
+        let pointer = ptrace::read(tid, slot as ptrace::AddressType)
+            .map_err(|error| {
+                io::Error::other(format!("cannot read tracee {tid} exec array at {slot:#x}: {error}"))
+            })?
+            .cast_unsigned();
+        if pointer == 0 {
+            return Ok(strings);
+        }
+        let mut bytes = Vec::new();
+        read_bytes(tid, pointer, "exec string wraps address space", |byte| {
+            charge(budget, 1)?;
+            if byte == 0 {
+                return Ok(false);
+            }
+            bytes.push(byte);
+            Ok(true)
+        })?;
+        strings.push(OsString::from_vec(bytes));
+        slot = slot
+            .checked_add(WORD)
+            .ok_or_else(|| io::Error::other("exec array wraps address space"))?;
+    }
 }
 
 pub(crate) fn read_flags(tid: Pid, address: u64) -> io::Result<u64> {

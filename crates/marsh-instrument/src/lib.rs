@@ -16,6 +16,6 @@ mod wire;
 pub use host::HostCall;
 pub use syscall::{FileTarget, Syscall};
 pub use tracing::{
-    ChildEvent, InvocationId, PollScope, RootId, Scoped, TraceRun, TraceScope, TraceScopeGuard,
-    TracedChild, Tracing, open_process, signal_process,
+    ChildEvent, ExecCommand, ExecDecision, ExecHooks, InvocationId, PollScope, RootId, Scoped,
+    TraceRun, TraceScope, TraceScopeGuard, TracedChild, Tracing, open_process, signal_process,
 };

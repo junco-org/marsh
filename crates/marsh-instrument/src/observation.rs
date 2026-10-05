@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 use std::io;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
@@ -21,6 +22,7 @@ use syscalls::{Sysno, SysnoSet};
 use crate::Syscall;
 use crate::capture::{Captured, native_usize};
 use crate::ring::Rings;
+use crate::tracing::ExecCommand;
 
 #[cfg(target_arch = "x86_64")]
 const NATIVE_ARCH: u32 = 0xC000_003E;
@@ -36,7 +38,35 @@ const OPTIONS: Options = Options::PTRACE_O_TRACESYSGOOD
     .union(Options::PTRACE_O_TRACEEXEC)
     .union(Options::PTRACE_O_TRACEEXIT);
 
-type Observe<'a> = dyn FnMut(u64, Pid, i32, Option<u64>, Option<Syscall>) -> io::Result<()> + 'a;
+/// What a delivered stop asks of the observer, after the consumer has seen it.
+#[derive(Debug, Default)]
+pub(crate) struct Resume {
+    /// Keep the delivered task stopped until a later delivery releases it.
+    pub hold_current: bool,
+    /// Held tasks to resume now, each from the stop it was held at.
+    pub release: Vec<Pid>,
+}
+
+/// A stop as the consumer sees it: sequence, task, raw status, event message, completed call,
+/// and — at a selected exec's `PTRACE_EVENT_EXEC` — what the new image runs.
+pub(crate) type Observe<'a> = dyn FnMut(
+        u64,
+        Pid,
+        i32,
+        Option<u64>,
+        Option<Syscall>,
+        Option<io::Result<ExecCommand>>,
+    ) -> io::Result<Resume>
+    + 'a;
+
+/// Decides at an exec's entry, from the executable it names, whether its arguments are read.
+pub(crate) type Select = Box<dyn FnMut(Pid, &Path) -> bool>;
+
+/// Why a tree whose remaining tasks are all held can make no progress.
+pub(crate) const UNCLASSIFIED: &str = "native creator exited with unclassified child effects";
+
+/// A lifecycle stop's message and a selected exec's command.
+type Lifecycle = (Option<u64>, Option<io::Result<ExecCommand>>);
 
 struct Entry {
     syscall: Sysno,
@@ -47,8 +77,8 @@ struct Entry {
 
 #[derive(Default)]
 struct Task {
-    seen_entry: bool,
-    discarded_initial_exit: bool,
+    /// Whether an entry, or the one return allowed before any, has kept this task in step.
+    synchronized: bool,
     in_syscall: bool,
     entry: Option<Entry>,
 }
@@ -80,6 +110,10 @@ pub(crate) struct Observer {
     detached: bool,
     /// The `io_uring` rings this tree set up.
     rings: Rings,
+    /// Stops left unresumed at the consumer's request, by task: their raw status.
+    held: HashMap<Pid, i32>,
+    /// Which execs have their arguments read; none without one.
+    select: Option<Select>,
 }
 
 impl Observer {
@@ -120,7 +154,14 @@ impl Observer {
             root_executed: false,
             detached: false,
             rings: Rings::default(),
+            held: HashMap::new(),
+            select: None,
         }
+    }
+
+    /// Reads the arguments, environment and cwd of every exec `select` accepts at its entry.
+    pub(crate) fn select_exec(&mut self, select: Select) {
+        self.select = Some(select);
     }
 
     /// Whether the command was handed back untraced because its exec failed: the launcher then
@@ -168,9 +209,16 @@ impl Observer {
         }
     }
 
-    /// Observes every stop until this thread has no tracee left.
+    /// Observes every stop until this thread has no tracee left. A tree whose every remaining
+    /// task is held can never be released by any of them, and fails.
     pub(crate) fn run(&mut self, observe: &mut Observe<'_>) -> io::Result<()> {
-        while let Some((tid, status)) = wait_any()? {
+        loop {
+            if !self.held.is_empty() && self.tasks.keys().all(|tid| self.held.contains_key(tid)) {
+                return Err(io::Error::other(UNCLASSIFIED));
+            }
+            let Some((tid, status)) = wait_any()? else {
+                break;
+            };
             self.stop(tid, status, observe)?;
         }
         if self.tasks.is_empty() {
@@ -188,6 +236,10 @@ impl Observer {
         for tid in self.tasks.keys() {
             let _ = nix::sys::signal::kill(*tid, Signal::SIGKILL);
         }
+        // A held task stays stopped until resumed; the kill above ends it there.
+        for tid in std::mem::take(&mut self.held).into_keys() {
+            let _ = ptrace::cont(tid, None);
+        }
         while let Ok(Some((tid, status))) = wait_any() {
             if let Ok(WaitStatus::Exited(..) | WaitStatus::Signaled(..)) =
                 WaitStatus::from_raw(tid, status)
@@ -204,9 +256,9 @@ impl Observer {
         }
     }
 
-    /// Applies a lifecycle stop to the task table, returning its message and any created or
-    /// exec-displaced task.
-    fn lifecycle(&mut self, tid: Pid, code: i32) -> io::Result<(Option<u64>, Option<Pid>)> {
+    /// Applies a lifecycle stop to the task table, returning its message and at an exec what a
+    /// selected command runs.
+    fn lifecycle(&mut self, tid: Pid, code: i32) -> io::Result<Lifecycle> {
         let message = event_message(tid, code)?;
         let exec = code == Event::PTRACE_EVENT_EXEC as i32;
         if exec && tid == self.root {
@@ -232,10 +284,28 @@ impl Observer {
             task.entry = None;
             task.in_syscall = false;
         }
-        Ok((message, other))
+        // The exec succeeded: the new image has not run an instruction yet.
+        let command = if exec {
+            task.entry.as_mut().and_then(|entry| {
+                let order = entry.order;
+                entry.capture.take_exec().map(|image| {
+                    image.map(|image| ExecCommand {
+                        pid: tid.as_raw(),
+                        entry_order: order,
+                        program: image.program,
+                        argv: image.argv,
+                        environment: image.environment,
+                        cwd: image.cwd,
+                    })
+                })
+            })
+        } else {
+            None
+        };
+        Ok((message, command))
     }
 
-    /// Delivers one stop, then resumes its task.
+    /// Delivers one stop, then resumes its task unless the consumer holds it.
     pub(crate) fn stop(
         &mut self,
         tid: Pid,
@@ -243,21 +313,41 @@ impl Observer {
         observe: &mut Observe<'_>,
     ) -> io::Result<()> {
         let wait = WaitStatus::from_raw(tid, status)?;
-        let event = match wait {
+        let (event, command) = match wait {
             WaitStatus::PtraceSyscall(_) => return self.syscall_stop(tid, status, observe),
             WaitStatus::Exited(..) | WaitStatus::Signaled(..) => {
                 self.tasks.remove(&tid);
-                None
+                self.held.remove(&tid);
+                (None, None)
             }
-            WaitStatus::PtraceEvent(_, _, code) => self.lifecycle(tid, code)?.0,
+            WaitStatus::PtraceEvent(_, _, code) => self.lifecycle(tid, code)?,
             WaitStatus::Stopped(..) => {
                 self.tasks.entry(tid).or_default();
-                None
+                (None, None)
             }
             WaitStatus::Continued(_) | WaitStatus::StillAlive => return Ok(()),
         };
-        observe(self.sequence.next()?, tid, status, event, None)?;
-        resume_stop(tid, wait)
+        let resume = observe(self.sequence.next()?, tid, status, event, None, command)?;
+        self.apply(tid, status, resume)
+    }
+
+    /// Resumes the delivered task — or holds it — and every held task the consumer released.
+    /// A released task resumes from its own saved stop; nothing about that stop is delivered
+    /// again.
+    fn apply(&mut self, tid: Pid, status: i32, resume: Resume) -> io::Result<()> {
+        let wait = WaitStatus::from_raw(tid, status)?;
+        if resume.hold_current && !matches!(wait, WaitStatus::Exited(..) | WaitStatus::Signaled(..))
+        {
+            self.held.insert(tid, status);
+        } else {
+            resume_stop(tid, wait)?;
+        }
+        for released in resume.release {
+            if let Some(status) = self.held.remove(&released) {
+                resume_stop(released, WaitStatus::from_raw(released, status)?)?;
+            }
+        }
+        Ok(())
     }
 
     fn syscall_stop(&mut self, tid: Pid, status: i32, observe: &mut Observe<'_>) -> io::Result<()> {
@@ -319,7 +409,7 @@ impl Observer {
             )));
         }
         task.in_syscall = true;
-        task.seen_entry = true;
+        task.synchronized = true;
         let selected = usize::try_from(number)
             .ok()
             .and_then(Sysno::new)
@@ -332,6 +422,12 @@ impl Observer {
             if syscall == Sysno::io_uring_enter {
                 capture.submit(self.rings.pending(tid, capture.descriptor(0)));
             }
+            if let Some(select) = &mut self.select
+                && let Some(program) = capture.exec_path(syscall)
+                && select(tid, &program)
+            {
+                capture.capture_exec(tid, syscall, registers, program);
+            }
             let order = self.sequence.next()?;
             self.tasks
                 .get_mut(&tid)
@@ -342,7 +438,8 @@ impl Observer {
                 order,
                 started: Instant::now(),
             });
-            observe(order, tid, status, None, None)?;
+            let resume = observe(order, tid, status, None, None, None)?;
+            return self.apply(tid, status, resume);
         }
         resume(tid, None)
     }
@@ -356,13 +453,13 @@ impl Observer {
     ) -> io::Result<()> {
         let task = self.tasks.entry(tid).or_default();
         if !task.in_syscall {
-            if task.seen_entry || task.discarded_initial_exit {
+            if task.synchronized {
                 return Err(io::Error::other(format!(
                     "task {tid} returned without an observed entry"
                 )));
             }
             // One syscall may predate attachment (or be the child's inherited clone return).
-            task.discarded_initial_exit = true;
+            task.synchronized = true;
             return resume(tid, None);
         }
         task.in_syscall = false;
@@ -383,7 +480,7 @@ impl Observer {
                 && !self.root_executed
                 && matches!(call.info.syscall, Sysno::execve | Sysno::execveat)
                 && matches!(call.info.result, RetCode::Err(_));
-            observe(self.sequence.next()?, tid, status, None, Some(call))?;
+            let resume = observe(self.sequence.next()?, tid, status, None, Some(call), None)?;
             if failed_launch {
                 // The launcher now reports the errno and waits for this process itself. Only
                 // the launcher's own code runs from here, which ran untraced before the
@@ -393,6 +490,7 @@ impl Observer {
                 self.detached = true;
                 return Ok(());
             }
+            return self.apply(tid, status, resume);
         }
         resume(tid, None)
     }

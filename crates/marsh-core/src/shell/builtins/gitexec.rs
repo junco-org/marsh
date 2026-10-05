@@ -15,29 +15,37 @@
 //! path ([`GitEffectRecord`]). Those records, not the command line, are what the line's boundary
 //! later maps onto capability requests. A fact the attribution needs that cannot be read latches a
 //! failure instead, and the line is never published.
+//!
+//! A `git` some other process executes is observed by the same [`Runner`]: the tracer stops it
+//! before its first instruction, its argv, cwd and environment become the runner's inputs
+//! ([`external`]), and its end is attributed once its whole process tree has ended. It keeps its
+//! own environment; only the probes reproduce it.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
+use std::process::{Command, Stdio};
+use std::sync::{Arc, Weak};
 
-use brush_core::commands::{CommandArg, ShellForCommand, SimpleCommand};
+use brush_core::commands::{CommandArg, ShellForCommand, SimpleCommand, compose_std_command};
 use brush_core::env::EnvironmentScope;
-use brush_core::openfiles::{OpenFile, OpenFiles};
 use brush_core::processes::{ChildProcess, ProcessWaitResult};
 use brush_core::results::ExecutionWaitResult;
 use brush_core::{
     ExecutionContext, ExecutionParameters, ExecutionResult, ProcessGroupPolicy, Shell,
     ShellExtensions, ShellVariable,
 };
+use marsh_instrument::{ChildEvent, InvocationId, TraceRun, Tracing};
 
-use super::gitcmd::{self, GitAction, GitInvocation};
+use super::gitcmd::{self, GitAction};
+use crate::shell::completion::Completion;
 use crate::shell::execution::brush_error;
 use crate::shell::policy::capability_of;
-use crate::shell::snapshot::{GitCohortKind, GitEffectRecord, Snapshot};
+use crate::shell::snapshot::{GitCohortKind, GitEffectRecord, GitGuard, Snapshot};
 
 /// Exit code of a command the shell cannot find.
 const NOT_FOUND: u8 = 127;
@@ -86,101 +94,70 @@ pub(crate) async fn run<SE: ShellExtensions>(
         writeln!(context.stderr(), "git: command not found")?;
         return Ok(ExecutionResult::new(NOT_FOUND));
     };
-    let invocation = gitcmd::parse(&argv);
-    let kind = match invocation.action.clone().map(capability_of) {
-        Some(action) if action.is_read() && !action.is_write() => GitCohortKind::Inspect,
-        _ => GitCohortKind::Exclusive,
+    let runner = Runner::new(argv);
+    let internal = |message: &str| {
+        brush_core::Error::from(brush_core::ErrorKind::InternalError(message.into()))
     };
-    let bound = snapshot.path().to_path_buf();
 
     // One clone per invocation carries every overlay, so nothing set here can leak into the
     // caller's shell, whatever becomes of this future.
     let mut shell = context.shell.clone();
-    isolate(&mut shell, &bound, kind)?;
-    let cwd = effective_cwd(shell.working_dir(), invocation.global_args);
-    let mut runner = Runner {
-        shell: &mut shell,
-        params: &context.params,
-        git: &git,
-        globals: invocation.global_args,
-        target: None,
+    isolate(&mut shell, snapshot.path(), runner.kind())?;
+    let template = compose_std_command(
+        &ExecutionContext {
+            shell: &mut shell,
+            command_name: "git".to_string(),
+            params: ExecutionParameters::default(),
+            process_group_id: None,
+        },
+        &git,
+        "git",
+        &[] as &[&str],
+        false,
+    )?;
+    let owner =
+        super::current_context().ok_or_else(|| internal("git has no owning command context"))?;
+    let invocation = owner
+        .invocation()
+        .ok_or_else(|| internal("git has no builtin invocation"))?;
+    let (tracing, trace) = owner
+        .run()
+        .and_then(|run| run.trace())
+        .map(|(tracing, trace)| (Arc::clone(tracing), trace))
+        .map_err(brush_error)?;
+    let prepared = {
+        let snapshot = Arc::clone(&snapshot);
+        owner
+            .spawn_blocking(move || runner.prepare(template, &snapshot, tracing, trace, invocation))
+            .map_err(brush_error)?
     };
-
-    let admitted = match runner.contain(&invocation, &cwd, &bound).await {
-        Ok(layout) => snapshot.begin_git(kind).map(|guard| (layout, guard)),
-        Err(refusal) => Err(format!("fatal: {refusal}")),
-    };
-    let (layout, guard) = match admitted {
-        Ok(admitted) => admitted,
+    let runner = match prepared
+        .await
+        .map_err(|_| internal("git preparation was abandoned"))?
+    {
+        Ok(runner) => runner,
         Err(refusal) => {
             writeln!(context.stderr(), "{refusal}")?;
             return Ok(ExecutionResult::new(FATAL));
         }
     };
 
-    let before = match kind {
-        GitCohortKind::Inspect => None,
-        GitCohortKind::Exclusive => match runner.observe(&invocation, layout, true).await {
-            Ok(before) => Some(before),
-            Err(failure) => {
-                guard.fail(failure);
-                None
-            }
-        },
-    };
-    let (result, stopped) = runner.execute(&argv, context.process_group_id).await?;
-    if stopped {
-        guard.fail("git: a managed git was stopped before it completed".to_string());
-    }
-
-    let owner = super::current_context().ok_or_else(|| {
-        brush_core::Error::from(brush_core::ErrorKind::InternalError(
-            "git has no owning command context".into(),
-        ))
-    })?;
-    let run = owner.run().map_err(brush_error)?;
-    let (tracing, trace) = run.trace().map_err(brush_error)?;
-    let tracing = Arc::clone(tracing);
-    let drain = {
-        let internal = tracing.internal_scope()?;
-        let _guard = internal.enter();
-        run.runtime.spawn_blocking(move || tracing.drain(trace))
-    };
-    let window = match drain.await {
-        Ok(Ok(())) => snapshot.writes_for(guard.invocation),
-        failure => {
-            guard.fail(format!("git: evidence drain failed: {failure:?}"));
-            return Ok(result);
-        }
-    };
-    if !result.is_success() && !window.is_empty() {
-        guard.fail("failed git invocation changed protected state".into());
-        return Ok(result);
-    }
-    let invocation_id = guard.invocation;
-    match (kind, before) {
-        (GitCohortKind::Inspect, _) => {
-            if window.iter().any(|path| changes_repository_state(path)) {
-                guard.fail("git: inspection changed repository state".to_string());
-            }
-            guard.complete();
-        }
-        (GitCohortKind::Exclusive, None) => {}
-        (GitCohortKind::Exclusive, Some(before)) => {
-            match runner
-                .attribute(&invocation, &before, &window, &bound)
-                .await
-            {
-                Ok((requests, metadata)) => guard.record(GitEffectRecord {
-                    invocation: invocation_id,
-                    started_order: 0,
-                    finished_order: 0,
-                    requests,
-                    metadata,
-                }),
-                Err(failure) => guard.fail(failure),
-            }
-        }
+    let (result, stopped) = execute(
+        &mut shell,
+        &context.params,
+        &git,
+        runner.argv(),
+        context.process_group_id,
+    )
+    .await?;
+    let success = result.is_success();
+    let finished = owner
+        .spawn_blocking(move || runner.finish(success, stopped))
+        .map_err(brush_error)?;
+    match finished.await {
+        Ok(Ok(())) => {}
+        Ok(Err(failure)) => snapshot.fail_evidence(failure),
+        Err(_) => snapshot.fail_evidence("git invocation did not finish observation".into()),
     }
     Ok(result)
 }
@@ -352,124 +329,367 @@ impl Probe {
     }
 }
 
-/// One invocation's native runs: the command itself and its probes, through one shell clone.
-struct Runner<'a, SE: ShellExtensions> {
-    /// The invocation's own shell, carrying its overlays.
-    shell: &'a mut Shell<SE>,
-    /// The builtin's parameters: its descriptors and process-group policy.
-    params: &'a ExecutionParameters,
-    /// The resolved `git` executable.
-    git: &'a str,
-    /// The command line's global options, which every probe repeats.
-    globals: &'a [String],
+/// Runs the command line itself with the builtin's own descriptors.
+///
+/// A process group the pipeline already established is joined; a process that would otherwise
+/// land in the shell's own group gets one of its own, so a boundary can end it without touching
+/// anything else. A process that stopped rather than exited is ended and reaped here: the
+/// observation around it cannot wait for a job that may never resume.
+///
+/// Returns the result and whether the process had to be ended.
+async fn execute<SE: ShellExtensions>(
+    shell: &mut Shell<SE>,
+    params: &ExecutionParameters,
+    git: &str,
+    argv: &[String],
+    group: Option<i32>,
+) -> Result<(ExecutionResult, bool), brush_core::Error> {
+    let mut params = params.clone();
+    if group.is_none()
+        && matches!(
+            params.process_group_policy,
+            ProcessGroupPolicy::SameProcessGroup
+        )
+    {
+        params.process_group_policy = ProcessGroupPolicy::NewProcessGroup;
+    }
+    spawn(shell, params, git, argv.iter().skip(1).cloned(), group).await
+}
+
+/// Runs `git` with `args` through the shell's own external-command path — never a function of
+/// that name — and waits for it; a process that stopped instead is ended and reaped.
+///
+/// Returns the result and whether the process had to be ended.
+async fn spawn<SE: ShellExtensions>(
+    shell: &mut Shell<SE>,
+    params: ExecutionParameters,
+    git: &str,
+    args: impl IntoIterator<Item = String> + Send,
+    group: Option<i32>,
+) -> Result<(ExecutionResult, bool), brush_core::Error> {
+    let argv = std::iter::once(git.to_string())
+        .chain(args)
+        .map(CommandArg::String)
+        .collect();
+    let mut command = SimpleCommand::new(
+        ShellForCommand::ParentShell(shell),
+        params,
+        git.to_string(),
+        argv,
+    );
+    command.use_functions = false;
+    command.argv0 = Some("git".to_string());
+    command.process_group_id = group;
+    match command.execute().await?.wait().await? {
+        ExecutionWaitResult::Completed(result) => Ok((result, false)),
+        ExecutionWaitResult::Stopped(child) => Ok((reap(child).await?, true)),
+    }
+}
+
+/// The git actions a run performed on snapshot-relative paths, and the repository metadata
+/// roots its writes belong to.
+type Attribution = (Vec<(GitAction, PathBuf)>, Vec<PathBuf>);
+/// A committed path and its new `<mode> <object>` entry, `None` when the commit removed it.
+type CommittedEntry = (Vec<u8>, Option<Vec<u8>>);
+
+/// Why an unprepared runner cannot observe anything.
+const UNPREPARED: &str = "git: observation runner is not prepared";
+
+/// An executed `git` as the builtin's runner takes it: its argument vector, and a template of
+/// its program, working directory and exact environment for the probes to reproduce.
+///
+/// The conversion is lossless or refused. The classifier reads UTF-8 words; `git-*` dispatch
+/// through `argv[0]` is not a builtin invocation; and an environment entry without a name, or
+/// a name given twice, would leave the probes guessing which value git used.
+///
+/// # Errors
+///
+/// Returns the refusal's diagnostic.
+pub(crate) fn external(
+    command: marsh_instrument::ExecCommand,
+) -> Result<(Vec<String>, Command), &'static str> {
+    let argv = command
+        .argv
+        .into_iter()
+        .map(std::ffi::OsString::into_string)
+        .collect::<Result<Vec<String>, _>>()
+        .map_err(|_| "git: exec arguments are not UTF-8")?;
+    if argv
+        .first()
+        .is_none_or(|zero| Path::new(zero).file_name() != Some(OsStr::new("git")))
+    {
+        return Err("git: unsupported exec argv[0]");
+    }
+    let mut template = Command::new(&command.program);
+    template.current_dir(&command.cwd).env_clear();
+    let mut names = std::collections::HashSet::new();
+    for entry in &command.environment {
+        let entry = entry.as_bytes();
+        let (name, value) = entry
+            .iter()
+            .position(|byte| *byte == b'=')
+            .filter(|at| *at > 0)
+            .map(|at| (&entry[..at], &entry[at + 1..]))
+            .ok_or("git: external invocation environment is ambiguous")?;
+        if !names.insert(name) {
+            return Err("git: external invocation environment is ambiguous");
+        }
+        template.env(OsStr::from_bytes(name), OsStr::from_bytes(value));
+    }
+    Ok((argv, template))
+}
+
+/// One invocation's observation: its command line, classified once, and the native inputs its
+/// probes share with the command — program, working directory and environment — together with
+/// the reading before the run and the admission its attribution completes.
+///
+/// The builtin and an external `git` the tracer selected both prepare one before the command
+/// runs and finish it after; nothing is observed through a runner that was never prepared.
+pub(crate) struct Runner {
+    /// The command line, `git` first.
+    argv: Vec<String>,
+    /// The classified action.
+    action: Option<GitAction>,
+    /// How many global options follow `argv[0]`.
+    globals: usize,
+    /// Whether the word after the global options is a subcommand.
+    subcommand: bool,
+    /// Whether the invocation only inspects or must run alone.
+    kind: GitCohortKind,
     /// The repository a `git init` or `git clone` creates, which probes are pointed at instead of
     /// the one the working directory is in.
     target: Option<String>,
+    /// The program, working directory and environment the command runs with, which every probe
+    /// reproduces.
+    template: Option<Command>,
+    /// The tracer, run and invocation every probe is attributed to.
+    trace: Option<(Arc<Tracing>, TraceRun, InvocationId)>,
+    /// The snapshot the invocation runs in.
+    snapshot: Weak<Snapshot>,
+    /// The repository's state before an exclusive run.
+    before: Option<Observation>,
+    /// The admission that the attribution completes.
+    guard: Option<Completion<GitGuard>>,
 }
 
-impl<SE: ShellExtensions> Runner<'_, SE> {
-    /// Runs the command line itself with the builtin's own descriptors.
-    ///
-    /// A process group the pipeline already established is joined; a process that would
-    /// otherwise land in the shell's own group gets one of its own, so a boundary can end it
-    /// without touching anything else. A process that stopped rather than exited is ended and
-    /// reaped here: the observation around it cannot wait for a job that may never resume.
-    ///
-    /// Returns the result and whether the process had to be ended.
-    async fn execute(
-        &mut self,
-        argv: &[String],
-        group: Option<i32>,
-    ) -> Result<(ExecutionResult, bool), brush_core::Error> {
-        let mut params = self.params.clone();
-        if group.is_none()
-            && matches!(
-                params.process_group_policy,
-                ProcessGroupPolicy::SameProcessGroup
-            )
-        {
-            params.process_group_policy = ProcessGroupPolicy::NewProcessGroup;
+impl Runner {
+    /// Classifies `argv`, which starts with `git`, once.
+    pub(crate) fn new(argv: Vec<String>) -> Self {
+        let parsed = gitcmd::parse(&argv);
+        let globals = parsed.global_args.len();
+        let subcommand = parsed.subcommand.is_some();
+        let action = parsed.action;
+        let kind = match action.clone().map(capability_of) {
+            Some(action) if action.is_read() && !action.is_write() => GitCohortKind::Inspect,
+            _ => GitCohortKind::Exclusive,
+        };
+        Self {
+            argv,
+            action,
+            globals,
+            subcommand,
+            kind,
+            target: None,
+            template: None,
+            trace: None,
+            snapshot: Weak::new(),
+            before: None,
+            guard: None,
         }
-        self.spawn(params, argv.iter().skip(1).cloned(), group)
-            .await
     }
 
-    /// Runs `git` with `args` through the shell's own external-command path — never a function
-    /// of that name — and waits for it; a process that stopped instead is ended and reaped.
+    /// Whether the invocation only inspects or must run alone.
+    pub(crate) const fn kind(&self) -> GitCohortKind {
+        self.kind
+    }
+
+    /// The command line, `git` first.
+    pub(crate) fn argv(&self) -> &[String] {
+        &self.argv
+    }
+
+    /// Binds the command's native inputs, admits the invocation, refuses one that would use or
+    /// create a repository outside the snapshot, and reads the state an exclusive run is judged
+    /// against; returns the prepared runner.
     ///
-    /// Returns the result and whether the process had to be ended.
-    async fn spawn(
-        &mut self,
-        params: ExecutionParameters,
-        args: impl IntoIterator<Item = String> + Send,
-        group: Option<i32>,
-    ) -> Result<(ExecutionResult, bool), brush_core::Error> {
-        let argv = std::iter::once(self.git.to_string())
-            .chain(args)
-            .map(CommandArg::String)
-            .collect();
-        let mut command = SimpleCommand::new(
-            ShellForCommand::ParentShell(self.shell),
-            params,
-            self.git.to_string(),
-            argv,
-        );
-        command.use_functions = false;
-        command.argv0 = Some("git".to_string());
-        command.process_group_id = group;
-        match command.execute().await?.wait().await? {
-            ExecutionWaitResult::Completed(result) => Ok((result, false)),
-            ExecutionWaitResult::Stopped(child) => Ok((reap(child).await?, true)),
+    /// `command` supplies the program, working directory and environment every probe runs with;
+    /// probes are attributed to `invocation` of `run`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the diagnostic of a refusal; the command must not run. A reading that fails is
+    /// latched on the admission instead, which then never publishes.
+    pub(crate) fn prepare(
+        mut self,
+        command: Command,
+        snapshot: &Arc<Snapshot>,
+        tracing: Arc<Tracing>,
+        run: TraceRun,
+        invocation: InvocationId,
+    ) -> Result<Self, String> {
+        let start = command
+            .get_current_dir()
+            .ok_or("git: the invocation has no working directory")?
+            .to_path_buf();
+        self.template = Some(command);
+        self.trace = Some((tracing, run, invocation));
+        self.snapshot = Arc::downgrade(snapshot);
+        let cwd = effective_cwd(&start, self.globals());
+        let guard = snapshot.begin_git(run, invocation, self.kind)?;
+        let layout = match self.contain(&cwd, snapshot.path()) {
+            Ok(layout) => layout,
+            Err(refusal) => {
+                guard.complete();
+                return Err(format!("fatal: {refusal}"));
+            }
+        };
+        if self.kind == GitCohortKind::Exclusive {
+            match self.observe(layout, true) {
+                Ok(before) => self.before = Some(before),
+                Err(failure) => guard.fail(failure),
+            }
         }
+        self.guard = Some(guard);
+        Ok(self)
+    }
+
+    /// Attributes the finished run, which exited successfully when `success`, or had to be
+    /// ended when `stopped`, and completes its admission.
+    ///
+    /// # Errors
+    ///
+    /// Fails only for a runner that was never prepared. Every failure of the attribution itself
+    /// is latched on the admission, so the line is never published.
+    pub(crate) fn finish(mut self, success: bool, stopped: bool) -> Result<(), String> {
+        let guard = self.guard.take().ok_or(UNPREPARED)?;
+        let (tracing, run, invocation) = self.trace.as_ref().ok_or(UNPREPARED)?;
+        let snapshot = self.snapshot.upgrade().ok_or(UNPREPARED)?;
+        if stopped {
+            guard.fail("git: a managed git was stopped before it completed".to_string());
+        }
+        if let Err(failure) = tracing.drain(*run) {
+            guard.fail(format!("git: evidence drain failed: {failure}"));
+            return Ok(());
+        }
+        let window = snapshot.writes_for(*invocation);
+        if !success && !window.is_empty() {
+            guard.fail("failed git invocation changed protected state".into());
+            return Ok(());
+        }
+        match (self.kind, self.before.take()) {
+            (GitCohortKind::Inspect, _) => {
+                if window.iter().any(|path| changes_repository_state(path)) {
+                    guard.fail("git: inspection changed repository state".to_string());
+                }
+                guard.complete();
+            }
+            (GitCohortKind::Exclusive, None) => {}
+            (GitCohortKind::Exclusive, Some(before)) => {
+                match self.attribute(&before, &window, snapshot.path()) {
+                    Ok((requests, metadata)) => guard.record(GitEffectRecord {
+                        invocation: *invocation,
+                        started_order: 0,
+                        finished_order: 0,
+                        requests,
+                        metadata,
+                    }),
+                    Err(failure) => guard.fail(failure),
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The command line's global options, which every probe repeats.
+    fn globals(&self) -> &[String] {
+        self.argv.get(1..=self.globals).unwrap_or_default()
+    }
+
+    /// The subcommand word, when the command line has one.
+    fn subcommand(&self) -> Option<&str> {
+        self.subcommand
+            .then(|| self.argv.get(self.globals + 1).map(String::as_str))
+            .flatten()
     }
 
     /// Runs one read-only query with the command line's global options and [`PROBE_OPTIONS`],
     /// capturing what it prints.
     ///
-    /// Both output pipes are drained while the probe runs, so an index larger than a pipe buffer
-    /// cannot stall it. The probe goes through the same spawner as the command, and is recorded
-    /// and traced like it: it is part of what this line ran.
-    async fn probe(&mut self, args: &[&str]) -> Result<Probe, String> {
+    /// The probe runs the command's own program in its working directory with exactly its
+    /// environment, in a process group of its own, and is traced as part of the invocation: it
+    /// is part of what this line ran. Both output pipes are drained while it runs, so an index
+    /// larger than a pipe buffer cannot stall it; a probe that stops is ended.
+    fn probe(&self, args: &[&str]) -> Result<Probe, String> {
+        let (Some(template), Some((tracing, run, invocation))) = (&self.template, &self.trace)
+        else {
+            return Err(UNPREPARED.to_string());
+        };
+        let cwd = template
+            .get_current_dir()
+            .ok_or("git: the invocation has no working directory")?;
         let (out, out_writer) = std::io::pipe().map_err(unprobed)?;
         let (err, err_writer) = std::io::pipe().map_err(unprobed)?;
-        let null = std::fs::File::open("/dev/null").map_err(unprobed)?;
-        let mut params = self.params.clone();
-        params.set_fd(OpenFiles::STDIN_FD, OpenFile::File(null));
-        params.set_fd(OpenFiles::STDOUT_FD, out_writer.into());
-        params.set_fd(OpenFiles::STDERR_FD, err_writer.into());
-        params.process_group_policy = ProcessGroupPolicy::NewProcessGroup;
-        let managed = super::current_context()
-            .ok_or_else(|| "git probe has no managed context".to_string())?;
-        let stdout = managed
-            .spawn_blocking(move || read_all(out))
-            .map_err(unprobed)?;
-        let stderr = managed
-            .spawn_blocking(move || read_all(err))
-            .map_err(unprobed)?;
-
-        let target = self
-            .target
-            .iter()
-            .flat_map(|target| ["-C".to_string(), target.clone()]);
-        let options = PROBE_OPTIONS
-            .iter()
-            .chain(args)
-            .map(|word| (*word).to_string());
-        let argv: Vec<String> = self
-            .globals
-            .iter()
-            .cloned()
-            .chain(target)
-            .chain(options)
-            .collect();
-        let status = self.spawn(params, argv, None).await;
-        let stdout = stdout.await.map_err(unprobed)?;
-        let stderr = stderr.await.map_err(unprobed)?;
-        let (status, _) = status.map_err(unprobed)?;
+        let mut command = Command::new(template.get_program());
+        command
+            .arg0("git")
+            .current_dir(cwd)
+            .env_clear()
+            .envs(
+                template
+                    .get_envs()
+                    .filter_map(|(name, value)| value.map(|value| (name, value))),
+            )
+            .args(self.globals())
+            .args(self.target.iter().flat_map(|target| ["-C", target.as_str()]))
+            .args(PROBE_OPTIONS)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(out_writer)
+            .stderr(err_writer)
+            .process_group(0);
+        let (sender, events) = std::sync::mpsc::channel();
+        let scope = tracing.scope(*run, Some(*invocation)).map_err(unprobed)?;
+        let child = {
+            let _scope = scope.enter();
+            tracing.spawn(
+                command,
+                Box::new(move |event| {
+                    let _ = sender.send(event);
+                }),
+            )
+        }
+        .map_err(unprobed)?;
+        let group = i32::try_from(child.pid).map_err(unprobed)?;
+        let (status, stdout, stderr) = std::thread::scope(|threads| {
+            let stdout = threads.spawn(|| read_all(out));
+            let stderr = threads.spawn(|| read_all(err));
+            let status = loop {
+                match events.recv() {
+                    Ok(ChildEvent::Exited(status)) => break Some(status),
+                    // SAFETY: killpg takes integer arguments; the probe leads its own group,
+                    // which its tracer has not reaped while it is stopped.
+                    Ok(ChildEvent::Stopped) => unsafe {
+                        libc::killpg(group, libc::SIGKILL);
+                    },
+                    Err(_) => break None,
+                }
+            };
+            (status, stdout.join(), stderr.join())
+        });
+        child.wait_observed().map_err(unprobed)?;
+        let status = status.ok_or_else(|| unprobed("its tracer reported no status"))?;
+        let output = |joined: std::thread::Result<std::io::Result<Vec<u8>>>| {
+            joined
+                .map_err(|_| unprobed("an output reader panicked"))?
+                .map_err(unprobed)
+        };
         Ok(Probe {
-            status: status.exit_code.into(),
-            stdout: stdout.map_err(unprobed)?,
-            stderr: stderr.map_err(unprobed)?,
+            status: status
+                .code()
+                .and_then(|code| u8::try_from(code).ok())
+                .unwrap_or(FATAL),
+            stdout: output(stdout)?,
+            stderr: output(stderr)?,
         })
     }
 
@@ -484,36 +704,41 @@ impl<SE: ShellExtensions> Runner<'_, SE> {
     /// repository they stand in is still returned, because it is what an observation of them
     /// compares with afterwards. Sources — a clone's origin, an alternate — may be anywhere: only
     /// what git writes has to be here.
-    async fn contain(
-        &mut self,
-        invocation: &GitInvocation<'_, String>,
-        cwd: &Path,
-        bound: &Path,
-    ) -> Result<Option<Layout>, String> {
+    fn contain(&mut self, cwd: &Path, bound: &Path) -> Result<Option<Layout>, String> {
         let outside = |path: &Path| !physical(path).starts_with(bound);
-        let Some(subcommand) = invocation.subcommand.filter(|word| !word.starts_with('-')) else {
-            return self.layout().await;
+        let Some(subcommand) = self.subcommand().filter(|word| !word.starts_with('-')) else {
+            return self.layout();
         };
         if matches!(subcommand, "init" | "clone") {
-            let target = destination(subcommand, invocation.command_args, cwd)?;
-            let environment = [
+            let target = destination(
+                subcommand,
+                self.argv.get(self.globals + 2..).unwrap_or_default(),
+                cwd,
+            )?;
+            let template = self.template.as_ref().ok_or(UNPREPARED)?;
+            let mut writes: Vec<PathBuf> = Vec::new();
+            for name in [
                 "GIT_DIR",
                 "GIT_WORK_TREE",
                 "GIT_COMMON_DIR",
                 "GIT_INDEX_FILE",
                 "GIT_OBJECT_DIRECTORY",
-            ]
-            .into_iter()
-            .filter_map(|name| {
-                self.shell
-                    .env_str(name)
-                    .filter(|value| !value.is_empty())
-                    .map(|value| gitcmd::resolve(cwd, &value))
-            });
-            let options = ["--git-dir", "--work-tree"].into_iter().filter_map(|name| {
-                global_path(self.globals, name).map(|value| gitcmd::resolve(cwd, value))
-            });
-            let mut writes: Vec<PathBuf> = environment.chain(options).collect();
+            ] {
+                let value = template
+                    .get_envs()
+                    .find(|(variable, _)| *variable == name)
+                    .and_then(|(_, value)| value)
+                    .filter(|value| !value.is_empty());
+                if let Some(value) = value {
+                    let value = value
+                        .to_str()
+                        .ok_or("git: repository environment path is not UTF-8")?;
+                    writes.push(gitcmd::resolve(cwd, value));
+                }
+            }
+            writes.extend(["--git-dir", "--work-tree"].into_iter().filter_map(|name| {
+                global_path(self.globals(), name).map(|value| gitcmd::resolve(cwd, value))
+            }));
             let redirected = !writes.is_empty();
             writes.extend(target.separate.iter().cloned());
             writes.push(target.path.clone());
@@ -538,7 +763,7 @@ impl<SE: ShellExtensions> Runner<'_, SE> {
                         .to_string(),
                 );
             }
-            let layout = self.layout().await?;
+            let layout = self.layout()?;
             return Ok(layout.filter(|layout| {
                 let root = if target.bare {
                     Some(&layout.git_dir)
@@ -548,7 +773,7 @@ impl<SE: ShellExtensions> Runner<'_, SE> {
                 redirected || root.is_some_and(|root| physical(root) == physical(&target.path))
             }));
         }
-        let Some(layout) = self.layout().await? else {
+        let Some(layout) = self.layout()? else {
             // No repository: git reports that itself, and has nothing of the seed to touch.
             return Ok(None);
         };
@@ -574,7 +799,7 @@ impl<SE: ShellExtensions> Runner<'_, SE> {
     ///
     /// The four paths come from one query, each on its own line; a path with a line feed in it
     /// would make that ambiguous, so it is refused rather than guessed at.
-    async fn layout(&mut self) -> Result<Option<Layout>, String> {
+    fn layout(&self) -> Result<Option<Layout>, String> {
         let dirs = self
             .probe(&[
                 "rev-parse",
@@ -585,8 +810,7 @@ impl<SE: ShellExtensions> Runner<'_, SE> {
                 "index",
                 "--git-path",
                 "objects",
-            ])
-            .await?;
+            ])?;
         if dirs.status != 0 {
             return Ok(None);
         }
@@ -605,8 +829,7 @@ impl<SE: ShellExtensions> Runner<'_, SE> {
         // The way up is a run of `../` and cannot hold a line feed, so it goes first and the
         // top-level directory is everything after it.
         let top = self
-            .probe(&["rev-parse", "--show-cdup", "--show-toplevel"])
-            .await?;
+            .probe(&["rev-parse", "--show-cdup", "--show-toplevel"])?;
         let (to_top, worktree) = match top.stdout.strip_suffix(b"\n") {
             Some(lines) if top.status == 0 => {
                 let end = lines
@@ -632,17 +855,12 @@ impl<SE: ShellExtensions> Runner<'_, SE> {
         }))
     }
 
-    /// Reads the repository state the attribution of `invocation` needs.
+    /// Reads the repository state the attribution of this invocation needs.
     ///
     /// `layout` is the repository [`Self::contain`] already found for the reading before the
     /// run; the reading after it looks again, because the run may have created or moved one.
-    async fn observe(
-        &mut self,
-        invocation: &GitInvocation<'_, String>,
-        layout: Option<Layout>,
-        before: bool,
-    ) -> Result<Observation, String> {
-        let layout = if before { layout } else { self.layout().await? };
+    fn observe(&self, layout: Option<Layout>, before: bool) -> Result<Observation, String> {
+        let layout = if before { layout } else { self.layout()? };
         let Some(present) = &layout else {
             return Ok(Observation::default());
         };
@@ -656,17 +874,16 @@ impl<SE: ShellExtensions> Runner<'_, SE> {
                 "--",
                 &present.to_top,
             ];
-            observation.index = parse_index(&self.probe(&everything).await?.output("the index")?);
+            observation.index = parse_index(&self.probe(&everything)?.output("the index")?);
         }
-        let action = &invocation.action;
-        if matches!(action, Some(GitAction::Commit { .. })) || unknown(invocation) {
-            observation.head = self.head().await?;
+        let action = &self.action;
+        if matches!(action, Some(GitAction::Commit { .. })) || self.unknown() {
+            observation.head = self.head()?;
         }
         if before && matches!(action, Some(GitAction::Unstage)) {
-            observation.staged = if self.head().await?.is_some() {
+            observation.staged = if self.head()?.is_some() {
                 let staged = self
-                    .probe(&["diff-index", "--cached", "--name-only", "-z", "HEAD", "--"])
-                    .await?;
+                    .probe(&["diff-index", "--cached", "--name-only", "-z", "HEAD", "--"])?;
                 records(&staged.output("the staged paths")?)
                     .map(<[u8]>::to_vec)
                     .collect()
@@ -680,10 +897,9 @@ impl<SE: ShellExtensions> Runner<'_, SE> {
     }
 
     /// The commit `HEAD` names, or `None` on an unborn branch.
-    async fn head(&mut self) -> Result<Option<Vec<u8>>, String> {
+    fn head(&self) -> Result<Option<Vec<u8>>, String> {
         let head = self
-            .probe(&["rev-parse", "-q", "--verify", "HEAD^{commit}"])
-            .await?;
+            .probe(&["rev-parse", "-q", "--verify", "HEAD^{commit}"])?;
         Ok((head.status == 0).then(|| head.stdout.trim_ascii_end().to_vec()))
     }
 
@@ -694,14 +910,13 @@ impl<SE: ShellExtensions> Runner<'_, SE> {
     ///
     /// Fails with a diagnostic when a fact the attribution needs cannot be read, or when the run
     /// changed staged or committed state that its classification cannot name.
-    async fn attribute(
-        &mut self,
-        invocation: &GitInvocation<'_, String>,
+    fn attribute(
+        &self,
         before: &Observation,
         window: &[PathBuf],
         bound: &Path,
-    ) -> Result<(Vec<(GitAction, PathBuf)>, Vec<PathBuf>), String> {
-        let after = self.observe(invocation, None, false).await?;
+    ) -> Result<Attribution, String> {
+        let after = self.observe(None, false)?;
         let relative = |path: &Path| path.strip_prefix(bound).ok().map(Path::to_path_buf);
         let metadata: Vec<PathBuf> = [&before.layout, &after.layout]
             .into_iter()
@@ -734,8 +949,7 @@ impl<SE: ShellExtensions> Runner<'_, SE> {
             .filter(|path| before.index.get(*path) != after.index.get(*path))
             .collect();
         let requests = self
-            .transitions(invocation, before, &after, &changed, &written)
-            .await?
+            .transitions(before, &after, &changed, &written)?
             .into_iter()
             .map(|(action, path)| (action, top.join(OsStr::from_bytes(&path))))
             .collect();
@@ -750,9 +964,8 @@ impl<SE: ShellExtensions> Runner<'_, SE> {
     /// Fails when a fact the attribution needs cannot be read, or when a run the grammar could
     /// not decide — or one that should only have touched metadata — changed staged or committed
     /// state.
-    async fn transitions(
-        &mut self,
-        invocation: &GitInvocation<'_, String>,
+    fn transitions(
+        &self,
         before: &Observation,
         after: &Observation,
         changed: &BTreeSet<&Vec<u8>>,
@@ -760,7 +973,7 @@ impl<SE: ShellExtensions> Runner<'_, SE> {
     ) -> Result<Vec<(GitAction, Vec<u8>)>, String> {
         let mut requests: Vec<(GitAction, Vec<u8>)> = Vec::new();
         let mut request = |action: GitAction, path: &[u8]| requests.push((action, path.to_vec()));
-        match &invocation.action {
+        match &self.action {
             Some(GitAction::Stage) => {
                 for path in changed {
                     if written.contains(*path) {
@@ -794,11 +1007,11 @@ impl<SE: ShellExtensions> Runner<'_, SE> {
                 }
             }
             Some(GitAction::Commit { .. }) => {
-                return self.commits(before, after, changed, written).await;
+                return self.commits(before, after, changed, written);
             }
-            Some(GitAction::Checkout) => return self.settle(&after.index, changed, written).await,
-            Some(GitAction::Edit) if !unknown(invocation) => {
-                return self.settle(&after.index, changed, written).await;
+            Some(GitAction::Checkout) => return self.settle(&after.index, changed, written),
+            Some(GitAction::Edit) if !self.unknown() => {
+                return self.settle(&after.index, changed, written);
             }
             Some(GitAction::Stash) => {
                 let mut stashed: BTreeSet<&[u8]> =
@@ -814,7 +1027,7 @@ impl<SE: ShellExtensions> Runner<'_, SE> {
                 }
             }
             Some(GitAction::Edit) | None => {
-                let moved_head = unknown(invocation) && before.head != after.head;
+                let moved_head = self.unknown() && before.head != after.head;
                 if !changed.is_empty() || moved_head {
                     return Err("git: cannot attribute repository state changes".to_string());
                 }
@@ -828,8 +1041,8 @@ impl<SE: ShellExtensions> Runner<'_, SE> {
     /// commit's real message — edited first when the run itself rewrote it, staged first when the
     /// committed entry is not the one the index held — and anything else it staged is staged.
     /// A run that made no commit commits nothing.
-    async fn commits(
-        &mut self,
+    fn commits(
+        &self,
         before: &Observation,
         after: &Observation,
         changed: &BTreeSet<&Vec<u8>>,
@@ -838,11 +1051,11 @@ impl<SE: ShellExtensions> Runner<'_, SE> {
         let committed = match (&before.head, &after.head) {
             (_, None) => Vec::new(),
             (Some(old), Some(new)) if old == new => Vec::new(),
-            (old, Some(new)) => self.committed(old.as_deref(), new).await?,
+            (old, Some(new)) => self.committed(old.as_deref(), new)?,
         };
         let mut requests: Vec<(GitAction, Vec<u8>)> = Vec::new();
         if let (Some(new), false) = (&after.head, committed.is_empty()) {
-            let message = self.message(new).await?;
+            let message = self.message(new)?;
             for (path, entry) in &committed {
                 if written.contains(path) {
                     requests.push((GitAction::Edit, path.clone()));
@@ -878,8 +1091,8 @@ impl<SE: ShellExtensions> Runner<'_, SE> {
     /// judged by where it ended up. Clean — worktree, index and `HEAD` agree — is a checkout;
     /// staged — the index moved and the worktree with it — is an edit and a stage; anything else,
     /// a conflict above all, is an edit that settles nothing.
-    async fn settle(
-        &mut self,
+    fn settle(
+        &self,
         after: &BTreeMap<Vec<u8>, Vec<Vec<u8>>>,
         changed: &BTreeSet<&Vec<u8>>,
         written: &BTreeSet<Vec<u8>>,
@@ -906,8 +1119,7 @@ impl<SE: ShellExtensions> Runner<'_, SE> {
                     "--untracked-files=all",
                     "--ignored=matching",
                     "--no-renames",
-                ])
-                .await?
+                ])?
                 .output("the worktree status")?,
         );
         let mut requests = Vec::new();
@@ -926,16 +1138,15 @@ impl<SE: ShellExtensions> Runner<'_, SE> {
 
     /// The entries a commit changed relative to `old`, by repository-relative path; an entry is
     /// `<mode> <object>`, or `None` for a path the commit removed.
-    async fn committed(
-        &mut self,
+    fn committed(
+        &self,
         old: Option<&[u8]>,
         new: &[u8],
-    ) -> Result<Vec<(Vec<u8>, Option<Vec<u8>>)>, String> {
+    ) -> Result<Vec<CommittedEntry>, String> {
         let new = object_name(new)?;
         let Some(old) = old else {
             let listing = self
-                .probe(&["ls-tree", "-r", "-z", "--full-tree", new])
-                .await?
+                .probe(&["ls-tree", "-r", "-z", "--full-tree", new])?
                 .output("the committed tree")?;
             return Ok(records(&listing)
                 .filter_map(|record| {
@@ -953,8 +1164,7 @@ impl<SE: ShellExtensions> Runner<'_, SE> {
         };
         let old = object_name(old)?;
         let raw = self
-            .probe(&["diff-tree", "-r", "-z", "--no-renames", old, new])
-            .await?
+            .probe(&["diff-tree", "-r", "-z", "--no-renames", old, new])?
             .output("the committed changes")?;
         let mut fields = records(&raw);
         let mut committed = Vec::new();
@@ -973,11 +1183,10 @@ impl<SE: ShellExtensions> Runner<'_, SE> {
     }
 
     /// The message of `commit` as the object stores it, less exactly one terminating line feed.
-    async fn message(&mut self, commit: &[u8]) -> Result<String, String> {
+    fn message(&self, commit: &[u8]) -> Result<String, String> {
         let commit = object_name(commit)?;
         let object = self
-            .probe(&["cat-file", "commit", commit])
-            .await?
+            .probe(&["cat-file", "commit", commit])?
             .output("the commit")?;
         let body = object
             .windows(2)
@@ -986,12 +1195,12 @@ impl<SE: ShellExtensions> Runner<'_, SE> {
         let body = body.strip_suffix(b"\n").unwrap_or(body);
         Ok(String::from_utf8_lossy(body).into_owned())
     }
-}
 
-/// Whether `invocation` is a form the grammar could not decide — classified as an edit — rather
-/// than one whose edit is a known outcome, like a popped stash.
-fn unknown<S: AsRef<str>>(invocation: &GitInvocation<'_, S>) -> bool {
-    matches!(invocation.action, Some(GitAction::Edit)) && invocation.subcommand != Some("stash")
+    /// Whether this is a form the grammar could not decide — classified as an edit — rather than
+    /// one whose edit is a known outcome, like a popped stash.
+    fn unknown(&self) -> bool {
+        matches!(&self.action, Some(GitAction::Edit)) && self.subcommand() != Some("stash")
+    }
 }
 
 /// Ends a stopped process and waits for it to exit.

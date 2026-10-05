@@ -1186,3 +1186,174 @@ async fn git_command_clean() {
     );
     close(shell).await;
 }
+
+/// `git <args>` as each route reaches the system git: the builtin, an absolute external path,
+/// and a nested shell's PATH search.
+fn routes(args: &str) -> [String; 3] {
+    [
+        format!("git {args}"),
+        format!("/bin/git {args}"),
+        format!("/bin/sh -c 'git {args}'"),
+    ]
+}
+
+#[tokio::test]
+#[serial]
+async fn external_git_uses_managed_authorization() {
+    let mut outcomes = Vec::new();
+    for route in 0..3 {
+        let (_fixture, repo, shell) = repository(&[("p", "v1\n"), ("gone", "g\n")]).await;
+        checked(&shell, "printf 'v2\\n' > p").await;
+        let stage = &routes("add -- p")[route];
+        grants(&shell, stage, &[(Action::Stage, "repo/p")]).await;
+        assert_eq!(git_out(&repo, &["show", ":p"]), "v2", "{stage}");
+        let commit = &routes("commit -q -m external")[route];
+        grants(&shell, commit, &[(Action::commit("external"), "repo/p")]).await;
+        let remove = &routes("rm -q -- gone")[route];
+        grants(&shell, remove, &[(Action::Delete, "repo/gone")]).await;
+        outcomes.push((
+            git_out(&repo, &["rev-parse", "HEAD"]),
+            git_out(&repo, &["ls-files", "--stage"]),
+            read(&repo.join("p")),
+            names(&repo),
+        ));
+        close(shell).await;
+    }
+    assert_eq!(outcomes[1], outcomes[0], "an absolute external git");
+    assert_eq!(outcomes[2], outcomes[0], "a nested shell's git");
+}
+
+#[tokio::test]
+#[serial]
+async fn external_git_keeps_causal_order() {
+    let (_fixture, repo, shell) = repository(&[("p", "v1\n")]).await;
+    grants(
+        &shell,
+        "/bin/sh -c 'printf first > p; git add -- p; printf second > p'",
+        &[
+            (Action::Edit, "repo/p"),
+            (Action::Stage, "repo/p"),
+            (Action::Edit, "repo/p"),
+        ],
+    )
+    .await;
+    assert_eq!(git_out(&repo, &["show", ":p"]), "first");
+    assert_eq!(read(&repo.join("p")), "second");
+    close(shell).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn external_git_keeps_argument_boundaries() {
+    let (_fixture, repo, shell) = repository(&[("p", "v1\n")]).await;
+    checked(&shell, "mkdir sub; printf 'spaced\\n' > 'p with space'").await;
+    grants(
+        &shell,
+        "/bin/sh -c \"git -C sub -C .. add -- 'p with space'\"",
+        &[(Action::Stage, "repo/p with space")],
+    )
+    .await;
+    assert_eq!(git_out(&repo, &["show", ":p with space"]), "spaced");
+
+    // A listing inside a tool script: its output is published, and it is granted nothing.
+    let index = git_out(&repo, &["ls-files", "--stage"]);
+    grants(
+        &shell,
+        "/bin/sh -c 'git ls-files --cached --others --exclude-standard -z -- > files; \
+         printf graph > graph.out'",
+        &[(Action::Edit, "repo/files"), (Action::Edit, "repo/graph.out")],
+    )
+    .await;
+    let listed: std::collections::BTreeSet<Vec<u8>> = std::fs::read(repo.join("files"))
+        .unwrap()
+        .split(|byte| *byte == 0)
+        .filter(|entry| !entry.is_empty())
+        .map(<[u8]>::to_vec)
+        .collect();
+    assert_eq!(
+        listed,
+        [&b"files"[..], b"p", b"p with space"]
+            .into_iter()
+            .map(<[u8]>::to_vec)
+            .collect()
+    );
+    assert_eq!(read(&repo.join("graph.out")), "graph");
+    assert_eq!(git_out(&repo, &["ls-files", "--stage"]), index);
+    close(shell).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn external_git_refusals_match_the_builtin() {
+    // Outside any repository git reports that itself, as an ordinary result.
+    let fixture = Fixture::new();
+    let shell = fixture.shell().await;
+    export_git_identity(&shell).await;
+    assert!(exits(&shell, "/bin/git status 2>/dev/null", 128).await.is_empty());
+    close(shell).await;
+
+    // Git's own safety refusal still changed protected state: nothing publishes, by any route.
+    let (fixture, repo, shell) = repository(&[("m", "m\n")]).await;
+    checked(&shell, "printf 'x\\n' > m").await;
+    let state = || {
+        (
+            read(&repo.join("m")),
+            git_out(&repo, &["ls-files", "--stage"]),
+            git_out(&repo, &["rev-parse", "HEAD"]),
+        )
+    };
+    let before = state();
+    for route in routes("rm -q -- m 2>/dev/null") {
+        refused_git(&shell, &route, 1).await;
+        assert_eq!(state(), before, "{route}");
+    }
+    // A form the grammar cannot decide may not move the index, however git itself fared.
+    refused_git(&shell, "/bin/git -c 'alias.zap=add --' zap m", 0).await;
+    assert_eq!(state(), before);
+
+    // A repository outside the snapshot is refused before git runs.
+    let outside = fixture.outside("outside-repo");
+    committed_repository(&outside, &[("p", "outside\n")]);
+    let outside_state = || {
+        (
+            read(&outside.join("p")),
+            git_out(&outside, &["ls-files", "--stage"]),
+        )
+    };
+    let outside_before = outside_state();
+    let path = outside.to_str().expect("UTF-8 outside path");
+    shell
+        .set_var("outside", ShellVariable::new(path))
+        .await
+        .unwrap();
+    let error = shell
+        .run("/bin/git -C \"$outside\" status 2>/dev/null")
+        .await
+        .err()
+        .expect("a repository outside the snapshot is refused");
+    assert!(
+        matches!(error.kind(), super::super::ShellErrorKind::Unsupported),
+        "{error}"
+    );
+    assert_eq!(outside_state(), outside_before);
+    assert_eq!(state(), before);
+
+    // No refusal left an admission behind.
+    grants(&shell, "/bin/git add -- m", &[(Action::Stage, "repo/m")]).await;
+    assert_eq!(git_out(&repo, &["show", ":m"]), "x");
+    close(shell).await;
+
+    // Another shell's blind edit and stage of a path one shell owns is denied whole.
+    let fixture = Fixture::new();
+    let repo = fixture.seed.join("repo");
+    committed_repository(&repo, &[("p", "v1\n")]);
+    let a = repository_shell(&fixture).await;
+    let b = repository_shell(&fixture).await;
+    checked(&a, "printf mine > p").await;
+    let index = git_out(&repo, &["ls-files", "--stage"]);
+    super::refused(&b, "printf illegal > p; /bin/git add -- p").await;
+    assert_eq!(read(&repo.join("p")), "mine");
+    assert_eq!(git_out(&repo, &["ls-files", "--stage"]), index);
+    close(a).await;
+    close(b).await;
+}

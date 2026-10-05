@@ -191,11 +191,29 @@ async fn git_effects_keep_causal_order() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
+async fn external_git_publishes_through_managed_authorization() {
+    for line in [
+        "printf staged > src/a.txt; /bin/git add -- src/a.txt; printf unrelated > other",
+        "printf staged > src/a.txt; /bin/sh -c 'git add -- src/a.txt'; printf unrelated > other",
+    ] {
+        let fixture = seed();
+        fixture.git();
+        let index = fixture.bytes(".git/index");
+        let a = fixture.shell().await;
+        run(&a, line).await;
+        assert_ne!(fixture.bytes(".git/index"), index, "{line}");
+        assert_eq!(fixture.bytes("src/a.txt"), b"staged");
+        assert_eq!(fixture.bytes("other"), b"unrelated");
+        a.close(false).await.unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
 async fn unmanaged_git_metadata_cannot_publish() {
     for line in [
-        "/bin/git add -- src/a.txt; printf unrelated > other",
-        "/bin/sh -c 'git add -- src/a.txt'; printf unrelated > other",
         "/bin/sh -c 'printf injected > .git/injected'; printf unrelated > other",
+        "/bin/mkdir .git/spoof; printf unrelated > other",
     ] {
         let fixture = seed();
         fixture.git();
@@ -211,6 +229,7 @@ async fn unmanaged_git_metadata_cannot_publish() {
         assert_eq!(fixture.bytes(".git/HEAD"), head);
         assert!(!fixture.source.join("other").exists());
         assert!(!fixture.source.join(".git/injected").exists());
+        assert!(!fixture.source.join(".git/spoof").exists());
         run(&a, "printf managed > src/a.txt; git add -- src/a.txt").await;
         assert_eq!(fixture.bytes("src/a.txt"), b"managed");
         a.close(false).await.unwrap();
