@@ -111,7 +111,7 @@ impl ShellMux {
             return Err(MuxError::ShuttingDown);
         }
         let shell = self
-            .build_shell(None, directory, HashMap::new(), None)
+            .build_shell(None, directory, HashMap::new(), None, false)
             .await?;
         let outcome = shell.run_tool(tool, operation).await;
         let closed = shell.close(false).await;
@@ -122,14 +122,21 @@ impl ShellMux {
     }
 
     /// Builds a shell with this mux's builder and profile; `id` is the display name a job
-    /// reserved, and a shell without one is named by its principal.
+    /// reserved, and a shell without one is named by its principal. `force_sandbox` replaces the
+    /// profile's routing policy with one that always takes the managed route.
     pub(crate) async fn build_shell(
         &self,
         id: Option<ShellId>,
         directory: &Path,
         fds: HashMap<ShellFd, OpenFile>,
         environment: Option<ShellEnvironment>,
+        force_sandbox: bool,
     ) -> Result<Arc<crate::Shell>, MuxError> {
+        let policy = if force_sandbox {
+            crate::SandboxPolicy::allow()
+        } else {
+            self.profile.sandbox_policy.clone()
+        };
         let mut builder = (self.builder)()
             .working_dir(directory.to_path_buf())
             .fds(fds)
@@ -137,7 +144,7 @@ impl ShellMux {
             .no_editing(true)
             .external_cmd_leads_session(true)
             .enable_option("monitor".into())
-            .sandbox_policy(self.profile.sandbox_policy.clone());
+            .sandbox_policy(policy);
         if let Some(environment) = environment {
             builder = builder.environment(environment);
         } else {

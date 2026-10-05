@@ -542,7 +542,8 @@ impl Run {
     }
     /// Bounds the run's remaining execution once its input has ended.
     ///
-    /// `grace` for the producers to finish, then `SIGTERM` and `grace` again, then cancellation.
+    /// `stdin_grace` for the producers to finish after their input ended, then `SIGTERM` and
+    /// `terminate_grace` windows, then cancellation.
     /// Each step applies only while the run is still running, so a run that reached finalization
     /// is never signalled or discarded here, however long finalization takes.
     ///
@@ -553,8 +554,8 @@ impl Run {
     /// instead of discarding finished work, and a descendant that delivery later reveals alive
     /// is cancelled at the next window. Signalling failures are ignored: the run's own verdict
     /// says what happened.
-    async fn terminate_within(&self, grace: Duration) {
-        if tokio::time::timeout(grace, self.wait_until_not_running())
+    async fn terminate_within(&self, stdin_grace: Duration, terminate_grace: Duration) {
+        if tokio::time::timeout(stdin_grace, self.wait_until_not_running())
             .await
             .is_ok()
         {
@@ -564,7 +565,7 @@ impl Run {
             let _ = self.signal(libc::SIGTERM);
         }
         loop {
-            if tokio::time::timeout(grace, self.wait_until_not_running())
+            if tokio::time::timeout(terminate_grace, self.wait_until_not_running())
                 .await
                 .is_ok()
             {
@@ -671,7 +672,7 @@ impl ExecutionProgress {
     /// Waits, untimed, for the execution to begin. Returns at once when it already ended, and
     /// never resolves for a command that never begins executing; the caller races this against
     /// the command's verdict.
-    pub(crate) async fn finish_with_grace(&self, grace: Duration) {
+    pub(crate) async fn finish_with_grace(&self, stdin_grace: Duration, terminate_grace: Duration) {
         let mut attached = self.run.subscribe();
         let Ok(run) = attached
             .wait_for(Option::is_some)
@@ -682,7 +683,7 @@ impl ExecutionProgress {
             return;
         };
         if let Some(run) = run {
-            run.terminate_within(grace).await;
+            run.terminate_within(stdin_grace, terminate_grace).await;
         }
     }
 }
@@ -1326,7 +1327,7 @@ mod tests {
         run.finish().await.expect("a run with no producers finishes");
         let watch = tokio::spawn({
             let run = Arc::clone(&run);
-            async move { run.terminate_within(GRACE).await }
+            async move { run.terminate_within(GRACE, GRACE).await }
         });
         tokio::time::sleep(GRACE * 20).await;
         assert!(!run.is_cancelled(), "finished work is not discarded");
@@ -1355,7 +1356,7 @@ mod tests {
         assert_eq!(&ready, b"ready\n");
         // The evaluation returned; only the adopted producer outlives it.
         run.closed.store(true, Ordering::Release);
-        run.terminate_within(GRACE).await;
+        run.terminate_within(GRACE, GRACE).await;
         assert!(run.is_cancelled(), "a live producer is cancelled");
         let status = child.wait().await.expect("reap the producer");
         assert_eq!(status.signal(), Some(libc::SIGKILL));

@@ -468,7 +468,13 @@ impl ShellMux {
             readers,
         } = Self::open_streams(io)?;
         let interpreter = self
-            .build_shell(Some(id.clone()), &requested, fds, options.environment)
+            .build_shell(
+                Some(id.clone()),
+                &requested,
+                fds,
+                options.environment,
+                options.force_sandbox,
+            )
             .await?;
         let working_directory = interpreter.working_dir().await;
         let sandbox = interpreter.sandbox().clone();

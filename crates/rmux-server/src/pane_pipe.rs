@@ -488,7 +488,9 @@ async fn supervise(job: PipeJob) {
         // gated, or be signalled and then forced — and a forced command's verdict, not the force,
         // is what gets reported, because a force cannot undo an approval already sealed.
         Some(PipeStop::Close) => publication(
-            command.finish_with_grace(PIPE_TERMINATION_GRACE).await,
+            command
+                .finish_with_grace(PIPE_TERMINATION_GRACE, PIPE_TERMINATION_GRACE)
+                .await,
             &text,
         ),
         Some(PipeStop::Discard) => discarded(command.wait().await, &text),

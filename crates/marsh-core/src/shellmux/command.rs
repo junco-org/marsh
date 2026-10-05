@@ -108,11 +108,11 @@ impl CommandHandle {
     ///
     /// This is an active termination operation, and only execution is timed. Admission and view
     /// preparation run to completion first. Once the command's producers are running they get
-    /// `grace` to finish on their own, then `SIGTERM` and `grace` again, and are then cancelled —
-    /// which discards the command — provided one of them is still alive to end. Producers that
-    /// already ended are never discarded because the native service is late to confirm it. Once
-    /// they have finished, authorization and publication are awaited whatever they take, so the
-    /// answer is the command's own verdict, never a timeout.
+    /// `stdin_grace` to finish on their own, then `SIGTERM` and `terminate_grace`, and are then
+    /// cancelled — which discards the command — provided one of them is still alive to end.
+    /// Producers that already ended are never discarded because the native service is late to
+    /// confirm it. Once they have finished, authorization and publication are awaited whatever
+    /// they take, so the answer is the command's own verdict, never a timeout.
     ///
     /// Dropping the returned future stops its timers and cancels nothing. The timers need an
     /// enabled Tokio time driver on the polling runtime.
@@ -122,12 +122,13 @@ impl CommandHandle {
     /// As [`Self::wait`].
     pub async fn finish_with_grace(
         &self,
-        grace: Duration,
+        stdin_grace: Duration,
+        terminate_grace: Duration,
     ) -> Result<Arc<CommandCompletion>, WaitError> {
         tokio::select! {
             biased;
             verdict = self.wait() => return verdict,
-            () = self.execution.finish_with_grace(grace) => {}
+            () = self.execution.finish_with_grace(stdin_grace, terminate_grace) => {}
         }
         self.wait().await
     }

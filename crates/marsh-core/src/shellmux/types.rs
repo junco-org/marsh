@@ -158,6 +158,14 @@ pub struct SpawnOptions {
     /// `false` — the default — is an ordinary persistent shell: opening one runs nothing, and it
     /// outlives every command submitted into it until something stops it.
     pub automatic_close: bool,
+    /// Whether every call this shell routes takes the managed route, whatever the mux profile's
+    /// [`MuxProfile::sandbox_policy`] would decide.
+    ///
+    /// `true` builds the shell with [`SandboxPolicy::allow`](crate::SandboxPolicy::allow): its
+    /// commands and their descendants always run traced in a private snapshot whose effects
+    /// publish only when authorized, even while no other shell shares its source. `false` — the
+    /// default — applies the profile's policy.
+    pub force_sandbox: bool,
 }
 
 impl Default for JobIo {
