@@ -1708,7 +1708,8 @@ async fn fixture_shell(fixture: &Fixture, initial_dir: &Path) -> Result<marsh::S
     }
 }
 
-/// This process's kernel-reported tracer: zero when no native helper is attached.
+/// This process's kernel-reported tracer: always zero, since tracer threads seize only spawned
+/// commands and a process can never trace its own threads.
 fn tracer_pid() -> Result<i32, Failure> {
     let status = std::fs::read_to_string("/proc/self/status")?;
     let value = status
@@ -1760,11 +1761,8 @@ async fn prove_native_shells(
         initialized.status,
         String::from_utf8_lossy(&initialized.stderr)
     );
-    ensure_eq!(tracer_pid()?, 0);
     shells.push(fixture_shell(fixture, &fixture.seed).await?);
-    // Construction itself attaches the tracer; durable storage still waits for a managed route.
-    let helper = tracer_pid()?;
-    ensure!(helper != 0, "a built shell has no native tracer attached");
+    // Durable storage still waits for a managed route.
     let state = fixture.scratch.path().join(marsh_btrfs::STATE_DIR);
     ensure!(
         !state.try_exists()?,
@@ -1773,7 +1771,6 @@ async fn prove_native_shells(
     );
     println!("[tracing] shell build ready before commands");
     shells.push(fixture_shell(fixture, &fixture.seed).await?);
-    ensure_eq!(tracer_pid()?, helper);
     let [a, b] = shells.as_slice() else {
         return Err("the two initial shells were not retained".into());
     };
@@ -1808,30 +1805,16 @@ async fn prove_native_shells(
     b.run("/bin/cat read-claim >/dev/null; printf accepted > read-claim")
         .await?;
     ensure_eq!(std::fs::read(fixture.seed("read-claim"))?, b"accepted");
+    // The commands above were traced in-process; the host itself never is.
+    ensure_eq!(tracer_pid()?, 0);
     a.run("printf same > zero-op").await?;
     // Both close before the third opens: that ordering is what makes its authority recovered.
     a.close(false).await?;
-    ensure_eq!(tracer_pid()?, helper);
     b.close(false).await?;
-    // Closed handles stay in `shells`; releasing a shell must still release its tracer.
-    until("the closed shells' native tracer to detach", || async {
-        match tracer_pid() {
-            Ok(0) => Some(Ok(())),
-            Ok(_) => None,
-            Err(error) => Some(Err(error)),
-        }
-    })
-    .await??;
     let first = a.principal().clone();
     // An idle peer keeps the reopened shell on the managed route under the default policy.
     shells.push(fixture_shell(fixture, &fixture.seed).await?);
-    let reattached = tracer_pid()?;
-    ensure!(
-        reattached != 0,
-        "a reopened shell has no native tracer attached"
-    );
     shells.push(fixture_shell(fixture, &fixture.seed).await?);
-    ensure_eq!(tracer_pid()?, reattached);
     let reopened = shells.last().ok_or("the reopened shell was not retained")?;
     ensure!(*reopened.principal() != first);
     for path in ["owned", "read-claim", "zero-op"] {
