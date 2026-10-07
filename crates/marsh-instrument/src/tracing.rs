@@ -659,6 +659,7 @@ impl Tracing {
             descriptors: Vec::new(),
             flags: None,
             submissions: None,
+            address: None,
         };
         self.classify(run, fork)
     }

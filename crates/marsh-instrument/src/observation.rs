@@ -99,7 +99,8 @@ pub(crate) struct Observer {
 }
 
 impl Observer {
-    /// The observed syscalls: lurk's categories plus the interfaces its 0.3.14 lists predate.
+    /// The observed syscalls: lurk's categories, the interfaces its 0.3.14 lists predate, and the
+    /// socket calls that name a peer.
     pub(crate) fn selection() -> io::Result<SysnoSet> {
         let args = Args {
             follow_forks: true,
@@ -121,6 +122,9 @@ impl Observer {
             Sysno::io_uring_register,
             Sysno::io_submit,
             Sysno::io_getevents,
+            Sysno::connect,
+            Sysno::sendto,
+            Sysno::sendmsg,
         ] {
             selected.insert(syscall);
         }
