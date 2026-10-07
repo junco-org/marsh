@@ -79,7 +79,13 @@ struct Root {
     path: PathBuf,
     observe: Arc<dyn Fn(TraceRun, Option<InvocationId>, Syscall) -> io::Result<()> + Send + Sync>,
     exec: Option<ExecHooks>,
+    peers: Option<PeerGate>,
 }
+
+/// Whether a task of `run`, owned by the invocation, may contact the peer whose `sockaddr` it
+/// names (empty when unknown). Called at the call's entry stop, without trace locks held, from
+/// the tracer thread owning the task; a refused call is skipped and fails with `EPERM`.
+pub type PeerGate = Arc<dyn Fn(TraceRun, Option<InvocationId>, &[u8]) -> bool + Send + Sync>;
 
 /// A selected command a traced task has just executed, read before its new image ran anything.
 ///
@@ -440,6 +446,7 @@ impl Tracing {
                 path: root.to_path_buf(),
                 observe,
                 exec,
+                peers: None,
             },
         );
         drop(state);
@@ -647,6 +654,19 @@ impl Tracing {
         Ok(())
     }
 
+    /// Consults `gate` before any task of `root`'s runs contacts a socket peer.
+    pub fn gate_peers(&self, root: RootId, gate: PeerGate) -> io::Result<()> {
+        let mut state = lock(&self.state);
+        state.check()?;
+        state
+            .roots
+            .get_mut(&root)
+            .ok_or_else(|| io::Error::other("unknown root"))?
+            .peers = Some(gate);
+        drop(state);
+        Ok(())
+    }
+
     /// Releases a root only after its runs have finished.
     pub fn unregister_root(&self, root: RootId) -> io::Result<()> {
         let mut state = lock(&self.state);
@@ -778,6 +798,8 @@ impl Tracing {
         let mut observer = Observer::new(self.selected.clone(), Arc::clone(&self.sequence), root);
         let selector = Arc::clone(self);
         observer.select_exec(Box::new(move |tid, path| selector.selects(tid, path)));
+        let gate = Arc::clone(self);
+        observer.gate_peers(Box::new(move |tid, peer| gate.permits(tid, peer)));
         let result = (|| -> io::Result<()> {
             let mut observe = |sequence, tid: Pid, status, event, info, exec| {
                 let resume = self.deliver(sequence, tid, status, event, info, exec)?;
@@ -834,6 +856,21 @@ impl Tracing {
             self.progress.notify_all();
         }
         result
+    }
+
+    /// Whether `tid`'s root lets it contact `peer`. A task no root owns is not gated.
+    fn permits(&self, tid: Pid, peer: &[u8]) -> bool {
+        let state = lock(&self.state);
+        let Some(target) = state.threads.get(&tid).and_then(|thread| thread.inherited) else {
+            return true;
+        };
+        let gate = state
+            .roots
+            .get(&target.run.root)
+            .and_then(|root| root.peers.as_ref())
+            .map(Arc::clone);
+        drop(state);
+        gate.is_none_or(|gate| gate(target.run, target.builtin, peer))
     }
 
     /// Whether `tid`'s owner selects the executable it is about to exec.
@@ -962,7 +999,7 @@ impl Tracing {
             descriptors: Vec::new(),
             flags: None,
             submissions: None,
-            address: None,
+            peers: Vec::new(),
         };
         self.classify(target, fork)
     }

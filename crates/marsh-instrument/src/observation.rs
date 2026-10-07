@@ -61,6 +61,13 @@ pub(crate) type Observe<'a> = dyn FnMut(
 
 /// Decides at an exec's entry, from the executable it names, whether its arguments are read.
 pub(crate) type Select = Box<dyn FnMut(Pid, &Path) -> bool>;
+/// Decides at a socket call's entry whether the task may contact a peer, given its `sockaddr`
+/// (empty when unknown). A refused call is skipped and fails with `EPERM`.
+pub(crate) type Gate = Box<dyn FnMut(Pid, &[u8]) -> bool>;
+
+/// `io_uring` operations that contact a peer: `SENDMSG`, `CONNECT`, `SEND`, `SEND_ZC` and
+/// `SENDMSG_ZC`. Their destinations live in memory a ring read cannot attribute to a call.
+const NETWORK_IO_URING_OPS: [u8; 5] = [9, 16, 26, 47, 48];
 
 /// Why a tree whose remaining tasks are all held can make no progress.
 pub(crate) const UNCLASSIFIED: &str = "native creator exited with unclassified child effects";
@@ -73,6 +80,8 @@ struct Entry {
     capture: Captured,
     order: u64,
     started: Instant,
+    /// The gate refused it: the kernel skips it and its exit reports `EPERM`.
+    blocked: bool,
 }
 
 #[derive(Default)]
@@ -114,6 +123,8 @@ pub(crate) struct Observer {
     held: HashMap<Pid, i32>,
     /// Which execs have their arguments read; none without one.
     select: Option<Select>,
+    /// Which peers socket calls may contact; every one without one.
+    gate: Option<Gate>,
 }
 
 impl Observer {
@@ -143,6 +154,7 @@ impl Observer {
             Sysno::connect,
             Sysno::sendto,
             Sysno::sendmsg,
+            Sysno::sendmmsg,
         ] {
             selected.insert(syscall);
         }
@@ -160,12 +172,18 @@ impl Observer {
             rings: Rings::default(),
             held: HashMap::new(),
             select: None,
+            gate: None,
         }
     }
 
     /// Reads the arguments, environment and cwd of every exec `select` accepts at its entry.
     pub(crate) fn select_exec(&mut self, select: Select) {
         self.select = Some(select);
+    }
+
+    /// Consults `gate` at the entry of every call that would contact a peer.
+    pub(crate) fn gate_peers(&mut self, gate: Gate) {
+        self.gate = Some(gate);
     }
 
     /// Whether the command was handed back untraced because its exec failed: the launcher then
@@ -432,6 +450,15 @@ impl Observer {
             {
                 capture.capture_exec(tid, syscall, registers, program);
             }
+            let blocked = match &mut self.gate {
+                Some(gate) => contacted(syscall, &capture, registers)
+                    .iter()
+                    .any(|peer| !gate(tid, peer)),
+                None => false,
+            };
+            if blocked && alive(skip_syscall(tid, registers))?.is_none() {
+                return Ok(());
+            }
             let order = self.sequence.next()?;
             self.tasks
                 .get_mut(&tid)
@@ -441,6 +468,7 @@ impl Observer {
                 capture,
                 order,
                 started: Instant::now(),
+                blocked,
             });
             let resume = observe(order, tid, status, None, None, None)?;
             return self.apply(tid, status, resume);
@@ -468,6 +496,14 @@ impl Observer {
         }
         task.in_syscall = false;
         if let Some(entry) = task.entry.take() {
+            let result = if entry.blocked {
+                if alive(fail_syscall(tid, libc::EPERM))?.is_none() {
+                    return Ok(());
+                }
+                RetCode::Err(-libc::EPERM)
+            } else {
+                result
+            };
             let mut call = entry.capture.complete(
                 tid,
                 entry.syscall,
@@ -524,6 +560,55 @@ fn event_message(tid: Pid, event: i32) -> io::Result<Option<u64>> {
     } else {
         Ok(None)
     }
+}
+
+/// The peers a call at its entry stop would contact: the addresses it names, or one unknown peer
+/// for an `io_uring_enter` submitting network operations, or submissions it cannot read.
+fn contacted(syscall: Sysno, capture: &Captured, registers: libc::user_regs_struct) -> Vec<&[u8]> {
+    match syscall {
+        Sysno::connect | Sysno::sendto | Sysno::sendmsg | Sysno::sendmmsg => {
+            capture.peers().iter().map(Vec::as_slice).collect()
+        }
+        Sysno::io_uring_enter
+            if lurk_cli::arch::get_arg_value(registers, 1) != 0
+                && capture.submissions().is_none_or(|opcodes| {
+                    opcodes
+                        .iter()
+                        .any(|opcode| NETWORK_IO_URING_OPS.contains(opcode))
+                }) =>
+        {
+            vec![&[]]
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Makes the kernel skip the call `tid` is stopped at the entry of.
+#[cfg(target_arch = "x86_64")]
+fn skip_syscall(tid: Pid, mut registers: libc::user_regs_struct) -> nix::Result<()> {
+    // An invalid number is never dispatched; its exit stop still follows.
+    registers.orig_rax = u64::MAX;
+    ptrace::setregs(tid, registers)
+}
+
+/// Sets the result `tid`'s skipped call returns, at its exit stop.
+#[cfg(target_arch = "x86_64")]
+fn fail_syscall(tid: Pid, errno: i32) -> nix::Result<()> {
+    let mut registers = ptrace::getregs(tid)?;
+    registers.rax = i64::from(-errno).cast_unsigned();
+    ptrace::setregs(tid, registers)
+}
+
+/// Refusing a call needs its number rewritten through an architecture-specific regset this
+/// tracer does not implement; failing the observation stops the command instead of letting the
+/// call through.
+#[cfg(not(target_arch = "x86_64"))]
+const fn skip_syscall(_: Pid, _: libc::user_regs_struct) -> nix::Result<()> {
+    Err(Errno::ENOSYS)
+}
+#[cfg(not(target_arch = "x86_64"))]
+const fn fail_syscall(_: Pid, _: i32) -> nix::Result<()> {
+    Err(Errno::ENOSYS)
 }
 
 fn resume(tid: Pid, signal: Option<Signal>) -> io::Result<()> {

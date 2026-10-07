@@ -29,7 +29,7 @@ fn info(syscall: Sysno, args: Vec<SyscallArg>, result: RetCode) -> Syscall {
         descriptors: Vec::new(),
         flags: None,
         submissions: None,
-        address: None,
+        peers: Vec::new(),
     }
 }
 fn with_descriptor(mut info: Syscall, index: usize, path: &[u8]) -> Syscall {

@@ -34,7 +34,7 @@ pub(super) struct Effects {
     pub outside_reads: Vec<PathBuf>,
     /// Programs a successful exec ran, as the call named them.
     pub execs: Vec<PathBuf>,
-    /// Socket peers a `connect`, `sendto` or `sendmsg` named.
+    /// Socket peers a `connect`, `sendto`, `sendmsg` or `sendmmsg` named.
     pub peers: Vec<Peer>,
 }
 
@@ -559,14 +559,16 @@ impl Access {
                 if success
                     || matches!(info.info.result, RetCode::Err(code) if code == -libc::EINPROGRESS) =>
             {
+                effects.peers.push(
+                    info.peers
+                        .first()
+                        .map_or(Peer::Unknown, |peer| Peer::decode(peer)),
+                );
+            }
+            Sysno::sendto | Sysno::sendmsg | Sysno::sendmmsg if success => {
                 effects
                     .peers
-                    .push(info.address.as_deref().map_or(Peer::Unknown, Peer::decode));
-            }
-            Sysno::sendto | Sysno::sendmsg if success => {
-                if let Some(address) = &info.address {
-                    effects.peers.push(Peer::decode(address));
-                }
+                    .extend(info.peers.iter().map(|peer| Peer::decode(peer)));
             }
             _ => {}
         }
