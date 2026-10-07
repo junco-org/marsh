@@ -5,6 +5,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
+use super::agent::{AgentPolicy, Observation, Observed, PathAction};
 use super::builtins::gitcmd::GitAction;
 use super::completion::{Completion, Finalize};
 use super::execution::ExecutedCommand;
@@ -25,7 +26,7 @@ impl PolicyObserver {
     pub fn new(observe: impl Fn(&Event, &PolicyDecision) + Send + Sync + 'static) -> Self {
         Self(Box::new(observe))
     }
-    fn notify(&self, event: &Event, decision: &PolicyDecision) {
+    pub(super) fn notify(&self, event: &Event, decision: &PolicyDecision) {
         (self.0)(event, decision);
     }
 }
@@ -100,6 +101,24 @@ impl PolicyValidator {
     pub(super) fn revision(&self) -> u64 {
         self.revision.load(Ordering::Acquire)
     }
+    /// Records `approver`'s approval of `label` for every agent policy judging this source.
+    ///
+    /// Approvals enter the shared observation log, which agent rules such as
+    /// [`crate::AgentRule::requires_approval`] consult. Nothing a managed command runs can call this.
+    pub fn approve(&self, approver: Principal, label: impl Into<String>) -> Result<(), ShellError> {
+        let mut authority = self.write()?;
+        if authority.recovery_required {
+            return Err(ShellError::infrastructure(
+                "source requires recovery before new approvals",
+            ));
+        }
+        authority.observations.push(Observation {
+            principal: approver,
+            observed: Observed::Approve(label.into()),
+        });
+        drop(authority);
+        Ok(())
+    }
 }
 impl Authority {
     fn check(
@@ -145,6 +164,7 @@ pub(super) struct AuthorizedCommand<'a> {
     pub operations: Vec<CommitOp>,
     pub events: Vec<Event>,
     checkpoint: usize,
+    observation_checkpoint: usize,
 }
 impl Completion<AuthorizedCommand<'_>> {
     /// Finalizes now and releases the authority; the later drop finds no guard to roll back.
@@ -157,6 +177,7 @@ impl Finalize for AuthorizedCommand<'_> {
     fn finalize(&mut self, completed: bool) {
         if !completed && let Some(guard) = &mut self.guard {
             guard.history.truncate(self.checkpoint);
+            guard.observations.truncate(self.observation_checkpoint);
         }
     }
 }
@@ -165,6 +186,7 @@ pub(super) fn authorize<'session>(
     session: &'session Session,
     mut executed: ExecutedCommand,
     observer: Option<&PolicyObserver>,
+    agent: Option<&AgentPolicy>,
 ) -> Result<Completion<AuthorizedCommand<'session>>, ShellError> {
     // Every refusal carries the native status the command already produced.
     let admitted = (|| -> Result<_, ShellError> {
@@ -200,20 +222,38 @@ pub(super) fn authorize<'session>(
             }));
         }
         let events = translate(&executed)?;
+        let observations = observe(&executed, agent);
         let checkpoint = guard.history.len();
+        let observation_checkpoint = guard.observations.len();
         guard
             .check(&events, observer)
             .map_err(|denials| ShellError::new(ShellErrorKind::Denied { denials }))?;
-        Ok((guard, operations, events, checkpoint))
-    })();
-    match admitted {
-        Ok((guard, operations, events, checkpoint)) => Ok(Completion::new(AuthorizedCommand {
-            guard: Some(guard),
-            executed: Some(executed),
+        if let Some(agent) = agent
+            && let Err(denials) = agent.check(&guard.observations, &observations, observer)
+        {
+            guard.history.truncate(checkpoint);
+            return Err(ShellError::new(ShellErrorKind::Denied { denials }));
+        }
+        guard.observations.extend(observations);
+        Ok((
+            guard,
             operations,
             events,
             checkpoint,
-        })),
+            observation_checkpoint,
+        ))
+    })();
+    match admitted {
+        Ok((guard, operations, events, checkpoint, observation_checkpoint)) => {
+            Ok(Completion::new(AuthorizedCommand {
+                guard: Some(guard),
+                executed: Some(executed),
+                operations,
+                events,
+                checkpoint,
+                observation_checkpoint,
+            }))
+        }
         Err(error) => Err(error.with_result(executed.result.take())),
     }
 }
@@ -350,6 +390,74 @@ fn translate(executed: &ExecutedCommand) -> Result<Vec<Event>, ShellError> {
         events.push(Event::new(principal.clone(), action, resource));
     }
     Ok(events)
+}
+
+/// The command's agent-policy observations in execution order, each recorded once. A source path
+/// is created, modified or removed by comparing the command's baseline with its final work view.
+fn observe(executed: &ExecutedCommand, agent: Option<&AgentPolicy>) -> Vec<Observation> {
+    let baseline = &executed.prepared.baseline;
+    let work = executed.prepared.snapshot.path();
+    let exists = |root: &Path, path: &Path| root.join(path).symlink_metadata().is_ok();
+    let metadata = |path: &Path| {
+        path.as_os_str().is_empty()
+            || path
+                .components()
+                .any(|component| component.as_os_str() == ".git")
+    };
+    let mut ordered = Vec::new();
+    for (order, _, effects) in &executed.evidence.effects {
+        let mut push = |observed| ordered.push((*order, observed));
+        for path in effects.reads.iter().filter(|path| !metadata(path)) {
+            push(Observed::Path {
+                action: PathAction::Read,
+                path: path.clone(),
+                inside: true,
+            });
+        }
+        for path in effects.writes.iter().filter(|path| !metadata(path)) {
+            let action = match (exists(baseline, path), exists(work, path)) {
+                (false, false) => continue,
+                (false, true) => PathAction::Create,
+                (true, false) => PathAction::Delete,
+                (true, true) => PathAction::Edit,
+            };
+            push(Observed::Path {
+                action,
+                path: path.clone(),
+                inside: true,
+            });
+        }
+        for (paths, action) in [
+            (&effects.outside_reads, PathAction::Read),
+            (&effects.outside_writes, PathAction::Edit),
+        ] {
+            for path in paths {
+                push(Observed::Path {
+                    action,
+                    path: path.clone(),
+                    inside: false,
+                });
+            }
+        }
+        for program in &effects.execs {
+            push(Observed::Exec(program.clone()));
+        }
+        for peer in &effects.peers {
+            push(Observed::Connect(peer.clone()));
+        }
+    }
+    ordered.sort_by_key(|(order, _)| *order);
+    let principal = &executed.prepared.snapshot.uid;
+    let mut seen = std::collections::HashSet::new();
+    ordered
+        .into_iter()
+        .map(|(_, observed)| observed)
+        .filter(|observed| AgentPolicy::records(agent, observed) && seen.insert(observed.clone()))
+        .map(|observed| Observation {
+            principal: principal.clone(),
+            observed,
+        })
+        .collect()
 }
 
 pub(super) fn capability_of(action: GitAction) -> Action {

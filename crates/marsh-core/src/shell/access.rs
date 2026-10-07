@@ -12,6 +12,8 @@ use marsh_lib::{CheckedAdvance, RecoverPoison as _};
 use nix_observer::unistd::Pid;
 use syscalls::Sysno;
 
+use super::agent::Peer;
+
 /// `IORING_SETUP_SQPOLL`: a kernel thread consumes submissions without any syscall to observe.
 const IORING_SETUP_SQPOLL: u64 = 1 << 1;
 /// `io_uring` operations with no filesystem effect: `NOP`, `POLL_ADD`, `POLL_REMOVE`, `TIMEOUT`,
@@ -28,6 +30,12 @@ pub(super) struct Effects {
     pub recursive_reads: Vec<PathBuf>,
     pub recursive_writes: Vec<PathBuf>,
     pub outside_writes: Vec<PathBuf>,
+    /// Absolute paths outside the source whose contents were read.
+    pub outside_reads: Vec<PathBuf>,
+    /// Programs a successful exec ran, as the call named them.
+    pub execs: Vec<PathBuf>,
+    /// Socket peers a `connect`, `sendto` or `sendmsg` named.
+    pub peers: Vec<Peer>,
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -538,9 +546,26 @@ impl Access {
                     }
                 }
             }
-            Sysno::execve | Sysno::execveat => {
-                if success && let Some(task) = self.tasks.get_mut(&tid) {
+            Sysno::execve | Sysno::execveat if success => {
+                if let Some(task) = self.tasks.get_mut(&tid) {
                     task.mappings = Arc::default();
+                }
+                if let Some(program) = executed_program(info) {
+                    effects.execs.push(program);
+                }
+            }
+            // A nonblocking `connect` that returns `EINPROGRESS` has still begun to connect.
+            Sysno::connect
+                if success
+                    || matches!(info.info.result, RetCode::Err(code) if code == -libc::EINPROGRESS) =>
+            {
+                effects
+                    .peers
+                    .push(info.address.as_deref().map_or(Peer::Unknown, Peer::decode));
+            }
+            Sysno::sendto | Sysno::sendmsg if success => {
+                if let Some(address) = &info.address {
+                    effects.peers.push(Peer::decode(address));
                 }
             }
             _ => {}
@@ -640,8 +665,13 @@ impl Access {
                 if write {
                     effects.writes.push(relative);
                 }
-            } else if write {
-                effects.outside_writes.push(path.clone());
+            } else {
+                if write {
+                    effects.outside_writes.push(path.clone());
+                }
+                if read {
+                    effects.outside_reads.push(path.clone());
+                }
             }
         }
         Ok(())
@@ -854,6 +884,14 @@ fn inherit<T: Clone>(parent: &Arc<Mutex<T>>, shared: bool) -> Arc<Mutex<T>> {
         return Arc::clone(parent);
     }
     Arc::new(Mutex::new(parent.lock().recover().clone()))
+}
+/// The program an exec named: its path argument, or for `AT_EMPTY_PATH` its descriptor's file.
+fn executed_program(info: &Syscall) -> Option<PathBuf> {
+    let index = usize::from(info.info.syscall == Sysno::execveat);
+    match info.path(index) {
+        Some(path) if !path.is_empty() => Some(PathBuf::from(std::ffi::OsStr::from_bytes(path))),
+        _ => info.fd(0).ok().flatten().map(target_path),
+    }
 }
 fn target_path(target: &FileTarget) -> PathBuf {
     PathBuf::from(std::ffi::OsStr::from_bytes(&target.path))

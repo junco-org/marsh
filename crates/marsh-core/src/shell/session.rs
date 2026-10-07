@@ -11,6 +11,7 @@ use marsh_instrument::Tracing;
 use marsh_lib::{CheckedAdvance, RecoverPoison as _};
 use marsh_wal::{CommitOp, Seq};
 
+use super::agent::{Observation, SharedAgentPolicy};
 use super::completion::{Completion, Finalize};
 use super::execution::Run;
 use super::policy::{
@@ -165,6 +166,8 @@ pub(super) struct Authority {
     pub tree_seq: TreeVersion,
     pub versions: HashMap<PathBuf, TreeVersion>,
     pub history: Vec<Event>,
+    /// Unlabelled agent-policy observations, in memory only.
+    pub observations: Vec<Observation>,
     pub recovery_required: bool,
 }
 impl Default for Authority {
@@ -174,6 +177,7 @@ impl Default for Authority {
             tree_seq: TreeVersion::default(),
             versions: HashMap::new(),
             history: Vec::new(),
+            observations: Vec::new(),
             recovery_required: false,
         }
     }
@@ -572,6 +576,8 @@ pub(super) struct ExecutionResources {
     serial: u64,
     /// Notified of every capability decision this shell's commands reach.
     pub policy_observer: Option<Arc<PolicyObserver>>,
+    /// Judges this shell's managed commands' observations.
+    pub agent_policy: Option<SharedAgentPolicy>,
 }
 impl ExecutionResources {
     pub const fn new(
@@ -580,6 +586,7 @@ impl ExecutionResources {
         principal: Principal,
         policy: SandboxPolicy,
         policy_observer: Option<Arc<PolicyObserver>>,
+        agent_policy: Option<SharedAgentPolicy>,
     ) -> Self {
         Self {
             domain,
@@ -590,6 +597,7 @@ impl ExecutionResources {
             coverage,
             serial: 1,
             policy_observer,
+            agent_policy,
         }
     }
 

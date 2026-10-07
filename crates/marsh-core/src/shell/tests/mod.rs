@@ -6,6 +6,7 @@ use super::{SandboxPolicy, Shell, ShellError, ShellErrorKind};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+mod agent_policy;
 mod git_commands;
 mod publication;
 mod reconciliation;

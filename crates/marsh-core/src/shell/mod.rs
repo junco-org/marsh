@@ -17,6 +17,7 @@ pub use brush_interactive::UIOptions;
 use marsh_lib::RecoverPoison as _;
 
 mod access;
+mod agent;
 pub mod builtins;
 mod completion;
 mod error;
@@ -30,6 +31,7 @@ mod signal;
 mod snapshot;
 mod view;
 
+pub use agent::{AgentPolicy, AgentPolicyError, AgentRule, AgentRuleSet};
 pub use error::{ShellError, ShellErrorKind};
 pub use junco_policy::{Action, Principal};
 pub use policy::{Denial, Event, PolicyDecision, PolicyObserver, PolicyValidator};
@@ -52,6 +54,7 @@ pub struct ShellBuilder {
     /// The display name a mux reserved; a standalone shell is named by its principal.
     pub(crate) sandbox_id: Option<ShellId>,
     policy_observer: Option<Arc<PolicyObserver>>,
+    agent_policy: Option<Arc<AgentPolicy>>,
 }
 impl Default for ShellBuilder {
     fn default() -> Self {
@@ -68,6 +71,7 @@ impl Default for ShellBuilder {
             backend: None,
             sandbox_id: None,
             policy_observer: None,
+            agent_policy: None,
         }
     }
 }
@@ -113,6 +117,14 @@ impl ShellBuilder {
     #[must_use]
     pub fn policy_observer(mut self, observer: Option<Arc<PolicyObserver>>) -> Self {
         self.policy_observer = observer;
+        self
+    }
+    /// Judges this shell's managed commands with an agent policy, in the same atomic batch as the
+    /// Git capability policy. Direct-route commands are not observed, so pair this with a
+    /// [`SandboxPolicy`] that keeps the shell on the managed route.
+    #[must_use]
+    pub fn agent_policy(mut self, policy: Option<Arc<AgentPolicy>>) -> Self {
+        self.agent_policy = policy;
         self
     }
     /// Enables normal interactive shell semantics.
@@ -191,6 +203,7 @@ impl ShellBuilder {
             uid.clone(),
             self.policy,
             self.policy_observer,
+            self.agent_policy,
         );
         let executor = MarshExecutor::new();
         let profile = self.options.profile;
@@ -247,6 +260,7 @@ impl ShellBuilder {
         let shell = Shell {
             sandbox,
             shared: Arc::new(Shared {
+                validator: Arc::clone(&resources.domain.validator),
                 live: tokio::sync::Mutex::new(Some(Live {
                     interpreter,
                     resources,
@@ -349,6 +363,8 @@ struct Shared {
     /// The interpreter's spawner and observer; its state names the admitted span's run.
     executor: MarshExecutor,
     runtime: tokio::runtime::Handle,
+    /// The source's shared authority, for operator approvals.
+    validator: Arc<PolicyValidator>,
     busy: AtomicBool,
     closed: AtomicBool,
     force: AtomicBool,
@@ -620,6 +636,14 @@ impl Shell {
     /// Stable policy principal of this shell, independent of its display name.
     pub const fn principal(&self) -> &Principal {
         &self.sandbox.uid
+    }
+    /// Records this shell's principal approving `label` for every agent policy on its source:
+    /// an operator action, outside any command, that [`AgentRule::requires_approval`] and the
+    /// other approval-gated rules consult.
+    pub fn approve(&self, label: impl Into<String>) -> Result<(), ShellError> {
+        self.shared
+            .validator
+            .approve(self.sandbox.uid.clone(), label)
     }
     /// Canonical source root: the Git work-tree root, or the initial directory outside one.
     pub fn source_dir(&self) -> &Path {
@@ -904,8 +928,12 @@ impl Shared {
             );
         }
         let session = Arc::clone(&executed.prepared.snapshot.session);
-        let authorized =
-            policy::authorize(&session, executed, resources.policy_observer.as_deref())?;
+        let authorized = policy::authorize(
+            &session,
+            executed,
+            resources.policy_observer.as_deref(),
+            resources.agent_policy.as_deref(),
+        )?;
         publication::commit(authorized)
     }
     async fn conclude_direct(
