@@ -656,11 +656,13 @@ impl ShellIo {
             builtins::RMUX_IO_BUILTIN.to_string(),
             builtins::registration(),
         );
+        let agent = crate::agent_env::AgentEnvironment::from_env()?;
         let profile = marsh_core::shellmux::MuxProfile {
             environment,
             builtins,
-            sandbox_policy: marsh_core::SandboxPolicy::default(),
-            policy_observer: None,
+            sandbox_policy: agent.sandbox_policy,
+            policy_observer: agent.policy_observer,
+            agent_policy: agent.agent_policy,
         };
 
         let mux = create_mux(profile, Arc::new(std::sync::Mutex::new(frontend)))?;

@@ -336,3 +336,22 @@ fn a_denied_batch_reports_every_denial() {
         .unwrap_err();
     assert_eq!(denials.len(), 2);
 }
+
+#[test]
+fn audit_reports_would_be_denials_without_enforcing_them() {
+    let reported = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = Arc::clone(&reported);
+    let observer = PolicyObserver::new(move |event, decision| {
+        if !matches!(decision, PolicyDecision::Grant) {
+            sink.lock().unwrap().push(event.resource.to_string());
+        }
+    });
+    let policy = AgentPolicy::recommended().unwrap().audit();
+    let batch = [
+        path("a", PathAction::Read, ".env"),
+        connect("a", external()),
+        connect("a", external()),
+    ];
+    assert!(policy.check(&[], &batch, Some(&observer)).is_ok());
+    assert_eq!(*reported.lock().unwrap(), ["net/external", "net/external"]);
+}

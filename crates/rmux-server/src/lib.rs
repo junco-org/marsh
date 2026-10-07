@@ -4,6 +4,7 @@
 
 //! Tokio-based detached RPC server for RMUX.
 
+mod agent_env;
 mod automatic_rename;
 mod buffer_file_io;
 mod client_flags;

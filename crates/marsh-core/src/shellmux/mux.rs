@@ -145,7 +145,8 @@ impl ShellMux {
             .external_cmd_leads_session(true)
             .enable_option("monitor".into())
             .sandbox_policy(policy)
-            .policy_observer(self.profile.policy_observer.clone());
+            .policy_observer(self.profile.policy_observer.clone())
+            .agent_policy(self.profile.agent_policy.clone());
         if let Some(environment) = environment {
             builder = builder.environment(environment);
         } else {

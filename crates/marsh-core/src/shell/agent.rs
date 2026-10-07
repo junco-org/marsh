@@ -207,6 +207,7 @@ pub struct AgentPolicy {
     outside: Vec<(Pattern, String)>,
     networks: Vec<(Network, String)>,
     rules: Vec<AgentRule>,
+    audit: bool,
 }
 impl fmt::Debug for AgentPolicy {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -215,6 +216,7 @@ impl fmt::Debug for AgentPolicy {
             .field("outside", &self.outside)
             .field("networks", &self.networks)
             .field("rules", &self.rules.len())
+            .field("audit", &self.audit)
             .finish()
     }
 }
@@ -353,6 +355,14 @@ impl AgentPolicy {
         Ok(self)
     }
 
+    /// Reports every decision to the shell's [`PolicyObserver`] but never denies: a would-be
+    /// denial is recorded as granted. For measuring a policy's false denials on unmodified runs.
+    #[must_use]
+    pub const fn audit(mut self) -> Self {
+        self.audit = true;
+        self
+    }
+
     /// Appends a rule or a constructor's rule set. Rules apply in order and the first violation
     /// is reported.
     #[must_use]
@@ -453,7 +463,8 @@ impl AgentPolicy {
     }
 
     /// Checks `batch` in order against the labelled `history`, as one atomic decision. Every
-    /// decision is reported to `observer`; on any denial, every denial is returned.
+    /// decision is reported to `observer`; on any denial, every denial is returned, unless this
+    /// policy only audits.
     pub(super) fn check(
         &self,
         history: &[Observation],
@@ -481,6 +492,7 @@ impl AgentPolicy {
             }
             match decision {
                 PolicyDecision::Grant => labelled.push(event),
+                PolicyDecision::Deny { .. } if self.audit => labelled.push(event),
                 PolicyDecision::Deny {
                     failed_precondition,
                     allowed_fixes,

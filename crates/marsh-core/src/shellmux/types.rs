@@ -225,6 +225,8 @@ pub struct MuxProfile {
     /// Notified of every capability decision any shell of this mux reaches; see
     /// [`crate::PolicyObserver`].
     pub policy_observer: Option<std::sync::Arc<crate::PolicyObserver>>,
+    /// The agent policy every shell of this mux is judged by; see [`crate::AgentPolicy`].
+    pub agent_policy: Option<std::sync::Arc<crate::AgentPolicy>>,
 }
 
 impl std::fmt::Debug for MuxProfile {
@@ -236,6 +238,7 @@ impl std::fmt::Debug for MuxProfile {
             .field("variables", &self.environment.iter().count())
             .field("builtins", &names)
             .field("policy_observer", &self.policy_observer.is_some())
+            .field("agent_policy", &self.agent_policy)
             .finish_non_exhaustive()
     }
 }
