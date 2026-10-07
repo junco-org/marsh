@@ -52,6 +52,10 @@ pub struct Syscall {
     /// ring's layout is known and its memory was readable.
     #[serde(default)]
     pub submissions: Option<Vec<u8>>,
+    /// For `connect`, `sendto` and `sendmsg`: the peer `sockaddr` bytes the call names, bounded
+    /// to `sockaddr_storage`. `None` when the call names no peer or it was unreadable.
+    #[serde(default)]
+    pub address: Option<Vec<u8>>,
 }
 
 impl Syscall {

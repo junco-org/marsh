@@ -23,6 +23,8 @@ pub(crate) const PATH_LIMIT: usize = 4096;
 /// terminating NULs included.
 const EXEC_CAPTURE_LIMIT: usize = 8 * 1024 * 1024;
 const WORD: u64 = std::mem::size_of::<libc::c_long>() as u64;
+/// `sizeof(struct sockaddr_storage)`: no peer address the kernel accepts is longer.
+const SOCKADDR_LIMIT: u64 = 128;
 
 /// Only added role information: the native value and scalar/pointer vocabulary stay upstream.
 struct Roles {
@@ -98,6 +100,7 @@ pub(crate) struct Captured {
     cwd: Option<FileTarget>,
     flags: Option<u64>,
     submissions: Option<Vec<u8>>,
+    address: Option<Vec<u8>>,
     failure: Option<io::Error>,
     /// For a selected exec: what it runs, or why that could not be read. Only an exec that
     /// succeeds ever needs it.
@@ -119,6 +122,7 @@ impl Captured {
             cwd: None,
             flags: None,
             submissions: None,
+            address: None,
             failure: None,
             exec: None,
         };
@@ -184,6 +188,21 @@ impl Captured {
             };
             captured.flags = captured.keep(result);
         }
+        let address = match syscall {
+            Sysno::connect => Some(read_sockaddr(
+                tid,
+                get_arg_value(registers, 1),
+                get_arg_value(registers, 2),
+            )),
+            Sysno::sendto if get_arg_value(registers, 4) != 0 => Some(read_sockaddr(
+                tid,
+                get_arg_value(registers, 4),
+                get_arg_value(registers, 5),
+            )),
+            Sysno::sendmsg => read_message_name(tid, get_arg_value(registers, 1)).transpose(),
+            _ => None,
+        };
+        captured.address = address.and_then(|address| captured.keep(address));
         Ok(captured)
     }
 
@@ -324,6 +343,7 @@ impl Captured {
             descriptors: self.descriptors,
             flags: self.flags,
             submissions: self.submissions,
+            address: self.address,
         })
     }
 }
@@ -430,6 +450,37 @@ pub(crate) fn read_bytes(
 )]
 pub(crate) const fn native_usize(value: u64) -> usize {
     value as usize
+}
+
+/// Reads a peer `sockaddr` of `length` bytes, bounded to `sockaddr_storage`.
+fn read_sockaddr(tid: Pid, address: u64, length: u64) -> io::Result<Vec<u8>> {
+    let wanted = native_usize(length.min(SOCKADDR_LIMIT));
+    let mut bytes = Vec::with_capacity(wanted);
+    if wanted == 0 {
+        return Ok(bytes);
+    }
+    read_bytes(tid, address, "sockaddr wraps the address space", |byte| {
+        bytes.push(byte);
+        Ok(bytes.len() < wanted)
+    })?;
+    Ok(bytes)
+}
+
+/// Reads the peer address a `sendmsg` header names: `None` when `msg_name` is null, as on a
+/// connected socket whose peer its `connect` already named.
+fn read_message_name(tid: Pid, header: u64) -> io::Result<Option<Vec<u8>>> {
+    // `struct msghdr` begins with `void *msg_name; socklen_t msg_namelen;` on every 64-bit ABI.
+    let mut prefix = Vec::with_capacity(12);
+    read_bytes(tid, header, "msghdr wraps the address space", |byte| {
+        prefix.push(byte);
+        Ok(prefix.len() < 12)
+    })?;
+    let name = u64::from_ne_bytes(prefix[..8].try_into().map_err(io::Error::other)?);
+    let length = u32::from_ne_bytes(prefix[8..12].try_into().map_err(io::Error::other)?);
+    if name == 0 {
+        return Ok(None);
+    }
+    read_sockaddr(tid, name, u64::from(length)).map(Some)
 }
 
 pub(crate) fn read_path(tid: Pid, address: u64) -> io::Result<Vec<u8>> {
