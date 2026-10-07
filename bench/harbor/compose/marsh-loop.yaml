@@ -1,0 +1,7 @@
+# Run-level override for hosts without a btrfs filesystem to bind-mount: each trial formats a
+# sparse btrfs loop image inside its container. Requires privileged containers.
+services:
+  main:
+    privileged: true
+    volumes:
+      - ${MARSH_BUNDLE:?set MARSH_BUNDLE to the bundle from build-bundle.sh}:/opt/marsh:ro

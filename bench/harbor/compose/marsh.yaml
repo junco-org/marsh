@@ -1,0 +1,15 @@
+# Run-level override: `harbor run --extra-docker-compose bench/harbor/compose/marsh.yaml`.
+#
+# MARSH_BUNDLE: the directory build-bundle.sh produced.
+# MARSH_STORE: a host directory on a btrfs filesystem mounted with user_subvol_rm_allowed.
+#   Every trial creates its own subvolume under it; remove them after a run
+#   (see README.md).
+services:
+  main:
+    volumes:
+      - ${MARSH_BUNDLE:?set MARSH_BUNDLE to the bundle from build-bundle.sh}:/opt/marsh:ro
+      - ${MARSH_STORE:?set MARSH_STORE to a btrfs directory (user_subvol_rm_allowed)}:/marsh-store
+    # Marsh traces its own descendants with ptrace; Docker's default seccomp profile allows that
+    # on Linux 4.8+, and the capability covers older engines.
+    cap_add:
+      - SYS_PTRACE

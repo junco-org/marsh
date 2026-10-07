@@ -1,0 +1,24 @@
+#!/bin/sh
+# tmux, as far as Terminus-2 can tell: forwards to rmux.
+#
+# Terminus-2 starts its pane with the command 'bash --login'. In rmux that would run the whole
+# session as ONE marsh command, so nothing would be published or judged until bash exited. The
+# argument is dropped: a commandless rmux pane is a marsh shell that runs each line on its own.
+set -eu
+if [ -r /etc/marsh.env ]; then
+    set -a
+    . /etc/marsh.env
+    set +a
+fi
+if [ "${1:-}" = new-session ] || [ "${1:-}" = new ]; then
+    dropped=
+    for argument do
+        shift
+        if [ -z "$dropped" ] && [ "$argument" = "bash --login" ]; then
+            dropped=1
+            continue
+        fi
+        set -- "$@" "$argument"
+    done
+fi
+exec /opt/marsh/bin/rmux "$@"
