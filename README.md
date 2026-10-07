@@ -215,6 +215,41 @@ bound inside the view being left are revoked rather than reopened elsewhere, and
 parameters carrying a descriptor into a private view are refused. On the direct route, builtin
 context I/O and `git` act on the source natively.
 
+### Agent policies
+
+`ShellBuilder::agent_policy` (and `MuxProfile::agent_policy`) judges a shell's managed commands
+by what they were observed doing. The checks run in the same atomic batch as the Git policy and
+roll back with it. Each observation gets labels, as follows:
+* source paths: first-match glob classes, `other` when nothing matches;
+* paths outside the source: absolute or `~/` globs, and recorded only when one matches;
+* executed programs, by basename;
+* socket peers: `unix`, `loopback`, a declared CIDR's label, `external` or `unknown`;
+* operator approvals recorded with `Shell::approve`.
+
+`AgentRule`s are junco-policy past-regexes over that labelled stream, which each source shares
+across all of its shells. The presets are:
+* no egress after reading a secret;
+* approval-gated classes;
+* tests locked once the same principal changed `src`;
+* taint by downloaders;
+* append-only classes;
+* deletion budgets.
+
+`AgentPolicy::recommended()` combines them over a default class table. `AgentPolicy::audit()`
+reports would-be denials without enforcing them.
+
+Two limits apply. Enforcement happens at publication, so a denied connection has already been
+attempted, and effects outside the source are not rolled back. Observations live in memory and
+are not recovered from the WAL.
+
+The `rmux` daemon reads two environment variables when it starts:
+* `MARSH_AGENT_POLICY=sandbox|audit|recommended` routes every pane through the managed route
+  and selects the policy;
+* `MARSH_POLICY_LOG=<file>` appends each denial as a JSON line.
+
+[`bench/harbor`](bench/harbor/README.md) uses both to run Harbor benchmarks such as
+Terminal-Bench through rmux.
+
 ### Native builtins
 
 Use `marsh::builtins::{builtin, simple_builtin, decl_builtin, raw_arg_builtin}` with Brush's existing
