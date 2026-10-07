@@ -75,7 +75,7 @@ brush-builtins.workspace = true
 marsh-btrfs = { path = "crates/marsh-btrfs", features = ["fake"] }
 marsh-wal = { path = "crates/marsh-wal" }
 # Routing predicates that query a source's shared authority name its events directly.
-junco-policy = { git = "https://github.com/junco-org/junco-policy.git" }
+junco-policy = { git = "https://github.com/zachary-kent/junco-policy.git", branch = "feat/trace-policy" }
 # The WAL smoke's own transaction metadata derives its serde implementations.
 serde = { version = "1", features = ["derive"] }
 git2 = { version = "0.21", default-features = false, features = ["vendored-libgit2"] }
@@ -131,11 +131,6 @@ rmux-web-crypto = { version = "=0.10.0", git = "https://github.com/Helvesec/rmux
 brush-core = { path = "crates/brush-core" }
 brush-interactive = { path = "crates/brush-interactive" }
 rmux-server = { path = "crates/rmux-server" }
-
-# TEMPORARY: junco-policy `feat/trace-policy` (TracePolicy) is not yet pushed. Replace with
-# `branch = "feat/trace-policy"` on the git dependency once it is, then drop this patch.
-[patch."https://github.com/junco-org/junco-policy.git"]
-junco-policy = { path = "../junco-policy" }
 
 [workspace.lints.rust]
 warnings = { level = "deny" }
