@@ -212,7 +212,6 @@ impl std::fmt::Debug for CommandOptions {
 }
 
 /// Ordinary shell configuration applied independently to every shell built by this mux.
-#[derive(Default)]
 pub struct MuxProfile {
     /// Variables seeded into every shell, on top of what the process inherited.
     pub environment: brush_core::env::ShellEnvironment,
@@ -222,9 +221,23 @@ pub struct MuxProfile {
     pub builtins: HashMap<String, crate::builtins::Registration>,
     /// The routing policy every shell of this mux is built with; each shell gets its own clone.
     pub sandbox_policy: crate::SandboxPolicy,
+    /// The authorization policy every shell of this mux shares.
+    pub shell_policy: std::sync::Arc<dyn crate::Policy>,
     /// Notified of every capability decision any shell of this mux reaches; see
     /// [`crate::PolicyObserver`].
     pub policy_observer: Option<std::sync::Arc<crate::PolicyObserver>>,
+}
+
+impl Default for MuxProfile {
+    fn default() -> Self {
+        Self {
+            environment: brush_core::env::ShellEnvironment::default(),
+            builtins: HashMap::default(),
+            sandbox_policy: crate::SandboxPolicy::default(),
+            shell_policy: std::sync::Arc::new(crate::GitPolicy),
+            policy_observer: None,
+        }
+    }
 }
 
 impl std::fmt::Debug for MuxProfile {

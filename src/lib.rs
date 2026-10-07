@@ -19,10 +19,11 @@
 //! ```
 
 pub use marsh_core::{
-    Action, CommandContext, Denial, ExecutionParameters, ExecutionResult, MarshTool, OpenFile,
-    PolicyValidator, Principal, ProfileLoadBehavior, RcLoadBehavior, SandboxPolicy, Shell,
-    ShellBuilder, ShellCommand, ShellEnvironment, ShellError, ShellErrorKind, ShellFd,
-    ShellVariable, Signal, SourceInfo, UIOptions, builtins, shellmux,
+    Action, Bump, CommandContext, Denial, EmptyPolicy, Event, ExecutionParameters,
+    ExecutionResult, GitPolicy, MarshTool, OpenFile, Policy, PolicyDecision, PolicyValidator,
+    Principal, ProfileLoadBehavior, RcLoadBehavior, SandboxPolicy, Shell, ShellBuilder,
+    ShellCommand, ShellEnvironment, ShellError, ShellErrorKind, ShellFd, ShellVariable, Signal,
+    SourceInfo, UIOptions, builtins, shellmux,
 };
 
 pub mod rmux;

@@ -14,7 +14,7 @@ use marsh_wal::{CommitOp, Seq};
 use super::completion::{Completion, Finalize};
 use super::execution::Run;
 use super::policy::{
-    Action, Event, PolicyObserver, PolicyValidator, Principal, Resource, resource_of,
+    Action, Event, Policy, PolicyObserver, PolicyValidator, Principal, Resource, resource_of,
 };
 use super::sandbox_policy::{CommandContext, SandboxPolicy};
 use super::snapshot::{CommandNumber, Snapshot};
@@ -570,6 +570,8 @@ pub(super) struct ExecutionResources {
     pub snapshot: Option<Arc<Snapshot>>,
     pub coverage: PathBuf,
     serial: u64,
+    /// The authorization policy every managed command of this shell is checked against.
+    pub shell_policy: Arc<dyn Policy>,
     /// Notified of every capability decision this shell's commands reach.
     pub policy_observer: Option<Arc<PolicyObserver>>,
 }
@@ -579,6 +581,7 @@ impl ExecutionResources {
         coverage: PathBuf,
         principal: Principal,
         policy: SandboxPolicy,
+        shell_policy: Arc<dyn Policy>,
         policy_observer: Option<Arc<PolicyObserver>>,
     ) -> Self {
         Self {
@@ -589,6 +592,7 @@ impl ExecutionResources {
             snapshot: None,
             coverage,
             serial: 1,
+            shell_policy,
             policy_observer,
         }
     }

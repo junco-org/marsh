@@ -32,7 +32,10 @@ mod view;
 
 pub use error::{ShellError, ShellErrorKind};
 pub use junco_policy::{Action, Principal};
-pub use policy::{Denial, Event, PolicyDecision, PolicyObserver, PolicyValidator};
+pub use policy::{
+    Bump, Denial, EmptyPolicy, Event, GitPolicy, Policy, PolicyDecision, PolicyObserver,
+    PolicyValidator,
+};
 pub use sandbox_policy::{CommandContext, MarshTool, SandboxPolicy, ShellCommand};
 pub use signal::Signal;
 
@@ -52,6 +55,8 @@ pub struct ShellBuilder {
     /// The display name a mux reserved; a standalone shell is named by its principal.
     pub(crate) sandbox_id: Option<ShellId>,
     policy_observer: Option<Arc<PolicyObserver>>,
+    /// Unset means [`GitPolicy`], resolved once in `build`.
+    shell_policy: Option<Arc<dyn Policy>>,
 }
 impl Default for ShellBuilder {
     fn default() -> Self {
@@ -68,6 +73,7 @@ impl Default for ShellBuilder {
             backend: None,
             sandbox_id: None,
             policy_observer: None,
+            shell_policy: None,
         }
     }
 }
@@ -113,6 +119,13 @@ impl ShellBuilder {
     #[must_use]
     pub fn policy_observer(mut self, observer: Option<Arc<PolicyObserver>>) -> Self {
         self.policy_observer = observer;
+        self
+    }
+    /// Selects the authorization policy this shell's managed commands are checked against.
+    /// Without one, the shell uses [`GitPolicy`].
+    #[must_use]
+    pub fn shell_policy(mut self, policy: Arc<dyn Policy>) -> Self {
+        self.shell_policy = Some(policy);
         self
     }
     /// Enables normal interactive shell semantics.
@@ -190,6 +203,7 @@ impl ShellBuilder {
             discovered.coverage,
             uid.clone(),
             self.policy,
+            self.shell_policy.unwrap_or_else(|| Arc::new(GitPolicy)),
             self.policy_observer,
         );
         let executor = MarshExecutor::new();
@@ -904,8 +918,12 @@ impl Shared {
             );
         }
         let session = Arc::clone(&executed.prepared.snapshot.session);
-        let authorized =
-            policy::authorize(&session, executed, resources.policy_observer.as_deref())?;
+        let authorized = policy::authorize(
+            &session,
+            executed,
+            resources.shell_policy.as_ref(),
+            resources.policy_observer.as_deref(),
+        )?;
         publication::commit(authorized)
     }
     async fn conclude_direct(
