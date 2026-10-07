@@ -132,6 +132,11 @@ brush-core = { path = "crates/brush-core" }
 brush-interactive = { path = "crates/brush-interactive" }
 rmux-server = { path = "crates/rmux-server" }
 
+# TEMPORARY: junco-policy `feat/trace-policy` (TracePolicy) is not yet pushed. Replace with
+# `branch = "feat/trace-policy"` on the git dependency once it is, then drop this patch.
+[patch."https://github.com/junco-org/junco-policy.git"]
+junco-policy = { path = "../junco-policy" }
+
 [workspace.lints.rust]
 warnings = { level = "deny" }
 future_incompatible = { level = "deny" }
