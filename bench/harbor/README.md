@@ -78,8 +78,10 @@ lost, lost with a denial, and gained, followed by a table of denied capabilities
 * **Effects outside the working directory.** Only the working directory is a marsh source.
   Writes elsewhere (for example `pip install` into `/usr`) are traced and visible to policies,
   but they are not rolled back.
-* **Publish-time enforcement.** A denied network connection has already been attempted. What
-  the denial stops is publication of the command's working-directory effects.
+* **Network rules block at the syscall, file rules at publication.** A refused
+  `connect`/`send*` never reaches the kernel; the agent's program sees `EPERM`. File-class
+  rules refuse a command's working-directory effects when it is published. Effects outside the
+  working directory are not rolled back.
 * **Unsupported effects are refused, not approximated.** For example FIFOs, special files, and
   some `io_uring` uses. A task that needs them fails under every marsh configuration, and the
   `sandbox` row shows this cost separately from the policy's.

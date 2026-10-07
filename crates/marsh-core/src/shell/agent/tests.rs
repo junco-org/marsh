@@ -355,3 +355,40 @@ fn audit_reports_would_be_denials_without_enforcing_them() {
     assert!(policy.check(&[], &batch, Some(&observer)).is_ok());
     assert_eq!(*reported.lock().unwrap(), ["net/external", "net/external"]);
 }
+
+#[test]
+fn deciding_now_judges_only_the_candidate() {
+    let policy = AgentPolicy::recommended().unwrap();
+    let ci = path("a", PathAction::Edit, ".github/workflows/ci.yml");
+    let read = path("a", PathAction::Read, ".env");
+    // An unapproved CI edit earlier in the command is publication's to refuse, not the peer's.
+    assert_eq!(
+        policy.decide_now(&[], std::slice::from_ref(&ci), &connect("a", external())),
+        None
+    );
+    let denial = policy
+        .decide_now(&[], &[ci, read.clone()], &connect("a", external()))
+        .unwrap();
+    assert_eq!(denial.event.resource.to_string(), "net/external");
+    assert!(
+        policy
+            .decide_now(
+                std::slice::from_ref(&read),
+                &[],
+                &connect("a", Peer::Unknown)
+            )
+            .is_some()
+    );
+    assert_eq!(
+        policy.decide_now(
+            std::slice::from_ref(&read),
+            &[],
+            &connect("a", Peer::Ip("127.0.0.1:5432".parse().unwrap()))
+        ),
+        None
+    );
+    assert_eq!(
+        policy.decide_now(&[read], &[], &connect("b", external())),
+        None
+    );
+}

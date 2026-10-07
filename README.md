@@ -238,9 +238,14 @@ across all of its shells. The presets are:
 `AgentPolicy::recommended()` combines them over a default class table. `AgentPolicy::audit()`
 reports would-be denials without enforcing them.
 
-Two limits apply. Enforcement happens at publication, so a denied connection has already been
-attempted, and effects outside the source are not rolled back. Observations live in memory and
-are not recovered from the WAL.
+Socket peers are judged while the command runs. At the entry of each `connect`, `sendto`,
+`sendmsg` and `sendmmsg`, and of each `io_uring_enter` submitting network operations, the tracer
+asks the policy about the named peer. It decides against committed history plus what the command
+has done so far. A refused call is skipped by the kernel and fails with `EPERM`, implemented on
+x86-64 only; elsewhere a refusal fails the command instead.
+
+Everything else is judged at publication, atomically with the Git policy. Effects outside the
+source are not rolled back. Observations live in memory and are not recovered from the WAL.
 
 The `rmux` daemon reads two environment variables when it starts:
 * `MARSH_AGENT_POLICY=sandbox|audit|recommended` routes every pane through the managed route

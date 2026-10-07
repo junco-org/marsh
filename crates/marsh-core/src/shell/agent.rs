@@ -20,11 +20,22 @@
 //! | socket peer contacted | `Edit` | `["net", class]` |
 //! | operator approval | `Stage` | `["approve", label]` |
 //!
-//! Enforcement happens when a managed command's effects are published, so it governs what reaches
-//! the source and what later commands may do. A denied `connect` has already been attempted, and
-//! writes outside the source are not rolled back; the denial refuses the command's source effects
-//! and keeps them out of history. Observations are kept in memory for the source's lifetime and
-//! are not recovered from the WAL.
+//! Rules are enforced at two points:
+//!
+//! * **At the syscall, for socket peers.** At the entry of every `connect`, `sendto`, `sendmsg` and
+//!   `sendmmsg`, the tracer asks the policy about each peer the call names. It also asks at every
+//!   `io_uring_enter` that submits network operations or whose submissions it cannot read; there
+//!   the peer is `unknown`. The policy decides against committed history plus what the command
+//!   has done so far. A refused call never reaches the kernel: the task sees `EPERM`, and the rest
+//!   of the command proceeds normally. The tracer reads the address at entry, so another thread of
+//!   the tracee could rewrite it before the kernel copies it; this blocks what the call names,
+//!   not what a racing thread substitutes. Blocking rewrites the syscall number, implemented on
+//!   x86-64 only; elsewhere a refused call fails the command's observation instead.
+//! * **At publication, for everything.** The command's whole batch of observations is checked
+//!   atomically with the Git policy. A denial refuses the command's source effects and keeps them
+//!   out of history. Writes outside the source are not rolled back.
+//!
+//! Observations are kept in memory for the source's lifetime and are not recovered from the WAL.
 
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
@@ -32,12 +43,17 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use std::collections::hash_map::Entry;
+use std::collections::{HashMap, HashSet};
+
 use glob::{MatchOptions, Pattern};
 use junco_policy::{
-    AtomPattern, Bump, Comparison, ComponentPattern, Head, PolicyDecision, RegexExpr, Rule,
-    RuleMode, TestExpr, TracePolicy, TraceRule,
+    AtomPattern, Bump, Comparison, CompileError, ComponentPattern, Head, PolicyDecision, RegexExpr,
+    Rule, RuleMode, TestExpr, TracePolicy, TraceRule,
 };
+use marsh_instrument::InvocationId;
 
+use super::access::Effects;
 use super::policy::{Action, Denial, Event, PolicyObserver, Principal, Resource};
 
 const PRINCIPAL: &str = "p";
@@ -462,6 +478,15 @@ impl AgentPolicy {
         ))
     }
 
+    /// The rules whose head can match `event`; no other rule can judge it.
+    fn firing(&self, event: &Event) -> Vec<TraceRule> {
+        self.rules
+            .iter()
+            .filter(|rule| could_fire(&rule.0.rule.head, event))
+            .map(|rule| rule.0.clone())
+            .collect()
+    }
+
     /// Checks `batch` in order against the labelled `history`, as one atomic decision. Every
     /// decision is reported to `observer`; on any denial, every denial is returned, unless this
     /// policy only audits.
@@ -475,18 +500,19 @@ impl AgentPolicy {
             return Ok(());
         }
         let arena = Bump::new();
-        let mut policy = TracePolicy::new(&arena, self.rules.iter().map(|rule| rule.0.clone()))
-            .map_err(|error| {
-                vec![Denial {
-                    event: Event::new("agent-policy", Action::Read, Resource::new(["rules"])),
-                    failed_precondition: format!("agent policy does not compile: {error}"),
-                    allowed_fixes: Vec::new(),
-                }]
-            })?;
+        // Each distinct candidate compiles only the rules that can judge it, once per batch.
+        let mut judges: HashMap<Event, TracePolicy<'_>> = HashMap::new();
         let mut labelled: Vec<Event> = history.iter().filter_map(|o| self.label(o)).collect();
         let mut denials = Vec::new();
         for event in batch.iter().filter_map(|o| self.label(o)) {
-            let decision = policy.decide(&labelled, &event);
+            let judge = match judges.entry(event.clone()) {
+                Entry::Occupied(judge) => judge.into_mut(),
+                Entry::Vacant(slot) => slot.insert(
+                    TracePolicy::new(&arena, self.firing(&event))
+                        .map_err(|error| vec![uncompiled(&error)])?,
+                ),
+            };
+            let decision = judge.decide(&labelled, &event);
             if let Some(observer) = observer {
                 observer.notify(&event, &decision);
             }
@@ -509,6 +535,139 @@ impl AgentPolicy {
             Err(denials)
         }
     }
+
+    /// Decides `candidate` now, while its command still runs: against the committed `history`
+    /// and the command's own `prior` observations, which are not yet granted. Returns the denial,
+    /// if any; an auditing policy's denial is the caller's to report, not to enforce.
+    pub(super) fn decide_now(
+        &self,
+        history: &[Observation],
+        prior: &[Observation],
+        candidate: &Observation,
+    ) -> Option<Denial> {
+        let event = self.label(candidate)?;
+        let rules = self.firing(&event);
+        if rules.is_empty() {
+            return None;
+        }
+        let arena = Bump::new();
+        let mut judge = match TracePolicy::new(&arena, rules) {
+            Ok(judge) => judge,
+            Err(error) => return Some(uncompiled(&error)),
+        };
+        let labelled: Vec<Event> = history
+            .iter()
+            .chain(prior)
+            .filter_map(|o| self.label(o))
+            .collect();
+        match judge.decide(&labelled, &event) {
+            PolicyDecision::Grant => None,
+            PolicyDecision::Deny {
+                failed_precondition,
+                allowed_fixes,
+            } => Some(Denial {
+                event,
+                failed_precondition,
+                allowed_fixes,
+            }),
+        }
+    }
+
+    /// Whether this policy reports denials without enforcing them.
+    pub(super) const fn audits(&self) -> bool {
+        self.audit
+    }
+}
+
+/// The denial every candidate gets when a caller-built rule does not compile.
+fn uncompiled(error: &CompileError) -> Denial {
+    Denial {
+        event: Event::new("agent-policy", Action::Read, Resource::new(["rules"])),
+        failed_precondition: format!("agent policy does not compile: {error}"),
+        allowed_fixes: Vec::new(),
+    }
+}
+
+/// Whether `head` can match `event`: every constant component equals the event's.
+fn could_fire(head: &Head, event: &Event) -> bool {
+    let principal = match &head.principal {
+        ComponentPattern::Constant(principal) => *principal == event.principal,
+        ComponentPattern::Variable(_) => true,
+    };
+    let action = match &head.action {
+        ComponentPattern::Constant(action) => *action == event.action,
+        ComponentPattern::Variable(_) => true,
+    };
+    let resource = match &head.resource {
+        ComponentPattern::Constant(resource) => *resource == event.resource,
+        ComponentPattern::Variable(_) => true,
+    };
+    principal && action && resource
+}
+
+/// One command's observations so far, in execution order and each recorded once. `write`
+/// classifies a source path the command wrote, or drops it (`None`) when it left no change.
+pub(super) fn observations(
+    effects: &[(u64, Option<InvocationId>, Effects)],
+    principal: &Principal,
+    agent: Option<&AgentPolicy>,
+    write: impl Fn(&Path) -> Option<PathAction>,
+) -> Vec<Observation> {
+    let metadata = |path: &Path| {
+        path.as_os_str().is_empty()
+            || path
+                .components()
+                .any(|component| component.as_os_str() == ".git")
+    };
+    let mut ordered = Vec::new();
+    for (order, _, effects) in effects {
+        let mut push = |observed| ordered.push((*order, observed));
+        for path in effects.reads.iter().filter(|path| !metadata(path)) {
+            push(Observed::Path {
+                action: PathAction::Read,
+                path: path.clone(),
+                inside: true,
+            });
+        }
+        for path in effects.writes.iter().filter(|path| !metadata(path)) {
+            if let Some(action) = write(path) {
+                push(Observed::Path {
+                    action,
+                    path: path.clone(),
+                    inside: true,
+                });
+            }
+        }
+        for (paths, action) in [
+            (&effects.outside_reads, PathAction::Read),
+            (&effects.outside_writes, PathAction::Edit),
+        ] {
+            for path in paths {
+                push(Observed::Path {
+                    action,
+                    path: path.clone(),
+                    inside: false,
+                });
+            }
+        }
+        for program in &effects.execs {
+            push(Observed::Exec(program.clone()));
+        }
+        for peer in &effects.peers {
+            push(Observed::Connect(peer.clone()));
+        }
+    }
+    ordered.sort_by_key(|(order, _)| *order);
+    let mut seen = HashSet::new();
+    ordered
+        .into_iter()
+        .map(|(_, observed)| observed)
+        .filter(|observed| AgentPolicy::records(agent, observed) && seen.insert(observed.clone()))
+        .map(|observed| Observation {
+            principal: principal.clone(),
+            observed,
+        })
+        .collect()
 }
 
 /// One rule of an [`AgentPolicy`]: a junco-policy past-regex over labelled observations.

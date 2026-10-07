@@ -12,10 +12,12 @@ use marsh_instrument::{
 use marsh_lib::RecoverPoison as _;
 
 use super::access::{Access, Effects};
+use super::agent::{self, AgentPolicy, Observation, Observed, PathAction, Peer};
 use super::builtins::gitcmd::GitAction;
 use super::builtins::gitexec::{self, Runner};
 use super::completion::{Completion, Finalize};
 use super::execution::Run;
+use super::policy::{PolicyDecision, PolicyObserver};
 use super::session::Session;
 use super::{Principal, ShellError};
 
@@ -40,6 +42,10 @@ pub(super) struct Snapshot {
     reclaimed: AtomicBool,
     deferred: Mutex<Vec<PathBuf>>,
     pub state: Mutex<SnapshotState>,
+    /// Judges socket peers while commands run, before the call reaches the kernel.
+    agent: Option<Arc<AgentPolicy>>,
+    /// Notified of each peer the agent policy refuses (or, auditing, would refuse).
+    observer: Option<Arc<PolicyObserver>>,
 }
 
 pub(super) struct SnapshotState {
@@ -54,7 +60,12 @@ pub(super) struct SnapshotState {
 }
 
 impl Snapshot {
-    pub fn new(session: Arc<Session>, uid: Principal) -> Result<Arc<Self>, ShellError> {
+    pub fn new(
+        session: Arc<Session>,
+        uid: Principal,
+        agent: Option<Arc<AgentPolicy>>,
+        observer: Option<Arc<PolicyObserver>>,
+    ) -> Result<Arc<Self>, ShellError> {
         session.check()?;
         let path = session.persistence.work(uid.as_str());
         let authority = session.validator.read();
@@ -82,6 +93,8 @@ impl Snapshot {
                 evidence: None,
                 runners: HashMap::new(),
             }),
+            agent,
+            observer,
         });
         let weak = Arc::downgrade(&snapshot);
         let (select, begin, end) = (weak.clone(), weak.clone(), weak.clone());
@@ -116,6 +129,16 @@ impl Snapshot {
             .root
             .set(root)
             .map_err(|_| ShellError::infrastructure("snapshot registered twice"))?;
+        if snapshot.agent.is_some() {
+            let gate = Arc::downgrade(&snapshot);
+            snapshot.session.tracing.gate_peers(
+                root,
+                Arc::new(move |run, _, peer| {
+                    gate.upgrade()
+                        .is_none_or(|snapshot| snapshot.permits_peer(run, peer))
+                }),
+            )?;
+        }
         snapshot
             .session
             .snapshots
@@ -226,6 +249,44 @@ impl Snapshot {
             }
             evidence.records.push(info);
         }
+    }
+
+    /// Whether the active command may contact `peer` (a native `sockaddr`, empty when unknown):
+    /// its agent policy decides against committed history plus the command's observations so
+    /// far. Called on the tracer thread while the calling task is stopped at the call's entry.
+    fn permits_peer(&self, run: TraceRun, peer: &[u8]) -> bool {
+        let Some(agent) = &self.agent else {
+            return true;
+        };
+        let candidate = Observation {
+            principal: self.uid.clone(),
+            observed: Observed::Connect(Peer::decode(peer)),
+        };
+        let prior = match &self.state.lock().recover().evidence {
+            Some((active, evidence)) if *active == run => {
+                agent::observations(&evidence.effects, &self.uid, Some(agent), |_| {
+                    Some(PathAction::Edit)
+                })
+            }
+            _ => Vec::new(),
+        };
+        let denial = {
+            let authority = self.session.validator.read();
+            agent.decide_now(&authority.observations, &prior, &candidate)
+        };
+        let Some(denial) = denial else {
+            return true;
+        };
+        if let Some(observer) = &self.observer {
+            observer.notify(
+                &denial.event,
+                &PolicyDecision::Deny {
+                    failed_precondition: format!("blocked: {}", denial.failed_precondition),
+                    allowed_fixes: denial.allowed_fixes,
+                },
+            );
+        }
+        agent.audits()
     }
 
     /// Marks the active command's evidence incomplete, so it is never published.

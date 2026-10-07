@@ -839,7 +839,12 @@ impl Shared {
             Route::Managed => {
                 if resources.snapshot.is_none() {
                     let session = resources.domain.managed().await?;
-                    let snapshot = Snapshot::new(session, resources.principal.clone())?;
+                    let snapshot = Snapshot::new(
+                        session,
+                        resources.principal.clone(),
+                        resources.agent_policy.clone(),
+                        resources.policy_observer.clone(),
+                    )?;
                     view::Transition::plan(
                         interpreter,
                         &snapshot.session.persistence.seed,

@@ -5,7 +5,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
-use super::agent::{AgentPolicy, Observation, Observed, PathAction};
+use super::agent::{self, AgentPolicy, Observation, Observed, PathAction};
 use super::builtins::gitcmd::GitAction;
 use super::completion::{Completion, Finalize};
 use super::execution::ExecutedCommand;
@@ -392,72 +392,23 @@ fn translate(executed: &ExecutedCommand) -> Result<Vec<Event>, ShellError> {
     Ok(events)
 }
 
-/// The command's agent-policy observations in execution order, each recorded once. A source path
-/// is created, modified or removed by comparing the command's baseline with its final work view.
+/// The command's agent-policy observations. A source path is created, modified or removed by
+/// comparing the command's baseline with its final work view.
 fn observe(executed: &ExecutedCommand, agent: Option<&AgentPolicy>) -> Vec<Observation> {
     let baseline = &executed.prepared.baseline;
     let work = executed.prepared.snapshot.path();
     let exists = |root: &Path, path: &Path| root.join(path).symlink_metadata().is_ok();
-    let metadata = |path: &Path| {
-        path.as_os_str().is_empty()
-            || path
-                .components()
-                .any(|component| component.as_os_str() == ".git")
-    };
-    let mut ordered = Vec::new();
-    for (order, _, effects) in &executed.evidence.effects {
-        let mut push = |observed| ordered.push((*order, observed));
-        for path in effects.reads.iter().filter(|path| !metadata(path)) {
-            push(Observed::Path {
-                action: PathAction::Read,
-                path: path.clone(),
-                inside: true,
-            });
-        }
-        for path in effects.writes.iter().filter(|path| !metadata(path)) {
-            let action = match (exists(baseline, path), exists(work, path)) {
-                (false, false) => continue,
-                (false, true) => PathAction::Create,
-                (true, false) => PathAction::Delete,
-                (true, true) => PathAction::Edit,
-            };
-            push(Observed::Path {
-                action,
-                path: path.clone(),
-                inside: true,
-            });
-        }
-        for (paths, action) in [
-            (&effects.outside_reads, PathAction::Read),
-            (&effects.outside_writes, PathAction::Edit),
-        ] {
-            for path in paths {
-                push(Observed::Path {
-                    action,
-                    path: path.clone(),
-                    inside: false,
-                });
-            }
-        }
-        for program in &effects.execs {
-            push(Observed::Exec(program.clone()));
-        }
-        for peer in &effects.peers {
-            push(Observed::Connect(peer.clone()));
-        }
-    }
-    ordered.sort_by_key(|(order, _)| *order);
-    let principal = &executed.prepared.snapshot.uid;
-    let mut seen = std::collections::HashSet::new();
-    ordered
-        .into_iter()
-        .map(|(_, observed)| observed)
-        .filter(|observed| AgentPolicy::records(agent, observed) && seen.insert(observed.clone()))
-        .map(|observed| Observation {
-            principal: principal.clone(),
-            observed,
-        })
-        .collect()
+    agent::observations(
+        &executed.evidence.effects,
+        &executed.prepared.snapshot.uid,
+        agent,
+        |path| match (exists(baseline, path), exists(work, path)) {
+            (false, false) => None,
+            (false, true) => Some(PathAction::Create),
+            (true, false) => Some(PathAction::Delete),
+            (true, true) => Some(PathAction::Edit),
+        },
+    )
 }
 
 pub(super) fn capability_of(action: GitAction) -> Action {
