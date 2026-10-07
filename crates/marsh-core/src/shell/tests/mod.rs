@@ -6,6 +6,7 @@ use super::{SandboxPolicy, Shell, ShellError, ShellErrorKind};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+mod agent_policy;
 mod publication;
 mod reconciliation;
 
@@ -45,6 +46,10 @@ impl Fixture {
         backend: Arc<dyn marsh_btrfs::Subvolumes>,
     ) -> Result<Shell, ShellError> {
         managed(self.seed.clone(), backend).await
+    }
+    /// A path beside the seed, outside the source.
+    fn outside(&self, name: &str) -> PathBuf {
+        self.seed.parent().unwrap().join(name)
     }
     /// The seed's write-ahead log.
     fn log(&self) -> PathBuf {

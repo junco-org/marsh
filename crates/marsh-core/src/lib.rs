@@ -19,10 +19,11 @@ pub mod shellmux;
 pub mod test_support;
 
 pub use shell::{
-    Action, Bump, CommandContext, CpuLimit, Denial, EmptyPolicy, Event, ExecutionParameters,
-    ExecutionResult, LockPolicy, MIB, MarshTool, MemoryLimit, OpenFile, PipelineOptions, Policy,
-    PolicyDecision, PolicyObserver, PolicyValidator, Principal, ProfileLoadBehavior,
-    RcLoadBehavior, ResourceEvent, ResourceLimits, ResourceMonitorConfig, ResourceSample,
-    SandboxPolicy, Shell, ShellBuilder, ShellCommand, ShellEnvironment, ShellError, ShellErrorKind,
-    ShellFd, ShellVariable, Signal, SourceInfo, UIOptions, builtins, fresh_principal,
+    Action, AgentPolicy, AgentPolicyError, AgentRule, AgentRuleSet, Bump, CommandContext,
+    CpuLimit, Denial, EmptyPolicy, Event, ExecutionParameters, ExecutionResult, LockPolicy, MIB,
+    MarshTool, MemoryLimit, OpenFile, PipelineOptions, Policy, PolicyDecision, PolicyObserver,
+    PolicyValidator, Principal, ProfileLoadBehavior, RcLoadBehavior, ResourceEvent,
+    ResourceLimits, ResourceMonitorConfig, ResourceSample, SandboxPolicy, Shell, ShellBuilder,
+    ShellCommand, ShellEnvironment, ShellError, ShellErrorKind, ShellFd, ShellVariable, Signal,
+    SourceInfo, UIOptions, builtins, fresh_principal,
 };
