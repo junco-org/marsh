@@ -11,8 +11,7 @@ use super::execution::ExecutedCommand;
 use super::session::{Authority, Session};
 use super::{ShellError, ShellErrorKind};
 pub(super) use junco_policy::{Action, Principal, Resource};
-use junco_policy::{Bump, GitPolicy};
-pub use junco_policy::{Event, PolicyDecision};
+pub use junco_policy::{Bump, Event, PolicyDecision};
 use marsh_lib::RecoverPoison as _;
 use marsh_wal::CommitOp;
 
@@ -54,6 +53,42 @@ impl std::fmt::Display for Denial {
     }
 }
 
+/// Immutable authorization configuration selected per shell. Marsh calls [`Policy::evaluator`]
+/// once per command batch and owns everything around it: observer notification, append-on-grant,
+/// denial collection, rollback, freshness, and publication. The evaluator only decides.
+pub trait Policy: Send + Sync + 'static {
+    /// Fresh decision state for one batch; `arena` outlives it.
+    fn evaluator<'batch>(
+        &'batch self,
+        arena: &'batch Bump,
+    ) -> Box<dyn FnMut(&[Event], &Event) -> PolicyDecision + 'batch>;
+}
+
+/// The Git capability policy: a shell's default.
+#[derive(Debug, Default)]
+pub struct GitPolicy;
+impl Policy for GitPolicy {
+    fn evaluator<'batch>(
+        &'batch self,
+        arena: &'batch Bump,
+    ) -> Box<dyn FnMut(&[Event], &Event) -> PolicyDecision + 'batch> {
+        let mut evaluator = junco_policy::GitPolicy::new(arena);
+        Box::new(move |history, event| evaluator.decide(history, event))
+    }
+}
+
+/// Grants every capability. Snapshots, freshness, history, and publication still apply.
+#[derive(Debug, Default)]
+pub struct EmptyPolicy;
+impl Policy for EmptyPolicy {
+    fn evaluator<'batch>(
+        &'batch self,
+        _arena: &'batch Bump,
+    ) -> Box<dyn FnMut(&[Event], &Event) -> PolicyDecision + 'batch> {
+        Box::new(|_, _| PolicyDecision::Grant)
+    }
+}
+
 /// One source's policy authority: its committed capability history and ledger ordering, shared by
 /// every shell on that source and by routing predicates that query it.
 pub struct PolicyValidator {
@@ -68,8 +103,9 @@ impl PolicyValidator {
             revision: AtomicU64::new(0),
         }
     }
-    /// What the policy would decide for `event` against the committed history, without adopting
-    /// it. Resources name seed-relative paths, exactly as managed authorization does.
+    /// What the Git policy would decide for `event` against the shared committed history, without
+    /// adopting it. Resources name seed-relative paths, exactly as managed authorization does.
+    /// This is a Git-policy query, not the selected shell's publication policy.
     pub fn decide(&self, event: &Event) -> Result<PolicyDecision, ShellError> {
         let authority = self.read();
         if authority.recovery_required {
@@ -78,7 +114,7 @@ impl PolicyValidator {
             ));
         }
         let arena = Bump::new();
-        let mut policy = GitPolicy::new(&arena);
+        let mut policy = junco_policy::GitPolicy::new(&arena);
         let decision = policy.decide(&authority.history, event);
         drop(authority);
         Ok(decision)
@@ -104,15 +140,16 @@ impl PolicyValidator {
 impl Authority {
     fn check(
         &mut self,
+        shell_policy: &dyn Policy,
         events: &[Event],
         observer: Option<&PolicyObserver>,
     ) -> Result<(), Vec<Denial>> {
         let arena = Bump::new();
-        let mut policy = GitPolicy::new(&arena);
+        let mut decide = shell_policy.evaluator(&arena);
         let checkpoint = self.history.len();
         let mut denials = Vec::new();
         for event in events {
-            let decision = policy.decide(&self.history, event);
+            let decision = decide(&self.history, event);
             if let Some(observer) = observer {
                 observer.notify(event, &decision);
             }
@@ -164,6 +201,7 @@ impl Finalize for AuthorizedCommand<'_> {
 pub(super) fn authorize<'session>(
     session: &'session Session,
     mut executed: ExecutedCommand,
+    shell_policy: &dyn Policy,
     observer: Option<&PolicyObserver>,
 ) -> Result<Completion<AuthorizedCommand<'session>>, ShellError> {
     // Every refusal carries the native status the command already produced.
@@ -202,7 +240,7 @@ pub(super) fn authorize<'session>(
         let events = translate(&executed)?;
         let checkpoint = guard.history.len();
         guard
-            .check(&events, observer)
+            .check(shell_policy, &events, observer)
             .map_err(|denials| ShellError::new(ShellErrorKind::Denied { denials }))?;
         Ok((guard, operations, events, checkpoint))
     })();

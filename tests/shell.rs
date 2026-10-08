@@ -239,42 +239,99 @@ async fn unmanaged_git_metadata_cannot_publish() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
 async fn a_conflict_never_reexecutes_the_line() {
-    let fixture = seed();
-    let mut a = controlled(fixture.managed_builder()).await;
-    let b = fixture.shell().await;
-    let counter = fixture.outside("counter");
-    let task = launch(
-        &a.shell,
-        format!(
-            "printf x >> {}; COUNT=$((COUNT+1)); export COUNT; /bin/cat src/a.txt; printf 'READY\\n'; /bin/sh -c 'read value'; printf local > candidate",
-            counter.display()
-        ),
-    );
-    assert_eq!(a.ready().await, b"seed\nREADY\n");
-    let busy = a
-        .shell
-        .run("printf should-not-run > busy")
+    // A permissive policy still never publishes over newer bytes.
+    for empty in [false, true] {
+        let fixture = seed();
+        let builder = if empty {
+            fixture
+                .managed_builder()
+                .shell_policy(Arc::new(marsh::EmptyPolicy))
+        } else {
+            fixture.managed_builder()
+        };
+        let mut a = controlled(builder).await;
+        let b = fixture.shell().await;
+        let counter = fixture.outside("counter");
+        let task = launch(
+            &a.shell,
+            format!(
+                "printf x >> {}; COUNT=$((COUNT+1)); export COUNT; /bin/cat src/a.txt; printf 'READY\\n'; /bin/sh -c 'read value'; printf local > candidate; printf stale > src/a.txt",
+                counter.display()
+            ),
+        );
+        assert_eq!(a.ready().await, b"seed\nREADY\n");
+        let busy = a
+            .shell
+            .run("printf should-not-run > busy")
+            .await
+            .err()
+            .expect("second command is busy");
+        assert!(matches!(busy.kind(), ShellErrorKind::Busy));
+        run(&b, "/bin/cat src/a.txt >/dev/null; printf B > src/a.txt").await;
+        a.release();
+        let error = join(task).await.err().expect("stale, not replayed");
+        assert!(
+            matches!(error.kind(), ShellErrorKind::Stale { .. }),
+            "{error}"
+        );
+        assert_eq!(u8::from(error.execution_result().unwrap().exit_code), 0);
+        assert_eq!(std::fs::read(counter).unwrap(), b"x");
+        assert!(
+            matches!(a.shell.env_var("COUNT").await.unwrap().value(), brush_core::ShellValue::String(value) if value == "1")
+        );
+        assert!(!fixture.source.join("candidate").exists());
+        assert!(!fixture.source.join("busy").exists());
+        assert_eq!(fixture.bytes("src/a.txt"), b"B");
+        a.shell.close(false).await.unwrap();
+        b.close(false).await.unwrap();
+    }
+}
+
+/// Grants one Edit per batch; a test-local implementation of the public policy interface.
+struct OneEditPerBatch;
+impl marsh::Policy for OneEditPerBatch {
+    fn evaluator<'batch>(
+        &'batch self,
+        _arena: &'batch marsh::Bump,
+    ) -> Box<dyn FnMut(&[marsh::Event], &marsh::Event) -> marsh::PolicyDecision + 'batch> {
+        let mut edited = false;
+        Box::new(move |_, event| {
+            if event.action != marsh::Action::Edit {
+                marsh::PolicyDecision::Grant
+            } else if edited {
+                marsh::PolicyDecision::Deny {
+                    failed_precondition: "Only one edit per batch".into(),
+                    allowed_fixes: vec!["Split edits into separate commands".into()],
+                }
+            } else {
+                edited = true;
+                marsh::PolicyDecision::Grant
+            }
+        })
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn custom_policy_keeps_batch_state_and_atomic_publication() {
+    let fixture = Seed::new("first", "original-first");
+    std::fs::write(fixture.source.join("second"), "original-second").unwrap();
+    let custom = fixture
+        .managed_builder()
+        .shell_policy(Arc::new(OneEditPerBatch))
+        .build()
         .await
-        .err()
-        .expect("second command is busy");
-    assert!(matches!(busy.kind(), ShellErrorKind::Busy));
-    run(&b, "/bin/cat src/a.txt >/dev/null; printf B > src/a.txt").await;
-    a.release();
-    let error = join(task).await.err().expect("stale, not replayed");
-    assert!(
-        matches!(error.kind(), ShellErrorKind::Stale { .. }),
-        "{error}"
-    );
-    assert_eq!(u8::from(error.execution_result().unwrap().exit_code), 0);
-    assert_eq!(std::fs::read(counter).unwrap(), b"x");
-    assert!(
-        matches!(a.shell.env_var("COUNT").await.unwrap().value(), brush_core::ShellValue::String(value) if value == "1")
-    );
-    assert!(!fixture.source.join("candidate").exists());
-    assert!(!fixture.source.join("busy").exists());
-    assert_eq!(fixture.bytes("src/a.txt"), b"B");
-    a.shell.close(false).await.unwrap();
-    b.close(false).await.unwrap();
+        .unwrap();
+    let git = fixture.shell().await;
+    denied(&custom, "printf changed-first > first; printf changed-second > second").await;
+    assert_eq!(fixture.bytes("first"), b"original-first");
+    assert_eq!(fixture.bytes("second"), b"original-second");
+    run(&git, "printf git-first > first; printf git-second > second").await;
+    assert_eq!(fixture.bytes("first"), b"git-first");
+    run(&custom, "printf custom > second").await;
+    assert_eq!(fixture.bytes("second"), b"custom");
+    custom.close(false).await.unwrap();
+    git.close(false).await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

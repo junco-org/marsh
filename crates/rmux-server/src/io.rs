@@ -660,6 +660,7 @@ impl ShellIo {
             environment,
             builtins,
             sandbox_policy: marsh_core::SandboxPolicy::default(),
+            shell_policy: Arc::new(marsh_core::GitPolicy),
             policy_observer: None,
         };
 

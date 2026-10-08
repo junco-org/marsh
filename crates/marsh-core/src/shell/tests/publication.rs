@@ -1,7 +1,7 @@
 //! Storage faults are tested privately; consumer Shell APIs expose only their typed verdicts.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use super::super::ShellErrorKind;
+use super::super::{EmptyPolicy, SandboxPolicy, Shell, ShellErrorKind};
 use super::{Fixture, accepted, close, refused, session};
 use marsh_btrfs::Subvolumes;
 use serial_test::serial;
@@ -79,11 +79,40 @@ async fn missing_staging_at_startup_starts_a_fresh_usable_wal() {
 
 #[tokio::test]
 #[serial]
+async fn shell_policy_selects_authorization_per_shell() {
+    let fixture = Fixture::new();
+    let owner = fixture.shell().await;
+    accepted(&owner, "cat src/a.txt > /dev/null; printf owned > src/a.txt").await;
+    let thief = fixture.shell().await;
+    refused(&thief, "printf stolen > src/a.txt").await;
+    assert_eq!(fixture.read("src/a.txt"), "owned");
+    let mut builder = Shell::builder()
+        .working_dir(fixture.seed.clone())
+        .sandbox_policy(SandboxPolicy::allow())
+        .shell_policy(Arc::new(EmptyPolicy));
+    builder.backend = Some(fixture.fs.clone());
+    let permissive = builder.build().await.unwrap();
+    accepted(&permissive, ":").await;
+    accepted(&permissive, "printf allowed > src/a.txt").await;
+    assert_eq!(fixture.read("src/a.txt"), "allowed");
+    close(permissive).await;
+    close(thief).await;
+    close(owner).await;
+}
+
+#[tokio::test]
+#[serial]
 async fn pre_intent_failure_preserves_exit_and_rolls_back_tentative_grants() {
     use super::super::policy::{Action, Event, Resource};
     use junco_policy::PolicyDecision;
     let fixture = Fixture::new();
-    let shell = fixture.shell().await;
+    let mut builder = Shell::builder()
+        .working_dir(fixture.seed.clone())
+        .sandbox_policy(SandboxPolicy::allow())
+        .shell_policy(Arc::new(EmptyPolicy));
+    builder.backend = Some(fixture.fs.clone());
+    let shell = builder.build().await.unwrap();
+    accepted(&shell, ":").await;
     // A live sibling keeps the source's in-memory authority across the failing shell's close.
     let sibling = fixture.shell().await;
     let validator = Arc::clone(&session(&sibling).await.validator);
