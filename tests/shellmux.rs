@@ -278,7 +278,6 @@ async fn one_shot_receipts_keep_exact_output_and_native_status() {
 #[serial]
 async fn same_name_never_inherits_a_previous_uid() {
     let fixture = Fixture::new();
-    fixture.git();
     let old = fixture
         .open("build", JobIo::Terminal { geometry: None })
         .await;
@@ -288,7 +287,7 @@ async fn same_name_never_inherits_a_previous_uid() {
         .open("build", JobIo::Terminal { geometry: None })
         .await;
     assert_ne!(old.sandbox().uid, replacement.sandbox().uid);
-    for line in ["printf blind > src/file", "git add -- src/file"] {
+    for line in ["printf blind > src/file", "release -- src/file"] {
         denied(&replacement, line).await;
     }
     assert!(

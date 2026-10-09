@@ -8,8 +8,9 @@ command either through four private managed stages:
 immutable command baseline → observed execution → capability authorization → durable WAL merge
 ```
 
-or directly against its source. By default a shell sandboxes exactly while another live shell in
-the same process shares its source; a shell alone on its source runs commands natively.
+or directly against its source. By default a library shell sandboxes exactly while another live
+shell in the same process shares its source, and a shell alone on its source runs commands
+natively. Every `rmux` pane, `-c` command and `run-shell` helper is always managed.
 
 Shells over the same canonical source share one authority. A managed command executes once:
 conflicting newer data returns `Stale`, never an automatic replay. Supported managed changes reach
@@ -96,8 +97,24 @@ Inside the pane:
 
 ```sh
 printf hello > greeting.txt
-git add -- greeting.txt
+release -- greeting.txt
 ```
+
+A write acquires ownership of the file; another shell must not edit or remove it until the owner
+releases it with the embedded `release [--] FILE` builtin. Deleting a file releases it. Exiting a
+pane or a `-c` command does **not** release anything, and every `rmux` pane and helper is managed
+even with no other shell present, so a one-shot workload must release what it wrote before it
+exits:
+
+```sh
+"$RMUX" -N -S "$WORK/rmux.sock" -c 'printf x > new-file && release -- new-file'
+"$RMUX" -N -S "$WORK/rmux.sock" -c 'release -- unowned-file'
+```
+
+A file written at a pane's prompt is released by typing `release -- file` at that same prompt (or
+sending it there with `send-keys`). A fresh `-c` command or `run-shell -t <pane>` runs as a new
+owner and cannot release it. `release` exists only in the embedded shell, not in an external
+`default-shell`. Managed filesystem prerequisites therefore apply even to a lone CLI shell.
 
 `Ctrl-b d` detaches. Host commands can reattach or stop this disposable daemon:
 
@@ -237,9 +254,27 @@ trace-scoped blocking thread and returns a value the caller gets back once the c
 the managed route, only once its effects were published. A process cannot trace its own threads, so
 the view's changes are evidence only when made through the context's I/O methods; any other change
 refuses publication. On the direct route the operation acts on the source. A refused, failed or
-interrupted call drops the operation's result. `ShellMux::run_tool(directory, tool, operation)` runs
-one such call in a transient shell built with the mux's builder and profile policy; the shell has
-no streams, is not a job, and closes when the call ends.
+interrupted call drops the operation's result. `ShellMux::run_tool(directory, owner, tool,
+operation)` runs one such call in a transient shell built with the mux's builder and profile
+policy; the shell has no streams, is not a job, and closes when the call ends.
+
+### Ownership
+
+The default `LockPolicy` decides four actions per file. A read always grants and makes the reader
+the file's last reader. A write (`edit`) acquires ownership. `release` gives ownership up and keeps
+the last reader. An observed successful `unlink`/`rmdir` (`remove`) clears both claims, so anyone
+can recreate the name. `edit` and `remove` are denied while another principal owns the file or
+was its last reader; `release` is denied only while another principal owns it. Releasing an
+unowned file grants, so it is idempotent. `BuiltinContext::release(file)` and the `release` builtin
+record a release in the current managed command; it publishes atomically with that command's
+other effects. A direct command cannot release.
+
+Each shell has a fresh uid for its jobs, views, routes and cancellation. By default its commands
+also act as that uid. `ShellBuilder::policy_owner`, `SpawnOptions::policy_owner` and the `owner`
+argument of `ShellMux::run_tool` make a shell act as a trusted principal from
+`marsh::fresh_principal()` instead, so a later shell can release what an earlier one wrote. Never derive
+an owner from a display name or other untrusted input. A reused display name inherits nothing,
+and native `git` is an ordinary program: staging or committing releases nothing.
 
 ## Publication and recovery
 
@@ -253,11 +288,8 @@ no streams, is not a job, and closes when the call ends.
   already happened once; the line is not reoffered or reexecuted.
 * Persistent descriptors survive unchanged work generations. Access through a descriptor or mapping
   from a necessarily retired generation fails rather than silently rebinding paths or offsets.
-* Managed Git preserves causal Stage/Commit/Checkout semantics. On the managed route, a `git`
-  executed directly or by any descendant (`/bin/git`, `sh -c 'git …'`, tool scripts) is classified
-  and authorized exactly like the builtin, with its own argv, cwd and environment; repository
-  metadata mutations outside a successful managed invocation are refused. `git add` releases an
-  unstaged stake; a reused display name never inherits an older shell instance's authority.
+* A reused display name never inherits an older shell instance's authority. Git metadata under
+  `.git` is owned like any other path.
 * Directories, including empty directories and modes, have explicit operations. FIFO/socket/device
   publication, unsupported metadata effects and unrepresentable hard-link mutations are refused
   before intent. Directory removal is nonrecursive and replay never follows symlink ancestors.
@@ -265,18 +297,16 @@ no streams, is not a job, and closes when the call ends.
   counted intent and grants, applies descriptor-relative operations with namespace fsyncs, and ends
   with durable `END`. Any possibly written intent failure blocks the source until reopen recovery.
   After `END`, cleanup failure cannot relabel committed bytes as unpublished.
-* A complete WAL record that cannot be decoded — malformed JSON, an obsolete or incompatible
-  record schema, or missing/obsolete ownership metadata — resets startup: the whole log, including
-  valid prefixes, suffixes and pending intent, is atomically replaced by an empty durable log and
-  nothing is replayed. Source bytes stay as they are; the discarded grants are gone. Failing to
-  replace the log refuses startup with it unchanged. Records that decode but carry impossible
-  framing, paths or sources still refuse startup unchanged. Only a genuinely torn final append is
-  truncated. Recovery checks source kind, digest and mode before copying; an absent source is
-  accepted only if the target proves the operation already applied.
+* A complete WAL record that cannot be decoded is refused, and startup fails with the log, seed
+  and snapshots unchanged. This covers malformed JSON, an obsolete or incompatible record schema,
+  missing or obsolete ownership metadata, and retired Git actions such as `stage` or `delete`.
+  Nothing is replayed, migrated or reset. Records that decode but carry impossible framing, paths
+  or sources also refuse startup unchanged. Only a genuinely torn final append is truncated.
+  Recovery checks source kind, digest and mode before copying; an absent source is accepted only
+  if the target proves the operation already applied.
 * Reopen reconciles externally deleted source paths without forgetting other paths' grants. A
-  deletion recorded by the WAL is not treated as an external disappearance. Missing/obsolete
-  ownership metadata and old uncounted or untyped WAL records are never interpreted as empty
-  ownership or silently migrated; they reset the log as above.
+  deletion recorded by the WAL is not treated as an external disappearance. That recorded removal
+  releases the path.
 
 Private operator layout:
 
@@ -339,7 +369,7 @@ cargo test -p brush-core --test external_command_spawner_tests
 cargo test -p brush-interactive --lib --features basic
 cargo test -p marsh-core --lib
 cargo test -p rmux-server --lib pane_repl::
-cargo test -p marsh --test sandbox_policy --test shell --test shellmux --test builtins --test git_shell --test rmux --test rmux_cli
+cargo test -p marsh --test sandbox_policy --test shell --test shellmux --test builtins --test rmux --test rmux_cli
 env -u RMUX -u TMUX cargo run -p marsh --example rmux_smoke
 ```
 

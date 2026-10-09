@@ -145,9 +145,7 @@ pub struct SpawnOptions {
     /// Variables replacing the mux profile's for this shell alone, or `None` to inherit them.
     ///
     /// `Some` *replaces* the ordinary inherited and profile variables rather than merging with
-    /// them; it does not resurrect a variable the caller unset. Marsh's own principal, git and
-    /// snapshot variables are reapplied afterwards, because they are the shell's identity rather
-    /// than the caller's configuration.
+    /// them; it does not resurrect a variable the caller unset.
     pub environment: Option<brush_core::env::ShellEnvironment>,
     /// Whether this shell reclaims itself once a command run in it ends.
     ///
@@ -166,6 +164,10 @@ pub struct SpawnOptions {
     /// publish only when authorized, even while no other shell shares its source. `false` — the
     /// default — applies the profile's policy.
     pub force_sandbox: bool,
+    /// The trusted policy principal this shell's managed commands act as, shared with other
+    /// shells and tool calls minted for the same owner; `None` acts as the shell's own uid.
+    /// Never derive it from a display name, job name or other untrusted input.
+    pub policy_owner: Option<crate::Principal>,
 }
 
 impl Default for JobIo {
@@ -234,7 +236,7 @@ impl Default for MuxProfile {
             environment: brush_core::env::ShellEnvironment::default(),
             builtins: HashMap::default(),
             sandbox_policy: crate::SandboxPolicy::default(),
-            shell_policy: std::sync::Arc::new(crate::GitPolicy),
+            shell_policy: std::sync::Arc::new(crate::LockPolicy),
             policy_observer: None,
         }
     }

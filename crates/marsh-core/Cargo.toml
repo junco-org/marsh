@@ -42,9 +42,9 @@ libc = "0.2"
 # so `nix::errno::Errno` converts into `brush_core::Error` through the impl brush-core provides.
 # `term` carries both `nix::sys::termios` and `nix::pty`.
 nix = { version = "0.31.2", features = ["fs", "term"] }
-# The capability policy every staged line is checked against before it is published. Its default
-# branch is the authored source of the action predicates the git builtin classifies with.
-junco-policy = { git = "https://github.com/junco-org/junco-policy.git" }
+# The ownership-lock policy every managed command's capabilities are checked against before it
+# is published, pinned to the exact revision this source's action vocabulary matches.
+junco-policy = { git = "https://github.com/junco-org/junco-policy.git", rev = "8d3150b7ce657dbb53de23b6f74095711ad78e07" }
 
 [dev-dependencies]
 marsh-btrfs = { path = "../marsh-btrfs", features = ["fake"] }

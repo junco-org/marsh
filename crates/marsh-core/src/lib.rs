@@ -20,8 +20,8 @@ pub mod test_support;
 
 pub use shell::{
     Action, Bump, CommandContext, Denial, EmptyPolicy, Event, ExecutionParameters, ExecutionResult,
-    GitPolicy, MarshTool, OpenFile, Policy, PolicyDecision, PolicyObserver, PolicyValidator,
+    LockPolicy, MarshTool, OpenFile, Policy, PolicyDecision, PolicyObserver, PolicyValidator,
     Principal, ProfileLoadBehavior, RcLoadBehavior, SandboxPolicy, Shell, ShellBuilder,
     ShellCommand, ShellEnvironment, ShellError, ShellErrorKind, ShellFd, ShellVariable, Signal,
-    SourceInfo, UIOptions, builtins,
+    SourceInfo, UIOptions, builtins, fresh_principal,
 };

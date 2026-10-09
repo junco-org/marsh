@@ -105,10 +105,9 @@ async fn persistent_descriptors_reassert_accesses() {
     b.close(false).await.unwrap();
 
     let fixture = seed();
-    fixture.git();
     let a = fixture.shell().await;
     let b = fixture.shell().await;
-    run(&a, "exec 4>>src/a.txt; git add -- src/a.txt").await;
+    run(&a, "exec 4>>src/a.txt; release -- src/a.txt").await;
     run(&b, "/bin/cat src/a.txt >/dev/null").await;
     denied(&a, "printf x >&4").await;
     assert_eq!(fixture.bytes("src/a.txt"), b"seed\n");
@@ -166,74 +165,59 @@ async fn unchanged_bytes_still_require_edit_capabilities() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
-async fn git_effects_keep_causal_order() {
-    for line in [
-        "git checkout HEAD -- src/a.txt; printf after > src/a.txt",
-        "printf one > src/a.txt; git add -- src/a.txt; printf two > src/a.txt",
-        "printf one > src/a.txt; builtin git add -- src/a.txt; printf two > src/a.txt; touch -t 200001010000 src/a.txt",
+async fn release_effects_keep_causal_order() {
+    for (line, reacquired) in [
+        ("printf one > src/a.txt; release -- src/a.txt", false),
+        (
+            "printf one > src/a.txt; release -- src/a.txt; printf two > src/a.txt",
+            true,
+        ),
     ] {
         let fixture = seed();
-        fixture.git();
         let a = fixture.shell().await;
         let b = fixture.shell().await;
         run(&a, line).await;
-        let expected = if line.starts_with("git checkout") {
-            b"after".as_slice()
+        run(&b, "/bin/cat src/a.txt >/dev/null").await;
+        if reacquired {
+            denied(&b, "printf lost > src/a.txt").await;
+            assert_eq!(fixture.bytes("src/a.txt"), b"two");
         } else {
-            b"two".as_slice()
-        };
-        assert_eq!(fixture.bytes("src/a.txt"), expected);
-        denied(&b, "printf lost > src/a.txt").await;
+            run(&b, "printf B > src/a.txt").await;
+            assert_eq!(fixture.bytes("src/a.txt"), b"B");
+        }
         a.close(false).await.unwrap();
         b.close(false).await.unwrap();
     }
 }
 
+/// Native Git is an ordinary writer: staging changes the index but releases nothing, and its
+/// metadata is owned like any other file.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
-async fn external_git_publishes_through_managed_authorization() {
-    for line in [
-        "printf staged > src/a.txt; /bin/git add -- src/a.txt; printf unrelated > other",
-        "printf staged > src/a.txt; /bin/sh -c 'git add -- src/a.txt'; printf unrelated > other",
-    ] {
-        let fixture = seed();
-        fixture.git();
-        let index = fixture.bytes(".git/index");
-        let a = fixture.shell().await;
-        run(&a, line).await;
-        assert_ne!(fixture.bytes(".git/index"), index, "{line}");
-        assert_eq!(fixture.bytes("src/a.txt"), b"staged");
-        assert_eq!(fixture.bytes("other"), b"unrelated");
-        a.close(false).await.unwrap();
-    }
-}
+async fn native_git_is_an_ordinary_writer() {
+    let fixture = seed();
+    fixture.git();
+    let index = fixture.bytes(".git/index");
+    let a = fixture.shell().await;
+    let b = fixture.shell().await;
+    run(&a, "printf staged > src/a.txt; git add -- src/a.txt").await;
+    assert_ne!(fixture.bytes(".git/index"), index);
+    let (index, head) = (fixture.bytes(".git/index"), fixture.bytes(".git/HEAD"));
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[serial]
-async fn unmanaged_git_metadata_cannot_publish() {
-    for line in [
-        "/bin/sh -c 'printf injected > .git/injected'; printf unrelated > other",
-        "/bin/mkdir .git/spoof; printf unrelated > other",
-    ] {
-        let fixture = seed();
-        fixture.git();
-        let index = fixture.bytes(".git/index");
-        let head = fixture.bytes(".git/HEAD");
-        let a = fixture.shell().await;
-        let error = a.run(line).await.err().expect("unmanaged Git refused");
-        assert!(
-            matches!(error.kind(), ShellErrorKind::Unsupported),
-            "{error}"
-        );
-        assert_eq!(fixture.bytes(".git/index"), index);
-        assert_eq!(fixture.bytes(".git/HEAD"), head);
-        assert!(!fixture.source.join("other").exists());
-        assert!(!fixture.source.join(".git/injected").exists());
-        assert!(!fixture.source.join(".git/spoof").exists());
-        run(&a, "printf managed > src/a.txt; git add -- src/a.txt").await;
-        assert_eq!(fixture.bytes("src/a.txt"), b"managed");
-        a.close(false).await.unwrap();
-    }
+    run(&b, "/bin/cat src/a.txt .git/index >/dev/null").await;
+    denied(&b, "printf B > src/a.txt").await;
+    denied(&b, "release -- src/a.txt").await;
+    denied(&b, "printf B > .git/index").await;
+    run(&b, "printf note > .git/description").await;
+
+    run(&a, "release -- src/a.txt").await;
+    assert_eq!(fixture.bytes(".git/index"), index);
+    assert_eq!(fixture.bytes(".git/HEAD"), head);
+    assert_eq!(fixture.bytes("src/a.txt"), b"staged");
+    run(&b, "printf B > src/a.txt").await;
+    assert_eq!(fixture.bytes("src/a.txt"), b"B");
+    a.close(false).await.unwrap();
+    b.close(false).await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -322,59 +306,47 @@ async fn custom_policy_keeps_batch_state_and_atomic_publication() {
         .build()
         .await
         .unwrap();
-    let git = fixture.shell().await;
-    denied(&custom, "printf changed-first > first; printf changed-second > second").await;
+    let lock = fixture.shell().await;
+    denied(
+        &custom,
+        "printf changed-first > first; printf changed-second > second",
+    )
+    .await;
     assert_eq!(fixture.bytes("first"), b"original-first");
     assert_eq!(fixture.bytes("second"), b"original-second");
-    run(&git, "printf git-first > first; printf git-second > second").await;
-    assert_eq!(fixture.bytes("first"), b"git-first");
+    run(
+        &lock,
+        "printf lock-first > first; printf lock-second > second",
+    )
+    .await;
+    assert_eq!(fixture.bytes("first"), b"lock-first");
     run(&custom, "printf custom > second").await;
     assert_eq!(fixture.bytes("second"), b"custom");
     custom.close(false).await.unwrap();
-    git.close(false).await.unwrap();
+    lock.close(false).await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
-async fn directory_membership_and_git_dependencies_become_stale() {
-    for git in [false, true] {
-        let fixture = seed();
-        if git {
-            fixture.git();
-        }
-        let mut a = controlled(fixture.managed_builder()).await;
-        let b = fixture.shell().await;
-        let inspect = if git {
-            "git status >/dev/null"
-        } else {
-            "printf '%s\\n' src/* >/dev/null"
-        };
-        let task = launch(
-            &a.shell,
-            format!(
-                "{inspect}; printf 'READY\\n'; /bin/sh -c 'read value'; printf local > candidate"
-            ),
-        );
-        a.ready().await;
-        if git {
-            run(
-                &b,
-                "printf B > src/a.txt; git add -- src/a.txt; git commit -qm newer",
-            )
-            .await;
-        } else {
-            run(&b, "printf member > src/new").await;
-        }
-        a.release();
-        let error = join(task).await.err().expect("dependency invalidation");
-        assert!(
-            matches!(error.kind(), ShellErrorKind::Stale { .. }),
-            "{error}"
-        );
-        assert!(!fixture.source.join("candidate").exists());
-        a.shell.close(false).await.unwrap();
-        b.close(false).await.unwrap();
-    }
+async fn directory_membership_becomes_stale() {
+    let fixture = seed();
+    let mut a = controlled(fixture.managed_builder()).await;
+    let b = fixture.shell().await;
+    let task = launch(
+        &a.shell,
+        "printf '%s\\n' src/* >/dev/null; printf 'READY\\n'; /bin/sh -c 'read value'; printf local > candidate".into(),
+    );
+    a.ready().await;
+    run(&b, "printf member > src/new").await;
+    a.release();
+    let error = join(task).await.err().expect("dependency invalidation");
+    assert!(
+        matches!(error.kind(), ShellErrorKind::Stale { .. }),
+        "{error}"
+    );
+    assert!(!fixture.source.join("candidate").exists());
+    a.shell.close(false).await.unwrap();
+    b.close(false).await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -656,20 +628,6 @@ async fn startup_preserves_claims_for_other_paths_in_a_partly_reconciled_frame()
     run(&reopened, "printf new > removed").await;
     denied(&reopened, "printf blind > src/a.txt").await;
     assert_eq!(fixture.bytes("src/a.txt"), b"seed\n");
-    reopened.close(false).await.unwrap();
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[serial]
-async fn startup_preserves_claims_over_a_logged_deletion() {
-    let fixture = seed();
-    let owner = fixture.shell().await;
-    run(&owner, "printf owned > deleted").await;
-    run(&owner, "rm deleted").await;
-    owner.close(false).await.unwrap();
-    let reopened = fixture.shell().await;
-    denied(&reopened, "printf blind > deleted").await;
-    assert!(!fixture.source.join("deleted").exists());
     reopened.close(false).await.unwrap();
 }
 

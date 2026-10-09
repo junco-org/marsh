@@ -1228,51 +1228,6 @@ async fn supplied_descriptors_into_a_private_view_are_refused() {
     a.close(false).await.unwrap();
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[serial]
-async fn the_direct_route_runs_native_git() {
-    let seed = Seed::new("a.txt", "seed\n");
-    seed.git();
-    let mut a = controlled(seed.builder()).await;
-    let task = launch(
-        &a.shell,
-        "saved=$PATH; PATH=/nonexistent; git status; s=$?; PATH=$saved; printf 'READY\\n'".into(),
-    );
-    let output = a.ready().await;
-    join(task).await.unwrap();
-    assert!(
-        String::from_utf8_lossy(&output).contains("git: command not found"),
-        "{}",
-        String::from_utf8_lossy(&output)
-    );
-    assert_eq!(string(&a.shell.env_var("s").await.unwrap()), "127");
-    let task = launch(
-        &a.shell,
-        "printf new > new; git add new; added=$?; git commit -qm direct-commit; committed=$?; printf 'READY\\n'".into(),
-    );
-    let output = a.ready().await;
-    join(task).await.unwrap();
-    let statuses = (
-        string(&a.shell.env_var("added").await.unwrap()),
-        string(&a.shell.env_var("committed").await.unwrap()),
-    );
-    assert_eq!(
-        statuses,
-        ("0".to_owned(), "0".to_owned()),
-        "{}",
-        String::from_utf8_lossy(&output)
-    );
-    let log = std::process::Command::new("/bin/git")
-        .current_dir(&seed.source)
-        .args(["log", "-1", "--format=%s", "--name-only"])
-        .output()
-        .unwrap();
-    assert!(log.status.success());
-    assert_eq!(log.stdout, b"direct-commit\n\nnew\n");
-
-    a.shell.close(false).await.unwrap();
-}
-
 /// A callback context kept past the end of the command that owned it.
 static RETAINED: Mutex<Option<marsh::builtins::BuiltinContext>> = Mutex::new(None);
 /// Whether each use of [`RETAINED`] inside a later command failed.
@@ -1456,7 +1411,41 @@ async fn tool_calls_route_by_their_action_and_publish_their_effects() {
     assert_eq!(physical, source, "a read runs directly against the source");
     assert_eq!(logical, source);
     assert_eq!(bytes, b"tool\n");
-    shell.close(false).await.unwrap();
+
+    // The removal released `a.txt`: a challenger recreates it with no read of a missing file.
+    let peer = seed.managed_builder().build().await.unwrap();
+    run(&peer, "printf peer > a.txt").await;
+    run(&peer, "/bin/cat b.txt >/dev/null").await;
+    denied(&peer, "printf peer > b.txt").await;
+    denied(&peer, "release -- b.txt").await;
+    shell
+        .run_tool(Stamp, |ctx| ctx.release(Path::new("b.txt")).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(seed.bytes("b.txt"), b"tool\n", "a release writes nothing");
+    run(&peer, "printf peer > b.txt").await;
+
+    // A trusted owner shared by two shells lets one release what the other wrote.
+    let owner = marsh::fresh_principal().unwrap();
+    let first = seed
+        .managed_builder()
+        .policy_owner(Some(owner.clone()))
+        .build()
+        .await
+        .unwrap();
+    let second = seed
+        .managed_builder()
+        .policy_owner(Some(owner))
+        .build()
+        .await
+        .unwrap();
+    run(&first, "printf mine > c.txt").await;
+    denied(&peer, "printf peer > c.txt").await;
+    run(&second, "release -- c.txt").await;
+    run(&peer, "printf peer > c.txt").await;
+    for shell in [shell, peer, first, second] {
+        shell.close(false).await.unwrap();
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1501,6 +1490,10 @@ async fn a_direct_tool_call_acts_on_the_source() {
     let (physical, logical) = shell
         .run_tool(Stamp, |ctx| {
             stamp(ctx, "b.txt", b"direct\n");
+            assert!(
+                ctx.release(Path::new("b.txt")).is_err(),
+                "nothing records it"
+            );
             let physical = ctx.physical_path(Path::new("b.txt")).unwrap();
             let logical = ctx.logical_path(&physical).unwrap();
             (physical, logical)

@@ -92,15 +92,18 @@ impl ShellMux {
     }
     /// Whether shells built by this mux include the named extra or managed builtin.
     pub fn has_builtin(&self, name: &str) -> bool {
-        self.profile.builtins.contains_key(name) || matches!(name, "git" | "exec")
+        self.profile.builtins.contains_key(name) || matches!(name, "exec" | "release")
     }
 
     /// Builds a transient shell at `directory` with this mux's builder and profile policy, runs
     /// one tool call through it as [`crate::Shell::run_tool`] does, and closes it. The shell has
-    /// no streams and is not a job; it is named by its principal.
+    /// no streams and is not a job; it is named by its principal. `owner` is the trusted policy
+    /// principal the call acts as (see [`crate::ShellBuilder::policy_owner`]); `None` acts as the
+    /// transient shell's own uid.
     pub async fn run_tool<T: MarshTool, R: Send + 'static>(
         self: &Arc<Self>,
         directory: &Path,
+        owner: Option<Principal>,
         tool: T,
         operation: impl FnOnce(&BuiltinContext) -> R + Send + 'static,
     ) -> Result<R, MuxError>
@@ -111,7 +114,7 @@ impl ShellMux {
             return Err(MuxError::ShuttingDown);
         }
         let shell = self
-            .build_shell(None, directory, HashMap::new(), None, false)
+            .build_shell(None, directory, HashMap::new(), None, false, owner)
             .await?;
         let outcome = shell.run_tool(tool, operation).await;
         let closed = shell.close(false).await;
@@ -123,7 +126,8 @@ impl ShellMux {
 
     /// Builds a shell with this mux's builder and profile; `id` is the display name a job
     /// reserved, and a shell without one is named by its principal. `force_sandbox` replaces the
-    /// profile's routing policy with one that always takes the managed route.
+    /// profile's routing policy with one that always takes the managed route; `owner` is the
+    /// trusted policy principal its managed commands act as.
     pub(crate) async fn build_shell(
         &self,
         id: Option<ShellId>,
@@ -131,6 +135,7 @@ impl ShellMux {
         fds: HashMap<ShellFd, OpenFile>,
         environment: Option<ShellEnvironment>,
         force_sandbox: bool,
+        owner: Option<Principal>,
     ) -> Result<Arc<crate::Shell>, MuxError> {
         let policy = if force_sandbox {
             crate::SandboxPolicy::allow()
@@ -146,7 +151,8 @@ impl ShellMux {
             .enable_option("monitor".into())
             .sandbox_policy(policy)
             .shell_policy(Arc::clone(&self.profile.shell_policy))
-            .policy_observer(self.profile.policy_observer.clone());
+            .policy_observer(self.profile.policy_observer.clone())
+            .policy_owner(owner);
         if let Some(environment) = environment {
             builder = builder.environment(environment);
         } else {

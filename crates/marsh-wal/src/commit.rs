@@ -525,14 +525,15 @@ impl PreparedTransaction<'_> {
 ///
 /// # Errors
 ///
-/// Fails with [`Error::Wal`] — before any seed mutation — when an operation lies outside any
-/// transaction, an `END` matches no open transaction, a count does not match, a transaction never
-/// finished yet another follows it, a record names what no writer produces, a source differs from
-/// its record, or a staging directory holds anything but its own temporaries; and during replay
-/// when a record can neither be applied nor recognized as already applied. Fails with
-/// [`Error::Io`] when the log, the seed or a source cannot be read or written — an undecodable log
-/// that cannot be replaced included — and when a path the log expects cannot be looked up for any
-/// reason but its absence, which leaves the log as it was.
+/// Fails with [`Error::Wal`] — before any seed mutation — when a complete record cannot be
+/// decoded as `M`'s log (an incompatible or corrupt log, which is left exactly as it was), when an
+/// operation lies outside any transaction, an `END` matches no open transaction, a count does not
+/// match, a transaction never finished yet another follows it, a record names what no writer
+/// produces, a source differs from its record, or a staging directory holds anything but its own
+/// temporaries; and during replay when a record can neither be applied nor recognized as already
+/// applied. Fails with [`Error::Io`] when the log, the seed or a source cannot be read or written,
+/// and when a path the log expects cannot be looked up for any reason but its absence, which
+/// leaves the log as it was.
 pub fn recover<M: Serialize + DeserializeOwned>(
     seed: &Path,
     snap: &Path,
@@ -540,14 +541,7 @@ pub fn recover<M: Serialize + DeserializeOwned>(
     mut metadata_paths: impl FnMut(&M, &mut Vec<PathBuf>),
     mut prune_metadata: impl FnMut(&mut M, &BTreeSet<PathBuf>) -> bool,
 ) -> Result<Vec<Transaction<M>>, Error> {
-    let records = match log::read_records::<WalRecord<M>>(log) {
-        Ok(records) => records,
-        Err(Error::Wal(_)) => {
-            log::replace_log(log, |_| Ok(()))?;
-            return Ok(Vec::new());
-        }
-        Err(error) => return Err(error),
-    };
+    let records = log::read_records::<WalRecord<M>>(log)?;
     if records.is_empty() {
         return Ok(Vec::new());
     }
@@ -2529,11 +2523,11 @@ pub(crate) mod tests {
         }
     }
 
-    /// A durable but undecodable line discards the whole log: the valid unfinished transaction
-    /// before it is not replayed and the valid transaction after it is not kept. Recovery returns
-    /// nothing, the log is left empty, and neither the seed nor any source is touched.
+    /// A durable but undecodable line refuses recovery before replay or cleanup: the valid
+    /// unfinished transaction before it is not replayed, and the log, the seed and every source
+    /// keep every byte.
     #[test]
-    fn an_undecodable_record_resets_the_wal_without_replay() {
+    fn an_undecodable_record_is_refused_without_replay() {
         for bad in [
             "{not-json}",
             r#"{"op":"NOPE"}"#,
@@ -2551,43 +2545,18 @@ pub(crate) mod tests {
             let seed_before = shape(&layout.seed);
             let sources_before = shape(&layout.snap);
 
-            let recovered = layout.recover().expect("reset the undecodable log");
-            assert!(recovered.is_empty(), "{bad}: nothing recovered");
-            assert_eq!(layout.log_bytes(), b"", "{bad}: the log is empty");
-            assert_eq!(
-                shape(&layout.seed),
-                seed_before,
-                "{bad}: the seed is untouched"
-            );
+            let error = layout
+                .recover()
+                .expect_err("the undecodable log is refused");
+            assert!(matches!(error, Error::Wal(_)), "{bad}: got {error:?}");
+            assert_eq!(layout.log_bytes(), raw, "{bad}: the log is intact");
+            assert_eq!(shape(&layout.seed), seed_before, "{bad}: seed untouched");
             assert_eq!(
                 shape(&layout.snap),
                 sources_before,
-                "{bad}: the sources are untouched"
+                "{bad}: sources untouched"
             );
         }
-    }
-
-    /// An undecodable log that cannot be replaced fails recovery with the I/O error, leaving the
-    /// log, both trees and whatever blocked the replacement as they were.
-    #[test]
-    fn a_failed_wal_reset_preserves_the_log_and_both_trees() {
-        let layout = Scratch::new();
-        put(&layout.seed.join("a.txt"), b"seed\n", 0o644);
-        put(&layout.work("job0").join("a.txt"), b"pending\n", 0o644);
-        layout.append(&[begin(1, "job0", 1), file_move("a.txt", b"pending\n", 0o644)]);
-        std::fs::write(&layout.log, b"{not-json}\n").expect("write the corrupt log");
-        let corrupt = layout.log_bytes();
-        let seed_before = shape(&layout.seed);
-        let sources_before = shape(&layout.snap);
-        let blocker = layout.log.with_file_name("wal.jsonl.tmp-wal");
-        std::fs::create_dir(&blocker).expect("a directory where the replacement goes");
-
-        let error = layout.recover().expect_err("the replacement is blocked");
-        assert!(matches!(error, Error::Io(_)), "got {error:?}");
-        assert_eq!(layout.log_bytes(), corrupt);
-        assert_eq!(shape(&layout.seed), seed_before);
-        assert_eq!(shape(&layout.snap), sources_before);
-        assert!(blocker.is_dir(), "the blocking directory is left alone");
     }
 
     /// A record that decodes but names what no writer produces — a file move without its mode, a
@@ -2617,11 +2586,11 @@ pub(crate) mod tests {
         }
     }
 
-    /// Obsolete complete records fail to decode even inside finished frames, and the whole log is
-    /// reset: no frame is replayed or returned, no missing path is reconciled, no earlier staging
-    /// residue is cleared and the valid suffix is not kept.
+    /// Obsolete complete records fail to decode even inside finished frames, and recovery is
+    /// refused whole: no frame is replayed or returned, no missing path is reconciled, no earlier
+    /// staging residue is cleared, and the log keeps every byte.
     #[test]
-    fn obsolete_records_reset_the_wal_and_preserve_both_trees() {
+    fn obsolete_records_are_refused_and_preserve_the_log_and_both_trees() {
         for (index, removed, added) in [
             (0, vec!["op_count"], json!({})),
             (0, vec!["staging"], json!({})),
@@ -2677,15 +2646,15 @@ pub(crate) mod tests {
             let seed_before = shape(&layout.seed);
             let sources_before = shape(&layout.snap);
 
-            let recovered = layout.recover().expect("reset the obsolete log");
+            let error = layout.recover().expect_err("the obsolete log is refused");
             assert!(
-                recovered.is_empty(),
-                "{index} {removed:?} {added}: nothing recovered"
+                matches!(error, Error::Wal(_)),
+                "{index} {removed:?} {added}: got {error:?}"
             );
             assert_eq!(
                 layout.log_bytes(),
-                b"",
-                "{index} {removed:?} {added}: the log is empty"
+                raw,
+                "{index} {removed:?} {added}: the log is intact"
             );
             assert_eq!(shape(&layout.seed), seed_before);
             assert_eq!(shape(&layout.snap), sources_before);

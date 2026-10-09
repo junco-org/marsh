@@ -474,6 +474,7 @@ impl ShellMux {
                 fds,
                 options.environment,
                 options.force_sandbox,
+                options.policy_owner,
             )
             .await?;
         let working_directory = interpreter.working_dir().await;

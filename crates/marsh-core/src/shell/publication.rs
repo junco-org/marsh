@@ -61,7 +61,7 @@ pub(super) fn commit(
             }
             let meta = PublishMeta {
                 cmd: std::mem::take(&mut executed.command),
-                principal: snapshot.uid.clone(),
+                principal: snapshot.owner.clone(),
                 granted: authorized
                     .payload
                     .events

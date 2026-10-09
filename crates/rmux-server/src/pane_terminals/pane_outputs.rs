@@ -12,8 +12,6 @@ use super::{session_not_found, HandlerState};
 #[path = "pane_outputs/submitted.rs"]
 mod submitted;
 
-#[path = "pane_outputs/exit_refresh.rs"]
-mod exit_refresh;
 #[path = "pane_outputs/spawn.rs"]
 mod spawn;
 

@@ -1,11 +1,12 @@
 //! Ordinary builtin registration and logical callback I/O.
 
-use super::execution::ManagedExtensions;
+use std::path::PathBuf;
+
+use brush_core::{ExecutionContext, ExecutionResult, ShellExtensions};
+
+use super::execution::{ManagedExtensions, brush_error};
 
 mod exec;
-mod git;
-pub(super) mod gitcmd;
-pub(super) mod gitexec;
 
 pub use super::execution::{BuiltinContext, DirectoryEntry, GlobPaths, ReadDir, current_context};
 pub use brush_core::builtins::{Command, DeclarationCommand, SimpleCommand};
@@ -50,6 +51,27 @@ pub fn raw_arg_builtin<T: DeclarationCommand + Default + Send + Sync>() -> Regis
     Registration(brush_core::builtins::raw_arg_builtin::<T, ManagedExtensions>())
 }
 
+/// `release [--] FILE`: relinquishes this shell's ownership of one file, so another principal may
+/// write it once it has read it. Recorded in the managed command and published with it.
+#[derive(clap::Parser)]
+struct ReleaseBuiltin {
+    /// The file whose ownership is relinquished.
+    file: PathBuf,
+}
+impl Command for ReleaseBuiltin {
+    type Error = brush_core::Error;
+    async fn execute<SE: ShellExtensions>(
+        &self,
+        _: ExecutionContext<'_, SE>,
+    ) -> Result<ExecutionResult, Self::Error> {
+        current_context()
+            .ok_or_else(|| brush_error(super::ShellError::infrastructure("no active command")))?
+            .release(&self.file)
+            .map_err(brush_error)?;
+        Ok(ExecutionResult::success())
+    }
+}
+
 pub(super) fn managed()
 -> std::collections::HashMap<String, brush_core::builtins::Registration<ManagedExtensions>> {
     std::collections::HashMap::from([
@@ -58,8 +80,8 @@ pub(super) fn managed()
             brush_core::builtins::builtin::<exec::ExecBuiltin, ManagedExtensions>(),
         ),
         (
-            "git".into(),
-            brush_core::builtins::builtin::<git::GitBuiltin, ManagedExtensions>(),
+            "release".into(),
+            brush_core::builtins::builtin::<ReleaseBuiltin, ManagedExtensions>(),
         ),
     ])
 }

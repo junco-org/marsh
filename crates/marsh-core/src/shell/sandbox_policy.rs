@@ -35,7 +35,7 @@ pub struct ShellCommand {
     pub command: String,
 }
 /// Every shell span may write, including `cat` and startup spans: conservative routing metadata,
-/// not a claim about what the text does. Observed effects and Git capabilities remain what
+/// not a claim about what the text does. Observed effects and explicit releases remain what
 /// publication authorizes.
 impl From<&ShellCommand> for Action {
     fn from(_: &ShellCommand) -> Self {

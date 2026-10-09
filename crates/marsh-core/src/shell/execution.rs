@@ -20,8 +20,7 @@ use brush_core::sys::process::{Child, HostedChild, HostedEvent};
 use brush_core::{CommandArg, ExecutionResult};
 use futures_util::FutureExt;
 use marsh_instrument::{
-    ChildEvent, HostCall, InvocationId, PollScope, Scoped, TraceRun, TraceScope,
-    TraceScopeGuard, Tracing,
+    ChildEvent, HostCall, PollScope, Scoped, TraceRun, TraceScope, TraceScopeGuard, Tracing,
 };
 use marsh_lib::RecoverPoison as _;
 use tokio::io::unix::AsyncFd;
@@ -97,7 +96,6 @@ impl MarshExecutor {
         Ok(BuiltinContext {
             cwd: Arc::clone(&run.cwd),
             run,
-            builtin: None,
         })
     }
 }
@@ -150,10 +148,6 @@ impl ExecutionObserver for MarshExecutor {
                 Some(snapshot) => snapshot.logical(cwd),
                 None => cwd.to_path_buf(),
             });
-            context.builtin = match &context.run.backend {
-                Backend::Managed { tracing, trace, .. } => Some(tracing.invocation(*trace)?),
-                Backend::Direct { .. } => None,
-            };
             Ok(context)
         }))
     }
@@ -724,7 +718,6 @@ impl Drop for ContextGuard {
 pub struct BuiltinContext {
     run: Arc<Run>,
     cwd: Arc<PathBuf>,
-    builtin: Option<InvocationId>,
 }
 impl std::fmt::Debug for BuiltinContext {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -749,17 +742,9 @@ fn logical(view: Option<&Snapshot>, path: &Path) -> PathBuf {
 }
 
 impl BuiltinContext {
-    pub(super) const fn invocation(&self) -> Option<InvocationId> {
-        self.builtin
-    }
     /// The owning run, as a nested call's admission sees its caller.
     pub(super) fn parent(&self) -> Weak<Run> {
         Arc::downgrade(&self.run)
-    }
-    /// The owning run, while it still accepts work.
-    pub(super) fn run(&self) -> Result<&Arc<Run>, ShellError> {
-        self.check()?;
-        Ok(&self.run)
     }
     /// Refuses the owning managed run's publication: its evidence is incomplete.
     pub(super) fn fail_evidence(&self, cause: String) {
@@ -784,9 +769,7 @@ impl BuiltinContext {
     /// The workload scope of a managed run; direct work is never attributed.
     fn scope(&self) -> Result<Option<TraceScope>, ShellError> {
         match &self.run.backend {
-            Backend::Managed { tracing, trace, .. } => {
-                Ok(Some(tracing.scope(*trace, self.builtin)?))
-            }
+            Backend::Managed { tracing, trace, .. } => Ok(Some(tracing.scope(*trace)?)),
             Backend::Direct { .. } => Ok(None),
         }
     }
@@ -832,6 +815,26 @@ impl BuiltinContext {
     /// Whether its owner requested cancellation or already ended the run.
     pub fn cancellation_requested(&self) -> bool {
         self.run.is_cancelled() || self.run.closed.load(Ordering::Acquire)
+    }
+    /// Relinquishes the calling principal's ownership of `file` (absolute, or relative to the
+    /// logical working directory) once this managed command publishes. Ancestor symlinks are
+    /// followed, a final symlink is released itself, and a missing file is fine. Nothing is read
+    /// or written; releasing a file another principal owns is denied at publication, and one
+    /// nobody owns is a no-op grant. A direct or ended command cannot record a release.
+    pub fn release(&self, file: &Path) -> Result<(), ShellError> {
+        use std::os::unix::ffi::OsStrExt as _;
+        let bytes = file.as_os_str().as_bytes();
+        if bytes.is_empty() || bytes.contains(&0) {
+            return Err(ShellError::unsupported(
+                "release needs one nonempty file path without NUL bytes",
+            ));
+        }
+        let (tracing, trace) = self.run.trace()?;
+        let snapshot = self
+            .snapshot()?
+            .ok_or_else(|| ShellError::infrastructure("a direct command cannot release"))?;
+        let order = tracing.next_order(trace)?;
+        snapshot.release(trace, &snapshot.physical(&self.cwd.join(file)), order)
     }
     /// Resolves when cancellation is requested or the owning run ends.
     pub async fn cancelled(&self) {
@@ -1163,7 +1166,6 @@ pub(super) async fn evaluate(
     let context = BuiltinContext {
         run: Arc::clone(run),
         cwd: Arc::clone(&run.cwd),
-        builtin: None,
     };
     let evaluation = match context.wrap(command.evaluate(interpreter)) {
         Ok(evaluation) => evaluation,
