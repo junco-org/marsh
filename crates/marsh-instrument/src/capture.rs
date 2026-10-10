@@ -3,6 +3,7 @@
 use std::ffi::OsString;
 use std::fmt::Display;
 use std::io;
+use std::mem::{offset_of, size_of};
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
@@ -23,12 +24,15 @@ pub(crate) const PATH_LIMIT: usize = 4096;
 /// terminating NULs included.
 const EXEC_CAPTURE_LIMIT: usize = 8 * 1024 * 1024;
 const WORD: u64 = std::mem::size_of::<libc::c_long>() as u64;
-/// `sizeof(struct sockaddr_storage)`: no peer address the kernel accepts is longer.
-const SOCKADDR_LIMIT: u64 = 128;
-/// `sizeof(struct mmsghdr)` on every 64-bit ABI: a `msghdr` and its `msg_len`, padded.
-const MMSGHDR_SIZE: u64 = 64;
-/// `UIO_MAXIOV`: the kernel sends at most this many messages per `sendmmsg`.
-const MMSG_LIMIT: u64 = 1024;
+// The socket layouts below are the tracer's, which are the tracee's: observation builds only for
+// the 64-bit ABIs `NATIVE_ARCH` names, and refuses tracees of any other.
+/// No peer address the kernel accepts is longer than a `sockaddr_storage`.
+const SOCKADDR_LIMIT: u64 = size_of::<libc::sockaddr_storage>() as u64;
+const MMSGHDR_SIZE: u64 = size_of::<libc::mmsghdr>() as u64;
+/// The kernel sends at most this many messages per `sendmmsg`.
+const MMSG_LIMIT: u64 = libc::UIO_MAXIOV.unsigned_abs() as u64;
+/// The leading `msghdr` fields that name a message's peer: `msg_name` and `msg_namelen`.
+const MSGHDR_NAME_END: usize = offset_of!(libc::msghdr, msg_namelen) + size_of::<libc::socklen_t>();
 
 /// Only added role information: the native value and scalar/pointer vocabulary stay upstream.
 struct Roles {
@@ -473,14 +477,26 @@ fn read_sockaddr(tid: Pid, address: u64, length: u64) -> io::Result<Vec<u8>> {
 /// Reads the peer address a `sendmsg` header names: `None` when `msg_name` is null, as on a
 /// connected socket whose peer its `connect` already named.
 fn read_message_name(tid: Pid, header: u64) -> io::Result<Option<Vec<u8>>> {
-    // `struct msghdr` begins with `void *msg_name; socklen_t msg_namelen;` on every 64-bit ABI.
-    let mut prefix = Vec::with_capacity(12);
+    let mut prefix = Vec::with_capacity(MSGHDR_NAME_END);
     read_bytes(tid, header, "msghdr wraps the address space", |byte| {
         prefix.push(byte);
-        Ok(prefix.len() < 12)
+        Ok(prefix.len() < MSGHDR_NAME_END)
     })?;
-    let name = u64::from_ne_bytes(prefix[..8].try_into().map_err(io::Error::other)?);
-    let length = u32::from_ne_bytes(prefix[8..12].try_into().map_err(io::Error::other)?);
+    let field = |offset: usize, length: usize| {
+        prefix
+            .get(offset..offset + length)
+            .ok_or_else(|| io::Error::other("short msghdr read"))
+    };
+    let name = field(
+        offset_of!(libc::msghdr, msg_name),
+        size_of::<*mut libc::c_void>(),
+    )?;
+    let name = u64::from_ne_bytes(name.try_into().map_err(io::Error::other)?);
+    let length = field(
+        offset_of!(libc::msghdr, msg_namelen),
+        size_of::<libc::socklen_t>(),
+    )?;
+    let length = libc::socklen_t::from_ne_bytes(length.try_into().map_err(io::Error::other)?);
     if name == 0 {
         return Ok(None);
     }

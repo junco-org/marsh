@@ -17,6 +17,7 @@ use nix::sys::ptrace::{self, Event, Options};
 use nix::sys::signal::Signal;
 use nix::sys::wait::WaitStatus;
 use nix::unistd::Pid;
+use rustix::io_uring::IoringOp;
 use syscalls::{Sysno, SysnoSet};
 
 use crate::Syscall;
@@ -65,9 +66,15 @@ pub(crate) type Select = Box<dyn FnMut(Pid, &Path) -> bool>;
 /// (empty when unknown). A refused call is skipped and fails with `EPERM`.
 pub(crate) type Gate = Box<dyn FnMut(Pid, &[u8]) -> bool>;
 
-/// `io_uring` operations that contact a peer: `SENDMSG`, `CONNECT`, `SEND`, `SEND_ZC` and
-/// `SENDMSG_ZC`. Their destinations live in memory a ring read cannot attribute to a call.
-const NETWORK_IO_URING_OPS: [u8; 5] = [9, 16, 26, 47, 48];
+/// `io_uring` operations that contact a peer. Their destinations live in memory a ring read
+/// cannot attribute to a call.
+const NETWORK_IO_URING_OPS: [u8; 5] = [
+    IoringOp::Sendmsg as u8,
+    IoringOp::Connect as u8,
+    IoringOp::Send as u8,
+    IoringOp::SendZc as u8,
+    IoringOp::SendmsgZc as u8,
+];
 
 /// Why a tree whose remaining tasks are all held can make no progress.
 pub(crate) const UNCLASSIFIED: &str = "native creator exited with unclassified child effects";

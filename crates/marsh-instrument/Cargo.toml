@@ -18,6 +18,8 @@ syscalls.workspace = true
 nix = { version = "=0.30.1", features = ["ptrace", "signal", "process"] }
 serde = { version = "1", features = ["derive"] }
 libc = "0.2"
+# Only for `io_uring` opcode names.
+rustix = { version = "1", default-features = false, features = ["io_uring"] }
 marsh-lib = { path = "../marsh-lib", default-features = false }
 
 [dev-dependencies]

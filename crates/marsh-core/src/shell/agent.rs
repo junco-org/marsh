@@ -38,7 +38,8 @@
 //! Observations are kept in memory for the source's lifetime and are not recovered from the WAL.
 
 use std::fmt;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+use std::mem::{offset_of, size_of};
+use std::net::{IpAddr, SocketAddr};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -52,6 +53,7 @@ use junco_policy::{
     Rule, RuleMode, TestExpr, TracePolicy, TraceRule,
 };
 use marsh_instrument::InvocationId;
+use socket2::{SockAddr, SockAddrStorage, socklen_t};
 
 use super::access::Effects;
 use super::policy::{Action, Denial, Event, PolicyObserver, Principal, Resource};
@@ -74,20 +76,18 @@ pub(super) enum Peer {
     Unknown,
 }
 impl Peer {
-    /// Decodes a native `sockaddr`.
+    /// Decodes a native `sockaddr` of `bytes.len()` bytes, as the kernel would read it.
     pub(super) fn decode(bytes: &[u8]) -> Self {
-        let Some(family) = bytes.get(..2).and_then(|family| family.try_into().ok()) else {
+        let Some(address) = Self::sockaddr(bytes) else {
             return Self::Unknown;
         };
-        let port = |bytes: &[u8]| {
-            bytes
-                .get(2..4)
-                .and_then(|port| port.try_into().ok())
-                .map(u16::from_be_bytes)
-        };
-        match i32::from(u16::from_ne_bytes(family)) {
+        match i32::from(address.family()) {
+            // Not `SockAddr::as_pathname`: that assumes the length counts one terminating NUL,
+            // where the kernel takes the path up to the first NUL within the length, if any.
             libc::AF_UNIX => {
-                let path = bytes.get(2..).unwrap_or_default();
+                let path = bytes
+                    .get(offset_of!(libc::sockaddr_un, sun_path)..)
+                    .unwrap_or_default();
                 let end = if path.first() == Some(&0) {
                     path.len()
                 } else {
@@ -97,30 +97,38 @@ impl Peer {
                 };
                 Self::Unix(path.get(..end).unwrap_or_default().to_vec())
             }
-            libc::AF_INET => {
-                let address = bytes
-                    .get(4..8)
-                    .and_then(|octets| <[u8; 4]>::try_from(octets).ok());
-                match (port(bytes), address) {
-                    (Some(port), Some(octets)) => {
-                        Self::Ip(SocketAddrV4::new(Ipv4Addr::from(octets), port).into())
-                    }
-                    _ => Self::Unknown,
-                }
+            // The kernel refuses shorter IPv4 lengths, and IPv6 ones that stop before the scope.
+            libc::AF_INET if bytes.len() < size_of::<libc::sockaddr_in>() => Self::Unknown,
+            libc::AF_INET6 if bytes.len() < offset_of!(libc::sockaddr_in6, sin6_scope_id) => {
+                Self::Unknown
             }
-            libc::AF_INET6 => {
-                let address = bytes
-                    .get(8..24)
-                    .and_then(|octets| <[u8; 16]>::try_from(octets).ok());
-                match (port(bytes), address) {
-                    (Some(port), Some(octets)) => {
-                        Self::Ip(SocketAddrV6::new(Ipv6Addr::from(octets), port, 0, 0).into())
-                    }
-                    _ => Self::Unknown,
-                }
-            }
-            _ => Self::Unknown,
+            _ => address.as_socket().map_or(Self::Unknown, |peer| {
+                Self::Ip(SocketAddr::new(peer.ip(), peer.port()))
+            }),
         }
+    }
+
+    /// `bytes` as a `sockaddr`, or `None` when they would overflow `sockaddr_storage` or lack a
+    /// family.
+    fn sockaddr(bytes: &[u8]) -> Option<SockAddr> {
+        let mut storage = SockAddrStorage::zeroed();
+        if bytes.len() < size_of::<libc::sa_family_t>()
+            || bytes.len() > size_of::<SockAddrStorage>()
+        {
+            return None;
+        }
+        let length = socklen_t::try_from(bytes.len()).ok()?;
+        // SAFETY: `storage` is `bytes.len()` bytes or longer, both regions are distinct, and every
+        // byte pattern is a valid `sockaddr_storage`.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                (&raw mut storage).cast::<u8>(),
+                bytes.len(),
+            );
+        }
+        // SAFETY: `storage` is initialised and `length` does not exceed its size.
+        Some(unsafe { SockAddr::new(storage, length) })
     }
 }
 
