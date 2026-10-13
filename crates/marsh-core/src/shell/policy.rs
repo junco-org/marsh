@@ -17,17 +17,32 @@ pub use junco_policy::{Event, PolicyDecision};
 use marsh_lib::RecoverPoison as _;
 use marsh_wal::CommitOp;
 
+/// The policy that made a decision.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PolicyKind {
+    /// The Git capability policy every managed command is checked against.
+    Git,
+    /// A shell's [`AgentPolicy`].
+    Agent,
+}
+
 /// Receives every capability decision `Authority::check` makes, in order, before its effect.
 /// A grant is tentative: a later denial in the same batch or a failed publication rolls it back.
 /// Called under the authority's write lock, so it must only enqueue, never block.
-pub struct PolicyObserver(Box<dyn Fn(&Event, &PolicyDecision) + Send + Sync>);
+pub struct PolicyObserver(Box<dyn Fn(PolicyKind, &Event, &PolicyDecision) + Send + Sync>);
 impl PolicyObserver {
     /// Wraps the callback each decision is passed to.
     pub fn new(observe: impl Fn(&Event, &PolicyDecision) + Send + Sync + 'static) -> Self {
+        Self::with_kind(move |_, event, decision| observe(event, decision))
+    }
+    /// Wraps a callback that is also told which policy made each decision.
+    pub fn with_kind(
+        observe: impl Fn(PolicyKind, &Event, &PolicyDecision) + Send + Sync + 'static,
+    ) -> Self {
         Self(Box::new(observe))
     }
-    pub(super) fn notify(&self, event: &Event, decision: &PolicyDecision) {
-        (self.0)(event, decision);
+    pub(super) fn notify(&self, kind: PolicyKind, event: &Event, decision: &PolicyDecision) {
+        (self.0)(kind, event, decision);
     }
 }
 
@@ -133,7 +148,7 @@ impl Authority {
         for event in events {
             let decision = policy.decide(&self.history, event);
             if let Some(observer) = observer {
-                observer.notify(event, &decision);
+                observer.notify(PolicyKind::Git, event, &decision);
             }
             match decision {
                 PolicyDecision::Grant => self.history.push(event.clone()),
@@ -165,6 +180,8 @@ pub(super) struct AuthorizedCommand<'a> {
     pub events: Vec<Event>,
     checkpoint: usize,
     observation_checkpoint: usize,
+    /// The command's observations that a rollback cannot undo, kept even if it fails.
+    irreversible: Vec<Observation>,
 }
 impl Completion<AuthorizedCommand<'_>> {
     /// Finalizes now and releases the authority; the later drop finds no guard to roll back.
@@ -178,6 +195,9 @@ impl Finalize for AuthorizedCommand<'_> {
         if !completed && let Some(guard) = &mut self.guard {
             guard.history.truncate(self.checkpoint);
             guard.observations.truncate(self.observation_checkpoint);
+            guard
+                .observations
+                .extend(std::mem::take(&mut self.irreversible));
         }
     }
 }
@@ -188,6 +208,7 @@ pub(super) fn authorize<'session>(
     observer: Option<&PolicyObserver>,
     agent: Option<&AgentPolicy>,
 ) -> Result<Completion<AuthorizedCommand<'session>>, ShellError> {
+    let observations = observe(&executed, agent);
     // Every refusal carries the native status the command already produced.
     let admitted = (|| -> Result<_, ShellError> {
         if let Some(failure) = executed.failure.take() {
@@ -222,7 +243,6 @@ pub(super) fn authorize<'session>(
             }));
         }
         let events = translate(&executed)?;
-        let observations = observe(&executed, agent);
         let checkpoint = guard.history.len();
         let observation_checkpoint = guard.observations.len();
         guard
@@ -234,7 +254,7 @@ pub(super) fn authorize<'session>(
             guard.history.truncate(checkpoint);
             return Err(ShellError::new(ShellErrorKind::Denied { denials }));
         }
-        guard.observations.extend(observations);
+        guard.observations.extend(observations.iter().cloned());
         Ok((
             guard,
             operations,
@@ -252,10 +272,28 @@ pub(super) fn authorize<'session>(
                 events,
                 checkpoint,
                 observation_checkpoint,
+                irreversible: irreversible(observations),
             }))
         }
-        Err(error) => Err(error.with_result(executed.result.take())),
+        Err(error) => {
+            // Refusing the command rolls back its source changes, not what it read, ran or sent.
+            let kept = irreversible(observations);
+            if !kept.is_empty()
+                && let Ok(mut authority) = session.validator.write()
+            {
+                authority.observations.extend(kept);
+            }
+            Err(error.with_result(executed.result.take()))
+        }
     }
+}
+
+/// The observations a rollback of their command cannot undo.
+fn irreversible(observations: Vec<Observation>) -> Vec<Observation> {
+    observations
+        .into_iter()
+        .filter(|observation| observation.observed.irreversible())
+        .collect()
 }
 
 fn preflight(executed: &ExecutedCommand, operations: &[CommitOp]) -> Result<(), ShellError> {
@@ -395,20 +433,60 @@ fn translate(executed: &ExecutedCommand) -> Result<Vec<Event>, ShellError> {
 /// The command's agent-policy observations. A source path is created, modified or removed by
 /// comparing the command's baseline with its final work view.
 fn observe(executed: &ExecutedCommand, agent: Option<&AgentPolicy>) -> Vec<Observation> {
-    let baseline = &executed.prepared.baseline;
-    let work = executed.prepared.snapshot.path();
-    let exists = |root: &Path, path: &Path| root.join(path).symlink_metadata().is_ok();
+    let snapshot = &executed.prepared.snapshot;
+    let principal = agent.map_or_else(|| snapshot.uid.clone(), |agent| agent.acting(&snapshot.uid));
+    let (baseline, work) = (&executed.prepared.baseline, snapshot.path());
     agent::observations(
         &executed.evidence.effects,
-        &executed.prepared.snapshot.uid,
+        &principal,
         agent,
-        |path| match (exists(baseline, path), exists(work, path)) {
-            (false, false) => None,
-            (false, true) => Some(PathAction::Create),
-            (true, false) => Some(PathAction::Delete),
-            (true, true) => Some(PathAction::Edit),
+        |path| change(baseline, work, path),
+        |directory| {
+            let mut paths = descendants(baseline, directory);
+            paths.extend(descendants(work, directory));
+            paths.sort();
+            paths.dedup();
+            paths
         },
     )
+}
+
+/// How `path` differs between `baseline` and `work`, if at all.
+pub(super) fn change(baseline: &Path, work: &Path, path: &Path) -> Option<PathAction> {
+    let exists = |root: &Path| root.join(path).symlink_metadata().is_ok();
+    match (exists(baseline), exists(work)) {
+        (false, false) => None,
+        (false, true) => Some(PathAction::Create),
+        (true, false) => Some(PathAction::Delete),
+        (true, true) => Some(PathAction::Edit),
+    }
+}
+
+/// The root-relative paths beneath `directory` in the tree at `root`, never following links.
+fn descendants(root: &Path, directory: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let real = |path: &Path| {
+        root.join(path)
+            .symlink_metadata()
+            .is_ok_and(|metadata| metadata.is_dir())
+    };
+    let mut pending: Vec<PathBuf> = real(directory)
+        .then(|| directory.to_path_buf())
+        .into_iter()
+        .collect();
+    while let Some(next) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(root.join(&next)) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = next.join(entry.file_name());
+            if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                pending.push(path.clone());
+            }
+            found.push(path);
+        }
+    }
+    found
 }
 
 pub(super) fn capability_of(action: GitAction) -> Action {

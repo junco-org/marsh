@@ -109,6 +109,8 @@ pub(crate) struct Captured {
     flags: Option<u64>,
     submissions: Option<Vec<u8>>,
     peers: Vec<Vec<u8>>,
+    /// For each of `peers`, the index of the `sendmmsg` message naming it.
+    peer_messages: Vec<usize>,
     failure: Option<io::Error>,
     /// For a selected exec: what it runs, or why that could not be read. Only an exec that
     /// succeeds ever needs it.
@@ -131,6 +133,7 @@ impl Captured {
             flags: None,
             submissions: None,
             peers: Vec::new(),
+            peer_messages: Vec::new(),
             failure: None,
             exec: None,
         };
@@ -196,11 +199,15 @@ impl Captured {
             };
             captured.flags = captured.keep(result);
         }
-        // An unreadable peer is kept as an empty address: an unknown peer, never no peer.
-        captured.peers = read_peers(tid, syscall, registers)
+        // An unreadable peer is kept as an empty address: an unknown peer, never no peer. It
+        // does not fail the capture: the kernel may never reach it, as in a partial `sendmmsg`.
+        (captured.peer_messages, captured.peers) = read_peers(tid, syscall, registers)
             .into_iter()
-            .map(|peer| captured.keep(peer).unwrap_or_default())
-            .collect();
+            .filter_map(|(message, peer)| match peer {
+                Ok(peer) => interpret_peer(syscall, peer).map(|peer| (message, peer)),
+                Err(_) => Some((message, Vec::new())),
+            })
+            .unzip();
         Ok(captured)
     }
 
@@ -335,6 +342,7 @@ impl Captured {
                 })
             })
             .transpose()?;
+        let peers = sent_peers(syscall, &result, self.peers, &self.peer_messages);
         Ok(Syscall {
             info: SyscallInfo {
                 typ: "SYSCALL",
@@ -351,7 +359,7 @@ impl Captured {
             descriptors: self.descriptors,
             flags: self.flags,
             submissions: self.submissions,
-            peers: self.peers,
+            peers,
         })
     }
 }
@@ -497,24 +505,30 @@ fn read_message_name(tid: Pid, header: u64) -> io::Result<Option<Vec<u8>>> {
         size_of::<libc::socklen_t>(),
     )?;
     let length = libc::socklen_t::from_ne_bytes(length.try_into().map_err(io::Error::other)?);
-    if name == 0 {
+    // The kernel ignores a name of length zero.
+    if name == 0 || length == 0 {
         return Ok(None);
     }
     read_sockaddr(tid, name, u64::from(length)).map(Some)
 }
 
-/// Reads every peer `sockaddr` a socket call names at its entry.
+/// Reads every peer `sockaddr` a socket call names at its entry, each with the index of the
+/// `sendmmsg` message naming it (zero for other calls).
 fn read_peers(
     tid: Pid,
     syscall: Sysno,
     registers: libc::user_regs_struct,
-) -> Vec<io::Result<Vec<u8>>> {
+) -> Vec<(usize, io::Result<Vec<u8>>)> {
     let argument = |index| get_arg_value(registers, index);
     match syscall {
-        Sysno::connect => vec![read_sockaddr(tid, argument(1), argument(2))],
-        Sysno::sendto if argument(4) != 0 => vec![read_sockaddr(tid, argument(4), argument(5))],
+        Sysno::connect => vec![(0, read_sockaddr(tid, argument(1), argument(2)))],
+        // As in `sendmsg`, a null or zero-length address names no peer.
+        Sysno::sendto if argument(4) != 0 && argument(5) != 0 => {
+            vec![(0, read_sockaddr(tid, argument(4), argument(5)))]
+        }
         Sysno::sendmsg => read_message_name(tid, argument(1))
             .transpose()
+            .map(|peer| (0, peer))
             .into_iter()
             .collect(),
         Sysno::sendmmsg => read_message_names(tid, argument(1), argument(2)),
@@ -523,17 +537,60 @@ fn read_peers(
 }
 
 /// Reads the peer address of each of a `sendmmsg`'s first `count` headers that names one.
-fn read_message_names(tid: Pid, vector: u64, count: u64) -> Vec<io::Result<Vec<u8>>> {
-    (0..count.min(MMSG_LIMIT))
-        .filter_map(|index| {
+fn read_message_names(tid: Pid, vector: u64, count: u64) -> Vec<(usize, io::Result<Vec<u8>>)> {
+    // `vlen` is an `unsigned int`, which the kernel bounds to `UIO_MAXIOV`.
+    let count = (count & u64::from(u32::MAX)).min(MMSG_LIMIT);
+    (0..count)
+        .zip(0_usize..)
+        .filter_map(|(index, message)| {
             let header = index
                 .checked_mul(MMSGHDR_SIZE)
                 .and_then(|offset| vector.checked_add(offset));
-            match header {
+            let peer = match header {
                 Some(header) => read_message_name(tid, header).transpose(),
                 None => Some(Err(io::Error::other("mmsghdr wraps the address space"))),
-            }
+            };
+            peer.map(|peer| (message, peer))
         })
+        .collect()
+}
+
+/// The peer a named `sockaddr` reaches, as the kernel reads it: an `AF_UNSPEC` address dissolves
+/// a `connect`'s association instead of naming a peer, and an IPv4 socket sends to one as though
+/// it were `AF_INET`.
+fn interpret_peer(syscall: Sysno, mut peer: Vec<u8>) -> Option<Vec<u8>> {
+    let family = offset_of!(libc::sockaddr, sa_family);
+    let family = family..family + size_of::<libc::sa_family_t>();
+    let unspecified = libc::sa_family_t::try_from(libc::AF_UNSPEC)
+        .ok()?
+        .to_ne_bytes();
+    if peer.get(family.clone()) != Some(&unspecified[..]) {
+        return Some(peer);
+    }
+    if syscall == Sysno::connect {
+        return None;
+    }
+    let inet = libc::sa_family_t::try_from(libc::AF_INET).ok()?.to_ne_bytes();
+    peer.get_mut(family)?.copy_from_slice(&inet);
+    Some(peer)
+}
+
+/// The peers a completed call reached: a `sendmmsg` reaches only those of the messages it sent.
+fn sent_peers(
+    syscall: Sysno,
+    result: &RetCode,
+    peers: Vec<Vec<u8>>,
+    messages: &[usize],
+) -> Vec<Vec<u8>> {
+    let sent = match (syscall, result) {
+        (Sysno::sendmmsg, RetCode::Ok(sent)) => usize::try_from(*sent).unwrap_or(0),
+        _ => return peers,
+    };
+    peers
+        .into_iter()
+        .zip(messages)
+        .filter(|(_, message)| **message < sent)
+        .map(|(peer, _)| peer)
         .collect()
 }
 

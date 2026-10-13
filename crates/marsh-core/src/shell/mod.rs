@@ -34,7 +34,7 @@ mod view;
 pub use agent::{AgentPolicy, AgentPolicyError, AgentRule, AgentRuleSet};
 pub use error::{ShellError, ShellErrorKind};
 pub use junco_policy::{Action, Principal};
-pub use policy::{Denial, Event, PolicyDecision, PolicyObserver, PolicyValidator};
+pub use policy::{Denial, Event, PolicyDecision, PolicyKind, PolicyObserver, PolicyValidator};
 pub use sandbox_policy::{CommandContext, MarshTool, SandboxPolicy, ShellCommand};
 pub use signal::Signal;
 

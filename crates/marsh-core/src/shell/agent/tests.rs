@@ -370,10 +370,189 @@ fn audit_reports_would_be_denials_without_enforcing_them() {
     let batch = [
         path("a", PathAction::Read, ".env"),
         connect("a", external()),
-        connect("a", external()),
+        path("a", PathAction::Edit, ".github/workflows/ci.yml"),
     ];
     assert!(policy.check(&[], &batch, Some(&observer)).is_ok());
-    assert_eq!(*reported.lock().unwrap(), ["net/external", "net/external"]);
+    // The peer's would-be denial was reported at its syscall; publication does not repeat it.
+    assert_eq!(*reported.lock().unwrap(), ["path/ci"]);
+}
+
+/// A custom rule whose tail names a variable its head does not bind.
+fn uncompilable() -> AgentRule {
+    let head = Head::new(
+        ComponentPattern::variable(PRINCIPAL),
+        ComponentPattern::constant(Action::Edit),
+        ComponentPattern::constant(Resource::new(["net", "external"])),
+    );
+    let tail = RegexExpr::test(TestExpr::atom(
+        Comparison::Eq,
+        AtomPattern::Principal(ComponentPattern::variable("unbound")),
+    ));
+    AgentRule::custom(TraceRule::new(
+        Rule::new(RuleMode::Forbid, head, tail),
+        |_| (String::new(), Vec::new()),
+    ))
+}
+
+#[test]
+fn an_uncompilable_rule_denies_what_it_judges_and_audit_only_reports_it() {
+    let reported = Arc::new(std::sync::Mutex::new(0));
+    let sink = Arc::clone(&reported);
+    let observer = PolicyObserver::new(move |_, decision| {
+        if !matches!(decision, PolicyDecision::Grant) {
+            *sink.lock().unwrap() += 1;
+        }
+    });
+    let batch = [connect("a", external()), path("a", PathAction::Edit, "x")];
+    let policy = AgentPolicy::new().rule(uncompilable());
+    let denials = policy.check(&[], &batch, Some(&observer)).unwrap_err();
+    assert_eq!(denials.len(), 1);
+    assert_eq!(denials[0].event.resource.to_string(), "net/external");
+    assert!(denials[0].failed_precondition.contains("does not compile"));
+    assert!(policy.check(&[], &batch, None).is_err());
+    let audit = AgentPolicy::new().rule(uncompilable()).audit();
+    assert!(audit.check(&[], &batch[1..], Some(&observer)).is_ok());
+    assert!(audit.decide_now(&[], &[], &batch[0]).is_some());
+    assert_eq!(*reported.lock().unwrap(), 1);
+}
+
+#[test]
+fn local_and_kernel_peers_are_not_external() {
+    let policy = AgentPolicy::recommended().unwrap();
+    let mut netlink = u16::try_from(libc::AF_NETLINK)
+        .unwrap()
+        .to_ne_bytes()
+        .to_vec();
+    netlink.extend([0; 10]);
+    assert_eq!(Peer::decode(&netlink), Peer::Netlink);
+    let read = path("a", PathAction::Read, ".env");
+    for peer in [
+        Peer::Netlink,
+        Peer::Ip("0.0.0.0:80".parse().unwrap()),
+        Peer::Ip("[::]:80".parse().unwrap()),
+    ] {
+        assert_eq!(
+            policy.decide_now(std::slice::from_ref(&read), &[], &connect("a", peer)),
+            None
+        );
+    }
+}
+
+#[test]
+fn a_shared_principal_carries_taint_across_shells() {
+    let policy = AgentPolicy::recommended().unwrap().principal("agent");
+    let shared = policy.acting(&Principal::from("shell-1"));
+    assert_eq!(shared, policy.acting(&Principal::from("shell-2")));
+    let read = Observation {
+        principal: shared.clone(),
+        observed: Observed::Path {
+            action: PathAction::Read,
+            path: PathBuf::from(".env"),
+            inside: true,
+        },
+    };
+    let egress = Observation {
+        principal: shared,
+        observed: Observed::Connect(external()),
+    };
+    assert!(policy.decide_now(&[read], &[], &egress).is_some());
+    let own = AgentPolicy::recommended().unwrap();
+    assert_eq!(
+        own.acting(&Principal::from("shell-1")),
+        Principal::from("shell-1")
+    );
+}
+
+/// One command's effects, each a single call writing `path`.
+fn writes(paths: &[&str]) -> Vec<(u64, Option<InvocationId>, Effects)> {
+    paths
+        .iter()
+        .zip(1..)
+        .map(|(path, order)| {
+            let effects = Effects {
+                writes: vec![PathBuf::from(path)],
+                ..Effects::default()
+            };
+            (order, None, effects)
+        })
+        .collect()
+}
+
+fn observed_paths(observations: &[Observation]) -> Vec<String> {
+    observations
+        .iter()
+        .map(|observation| match &observation.observed {
+            Observed::Path { path, .. } => path.display().to_string(),
+            other => format!("{other:?}"),
+        })
+        .collect()
+}
+
+#[test]
+fn only_consecutive_repeats_collapse() {
+    let observed = observations(
+        &writes(&["tests/a.rs", "tests/a.rs", "src/b", "tests/a.rs"]),
+        &Principal::from("a"),
+        None,
+        |_| Some(PathAction::Edit),
+        |_| Vec::new(),
+    );
+    assert_eq!(
+        observed_paths(&observed),
+        ["tests/a.rs", "src/b", "tests/a.rs"]
+    );
+    let policy = AgentPolicy::recommended().unwrap();
+    assert!(verdict(&policy, &[], &observed).is_some());
+}
+
+#[test]
+fn a_moved_directory_changes_every_path_beneath_it() {
+    let mut effects = writes(&[".github", ".gh-old", ".gh-old/kept"]);
+    effects[0].2.recursive_writes = vec![PathBuf::from(".github")];
+    effects[1].2.recursive_writes = vec![PathBuf::from(".gh-old")];
+    let before = [".github", ".github/workflows", ".github/workflows/ci.yml"];
+    let observed = observations(
+        &effects,
+        &Principal::from("a"),
+        None,
+        |path| {
+            let path = path.to_str().unwrap();
+            if before.contains(&path) {
+                Some(PathAction::Delete)
+            } else {
+                Some(PathAction::Create)
+            }
+        },
+        |directory| match directory.to_str().unwrap() {
+            ".github" => vec![
+                PathBuf::from(".github/workflows"),
+                PathBuf::from(".github/workflows/ci.yml"),
+            ],
+            _ => vec![
+                PathBuf::from(".gh-old/kept"),
+                PathBuf::from(".gh-old/workflows"),
+                PathBuf::from(".gh-old/workflows/ci.yml"),
+            ],
+        },
+    );
+    // `.gh-old/kept` is observed once, at its own write.
+    assert_eq!(
+        observed_paths(&observed),
+        [
+            ".github",
+            ".github/workflows",
+            ".github/workflows/ci.yml",
+            ".gh-old",
+            ".gh-old/workflows",
+            ".gh-old/workflows/ci.yml",
+            ".gh-old/kept",
+        ]
+    );
+    let policy = AgentPolicy::recommended().unwrap();
+    assert!(
+        verdict(&policy, &[], &observed)
+            .is_some_and(|reason| reason.contains("may not change ci paths"))
+    );
 }
 
 #[test]

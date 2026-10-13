@@ -15,6 +15,7 @@ Standard library only; reads result.json as Harbor writes it (verifier_result.re
 from __future__ import annotations
 
 import json
+import re
 import statistics
 import sys
 from dataclasses import dataclass, field
@@ -38,9 +39,17 @@ class Trial:
 def seconds(timing: dict | None) -> float | None:
     if not timing or not timing.get("started_at") or not timing.get("finished_at"):
         return None
-    start = datetime.fromisoformat(timing["started_at"])
-    end = datetime.fromisoformat(timing["finished_at"])
+    start = timestamp(timing["started_at"])
+    end = timestamp(timing["finished_at"])
     return (end - start).total_seconds()
+
+
+def timestamp(text: str) -> datetime:
+    """An ISO 8601 time. Before Python 3.11, fromisoformat rejects a "Z" suffix and fractions of
+    other than 3 or 6 digits."""
+    text = re.sub(r"Z$", "+00:00", text)
+    text = re.sub(r"\.(\d+)", lambda fraction: "." + fraction.group(1)[:6].ljust(6, "0"), text)
+    return datetime.fromisoformat(text)
 
 
 def load_trial(result_path: Path) -> Trial:
@@ -101,7 +110,7 @@ def summarize(jobs: list[tuple[str, dict[str, list[Trial]]]]) -> str:
         lost_denied = [task for task in lost if any(t.denials for t in trials[task])]
         for trial in attempts:
             for denial in trial.denials:
-                key = f"{denial.get('action')} {denial.get('resource')}"
+                key = f"{denial.get('policy', 'agent')}: {denial.get('action')} {denial.get('resource')}"
                 rules.setdefault(key, {}).setdefault(label, 0)
                 rules[key][label] += 1
         lines.append(

@@ -82,9 +82,9 @@ struct Root {
     peers: Option<PeerGate>,
 }
 
-/// Whether a task of `run`, owned by the invocation, may contact the peer whose `sockaddr` it
-/// names (empty when unknown). Called at the call's entry stop, without trace locks held, from
-/// the tracer thread owning the task; a refused call is skipped and fails with `EPERM`.
+/// Whether a task of `run`, owned by the invocation, may reach the peer whose `sockaddr` it names
+/// or writes to (empty when unknown). Called at the call's entry stop, without trace locks held,
+/// from the tracer thread owning the task; a refused call is skipped and fails with `EPERM`.
 pub type PeerGate = Arc<dyn Fn(TraceRun, Option<InvocationId>, &[u8]) -> bool + Send + Sync>;
 
 /// A selected command a traced task has just executed, read before its new image ran anything.
@@ -799,7 +799,7 @@ impl Tracing {
         let selector = Arc::clone(self);
         observer.select_exec(Box::new(move |tid, path| selector.selects(tid, path)));
         let gate = Arc::clone(self);
-        observer.gate_peers(Box::new(move |tid, peer| gate.permits(tid, peer)));
+        observer.gate_peers(Box::new(move |tid, peers| gate.permits(tid, peers)));
         let result = (|| -> io::Result<()> {
             let mut observe = |sequence, tid: Pid, status, event, info, exec| {
                 let resume = self.deliver(sequence, tid, status, event, info, exec)?;
@@ -858,8 +858,9 @@ impl Tracing {
         result
     }
 
-    /// Whether `tid`'s root lets it contact `peer`. A task no root owns is not gated.
-    fn permits(&self, tid: Pid, peer: &[u8]) -> bool {
+    /// Whether `tid`'s root lets it contact every one of `peers`, listed only for a gated task.
+    /// A task no root owns is not gated.
+    fn permits(&self, tid: Pid, peers: &mut dyn FnMut() -> Vec<Vec<u8>>) -> bool {
         let state = lock(&self.state);
         let Some(target) = state.threads.get(&tid).and_then(|thread| thread.inherited) else {
             return true;
@@ -870,7 +871,11 @@ impl Tracing {
             .and_then(|root| root.peers.as_ref())
             .map(Arc::clone);
         drop(state);
-        gate.is_none_or(|gate| gate(target.run, target.builtin, peer))
+        gate.is_none_or(|gate| {
+            peers()
+                .iter()
+                .all(|peer| gate(target.run, target.builtin, peer))
+        })
     }
 
     /// Whether `tid`'s owner selects the executable it is about to exec.

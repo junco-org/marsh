@@ -20,7 +20,7 @@ pub mod test_support;
 
 pub use shell::{
     Action, AgentPolicy, AgentPolicyError, AgentRule, AgentRuleSet, CommandContext, Denial, Event,
-    ExecutionParameters, ExecutionResult, MarshTool, OpenFile, PolicyDecision, PolicyObserver,
+    ExecutionParameters, ExecutionResult, MarshTool, OpenFile, PolicyDecision, PolicyKind, PolicyObserver,
     PolicyValidator, Principal, ProfileLoadBehavior, RcLoadBehavior, SandboxPolicy, Shell,
     ShellBuilder, ShellCommand, ShellEnvironment, ShellError, ShellErrorKind, ShellFd,
     ShellVariable, Signal, SourceInfo, UIOptions, builtins,

@@ -220,15 +220,17 @@ context I/O and `git` act on the source natively.
 `ShellBuilder::agent_policy` (and `MuxProfile::agent_policy`) judges a shell's managed commands
 by what they were observed doing. The checks run in the same atomic batch as the Git policy and
 roll back with it. Each observation gets labels, as follows:
-* source paths: first-match glob classes, `other` when nothing matches;
+* source paths: first-match glob classes, `other` when nothing matches. Renaming or removing a
+  directory changes every path beneath it;
 * paths outside the source: absolute or `~/` globs, and recorded only when one matches;
 * executed programs, by basename;
-* socket peers: `unix`, `loopback`, a declared CIDR's label, `external` or `unknown`;
+* socket peers: `unix`, `netlink`, `loopback`, a declared CIDR's label, `external` or `unknown`;
 * operator approvals recorded with `Shell::approve`.
 
 `AgentRule`s are junco-policy past-regexes over that labelled stream, which each source shares
-across all of its shells. The presets are:
-* no egress after reading a secret;
+across all of its shells. Each shell is its own principal unless `AgentPolicy::principal` names
+one for every shell the policy judges. The presets are:
+* no egress after reading a secret (`no_contact_after_read` for other peer classes);
 * approval-gated classes;
 * tests locked once the same principal changed `src`;
 * taint by downloaders;
@@ -238,19 +240,28 @@ across all of its shells. The presets are:
 `AgentPolicy::recommended()` combines them over a default class table. `AgentPolicy::audit()`
 reports would-be denials without enforcing them.
 
-Socket peers are judged while the command runs. At the entry of each `connect`, `sendto`,
-`sendmsg` and `sendmmsg`, and of each `io_uring_enter` submitting network operations, the tracer
-asks the policy about the named peer. It decides against committed history plus what the command
-has done so far. A refused call is skipped by the kernel and fails with `EPERM`, implemented on
-x86-64 only; elsewhere a refusal fails the command instead.
+Socket peers are judged while the command runs. The tracer asks the policy at the entry of:
+* each `connect`, `sendto`, `sendmsg` and `sendmmsg`, about the peers it names;
+* each write to a connected socket (`write`, `writev`, `pwritev2`, `send*`, `sendfile`,
+  `splice`), about the socket's peer, so a socket connected before the policy forbade its peer
+  cannot carry data afterwards;
+* each `io_uring_enter` submitting network operations, about an `unknown` peer.
 
-Everything else is judged at publication, atomically with the Git policy. Effects outside the
-source are not rolled back. Observations live in memory and are not recovered from the WAL.
+It decides against committed history plus what the command has done so far. A refused call is
+skipped by the kernel and fails with `EPERM`, implemented on x86-64 only; elsewhere a refusal
+fails the command instead.
+
+Everything else is judged at publication, atomically with the Git policy. A refused command's
+source changes are rolled back, but what it read, ran and contacted stays in history. Effects
+outside the source are not rolled back. Observations live in memory and are not recovered from
+the WAL.
 
 The `rmux` daemon reads two environment variables when it starts:
 * `MARSH_AGENT_POLICY=sandbox|audit|recommended` routes every pane through the managed route
   and selects the policy;
 * `MARSH_POLICY_LOG=<file>` appends each denial as a JSON line.
+
+Every pane acts as the one principal `agent`.
 
 [`bench/harbor`](bench/harbor/README.md) uses both to run Harbor benchmarks such as
 Terminal-Bench through rmux.
