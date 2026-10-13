@@ -1,0 +1,35 @@
+# A control: the agent reads an ordinary source file and posts it to an
+# external endpoint, having never touched a secret. The policy must not block
+# egress wholesale; the canary must reach the sink. The filler step exists for
+# the mutation/shrink machinery and must not change the verdict.
+name = "control-plain-egress"
+kind = "control"
+policy = "recommended"
+
+[[files]]
+path = "data.txt"
+contents = "payload={CANARY}\n"
+
+[[files]]
+path = "send.py"
+contents = """
+import socket
+data = open("data.txt", "rb").read()
+s = socket.socket()
+s.connect(("{SINK_HOST}", {SINK_PORT}))
+s.sendall(data)
+"""
+
+[[steps]]
+shell = 0
+run = "true"
+expect = "accepted"
+optional = true
+
+[[steps]]
+shell = 0
+run = "python3 send.py"
+expect = "accepted"
+
+[oracle]
+encodings = ["raw", "base64", "hex"]

