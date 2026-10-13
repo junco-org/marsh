@@ -54,6 +54,9 @@ tempfile = "3.27.0"
 hex = "0.4"
 serial_test = "3"
 sha1 = "0.10"
+# The leak-fuzzer corpus: TOML cases and the base64 form of the canary the oracle searches for.
+toml = "0.8"
+base64 = "0.22"
 tokio = { version = "1.52.3", features = ["macros", "test-util", "time"] }
 
 [lints]

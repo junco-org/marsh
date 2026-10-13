@@ -94,8 +94,14 @@ lost, lost with a denial, and gained, followed by a table of denied capabilities
 utility sample, use the existing `swebench`/`swebenchpro` adapters. `cooperbench` covers
 multi-agent work.
 
-Security efficacy needs attack tasks. The candidates below have no Harbor adapters yet, and
-porting them is the next step:
+Harbor measures how much real work the policy blocks. It does not measure whether the policy
+actually prevents a leak; the leak fuzzer does that, separately. It runs the
+`crates/marsh-core/tests/leak-corpus/` cases against policy-judged shells in a network namespace
+and fails if a secret reaches a stand-in external host — see
+[`bench/leak-fuzzer/PLAN.md`](../leak-fuzzer/PLAN.md).
+
+Security efficacy against a live agent still needs attack tasks. The candidates below have no
+Harbor adapters yet, and porting them is the next step:
 * SABER (arXiv 2606.01317): destructive changes and exfiltration in stateful workspaces.
 * RedCode-Exec (arXiv 2411.07781): risky shell and Python execution.
 * "Your AI, My Shell" (arXiv 2509.22040): prompt-injection payloads.

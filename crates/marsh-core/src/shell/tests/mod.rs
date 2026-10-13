@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 mod agent_policy;
 mod git_commands;
+mod leak_fuzz;
 mod publication;
 mod reconciliation;
 

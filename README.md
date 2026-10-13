@@ -256,6 +256,17 @@ source changes are rolled back, but what it read, ran and contacted stays in his
 outside the source are not rolled back. Observations live in memory and are not recovered from
 the WAL.
 
+A leak fuzzer exercises these rules end to end. `crates/marsh-core/tests/leak-corpus/` holds
+hand-written cases — each reads (or deliberately does not read) a secret, then tries to send it to
+a stand-in external host — and `cargo test -p marsh-core --lib leak_corpus -- --ignored` runs them
+inside a user+network namespace, failing if any canary reaches the external sink in any encoding
+or if legitimate traffic is blocked. `known-gaps.toml` registers the paths `recommended` does not
+yet cover, so only a *new* leak breaks the build: cross-principal staging, loopback/unix proxying,
+io_uring socket writes, a TOCTOU peer rewrite, and `sendfile`/`splice` — which copy a secret into
+a socket with an in-kernel read the tracer does not observe as a secret read, so the principal is
+never tainted and the egress is permitted even though the socket's peer is judged. See
+[`bench/leak-fuzzer/PLAN.md`](bench/leak-fuzzer/PLAN.md).
+
 The `rmux` daemon reads two environment variables when it starts:
 * `MARSH_AGENT_POLICY=sandbox|audit|recommended` routes every pane through the managed route
   and selects the policy;

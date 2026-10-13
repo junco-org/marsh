@@ -11,7 +11,17 @@ is written by hand or imported from existing benchmarks (for example the exfiltr
 SABER, arXiv 2606.01317, or RedCode, arXiv 2411.07781). The harness does not generate attack
 techniques of its own.
 
-Status: not started. The agent-policy branch `feat/agent-policy` is at `523bb19`.
+Status: **implemented**. The harness lives in `crates/marsh-core/src/shell/tests/leak_fuzz/`
+(namespace bootstrap and runner in `mod.rs`, capture listeners in `sink.rs`, the case schema and
+loader in `case.rs`, the encoding oracle in `oracle.rs`, shrinking in `shrink.rs`); the corpus is
+`crates/marsh-core/tests/leak-corpus/`. Run it with
+`cargo test -p marsh-core --lib leak_corpus -- --ignored --nocapture`. The notes below are the
+design it was built to; where the code refines the plan it is noted inline.
+
+Its first run found a real leak the corpus had not anticipated: `sendfile` copies the secret into
+the socket with an in-kernel read the tracer does not observe as a secret read, so the principal is
+never tainted and the egress is allowed. It is now registered in `known-gaps.toml` alongside the
+`splice` variant of the same root cause.
 
 ## Facts established on the development host
 

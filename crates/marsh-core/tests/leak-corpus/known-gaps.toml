@@ -6,9 +6,24 @@
 # then becomes an ordinary attack that must be blocked.
 #
 # Each entry is a case `name` (not a file name) plus the reason it leaks today.
-# The first three have runnable cases in this directory (gap-*.toml). The last
-# two are documented placeholders with no runnable case yet; the notes say what
-# a case would need.
+# `cross-principal-staged`, `proxy-via-loopback` and `proxy-via-unix` have
+# runnable cases named `gap-*.toml`; `sendfile-exfil` reuses the ordinary
+# `sendfile-exfil.toml` case (the fuzzer found this leak). The last two are
+# documented placeholders with no runnable case yet; the notes say what a case
+# would need.
+
+[[gap]]
+name = "sendfile-exfil"
+reason = """
+Taint on a traced process follows the `read` family of syscalls. `sendfile` \
+(and `splice` from a file to a socket) copies the secret file into the socket \
+entirely in-kernel, with no userspace read, so no secret-read observation is \
+made and the principal is never tainted. The write-to-connected-peer gate then \
+sees an untainted principal and permits the egress to the external peer. Only \
+the host interpreter's own opens synthesize a read (see marsh-instrument \
+`host::opened`); a traced program's in-kernel reads are unobserved. Closing it \
+needs the tracer to treat a `sendfile`/`splice` source fd as a read of its \
+backing path."""
 
 [[gap]]
 name = "cross-principal-staged"

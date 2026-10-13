@@ -2013,6 +2013,7 @@ dependencies = [
 name = "marsh-core"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "brush-builtins",
  "brush-core",
  "brush-interactive",
@@ -2039,6 +2040,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
+ "toml 0.8.23",
 ]
 
 [[package]]
