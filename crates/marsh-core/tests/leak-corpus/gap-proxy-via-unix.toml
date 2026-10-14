@@ -16,7 +16,7 @@ contents = "TOKEN={CANARY}\n"
 path = "relay.py"
 contents = """
 import os, socket
-path = "relay.sock"
+path = "/tmp/marsh-leak-relay.sock"
 try:
     os.unlink(path)
 except FileNotFoundError:
@@ -38,7 +38,7 @@ import socket, time
 secret = open(".env", "rb").read()
 time.sleep(0.5)
 s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-s.connect("relay.sock")
+s.connect("/tmp/marsh-leak-relay.sock")
 s.sendall(secret)
 """
 

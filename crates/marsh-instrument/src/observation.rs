@@ -20,7 +20,7 @@ use nix::unistd::Pid;
 use rustix::io_uring::IoringOp;
 use syscalls::{Sysno, SysnoSet};
 
-use crate::Syscall;
+use crate::{FileTarget, Syscall};
 use crate::capture::{Captured, native_usize};
 use crate::ring::Rings;
 use crate::socket::Sockets;
@@ -64,18 +64,26 @@ pub(crate) type Observe<'a> = dyn FnMut(
 /// Decides at an exec's entry, from the executable it names, whether its arguments are read.
 pub(crate) type Select = Box<dyn FnMut(Pid, &Path) -> bool>;
 /// Decides at the entry of a call that may reach a socket peer whether the task may: `peers`
-/// lists each peer's `sockaddr` (empty when unknown), and is only called for a gated task. A
-/// refused call is skipped and fails with `EPERM`.
-pub(crate) type Gate = Box<dyn FnMut(Pid, &mut dyn FnMut() -> Vec<Vec<u8>>) -> bool>;
+/// lists each peer's `sockaddr` (empty when unknown), and is only called for a gated task. `source`
+/// is the file the same call copies into the socket in-kernel (`sendfile`), which no earlier read
+/// observed. A refused call is skipped and fails with `EPERM`.
+pub(crate) type Gate =
+    Box<dyn FnMut(Pid, &mut dyn FnMut() -> Vec<Vec<u8>>, Option<&FileTarget>) -> bool>;
 
-/// `io_uring` operations that contact a peer. Their destinations live in memory a ring read
-/// cannot attribute to a call.
-const NETWORK_IO_URING_OPS: [u8; 5] = [
-    IoringOp::Sendmsg as u8,
-    IoringOp::Connect as u8,
-    IoringOp::Send as u8,
-    IoringOp::SendZc as u8,
-    IoringOp::SendmsgZc as u8,
+/// `io_uring` operations with no filesystem or socket effect.
+///
+/// `NOP`, `POLL_ADD`, `POLL_REMOVE`, `TIMEOUT`, `TIMEOUT_REMOVE`, `ASYNC_CANCEL`, `LINK_TIMEOUT`
+/// and `EPOLL_CTL` (event-loop batching, as libuv uses). Any other operation may write to a
+/// socket: a `WRITE` names only a descriptor, so it is gated as reaching an unknown peer.
+pub const EFFECTLESS_IO_URING_OPS: [u8; 8] = [
+    IoringOp::Nop as u8,
+    IoringOp::PollAdd as u8,
+    IoringOp::PollRemove as u8,
+    IoringOp::Timeout as u8,
+    IoringOp::TimeoutRemove as u8,
+    IoringOp::AsyncCancel as u8,
+    IoringOp::LinkTimeout as u8,
+    IoringOp::EpollCtl as u8,
 ];
 
 /// Why a tree whose remaining tasks are all held can make no progress.
@@ -468,9 +476,15 @@ impl Observer {
             }
             let sockets = &mut self.sockets;
             let blocked = match &mut self.gate {
-                Some(gate) if reaches_peer(syscall) => !gate(tid, &mut || {
-                    contacted(tid, syscall, &capture, registers, sockets)
-                }),
+                Some(gate) if reaches_peer(syscall) => {
+                    let source =
+                        read_descriptor(syscall).and_then(|index| capture.descriptor(index));
+                    !gate(
+                        tid,
+                        &mut || contacted(tid, syscall, &capture, registers, sockets),
+                        source,
+                    )
+                }
                 _ => false,
             };
             if blocked && alive(skip_syscall(tid, registers))?.is_none() {
@@ -580,7 +594,7 @@ fn event_message(tid: Pid, event: i32) -> io::Result<Option<u64>> {
 }
 
 /// Calls that may reach a socket peer.
-fn reaches_peer(syscall: Sysno) -> bool {
+const fn reaches_peer(syscall: Sysno) -> bool {
     matches!(
         syscall,
         Sysno::connect | Sysno::sendto | Sysno::sendmsg | Sysno::sendmmsg | Sysno::io_uring_enter
@@ -589,7 +603,7 @@ fn reaches_peer(syscall: Sysno) -> bool {
 
 /// The argument naming the descriptor a call writes through, for calls that write to any
 /// descriptor, sockets included.
-fn written_descriptor(syscall: Sysno) -> Option<usize> {
+const fn written_descriptor(syscall: Sysno) -> Option<usize> {
     match syscall {
         Sysno::write
         | Sysno::writev
@@ -605,9 +619,19 @@ fn written_descriptor(syscall: Sysno) -> Option<usize> {
     }
 }
 
+/// The argument naming the descriptor a call copies from in-kernel, for calls that may copy a
+/// file straight into a socket without a userspace read. A `splice` into a socket reads a pipe,
+/// whose file-to-pipe `splice` was already observed as a read when it returned.
+const fn read_descriptor(syscall: Sysno) -> Option<usize> {
+    match syscall {
+        Sysno::sendfile => Some(1),
+        _ => None,
+    }
+}
+
 /// The peers a call at its entry stop may reach: the addresses it names, the peer of a connected
-/// socket it writes to, or one unknown peer for an `io_uring_enter` submitting network
-/// operations, or submissions it cannot read.
+/// socket it writes to, or one unknown peer for an `io_uring_enter` submitting any operation
+/// that may reach a socket, or submissions it cannot read.
 fn contacted(
     tid: Pid,
     syscall: Sysno,
@@ -621,7 +645,7 @@ fn contacted(
             && capture.submissions().is_none_or(|opcodes| {
                 opcodes
                     .iter()
-                    .any(|opcode| NETWORK_IO_URING_OPS.contains(opcode))
+                    .any(|opcode| !EFFECTLESS_IO_URING_OPS.contains(opcode))
             });
         return if networked { vec![Vec::new()] } else { Vec::new() };
     }

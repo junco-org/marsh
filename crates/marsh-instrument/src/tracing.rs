@@ -20,7 +20,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
 use std::thread::ThreadId;
 use std::time::Duration;
 
-use crate::Syscall;
+use crate::{FileTarget, Syscall};
 use crate::capture::proc_field;
 use crate::host::{HostCall, records};
 use crate::observation::{Observer, Resume, Sequence, UNCLASSIFIED, alive, creation};
@@ -83,9 +83,13 @@ struct Root {
 }
 
 /// Whether a task of `run`, owned by the invocation, may reach the peer whose `sockaddr` it names
-/// or writes to (empty when unknown). Called at the call's entry stop, without trace locks held,
+/// or writes to (empty when unknown).
+///
+/// The last argument is the file the same call copies into the socket in-kernel (`sendfile`), a
+/// read no earlier observation records. Called at the call's entry stop, without trace locks held,
 /// from the tracer thread owning the task; a refused call is skipped and fails with `EPERM`.
-pub type PeerGate = Arc<dyn Fn(TraceRun, Option<InvocationId>, &[u8]) -> bool + Send + Sync>;
+pub type PeerGate =
+    Arc<dyn Fn(TraceRun, Option<InvocationId>, &[u8], Option<&FileTarget>) -> bool + Send + Sync>;
 
 /// A selected command a traced task has just executed, read before its new image ran anything.
 ///
@@ -799,7 +803,9 @@ impl Tracing {
         let selector = Arc::clone(self);
         observer.select_exec(Box::new(move |tid, path| selector.selects(tid, path)));
         let gate = Arc::clone(self);
-        observer.gate_peers(Box::new(move |tid, peers| gate.permits(tid, peers)));
+        observer.gate_peers(Box::new(move |tid, peers, source| {
+            gate.permits(tid, peers, source)
+        }));
         let result = (|| -> io::Result<()> {
             let mut observe = |sequence, tid: Pid, status, event, info, exec| {
                 let resume = self.deliver(sequence, tid, status, event, info, exec)?;
@@ -860,7 +866,12 @@ impl Tracing {
 
     /// Whether `tid`'s root lets it contact every one of `peers`, listed only for a gated task.
     /// A task no root owns is not gated.
-    fn permits(&self, tid: Pid, peers: &mut dyn FnMut() -> Vec<Vec<u8>>) -> bool {
+    fn permits(
+        &self,
+        tid: Pid,
+        peers: &mut dyn FnMut() -> Vec<Vec<u8>>,
+        source: Option<&FileTarget>,
+    ) -> bool {
         let state = lock(&self.state);
         let Some(target) = state.threads.get(&tid).and_then(|thread| thread.inherited) else {
             return true;
@@ -874,7 +885,7 @@ impl Tracing {
         gate.is_none_or(|gate| {
             peers()
                 .iter()
-                .all(|peer| gate(target.run, target.builtin, peer))
+                .all(|peer| gate(target.run, target.builtin, peer, source))
         })
     }
 

@@ -7,7 +7,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use lurk_cli::syscall_info::{RetCode, SyscallArg};
-use marsh_instrument::{FileTarget, Syscall};
+use marsh_instrument::{EFFECTLESS_IO_URING_OPS, FileTarget, Syscall};
 use marsh_lib::{CheckedAdvance, RecoverPoison as _};
 use nix_observer::unistd::Pid;
 use syscalls::Sysno;
@@ -16,10 +16,6 @@ use super::agent::Peer;
 
 /// `IORING_SETUP_SQPOLL`: a kernel thread consumes submissions without any syscall to observe.
 const IORING_SETUP_SQPOLL: u64 = 1 << 1;
-/// `io_uring` operations with no filesystem effect: `NOP`, `POLL_ADD`, `POLL_REMOVE`, `TIMEOUT`,
-/// `TIMEOUT_REMOVE`, `ASYNC_CANCEL`, `LINK_TIMEOUT` and `EPOLL_CTL` (event-loop batching, as
-/// libuv uses).
-const EFFECTLESS_IO_URING_OPS: [u8; 8] = [0, 6, 7, 11, 12, 14, 15, 29];
 
 /// A single native call's footprint. Metadata observations never manufacture content claims.
 #[derive(Debug, Default)]
@@ -677,6 +673,13 @@ impl Access {
             }
         }
         Ok(())
+    }
+
+    /// The read of `target` a call is about to make, as [`Access::observe`] would record it.
+    pub(super) fn read_effect(&self, target: &FileTarget, root: &Path) -> Result<Effects, String> {
+        let mut effects = Effects::default();
+        self.target_effect(&mut effects, target, root, true, false)?;
+        Ok(effects)
     }
 
     fn fd_effect(

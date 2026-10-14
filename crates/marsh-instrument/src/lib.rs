@@ -15,6 +15,7 @@ mod tracing;
 mod wire;
 
 pub use host::HostCall;
+pub use observation::EFFECTLESS_IO_URING_OPS;
 pub use syscall::{FileTarget, Syscall};
 pub use tracing::{
     ChildEvent, ExecCommand, ExecDecision, ExecHooks, InvocationId, PeerGate, PollScope, RootId,

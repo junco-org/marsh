@@ -25,9 +25,10 @@
 //! * **At the syscall, for socket peers.** At the entry of every `connect`, `sendto`, `sendmsg` and
 //!   `sendmmsg`, the tracer asks the policy about each peer the call names. At every write to a
 //!   connected socket it asks about the socket's peer, so a connection made before a secret was
-//!   read cannot carry it. It also asks at every `io_uring_enter` that submits network operations
-//!   or whose submissions it cannot read; there the peer is `unknown`. The policy decides against
-//!   committed history plus what the command has done so far. A refused call never reaches the
+//!   read cannot carry it; a `sendfile` is judged with its source counted as read. It also asks at
+//!   every `io_uring_enter` that submits any operation outside the effectless poll, timeout and
+//!   cancel set, or whose submissions it cannot read; there the peer is `unknown`. The policy
+//!   decides against committed history plus what the command has done so far. A refused call never reaches the
 //!   kernel: the task sees `EPERM`, and the rest of the command proceeds normally. The tracer reads the address at entry, so another thread of
 //!   the tracee could rewrite it before the kernel copies it; this blocks what the call names,
 //!   not what a racing thread substitutes. Blocking rewrites the syscall number, implemented on

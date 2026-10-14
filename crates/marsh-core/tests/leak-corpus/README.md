@@ -10,8 +10,8 @@ is not a case; it registers cases whose leaks are expected (see below).
 * `attack` — a secret's bytes must **not** reach an external sink. The case
   passes when the policy blocks the egress. Most model a real exfiltration
   technique; a few probe a specific enforcement point (a pre-connected socket,
-  `writev`, an IPv4-mapped IPv6 peer). `sendfile` is registered as a known gap
-  (its in-kernel read evades taint); see below.
+  `writev`, an IPv4-mapped IPv6 peer, `sendfile`/`splice` copying in-kernel, an
+  io_uring `WRITE` to a connected socket).
 * `control` — legitimate traffic that must **not** be blocked. The canary must
   reach the sink; if it does not, the case fails as a false denial. Controls
   here never read a `secret`-classed path, so egress is allowed and the sink
@@ -50,8 +50,6 @@ fails loading, so file contents and commands must not contain stray braces.
 
 Cases listed in `known-gaps.toml` leak by design: they exercise paths
 `recommended` does not cover (cross-principal staging, loopback/unix proxying,
-io_uring socket writes, a TOCTOU peer rewrite, and `sendfile`/`splice`, whose
-in-kernel read of the secret is not observed as a secret read, so the egress is
-never tainted). Their leaks report "known gap" rather than failing, so only a
+and a TOCTOU peer rewrite). Their leaks report "known gap" rather than failing, so only a
 new, unlisted leak breaks the build. Close a gap in the policy, then delete its
 entry and the case becomes a must-block attack.

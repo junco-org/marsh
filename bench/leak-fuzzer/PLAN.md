@@ -20,8 +20,9 @@ design it was built to; where the code refines the plan it is noted inline.
 
 Its first run found a real leak the corpus had not anticipated: `sendfile` copies the secret into
 the socket with an in-kernel read the tracer does not observe as a secret read, so the principal is
-never tainted and the egress is allowed. It is now registered in `known-gaps.toml` alongside the
-`splice` variant of the same root cause.
+never tainted and the egress is allowed. The gate now counts a `sendfile`'s source as read before
+judging it, and `sendfile-exfil` is an ordinary must-block attack; `splice-exfil` covers the
+pipe-based variant.
 
 ## Facts established on the development host
 
@@ -176,8 +177,10 @@ instead of failing, so only new leaks fail the build. Gaps already documented in
 agent-policy section:
 
 * proxying through a loopback or unix-socket service;
-* io_uring writes to sockets;
 * a different principal sending data that the agent staged outside the source.
+
+io_uring writes to sockets were a gap and are closed: every operation outside the effectless set is
+gated as an unknown peer.
 
 ## Running it
 

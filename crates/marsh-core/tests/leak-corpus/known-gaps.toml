@@ -7,23 +7,12 @@
 #
 # Each entry is a case `name` (not a file name) plus the reason it leaks today.
 # `cross-principal-staged`, `proxy-via-loopback` and `proxy-via-unix` have
-# runnable cases named `gap-*.toml`; `sendfile-exfil` reuses the ordinary
-# `sendfile-exfil.toml` case (the fuzzer found this leak). The last two are
-# documented placeholders with no runnable case yet; the notes say what a case
-# would need.
-
-[[gap]]
-name = "sendfile-exfil"
-reason = """
-Taint on a traced process follows the `read` family of syscalls. `sendfile` \
-(and `splice` from a file to a socket) copies the secret file into the socket \
-entirely in-kernel, with no userspace read, so no secret-read observation is \
-made and the principal is never tainted. The write-to-connected-peer gate then \
-sees an untainted principal and permits the egress to the external peer. Only \
-the host interpreter's own opens synthesize a read (see marsh-instrument \
-`host::opened`); a traced program's in-kernel reads are unobserved. Closing it \
-needs the tracer to treat a `sendfile`/`splice` source fd as a read of its \
-backing path."""
+# runnable cases named `gap-*.toml`. `toctou-peer-rewrite` is a documented
+# placeholder with no runnable case.
+#
+# Closed: `sendfile-exfil` (the gate counts a sendfile's source as a read) and
+# `io-uring-socket-write` (every io_uring operation outside the effectless set
+# is gated as an unknown peer). Both are now ordinary must-block attacks.
 
 [[gap]]
 name = "cross-principal-staged"
@@ -46,16 +35,6 @@ reason = """
 `recommended` permits the `unix` peer class. A relay on a unix-domain socket, \
 run by a different principal, can forward a tainted principal's write out to an \
 external host."""
-
-[[gap]]
-name = "io-uring-socket-write"
-reason = """
-io_uring_enter is gated for submissions the tracer recognises as network \
-operations or cannot read (peer `unknown`). A plain IORING_OP_WRITE/WRITEV to \
-an already-connected socket fd, whose submission queue the tracer can read, is \
-not recognised as a network operation and is not re-checked against the \
-socket's peer. No runnable case yet: needs liburing or hand-rolled io_uring \
-setup, which the Python 3.8 corpus cannot express."""
 
 [[gap]]
 name = "toctou-peer-rewrite"

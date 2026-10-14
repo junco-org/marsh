@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use marsh_instrument::{
-    ExecCommand, ExecDecision, ExecHooks, InvocationId, RootId, Syscall, TraceRun,
+    ExecCommand, ExecDecision, ExecHooks, FileTarget, InvocationId, RootId, Syscall, TraceRun,
 };
 use marsh_lib::RecoverPoison as _;
 
@@ -139,9 +139,9 @@ impl Snapshot {
             let gate = Arc::downgrade(&snapshot);
             snapshot.session.tracing.gate_peers(
                 root,
-                Arc::new(move |run, _, peer| {
+                Arc::new(move |run, _, peer, source| {
                     gate.upgrade()
-                        .is_none_or(|snapshot| snapshot.permits_peer(run, peer))
+                        .is_none_or(|snapshot| snapshot.permits_peer(run, peer, source))
                 }),
             )?;
         }
@@ -258,9 +258,10 @@ impl Snapshot {
     }
 
     /// Whether the active command may reach `peer` (a native `sockaddr`, empty when unknown): its
-    /// agent policy decides against committed history plus the command's observations so far.
+    /// agent policy decides against committed history plus the command's observations so far,
+    /// including a read of `source`, the file this same call copies into the socket in-kernel.
     /// Called on the tracer thread while the calling task is stopped at the call's entry.
-    fn permits_peer(&self, run: TraceRun, peer: &[u8]) -> bool {
+    fn permits_peer(&self, run: TraceRun, peer: &[u8], source: Option<&FileTarget>) -> bool {
         let Some(agent) = &self.agent else {
             return true;
         };
@@ -273,7 +274,7 @@ impl Snapshot {
             return true;
         }
         // Taken one after the other, never nested: `prepare` locks this state under the authority.
-        let prior = match &self.state.lock().recover().evidence {
+        let mut prior = match &self.state.lock().recover().evidence {
             Some((active, evidence)) if *active == run => agent::observations(
                 &evidence.effects,
                 &principal,
@@ -283,6 +284,26 @@ impl Snapshot {
             ),
             _ => Vec::new(),
         };
+        // The call's own in-kernel read is recorded only at its exit, after the bytes left.
+        if let Some(source) = source {
+            let read = self
+                .state
+                .lock()
+                .recover()
+                .access
+                .read_effect(source, &self.path);
+            match read {
+                Ok(effects) => prior.extend(agent::observations(
+                    &[(u64::MAX, None, effects)],
+                    &principal,
+                    Some(agent),
+                    |_| None,
+                    |_| Vec::new(),
+                )),
+                // An unclassifiable source fails the command at exit; its bytes must not leave.
+                Err(_) => return agent.audits(),
+            }
+        }
         let denial = {
             let authority = self.session.validator.read();
             agent.decide_now(&authority.observations, &prior, &candidate)

@@ -1,9 +1,7 @@
-# KNOWN GAP (found by the fuzzer). sendfile copies the secret straight to the
-# socket with no userspace read, so no secret-read taint is recorded and the
-# write-to-connected-peer gate, seeing an untainted principal, permits the
-# egress. The socket fd IS judged (sendfile is in the gate's written-descriptor
-# set), but taint never fires. Registered in known-gaps.toml; closing it needs
-# the tracer to treat a sendfile/splice source fd as a read of its path.
+# Found by the fuzzer. sendfile copies the secret straight to the socket with
+# no userspace read, and its read of the source is recorded only when it
+# returns. The write-to-connected-peer gate must count that source as read at
+# the call's entry, or the principal is untainted when the egress is judged.
 name = "sendfile-exfil"
 kind = "attack"
 policy = "recommended"

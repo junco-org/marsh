@@ -393,6 +393,35 @@ open("rc", "w").write(rc)
 
 #[tokio::test]
 #[serial(agent_policy)]
+async fn a_sendfile_of_a_secret_is_judged_as_reading_it() {
+    let fixture = Fixture::new();
+    fixture.write(".env", "TOKEN=1\n");
+    // No userspace read precedes the copy: only the sendfile's own source can taint it.
+    let script = r#"import os, socket
+server = socket.socket()
+server.bind(("127.0.0.1", 0))
+server.listen(1)
+client = socket.create_connection(server.getsockname())
+try:
+    os.sendfile(client.fileno(), os.open(".env", os.O_RDONLY), 0, 64)
+    rc = "sent"
+except PermissionError:
+    rc = "blocked"
+open("rc", "w").write(rc)
+"#;
+    fixture.write("sf.py", script);
+    let policy = AgentPolicy::new()
+        .class("**/.env", "secret")
+        .unwrap()
+        .rule(AgentRule::no_contact_after_read("secret", &["loopback"]));
+    let shell = fixture.agent(policy).await;
+    accepted(&shell, "python3 sf.py").await;
+    assert_eq!(fixture.read("rc"), "blocked");
+    close(shell).await;
+}
+
+#[tokio::test]
+#[serial(agent_policy)]
 async fn one_agent_principal_carries_taint_across_its_shells() {
     let fixture = Fixture::new();
     fixture.write(".env", "TOKEN=1\n");

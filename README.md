@@ -244,8 +244,10 @@ Socket peers are judged while the command runs. The tracer asks the policy at th
 * each `connect`, `sendto`, `sendmsg` and `sendmmsg`, about the peers it names;
 * each write to a connected socket (`write`, `writev`, `pwritev2`, `send*`, `sendfile`,
   `splice`), about the socket's peer, so a socket connected before the policy forbade its peer
-  cannot carry data afterwards;
-* each `io_uring_enter` submitting network operations, about an `unknown` peer.
+  cannot carry data afterwards. A `sendfile` is judged with its source file counted as already
+  read, since its in-kernel copy is recorded only when the call returns;
+* each `io_uring_enter` submitting any operation other than a poll, timeout or cancel, or whose
+  submissions it cannot read, about an `unknown` peer: a ring `WRITE` names only a descriptor.
 
 It decides against committed history plus what the command has done so far. A refused call is
 skipped by the kernel and fails with `EPERM`, implemented on x86-64 only; elsewhere a refusal
@@ -261,10 +263,9 @@ hand-written cases — each reads (or deliberately does not read) a secret, then
 a stand-in external host — and `cargo test -p marsh-core --lib leak_corpus -- --ignored` runs them
 inside a user+network namespace, failing if any canary reaches the external sink in any encoding
 or if legitimate traffic is blocked. `known-gaps.toml` registers the paths `recommended` does not
-yet cover, so only a *new* leak breaks the build: cross-principal staging, loopback/unix proxying,
-io_uring socket writes, a TOCTOU peer rewrite, and `sendfile`/`splice` — which copy a secret into
-a socket with an in-kernel read the tracer does not observe as a secret read, so the principal is
-never tainted and the egress is permitted even though the socket's peer is judged. See
+yet cover, so only a *new* leak breaks the build: cross-principal staging, loopback/unix proxying
+and a TOCTOU peer rewrite. All three need taint to cross principals or the tracer's entry-time
+read, which the rules cannot express. See
 [`bench/leak-fuzzer/PLAN.md`](bench/leak-fuzzer/PLAN.md).
 
 The `rmux` daemon reads two environment variables when it starts:
