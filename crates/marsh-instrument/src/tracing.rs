@@ -659,44 +659,42 @@ impl Tracing {
         Ok(())
     }
 
-    /// The roots whose traced tasks hold a socket bound to the loopback or unix address `peer`
-    /// names (a native `sockaddr`): every root a contact with `peer` may hand data to. Empty for
-    /// any other address, and for one only untraced processes hold. Reads this host's network
-    /// namespace, which traced tasks share.
-    pub fn receivers(&self, peer: &[u8]) -> HashSet<RootId> {
-        let Some(inodes) = local::bound_to(peer).filter(|inodes| !inodes.is_empty()) else {
-            return HashSet::new();
-        };
+    /// The sockets bound to the loopback or unix address `peer` names (a native `sockaddr`), each
+    /// as the roots whose traced tasks hold it: every socket a contact with `peer` may hand data
+    /// to. A socket only untraced processes hold has no roots. `None` for any other address.
+    /// Reads this host's network namespace, which traced tasks share.
+    pub fn receivers(&self, peer: &[u8]) -> Option<Vec<HashSet<RootId>>> {
+        let inodes = local::bound_to(peer)?;
+        let mut holders: HashMap<u64, HashSet<RootId>> = inodes
+            .into_iter()
+            .map(|inode| (inode, HashSet::new()))
+            .collect();
+        if holders.is_empty() {
+            return Some(Vec::new());
+        }
         let tasks: Vec<(Pid, RootId)> = lock(&self.state)
             .threads
             .iter()
             .filter_map(|(tid, thread)| thread.inherited.map(|target| (*tid, target.run.root)))
             .collect();
-        let mut roots = HashSet::new();
         for (tid, root) in tasks {
-            if roots.contains(&root) {
-                continue;
-            }
             let Ok(entries) = std::fs::read_dir(format!("/proc/{tid}/fd")) else {
                 continue;
             };
-            let holds = entries.filter_map(Result::ok).any(|entry| {
-                std::fs::read_link(entry.path())
-                    .ok()
-                    .and_then(|link| {
-                        link.to_str()?
-                            .strip_prefix("socket:[")?
-                            .strip_suffix(']')?
-                            .parse()
-                            .ok()
-                    })
-                    .is_some_and(|inode: u64| inodes.contains(&inode))
-            });
-            if holds {
-                roots.insert(root);
+            for entry in entries.filter_map(Result::ok) {
+                let inode = std::fs::read_link(entry.path()).ok().and_then(|link| {
+                    link.to_str()?
+                        .strip_prefix("socket:[")?
+                        .strip_suffix(']')?
+                        .parse::<u64>()
+                        .ok()
+                });
+                if let Some(roots) = inode.and_then(|inode| holders.get_mut(&inode)) {
+                    roots.insert(root);
+                }
             }
         }
-        roots
+        Some(holders.into_values().collect())
     }
 
     /// Consults `gate` before any task of `root`'s runs contacts a socket peer.

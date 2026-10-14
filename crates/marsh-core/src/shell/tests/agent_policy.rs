@@ -8,7 +8,7 @@ use std::os::unix::fs::PermissionsExt;
 use serial_test::serial;
 
 use super::*;
-use crate::{AgentPolicy, AgentRule};
+use crate::{AgentPolicy, AgentRule, UntracedLocal};
 
 /// Starts a nonblocking connection to a TEST-NET-1 address that never answers and records the
 /// errno the kernel (or the gate) gave it in `file`: `115` (`EINPROGRESS`) when the connection
@@ -447,15 +447,15 @@ async fn a_secret_staged_outside_the_source_taints_whoever_reads_it() {
     close(sender).await;
 }
 
-#[tokio::test]
-#[serial(agent_policy)]
-async fn a_tainted_contact_with_a_local_relay_taints_the_relay() {
+/// Runs a relay listening on loopback in one shell and `send`, a Python snippet given `data` (the
+/// secret's bytes, read after `path` names it) and `port`, in another, each judged by `policy`.
+/// Returns how the relay's own attempt to reach an external peer ended once it received
+/// something.
+async fn relay(policy: impl Fn() -> AgentPolicy, send: &str) -> String {
     let fixture = Fixture::new();
     fixture.write(".env", "TOKEN=1\n");
     let outside = tempfile::tempdir().unwrap();
     let outside = outside.path().display();
-    // The relay publishes its port, then reports whether it could reach an external peer once a
-    // client sent it something.
     let relay = format!(
         r#"import os, socket
 server = socket.socket()
@@ -474,20 +474,20 @@ open("{outside}/rc", "w").write(str(out.connect_ex(("192.0.2.1", 9))))
     fixture.write(
         "send.py",
         &format!(
-            r#"import socket, time
+            r#"import os, socket, time
 while True:
     try:
         port = int(open("{outside}/port").read())
         break
     except OSError:
         time.sleep(0.05)
-data = open(".env", "rb").read()
-socket.create_connection(("127.0.0.1", port)).sendall(data)
+path = ".env"
+{send}
 "#
         ),
     );
-    let relayer = fixture.agent(AgentPolicy::recommended().unwrap()).await;
-    let sender = fixture.agent(AgentPolicy::recommended().unwrap()).await;
+    let relayer = fixture.agent(policy()).await;
+    let sender = fixture.agent(policy()).await;
     // A command waits for its background jobs: leave the relay's running while the sender runs.
     let relaying = relayer.run("python3 relay.py &");
     let _ = tokio::time::timeout(std::time::Duration::from_millis(300), relaying).await;
@@ -497,9 +497,43 @@ socket.create_connection(("127.0.0.1", port)).sendall(data)
     while std::fs::metadata(&rc).is_err() && std::time::Instant::now() < deadline {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
-    assert_eq!(std::fs::read_to_string(&rc).unwrap(), BLOCKED);
+    let rc = std::fs::read_to_string(&rc).expect("the relay received the sender's bytes");
     close(sender).await;
     close(relayer).await;
+    rc
+}
+
+/// Sends the secret to the relay with an ordinary write.
+const SEND_ALL: &str =
+    r#"socket.create_connection(("127.0.0.1", port)).sendall(open(path, "rb").read())"#;
+
+#[tokio::test]
+#[serial(agent_policy)]
+async fn a_tainted_contact_with_a_local_relay_taints_the_relay() {
+    let rc = relay(|| AgentPolicy::recommended().unwrap(), SEND_ALL).await;
+    assert_eq!(rc, BLOCKED);
+}
+
+#[tokio::test]
+#[serial(agent_policy)]
+async fn a_relay_marsh_traces_is_not_an_untraced_local_peer() {
+    let policy = || {
+        AgentPolicy::recommended()
+            .unwrap()
+            .untraced_local(UntracedLocal::Deny)
+    };
+    // The sender may reach the relay, and hands it the secret.
+    assert_eq!(relay(policy, SEND_ALL).await, BLOCKED);
+}
+
+#[tokio::test]
+#[serial(agent_policy)]
+async fn a_sendfile_to_a_local_relay_taints_the_relay() {
+    // No userspace read precedes the copy: the taint handed on is the sendfile's own source's.
+    let send = r#"client = socket.create_connection(("127.0.0.1", port))
+os.sendfile(client.fileno(), os.open(path, os.O_RDONLY), 0, 64)"#;
+    let rc = relay(|| AgentPolicy::recommended().unwrap(), send).await;
+    assert_eq!(rc, BLOCKED);
 }
 
 #[tokio::test]
@@ -551,4 +585,301 @@ async fn running_python_tests_after_a_source_edit_is_accepted() {
     accepted(&shell, "cd tests && python3 -c 'import test_a'").await;
     assert!(fixture.seed.join("tests/__pycache__").exists());
     close(shell).await;
+}
+
+/// A Python helper that sends one datagram to TEST-NET-1 and says how it went.
+const ATTEMPT: &str = r#"import socket
+out = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+def attempt():
+    try:
+        out.sendto(b"x", ("192.0.2.1", 9))
+        return "sent"
+    except PermissionError:
+        return "blocked"
+"#;
+
+/// Waits up to ten seconds for `path` to exist, then reads it.
+async fn await_file(path: &std::path::Path) -> String {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::fs::metadata(path).is_err() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    read(path)
+}
+
+#[tokio::test]
+#[serial(agent_policy)]
+async fn a_repeated_contact_is_judged_again_after_a_secret_read() {
+    let fixture = Fixture::new();
+    fixture.write(".env", "TOKEN=1\n");
+    fixture.write(
+        "x.py",
+        &format!(
+            "{ATTEMPT}before = [attempt() for _ in range(3)]\nopen(\".env\").read()\n\
+             after = [attempt() for _ in range(3)]\nopen(\"rc\", \"w\").write(\" \".join(before + after))\n"
+        ),
+    );
+    let shell = fixture.agent(AgentPolicy::recommended().unwrap()).await;
+    accepted(&shell, "python3 x.py").await;
+    assert_eq!(fixture.read("rc"), "sent sent sent blocked blocked blocked");
+    close(shell).await;
+}
+
+/// A policy refusing external peers once the same principal ran `true`: no propagated class, so
+/// only observations change its answer.
+fn after_running_true() -> AgentPolicy {
+    use junco_policy::{
+        AtomPattern, Comparison, ComponentPattern, Head, RegexExpr, Resource, Rule, RuleMode,
+        TestExpr, TraceRule,
+    };
+    let ran = TestExpr::and([
+        TestExpr::atom(
+            Comparison::Eq,
+            AtomPattern::Principal(ComponentPattern::variable("p")),
+        ),
+        TestExpr::atom(
+            Comparison::Eq,
+            AtomPattern::Resource(ComponentPattern::constant(Resource::new(["exec", "true"]))),
+        ),
+    ]);
+    let rule = Rule::new(
+        RuleMode::Forbid,
+        Head::new(
+            ComponentPattern::variable("p"),
+            ComponentPattern::constant(crate::Action::Edit),
+            ComponentPattern::constant(Resource::new(["net", "external"])),
+        ),
+        RegexExpr::concat([RegexExpr::all(), RegexExpr::test(ran), RegexExpr::all()]),
+    );
+    AgentPolicy::new().rule(AgentRule::custom(TraceRule::new(rule, |_| {
+        ("ran true".to_owned(), Vec::new())
+    })))
+}
+
+#[tokio::test]
+#[serial(agent_policy)]
+async fn a_repeated_contact_is_judged_again_after_anything_new_is_observed() {
+    let fixture = Fixture::new();
+    fixture.write(
+        "x.py",
+        &format!(
+            "{ATTEMPT}import subprocess\nbefore = [attempt() for _ in range(3)]\n\
+             subprocess.run([\"true\"])\nafter = [attempt() for _ in range(3)]\n\
+             open(\"rc\", \"w\").write(\" \".join(before + after))\n"
+        ),
+    );
+    let shell = fixture.agent(after_running_true()).await;
+    accepted(&shell, "python3 x.py").await;
+    assert_eq!(fixture.read("rc"), "sent sent sent blocked blocked blocked");
+    close(shell).await;
+}
+
+/// Python that waits for the file `name` in `dir`.
+fn wait_for(dir: &impl std::fmt::Display) -> String {
+    format!(
+        "import os, time\ndef wait(name):\n    while not os.path.exists(\"{dir}/\" + name):\n        \
+         time.sleep(0.05)\n"
+    )
+}
+
+#[tokio::test]
+#[serial(agent_policy)]
+async fn taint_received_mid_command_reaches_its_next_contact() {
+    let fixture = Fixture::new();
+    fixture.write(".env", "TOKEN=1\n");
+    let outside = tempfile::tempdir().unwrap();
+    let dir = outside.path().display();
+    let wait = wait_for(&dir);
+    // The receiver contacts the external peer once the sender's command is running, so nothing
+    // but the taint the sender hands it changes before its last contact; the sender's command
+    // publishes only after that contact.
+    fixture.write(
+        "receive.py",
+        &format!(
+            "{ATTEMPT}{wait}listener = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n\
+             listener.bind((\"127.0.0.1\", 0))\n\
+             open(\"{dir}/port.tmp\", \"w\").write(str(listener.getsockname()[1]))\n\
+             os.rename(\"{dir}/port.tmp\", \"{dir}/port\")\nwait(\"sending\")\n\
+             before = [attempt(), attempt()]\nopen(\"{dir}/armed\", \"w\").write(\"\")\n\
+             listener.recv(64)\nafter = attempt()\n\
+             open(\"{dir}/rc\", \"w\").write(\" \".join(before + [after]))\n"
+        ),
+    );
+    fixture.write(
+        "send.py",
+        &format!(
+            "import socket\n{wait}port = int(open(\"{dir}/port\").read())\n\
+             open(\"{dir}/sending\", \"w\").write(\"\")\nwait(\"armed\")\n\
+             socket.socket(socket.AF_INET, socket.SOCK_DGRAM).sendto(b\"x\", (\"127.0.0.1\", port))\n\
+             wait(\"rc\")\n"
+        ),
+    );
+    let receiver = fixture.agent(AgentPolicy::recommended().unwrap()).await;
+    let sender = fixture.agent(AgentPolicy::recommended().unwrap()).await;
+    let receiving = receiver.run("python3 receive.py &");
+    let _ = tokio::time::timeout(std::time::Duration::from_millis(300), receiving).await;
+    await_file(&outside.path().join("port")).await;
+    accepted(&sender, "cat .env > /dev/null; python3 send.py").await;
+    assert_eq!(read(&outside.path().join("rc")), "sent sent blocked");
+    close(sender).await;
+    close(receiver).await;
+}
+
+#[tokio::test]
+#[serial(agent_policy)]
+async fn history_another_shell_of_the_principal_commits_reaches_a_running_command() {
+    let fixture = Fixture::new();
+    let outside = tempfile::tempdir().unwrap();
+    let dir = outside.path().display();
+    let wait = wait_for(&dir);
+    fixture.write(
+        "wait.py",
+        &format!(
+            "{ATTEMPT}{wait}before = [attempt(), attempt()]\n\
+             open(\"{dir}/ready\", \"w\").write(\"\")\nwait(\"go\")\n\
+             open(\"{dir}/rc\", \"w\").write(\" \".join(before + [attempt()]))\n"
+        ),
+    );
+    let policy = || after_running_true().principal("agent");
+    let waiting = fixture.agent(policy()).await;
+    let running = fixture.agent(policy()).await;
+    let run = waiting.run("python3 wait.py &");
+    let _ = tokio::time::timeout(std::time::Duration::from_millis(300), run).await;
+    await_file(&outside.path().join("ready")).await;
+    accepted(&running, "/bin/true").await;
+    std::fs::write(outside.path().join("go"), "").unwrap();
+    assert_eq!(
+        await_file(&outside.path().join("rc")).await,
+        "sent sent blocked"
+    );
+    close(running).await;
+    close(waiting).await;
+}
+
+#[tokio::test]
+#[serial(agent_policy)]
+async fn a_tainted_principal_may_be_refused_local_peers_marsh_does_not_trace() {
+    let fixture = Fixture::new();
+    fixture.write(".env", "TOKEN=1\n");
+    // This test process stands in for a local daemon marsh does not trace.
+    let daemon = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = daemon.local_addr().unwrap().port();
+    let nobody = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    fixture.write(
+        "contact.py",
+        "import socket, sys\nrc = socket.socket().connect_ex((\"127.0.0.1\", int(sys.argv[2])))\n\
+         open(sys.argv[1], \"w\").write(str(rc))\n",
+    );
+    let denials = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let observer = {
+        let denials = Arc::clone(&denials);
+        Arc::new(crate::PolicyObserver::new(move |_, decision| {
+            if let crate::PolicyDecision::Deny {
+                failed_precondition,
+                ..
+            } = decision
+            {
+                denials.lock().unwrap().push(failed_precondition.clone());
+            }
+        }))
+    };
+    let strict = fixture
+        .observed_agent(
+            AgentPolicy::recommended()
+                .unwrap()
+                .untraced_local(UntracedLocal::Deny),
+            Some(observer),
+        )
+        .await;
+    accepted(&strict, &format!("python3 contact.py clean {port}")).await;
+    accepted(
+        &strict,
+        &format!("cat .env > /dev/null; python3 contact.py tainted {port}"),
+    )
+    .await;
+    // A local address nothing listens on hands nothing to anyone.
+    accepted(&strict, &format!("python3 contact.py nobody {nobody}")).await;
+    assert_eq!(fixture.read("clean"), "0");
+    assert_eq!(fixture.read("tainted"), BLOCKED);
+    assert_eq!(fixture.read("nobody"), "111");
+    assert!(
+        denials
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|denial| denial.contains("a local peer no traced command of this source holds")),
+        "{denials:?}"
+    );
+    strict.declassify(strict.principal(), "secret").unwrap();
+    accepted(&strict, &format!("python3 contact.py cleared {port}")).await;
+    assert_eq!(fixture.read("cleared"), "0");
+    // The default lets a principal holding a secret reach a local database or daemon.
+    let lenient = fixture.agent(AgentPolicy::recommended().unwrap()).await;
+    accepted(
+        &lenient,
+        &format!("cat .env > /dev/null; python3 contact.py allowed {port}"),
+    )
+    .await;
+    assert_eq!(fixture.read("allowed"), "0");
+    drop(daemon);
+    close(strict).await;
+    close(lenient).await;
+}
+
+#[tokio::test]
+#[serial(agent_policy)]
+async fn declassifying_a_principal_lets_it_egress_until_it_reads_again() {
+    let fixture = Fixture::new();
+    fixture.write(".env", "TOKEN=1\n");
+    let shell = fixture.agent(AgentPolicy::recommended().unwrap()).await;
+    accepted(
+        &shell,
+        &format!("cat .env > /dev/null; {}", egress("tainted")),
+    )
+    .await;
+    shell.declassify(shell.principal(), "secret").unwrap();
+    accepted(&shell, &egress("cleared")).await;
+    accepted(
+        &shell,
+        &format!("cat .env > /dev/null; {}", egress("again")),
+    )
+    .await;
+    assert_eq!(fixture.read("tainted"), BLOCKED);
+    assert_eq!(fixture.read("cleared"), STARTED);
+    assert_eq!(fixture.read("again"), BLOCKED);
+    close(shell).await;
+}
+
+#[tokio::test]
+#[serial(agent_policy)]
+async fn a_declassified_file_no_longer_taints_its_readers() {
+    let fixture = Fixture::new();
+    fixture.write(".env", "TOKEN=1\n");
+    let outside = tempfile::tempdir().unwrap();
+    let staged = outside.path().join("stage");
+    let stager = fixture.agent(AgentPolicy::recommended().unwrap()).await;
+    let reader = fixture.agent(AgentPolicy::recommended().unwrap()).await;
+    accepted(
+        &stager,
+        &format!("cat .env > {}; cp .env notes.txt", staged.display()),
+    )
+    .await;
+    stager.declassify_file(&staged, "secret").unwrap();
+    stager.declassify_file("./notes.txt", "secret").unwrap();
+    accepted(
+        &reader,
+        &format!(
+            "cat {} notes.txt > /dev/null; {}",
+            staged.display(),
+            egress("rc")
+        ),
+    )
+    .await;
+    assert_eq!(fixture.read("rc"), STARTED);
+    close(stager).await;
+    close(reader).await;
 }

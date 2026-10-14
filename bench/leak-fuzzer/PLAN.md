@@ -173,14 +173,17 @@ Print the minimal case as TOML so it can be pasted into the corpus as a regressi
 ## Known gaps
 
 `leak-corpus/known-gaps.toml` lists case names with a reason. They run but report `known gap`
-instead of failing, so only new leaks fail the build. The only remaining gap is the TOCTOU peer
-rewrite, which has no deterministic case.
+instead of failing, so only new leaks fail the build. Two remain: the TOCTOU peer rewrite, which
+has no deterministic case, and `untraced-local-daemon-allowed`, the trade-off `recommended` makes by
+letting a principal holding a secret reach a local daemon marsh does not trace.
 
 Closed since: io_uring writes to sockets (every operation outside the effectless set is gated as an
 unknown peer); a different principal sending data the agent staged outside the source (files a
 tainted principal writes carry its taint to their readers); and proxying through a loopback or
 unix-socket relay another principal runs (a tainted contact taints the principals holding the bound
-socket). A relay marsh does not trace is still not judged.
+socket). A relay marsh does not trace is refused under `untraced_local(Deny)`
+(`untraced-local-daemon-exfil`); the harness runs an untraced capture listener on `127.0.0.1` for
+these cases.
 
 ## Running it
 

@@ -17,6 +17,9 @@
 //! view shares. Files outside the source are carriers by inode, which renames and hard links keep.
 //! A reused inode, or another view's unpublished file of the same name, over-taints; neither
 //! under-taints.
+//!
+//! Only an operator's declassification removes taint: from a principal, which a later read
+//! taints again, or from a carrier.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
@@ -42,7 +45,7 @@ impl fmt::Display for Taint {
 
 /// A file that holds data of a propagated class.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-enum Carrier {
+pub(super) enum Carrier {
     /// A source-relative path.
     Inside(PathBuf),
     /// A file outside the source, by device and inode.
@@ -58,6 +61,8 @@ pub(super) struct TaintState {
     carriers: HashMap<Carrier, BTreeMap<String, Taint>>,
     /// Taint handed to a principal by another one's call, not yet in the receiver's log.
     pending: HashMap<Principal, Vec<Taint>>,
+    /// Advances whenever any principal comes to hold, or stops holding, a class.
+    revision: u64,
 }
 
 impl TaintState {
@@ -71,24 +76,8 @@ impl TaintState {
         effects: &Effects,
     ) -> Vec<Taint> {
         let mut acquired = self.pending.remove(principal).unwrap_or_default();
-        let own = effects
-            .reads
-            .iter()
-            .map(|path| (agent.inside_class(path), path))
-            .chain(effects.outside_reads.iter().filter_map(|path| {
-                agent.outside_class(path).map(|class| (class, path))
-            }));
-        for (class, path) in own {
-            if agent.propagates(class) {
-                self.hold(
-                    principal,
-                    Taint {
-                        class: class.to_owned(),
-                        from: principal.clone(),
-                        via: path.display().to_string(),
-                    },
-                );
-            }
+        for taint in own(principal, agent, effects) {
+            self.hold(principal, taint);
         }
         for taint in self.carried(effects) {
             if self.hold(principal, taint.clone()) {
@@ -147,21 +136,32 @@ impl TaintState {
             .collect()
     }
 
-    /// Every class `principal` holds, however it came to.
-    pub(super) fn held(&self, principal: &Principal) -> Vec<Taint> {
-        self.tainted
-            .get(principal)
-            .into_iter()
-            .flat_map(BTreeMap::values)
-            .cloned()
-            .collect()
+    /// Every class a call of `principal` sends: those it holds, and those of `source`, a file the
+    /// same call copies into the socket in-kernel, whose read is recorded only at the call's exit.
+    pub(super) fn sending(
+        &self,
+        principal: &Principal,
+        agent: &AgentPolicy,
+        source: Option<&Effects>,
+    ) -> Vec<Taint> {
+        let mut sent: BTreeMap<String, Taint> =
+            self.tainted.get(principal).cloned().unwrap_or_default();
+        if let Some(source) = source {
+            for taint in own(principal, agent, source).chain(self.carried(source)) {
+                sent.entry(taint.class.clone()).or_insert(taint);
+            }
+        }
+        sent.into_values().collect()
     }
 
     /// Hands `principal` the class of `taint` from another principal's call, before that call
     /// delivers anything to it. It enters `principal`'s log at its next observed call.
     pub(super) fn hand(&mut self, principal: &Principal, taint: Taint) {
         if self.hold(principal, taint.clone()) {
-            self.pending.entry(principal.clone()).or_default().push(taint);
+            self.pending
+                .entry(principal.clone())
+                .or_default()
+                .push(taint);
         }
     }
 
@@ -176,6 +176,30 @@ impl TaintState {
             .collect()
     }
 
+    /// Advances whenever [`Self::received`] may have changed for some principal.
+    pub(super) const fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    /// Stops `principal` holding `class`, however it came to, including taint handed to it and
+    /// not yet in its log. Carriers it wrote keep the class.
+    pub(super) fn declassify(&mut self, principal: &Principal, class: &str) {
+        if let Some(held) = self.tainted.get_mut(principal) {
+            held.remove(class);
+        }
+        if let Some(pending) = self.pending.get_mut(principal) {
+            pending.retain(|taint| taint.class != class);
+        }
+        self.revision += 1;
+    }
+
+    /// Stops the file `carrier` names carrying `class`: a later read of it taints no one.
+    pub(super) fn declassify_carrier(&mut self, carrier: &Carrier, class: &str) {
+        if let Some(classes) = self.carriers.get_mut(carrier) {
+            classes.remove(class);
+        }
+    }
+
     /// Records that `principal` holds `taint`'s class; true when it did not already.
     fn hold(&mut self, principal: &Principal, taint: Taint) -> bool {
         let held = self.tainted.entry(principal.clone()).or_default();
@@ -183,8 +207,33 @@ impl TaintState {
             return false;
         }
         held.insert(taint.class.clone(), taint);
+        self.revision += 1;
         true
     }
+}
+
+/// The propagated classes `principal` itself read in `effects`.
+fn own<'a>(
+    principal: &'a Principal,
+    agent: &'a AgentPolicy,
+    effects: &'a Effects,
+) -> impl Iterator<Item = Taint> + 'a {
+    effects
+        .reads
+        .iter()
+        .map(|path| (agent.inside_class(path), path))
+        .chain(
+            effects
+                .outside_reads
+                .iter()
+                .filter_map(|path| agent.outside_class(path).map(|class| (class, path))),
+        )
+        .filter(|(class, _)| agent.propagates(class))
+        .map(|(class, path)| Taint {
+            class: class.to_owned(),
+            from: principal.clone(),
+            via: path.display().to_string(),
+        })
 }
 
 #[cfg(test)]

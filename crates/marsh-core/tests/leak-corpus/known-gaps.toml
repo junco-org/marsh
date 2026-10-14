@@ -16,6 +16,8 @@
 #   carrier for every principal that reads it.
 # * `proxy-via-loopback`, `proxy-via-unix`: a tainted principal's contact with
 #   a local socket taints the principals whose commands hold it.
+# * `untraced-local-daemon-exfil`: under `untraced_local(Deny)` a tainted
+#   principal may not contact a local socket no traced command holds.
 
 [[gap]]
 name = "toctou-peer-rewrite"
@@ -24,3 +26,11 @@ The tracer reads the socket address at syscall entry. Another thread of the \
 tracee can rewrite the address after the check but before the kernel copies \
 it, so the call is judged by the loopback peer it named while the kernel sees \
 an external one. Inherently racy; no deterministic runnable case."""
+
+[[gap]]
+name = "untraced-local-daemon-allowed"
+reason = """
+`recommended` allows a principal holding a secret to contact a local peer no \
+traced command holds, so tests can reach a local database after reading its \
+password; the taint cannot follow into that daemon. A policy built with \
+`untraced_local(Deny)` refuses the contact (`untraced-local-daemon-exfil`)."""

@@ -35,7 +35,7 @@ use oracle::Found;
 use sink::Sink;
 
 use super::{SandboxPolicy, Shell, ShellErrorKind};
-use crate::{AgentPolicy, PolicyDecision, PolicyObserver};
+use crate::{AgentPolicy, PolicyDecision, PolicyObserver, UntracedLocal};
 
 /// The stand-in external server. TEST-NET-1 is reserved for documentation, never routed on the
 /// public internet, and the namespace routes its /24 to loopback.
@@ -416,6 +416,9 @@ fn assess(case: &Case, gap_reason: Option<&str>, outcome: &Outcome) -> Verdict {
 fn build_policy(case: &Case, mode: PolicyMode) -> AgentPolicy {
     let mut policy = match case.policy.as_str() {
         "recommended" => AgentPolicy::recommended().expect("recommended policy"),
+        "untraced-local-deny" => AgentPolicy::recommended()
+            .expect("recommended policy")
+            .untraced_local(UntracedLocal::Deny),
         other => panic!("case {} names unknown policy {other}", case.name),
     };
     if mode == PolicyMode::Audit {
@@ -430,7 +433,14 @@ fn build_policy(case: &Case, mode: PolicyMode) -> AgentPolicy {
 /// Runs one case once and reports what the sink saw and the policy denied.
 async fn run_once(case: &Case, variants: &BTreeMap<String, String>, token: &str, mode: PolicyMode) -> Outcome {
     let sink = Sink::start(IpAddr::V4(SINK_HOST)).expect("bind sink");
-    let values = case.values(token, &SINK_HOST.to_string(), sink.port, variants);
+    // A local daemon marsh does not trace: what reaches it has left marsh's sight too.
+    let local = Sink::start(IpAddr::V4(Ipv4Addr::LOCALHOST)).expect("bind local sink");
+    let values = case.values(
+        token,
+        &SINK_HOST.to_string(),
+        (sink.port, local.port),
+        variants,
+    );
 
     let fixture = super::Fixture::new();
     for file in &case.files {
@@ -467,7 +477,11 @@ async fn run_once(case: &Case, variants: &BTreeMap<String, String>, token: &str,
         steps.push((index, outcome));
     }
 
-    let hits = sink.drain(SINK_GRACE);
+    let mut hits = sink.drain(SINK_GRACE);
+    hits.extend(local.drain(Duration::ZERO).into_iter().map(|mut hit| {
+        hit.listener = format!("untraced local {}", hit.listener);
+        hit
+    }));
     for shell in shells {
         let _ = shell.close(true).await;
     }

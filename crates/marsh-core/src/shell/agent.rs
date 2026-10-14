@@ -20,6 +20,7 @@
 //! | socket peer contacted | `Edit` | `["net", class]` |
 //! | operator approval | `Stage` | `["approve", label]` |
 //! | data of a propagated class received from another principal | `Read` | `["taint", class]` |
+//! | operator declassification of what a principal holds | `Stage` | `["declassify", class]` |
 //!
 //! Rules are enforced at two points:
 //!
@@ -29,11 +30,15 @@
 //!   read cannot carry it; a `sendfile` is judged with its source counted as read. It also asks at
 //!   every `io_uring_enter` that submits any operation outside the effectless poll, timeout and
 //!   cancel set, or whose submissions it cannot read; there the peer is `unknown`. The policy
-//!   decides against committed history plus what the command has done so far. A refused call never reaches the
-//!   kernel: the task sees `EPERM`, and the rest of the command proceeds normally. The tracer reads the address at entry, so another thread of
-//!   the tracee could rewrite it before the kernel copies it; this blocks what the call names,
-//!   not what a racing thread substitutes. Blocking rewrites the syscall number, implemented on
-//!   x86-64 only; elsewhere a refused call fails the command's observation instead.
+//!   decides against committed history plus what the command has done so far, and each shell
+//!   keeps the answer per peer class until any of that changes. A principal holding a
+//!   propagated class may also be refused a local peer marsh does not trace (see
+//!   [`AgentPolicy::untraced_local`]). A refused call never reaches the kernel: the task sees
+//!   `EPERM`, and the rest of the command proceeds normally. The tracer reads the address at
+//!   entry, so another thread of the tracee could rewrite it before the kernel copies it; this
+//!   blocks what the call names, not what a racing thread substitutes. Blocking rewrites the
+//!   syscall number, implemented on x86-64 only; elsewhere a refused call fails the command's
+//!   observation instead.
 //! * **At publication, for everything.** The command's whole batch of observations is checked
 //!   atomically with the Git policy. A denial refuses the command's source effects and keeps them
 //!   out of history; what it read, ran or contacted cannot be undone, so it stays in history.
@@ -60,8 +65,8 @@ use marsh_instrument::InvocationId;
 use socket2::{SockAddr, SockAddrStorage, socklen_t};
 
 use super::access::Effects;
-use super::taint::Taint;
 use super::policy::{Action, Denial, Event, PolicyKind, PolicyObserver, Principal, Resource};
+use super::taint::Taint;
 
 const PRINCIPAL: &str = "p";
 const MATCH: MatchOptions = MatchOptions {
@@ -180,6 +185,8 @@ pub(super) enum Observed {
     Approve(String),
     /// Data of a propagated class, received through another principal's file.
     Taint(Taint),
+    /// An operator's declassification of the `class` data the observation's principal holds.
+    Declassify { class: String, approver: Principal },
 }
 
 impl Observed {
@@ -189,7 +196,11 @@ impl Observed {
     pub(super) const fn irreversible(&self) -> bool {
         match self {
             Self::Path { action, inside, .. } => matches!(action, PathAction::Read) || !*inside,
-            Self::Exec(_) | Self::Connect(_) | Self::Approve(_) | Self::Taint(_) => true,
+            Self::Exec(_)
+            | Self::Connect(_)
+            | Self::Approve(_)
+            | Self::Taint(_)
+            | Self::Declassify { .. } => true,
         }
     }
 }
@@ -273,6 +284,7 @@ pub struct AgentPolicy {
     rules: Vec<AgentRule>,
     /// Classes whose data taints whoever receives it from a principal that read it.
     propagated: BTreeSet<String>,
+    untraced_local: UntracedLocal,
     audit: bool,
     principal: Option<Principal>,
 }
@@ -284,6 +296,7 @@ impl fmt::Debug for AgentPolicy {
             .field("networks", &self.networks)
             .field("rules", &self.rules.len())
             .field("propagated", &self.propagated)
+            .field("untraced_local", &self.untraced_local)
             .field("audit", &self.audit)
             .field("principal", &self.principal)
             .finish()
@@ -444,6 +457,19 @@ impl AgentPolicy {
         self
     }
 
+    /// Whether a principal holding a propagated class may contact a loopback or unix peer that no
+    /// traced command of its source holds: a local daemon, database or proxy, which the class's
+    /// taint cannot follow. [`UntracedLocal::Allow`], the default (and `recommended`), lets tests
+    /// reach a local database after reading its password; [`UntracedLocal::Deny`] refuses the
+    /// contact unless an operator declassified the class for the principal. A local address
+    /// nothing listens on is not refused. Only the sockets traced tasks hold are known, so a
+    /// socket a traced command shares with an untraced process counts as traced.
+    #[must_use]
+    pub const fn untraced_local(mut self, setting: UntracedLocal) -> Self {
+        self.untraced_local = setting;
+        self
+    }
+
     /// Attributes the observations of every shell this policy judges to `principal`, so its rules
     /// follow one agent across all of its shells (for example every pane of a terminal session).
     /// Without it, each shell is its own principal.
@@ -489,7 +515,8 @@ impl AgentPolicy {
             .map(|(_, label)| label.as_str())
     }
 
-    fn peer_class(&self, peer: &Peer) -> &str {
+    /// The class of a socket peer.
+    pub(super) fn peer_class(&self, peer: &Peer) -> &str {
         match peer {
             Peer::Unix(_) => "unix",
             Peer::Netlink => "netlink",
@@ -559,6 +586,7 @@ impl AgentPolicy {
             Observed::Connect(peer) => (Action::Edit, ["net", self.peer_class(peer)]),
             Observed::Taint(taint) => (Action::Read, ["taint", taint.class.as_str()]),
             Observed::Approve(label) => (Action::Stage, ["approve", label.as_str()]),
+            Observed::Declassify { class, .. } => (Action::Stage, ["declassify", class.as_str()]),
         };
         Some(Event::new(
             observation.principal.clone(),
@@ -693,6 +721,23 @@ impl AgentPolicy {
     pub(super) const fn audits(&self) -> bool {
         self.audit
     }
+
+    /// Whether a principal holding a propagated class may contact a local peer no traced
+    /// command of its source holds.
+    pub(super) const fn denies_untraced_local(&self) -> bool {
+        matches!(self.untraced_local, UntracedLocal::Deny)
+    }
+}
+
+/// Whether a principal holding a propagated class may contact a local peer marsh does not trace;
+/// see [`AgentPolicy::untraced_local`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum UntracedLocal {
+    /// The contact is allowed; the class's taint stops at the untraced process.
+    #[default]
+    Allow,
+    /// The contact is refused.
+    Deny,
 }
 
 /// The denial of `event` when a caller-built rule that could judge it does not compile.
@@ -721,6 +766,51 @@ fn could_fire(head: &Head, event: &Event) -> bool {
     principal && action && resource
 }
 
+/// Whether observations never record `path`: the source root itself, or Git's own metadata.
+fn metadata(path: &Path) -> bool {
+    path.as_os_str().is_empty()
+        || path
+            .components()
+            .any(|component| component.as_os_str() == ".git")
+}
+
+/// Whether [`observations`], given a call's `effects` right after those whose last observation
+/// was `last`, would record nothing new: the call at most contacted the peer `last` contacted,
+/// which collapses as a consecutive repeat. Conservative: any path, taint or exec counts as new.
+pub(super) fn only_repeats(
+    agent: Option<&AgentPolicy>,
+    effects: &Effects,
+    last: Option<&Observed>,
+) -> bool {
+    let recorded = |path: &PathBuf| {
+        AgentPolicy::records(
+            agent,
+            &Observed::Path {
+                action: PathAction::Read,
+                path: path.clone(),
+                inside: false,
+            },
+        )
+    };
+    effects
+        .reads
+        .iter()
+        .chain(&effects.writes)
+        .chain(&effects.recursive_writes)
+        .all(|path| metadata(path))
+        && effects.taints.is_empty()
+        && effects.execs.is_empty()
+        && !effects
+            .outside_reads
+            .iter()
+            .chain(&effects.outside_writes)
+            .any(recorded)
+        && effects
+            .peers
+            .iter()
+            .all(|peer| matches!(last, Some(Observed::Connect(previous)) if previous == peer))
+}
+
 /// One command's observations so far, in execution order, with consecutive repeats collapsed.
 /// `write` classifies a source path the command wrote, or drops it (`None`) when it left no
 /// change. `expand` lists the source paths beneath a directory the command renamed or removed,
@@ -732,12 +822,6 @@ pub(super) fn observations(
     write: impl Fn(&Path) -> Option<PathAction>,
     expand: impl Fn(&Path) -> Vec<PathBuf>,
 ) -> Vec<Observation> {
-    let metadata = |path: &Path| {
-        path.as_os_str().is_empty()
-            || path
-                .components()
-                .any(|component| component.as_os_str() == ".git")
-    };
     let written: HashSet<&Path> = effects
         .iter()
         .flat_map(|(_, _, effects)| &effects.writes)
@@ -888,6 +972,23 @@ fn since_unapproved(trigger: TestExpr, label: &str) -> RegexExpr {
         RegexExpr::star(RegexExpr::test(not_approval(label))),
     ])
 }
+/// Any event that is not an operator's declassification of `class` for the acting principal.
+fn not_declassified(class: &str) -> TestExpr {
+    TestExpr::or([
+        principal_is(Comparison::Neq),
+        action_is(Action::Stage, Comparison::Neq),
+        resource_is("declassify", class, Comparison::Neq),
+    ])
+}
+/// Histories with no declassification of `class` for the acting principal after their last
+/// `trigger`.
+fn since_undeclassified(trigger: TestExpr, class: &str) -> RegexExpr {
+    RegexExpr::concat([
+        RegexExpr::all(),
+        RegexExpr::test(trigger),
+        RegexExpr::star(RegexExpr::test(not_declassified(class))),
+    ])
+}
 /// Histories that contain `event` somewhere.
 fn ever(event: TestExpr) -> RegexExpr {
     RegexExpr::concat([RegexExpr::all(), RegexExpr::test(event), RegexExpr::all()])
@@ -933,8 +1034,9 @@ impl AgentRule {
 
     /// No socket peer of any of `peer_classes` once the same principal has read a path of
     /// `secret_class`, or received its data through a file another principal wrote after reading
-    /// it. A peer is reached by naming it or by writing to a socket connected to it, including one
-    /// connected before the read.
+    /// it, unless an operator has since declassified the class for that principal (see
+    /// [`crate::Shell::declassify`]). A peer is reached by naming it or by writing to a socket
+    /// connected to it, including one connected before the read.
     #[must_use]
     pub fn no_contact_after_read(secret_class: &str, peer_classes: &[&str]) -> AgentRuleSet {
         let read = TestExpr::and([
@@ -952,7 +1054,11 @@ impl AgentRule {
                 .map(|peer| {
                     let (class, peer) = (class.clone(), (*peer).to_owned());
                     TraceRule::new(
-                        forbid(Action::Edit, ["net", &peer], ever(read.clone())),
+                        forbid(
+                            Action::Edit,
+                            ["net", &peer],
+                            since_undeclassified(read.clone(), &class),
+                        ),
                         move |event| {
                             (
                                 format!(

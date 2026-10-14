@@ -135,6 +135,32 @@ impl PolicyValidator {
         Ok(())
     }
 }
+impl PolicyValidator {
+    /// Records `approver` declassifying the `class` data `holder` holds, in the shared
+    /// observation log that [`crate::AgentRule::no_contact_after_read`] consults.
+    pub(super) fn declassify(
+        &self,
+        approver: Principal,
+        holder: Principal,
+        class: &str,
+    ) -> Result<(), ShellError> {
+        let mut authority = self.write()?;
+        if authority.recovery_required {
+            return Err(ShellError::infrastructure(
+                "source requires recovery before new declassifications",
+            ));
+        }
+        authority.observations.push(Observation {
+            principal: holder,
+            observed: Observed::Declassify {
+                class: class.to_owned(),
+                approver,
+            },
+        });
+        drop(authority);
+        Ok(())
+    }
+}
 impl Authority {
     fn check(
         &mut self,

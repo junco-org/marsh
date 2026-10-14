@@ -225,7 +225,8 @@ roll back with it. Each observation gets labels, as follows:
 * paths outside the source: absolute or `~/` globs, and recorded only when one matches;
 * executed programs, by basename;
 * socket peers: `unix`, `netlink`, `loopback`, a declared CIDR's label, `external` or `unknown`;
-* operator approvals recorded with `Shell::approve`.
+* operator approvals recorded with `Shell::approve`, and declassifications recorded with
+  `Shell::declassify`.
 
 `AgentRule`s are junco-policy past-regexes over that labelled stream, which each source shares
 across all of its shells. Each shell is its own principal unless `AgentPolicy::principal` names
@@ -251,7 +252,16 @@ bound datagram socket) holds the taint before anything is delivered. Each source
 live, as calls are observed, so a principal still running is judged on taint it received moments
 ago. A reused inode or a same-named file in another shell's unpublished view can over-taint. Taint
 does not reach processes outside the source's traced commands: a local daemon marsh does not run,
-or a shell of another source, can still relay what it is sent.
+or a shell of another source, can still relay what it is sent. `AgentPolicy::untraced_local`
+decides whether a principal holding a propagated class may contact such a local peer at all:
+`UntracedLocal::Allow`, the default and `recommended`'s choice, lets tests reach a local database
+after reading its password; `UntracedLocal::Deny` refuses the contact. A local address nothing
+listens on is never refused.
+
+An operator can lift taint. `Shell::declassify(holder, class)` records a declassification in the
+shared log: `no_contact_after_read` stops counting the holder's earlier reads and received taint of
+the class, and the holder stops handing it on, until it reads the class again.
+`Shell::declassify_file(path, class)` stops a carrier tainting its later readers.
 
 Socket peers are judged while the command runs. The tracer asks the policy at the entry of:
 * each `connect`, `sendto`, `sendmsg` and `sendmmsg`, about the peers it names;
@@ -262,9 +272,11 @@ Socket peers are judged while the command runs. The tracer asks the policy at th
 * each `io_uring_enter` submitting any operation other than a poll, timeout or cancel, or whose
   submissions it cannot read, about an `unknown` peer: a ring `WRITE` names only a descriptor.
 
-It decides against committed history plus what the command has done so far. A refused call is
-skipped by the kernel and fails with `EPERM`, implemented on x86-64 only; elsewhere a refusal
-fails the command instead.
+It decides against committed history plus what the command has done so far. The rules see a
+contact only as its peer's class, so each shell keeps the answer per class and reuses it until
+committed history, the source's taint or the command's own observations change; a call that only
+contacts the same peer again changes nothing. A refused call is skipped by the kernel and fails
+with `EPERM`, implemented on x86-64 only; elsewhere a refusal fails the command instead.
 
 Everything else is judged at publication, atomically with the Git policy. A refused command's
 source changes are rolled back, but what it read, ran and contacted stays in history. Effects
@@ -277,7 +289,7 @@ a stand-in external host — and `cargo test -p marsh-core --lib leak_corpus -- 
 inside a user+network namespace, failing if any canary reaches the external sink in any encoding
 or if legitimate traffic is blocked. `known-gaps.toml` registers the paths `recommended` does not
 yet cover, so only a *new* leak breaks the build: a TOCTOU peer rewrite of the tracer's entry-time
-read. See
+read, and `recommended`'s allowance for local daemons marsh does not trace. See
 [`bench/leak-fuzzer/PLAN.md`](bench/leak-fuzzer/PLAN.md).
 
 The `rmux` daemon reads two environment variables when it starts:

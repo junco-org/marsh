@@ -19,7 +19,7 @@ use super::policy::{
 };
 use super::sandbox_policy::{CommandContext, SandboxPolicy};
 use super::snapshot::{CommandNumber, Snapshot};
-use super::taint::TaintState;
+use super::taint::{Carrier, TaintState};
 use super::{ShellError, ShellErrorKind};
 use crate::shellmux::Sandbox;
 
@@ -395,6 +395,52 @@ impl SourceDomain {
     /// The durable session, when this source's storage has been opened.
     pub fn session(&self) -> Option<&Arc<Session>> {
         self.session.get()
+    }
+
+    /// Records `approver` declassifying the `class` data `holder` holds, and stops the source's
+    /// taint table handing it on. A source without a session yet holds no taint.
+    pub fn declassify(
+        &self,
+        approver: Principal,
+        holder: &Principal,
+        class: &str,
+    ) -> Result<(), ShellError> {
+        self.validator.declassify(approver, holder.clone(), class)?;
+        if let Some(session) = self.session() {
+            session.taint.lock().recover().declassify(holder, class);
+        }
+        Ok(())
+    }
+
+    /// Stops the file at `path` carrying `class` data: a relative path or one under the seed is
+    /// a source path, any other the file there now.
+    pub fn declassify_file(&self, path: &Path, class: &str) -> Result<(), ShellError> {
+        use std::os::unix::fs::MetadataExt;
+        let Some(session) = self.session() else {
+            return Ok(());
+        };
+        let inside = if path.is_relative() {
+            Some(path)
+        } else {
+            path.strip_prefix(&session.persistence.seed).ok()
+        };
+        let carrier = if let Some(relative) = inside {
+            Carrier::Inside(
+                relative
+                    .components()
+                    .filter(|component| *component != std::path::Component::CurDir)
+                    .collect(),
+            )
+        } else {
+            let metadata = std::fs::metadata(path)?;
+            Carrier::Outside(metadata.dev(), metadata.ino())
+        };
+        session
+            .taint
+            .lock()
+            .recover()
+            .declassify_carrier(&carrier, class);
+        Ok(())
     }
 
     /// The durable session prepared for managed work: materialized, leased and recovered.

@@ -32,7 +32,7 @@ mod snapshot;
 mod taint;
 mod view;
 
-pub use agent::{AgentPolicy, AgentPolicyError, AgentRule, AgentRuleSet};
+pub use agent::{AgentPolicy, AgentPolicyError, AgentRule, AgentRuleSet, UntracedLocal};
 pub use error::{ShellError, ShellErrorKind};
 pub use junco_policy::{Action, Principal};
 pub use policy::{Denial, Event, PolicyDecision, PolicyKind, PolicyObserver, PolicyValidator};
@@ -261,7 +261,7 @@ impl ShellBuilder {
         let shell = Shell {
             sandbox,
             shared: Arc::new(Shared {
-                validator: Arc::clone(&resources.domain.validator),
+                domain: Arc::downgrade(&resources.domain),
                 live: tokio::sync::Mutex::new(Some(Live {
                     interpreter,
                     resources,
@@ -364,8 +364,9 @@ struct Shared {
     /// The interpreter's spawner and observer; its state names the admitted span's run.
     executor: MarshExecutor,
     runtime: tokio::runtime::Handle,
-    /// The source's shared authority, for operator approvals.
-    validator: Arc<PolicyValidator>,
+    /// The source, for operator approvals and declassifications. Weak: a closed shell keeps no
+    /// source open.
+    domain: Weak<SourceDomain>,
     busy: AtomicBool,
     closed: AtomicBool,
     force: AtomicBool,
@@ -642,9 +643,31 @@ impl Shell {
     /// an operator action, outside any command, that [`AgentRule::requires_approval`] and the
     /// other approval-gated rules consult.
     pub fn approve(&self, label: impl Into<String>) -> Result<(), ShellError> {
-        self.shared
+        self.domain()?
             .validator
             .approve(self.sandbox.uid.clone(), label)
+    }
+    /// Records this shell's principal declassifying the `class` data `holder` holds, for every
+    /// agent policy on its source: an operator action, outside any command. `holder` stops handing
+    /// the class to other principals, and [`AgentRule::no_contact_after_read`] stops counting its
+    /// earlier reads of the class, until it reads data of the class again. A command of `holder`
+    /// already running keeps what it has read; files it wrote keep carrying the class.
+    pub fn declassify(&self, holder: &Principal, class: &str) -> Result<(), ShellError> {
+        self.domain()?
+            .declassify(self.sandbox.uid.clone(), holder, class)
+    }
+    /// Stops the file at `path` carrying `class` data to whoever reads it next: an operator
+    /// action, outside any command. A relative `path` names a file in the source; an absolute
+    /// one outside the source names the file there now, whatever it is later renamed to.
+    pub fn declassify_file(&self, path: impl AsRef<Path>, class: &str) -> Result<(), ShellError> {
+        self.domain()?.declassify_file(path.as_ref(), class)
+    }
+    /// This shell's source, while any shell keeps it open.
+    fn domain(&self) -> Result<Arc<SourceDomain>, ShellError> {
+        self.shared
+            .domain
+            .upgrade()
+            .ok_or_else(|| ShellError::new(ShellErrorKind::Closed))
     }
     /// Canonical source root: the Git work-tree root, or the initial directory outside one.
     pub fn source_dir(&self) -> &Path {

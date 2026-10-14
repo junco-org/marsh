@@ -591,3 +591,109 @@ fn deciding_now_judges_only_the_candidate() {
         None
     );
 }
+
+fn declassify(holder: &str, class: &str) -> Observation {
+    Observation {
+        principal: Principal::from(holder),
+        observed: Observed::Declassify {
+            class: class.to_owned(),
+            approver: Principal::from("operator"),
+        },
+    }
+}
+
+#[test]
+fn declassifying_a_holder_lifts_egress_until_it_reads_again() {
+    let policy = AgentPolicy::recommended().unwrap();
+    let read = path("a", PathAction::Read, ".env");
+    let egress = connect("a", external());
+    let cleared = [read.clone(), declassify("a", "secret")];
+    assert_eq!(
+        verdict(&policy, &cleared, std::slice::from_ref(&egress)),
+        None
+    );
+    // Only the holder's own declassification, and only of the class it read, counts.
+    for other in [declassify("b", "secret"), declassify("a", "ci")] {
+        assert!(
+            verdict(
+                &policy,
+                &[read.clone(), other],
+                std::slice::from_ref(&egress)
+            )
+            .is_some()
+        );
+    }
+    assert!(
+        verdict(
+            &policy,
+            &[cleared[0].clone(), cleared[1].clone(), read],
+            &[egress]
+        )
+        .is_some()
+    );
+    // Taint received through a carrier is lifted the same way.
+    let taint = Observation {
+        principal: Principal::from("b"),
+        observed: Observed::Taint(Taint {
+            class: "secret".into(),
+            from: Principal::from("a"),
+            via: "notes.txt".into(),
+        }),
+    };
+    let egress = connect("b", external());
+    assert!(
+        verdict(
+            &policy,
+            std::slice::from_ref(&taint),
+            std::slice::from_ref(&egress)
+        )
+        .is_some()
+    );
+    assert_eq!(
+        verdict(&policy, &[taint, declassify("b", "secret")], &[egress]),
+        None
+    );
+}
+
+#[test]
+fn only_a_repeated_contact_records_nothing_new() {
+    let policy = AgentPolicy::recommended().unwrap();
+    let last = Observed::Connect(external());
+    let contact = |peer: Peer| Effects {
+        peers: vec![peer],
+        ..Effects::default()
+    };
+    assert!(only_repeats(Some(&policy), &Effects::default(), None));
+    assert!(only_repeats(
+        Some(&policy),
+        &contact(external()),
+        Some(&last)
+    ));
+    assert!(!only_repeats(Some(&policy), &contact(external()), None));
+    assert!(!only_repeats(
+        Some(&policy),
+        &contact(Peer::Unknown),
+        Some(&last)
+    ));
+    let read = |path: &str| Effects {
+        reads: vec![PathBuf::from(path)],
+        ..Effects::default()
+    };
+    assert!(!only_repeats(Some(&policy), &read(".env"), Some(&last)));
+    assert!(only_repeats(Some(&policy), &read(".git/HEAD"), Some(&last)));
+    // An outside path the policy does not label is never recorded.
+    let outside = |path: &str| Effects {
+        outside_reads: vec![PathBuf::from(path)],
+        ..Effects::default()
+    };
+    assert!(only_repeats(
+        Some(&policy),
+        &outside("/usr/lib/x.py"),
+        Some(&last)
+    ));
+    assert!(!only_repeats(
+        Some(&policy),
+        &outside("/etc/shadow"),
+        Some(&last)
+    ));
+}

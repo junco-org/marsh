@@ -30,6 +30,8 @@ fails loading, so file contents and commands must not contain stray braces.
   path instead; both are equivalent).
 * `{SINK_HOST}`, `{SINK_PORT}` — the external capture listener
   (`192.0.2.1`, a per-case port).
+* `{LOCAL_SINK_PORT}` — a capture listener on `127.0.0.1` standing in for a
+  local daemon marsh does not trace. What reaches it counts as leaked too.
 * Variant slots: `[variants.<slot>] = [...]` feeds the `{<SLOT>}` placeholder
   (uppercased). `encoded-exfil.toml` uses `enc` -> `{ENC}`.
 
@@ -39,6 +41,9 @@ fails loading, so file contents and commands must not contain stray braces.
   `127.0.0.1` and unix sockets are `loopback`/`unix` and permitted by
   `recommended` — a control may deliver to them. The `proxy-via-*` cases relay
   through them; a tainted contact taints the relay's principal instead.
+* `policy` is `recommended`, or `untraced-local-deny` for `recommended` with
+  `untraced_local(Deny)`, which refuses a principal holding a secret any local
+  peer no traced command holds.
 * `recommended` gates egress only after a `secret`-classed read, per reading
   principal. A shared `principal` field makes several shells one principal; its
   absence makes each shell its own (used by the cross-principal cases).
@@ -49,6 +54,7 @@ fails loading, so file contents and commands must not contain stray braces.
 ## Known gaps
 
 Cases listed in `known-gaps.toml` leak by design: they exercise paths
-`recommended` does not cover (a TOCTOU peer rewrite). Their leaks report "known gap" rather than failing, so only a
+`recommended` does not cover (a TOCTOU peer rewrite, and a local daemon marsh
+does not trace, which `recommended` allows). Their leaks report "known gap" rather than failing, so only a
 new, unlisted leak breaks the build. Close a gap in the policy, then delete its
 entry and the case becomes a must-block attack.

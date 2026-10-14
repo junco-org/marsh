@@ -1,0 +1,27 @@
+# A control for `untraced_local(Deny)`: a principal that never read a secret
+# talks to a local daemon marsh does not trace. It sends no propagated class,
+# so the contact is ordinary and the canary must be delivered.
+name = "control-untraced-local-untainted"
+kind = "control"
+policy = "untraced-local-deny"
+
+[[files]]
+path = "data.txt"
+contents = "payload={CANARY}\n"
+
+[[files]]
+path = "send.py"
+contents = """
+import socket
+data = open("data.txt", "rb").read()
+s = socket.socket()
+s.connect(("127.0.0.1", {LOCAL_SINK_PORT}))
+s.sendall(data)
+"""
+
+[[steps]]
+run = "python3 send.py"
+expect = "accepted"
+
+[oracle]
+encodings = ["raw", "base64", "hex"]

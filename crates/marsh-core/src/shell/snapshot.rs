@@ -17,7 +17,7 @@ use super::builtins::gitcmd::GitAction;
 use super::builtins::gitexec::{self, Runner};
 use super::completion::{Completion, Finalize};
 use super::execution::Run;
-use super::policy::{self, Event, PolicyDecision, PolicyKind, PolicyObserver};
+use super::policy::{self, Denial, Event, PolicyDecision, PolicyKind, PolicyObserver};
 use super::session::Session;
 use super::taint::Taint;
 use super::{Principal, ShellError};
@@ -35,6 +35,71 @@ pub(super) struct CommandEvidence {
     git_exclusive: bool,
 }
 
+/// What a contact of the active command is judged after, beyond committed history.
+struct Prior {
+    /// The command's own observations so far, then taint received from other principals.
+    observations: Vec<Observation>,
+    /// The taint table's revision when the received taint was read.
+    taint: u64,
+    /// How many effects the command's own observations were drawn from, their latest entry
+    /// order, and the last observation they recorded; `None` when the run is not active.
+    effects: Option<(usize, u64, Option<Observed>)>,
+}
+
+/// The agent policy's answers for the active command's contacts, by peer class, and what they
+/// were decided from. The policy sees a contact only as its peer's class, so a later contact of
+/// the same class reuses the answer while none of that has changed.
+#[derive(Default)]
+struct Verdicts {
+    basis: Option<Basis>,
+    answers: HashMap<String, Option<Denial>>,
+}
+
+/// What a set of [`Verdicts`] was decided from.
+#[derive(Clone, PartialEq, Eq)]
+struct Basis {
+    run: TraceRun,
+    /// The policy validator's revision, which advances before any change to committed history.
+    history: u64,
+    /// The taint table's revision, which advances whenever any principal's taint changes.
+    taint: u64,
+    /// How many of the command's effects were observed, and their latest entry order.
+    effects: usize,
+    order: u64,
+    /// The last observation those effects recorded.
+    last: Option<Observed>,
+}
+
+impl Basis {
+    /// Extends this basis over the command's `effects` observed since, when they record nothing
+    /// new. A call that records nothing at all may be ordered anywhere: a blocking call exits,
+    /// and is observed, long after later calls entered. Any other must have entered after every
+    /// earlier one, so it is ordered last, and only contacted the last peer again, which
+    /// collapses as a consecutive repeat. A file a shared mapping changes between calls is
+    /// classified as of the last call that recorded something.
+    fn advance(
+        &mut self,
+        agent: &AgentPolicy,
+        effects: &[(u64, Option<InvocationId>, Effects)],
+    ) -> bool {
+        let Some(since) = effects.get(self.effects..) else {
+            return false;
+        };
+        for (order, _, effect) in since {
+            if agent::only_repeats(Some(agent), effect, None) {
+                continue;
+            }
+            if *order < self.order || !agent::only_repeats(Some(agent), effect, self.last.as_ref())
+            {
+                return false;
+            }
+            self.order = *order;
+        }
+        self.effects = effects.len();
+        true
+    }
+}
+
 pub(super) struct Snapshot {
     pub session: Arc<Session>,
     pub uid: Principal,
@@ -49,6 +114,8 @@ pub(super) struct Snapshot {
     agent: Option<Arc<AgentPolicy>>,
     /// Notified of each peer the agent policy refuses (or, auditing, would refuse).
     observer: Option<Arc<PolicyObserver>>,
+    /// The agent policy's answers for the active command's contacts.
+    verdicts: Mutex<Verdicts>,
     /// The run whose refused peers were reported, and the refusals reported for it: a program
     /// retrying a refused call is reported once.
     reported: Mutex<(Option<TraceRun>, HashSet<Event>)>,
@@ -101,6 +168,7 @@ impl Snapshot {
             }),
             agent,
             observer,
+            verdicts: Mutex::new(Verdicts::default()),
             reported: Mutex::new((None, HashSet::new())),
         });
         let weak = Arc::downgrade(&snapshot);
@@ -270,54 +338,112 @@ impl Snapshot {
     /// Whether the active command may reach `peer` (a native `sockaddr`, empty when unknown): its
     /// agent policy decides against committed history plus the command's observations so far,
     /// including a read of `source`, the file this same call copies into the socket in-kernel.
-    /// Called on the tracer thread while the calling task is stopped at the call's entry.
+    /// When the call sends a propagated class to a local `peer`, the policy may also refuse a peer
+    /// only untraced processes hold, and a permitted contact hands the class to the other
+    /// principals of this source whose commands hold it. Called on the tracer thread while the
+    /// calling task is stopped at the call's entry.
     fn permits_peer(&self, run: TraceRun, peer: &[u8], source: Option<&FileTarget>) -> bool {
-        let permitted = self.judge_peer(run, peer, source);
-        if permitted {
-            self.hand_taint(peer);
-        }
-        permitted
-    }
-
-    /// Hands the acting principal's taint to every other principal of this source whose commands
-    /// hold a socket bound to `peer`, a loopback or unix address, before a permitted contact
-    /// delivers anything to it. Holders outside this source's traced commands are not judged.
-    fn hand_taint(&self, peer: &[u8]) {
         let Some(agent) = &self.agent else {
-            return;
+            return true;
         };
         let principal = agent.acting(&self.uid);
-        let held = self.session.taint.lock().recover().held(&principal);
-        if held.is_empty() {
-            return;
+        // The call's own in-kernel read is recorded only at its exit, after the bytes left.
+        let source = match source {
+            None => None,
+            Some(source) => {
+                let read = self
+                    .state
+                    .lock()
+                    .recover()
+                    .access
+                    .read_effect(source, &self.path);
+                match read {
+                    Ok(mut effects) => {
+                        // A carrier's source taints as it will at the call's exit, which records
+                        // it.
+                        effects.taints = self.session.taint.lock().recover().carried(&effects);
+                        Some(effects)
+                    }
+                    // An unclassifiable source fails the command at exit; its bytes must not
+                    // leave.
+                    Err(_) => return agent.audits(),
+                }
+            }
+        };
+        let sending =
+            self.session
+                .taint
+                .lock()
+                .recover()
+                .sending(&principal, agent, source.as_ref());
+        // Who holds a local peer matters only to a call that sends a propagated class.
+        let receivers = if sending.is_empty() {
+            None
+        } else {
+            self.session
+                .tracing
+                .receivers(peer)
+                .map(|sockets| (sockets, self.followed()))
+        };
+        let peer = Peer::decode(peer);
+        let denial = self
+            .judge_peer(run, agent, &principal, &peer, source)
+            .or_else(|| {
+                let (sockets, followed) = receivers.as_ref()?;
+                untraced_denial(agent, &principal, &peer, &sending, sockets, followed)
+            });
+        if let Some(denial) = denial {
+            self.report(run, agent, &denial);
+            if !agent.audits() {
+                return false;
+            }
         }
-        let receivers = self.session.tracing.receivers(peer);
-        if receivers.is_empty() {
-            return;
+        if let Some((sockets, followed)) = &receivers {
+            self.hand_taint(&principal, &peer, &sending, sockets, followed);
         }
-        let receivers: Vec<Principal> = self
-            .session
+        true
+    }
+
+    /// The principals of this source's agent-judged shells, by the root tracing their commands:
+    /// those whose taint the source's table follows.
+    fn followed(&self) -> HashMap<RootId, Principal> {
+        self.session
             .snapshots
             .lock()
             .recover()
             .values()
             .filter_map(Weak::upgrade)
-            .filter(|snapshot| {
-                snapshot
-                    .root
-                    .get()
-                    .is_some_and(|root| receivers.contains(root))
-            })
             .filter_map(|snapshot| {
                 let agent = snapshot.agent.as_ref()?;
-                Some(agent.acting(&snapshot.uid))
+                Some((*snapshot.root.get()?, agent.acting(&snapshot.uid)))
             })
+            .collect()
+    }
+
+    /// Hands the `sending` classes to every other principal of this source whose commands hold
+    /// one of `sockets`, those bound to the local `peer`, before a permitted contact delivers
+    /// anything to it. Holders outside this source's agent-judged commands are not tainted.
+    fn hand_taint(
+        &self,
+        principal: &Principal,
+        peer: &Peer,
+        sending: &[Taint],
+        sockets: &[HashSet<RootId>],
+        followed: &HashMap<RootId, Principal>,
+    ) {
+        let receivers: HashSet<&Principal> = sockets
+            .iter()
+            .flatten()
+            .filter_map(|root| followed.get(root))
             .filter(|receiver| *receiver != principal)
             .collect();
-        let via = format!("socket {}", Peer::decode(peer));
+        if receivers.is_empty() {
+            return;
+        }
+        let via = format!("socket {peer}");
         let mut table = self.session.taint.lock().recover();
-        for receiver in &receivers {
-            for taint in &held {
+        for receiver in receivers {
+            for taint in sending {
                 table.hand(
                     receiver,
                     Taint {
@@ -330,74 +456,140 @@ impl Snapshot {
         }
     }
 
-    /// Whether the agent policy lets the active command reach `peer`; see [`Self::permits_peer`].
-    fn judge_peer(&self, run: TraceRun, peer: &[u8], source: Option<&FileTarget>) -> bool {
-        let Some(agent) = &self.agent else {
-            return true;
-        };
-        let principal = agent.acting(&self.uid);
+    /// The agent policy's refusal, if any, of the active command reaching `peer`; see
+    /// [`Self::permits_peer`]. `source` is the call's own in-kernel read.
+    fn judge_peer(
+        &self,
+        run: TraceRun,
+        agent: &AgentPolicy,
+        principal: &Principal,
+        peer: &Peer,
+        source: Option<Effects>,
+    ) -> Option<Denial> {
         let candidate = Observation {
             principal: principal.clone(),
-            observed: Observed::Connect(Peer::decode(peer)),
+            observed: Observed::Connect(peer.clone()),
         };
         if !agent.judges(&candidate) {
-            return true;
+            return None;
         }
+        let Some(source) = source else {
+            return self.verdict(run, agent, principal, peer, &candidate);
+        };
+        let mut prior = self.prior(run, agent, principal).observations;
+        prior.extend(agent::observations(
+            &[(u64::MAX, None, source)],
+            principal,
+            Some(agent),
+            |_| None,
+            |_| Vec::new(),
+        ));
+        let authority = self.session.validator.read();
+        agent.decide_now(&authority.observations, &prior, &candidate)
+    }
+
+    /// The refusal of `candidate`, a contact with `peer` that copies nothing in-kernel: the
+    /// answer for `peer`'s class, decided again only when what it was decided from has changed.
+    fn verdict(
+        &self,
+        run: TraceRun,
+        agent: &AgentPolicy,
+        principal: &Principal,
+        peer: &Peer,
+        candidate: &Observation,
+    ) -> Option<Denial> {
+        let class = agent.peer_class(peer).to_owned();
+        // Held throughout, so answers and their basis change together. Every other lock is taken
+        // under it, never the reverse.
+        let mut verdicts = self.verdicts.lock().recover();
+        let taint = self.session.taint.lock().recover().revision();
+        let history = self.session.validator.revision();
+        let current = {
+            let state = self.state.lock().recover();
+            match (&state.evidence, &mut verdicts.basis) {
+                (Some((active, evidence)), Some(basis)) if *active == run => {
+                    basis.run == run
+                        && basis.history == history
+                        && basis.taint == taint
+                        && basis.advance(agent, &evidence.effects)
+                }
+                _ => false,
+            }
+        };
+        if current && let Some(answer) = verdicts.answers.get(&class) {
+            return answer.clone();
+        }
+        let prior = self.prior(run, agent, principal);
+        let (denial, history) = {
+            let authority = self.session.validator.read();
+            // Read under the guard: no change to the history it guards is under way.
+            let history = self.session.validator.revision();
+            (
+                agent.decide_now(&authority.observations, &prior.observations, candidate),
+                history,
+            )
+        };
+        if let Some((count, order, last)) = prior.effects {
+            let basis = Basis {
+                run,
+                history,
+                taint: prior.taint,
+                effects: count,
+                order,
+                last,
+            };
+            if verdicts.basis.as_ref() != Some(&basis) {
+                verdicts.answers.clear();
+                verdicts.basis = Some(basis);
+            }
+            verdicts.answers.insert(class, denial.clone());
+        }
+        denial
+    }
+
+    /// What a contact of the command `run` is judged after, beyond committed history.
+    fn prior(&self, run: TraceRun, agent: &AgentPolicy, principal: &Principal) -> Prior {
         // Taken one after the other, never nested: `prepare` locks this state under the authority.
-        let mut prior = match &self.state.lock().recover().evidence {
-            Some((active, evidence)) if *active == run => agent::observations(
-                &evidence.effects,
-                &principal,
-                Some(agent),
-                |path| policy::change(&evidence.baseline, &self.path, path),
-                |_| Vec::new(),
-            ),
-            _ => Vec::new(),
+        let (mut prior, effects) = match &self.state.lock().recover().evidence {
+            Some((active, evidence)) if *active == run => {
+                let own = agent::observations(
+                    &evidence.effects,
+                    principal,
+                    Some(agent),
+                    |path| policy::change(&evidence.baseline, &self.path, path),
+                    |_| Vec::new(),
+                );
+                let order = evidence
+                    .effects
+                    .iter()
+                    .map(|(order, _, _)| *order)
+                    .max()
+                    .unwrap_or_default();
+                let last = own.last().map(|observation| observation.observed.clone());
+                (own, Some((evidence.effects.len(), order, last)))
+            }
+            _ => (Vec::new(), None),
         };
         // Taint received from another principal, including through a command still running.
+        let table = self.session.taint.lock().recover();
         prior.extend(
-            self.session
-                .taint
-                .lock()
-                .recover()
-                .received(&principal)
+            table
+                .received(principal)
                 .into_iter()
                 .map(|taint| Observation {
                     principal: principal.clone(),
                     observed: Observed::Taint(taint),
                 }),
         );
-        // The call's own in-kernel read is recorded only at its exit, after the bytes left.
-        if let Some(source) = source {
-            let read = self
-                .state
-                .lock()
-                .recover()
-                .access
-                .read_effect(source, &self.path);
-            match read {
-                Ok(mut effects) => prior.extend({
-                    // A carrier's source taints as it will at the call's exit, which records it.
-                    effects.taints = self.session.taint.lock().recover().carried(&effects);
-                    agent::observations(
-                        &[(u64::MAX, None, effects)],
-                        &principal,
-                        Some(agent),
-                        |_| None,
-                        |_| Vec::new(),
-                    )
-                }),
-                // An unclassifiable source fails the command at exit; its bytes must not leave.
-                Err(_) => return agent.audits(),
-            }
+        Prior {
+            observations: prior,
+            taint: table.revision(),
+            effects,
         }
-        let denial = {
-            let authority = self.session.validator.read();
-            agent.decide_now(&authority.observations, &prior, &candidate)
-        };
-        let Some(denial) = denial else {
-            return true;
-        };
+    }
+
+    /// Reports `denial` of a contact to the observer, once per run.
+    fn report(&self, run: TraceRun, agent: &AgentPolicy, denial: &Denial) {
         if let Some(observer) = &self.observer
             && self.first_report(run, &denial.event)
         {
@@ -411,14 +603,12 @@ impl Snapshot {
                 &denial.event,
                 &PolicyDecision::Deny {
                     failed_precondition: format!("{verb}: {}", denial.failed_precondition),
-                    allowed_fixes: denial.allowed_fixes,
+                    allowed_fixes: denial.allowed_fixes.clone(),
                 },
             );
         }
-        agent.audits()
     }
 
-    /// Whether `event` is the first refusal of its kind in `run`.
     fn first_report(&self, run: TraceRun, event: &Event) -> bool {
         let mut reported = self.reported.lock().recover();
         if reported.0 != Some(run) {
@@ -750,4 +940,40 @@ impl Finalize for GitGuard {
             }
         });
     }
+}
+
+/// The refusal of a contact sending the propagated `sending` classes to the local `peer`, when
+/// `agent` denies untraced local peers and one of `sockets`, those bound to `peer`, is held by no
+/// command whose principal the source's taint table follows.
+fn untraced_denial(
+    agent: &AgentPolicy,
+    principal: &Principal,
+    peer: &Peer,
+    sending: &[Taint],
+    sockets: &[HashSet<RootId>],
+    followed: &HashMap<RootId, Principal>,
+) -> Option<Denial> {
+    let untraced = sockets
+        .iter()
+        .any(|holders| !holders.iter().any(|root| followed.contains_key(root)));
+    if !agent.denies_untraced_local() || sending.is_empty() || !untraced {
+        return None;
+    }
+    let event = agent.label(&Observation {
+        principal: principal.clone(),
+        observed: Observed::Connect(peer.clone()),
+    })?;
+    let classes: Vec<&str> = sending.iter().map(|taint| taint.class.as_str()).collect();
+    Some(Denial {
+        event,
+        failed_precondition: format!(
+            "{principal} sent {} data to {peer}, a local peer no traced command of this source holds",
+            classes.join(", ")
+        ),
+        allowed_fixes: classes
+            .iter()
+            .map(|class| format!("declassify {class} for {principal}"))
+            .chain(["allow untraced local peers in the agent policy".to_owned()])
+            .collect(),
+    })
 }

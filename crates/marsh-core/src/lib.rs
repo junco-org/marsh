@@ -23,5 +23,5 @@ pub use shell::{
     ExecutionParameters, ExecutionResult, MarshTool, OpenFile, PolicyDecision, PolicyKind, PolicyObserver,
     PolicyValidator, Principal, ProfileLoadBehavior, RcLoadBehavior, SandboxPolicy, Shell,
     ShellBuilder, ShellCommand, ShellEnvironment, ShellError, ShellErrorKind, ShellFd,
-    ShellVariable, Signal, SourceInfo, UIOptions, builtins,
+    ShellVariable, Signal, SourceInfo, UIOptions, UntracedLocal, builtins,
 };
