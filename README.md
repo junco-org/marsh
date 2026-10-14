@@ -240,13 +240,18 @@ one for every shell the policy judges. The presets are:
 `AgentPolicy::recommended()` combines them over a default class table. `AgentPolicy::audit()`
 reports would-be denials without enforcing them.
 
-Taint crosses principals through files. A secret class that `no_contact_after_read` guards
-propagates: once a principal has read it, every file that principal writes carries it, and any
-principal that reads such a file holds it too, recorded as a `Read` of `["taint", class]` that the
-rule treats like reading the class. Source files are carriers by relative path; files outside the
-source by inode, so renames and hard links keep the taint. Each source keeps this table live, as
-calls are observed, so a principal still running is judged on taint it received moments ago. A
-reused inode or a same-named file in another shell's unpublished view can over-taint.
+Taint crosses principals through files and local sockets. A secret class that
+`no_contact_after_read` guards propagates: once a principal has read it, every file that principal
+writes carries it, and any principal that reads such a file holds it too, recorded as a `Read` of
+`["taint", class]` that the rule treats like reading the class. Source files are carriers by
+relative path; files outside the source by inode, so renames and hard links keep the taint. When a
+tainted principal is permitted to reach a `loopback` or `unix` peer, every other principal of the
+source whose commands hold a socket bound to that address (a listener, its accepted connections, a
+bound datagram socket) holds the taint before anything is delivered. Each source keeps this table
+live, as calls are observed, so a principal still running is judged on taint it received moments
+ago. A reused inode or a same-named file in another shell's unpublished view can over-taint. Taint
+does not reach processes outside the source's traced commands: a local daemon marsh does not run,
+or a shell of another source, can still relay what it is sent.
 
 Socket peers are judged while the command runs. The tracer asks the policy at the entry of:
 * each `connect`, `sendto`, `sendmsg` and `sendmmsg`, about the peers it names;
@@ -271,8 +276,8 @@ hand-written cases — each reads (or deliberately does not read) a secret, then
 a stand-in external host — and `cargo test -p marsh-core --lib leak_corpus -- --ignored` runs them
 inside a user+network namespace, failing if any canary reaches the external sink in any encoding
 or if legitimate traffic is blocked. `known-gaps.toml` registers the paths `recommended` does not
-yet cover, so only a *new* leak breaks the build: loopback/unix proxying, where taint would have to
-cross a socket, and a TOCTOU peer rewrite of the tracer's entry-time read. See
+yet cover, so only a *new* leak breaks the build: a TOCTOU peer rewrite of the tracer's entry-time
+read. See
 [`bench/leak-fuzzer/PLAN.md`](bench/leak-fuzzer/PLAN.md).
 
 The `rmux` daemon reads two environment variables when it starts:

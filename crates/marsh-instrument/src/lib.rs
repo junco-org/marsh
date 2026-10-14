@@ -7,6 +7,7 @@
 
 mod capture;
 mod host;
+mod local;
 mod observation;
 mod ring;
 mod socket;

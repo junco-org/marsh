@@ -173,14 +173,14 @@ Print the minimal case as TOML so it can be pasted into the corpus as a regressi
 ## Known gaps
 
 `leak-corpus/known-gaps.toml` lists case names with a reason. They run but report `known gap`
-instead of failing, so only new leaks fail the build. Gaps already documented in the README's
-agent-policy section:
-
-* proxying through a loopback or unix-socket service.
+instead of failing, so only new leaks fail the build. The only remaining gap is the TOCTOU peer
+rewrite, which has no deterministic case.
 
 Closed since: io_uring writes to sockets (every operation outside the effectless set is gated as an
-unknown peer), and a different principal sending data the agent staged outside the source (files a
-tainted principal writes carry its taint to their readers).
+unknown peer); a different principal sending data the agent staged outside the source (files a
+tainted principal writes carry its taint to their readers); and proxying through a loopback or
+unix-socket relay another principal runs (a tainted contact taints the principals holding the bound
+socket). A relay marsh does not trace is still not judged.
 
 ## Running it
 

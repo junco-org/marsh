@@ -298,7 +298,9 @@ mod tests {
         let (cases, gaps) = load(&dir).unwrap();
         assert!(cases.iter().any(|case| case.kind == Kind::Control));
         assert!(cases.iter().any(|case| case.kind == Kind::Attack));
-        assert!(gaps.contains_key("proxy-via-loopback"));
+        assert!(gaps.contains_key("toctou-peer-rewrite"));
+        // A closed gap is an ordinary attack again, never still excused.
+        assert!(!gaps.contains_key("proxy-via-loopback"));
         for case in &cases {
             let printed = case.to_toml(&case.first_variants());
             let reparsed: Case = toml::from_str(&printed).unwrap();

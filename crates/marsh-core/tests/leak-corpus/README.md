@@ -37,8 +37,8 @@ fails loading, so file contents and commands must not contain stray braces.
 
 * The external sink is `192.0.2.1` (TEST-NET-1), labelled `external`.
   `127.0.0.1` and unix sockets are `loopback`/`unix` and permitted by
-  `recommended` — a control may deliver to them, and the loopback/unix proxy
-  gaps abuse exactly that.
+  `recommended` — a control may deliver to them. The `proxy-via-*` cases relay
+  through them; a tainted contact taints the relay's principal instead.
 * `recommended` gates egress only after a `secret`-classed read, per reading
   principal. A shared `principal` field makes several shells one principal; its
   absence makes each shell its own (used by the cross-principal cases).
@@ -49,7 +49,6 @@ fails loading, so file contents and commands must not contain stray braces.
 ## Known gaps
 
 Cases listed in `known-gaps.toml` leak by design: they exercise paths
-`recommended` does not cover (loopback/unix proxying and a TOCTOU peer
-rewrite). Their leaks report "known gap" rather than failing, so only a
+`recommended` does not cover (a TOCTOU peer rewrite). Their leaks report "known gap" rather than failing, so only a
 new, unlisted leak breaks the build. Close a gap in the policy, then delete its
 entry and the case becomes a must-block attack.

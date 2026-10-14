@@ -82,6 +82,19 @@ pub(super) enum Peer {
     /// A family this module does not decode, or an address that could not be read.
     Unknown,
 }
+impl fmt::Display for Peer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unix(path) => match path.split_first() {
+                Some((0, name)) => write!(f, "@{}", String::from_utf8_lossy(name)),
+                _ => f.write_str(&String::from_utf8_lossy(path)),
+            },
+            Self::Ip(address) => write!(f, "{address}"),
+            Self::Netlink => f.write_str("netlink"),
+            Self::Unknown => f.write_str("an unknown peer"),
+        }
+    }
+}
 impl Peer {
     /// Decodes a native `sockaddr` of `bytes.len()` bytes, as the kernel would read it.
     pub(super) fn decode(bytes: &[u8]) -> Self {

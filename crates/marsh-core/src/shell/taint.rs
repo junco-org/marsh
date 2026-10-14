@@ -1,10 +1,12 @@
 //! Taint that crosses principals.
 //!
 //! Agent rules follow the principal that read a secret. A principal can hand the secret to
-//! another one through a file it writes, so each source keeps one live table of which principals
-//! hold data of a propagated class (see [`crate::AgentRuleSet`]) and which files carry it. A
-//! principal that reads a carrier acquires its classes; the acquisition enters the observation log
-//! as [`Observed::Taint`](super::agent::Observed::Taint), which the rules read like a read of the
+//! another one through a file it writes or a local socket it sends to, so each source keeps one
+//! live table of which principals hold data of a propagated class (see [`crate::AgentRuleSet`])
+//! and which files carry it. A principal that reads a carrier acquires its classes, and so does
+//! one whose commands hold a socket bound to a loopback or unix address a holder contacts. The
+//! acquisition enters the observation log as
+//! [`Observed::Taint`](super::agent::Observed::Taint), which the rules read like a read of the
 //! class itself.
 //!
 //! The table is updated as each call is observed, while its task is still stopped, so a carrier
@@ -54,6 +56,8 @@ pub(super) struct TaintState {
     tainted: HashMap<Principal, BTreeMap<String, Taint>>,
     /// The classes each carrier holds, each with the taint of the principal that wrote it.
     carriers: HashMap<Carrier, BTreeMap<String, Taint>>,
+    /// Taint handed to a principal by another one's call, not yet in the receiver's log.
+    pending: HashMap<Principal, Vec<Taint>>,
 }
 
 impl TaintState {
@@ -66,7 +70,7 @@ impl TaintState {
         agent: &AgentPolicy,
         effects: &Effects,
     ) -> Vec<Taint> {
-        let mut acquired = Vec::new();
+        let mut acquired = self.pending.remove(principal).unwrap_or_default();
         let own = effects
             .reads
             .iter()
@@ -143,7 +147,25 @@ impl TaintState {
             .collect()
     }
 
-    /// Every class `principal` holds through another principal's carrier.
+    /// Every class `principal` holds, however it came to.
+    pub(super) fn held(&self, principal: &Principal) -> Vec<Taint> {
+        self.tainted
+            .get(principal)
+            .into_iter()
+            .flat_map(BTreeMap::values)
+            .cloned()
+            .collect()
+    }
+
+    /// Hands `principal` the class of `taint` from another principal's call, before that call
+    /// delivers anything to it. It enters `principal`'s log at its next observed call.
+    pub(super) fn hand(&mut self, principal: &Principal, taint: Taint) {
+        if self.hold(principal, taint.clone()) {
+            self.pending.entry(principal.clone()).or_default().push(taint);
+        }
+    }
+
+    /// Every class `principal` holds through another principal's carrier or socket.
     pub(super) fn received(&self, principal: &Principal) -> Vec<Taint> {
         self.tainted
             .get(principal)

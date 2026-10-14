@@ -19,6 +19,7 @@ use super::completion::{Completion, Finalize};
 use super::execution::Run;
 use super::policy::{self, Event, PolicyDecision, PolicyKind, PolicyObserver};
 use super::session::Session;
+use super::taint::Taint;
 use super::{Principal, ShellError};
 
 #[derive(Default)]
@@ -271,6 +272,66 @@ impl Snapshot {
     /// including a read of `source`, the file this same call copies into the socket in-kernel.
     /// Called on the tracer thread while the calling task is stopped at the call's entry.
     fn permits_peer(&self, run: TraceRun, peer: &[u8], source: Option<&FileTarget>) -> bool {
+        let permitted = self.judge_peer(run, peer, source);
+        if permitted {
+            self.hand_taint(peer);
+        }
+        permitted
+    }
+
+    /// Hands the acting principal's taint to every other principal of this source whose commands
+    /// hold a socket bound to `peer`, a loopback or unix address, before a permitted contact
+    /// delivers anything to it. Holders outside this source's traced commands are not judged.
+    fn hand_taint(&self, peer: &[u8]) {
+        let Some(agent) = &self.agent else {
+            return;
+        };
+        let principal = agent.acting(&self.uid);
+        let held = self.session.taint.lock().recover().held(&principal);
+        if held.is_empty() {
+            return;
+        }
+        let receivers = self.session.tracing.receivers(peer);
+        if receivers.is_empty() {
+            return;
+        }
+        let receivers: Vec<Principal> = self
+            .session
+            .snapshots
+            .lock()
+            .recover()
+            .values()
+            .filter_map(Weak::upgrade)
+            .filter(|snapshot| {
+                snapshot
+                    .root
+                    .get()
+                    .is_some_and(|root| receivers.contains(root))
+            })
+            .filter_map(|snapshot| {
+                let agent = snapshot.agent.as_ref()?;
+                Some(agent.acting(&snapshot.uid))
+            })
+            .filter(|receiver| *receiver != principal)
+            .collect();
+        let via = format!("socket {}", Peer::decode(peer));
+        let mut table = self.session.taint.lock().recover();
+        for receiver in &receivers {
+            for taint in &held {
+                table.hand(
+                    receiver,
+                    Taint {
+                        class: taint.class.clone(),
+                        from: principal.clone(),
+                        via: via.clone(),
+                    },
+                );
+            }
+        }
+    }
+
+    /// Whether the agent policy lets the active command reach `peer`; see [`Self::permits_peer`].
+    fn judge_peer(&self, run: TraceRun, peer: &[u8], source: Option<&FileTarget>) -> bool {
         let Some(agent) = &self.agent else {
             return true;
         };
