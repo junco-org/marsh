@@ -6,7 +6,6 @@
 # then becomes an ordinary attack that must be blocked.
 #
 # Each entry is a case `name` (not a file name) plus the reason it leaks today.
-# `toctou-peer-rewrite` is a documented placeholder with no runnable case.
 #
 # Closed, now ordinary must-block attacks:
 # * `sendfile-exfil`: the gate counts a sendfile's source as a read.
@@ -21,11 +20,12 @@
 
 [[gap]]
 name = "toctou-peer-rewrite"
+enforcement = "unprivileged"
 reason = """
 The tracer reads the socket address at syscall entry. Another thread of the \
 tracee can rewrite the address after the check but before the kernel copies \
 it, so the call is judged by the loopback peer it named while the kernel sees \
-an external one. Inherently racy; no deterministic runnable case."""
+an external one. The privileged BPF LSM checks the kernel's actual address."""
 
 [[gap]]
 name = "untraced-local-daemon-allowed"
@@ -34,3 +34,20 @@ reason = """
 traced command holds, so tests can reach a local database after reading its \
 password; the taint cannot follow into that daemon. A policy built with \
 `untraced_local(Deny)` refuses the contact (`untraced-local-daemon-exfil`)."""
+
+# Phase A residuals without deterministic corpus cases; not claims of coverage.
+[[gap]]
+name = "kernel-local-handoff-race"
+enforcement = "privileged"
+reason = """
+A rewritten local destination is handed taint when its real kernel contact is \
+drained at the sender's exit stop. A receiving relay can run before that stop. \
+Phase C's kernel receive-side taint is needed to close this window."""
+
+[[gap]]
+name = "connected-udp-peer-reconnect"
+reason = """
+A holder sharing a connected datagram socket can reconnect its mutable peer \
+after the socket_sendmsg hook inspects it but before protocol transmission. \
+The two Phase A LSM hooks close named-sockaddr rewrites, not this socket-state \
+race; it requires destination-stable protocol or packet enforcement."""

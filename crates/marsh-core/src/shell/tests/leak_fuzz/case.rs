@@ -85,6 +85,9 @@ pub(super) enum Expect {
     Any,
     /// Published, exiting 0.
     Accepted,
+    /// Privileged socket-only ring operations must publish; unprivileged observation may refuse.
+    #[serde(rename = "accepted-privileged")]
+    AcceptedPrivileged,
     /// Refused by a policy.
     Refused,
 }
@@ -110,6 +113,8 @@ pub(super) enum Encoding {
 pub(super) struct Gap {
     pub(super) name: String,
     pub(super) reason: String,
+    #[serde(default)]
+    pub(super) enforcement: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -189,7 +194,11 @@ impl Case {
 
     /// How many shells the steps name.
     pub(super) fn shells(&self) -> usize {
-        self.steps.iter().map(|step| step.shell + 1).max().unwrap_or(1)
+        self.steps
+            .iter()
+            .map(|step| step.shell + 1)
+            .max()
+            .unwrap_or(1)
     }
 
     /// The seeded file holding the canary, which `{CANARY_FILE}` names.
@@ -254,7 +263,9 @@ pub(super) fn substitute(text: &str, values: &HashMap<String, String>) -> Result
             .find(|c: char| !(c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_'))
             .unwrap_or(after.len());
         let name = after.get(..name_len).unwrap_or_default();
-        let closed = after.get(name_len..).is_some_and(|tail| tail.starts_with('}'));
+        let closed = after
+            .get(name_len..)
+            .is_some_and(|tail| tail.starts_with('}'));
         if name_len > 0 && closed {
             let value = values
                 .get(name)
@@ -274,7 +285,11 @@ pub(super) fn substitute(text: &str, values: &HashMap<String, String>) -> Result
 pub(super) fn describe(variants: &BTreeMap<String, String>) -> String {
     let mut out = String::new();
     for (slot, value) in variants {
-        let _ = write!(out, "{}{slot}={value}", if out.is_empty() { "" } else { " " });
+        let _ = write!(
+            out,
+            "{}{slot}={value}",
+            if out.is_empty() { "" } else { " " }
+        );
     }
     if out.is_empty() {
         out.push('-');

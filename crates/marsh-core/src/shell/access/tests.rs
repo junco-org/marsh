@@ -102,6 +102,19 @@ fn io_uring_is_accepted_only_while_every_submission_is_effectless_and_visible() 
     // OPENAT, or entries that could not be read, carry effects nothing observed.
     assert!(access.observe(&enter(2, Some(vec![29, 18])), root).is_err());
     assert!(access.observe(&enter(1, None), root).is_err());
+    // Kernel socket hooks permit socket-only SQEs, not filesystem READ/WRITE/OPENAT.
+    assert!(access.observe(&enter(1, Some(vec![26])), root).is_err());
+    access.kernel_contacts = true;
+    assert!(
+        access
+            .observe(&enter(5, Some(vec![9, 16, 26, 47, 48])), root)
+            .is_ok()
+    );
+    for opcode in [18, 22, 23] {
+        assert!(access.observe(&enter(1, Some(vec![opcode])), root).is_err());
+    }
+    assert!(access.observe(&setup(1 << 1), root).is_err());
+    assert!(access.observe(&enter(1, None), root).is_err());
     // Registration stays unsupported.
     assert!(
         access
@@ -110,6 +123,27 @@ fn io_uring_is_accepted_only_while_every_submission_is_effectless_and_visible() 
                 root
             )
             .is_err()
+    );
+}
+
+#[test]
+fn kernel_contacts_are_observed_even_on_a_later_non_network_stop() {
+    let mut access = Access::default();
+    let mut stop = info(Sysno::getpid, Vec::new(), RetCode::Ok(1));
+    let endpoint =
+        marsh_peer_class::Endpoint::from("192.0.2.1:9".parse::<std::net::SocketAddr>().unwrap());
+    stop.peers.push(endpoint.sockaddr());
+    assert!(
+        access
+            .observe(&stop, Path::new("/work"))
+            .unwrap()
+            .peers
+            .is_empty()
+    );
+    access.kernel_contacts = true;
+    assert_eq!(
+        access.observe(&stop, Path::new("/work")).unwrap().peers,
+        vec![Peer::decode(&stop.peers[0])]
     );
 }
 

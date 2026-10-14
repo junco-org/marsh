@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard, Weak};
 
 use super::agent::{self, AgentPolicy, Observation, Observed, PathAction};
 use super::builtins::gitcmd::GitAction;
@@ -75,6 +75,7 @@ impl std::fmt::Display for Denial {
 pub struct PolicyValidator {
     authority: RwLock<Authority>,
     revision: AtomicU64,
+    session: Mutex<Weak<Session>>,
 }
 impl PolicyValidator {
     /// An empty authority at the start of both orderings.
@@ -82,6 +83,7 @@ impl PolicyValidator {
         Self {
             authority: RwLock::new(Authority::default()),
             revision: AtomicU64::new(0),
+            session: Mutex::new(Weak::new()),
         }
     }
     /// What the policy would decide for `event` against the committed history, without adopting
@@ -106,6 +108,10 @@ impl PolicyValidator {
     /// so a concurrent routing decision either sees the change or waits for its final history.
     pub(super) fn write(&self) -> Result<RwLockWriteGuard<'_, Authority>, ShellError> {
         let guard = self.authority.write().recover();
+        let session = self.session.lock().recover().upgrade();
+        if let Some(session) = session {
+            session.invalidate_answers()?;
+        }
         self.revision
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |revision| {
                 revision.checked_add(1)
@@ -115,6 +121,9 @@ impl PolicyValidator {
     }
     pub(super) fn revision(&self) -> u64 {
         self.revision.load(Ordering::Acquire)
+    }
+    pub(super) fn attach_session(&self, session: &std::sync::Arc<Session>) {
+        *self.session.lock().recover() = std::sync::Arc::downgrade(session);
     }
     /// Records `approver`'s approval of `label` for every agent policy judging this source.
     ///

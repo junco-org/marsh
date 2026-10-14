@@ -408,6 +408,7 @@ impl SourceDomain {
         self.validator.declassify(approver, holder.clone(), class)?;
         if let Some(session) = self.session() {
             session.taint.lock().recover().declassify(holder, class);
+            session.invalidate_answers()?;
         }
         Ok(())
     }
@@ -435,11 +436,13 @@ impl SourceDomain {
             let metadata = std::fs::metadata(path)?;
             Carrier::Outside(metadata.dev(), metadata.ino())
         };
+        session.invalidate_answers()?;
         session
             .taint
             .lock()
             .recover()
             .declassify_carrier(&carrier, class);
+        session.invalidate_answers()?;
         Ok(())
     }
 
@@ -568,7 +571,7 @@ impl SourceDomain {
             Err(error) => return Err(error.into()),
         }
         *self.validator.write()? = authority;
-        Ok(Arc::new(Session {
+        let session = Arc::new(Session {
             fs: Arc::clone(&self.fs),
             tracing: Arc::clone(&self.tracing),
             validator: Arc::clone(&self.validator),
@@ -577,7 +580,9 @@ impl SourceDomain {
             snapshots: Mutex::new(BTreeMap::new()),
             taint: Mutex::new(TaintState::default()),
             persistence,
-        }))
+        });
+        self.validator.attach_session(&session);
+        Ok(session)
     }
 }
 
@@ -828,6 +833,23 @@ pub(super) struct Session {
 }
 
 impl Session {
+    /// Marks every source root stale before changed history or taint can be consumed.
+    pub fn invalidate_answers(&self) -> Result<(), ShellError> {
+        if self.tracing.enforcement() != marsh_instrument::Enforcement::Privileged {
+            return Ok(());
+        }
+        let snapshots: Vec<_> = self
+            .snapshots
+            .lock()
+            .recover()
+            .values()
+            .filter_map(Weak::upgrade)
+            .collect();
+        for snapshot in snapshots {
+            self.tracing.stale(snapshot.root()?)?;
+        }
+        Ok(())
+    }
     pub fn check(&self) -> Result<(), ShellError> {
         if self.validator.read().recovery_required {
             Err(ShellError::infrastructure(

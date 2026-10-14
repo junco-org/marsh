@@ -1,12 +1,14 @@
 # Privileged enforcement: agent-policy socket checks in the kernel
 
-Status: **proposed, not implemented.** Written 2026-10-14 on `feat/agent-policy`, after
-`a76f7c2` (per-class verdict cache, `untraced_local`, declassification).
+Status: **Phase A implemented and exercised on a BPF-LSM kernel. Both 31-case leak-corpus modes
+pass with seed 20261014; direct hooks and nested PID namespaces pass. Phases B/C are explicitly
+deferred.** Updated 2026-10-14 on `feat/agent-policy`.
 
-marsh will offer two enforcement modes for agent-policy socket checks. The **unprivileged** mode is
+marsh offers two enforcement modes for agent-policy socket checks. The **unprivileged** mode is
 today's ptrace gate and stays the default. The **privileged** mode moves the check itself into BPF
-LSM hooks, which see the address the kernel actually uses. That closes the TOCTOU address rewrite,
-the last entry in `crates/marsh-core/tests/leak-corpus/known-gaps.toml` that has no policy fix.
+LSM hooks, which see the kernel's copied address. That closes the named-sockaddr TOCTOU rewrite.
+It does not freeze the peer of a shared connected datagram socket through protocol transmission;
+the connected-UDP peer-reconnect race remains a documented gap (§7).
 Both modes share all of the policy code: classes, rules, taint and declassification.
 
 ## 1. The unprivileged gate today
@@ -106,18 +108,21 @@ refused rather than silently given the other.
   pinned nightly's BPF target.
 * **`crates/marsh-peer-class`** (new, `no_std`): the address classifier, shared by the BPF programs
   and by `AgentPolicy::peer_class`, so the two cannot drift (§4.5).
-* `marsh-instrument`: an `Enforcer` seam behind `PeerGate`. Ptrace mode keeps today's path.
-  Privileged mode refreshes answers instead of judging, and maintains the task map.
+* `marsh-instrument`: one `Enforcer` interface for ptrace decisions, all-class kernel refresh,
+  real contact delivery and asynchronous contact observations. The old public `PeerGate` path
+  is removed; ptrace enforcement itself remains unchanged.
 
 ### 4.3 Maps
 
 | Map | Type | Key → value | Written by |
 |---|---|---|---|
 | `TASK_ROOT` | hash | tgid → root id | the tracer, at every fork/clone stop before the child runs; removed at exit |
-| `ANSWERS` | hash | root id → `{ generation, deny: bitset over class ids, audit: bool }` | userspace refresh (§4.4) |
-| `CLASS_NET4`, `CLASS_NET6` | LPM trie | prefix → class id | userspace, from the policy's declared networks (§4.5) |
+| `ANSWERS` | hash | root id → `{ generation, deny, guarded, local, stale, audit }` | userspace refresh (§4.4) |
+| `CLASS_NET4`, `CLASS_NET6` | LPM trie | root-prefixed IP prefix → class id | userspace, from the policy's declared networks (§4.5) |
 | `LOCAL_ALLOWED` | hash | (root id, endpoint) → () | userspace, for `untraced_local(Deny)` (§4.7) |
 | `EVENTS` | ring buffer | contact and refusal records | the BPF programs |
+| `PID_NAMESPACE` | array | 0 → loader PID namespace device/inode | loader before attaching hooks |
+| `HEALTH` | array | 0 → sticky reporting/map failure | loader and BPF programs |
 
 The task map is keyed by tgid, not tid, because all threads of a process share a root. io_uring's
 `io-wq` workers are threads of the submitting process, so work they do on its behalf is attributed
@@ -185,11 +190,14 @@ checks the result against first-match search on random overlapping network sets.
 |---|---|---|
 | `lsm/socket_connect` | `connect`, io_uring `CONNECT` | the kernel's copy of the `sockaddr` |
 | `lsm/socket_sendmsg` | `send*`, `write`/`writev` on sockets (via `sock_write_iter`), io_uring `SEND`/`SENDMSG`/`WRITE` to a socket, and, on kernels whose `splice` reaches sockets through `sock_sendmsg`, `sendfile` and `splice` | `msg->msg_name` when set (kernel copy). Otherwise the socket's peer: `skc_daddr`/`skc_dport` (v4), `skc_v6_daddr` (v6), or the unix peer's bound name via BTF (`unix_sk(sk)->peer`) |
+| `lsm/uring_sqpoll` | admission of a kernel-polled submission ring | governed tasks are refused before a SQPOLL worker can be created |
 
-These replace, in privileged mode only, the address capture in `capture.rs`, the descriptor peer
-lookup in `socket.rs`, and the io_uring `unknown`-peer rule in `contacted`. The io_uring rule
-over-blocks today, for example Node/libuv after reading a dotenv file. The ptrace side still
-refuses SQPOLL rings and io_uring filesystem operations.
+In privileged mode, kernel contact events replace captured peer observations. Named-address
+capture remains only for the conservative early local taint handoff and `sendfile`/`splice`
+fallback. The io_uring `unknown`-peer rule is replaced by actual socket hook decisions; socket-only
+CONNECT/SEND/SENDMSG operations are accepted by the filesystem observer. Other ring operations
+remain unsupported. The extra `uring_sqpoll` hook is mandatory: rejecting a setup only at
+publication cannot prevent an untraced kernel submission thread consuming its queue.
 
 `sendfile` and `splice` still need their source counted as a read before the contact. In Phase A
 the entry stop does this exactly as `permits_peer` does now (`TaintState::sending` with the
@@ -205,8 +213,11 @@ source's effects), and the refresh includes it.
   the common case taints the receiver before delivery. A receiver that races the sender's exit
   stop after a rewritten address is a residual gap, recorded in `known-gaps.toml` for this mode.
 * **`untraced_local(Deny)`.** When a principal holds a propagated class, its refresh also writes
-  `LOCAL_ALLOWED`: the local endpoints held by traced commands of its source, from
-  `Tracing::receivers`. With the `deny` bit set for `loopback`/`unix` and an allowed-endpoint set
+  `LOCAL_ALLOWED`: exact bound endpoints obtained with `pidfd_getfd`/`getsockname` from traced
+  commands, filtered through `Tracing::receivers` so an untraced co-listener is not an exception.
+  Kernel names avoid `/proc/net/unix`'s ambiguous rendering of literal `@` and embedded NUL bytes.
+  Dual-stack IPv6 wildcards also supply an IPv4 exception only when `IPV6_V6ONLY` is disabled.
+  With local restriction bits and an allowed-endpoint set
   present, the hook permits a local contact only to an allowed endpoint. A local address nothing
   listens on is not refused today; the kernel cannot see listeners, so this mode refuses it. That
   differs only in the error a connection that would fail anyway returns.
@@ -231,6 +242,9 @@ Every judged contact is reported as `{ tgid, tid, root, family, endpoint, class,
   effect is pushed, so its order matches the other effects. Rules that depend on past contacts
   then see the real peer. io_uring contacts complete asynchronously and are drained at the
   process's next stop.
+  Draining reserves every batch owner while trace state is locked; callbacks run outside locks.
+  Run quiescence waits for in-flight deliveries and a final drain before reclaiming evidence,
+  so another tracer cannot retire a root whose events are already being dispatched.
 * **Refusals go to the `PolicyObserver`** with the same text as today (`Denial` from the cached
   answer), deduplicated per run by `Snapshot::first_report`.
 * **Audit mode.** `ANSWERS.audit` makes the hook permit and report `would block`, matching the
@@ -255,16 +269,37 @@ These need confirming on the target kernels.
   usually means an `lsm=…,bpf` boot parameter.
 * BTF: `CONFIG_DEBUG_INFO_BTF=y`.
 * BPF ring buffer: kernel 5.8 or later. BPF LSM: 5.7 or later.
-* `sendfile`/`splice` reaching `security_socket_sendmsg` depends on the kernel routing socket
-  splices through `sock_sendmsg` (believed 6.5 or later). On older kernels these calls keep being
-  judged at the ptrace entry stop, as today.
+* `CONFIG_IO_URING=y` and the `uring_sqpoll` LSM hook: privileged startup requires all three
+  admission/socket hooks. A kernel lacking the hook is not silently given weaker enforcement.
+* `sendfile`/`splice` coverage by `security_socket_sendmsg` varies with kernel implementation.
+  Phase A conservatively retains the ptrace peer gate and its observation evidence on every
+  kernel, even when the LSM hook also reports the contact.
 * Privileges to load and attach LSM programs. I believe this is CAP_BPF and CAP_PERFMON,
   possibly also CAP_MAC_ADMIN; in practice it means root, or a privileged helper that loads the
   programs and passes map descriptors to marsh.
 
-The current development host does **not** qualify: kernel 5.15, LSM list
-`lockdown,capability,landlock,yama,apparmor`, `unprivileged_bpf_disabled=2`, no root. Its kernel
-is built with BPF LSM and BTF, so a reboot with `lsm=` and root would be enough.
+The current development host has noninteractive sudo/root access, but its active LSM list does
+**not** include `bpf`, so privileged attachment is unavailable until the host is booted with BPF
+LSM active. An explicit privileged request must report this prerequisite failure; Auto reports
+the reason before falling back. Root alone cannot activate an LSM missing from the boot-time list.
+
+The isolated runner has loaded and exercised the real programs on Linux 7.0.0-38 with active
+BPF LSM and BTF, including a loader inside a nested PID namespace. No host reboot is required.
+
+### Build tools
+
+Default builds need no BPF toolchain. For the `privileged` feature:
+
+```sh
+rustup toolchain install nightly-2025-12-01 --profile minimal --component rust-src
+cargo +nightly-2025-12-01 install bpf-linker --version 0.9.15 --locked
+cargo build --features privileged
+```
+
+Install clang 21 alongside the normal C/libclang/libbtrfsutil prerequisites. The build checks the
+clang/linker versions, builds the CO-RE object with the pinned nightly, and embeds it; missing
+tools fail the privileged build rather than silently producing a weaker binary.
+
 
 ## 7. Security notes
 
@@ -278,25 +313,56 @@ is built with BPF LSM and BTF, so a reboot with `lsm=` and root would be enough.
   traced processes can reach, and their descriptors are not inherited (`O_CLOEXEC`).
 * Programs are detached and maps freed when the tracer exits. A crash leaves no stale policy
   because nothing is pinned.
+* `socket_sendmsg` sees a kernel-owned destination when `msg_name` is present. Without one,
+  it reads the socket's connected peer. Another holder of a connected UDP socket can reconnect
+  that mutable peer after the hook and before the protocol selects its transmission destination.
+  This residual socket-state race is not closed by the two hooks; closing it requires an
+  additional destination-stable protocol/packet enforcement point, not another userspace read.
+* Governed tasks use `PTRACE_O_EXITKILL`: a tracer crash must not leave them running with a
+  frozen policy table. Shared controller failures signal every governed process through pidfds,
+  clear task mappings even after poisoning, and detach only after those fatal signals are sent.
+* Task keys and events use the loader's PID namespace via `bpf_get_ns_current_pid_tgid`.
+  A loader may run in a nested PID namespace with a matching procfs view; a governed child
+  changing PID namespace is refused before resume rather than silently losing attribution.
+* Successful loading makes the host nondumpable, protecting its unpinned map/program descriptors
+  from same-UID tracees. Privileged managed launches clear effective/permitted/inheritable/ambient
+  capabilities and set `NO_NEW_PRIVS`; root children also lock `NOROOT` and clear their bounding
+  set. This intentionally prevents managed commands using administrative OS capabilities.
+  Their dumpability is restored only after stripping authority, so the parent can still seize
+  them. Same-UID signaling remains possible; `EXITKILL` protects against a killed tracer, not DoS.
 
 ## 8. Testing
 
-Runnable on the development host:
-* `marsh-peer-class` against `peer_class`: the first-match versus longest-prefix property (§4.5),
-  v4-mapped addresses, unspecified addresses and unix names.
-* `refresh_all` against the lazy `verdict`: after any sequence of observations, every class's
-  answer equals the lazy one.
-* The task-map bookkeeping with a fake `Enforcer`.
+The shared classifier and policy refresh regressions run without an active BPF LSM. Actual
+socket decisions, audit/stale outcomes, local exceptions, ring loss and PID-namespace attribution
+are tested by the ignored `marsh-bpf` `lsm` binary in a qualifying disposable kernel.
 
-Needs a privileged runner (kernel 6.x, `lsm=…,bpf`, root), for example a CI VM:
-* The full leak corpus in both modes. Its harness gains a mode switch.
-* A TOCTOU case: a thread rewrites the `sockaddr` from loopback to the external sink in a loop
-  while another connects. It must be blocked in privileged mode, and it stays in
-  `known-gaps.toml` for unprivileged mode.
-* An io_uring `CONNECT` and `SEND` after a secret read must be blocked. Node/libuv traffic before
-  any secret read must be delivered.
-* Audit mode on the Harbor benchmark in both modes, counting would-be denials (including `stale`)
-  to measure false denials.
+```sh
+cargo test -p marsh-core -p marsh-bpf --features privileged --no-run
+sudo python3 bench/leak-fuzzer/privileged-vm.py <printed-lsm-test-executable> --ignored --nocapture
+sudo python3 bench/leak-fuzzer/privileged-vm.py env MARSH_LEAK_ENFORCEMENT=privileged <printed-core-test-executable> leak_corpus --ignored --nocapture --test-threads=1
+```
+
+Run the same core executable again with `MARSH_LEAK_ENFORCEMENT=unprivileged`. The runner needs
+QEMU, busybox-static, cpio, zstd, kmod, iproute2 and an installed generic BPF/BTF kernel with 9p
+modules; the corpus also needs Python and genuine Node.js/libuv on a capless-accessible path.
+It mounts the host runtime read-only, only the repository writable, and creates no external NIC.
+System executable directories precede private-home PATH entries. `.github/workflows/privileged.yml`
+builds and runs these same checks. Serialize VM runs on small hosts; command deadlines are not
+excuses to weaken controls or remove forced io-wq execution.
+
+The named-address rewrite case is a must-block attack only in privileged mode. Forced asynchronous
+io_uring SEND/CONNECT attacks and untainted SEND/Node controls exercise real dispatch and delivery.
+The privilege-boundary control checks capability stripping, `NO_NEW_PRIVS` and loader-FD isolation;
+SQPOLL admission is checked with ordinary traffic still allowed. Harbor audit measurements remain
+separate benchmark work; no Harbor false-denial numbers are claimed here.
+
+Observed verification: 31 case runs with zero failures in each mode (including audit cross-checks),
+two direct LSM acceptance tests in both initial and nested PID namespaces, 167 core regressions,
+17 tracing regressions, three shared-classifier properties, and public mux/env mode checks.
+The native Git-history regression was not runnable: this host's Git 2.53 has no `git history`
+subcommand. Tests requiring real btrfs used an isolated btrfs HOME; the host LSM configuration was
+not changed or rebooted.
 
 ## 9. Open questions
 

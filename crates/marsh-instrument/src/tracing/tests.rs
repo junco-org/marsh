@@ -104,13 +104,48 @@ fn exited(events: &mpsc::Receiver<ChildEvent>) -> std::process::ExitStatus {
 }
 
 #[test]
+fn local_exceptions_exclude_an_untraced_co_listener() {
+    let fixture = Fixture::new();
+    let untraced = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let address = untraced.local_addr().unwrap();
+    let run = fixture.service.begin_run(fixture.root).unwrap();
+    let scope = fixture.service.scope(run, None).unwrap();
+    let ready = fixture.path("socket-ready");
+    let (child, events) = fixture.spawn(&scope, &format!(
+        "exec python3 -c \"import socket,time; s=socket.socket(); s.bind(('127.0.0.1', {})); s.listen(); open('{}','w').close(); time.sleep(60)\"",
+        address.port(), ready.display()
+    )).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !ready.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let bound = ready.exists();
+    let raw = local::endpoints(&[Pid::from_raw(i32::try_from(child.pid).unwrap())]);
+    let allowed = fixture.service.local_endpoints(&[fixture.root]);
+    fixture.service.cancel(run).unwrap();
+    assert_eq!(exited(&events).signal(), Some(libc::SIGKILL));
+    child.wait_observed().unwrap();
+    fixture.finish(run);
+    assert!(bound, "the traced TCP listener bound before inventory");
+    let endpoint = Endpoint::from(address);
+    assert!(raw.unwrap().contains(&endpoint));
+    assert!(
+        !allowed.unwrap().contains(&endpoint),
+        "an untraced UDP receiver shares the endpoint"
+    );
+}
+
+#[test]
 fn spawned_commands_are_traced_attributed_and_reaped_in_process() {
     let fixture = Fixture::new();
     let run = fixture.service.begin_run(fixture.root).unwrap();
     let scope = fixture.service.scope(run, None).unwrap();
     let file = fixture.path("traced.txt");
     let (child, events) = fixture
-        .spawn(&scope, &format!("printf traced > '{}'; /bin/true", file.display()))
+        .spawn(
+            &scope,
+            &format!("printf traced > '{}'; /bin/true", file.display()),
+        )
         .unwrap();
     assert!(exited(&events).success());
     fixture.service.quiesce(run).unwrap();
@@ -170,14 +205,20 @@ fn host_records_count_only_inside_workload_scopes() {
     let seen = std::mem::take(&mut *lock(&fixture.seen));
     assert!(!mentions(&seen, b"outside.txt"));
     assert!(!mentions(&seen, b"internal.txt"));
-    assert!(seen.iter().any(|call| call.info.syscall == Sysno::newfstatat
-        && call.path(1).is_some_and(|path| path.ends_with(b"probed.txt"))));
+    assert!(seen.iter().any(|call| {
+        call.info.syscall == Sysno::newfstatat
+            && call
+                .path(1)
+                .is_some_and(|path| path.ends_with(b"probed.txt"))
+    }));
     // A read-only open also stands for the reads made through it.
-    assert!(seen.iter().any(|call| call.info.syscall == Sysno::read
-        && call
-            .fd(0)
-            .unwrap()
-            .is_some_and(|target| target.path.ends_with(b"probed.txt"))));
+    assert!(seen.iter().any(|call| {
+        call.info.syscall == Sysno::read
+            && call
+                .fd(0)
+                .unwrap()
+                .is_some_and(|target| target.path.ends_with(b"probed.txt"))
+    }));
     fixture.finish(run);
 }
 
@@ -202,7 +243,9 @@ fn failed_launches_and_unscoped_spawns_leave_nothing_running() {
     assert!(unscoped.is_err());
     let unresolved = {
         let _guard = scope.enter();
-        fixture.service.spawn(Command::new("true"), Box::new(|_| {}))
+        fixture
+            .service
+            .spawn(Command::new("true"), Box::new(|_| {}))
     };
     assert_eq!(
         unresolved.err().map(|error| error.kind()),
@@ -346,11 +389,20 @@ fn tracked_execs_own_their_whole_tree_until_their_end() {
         command.argv,
         [program.to_str().unwrap(), "-c", inner, "a b", ""]
     );
-    assert!(command.environment.iter().any(|entry| entry == "SELECTOR=fixture"));
+    assert!(
+        command
+            .environment
+            .iter()
+            .any(|entry| entry == "SELECTOR=fixture")
+    );
     assert_eq!(command.cwd, sub);
     assert_eq!(tracked.ended[0].1.and_then(|status| status.code()), Some(3));
     assert_eq!(fixture.owner_of(b"marker").1, Some(*id));
-    assert_eq!(fixture.owner_of(b"child").1, Some(*id), "descendants stay owned");
+    assert_eq!(
+        fixture.owner_of(b"child").1,
+        Some(*id),
+        "descendants stay owned"
+    );
     let (after, owner) = fixture.owner_of(b"after");
     assert_eq!(owner, None);
     let (start, finish) = fixture.service.invocation_orders(run, *id).unwrap();
@@ -364,7 +416,11 @@ fn tracked_execs_own_their_whole_tree_until_their_end() {
     let (id, command, _) = &tracked.begun[2];
     assert_eq!(command.program, program);
     assert_eq!(command.environment, ["SELECTOR=fd", "PATH=/usr/bin:/bin"]);
-    assert_eq!(fixture.owner_of(b"vchild").1, Some(*id), "vforked children stay owned");
+    assert_eq!(
+        fixture.owner_of(b"vchild").1,
+        Some(*id),
+        "vforked children stay owned"
+    );
     assert!(tracked.ended.iter().all(|(_, status)| status.is_some()));
     fixture.finish(run);
 }
@@ -378,14 +434,20 @@ fn cancelling_while_an_admitted_exec_is_held_ends_it_incomplete() {
     let run = fixture.service.begin_run(fixture.root).unwrap();
     let scope = fixture.service.scope(run, None).unwrap();
     let (_, events) = fixture
-        .spawn(&scope, &format!("exec {} -c 'exec /bin/sleep 60'", program.display()))
+        .spawn(
+            &scope,
+            &format!("exec {} -c 'exec /bin/sleep 60'", program.display()),
+        )
         .unwrap();
     assert_eq!(exited(&events).signal(), Some(libc::SIGKILL));
     fixture.service.quiesce(run).unwrap();
     let tracked = lock(&tracked);
     assert_eq!(tracked.begun.len(), 1);
     assert_eq!(tracked.ended.len(), 1);
-    assert_eq!(tracked.ended[0].1, None, "a cancelled invocation never completes");
+    assert_eq!(
+        tracked.ended[0].1, None,
+        "a cancelled invocation never completes"
+    );
     drop(tracked);
     fixture.finish(run);
 }

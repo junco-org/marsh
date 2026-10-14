@@ -20,6 +20,19 @@ is not a case; it registers cases whose leaks are expected (see below).
 Every attack also runs under `AgentPolicy::audit()` (done by the harness, not a
 separate case): a leak must come with a "would block" report.
 
+Run the same corpus with `MARSH_LEAK_ENFORCEMENT=unprivileged` or `privileged`.
+The latter requires `--features privileged` and an active BPF-LSM kernel; it
+never skips or falls back if unavailable. `bench/leak-fuzzer/privileged-vm.py`
+provides an isolated runner when the host's boot-time LSM list lacks `bpf`.
+Root runs use a network namespace without dropping initial-user-namespace
+BPF authority. See `docs/privileged-enforcement.md` for pinned build tools.
+
+`expect = "accepted-privileged"` requires successful publication in kernel
+mode while allowing the unprivileged filesystem observer to refuse unsupported
+ring operations. Both modes still require a control's canary to be delivered.
+The SEND control forces an io-wq worker; the privilege-boundary control checks
+capability stripping and loader descriptor isolation.
+
 ## Placeholders
 
 The loader substitutes these before running a case. A `{NAME}` with no value
@@ -53,8 +66,11 @@ fails loading, so file contents and commands must not contain stray braces.
 
 ## Known gaps
 
-Cases listed in `known-gaps.toml` leak by design: they exercise paths
-`recommended` does not cover (a TOCTOU peer rewrite, and a local daemon marsh
-does not trace, which `recommended` allows). Their leaks report "known gap" rather than failing, so only a
-new, unlisted leak breaks the build. Close a gap in the policy, then delete its
-entry and the case becomes a must-block attack.
+Entries may select an `enforcement` mode. A named-sockaddr rewrite is a known
+gap only for ptrace; kernel mode must block it. `recommended`'s allowance for
+untraced daemons remains deliberate in both modes. Phase A's rewritten-local
+taint handoff and shared connected-UDP peer-state races are documented
+residuals without deterministic cases, not claims of test coverage.
+
+Registered leaks report "known gap" rather than failing. A new, unlisted leak
+breaks the build; remove an entry once its case is actually closed.

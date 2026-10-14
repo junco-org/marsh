@@ -16,15 +16,15 @@ use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 use std::rc::Rc;
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, Weak};
 use std::thread::ThreadId;
 use std::time::Duration;
 
-use crate::{FileTarget, Syscall};
 use crate::capture::proc_field;
 use crate::host::{HostCall, records};
 use crate::local;
 use crate::observation::{Observer, Resume, Sequence, UNCLASSIFIED, alive, creation};
+use crate::{FileTarget, Syscall};
 use lurk_cli::syscall_info::{RetCode, SyscallArgs, SyscallInfo};
 use marsh_lib::{CheckedAdvance, RecoverPoison as _};
 use nix::errno::Errno;
@@ -36,6 +36,12 @@ use syscalls::{Sysno, SysnoSet};
 
 /// The published generation; a weak that no longer upgrades admits a new one.
 static SHARED: Mutex<Option<Weak<Tracing>>> = Mutex::new(None);
+use crate::Endpoint;
+#[cfg(feature = "privileged")]
+use crate::enforcement::Kernel;
+use crate::enforcement::{Enforcement, Enforcer, SELECTION};
+#[path = "tracing_kernel.rs"]
+mod kernel_integration;
 
 thread_local! {
     /// Scopes entered on this host thread, innermost last: service, scope and attribution.
@@ -80,17 +86,8 @@ struct Root {
     path: PathBuf,
     observe: Arc<dyn Fn(TraceRun, Option<InvocationId>, Syscall) -> io::Result<()> + Send + Sync>,
     exec: Option<ExecHooks>,
-    peers: Option<PeerGate>,
+    enforcer: Option<Arc<dyn Enforcer>>,
 }
-
-/// Whether a task of `run`, owned by the invocation, may reach the peer whose `sockaddr` it names
-/// or writes to (empty when unknown).
-///
-/// The last argument is the file the same call copies into the socket in-kernel (`sendfile`), a
-/// read no earlier observation records. Called at the call's entry stop, without trace locks held,
-/// from the tracer thread owning the task; a refused call is skipped and fails with `EPERM`.
-pub type PeerGate =
-    Arc<dyn Fn(TraceRun, Option<InvocationId>, &[u8], Option<&FileTarget>) -> bool + Send + Sync>;
 
 /// A selected command a traced task has just executed, read before its new image ran anything.
 ///
@@ -141,7 +138,8 @@ pub struct ExecHooks {
     >,
     /// A tracked invocation's last task ended, with the executed task's status; `None` when its
     /// observation is incomplete. Called exactly once per tracked invocation.
-    pub end: Arc<dyn Fn(TraceRun, InvocationId, Option<ExitStatus>) -> io::Result<()> + Send + Sync>,
+    pub end:
+        Arc<dyn Fn(TraceRun, InvocationId, Option<ExitStatus>) -> io::Result<()> + Send + Sync>,
 }
 
 /// Where a tracked invocation stands.
@@ -222,6 +220,9 @@ struct Scope {
 struct RunState {
     cancelled: bool,
     waker: Option<std::task::Waker>,
+    /// Kernel records drained by a tracer but not yet delivered to the policy engine.
+    #[cfg(feature = "privileged")]
+    contacts: usize,
 }
 
 #[derive(Default)]
@@ -403,6 +404,12 @@ pub struct Tracing {
     progress: Condvar,
     sequence: Arc<Sequence>,
     selected: SysnoSet,
+    enforcement: Enforcement,
+    fallback: OnceLock<String>,
+    #[cfg(feature = "privileged")]
+    kernel: Option<Mutex<Kernel>>,
+    #[cfg(feature = "privileged")]
+    contacts: Mutex<HashMap<Pid, Vec<Vec<u8>>>>,
 }
 
 impl Tracing {
@@ -411,22 +418,102 @@ impl Tracing {
     /// # Errors
     /// Returns a live generation's recorded failure.
     pub fn shared() -> io::Result<Arc<Self>> {
+        let mode = lock(&SELECTION)
+            .as_ref()
+            .map_or(Enforcement::Unprivileged, |(mode, _)| *mode);
+        Self::shared_with_enforcement(mode)
+    }
+
+    /// Selects socket enforcement once per process, refusing incompatible requests.
+    pub fn shared_with_enforcement(requested: Enforcement) -> io::Result<Arc<Self>> {
         let mut shared = lock(&SHARED);
         if let Some(tracing) = shared.as_ref().and_then(Weak::upgrade) {
-            // Never drop a possibly-final owner while holding the cache.
             drop(shared);
-            let health = lock(&tracing.state).check();
-            return health.map(|()| tracing);
+            if requested != Enforcement::Auto && requested != tracing.enforcement {
+                return Err(io::Error::other(
+                    "socket enforcement already selected differently for this process",
+                ));
+            }
+            lock(&tracing.state).check()?;
+            if requested == Enforcement::Auto && tracing.enforcement == Enforcement::Unprivileged {
+                let reason = tracing.fallback.get_or_init(|| "process already selected unprivileged socket enforcement before Auto was requested".to_owned());
+                if let Some((_, fallback)) = lock(&SELECTION).as_mut() {
+                    fallback.get_or_insert_with(|| reason.clone());
+                }
+            }
+            return Ok(tracing);
+        }
+        let mut selection = lock(&SELECTION);
+        let previous = selection.as_ref().map(|(mode, _)| *mode);
+        if let Some(mode) = previous
+            && requested != Enforcement::Auto
+            && requested != mode
+        {
+            return Err(io::Error::other(
+                "socket enforcement already selected differently for this process",
+            ));
+        }
+        let desired = previous.unwrap_or(requested);
+        #[cfg(feature = "privileged")]
+        let (enforcement, kernel, fallback) = match desired {
+            Enforcement::Unprivileged => (Enforcement::Unprivileged, None, None),
+            Enforcement::Privileged | Enforcement::Auto => match Kernel::load() {
+                Ok(kernel) => (Enforcement::Privileged, Some(Mutex::new(kernel)), None),
+                Err(error) if desired == Enforcement::Auto => {
+                    (Enforcement::Unprivileged, None, Some(error.to_string()))
+                }
+                Err(error) => return Err(error),
+            },
+        };
+        #[cfg(not(feature = "privileged"))]
+        let (enforcement, fallback) = match desired {
+            Enforcement::Privileged => {
+                return Err(io::Error::other(
+                    "privileged socket enforcement requires the privileged cargo feature",
+                ));
+            }
+            Enforcement::Auto => (
+                Enforcement::Unprivileged,
+                Some(
+                    "privileged socket enforcement requires the privileged cargo feature"
+                        .to_owned(),
+                ),
+            ),
+            Enforcement::Unprivileged => (Enforcement::Unprivileged, None),
+        };
+        let fallback = selection.as_ref().and_then(|(_, reason)| reason.clone()).or(fallback)
+            .or_else(|| (requested == Enforcement::Auto && enforcement == Enforcement::Unprivileged).then(|| "process already selected unprivileged socket enforcement before Auto was requested".to_owned()));
+        let fallback_cell = OnceLock::new();
+        if let Some(reason) = &fallback {
+            let _ = fallback_cell.set(reason.clone());
         }
         let tracing = Arc::new(Self {
             state: Mutex::new(State::default()),
             progress: Condvar::new(),
             sequence: Arc::new(Sequence::default()),
             selected: Observer::selection()?,
+            enforcement,
+            fallback: fallback_cell,
+            #[cfg(feature = "privileged")]
+            kernel,
+            #[cfg(feature = "privileged")]
+            contacts: Mutex::new(HashMap::new()),
         });
+        *selection = Some((enforcement, fallback));
+        drop(selection);
         *shared = Some(Arc::downgrade(&tracing));
         drop(shared);
         Ok(tracing)
+    }
+
+    /// The effective process-wide socket enforcement mode.
+    pub const fn enforcement(&self) -> Enforcement {
+        self.enforcement
+    }
+
+    /// Why an automatic request fell back to ptrace, if it did.
+    pub fn enforcement_fallback(&self) -> Option<&str> {
+        self.fallback.get().map(String::as_str)
     }
 
     /// Registers a physical work root, its native observation consumer, and the executed
@@ -451,7 +538,7 @@ impl Tracing {
                 path: root.to_path_buf(),
                 observe,
                 exec,
-                peers: None,
+                enforcer: None,
             },
         );
         drop(state);
@@ -543,7 +630,11 @@ impl Tracing {
             .filter_map(|scope| scope.first)
             .min()
             .zip(scopes().filter_map(|scope| scope.last).max());
-        if let Some(native) = state.natives.get(&builtin).filter(|native| native.run == run) {
+        if let Some(native) = state
+            .natives
+            .get(&builtin)
+            .filter(|native| native.run == run)
+        {
             let finish = native
                 .finish
                 .ok_or_else(|| io::Error::other("tracked invocation has not ended"))?;
@@ -565,8 +656,15 @@ impl Tracing {
     /// Waits for all inherited producers and their pending calls to end.
     pub fn quiesce(&self, run: TraceRun) -> io::Result<()> {
         let mut state = lock(&self.state);
+        #[cfg(feature = "privileged")]
+        let mut drained = false;
         loop {
             state.run(run)?;
+            #[cfg(feature = "privileged")]
+            if state.runs.get(&run).is_some_and(|run| run.contacts != 0) {
+                state = self.progress.wait(state).recover();
+                continue;
+            }
             let busy = state.threads.values().any(|thread| {
                 run.owns(thread.inherited)
                     || thread.pending.is_some_and(|(_, target)| run.owns(target))
@@ -580,7 +678,21 @@ impl Tracing {
                     .values()
                     .any(|native| native.run == run && native.phase != Phase::Ended);
             if !busy {
+                #[cfg(feature = "privileged")]
+                if self.kernel.is_some() && !drained {
+                    drop(state);
+                    // The last io-wq contact must reach command evidence before quiescence
+                    // allows its consumer to take that evidence or retire its root.
+                    self.kernel_contacts(Pid::from_raw(0), None)?;
+                    state = lock(&self.state);
+                    drained = true;
+                    continue;
+                }
                 break;
+            }
+            #[cfg(feature = "privileged")]
+            {
+                drained = false;
             }
             state = self.progress.wait(state).recover();
         }
@@ -697,19 +809,6 @@ impl Tracing {
         Some(holders.into_values().collect())
     }
 
-    /// Consults `gate` before any task of `root`'s runs contacts a socket peer.
-    pub fn gate_peers(&self, root: RootId, gate: PeerGate) -> io::Result<()> {
-        let mut state = lock(&self.state);
-        state.check()?;
-        state
-            .roots
-            .get_mut(&root)
-            .ok_or_else(|| io::Error::other("unknown root"))?
-            .peers = Some(gate);
-        drop(state);
-        Ok(())
-    }
-
     /// Releases a root only after its runs have finished.
     pub fn unregister_root(&self, root: RootId) -> io::Result<()> {
         let mut state = lock(&self.state);
@@ -724,6 +823,7 @@ impl Tracing {
             .remove(&root)
             .ok_or_else(|| io::Error::other("missing trace root"))?;
         drop(state);
+        self.remove_kernel_root(root)?;
         Ok(())
     }
 
@@ -776,12 +876,20 @@ impl Tracing {
         let tracing = Arc::clone(self);
         let tracer = std::thread::Builder::new()
             .name("marsh-tracer".into())
-            .spawn(move || tracing.trace(request_read, release_write, &pinned, target, host, events))?;
+            .spawn(move || {
+                tracing.trace(request_read, release_write, &pinned, target, host, events)
+            })?;
         let (request, release) = (request_write.as_raw_fd(), release_read.as_raw_fd());
-        // SAFETY: the hook runs in the forked child and only calls async-signal-safe getpid, write
-        // and read on two descriptors the child inherited; it allocates nothing.
+        let restricted = self.enforcement == Enforcement::Privileged;
+        // SAFETY: the post-fork hook uses only stack data and Linux syscalls; it neither
+        // allocates nor locks before the inherited-descriptor handshake and exec.
         unsafe {
-            command.pre_exec(move || handshake(request, release));
+            command.pre_exec(move || {
+                if restricted {
+                    crate::enforcement::restrict_child()?;
+                }
+                handshake(request, release)
+            });
         }
         let spawned = command.spawn();
         drop(command);
@@ -842,11 +950,13 @@ impl Tracing {
         let selector = Arc::clone(self);
         observer.select_exec(Box::new(move |tid, path| selector.selects(tid, path)));
         let gate = Arc::clone(self);
-        observer.gate_peers(Box::new(move |tid, peers, source| {
-            gate.permits(tid, peers, source)
+        observer.kernel_peers(self.enforcement == Enforcement::Privileged);
+        observer.gate_peers(Box::new(move |tid, syscall, peers, source| {
+            gate.permits(tid, syscall, peers, source)
         }));
         let result = (|| -> io::Result<()> {
             let mut observe = |sequence, tid: Pid, status, event, info, exec| {
+                let info = self.kernel_contacts(tid, info)?;
                 let resume = self.deliver(sequence, tid, status, event, info, exec)?;
                 if tid == root {
                     report(&mut *events, status)?;
@@ -861,6 +971,7 @@ impl Tracing {
                 .send(process.try_clone()?)
                 .map_err(|_| io::Error::other("spawner abandoned its command"))?;
             self.adopt_root(root, target, host, process)?;
+            self.map_task(root)?;
             observer.stop(root, status, &mut observe)?;
             std::fs::File::from(release).write_all(&[1])?;
             observer.run(&mut observe)?;
@@ -876,6 +987,7 @@ impl Tracing {
         })();
         if observer.detached() {
             lock(&self.state).threads.remove(&root);
+            self.unmap_task(root)?;
             self.progress.notify_all();
         }
         if let Err(error) = &result {
@@ -893,8 +1005,11 @@ impl Tracing {
             }
             observer.abandon(|tid, status| {
                 lock(&self.state).threads.remove(&tid);
+                let _ = self.unmap_task(tid);
                 if tid == root {
-                    events(ChildEvent::Exited(std::process::ExitStatus::from_raw(status)));
+                    events(ChildEvent::Exited(std::process::ExitStatus::from_raw(
+                        status,
+                    )));
                 }
             });
             self.abandon_natives(tracer);
@@ -908,24 +1023,42 @@ impl Tracing {
     fn permits(
         &self,
         tid: Pid,
+        syscall: Sysno,
         peers: &mut dyn FnMut() -> Vec<Vec<u8>>,
         source: Option<&FileTarget>,
-    ) -> bool {
+    ) -> io::Result<bool> {
         let state = lock(&self.state);
         let Some(target) = state.threads.get(&tid).and_then(|thread| thread.inherited) else {
-            return true;
+            return Ok(true);
         };
-        let gate = state
+        let enforcer = state
             .roots
             .get(&target.run.root)
-            .and_then(|root| root.peers.as_ref())
-            .map(Arc::clone);
+            .and_then(|root| root.enforcer.clone());
         drop(state);
-        gate.is_none_or(|gate| {
-            peers()
+        if let Some(enforcer) = enforcer {
+            let peers = peers();
+            if self.enforcement == Enforcement::Privileged {
+                for peer in peers.iter().filter(|peer| {
+                    matches!(
+                        marsh_peer_class::builtin_class(&Endpoint::from_sockaddr(peer)),
+                        Some(marsh_peer_class::UNIX | marsh_peer_class::LOOPBACK)
+                    )
+                }) {
+                    enforcer.handoff(target.run, peer, source)?;
+                }
+                self.refresh_kernel(target, &*enforcer, source)?;
+                // Older kernels can bypass socket_sendmsg for these in-kernel copies.
+                // Keep the ptrace gate as well until hook coverage is established.
+                if !matches!(syscall, Sysno::sendfile | Sysno::splice) {
+                    return Ok(true);
+                }
+            }
+            return Ok(peers
                 .iter()
-                .all(|peer| gate(target.run, target.builtin, peer, source))
-        })
+                .all(|peer| enforcer.permits(target.run, target.builtin, peer, source)));
+        }
+        Ok(true)
     }
 
     /// Whether `tid`'s owner selects the executable it is about to exec.
@@ -982,10 +1115,7 @@ impl Tracing {
             _ => None,
         };
         native.phase = Phase::Ending;
-        let status = native
-            .status
-            .filter(|_| complete)
-            .map(ExitStatus::from_raw);
+        let status = native.status.filter(|_| complete).map(ExitStatus::from_raw);
         drop(state);
         let ended = end.map_or(Ok(()), |end| end(run, id, status));
         let order = self.sequence.next();
@@ -1060,8 +1190,19 @@ impl Tracing {
     }
 
     fn fail(&self, cause: impl Into<String>) {
+        let cause = cause.into();
+        #[cfg(feature = "privileged")]
+        let cause = if let Some(kernel) = &self.kernel {
+            let terminated = lock(kernel).controller.terminate();
+            match terminated {
+                Ok(()) => cause,
+                Err(error) => format!("{cause}; terminating governed tasks: {error}"),
+            }
+        } else {
+            cause
+        };
         let mut state = lock(&self.state);
-        state.failure.get_or_insert_with(|| cause.into());
+        state.failure.get_or_insert(cause);
         let waiters: Vec<_> = state
             .runs
             .values_mut()
@@ -1105,6 +1246,12 @@ impl Tracing {
         {
             let former = Self::event_thread(event, "missing exec identity")?;
             state.rekey(tid, former);
+            if former != tid {
+                drop(state);
+                self.unmap_task(former)?;
+                self.map_task(tid)?;
+                state = lock(&self.state);
+            }
         }
         if let Some(thread) = state.threads.get_mut(&tid) {
             thread.job_stopped = matches!(
@@ -1133,6 +1280,9 @@ impl Tracing {
             let child = Self::event_thread(event, "missing child identity")?;
             let early = Self::adopt(&mut state, tid, child)?;
             drop(state);
+            if !early.iter().any(|(_, status, _, _)| ended(*status)) {
+                self.map_task(child)?;
+            }
             let mut held = false;
             for (sequence, status, event, info) in early {
                 let replay = self.deliver(sequence, child, status, event, info, None)?;
@@ -1164,6 +1314,7 @@ impl Tracing {
             }
             state.threads.remove(&tid);
             drop(state);
+            self.unmap_task(tid)?;
             self.progress.notify_all();
             return self.settle(resume, ready);
         }
@@ -1264,7 +1415,8 @@ impl Tracing {
 
     /// Pins a stopped task's process identity once, killing it when its run was cancelled.
     fn lease(state: &mut State, tid: Pid) -> io::Result<()> {
-        let cancelled = state.cancelled(state.threads.get(&tid).and_then(|thread| thread.inherited));
+        let cancelled =
+            state.cancelled(state.threads.get(&tid).and_then(|thread| thread.inherited));
         let thread = state.threads.entry(tid).or_default();
         if thread.process.is_none()
             && let Some(group) = proc_field::<i32>(format!("/proc/{tid}/status"), "Tgid:")
@@ -1416,13 +1568,8 @@ fn handshake(request: RawFd, release: RawFd) -> io::Result<()> {
     let mut written = 0;
     while written < pid.len() {
         // SAFETY: the buffer is live for the stated length; the descriptor was inherited open.
-        let count = unsafe {
-            libc::write(
-                request,
-                pid[written..].as_ptr().cast(),
-                pid.len() - written,
-            )
-        };
+        let count =
+            unsafe { libc::write(request, pid[written..].as_ptr().cast(), pid.len() - written) };
         match usize::try_from(count) {
             Ok(count) => written += count,
             Err(_) if Errno::last() == Errno::EINTR => {}
@@ -1453,7 +1600,9 @@ const fn ended(status: i32) -> bool {
 fn report(events: &mut dyn FnMut(ChildEvent), status: i32) -> io::Result<()> {
     match WaitStatus::from_raw(Pid::from_raw(0), status)? {
         WaitStatus::Exited(..) | WaitStatus::Signaled(..) => {
-            events(ChildEvent::Exited(std::process::ExitStatus::from_raw(status)));
+            events(ChildEvent::Exited(std::process::ExitStatus::from_raw(
+                status,
+            )));
         }
         WaitStatus::PtraceEvent(_, signal, code)
             if code == Event::PTRACE_EVENT_STOP as i32

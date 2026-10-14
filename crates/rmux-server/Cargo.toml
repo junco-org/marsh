@@ -58,6 +58,7 @@ brush-core.workspace = true
 default = ["web"]
 perf-instrument = []
 testing = ["marsh-core/testing", "dep:marsh-btrfs"]
+privileged = ["marsh-core/privileged"]
 web = [
     "dep:base64",
     "dep:getrandom",

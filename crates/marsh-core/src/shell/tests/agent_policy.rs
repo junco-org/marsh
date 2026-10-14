@@ -50,6 +50,234 @@ impl Fixture {
 
 #[tokio::test]
 #[serial(agent_policy)]
+async fn an_unresolved_kernel_peer_reports_audit_without_aborting_the_command() {
+    use super::super::snapshot::CommandEvidence;
+    use marsh_peer_class::{Contact, Endpoint, UNKNOWN};
+    let fixture = Fixture::new();
+    let notices = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorded = Arc::clone(&notices);
+    let observer = Arc::new(crate::PolicyObserver::new(move |event, decision| {
+        if let crate::PolicyDecision::Deny {
+            failed_precondition,
+            ..
+        } = decision
+        {
+            recorded.lock().unwrap().push((
+                event.resource.clone(),
+                failed_precondition.starts_with("would block:"),
+            ));
+        }
+    }));
+    let shell = fixture
+        .observed_agent(
+            AgentPolicy::new()
+                .rule(AgentRule::no_network("external"))
+                .audit(),
+            Some(observer),
+        )
+        .await;
+    accepted(&shell, ":").await;
+    let snapshot = shell
+        .shared
+        .live
+        .lock()
+        .await
+        .as_ref()
+        .unwrap()
+        .resources
+        .snapshot
+        .clone()
+        .unwrap();
+    let run = snapshot
+        .session
+        .tracing
+        .begin_run(snapshot.root().unwrap())
+        .unwrap();
+    let mut evidence = CommandEvidence::default();
+    evidence.baseline.push(snapshot.path());
+    snapshot.state.lock().unwrap().evidence = Some((run, evidence));
+    let refreshed = snapshot.refresh_all(run, None).unwrap();
+    assert_eq!(refreshed.answers.deny & (1 << UNKNOWN), 0);
+    let event = Contact {
+        generation: refreshed.answers.generation,
+        endpoint: Endpoint::default(),
+        class: UNKNOWN,
+        decision: 2,
+        ..Contact::default()
+    };
+    snapshot.contact(run, event).unwrap();
+    snapshot.contact(run, event).unwrap();
+    {
+        let seen = notices.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].0.segments(), ["net", "unknown"]);
+        assert!(seen[0].1);
+        drop(seen);
+    }
+    snapshot.state.lock().unwrap().evidence = None;
+    snapshot.session.tracing.end_run(run).unwrap();
+    close(shell).await;
+}
+
+#[tokio::test]
+#[serial(agent_policy)]
+async fn kernel_refresh_matches_lazy_classes_and_tracks_one_generation() {
+    use super::super::access::Effects;
+    use super::super::agent::Peer;
+    use super::super::snapshot::CommandEvidence;
+    use marsh_peer_class::{Contact, EXTERNAL, Endpoint};
+    let fixture = Fixture::new();
+    fixture.write(".env", "TOKEN=1\n");
+    let notices = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorded = Arc::clone(&notices);
+    let observer = Arc::new(crate::PolicyObserver::new(move |_, decision| {
+        if let crate::PolicyDecision::Deny {
+            failed_precondition,
+            ..
+        } = decision
+        {
+            recorded.lock().unwrap().push(failed_precondition.clone());
+        }
+    }));
+    let policy = AgentPolicy::recommended()
+        .unwrap()
+        .network("203.0.113.0/24", "cloud")
+        .unwrap()
+        .rule(AgentRule::no_contact_after_read("secret", &["cloud"]));
+    let shell = fixture.observed_agent(policy, Some(observer)).await;
+    accepted(&shell, ":").await;
+    let snapshot = shell
+        .shared
+        .live
+        .lock()
+        .await
+        .as_ref()
+        .unwrap()
+        .resources
+        .snapshot
+        .clone()
+        .unwrap();
+    let run = snapshot
+        .session
+        .tracing
+        .begin_run(snapshot.root().unwrap())
+        .unwrap();
+    let mut evidence = CommandEvidence::default();
+    evidence.baseline.push(snapshot.path());
+    snapshot.state.lock().unwrap().evidence = Some((run, evidence));
+    let first = snapshot.refresh_all(run, None).unwrap();
+    assert_eq!(first.answers.deny, 0);
+    assert_eq!(
+        snapshot.refresh_all(run, None).unwrap().answers.generation,
+        first.answers.generation
+    );
+    let endpoints = [
+        Endpoint {
+            family: marsh_peer_class::AF_UNIX,
+            ..Endpoint::default()
+        },
+        Endpoint {
+            family: marsh_peer_class::AF_NETLINK,
+            ..Endpoint::default()
+        },
+        Endpoint::from("127.0.0.1:9".parse::<std::net::SocketAddr>().unwrap()),
+        Endpoint::from("192.0.2.1:9".parse::<std::net::SocketAddr>().unwrap()),
+        Endpoint::default(),
+        Endpoint::from("203.0.113.1:9".parse::<std::net::SocketAddr>().unwrap()),
+    ];
+    for (id, endpoint) in endpoints.iter().enumerate() {
+        assert_eq!(
+            snapshot.permits_peer(run, &endpoint.sockaddr(), None),
+            first.answers.deny & (1 << id) == 0
+        );
+    }
+    {
+        let mut state = snapshot.state.lock().unwrap();
+        state.evidence.as_mut().unwrap().1.effects.push((
+            1,
+            None,
+            Effects {
+                reads: vec![PathBuf::from(".env")],
+                ..Effects::default()
+            },
+        ));
+    }
+    let changed = snapshot.refresh_all(run, None).unwrap();
+    assert!(changed.answers.generation > first.answers.generation);
+    // Actual hook refusals reuse cached text and are deduplicated before lazy calls report it.
+    let contact = Contact {
+        root: 0,
+        tgid: 0,
+        tid: 0,
+        generation: changed.answers.generation,
+        endpoint: endpoints[3],
+        class: EXTERNAL,
+        decision: 1,
+    };
+    snapshot.contact(run, contact).unwrap();
+    snapshot.contact(run, contact).unwrap();
+    assert_eq!(notices.lock().unwrap().len(), 1);
+    assert!(notices.lock().unwrap()[0].starts_with("blocked: "));
+    for (id, endpoint) in endpoints.iter().enumerate() {
+        assert_eq!(
+            snapshot.permits_peer(run, &endpoint.sockaddr(), None),
+            changed.answers.deny & (1 << id) == 0
+        );
+    }
+    // An untracked io-wq tid contributes its real endpoint, ordered evidence and no fake syscall.
+    let asynchronous = Contact {
+        tid: u32::MAX,
+        ..contact
+    };
+    snapshot
+        .asynchronous_contact(run, None, 2, asynchronous)
+        .unwrap();
+    {
+        let state = snapshot.state.lock().unwrap();
+        let evidence = &state.evidence.as_ref().unwrap().1;
+        assert!(evidence.records.is_empty());
+        assert_eq!(evidence.effects[1].0, 2);
+        assert_eq!(
+            evidence.effects[1].2.peers,
+            [Peer::decode(&endpoints[3].sockaddr())]
+        );
+        drop(state);
+    }
+    let contacted = snapshot.refresh_all(run, None).unwrap();
+    assert!(contacted.answers.generation > changed.answers.generation);
+    // Consecutive real contacts retain the all-class generation after the first new contact.
+    snapshot
+        .asynchronous_contact(run, None, 3, asynchronous)
+        .unwrap();
+    assert_eq!(
+        snapshot.refresh_all(run, None).unwrap().answers.generation,
+        contacted.answers.generation
+    );
+    shell.approve("network").unwrap();
+    assert!(
+        snapshot.refresh_all(run, None).unwrap().answers.generation > changed.answers.generation
+    );
+    snapshot.state.lock().unwrap().evidence = None;
+    snapshot.session.tracing.end_run(run).unwrap();
+    close(shell).await;
+}
+
+#[tokio::test]
+#[serial(agent_policy)]
+async fn shell_modes_keep_the_default_and_refuse_an_explicit_mismatch() {
+    let fixture = Fixture::new();
+    let shell = fixture.agent(AgentPolicy::new()).await;
+    assert_eq!(shell.enforcement(), crate::Enforcement::Unprivileged);
+    let mut builder = Shell::builder()
+        .working_dir(fixture.seed.clone())
+        .enforcement(crate::Enforcement::Privileged);
+    builder.backend = Some(fixture.fs.clone());
+    assert!(builder.build().await.is_err());
+    close(shell).await;
+}
+
+#[tokio::test]
+#[serial(agent_policy)]
 async fn egress_after_a_secret_read_is_blocked_at_the_syscall() {
     let fixture = Fixture::new();
     fixture.write(".env", "TOKEN=1\n");

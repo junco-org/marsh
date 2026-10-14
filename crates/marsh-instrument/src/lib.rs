@@ -6,6 +6,7 @@
 //! attribution.
 
 mod capture;
+mod enforcement;
 mod host;
 mod local;
 mod observation;
@@ -15,11 +16,12 @@ mod syscall;
 mod tracing;
 mod wire;
 
+pub use enforcement::{Enforcement, Enforcer, KernelPolicy};
 pub use host::HostCall;
+pub use marsh_peer_class::{Answers, Contact, Endpoint, Network};
 pub use observation::EFFECTLESS_IO_URING_OPS;
 pub use syscall::{FileTarget, Syscall};
 pub use tracing::{
-    ChildEvent, ExecCommand, ExecDecision, ExecHooks, InvocationId, PeerGate, PollScope, RootId,
-    Scoped,
+    ChildEvent, ExecCommand, ExecDecision, ExecHooks, InvocationId, PollScope, RootId, Scoped,
     TraceRun, TraceScope, TraceScopeGuard, TracedChild, Tracing, open_process, signal_process,
 };

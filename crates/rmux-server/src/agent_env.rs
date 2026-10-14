@@ -1,7 +1,7 @@
 //! Daemon-wide agent sandboxing, chosen by the environment the daemon starts in.
 //!
 //! An unmodified tmux client — a benchmark harness, an agent scaffold — has no way to ask for a
-//! policy, so the daemon reads two variables once, when it builds its mux profile:
+//! policy, so the daemon reads these variables once, when it builds its mux profile:
 //!
 //! * `MARSH_AGENT_POLICY`: unset, empty or `off` keeps the default routing and no agent policy.
 //!   `recommended` sandboxes every call and judges it by [`AgentPolicy::recommended`];
@@ -11,6 +11,8 @@
 //!   appended to as one JSON object per line. `policy` names the policy that decided (`git` or
 //!   `agent`) and `mode` whether it enforced (`enforce`) or only reported (`audit`); the Git
 //!   policy always enforces.
+//! * `MARSH_ENFORCEMENT`: unset, empty or `unprivileged` keeps the ptrace gate; `privileged`
+//!   requires BPF LSM support and a privileged-feature build; `auto` reports any fallback.
 //!
 //! Every pane is one agent: its observations are attributed to the principal `agent`, so taint
 //! from one pane follows the agent into the others.
@@ -18,10 +20,12 @@
 use std::fmt::Write as _;
 use std::io::Write as _;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::mpsc;
+use std::sync::Arc;
 
-use marsh_core::{AgentPolicy, Event, PolicyDecision, PolicyKind, PolicyObserver, SandboxPolicy};
+use marsh_core::{
+    AgentPolicy, Enforcement, Event, PolicyDecision, PolicyKind, PolicyObserver, SandboxPolicy,
+};
 
 /// The principal every pane's observations are attributed to.
 const AGENT: &str = "agent";
@@ -31,11 +35,13 @@ pub(crate) struct AgentEnvironment {
     pub sandbox_policy: SandboxPolicy,
     pub agent_policy: Option<Arc<AgentPolicy>>,
     pub policy_observer: Option<Arc<PolicyObserver>>,
+    pub enforcement: Enforcement,
 }
 
 impl AgentEnvironment {
-    /// Reads `MARSH_AGENT_POLICY` and `MARSH_POLICY_LOG`.
+    /// Reads the daemon's agent policy, enforcement and decision-log settings.
     pub(crate) fn from_env() -> std::io::Result<Self> {
+        let enforcement = enforcement(&std::env::var("MARSH_ENFORCEMENT").unwrap_or_default())?;
         let mode = std::env::var("MARSH_AGENT_POLICY").unwrap_or_default();
         let (sandbox_policy, agent_policy) = match mode.as_str() {
             "" | "off" => (SandboxPolicy::default(), None),
@@ -65,7 +71,19 @@ impl AgentEnvironment {
             sandbox_policy,
             agent_policy,
             policy_observer,
+            enforcement,
         })
+    }
+}
+
+fn enforcement(mode: &str) -> std::io::Result<Enforcement> {
+    match mode {
+        "" | "unprivileged" => Ok(Enforcement::Unprivileged),
+        "privileged" => Ok(Enforcement::Privileged),
+        "auto" => Ok(Enforcement::Auto),
+        other => Err(std::io::Error::other(format!(
+            "MARSH_ENFORCEMENT must be unprivileged, privileged or auto, not {other:?}"
+        ))),
     }
 }
 
@@ -148,6 +166,18 @@ fn json(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn enforcement_modes_are_explicit_and_default_unprivileged() {
+        assert_eq!(enforcement("").unwrap(), Enforcement::Unprivileged);
+        assert_eq!(
+            enforcement("unprivileged").unwrap(),
+            Enforcement::Unprivileged
+        );
+        assert_eq!(enforcement("privileged").unwrap(), Enforcement::Privileged);
+        assert_eq!(enforcement("auto").unwrap(), Enforcement::Auto);
+        assert!(enforcement("off").is_err());
+    }
 
     #[test]
     fn records_are_single_line_json() {

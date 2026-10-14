@@ -224,10 +224,7 @@ impl std::error::Error for AgentPolicyError {}
 
 /// An IPv4 or IPv6 network in CIDR form.
 #[derive(Clone, Debug)]
-struct Network {
-    address: IpAddr,
-    prefix: u32,
-}
+struct Network(marsh_peer_class::Network);
 impl Network {
     fn parse(text: &str) -> Result<Self, AgentPolicyError> {
         let invalid = || AgentPolicyError(format!("invalid network {text:?}"));
@@ -240,28 +237,18 @@ impl Network {
         if prefix > width {
             return Err(invalid());
         }
-        Ok(Self { address, prefix })
+        let endpoint = marsh_peer_class::Endpoint::from(SocketAddr::new(address, 0));
+        Ok(Self(marsh_peer_class::Network {
+            family: endpoint.family,
+            class: 0,
+            prefix,
+            address: endpoint.address,
+        }))
     }
-    fn contains(&self, address: IpAddr) -> bool {
-        let mask = |bits: u32, width: u32| {
-            u128::MAX
-                .checked_shl(width - bits)
-                .unwrap_or(0)
-                .checked_shl(128 - width)
-                .unwrap_or(0)
-        };
-        let widen = |address: IpAddr| match address {
-            IpAddr::V4(address) => (u128::from(u32::from(address)) << 96, 32),
-            IpAddr::V6(address) => (u128::from(address), 128),
-        };
-        let address = match address {
-            IpAddr::V6(v6) if self.address.is_ipv4() => {
-                v6.to_ipv4_mapped().map_or(IpAddr::V6(v6), IpAddr::V4)
-            }
-            address => address,
-        };
-        let ((network, width), (candidate, other)) = (widen(self.address), widen(address));
-        width == other && network & mask(self.prefix, width) == candidate & mask(self.prefix, width)
+
+    /// Declared network bytes for the privileged classifier, with its policy-assigned class ID.
+    pub(super) const fn as_shared(&self, class: u16) -> marsh_peer_class::Network {
+        marsh_peer_class::Network { class, ..self.0 }
     }
 }
 
@@ -517,25 +504,29 @@ impl AgentPolicy {
 
     /// The class of a socket peer.
     pub(super) fn peer_class(&self, peer: &Peer) -> &str {
-        match peer {
-            Peer::Unix(_) => "unix",
-            Peer::Netlink => "netlink",
-            Peer::Unknown => "unknown",
-            Peer::Ip(address) => {
-                let ip = address.ip();
-                let ip = match ip {
-                    IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, IpAddr::V4),
-                    IpAddr::V4(_) => ip,
-                };
-                // Connecting to the unspecified address reaches this host.
-                if ip.is_loopback() || ip.is_unspecified() {
-                    return "loopback";
-                }
-                self.networks
-                    .iter()
-                    .find(|(network, _)| network.contains(ip))
-                    .map_or("external", |(_, label)| label)
-            }
+        use marsh_peer_class::{Endpoint, builtin_class, network_contains};
+        let endpoint = match peer {
+            Peer::Ip(address) => Endpoint::from(*address),
+            Peer::Unix(_) => Endpoint {
+                family: marsh_peer_class::AF_UNIX,
+                ..Endpoint::default()
+            },
+            Peer::Netlink => Endpoint {
+                family: marsh_peer_class::AF_NETLINK,
+                ..Endpoint::default()
+            },
+            Peer::Unknown => Endpoint::default(),
+        };
+        match builtin_class(&endpoint) {
+            Some(marsh_peer_class::UNIX) => "unix",
+            Some(marsh_peer_class::NETLINK) => "netlink",
+            Some(marsh_peer_class::LOOPBACK) => "loopback",
+            Some(_) => "unknown",
+            None => self
+                .networks
+                .iter()
+                .find(|(network, _)| network_contains(&network.0, &endpoint))
+                .map_or("external", |(_, label)| label),
         }
     }
 
@@ -690,6 +681,15 @@ impl AgentPolicy {
         candidate: &Observation,
     ) -> Option<Denial> {
         let event = self.label(candidate)?;
+        self.decide_event(history, prior, event)
+    }
+
+    fn decide_event(
+        &self,
+        history: &[Observation],
+        prior: &[Observation],
+        event: Event,
+    ) -> Option<Denial> {
         let rules = self.firing(&event);
         if rules.is_empty() {
             return None;
@@ -715,6 +715,54 @@ impl AgentPolicy {
                 allowed_fixes,
             }),
         }
+    }
+
+    /// Stable ABI IDs: builtins first, then distinct declared labels in declaration order.
+    pub(super) fn kernel_classes(&self) -> Vec<&str> {
+        let mut classes = vec!["unix", "netlink", "loopback", "external", "unknown"];
+        for (_, label) in &self.networks {
+            if !classes[5..].contains(&label.as_str()) {
+                classes.push(label);
+            }
+        }
+        classes
+    }
+
+    pub(super) fn kernel_networks(&self) -> std::io::Result<Vec<marsh_peer_class::Network>> {
+        let classes = self.kernel_classes();
+        self.networks
+            .iter()
+            .map(|(network, label)| {
+                let id = classes[5..]
+                    .iter()
+                    .position(|class| *class == label.as_str())
+                    .ok_or_else(|| std::io::Error::other("declared network class missing"))?
+                    + 5;
+                let id = u16::try_from(id).map_err(std::io::Error::other)?;
+                Ok(network.as_shared(id))
+            })
+            .collect()
+    }
+
+    pub(super) fn kernel_judges(&self, principal: &Principal, class: &str) -> bool {
+        let event = Event::new(principal.clone(), Action::Edit, ["net", class]);
+        self.rules
+            .iter()
+            .any(|rule| could_fire(&rule.0.rule.head, &event))
+    }
+
+    pub(super) fn kernel_decide(
+        &self,
+        principal: &Principal,
+        class: &str,
+        history: &[Observation],
+        prior: &[Observation],
+    ) -> Option<Denial> {
+        self.decide_event(
+            history,
+            prior,
+            Event::new(principal.clone(), Action::Edit, ["net", class]),
+        )
     }
 
     /// Whether this policy reports denials without enforcing them.

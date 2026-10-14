@@ -1,0 +1,20 @@
+[package]
+name = "marsh-bpf"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+build = "build.rs"
+
+[features]
+default = []
+privileged = []
+
+[dependencies]
+aya = "=0.13.1"
+libc = "0.2"
+marsh-peer-class = { path = "../marsh-peer-class", features = ["std"] }
+
+[lints]
+workspace = true

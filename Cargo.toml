@@ -27,6 +27,7 @@ bench = false
 default = ["web"]
 web = ["rmux-server/web"]
 perf-instrument = ["rmux-server/perf-instrument"]
+privileged = ["marsh-core/privileged", "marsh-instrument/privileged", "rmux-server/privileged"]
 
 [dependencies]
 marsh-core = { path = "crates/marsh-core" }
@@ -91,6 +92,7 @@ workspace = true
 [workspace]
 resolver = "3"
 members = ["crates/*", "fuzz"]
+exclude = ["crates/marsh-bpf-ebpf"]
 
 [workspace.package]
 authors = ["reuben olinsky"]

@@ -263,7 +263,8 @@ shared log: `no_contact_after_read` stops counting the holder's earlier reads an
 the class, and the holder stops handing it on, until it reads the class again.
 `Shell::declassify_file(path, class)` stops a carrier tainting its later readers.
 
-Socket peers are judged while the command runs. The tracer asks the policy at the entry of:
+Socket peers are judged while the command runs. In the default unprivileged mode, the tracer asks
+the policy at the entry of:
 * each `connect`, `sendto`, `sendmsg` and `sendmmsg`, about the peers it names;
 * each write to a connected socket (`write`, `writev`, `pwritev2`, `send*`, `sendfile`,
   `splice`), about the socket's peer, so a socket connected before the policy forbade its peer
@@ -277,9 +278,24 @@ contact only as its peer's class, so each shell keeps the answer per class and r
 committed history, the source's taint or the command's own observations change; a call that only
 contacts the same peer again changes nothing. A refused call is skipped by the kernel and fails
 with `EPERM`, implemented on x86-64 only; elsewhere a refusal fails the command instead.
-The tracer reads a call's address before the kernel copies it, so another thread can rewrite it
-in between; `docs/privileged-enforcement.md` designs a privileged mode that enforces in BPF LSM
-hooks against the kernel's own copy.
+The unprivileged tracer reads a call's address before the kernel copies it, so another thread can
+rewrite it in between. With the `privileged` Cargo feature, `ShellBuilder::enforcement` and
+`MuxProfile::enforcement` can instead select `Enforcement::Privileged`: the tracer refreshes every
+class under one policy generation, and BPF LSM hooks judge the address the kernel actually uses.
+Changed observations, history and taint mark answers stale; stale guarded contacts fail closed.
+Real endpoint reports supply contact observations, refusal text and local taint handoff.
+
+Privileged startup requires BPF capabilities, BTF, active BPF LSM and the `uring_sqpoll` admission
+hook; an explicit request fails if loading is unavailable. Build with `cargo build --features
+privileged` after installing nightly-2025-12-01 with rust-src, clang 21 and bpf-linker 0.9.15.
+`Enforcement::Auto` may fall back, with the reason reported through the first agent shell's
+`PolicyObserver` (or stderr without one); `Shell::enforcement()` returns the effective mode.
+The process-wide tracer refuses an incompatible explicit mode request. Phase A still uses network
+entry stops and userspace receiver discovery; eager incremental answers and in-kernel taint
+(Phases B/C) are deferred. See [`docs/privileged-enforcement.md`](docs/privileged-enforcement.md)
+for requirements, the isolated kernel runner, and residual filesystem/local-handoff/connected-UDP
+races. Privileged managed commands lose OS capabilities and cannot gain new privileges, so they
+cannot modify the enforcer's maps or use administrative capabilities even when launched as root.
 
 Everything else is judged at publication, atomically with the Git policy. A refused command's
 source changes are rolled back, but what it read, ran and contacted stays in history. Effects
@@ -289,16 +305,20 @@ the WAL.
 A leak fuzzer exercises these rules end to end. `crates/marsh-core/tests/leak-corpus/` holds
 hand-written cases — each reads (or deliberately does not read) a secret, then tries to send it to
 a stand-in external host — and `cargo test -p marsh-core --lib leak_corpus -- --ignored` runs them
-inside a user+network namespace, failing if any canary reaches the external sink in any encoding
-or if legitimate traffic is blocked. `known-gaps.toml` registers the paths `recommended` does not
-yet cover, so only a *new* leak breaks the build: a TOCTOU peer rewrite of the tracer's entry-time
-read, and `recommended`'s allowance for local daemons marsh does not trace. See
+inside an isolated network namespace, failing if any canary reaches the sink or legitimate traffic
+is blocked. `MARSH_LEAK_ENFORCEMENT=privileged` selects the kernel mode (build with `--features
+privileged`). Root runs retain initial-user-namespace BPF authority; unprivileged runs also create
+a user namespace. Known gaps are mode-specific: named-address rewriting remains a ptrace gap,
+and `recommended` deliberately permits untraced local daemons. Remaining Phase A races are
+documented in `known-gaps.toml`. See
 [`bench/leak-fuzzer/PLAN.md`](bench/leak-fuzzer/PLAN.md).
 
-The `rmux` daemon reads two environment variables when it starts:
+The `rmux` daemon reads these environment variables when it starts:
 * `MARSH_AGENT_POLICY=sandbox|audit|recommended` routes every pane through the managed route
   and selects the policy;
 * `MARSH_POLICY_LOG=<file>` appends each denial as a JSON line.
+* `MARSH_ENFORCEMENT=unprivileged|privileged|auto` selects socket enforcement; unset defaults to
+  unprivileged. Build `rmux` with `cargo build --features privileged` to enable BPF loading.
 
 Every pane acts as the one principal `agent`.
 

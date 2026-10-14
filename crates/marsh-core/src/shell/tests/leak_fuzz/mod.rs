@@ -49,6 +49,26 @@ const BACKGROUND_TIMEOUT: Duration = Duration::from_secs(6);
 /// Time left for in-flight bytes to reach the sink after a case's steps finish.
 const SINK_GRACE: Duration = Duration::from_millis(750);
 
+fn enforcement() -> marsh_instrument::Enforcement {
+    match std::env::var("MARSH_LEAK_ENFORCEMENT")
+        .as_deref()
+        .unwrap_or("unprivileged")
+    {
+        "unprivileged" => marsh_instrument::Enforcement::Unprivileged,
+        "privileged" => marsh_instrument::Enforcement::Privileged,
+        other => panic!("unknown MARSH_LEAK_ENFORCEMENT {other:?}"),
+    }
+}
+
+fn namespace_args() -> &'static [&'static str] {
+    // Keep initial-user-namespace BPF capabilities when running as real root.
+    // SAFETY: geteuid takes no arguments and has no memory effects.
+    if unsafe { libc::geteuid() } == 0 {
+        &["--net"]
+    } else {
+        &["--user", "--map-root-user", "--net"]
+    }
+}
 /// Runs the whole leak corpus. Ignored: it needs a user+network namespace and a real `python3`.
 #[test]
 #[ignore = "needs a user+network namespace and python3; run with --ignored"]
@@ -56,7 +76,13 @@ fn leak_corpus() {
     if std::env::var_os(IN_NAMESPACE).is_none() {
         match reexec_in_namespace() {
             Bootstrap::Ran => {}
-            Bootstrap::Skipped(reason) => eprintln!("leak_corpus skipped: {reason}"),
+            Bootstrap::Skipped(reason) => {
+                assert!(
+                    enforcement() != marsh_instrument::Enforcement::Privileged,
+                    "privileged leak corpus cannot skip: {reason}"
+                );
+                eprintln!("leak_corpus skipped: {reason}");
+            }
         }
         return;
     }
@@ -89,26 +115,40 @@ fn reexec_in_namespace() -> Bootstrap {
     // libtest names a test by its module path without the crate prefix.
     let test_name = format!(
         "{}::leak_corpus",
-        module_path!().strip_prefix("marsh_core::").unwrap_or(module_path!())
+        module_path!()
+            .strip_prefix("marsh_core::")
+            .unwrap_or(module_path!())
     );
     let mut command = Command::new("unshare");
     command
-        .args(["--user", "--map-root-user", "--net", "--"])
+        .args(namespace_args())
+        .arg("--")
         .arg(&exe)
-        .args([&test_name, "--exact", "--ignored", "--nocapture", "--test-threads", "1"])
+        .args([
+            &test_name,
+            "--exact",
+            "--ignored",
+            "--nocapture",
+            "--test-threads",
+            "1",
+        ])
         .env(IN_NAMESPACE, "1");
     if let Some(path) = std::env::var_os("LD_LIBRARY_PATH") {
         command.env("LD_LIBRARY_PATH", path);
     }
     let status = command.status().expect("run unshare");
-    assert!(status.success(), "leak_corpus failed inside the namespace: {status}");
+    assert!(
+        status.success(),
+        "leak_corpus failed inside the namespace: {status}"
+    );
     Bootstrap::Ran
 }
 
 /// Whether an unprivileged user+network namespace can be created at all.
 fn namespaces_available() -> bool {
     Command::new("unshare")
-        .args(["--user", "--map-root-user", "--net", "true"])
+        .args(namespace_args())
+        .arg("true")
         .status()
         .is_ok_and(|status| status.success())
 }
@@ -157,7 +197,9 @@ impl Rng {
 /// A fresh 24-character canary of `[A-Za-z0-9]`.
 fn canary(rng: &mut Rng) -> String {
     const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-    (0..24).map(|_| ALPHABET[rng.below(ALPHABET.len())] as char).collect()
+    (0..24)
+        .map(|_| ALPHABET[rng.below(ALPHABET.len())] as char)
+        .collect()
 }
 
 /// A nanosecond-resolution seed when none is given.
@@ -172,8 +214,12 @@ fn random_seed() -> u64 {
 
 /// Runs the whole corpus and returns how many cases failed.
 async fn run_corpus() -> usize {
+    // Keep the process-wide service alive across cases instead of re-verifying BPF each time.
+    let _tracing = marsh_instrument::Tracing::shared_with_enforcement(enforcement())
+        .expect("start requested leak-corpus enforcement");
     let dir = corpus_dir();
-    let (cases, gaps) = case::load(&dir).unwrap_or_else(|error| panic!("load {}: {error}", dir.display()));
+    let (cases, gaps) =
+        case::load(&dir).unwrap_or_else(|error| panic!("load {}: {error}", dir.display()));
     let filter = std::env::var("MARSH_LEAK_FILTER").ok();
     let iterations: usize = std::env::var("MARSH_LEAK_ITERATIONS")
         .ok()
@@ -185,7 +231,11 @@ async fn run_corpus() -> usize {
         .and_then(|value| value.parse().ok())
         .unwrap_or_else(random_seed);
 
-    eprintln!("leak_corpus: {} case(s) from {}", cases.len(), dir.display());
+    eprintln!(
+        "leak_corpus: {} case(s) from {}",
+        cases.len(),
+        dir.display()
+    );
     eprintln!("leak_corpus: seed={seed} iterations={iterations}");
     if let Some(filter) = &filter {
         eprintln!("leak_corpus: filter={filter:?}");
@@ -196,10 +246,24 @@ async fn run_corpus() -> usize {
     let mut failures = 0;
 
     for case in &cases {
-        if filter.as_ref().is_some_and(|needle| !case.name.contains(needle.as_str())) {
+        if filter
+            .as_ref()
+            .is_some_and(|needle| !case.name.contains(needle.as_str()))
+        {
             continue;
         }
-        let gap_reason = gaps.get(&case.name).map(|gap| gap.reason.clone());
+        let gap_reason = gaps
+            .get(&case.name)
+            .filter(|gap| {
+                gap.enforcement.as_deref().is_none_or(|mode| {
+                    mode == if enforcement() == marsh_instrument::Enforcement::Privileged {
+                        "privileged"
+                    } else {
+                        "unprivileged"
+                    }
+                })
+            })
+            .map(|gap| gap.reason.clone());
         let known_gap = gap_reason.is_some();
         for iteration in 0..iterations {
             let variants = sample_variants(case, &mut rng, iteration);
@@ -216,7 +280,10 @@ async fn run_corpus() -> usize {
                     case::describe(&variants),
                     outcome.report(case, &verdict)
                 );
-                eprintln!("--- minimal reproducer ---\n{}", minimal.to_toml(&minimal_variants));
+                eprintln!(
+                    "--- minimal reproducer ---\n{}",
+                    minimal.to_toml(&minimal_variants)
+                );
             }
             rows.push(Row {
                 name: case.name.clone(),
@@ -305,6 +372,10 @@ impl Outcome {
             let ok = match step.expect {
                 Expect::Any => true,
                 Expect::Accepted => matches!(outcome, StepOutcome::Accepted),
+                Expect::AcceptedPrivileged => {
+                    enforcement() != marsh_instrument::Enforcement::Privileged
+                        || matches!(outcome, StepOutcome::Accepted)
+                }
                 Expect::Refused => matches!(outcome, StepOutcome::Refused),
             };
             if !ok {
@@ -320,7 +391,11 @@ impl Outcome {
 
     /// A multi-line explanation for a failing case.
     fn report(&self, case: &Case, verdict: &Verdict) -> String {
-        let mut out = format!("kind={:?} status={}\nsteps:", case.kind, verdict.status.label());
+        let mut out = format!(
+            "kind={:?} status={}\nsteps:",
+            case.kind,
+            verdict.status.label()
+        );
         for (index, outcome) in &self.steps {
             let _ = write!(out, "\n  [{index}] {}", outcome.label());
         }
@@ -431,7 +506,12 @@ fn build_policy(case: &Case, mode: PolicyMode) -> AgentPolicy {
 }
 
 /// Runs one case once and reports what the sink saw and the policy denied.
-async fn run_once(case: &Case, variants: &BTreeMap<String, String>, token: &str, mode: PolicyMode) -> Outcome {
+async fn run_once(
+    case: &Case,
+    variants: &BTreeMap<String, String>,
+    token: &str,
+    mode: PolicyMode,
+) -> Outcome {
     let sink = Sink::start(IpAddr::V4(SINK_HOST)).expect("bind sink");
     // A local daemon marsh does not trace: what reaches it has left marsh's sight too.
     let local = Sink::start(IpAddr::V4(Ipv4Addr::LOCALHOST)).expect("bind local sink");
@@ -445,7 +525,8 @@ async fn run_once(case: &Case, variants: &BTreeMap<String, String>, token: &str,
     let fixture = super::Fixture::new();
     for file in &case.files {
         let path = case::substitute(&file.path, &values).expect("file path placeholders");
-        let contents = case::substitute(&file.contents, &values).expect("file contents placeholders");
+        let contents =
+            case::substitute(&file.contents, &values).expect("file contents placeholders");
         let full = fixture.seed.join(&path);
         if let Some(parent) = full.parent() {
             std::fs::create_dir_all(parent).expect("seed directory");
@@ -457,7 +538,11 @@ async fn run_once(case: &Case, variants: &BTreeMap<String, String>, token: &str,
     let observer = {
         let denials = Arc::clone(&denials);
         Arc::new(PolicyObserver::new(move |event, decision| {
-            if let PolicyDecision::Deny { failed_precondition, .. } = decision {
+            if let PolicyDecision::Deny {
+                failed_precondition,
+                ..
+            } = decision
+            {
                 denials
                     .lock()
                     .unwrap()
@@ -496,9 +581,14 @@ async fn run_once(case: &Case, variants: &BTreeMap<String, String>, token: &str,
 }
 
 /// Opens one managed shell over the fixture's seed, judged by `policy` and reporting to `observer`.
-async fn open_shell(fixture: &super::Fixture, policy: AgentPolicy, observer: Arc<PolicyObserver>) -> Shell {
+async fn open_shell(
+    fixture: &super::Fixture,
+    policy: AgentPolicy,
+    observer: Arc<PolicyObserver>,
+) -> Shell {
     let mut builder = Shell::builder()
         .working_dir(fixture.seed.clone())
+        .enforcement(enforcement())
         .sandbox_policy(SandboxPolicy::allow())
         .agent_policy(Some(Arc::new(policy)))
         .policy_observer(Some(observer));
@@ -507,13 +597,25 @@ async fn open_shell(fixture: &super::Fixture, policy: AgentPolicy, observer: Arc
 }
 
 /// Runs one step with a timeout and classifies how it ended.
-async fn run_step(shell: &Shell, step: &Step, values: &std::collections::HashMap<String, String>) -> StepOutcome {
+async fn run_step(
+    shell: &Shell,
+    step: &Step,
+    values: &std::collections::HashMap<String, String>,
+) -> StepOutcome {
     let line = case::substitute(&step.run, values).expect("command placeholders");
-    let timeout = if step.background().is_some() { BACKGROUND_TIMEOUT } else { STEP_TIMEOUT };
+    let timeout = if step.background().is_some() {
+        BACKGROUND_TIMEOUT
+    } else {
+        STEP_TIMEOUT
+    };
     match tokio::time::timeout(timeout, shell.run(&line)).await {
         Ok(Ok(result)) => {
             let code = u8::from(result.exit_code);
-            if code == 0 { StepOutcome::Accepted } else { StepOutcome::Exited(code) }
+            if code == 0 {
+                StepOutcome::Accepted
+            } else {
+                StepOutcome::Exited(code)
+            }
         }
         Ok(Err(error)) => {
             if matches!(error.kind(), ShellErrorKind::Denied { .. }) {
@@ -532,7 +634,11 @@ async fn run_step(shell: &Shell, step: &Step, values: &std::collections::HashMap
 /// Under audit the egress is not blocked, so the canary reaches the sink; the policy must still
 /// have reported a would-block for an external peer. A missing report means audit does not see what
 /// enforcement stops. Returns a description of the problem, or `None` when consistent.
-async fn audit_cross_check(case: &Case, variants: &BTreeMap<String, String>, rng: &mut Rng) -> Option<String> {
+async fn audit_cross_check(
+    case: &Case,
+    variants: &BTreeMap<String, String>,
+    rng: &mut Rng,
+) -> Option<String> {
     let token = canary(rng);
     let outcome = run_once(case, variants, &token, PolicyMode::Audit).await;
     // Audit never blocks, so the canary is expected to reach the sink. The check is only that the
@@ -563,16 +669,17 @@ async fn minimize_failure(
     gap_reason: Option<String>,
 ) -> (Case, BTreeMap<String, String>) {
     let token = token.to_owned();
-    let fails: Box<shrink::Reproduces<'_>> = Box::new(move |candidate: &Case, choice: &BTreeMap<String, String>| {
-        let token = token.clone();
-        let candidate = candidate.clone();
-        let choice = choice.clone();
-        let gap_reason = gap_reason.clone();
-        Box::pin(async move {
-            let outcome = run_once(&candidate, &choice, &token, PolicyMode::Enforce).await;
-            assess(&candidate, gap_reason.as_deref(), &outcome).is_failure()
-        }) as std::pin::Pin<Box<dyn std::future::Future<Output = bool>>>
-    });
+    let fails: Box<shrink::Reproduces<'_>> =
+        Box::new(move |candidate: &Case, choice: &BTreeMap<String, String>| {
+            let token = token.clone();
+            let candidate = candidate.clone();
+            let choice = choice.clone();
+            let gap_reason = gap_reason.clone();
+            Box::pin(async move {
+                let outcome = run_once(&candidate, &choice, &token, PolicyMode::Enforce).await;
+                assess(&candidate, gap_reason.as_deref(), &outcome).is_failure()
+            }) as std::pin::Pin<Box<dyn std::future::Future<Output = bool>>>
+        });
     shrink::minimize(case, variants, &fails).await
 }
 
@@ -585,7 +692,12 @@ fn sample_variants(case: &Case, rng: &mut Rng, iteration: usize) -> BTreeMap<Str
         .iter()
         .map(|(slot, values)| {
             let value = &values[rng.below(values.len())];
-            (slot.clone(), value.as_str().map_or_else(|| value.to_string(), str::to_owned))
+            (
+                slot.clone(),
+                value
+                    .as_str()
+                    .map_or_else(|| value.to_string(), str::to_owned),
+            )
         })
         .collect()
 }
@@ -601,7 +713,12 @@ struct Row {
 /// Prints the per-case result table and a count of failures.
 fn print_summary(rows: &[Row]) {
     eprintln!("\n=== leak_corpus summary ===");
-    let width = rows.iter().map(|row| row.name.len()).max().unwrap_or(4).max(4);
+    let width = rows
+        .iter()
+        .map(|row| row.name.len())
+        .max()
+        .unwrap_or(4)
+        .max(4);
     for row in rows {
         eprintln!(
             "  {:<width$}  {:<7}  {:<12}  {}",

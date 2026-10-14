@@ -8,6 +8,73 @@
 use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
+use crate::Endpoint;
+use std::io;
+
+/// Exact kernel bound endpoints, not the lossy abstract-name rendering in /proc/net/unix.
+pub(crate) fn endpoints(tasks: &[nix::unistd::Pid]) -> io::Result<Vec<Endpoint>> {
+    let mut seen = HashSet::new();
+    let mut endpoints = HashSet::new();
+    for tid in tasks {
+        let entries = match std::fs::read_dir(format!("/proc/{tid}/fd")) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        for entry in entries {
+            let entry = entry?;
+            let Some(fd) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse::<i32>().ok())
+            else {
+                continue;
+            };
+            let Some(inode) = std::fs::read_link(entry.path()).ok().and_then(|link| {
+                link.to_str()
+                    .and_then(|link| {
+                        link.strip_prefix("socket:[")
+                            .and_then(|link| link.strip_suffix(']'))
+                    })
+                    .and_then(|inode| inode.parse::<u64>().ok())
+            }) else {
+                continue;
+            };
+            if seen.contains(&inode) {
+                continue;
+            }
+            let (endpoint, v4) = match crate::socket::bound_endpoints(*tid, fd) {
+                Ok(endpoints) => endpoints,
+                Err(error)
+                    if matches!(
+                        error.raw_os_error(),
+                        Some(libc::EBADF | libc::ESRCH | libc::ENOENT)
+                    ) =>
+                {
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            seen.insert(inode);
+            endpoints.insert(endpoint);
+            if let Some(v4) = v4 {
+                endpoints.insert(v4);
+            }
+        }
+    }
+    let mut endpoints: Vec<_> = endpoints.into_iter().collect();
+    endpoints.sort_unstable_by_key(|endpoint| {
+        (
+            endpoint.family,
+            endpoint.port,
+            endpoint.scope,
+            endpoint.address,
+            endpoint.unix_len,
+            endpoint.unix,
+        )
+    });
+    Ok(endpoints)
+}
 /// A local address a contact names.
 #[derive(Debug, PartialEq, Eq)]
 enum Local {
@@ -72,8 +139,13 @@ fn decode(peer: &[u8]) -> Option<Local> {
                     .collect();
                 Some(Local::Unix(format!("@{abstract_name}")))
             } else {
-                let end = name.iter().position(|byte| *byte == 0).unwrap_or(name.len());
-                Some(Local::Unix(String::from_utf8_lossy(&name[..end]).into_owned()))
+                let end = name
+                    .iter()
+                    .position(|byte| *byte == 0)
+                    .unwrap_or(name.len());
+                Some(Local::Unix(
+                    String::from_utf8_lossy(&name[..end]).into_owned(),
+                ))
             }
         }
         _ => None,
@@ -178,7 +250,12 @@ mod tests {
         );
         let mut words = String::new();
         for chunk in Ipv6Addr::LOCALHOST.octets().chunks(4) {
-            write!(words, "{:08X}", u32::from_ne_bytes(chunk.try_into().unwrap())).unwrap();
+            write!(
+                words,
+                "{:08X}",
+                u32::from_ne_bytes(chunk.try_into().unwrap())
+            )
+            .unwrap();
         }
         assert_eq!(
             inet(&format!("{words}:0050")),
@@ -204,7 +281,50 @@ mod tests {
         peer[2..4].copy_from_slice(&port.to_be_bytes());
         peer[4..8].copy_from_slice(&[127, 0, 0, 1]);
         let fd = std::os::fd::AsRawFd::as_raw_fd(&listener);
-        let inode = std::fs::metadata(format!("/proc/self/fd/{fd}")).unwrap().ino();
+        let inode = std::fs::metadata(format!("/proc/self/fd/{fd}"))
+            .unwrap()
+            .ino();
         assert!(bound_to(&peer).unwrap().contains(&inode));
+        assert!(
+            endpoints(&[nix::unistd::getpid()])
+                .unwrap()
+                .contains(&Endpoint::from_sockaddr(&peer))
+        );
+    }
+
+    #[test]
+    fn inventory_preserves_unix_names_with_spaces() {
+        use std::os::unix::{ffi::OsStrExt as _, net::UnixListener};
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("local peer socket");
+        let _listener = UnixListener::bind(&path).unwrap();
+        let mut bytes = family(libc::AF_UNIX);
+        bytes.extend_from_slice(path.as_os_str().as_bytes());
+        bytes.push(0);
+        assert!(
+            endpoints(&[nix::unistd::getpid()])
+                .unwrap()
+                .contains(&Endpoint::from_sockaddr(&bytes))
+        );
+    }
+
+    #[test]
+    fn inventory_distinguishes_abstract_name_bytes() {
+        use std::os::{
+            linux::net::SocketAddrExt as _,
+            unix::net::{SocketAddr, UnixDatagram},
+        };
+        let name = format!("marsh-inventory-{}@literal", std::process::id());
+        let _socket =
+            UnixDatagram::bind_addr(&SocketAddr::from_abstract_name(name.as_bytes()).unwrap())
+                .unwrap();
+        let mut bytes = family(libc::AF_UNIX);
+        bytes.push(0);
+        bytes.extend_from_slice(name.as_bytes());
+        assert!(
+            endpoints(&[nix::unistd::getpid()])
+                .unwrap()
+                .contains(&Endpoint::from_sockaddr(&bytes))
+        );
     }
 }

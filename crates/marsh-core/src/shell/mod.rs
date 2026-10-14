@@ -14,6 +14,7 @@ pub use brush_core::{
     ShellVariable, SourceInfo,
 };
 pub use brush_interactive::UIOptions;
+pub use marsh_instrument::Enforcement;
 use marsh_lib::RecoverPoison as _;
 
 mod access;
@@ -45,6 +46,7 @@ use session::{Admission, ExecutionResources, Route, SourceDomain, fresh_principa
 use snapshot::Snapshot;
 
 use crate::shellmux::{JobDir, Sandbox, ShellId};
+static FALLBACK_REPORTED: AtomicBool = AtomicBool::new(false);
 
 /// Ordinary shell configuration. Execution machinery and storage choices are never public inputs.
 pub struct ShellBuilder {
@@ -56,6 +58,7 @@ pub struct ShellBuilder {
     pub(crate) sandbox_id: Option<ShellId>,
     policy_observer: Option<Arc<PolicyObserver>>,
     agent_policy: Option<Arc<AgentPolicy>>,
+    enforcement: Enforcement,
 }
 impl Default for ShellBuilder {
     fn default() -> Self {
@@ -73,6 +76,7 @@ impl Default for ShellBuilder {
             sandbox_id: None,
             policy_observer: None,
             agent_policy: None,
+            enforcement: Enforcement::Unprivileged,
         }
     }
 }
@@ -126,6 +130,13 @@ impl ShellBuilder {
     #[must_use]
     pub fn agent_policy(mut self, policy: Option<Arc<AgentPolicy>>) -> Self {
         self.agent_policy = policy;
+        self
+    }
+    /// Selects the process-wide socket enforcement mode before the tracer starts.
+    /// Explicit modes fail rather than silently using another mode; `Auto` reports fallback.
+    #[must_use]
+    pub const fn enforcement(mut self, enforcement: Enforcement) -> Self {
+        self.enforcement = enforcement;
         self
     }
     /// Enables normal interactive shell semantics.
@@ -186,11 +197,37 @@ impl ShellBuilder {
     /// Starts the shared native tracer, discovers the source, joins the live-shell set, then
     /// constructs the persistent shell. Durable storage is opened only when a command's route
     /// first needs it.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one startup transaction retains the selected tracer through source discovery and shell registration"
+    )]
     pub async fn build(mut self) -> Result<Shell, ShellError> {
         let runtime = tokio::runtime::Handle::try_current()
             .map_err(|error| ShellError::infrastructure(error.to_string()))?;
         let initial = self.options.working_dir.take().unwrap_or_default();
-        let tracing = marsh_instrument::Tracing::shared()?;
+        let tracing = marsh_instrument::Tracing::shared_with_enforcement(self.enforcement)?;
+        let enforcement = tracing.enforcement();
+        if self.agent_policy.is_some()
+            && let Some(reason) = tracing.enforcement_fallback()
+            && !FALLBACK_REPORTED.swap(true, Ordering::AcqRel)
+        {
+            if let Some(observer) = &self.policy_observer {
+                observer.notify(
+                    PolicyKind::Agent,
+                    &Event::new("marsh", Action::Edit, ["enforcement", "unprivileged"]),
+                    &PolicyDecision::Deny {
+                        failed_precondition: format!(
+                            "privileged enforcement unavailable; using unprivileged: {reason}"
+                        ),
+                        allowed_fixes: Vec::new(),
+                    },
+                );
+            } else {
+                eprintln!(
+                    "marsh: privileged enforcement unavailable; using unprivileged enforcement: {reason}"
+                );
+            }
+        }
         let discovered = {
             let scope = tracing.internal_scope()?;
             let _guard = scope.enter();
@@ -260,6 +297,7 @@ impl ShellBuilder {
         };
         let shell = Shell {
             sandbox,
+            enforcement,
             shared: Arc::new(Shared {
                 domain: Arc::downgrade(&resources.domain),
                 live: tokio::sync::Mutex::new(Some(Live {
@@ -277,11 +315,7 @@ impl ShellBuilder {
                 finished: tokio::sync::Notify::new(),
             }),
         };
-        if startup
-            && let Err(error) = shell
-                .execute(Command::Startup(profile, rc), None)
-                .await
-        {
+        if startup && let Err(error) = shell.execute(Command::Startup(profile, rc), None).await {
             // Membership ends before the caller sees the failure, not when a detached drop runs.
             let _ = shell.close(true).await;
             return Err(error);
@@ -388,9 +422,14 @@ enum SpanRoute {
 /// A persistent in-process shell. Each accepted operation owns all four private stages.
 pub struct Shell {
     sandbox: Sandbox,
+    enforcement: Enforcement,
     shared: Arc<Shared>,
 }
 impl Shell {
+    /// The socket enforcement mode actually in force, never `Auto`.
+    pub const fn enforcement(&self) -> Enforcement {
+        self.enforcement
+    }
     /// Opens the source containing `initial_dir`, automatically recovering its durable authority.
     pub async fn new(initial_dir: &Path) -> Result<Self, ShellError> {
         Self::builder()

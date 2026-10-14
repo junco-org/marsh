@@ -20,11 +20,11 @@ use nix::unistd::Pid;
 use rustix::io_uring::IoringOp;
 use syscalls::{Sysno, SysnoSet};
 
-use crate::{FileTarget, Syscall};
 use crate::capture::{Captured, native_usize};
 use crate::ring::Rings;
 use crate::socket::Sockets;
 use crate::tracing::ExecCommand;
+use crate::{FileTarget, Syscall};
 
 #[cfg(target_arch = "x86_64")]
 const NATIVE_ARCH: u32 = 0xC000_003E;
@@ -67,8 +67,14 @@ pub(crate) type Select = Box<dyn FnMut(Pid, &Path) -> bool>;
 /// lists each peer's `sockaddr` (empty when unknown), and is only called for a gated task. `source`
 /// is the file the same call copies into the socket in-kernel (`sendfile`), which no earlier read
 /// observed. A refused call is skipped and fails with `EPERM`.
-pub(crate) type Gate =
-    Box<dyn FnMut(Pid, &mut dyn FnMut() -> Vec<Vec<u8>>, Option<&FileTarget>) -> bool>;
+pub(crate) type Gate = Box<
+    dyn FnMut(
+        Pid,
+        Sysno,
+        &mut dyn FnMut() -> Vec<Vec<u8>>,
+        Option<&FileTarget>,
+    ) -> io::Result<bool>,
+>;
 
 /// `io_uring` operations with no filesystem or socket effect.
 ///
@@ -99,6 +105,8 @@ struct Entry {
     started: Instant,
     /// The gate refused it: the kernel skips it and its exit reports `EPERM`.
     blocked: bool,
+    /// Connected peer evidence for copies whose LSM coverage is not established.
+    fallback_peers: Option<Vec<Vec<u8>>>,
 }
 
 #[derive(Default)]
@@ -144,6 +152,8 @@ pub(crate) struct Observer {
     gate: Option<Gate>,
     /// The peers of connected sockets this tree wrote to.
     sockets: Sockets,
+    /// Contacts are supplied by BPF rather than entry-time argument capture.
+    kernel_peers: bool,
 }
 
 impl Observer {
@@ -193,6 +203,7 @@ impl Observer {
             select: None,
             gate: None,
             sockets: Sockets::default(),
+            kernel_peers: false,
         }
     }
 
@@ -207,6 +218,10 @@ impl Observer {
         self.gate = Some(gate);
     }
 
+    pub(crate) const fn kernel_peers(&mut self, enabled: bool) {
+        self.kernel_peers = enabled;
+    }
+
     /// Whether the command was handed back untraced because its exec failed: the launcher then
     /// reports that failure and reaps the process itself.
     pub(crate) const fn detached(&self) -> bool {
@@ -216,7 +231,12 @@ impl Observer {
     /// Seizes a spawned child parked in its launch handshake and stops it. Returns the raw status
     /// of its interrupt stop, still unresumed, or `None` once the child vanished first.
     pub(crate) fn seize(&mut self, pid: Pid) -> io::Result<Option<i32>> {
-        ptrace::seize(pid, OPTIONS)
+        let options = if self.kernel_peers {
+            OPTIONS | Options::PTRACE_O_EXITKILL
+        } else {
+            OPTIONS
+        };
+        ptrace::seize(pid, options)
             .map_err(|error| io::Error::other(format!("seizing child {pid}: {error}")))?;
         self.tasks.insert(pid, Task::default());
         // A child that died meanwhile is still reported, and reaped, by the wait below.
@@ -225,7 +245,11 @@ impl Observer {
             let mut status = 0;
             // SAFETY: status points to one writable integer; the pid is this thread's tracee.
             let waited = unsafe {
-                libc::waitpid(pid.as_raw(), &raw mut status, libc::__WALL | libc::__WNOTHREAD)
+                libc::waitpid(
+                    pid.as_raw(),
+                    &raw mut status,
+                    libc::__WALL | libc::__WNOTHREAD,
+                )
             };
             if waited < 0 {
                 match Errno::last() {
@@ -475,15 +499,30 @@ impl Observer {
                 self.sockets.forget();
             }
             let sockets = &mut self.sockets;
+            let fallback = self.kernel_peers && matches!(syscall, Sysno::sendfile | Sysno::splice);
+            let mut fallback_peers = None;
             let blocked = match &mut self.gate {
                 Some(gate) if reaches_peer(syscall) => {
                     let source =
                         read_descriptor(syscall).and_then(|index| capture.descriptor(index));
                     !gate(
                         tid,
-                        &mut || contacted(tid, syscall, &capture, registers, sockets),
+                        syscall,
+                        &mut || {
+                            if self.kernel_peers
+                                && !matches!(syscall, Sysno::sendfile | Sysno::splice)
+                            {
+                                capture.peers().to_vec()
+                            } else {
+                                let peers = contacted(tid, syscall, &capture, registers, sockets);
+                                if fallback {
+                                    fallback_peers = Some(peers.clone());
+                                }
+                                peers
+                            }
+                        },
                         source,
-                    )
+                    )?
                 }
                 _ => false,
             };
@@ -500,6 +539,7 @@ impl Observer {
                 order,
                 started: Instant::now(),
                 blocked,
+                fallback_peers,
             });
             let resume = observe(order, tid, status, None, None, None)?;
             return self.apply(tid, status, resume);
@@ -542,6 +582,15 @@ impl Observer {
                 entry.order,
                 entry.started.elapsed(),
             )?;
+            if self.kernel_peers {
+                if let Some(peers) = entry.fallback_peers {
+                    if !matches!(call.info.result, RetCode::Err(_)) {
+                        call.peers.extend(peers);
+                    }
+                } else {
+                    call.peers.clear();
+                }
+            }
             if call.info.syscall == Sysno::io_uring_setup
                 && !matches!(call.info.result, RetCode::Err(_))
             {
@@ -647,7 +696,11 @@ fn contacted(
                     .iter()
                     .any(|opcode| !EFFECTLESS_IO_URING_OPS.contains(opcode))
             });
-        return if networked { vec![Vec::new()] } else { Vec::new() };
+        return if networked {
+            vec![Vec::new()]
+        } else {
+            Vec::new()
+        };
     }
     // A stream socket ignores the address a send names, so a send is judged by both.
     let mut peers = capture.peers().to_vec();
@@ -771,8 +824,7 @@ fn wait_any() -> io::Result<Option<(Pid, i32)>> {
         let mut status = 0;
         // SAFETY: status points to one writable integer. `__WNOTHREAD` confines the wait to this
         // tracer thread's own tracees; the host's other children are never touched.
-        let tid =
-            unsafe { libc::waitpid(-1, &raw mut status, libc::__WALL | libc::__WNOTHREAD) };
+        let tid = unsafe { libc::waitpid(-1, &raw mut status, libc::__WALL | libc::__WNOTHREAD) };
         if tid > 0 {
             return Ok(Some((Pid::from_raw(tid), status)));
         }

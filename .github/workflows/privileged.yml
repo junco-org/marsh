@@ -1,0 +1,62 @@
+name: Privileged socket enforcement
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'crates/marsh-bpf*/**'
+      - 'crates/marsh-peer-class/**'
+      - 'crates/marsh-instrument/**'
+      - 'crates/marsh-core/**'
+      - 'bench/leak-fuzzer/**'
+      - '.github/workflows/privileged.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  bpf-lsm:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_BUILD_JOBS: '2'
+      CARGO_INCREMENTAL: '0'
+      MARSH_BPF_CLANG: clang-21
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Install host and guest prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential libbtrfsutil-dev pkg-config libssl-dev curl gnupg qemu-system-x86 busybox-static cpio zstd kmod linux-image-generic linux-modules-extra-generic python3 nodejs iproute2
+          curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key | sudo gpg --dearmor -o /usr/share/keyrings/llvm.gpg
+          echo 'deb [signed-by=/usr/share/keyrings/llvm.gpg] https://apt.llvm.org/noble/ llvm-toolchain-noble-21 main' | sudo tee /etc/apt/sources.list.d/llvm21.list
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang-21 libclang-21-dev
+      - name: Install pinned Rust and BPF linker
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal
+          rustup default 1.95.0
+          rustup toolchain install nightly-2025-12-01 --profile minimal --component rust-src
+          cargo +nightly-2025-12-01 install bpf-linker --version 0.9.15 --locked
+      - name: Build real BPF hooks and policy harnesses
+        run: |
+          cargo test --locked -p marsh-core -p marsh-bpf --features privileged --no-run --message-format=json > artifacts.json
+          python3 - <<'PY'
+          import json, os
+          artifacts = [json.loads(line) for line in open('artifacts.json')]
+          with open(os.environ['GITHUB_ENV'], 'a') as env:
+              for variable, name in [('CORE_TEST', 'marsh_core'), ('LSM_TEST', 'lsm')]:
+                  matches = [a['executable'] for a in artifacts if a.get('reason') == 'compiler-artifact' and a['target']['name'] == name and a['profile']['test'] and a.get('executable')]
+                  assert len(matches) == 1, (name, matches)
+                  env.write(variable + '=' + matches[0] + '\n')
+          PY
+      - name: Exercise actual LSM hooks and PID namespace attribution
+        run: |
+          sudo env PATH="$PATH" python3 bench/leak-fuzzer/privileged-vm.py /bin/sh -c '"$1" --ignored --nocapture && unshare --pid --fork --mount-proc "$1" --ignored --nocapture' sh "$LSM_TEST"
+      - name: Run unchanged leak corpus in both modes
+        run: |
+          sudo env PATH="$PATH" python3 bench/leak-fuzzer/privileged-vm.py /bin/sh -c 'MARSH_LEAK_ENFORCEMENT=unprivileged "$1" leak_corpus --ignored --nocapture --test-threads=1 && MARSH_LEAK_ENFORCEMENT=privileged "$1" leak_corpus --ignored --nocapture --test-threads=1' sh "$CORE_TEST"

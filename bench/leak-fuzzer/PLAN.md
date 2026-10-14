@@ -59,13 +59,11 @@ crate-private `Fixture`, the fake backend and `ShellBuilder.backend`.
 
 The entry is `#[test] #[ignore] fn leak_corpus()`.
 
-1. If `MARSH_LEAK_NS` is not set, re-run the test binary as
-   `unshare --user --map-root-user --net -- <current_exe> leak_corpus --exact --ignored
-   --nocapture --test-threads 1` with `MARSH_LEAK_NS=1`, passing `LD_LIBRARY_PATH` through, and
-   assert that the child succeeded.
-   * If `unshare` fails (no user namespaces), print a skip notice and return.
-   * Re-execution is required: `unshare(CLONE_NEWUSER)` refuses a multithreaded process, and the
-     test harness has threads.
+1. If `MARSH_LEAK_NS` is not set, re-run the test binary through `unshare --net` as real root,
+   retaining initial-user-namespace BPF authority. Other users also request `--user --map-root-user`.
+   Set `MARSH_LEAK_NS=1`, pass `LD_LIBRARY_PATH` through, and assert the child succeeded.
+   * An unavailable namespace may skip only unprivileged mode; privileged mode fails closed.
+   * Re-execution avoids `unshare(CLONE_NEWUSER)` in the multithreaded test harness.
 2. Inside the namespace, run `ip link set lo up` and `ip route add local 192.0.2.0/24 dev lo`,
    failing loudly on error. Then run the corpus.
 
@@ -172,10 +170,11 @@ Print the minimal case as TOML so it can be pasted into the corpus as a regressi
 
 ## Known gaps
 
-`leak-corpus/known-gaps.toml` lists case names with a reason. They run but report `known gap`
-instead of failing, so only new leaks fail the build. Two remain: the TOCTOU peer rewrite, which
-has no deterministic case, and `untraced-local-daemon-allowed`, the trade-off `recommended` makes by
-letting a principal holding a secret reach a local daemon marsh does not trace.
+`leak-corpus/known-gaps.toml` lists case names, reasons and an optional enforcement mode. Registered
+leaks report `known gap` instead of failing. `toctou-peer-rewrite` is runnable and remains a gap only
+for ptrace; privileged mode must block it. `untraced-local-daemon-allowed` remains the deliberate
+`recommended` trade-off. Rewritten-local handoff and connected-UDP peer-state races are documented
+Phase A residuals without deterministic cases, not test coverage claims.
 
 Closed since: io_uring writes to sockets (every operation outside the effectless set is gated as an
 unknown peer); a different principal sending data the agent staged outside the source (files a
@@ -190,6 +189,12 @@ these cases.
 * Locally:
   `cargo test -p marsh-core --lib leak_corpus -- --ignored --nocapture`
   (with `LD_LIBRARY_PATH` set when `libbtrfsutil` is not installed).
+* Select `MARSH_LEAK_ENFORCEMENT=unprivileged|privileged`; kernel mode needs the `privileged`
+  Cargo feature, active BPF LSM and the pinned toolchain described in
+  `docs/privileged-enforcement.md`. The corpus requires Python and genuine Node.js/libuv.
+* `bench/leak-fuzzer/privileged-vm.py` boots an isolated qualifying kernel without rebooting the
+  host. The privileged CI workflow builds the same artifacts and runs both modes; serialize VM
+  verification on small hosts so emulation load does not turn command deadlines into false denials.
 * CI: a separate job on a Linux runner with user namespaces enabled. Run nightly with a random seed,
   and per pull request with a fixed seed and a small iteration count.
 

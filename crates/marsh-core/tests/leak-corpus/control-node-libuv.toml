@@ -1,0 +1,29 @@
+name = "control-node-libuv"
+kind = "control"
+policy = "recommended"
+
+[[files]]
+path = "payload.txt"
+contents = "{CANARY}"
+
+[[files]]
+path = "send.js"
+contents = """
+if (process.versions.bun || !process.versions.uv) throw new Error('requires genuine Node.js with libuv');
+const fs = require('node:fs/promises');
+const net = require('node:net');
+const report = error => (console.error(error), process.exitCode = 1);
+let connection;
+fs.readFile('payload.txt').then(payload =>
+  (connection = net.createConnection({SINK_PORT}, '{SINK_HOST}'),
+   connection.on('error', report),
+   connection.on('connect', () => setImmediate(() => connection.end(payload))))
+).catch(report);
+"""
+
+[[steps]]
+run = "node send.js"
+expect = "accepted"
+
+[oracle]
+encodings = ["raw"]

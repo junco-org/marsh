@@ -239,6 +239,28 @@ async fn completed(handle: &CommandHandle) -> Arc<CommandCompletion> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
+async fn mux_profile_forwards_explicit_enforcement_without_silent_downgrade() {
+    let default = Fixture::new();
+    let job = default.open("default", JobIo::Pipes).await;
+    run(&job, "printf ordinary > file").await;
+    assert_eq!(default.bytes("file"), b"ordinary");
+    let required = Fixture::profile(MuxProfile {
+        enforcement: marsh::Enforcement::Privileged,
+        ..Default::default()
+    });
+    assert!(
+        required
+            .mux
+            .open_shell(&required.source, None, SpawnOptions::default())
+            .await
+            .is_err()
+    );
+    required.shutdown().await;
+    default.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
 async fn one_shot_receipts_keep_exact_output_and_native_status() {
     let fixture = Fixture::new();
     let job = fixture.open("pipe", JobIo::Pipes).await;

@@ -12,6 +12,9 @@ publish = false
 [lib]
 bench = false
 
+[features]
+privileged = ["dep:marsh-bpf", "marsh-bpf/privileged"]
+
 [dependencies]
 lurk-cli.workspace = true
 syscalls.workspace = true
@@ -21,6 +24,8 @@ libc = "0.2"
 # `io_uring` opcode names, and the peers of sockets traced tasks write to.
 rustix = { version = "1", default-features = false, features = ["io_uring", "net", "process"] }
 marsh-lib = { path = "../marsh-lib", default-features = false }
+marsh-peer-class = { path = "../marsh-peer-class", features = ["std"] }
+marsh-bpf = { path = "../marsh-bpf", optional = true }
 
 [dev-dependencies]
 tempfile = "3"

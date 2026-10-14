@@ -1,0 +1,27 @@
+[package]
+name = "marsh-bpf-ebpf"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+build = "build.rs"
+
+[[bin]]
+name = "marsh-bpf-ebpf"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+aya-ebpf = "=0.1.1"
+marsh-peer-class = { path = "../marsh-peer-class", default-features = false }
+
+# The host workspace must not build a BPF binary or select its nightly by default.
+[workspace]
+
+[profile.release]
+codegen-units = 1
+debug = 2
+lto = true
+panic = "abort"
+opt-level = 2

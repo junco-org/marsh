@@ -142,7 +142,7 @@ pub mod types {
 
     /// Ordinary shell construction, execution values and typed diagnostics.
     pub use marsh_core::{
-        Denial, ExecutionParameters, ExecutionResult, OpenFile, ProfileLoadBehavior,
+        Denial, Enforcement, ExecutionParameters, ExecutionResult, OpenFile, ProfileLoadBehavior,
         RcLoadBehavior, Shell, ShellBuilder, ShellError, ShellErrorKind, ShellFd, ShellVariable,
         SourceInfo, UIOptions,
     };

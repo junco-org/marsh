@@ -96,6 +96,8 @@ struct TaskState {
 #[derive(Default)]
 pub(super) struct Access {
     generation: WorkGeneration,
+    /// Real peer reports come from the BPF hooks, including socket writes and `io_uring`.
+    pub kernel_contacts: bool,
     host: TaskState,
     tasks: HashMap<Pid, TaskState>,
     aliases: HashMap<Inode, Vec<PathBuf>>,
@@ -525,10 +527,10 @@ impl Access {
                         .submissions
                         .as_ref()
                         .ok_or_else(|| "unobserved io_uring submissions".to_string())?;
-                    if let Some(opcode) = submissions
-                        .iter()
-                        .find(|opcode| !EFFECTLESS_IO_URING_OPS.contains(opcode))
-                    {
+                    if let Some(opcode) = submissions.iter().find(|opcode| {
+                        !(EFFECTLESS_IO_URING_OPS.contains(opcode)
+                            || self.kernel_contacts && matches!(**opcode, 9 | 16 | 26 | 47 | 48))
+                    }) {
                         return Err(format!("unsupported io_uring operation {opcode}"));
                     }
                 }
@@ -583,6 +585,9 @@ impl Access {
                     .extend(info.peers.iter().map(|peer| Peer::decode(peer)));
             }
             _ => {}
+        }
+        if self.kernel_contacts {
+            effects.peers = info.peers.iter().map(|peer| Peer::decode(peer)).collect();
         }
         Ok(effects)
     }
