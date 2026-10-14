@@ -277,6 +277,9 @@ contact only as its peer's class, so each shell keeps the answer per class and r
 committed history, the source's taint or the command's own observations change; a call that only
 contacts the same peer again changes nothing. A refused call is skipped by the kernel and fails
 with `EPERM`, implemented on x86-64 only; elsewhere a refusal fails the command instead.
+The tracer reads a call's address before the kernel copies it, so another thread can rewrite it
+in between; `docs/privileged-enforcement.md` designs a privileged mode that enforces in BPF LSM
+hooks against the kernel's own copy.
 
 Everything else is judged at publication, atomically with the Git policy. A refused command's
 source changes are rolled back, but what it read, ran and contacted stays in history. Effects
