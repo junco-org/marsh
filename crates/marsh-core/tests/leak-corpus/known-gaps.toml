@@ -6,21 +6,15 @@
 # then becomes an ordinary attack that must be blocked.
 #
 # Each entry is a case `name` (not a file name) plus the reason it leaks today.
-# `cross-principal-staged`, `proxy-via-loopback` and `proxy-via-unix` have
-# runnable cases named `gap-*.toml`. `toctou-peer-rewrite` is a documented
-# placeholder with no runnable case.
+# `proxy-via-loopback` and `proxy-via-unix` have runnable cases named
+# `gap-*.toml`. `toctou-peer-rewrite` is a documented placeholder with no
+# runnable case.
 #
 # Closed: `sendfile-exfil` (the gate counts a sendfile's source as a read) and
 # `io-uring-socket-write` (every io_uring operation outside the effectless set
-# is gated as an unknown peer). Both are now ordinary must-block attacks.
-
-[[gap]]
-name = "cross-principal-staged"
-reason = """
-Taint follows the reading principal and the `secret` path class. A principal \
-can read the secret, stage it outside the source where nothing labels it, and \
-a second principal can read the staged bytes and egress them without ever \
-performing a secret-classed read."""
+# is gated as an unknown peer), and `cross-principal-staged` (a file written
+# after a secret read is a taint carrier for every principal that reads it).
+# All are now ordinary must-block attacks.
 
 [[gap]]
 name = "proxy-via-loopback"

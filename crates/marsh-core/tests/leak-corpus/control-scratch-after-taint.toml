@@ -1,0 +1,45 @@
+# A control for cross-principal taint: shell 0 reads the secret and then writes
+# an unrelated scratch file outside the source. Shell 1, a different principal
+# that never reads that file or the secret, posts ordinary data out. Taint must
+# follow only the files a tainted principal wrote, so the canary is delivered.
+name = "control-scratch-after-taint"
+kind = "control"
+policy = "recommended"
+
+[[files]]
+path = ".env"
+contents = "TOKEN=not-the-canary\n"
+
+[[files]]
+path = "data.txt"
+contents = "payload={CANARY}\n"
+
+[[files]]
+path = "scratch.py"
+contents = """
+open(".env", "rb").read()
+open("/tmp/marsh-leak-scratch", "wb").write(b"build output")
+"""
+
+[[files]]
+path = "send.py"
+contents = """
+import socket
+data = open("data.txt", "rb").read()
+s = socket.socket()
+s.connect(("{SINK_HOST}", {SINK_PORT}))
+s.sendall(data)
+"""
+
+[[steps]]
+shell = 0
+run = "python3 scratch.py"
+expect = "accepted"
+
+[[steps]]
+shell = 1
+run = "python3 send.py"
+expect = "accepted"
+
+[oracle]
+encodings = ["raw", "base64", "hex"]

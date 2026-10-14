@@ -19,6 +19,7 @@ use super::policy::{
 };
 use super::sandbox_policy::{CommandContext, SandboxPolicy};
 use super::snapshot::{CommandNumber, Snapshot};
+use super::taint::TaintState;
 use super::{ShellError, ShellErrorKind};
 use crate::shellmux::Sandbox;
 
@@ -528,6 +529,7 @@ impl SourceDomain {
             epoch: Arc::clone(&self.epoch),
             log,
             snapshots: Mutex::new(BTreeMap::new()),
+            taint: Mutex::new(TaintState::default()),
             persistence,
         }))
     }
@@ -773,6 +775,8 @@ pub(super) struct Session {
     pub epoch: Arc<AtomicU64>,
     pub log: PathBuf,
     pub snapshots: Mutex<BTreeMap<PathBuf, Weak<Snapshot>>>,
+    /// Which principals hold propagated classes, and which files carry them.
+    pub taint: Mutex<TaintState>,
     // Lease is released after every other resource owned by this source.
     pub persistence: PersistenceLayer,
 }

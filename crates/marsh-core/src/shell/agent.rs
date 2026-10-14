@@ -19,6 +19,7 @@
 //! | program executed | `Read` | `["exec", basename]` |
 //! | socket peer contacted | `Edit` | `["net", class]` |
 //! | operator approval | `Stage` | `["approve", label]` |
+//! | data of a propagated class received from another principal | `Read` | `["taint", class]` |
 //!
 //! Rules are enforced at two points:
 //!
@@ -48,7 +49,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use std::collections::hash_map::Entry;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use glob::{MatchOptions, Pattern};
 use junco_policy::{
@@ -59,6 +60,7 @@ use marsh_instrument::InvocationId;
 use socket2::{SockAddr, SockAddrStorage, socklen_t};
 
 use super::access::Effects;
+use super::taint::Taint;
 use super::policy::{Action, Denial, Event, PolicyKind, PolicyObserver, Principal, Resource};
 
 const PRINCIPAL: &str = "p";
@@ -163,6 +165,8 @@ pub(super) enum Observed {
     Connect(Peer),
     /// An operator's approval of a label.
     Approve(String),
+    /// Data of a propagated class, received through another principal's file.
+    Taint(Taint),
 }
 
 impl Observed {
@@ -172,7 +176,7 @@ impl Observed {
     pub(super) const fn irreversible(&self) -> bool {
         match self {
             Self::Path { action, inside, .. } => matches!(action, PathAction::Read) || !*inside,
-            Self::Exec(_) | Self::Connect(_) | Self::Approve(_) => true,
+            Self::Exec(_) | Self::Connect(_) | Self::Approve(_) | Self::Taint(_) => true,
         }
     }
 }
@@ -254,6 +258,8 @@ pub struct AgentPolicy {
     outside: Vec<(Pattern, String)>,
     networks: Vec<(Network, String)>,
     rules: Vec<AgentRule>,
+    /// Classes whose data taints whoever receives it from a principal that read it.
+    propagated: BTreeSet<String>,
     audit: bool,
     principal: Option<Principal>,
 }
@@ -264,6 +270,7 @@ impl fmt::Debug for AgentPolicy {
             .field("outside", &self.outside)
             .field("networks", &self.networks)
             .field("rules", &self.rules.len())
+            .field("propagated", &self.propagated)
             .field("audit", &self.audit)
             .field("principal", &self.principal)
             .finish()
@@ -442,12 +449,19 @@ impl AgentPolicy {
     /// is reported.
     #[must_use]
     pub fn rule(mut self, rules: impl Into<AgentRuleSet>) -> Self {
-        self.rules.extend(rules.into());
+        let rules = rules.into();
+        self.propagated.extend(rules.1.iter().cloned());
+        self.rules.extend(rules);
         self
     }
 
+    /// Whether a principal that receives data of `class` from another one holds it too.
+    pub(super) fn propagates(&self, class: &str) -> bool {
+        self.propagated.contains(class)
+    }
+
     /// The class of a source-relative path.
-    fn inside_class(&self, path: &Path) -> &str {
+    pub(super) fn inside_class(&self, path: &Path) -> &str {
         self.inside
             .iter()
             .find(|(pattern, _)| pattern.matches_path_with(path, MATCH))
@@ -455,7 +469,7 @@ impl AgentPolicy {
     }
 
     /// The class of an absolute path outside the source, if any pattern labels it.
-    fn outside_class(&self, path: &Path) -> Option<&str> {
+    pub(super) fn outside_class(&self, path: &Path) -> Option<&str> {
         self.outside
             .iter()
             .find(|(pattern, _)| pattern.matches_path_with(path, MATCH))
@@ -530,6 +544,7 @@ impl AgentPolicy {
                 ));
             }
             Observed::Connect(peer) => (Action::Edit, ["net", self.peer_class(peer)]),
+            Observed::Taint(taint) => (Action::Read, ["taint", taint.class.as_str()]),
             Observed::Approve(label) => (Action::Stage, ["approve", label.as_str()]),
         };
         Some(Event::new(
@@ -726,6 +741,9 @@ pub(super) fn observations(
                 inside: true,
             });
         }
+        for taint in &effects.taints {
+            push(Observed::Taint(taint.clone()));
+        }
         for path in effects.writes.iter().filter(|path| !metadata(path)) {
             if let Some(action) = write(path) {
                 push(Observed::Path {
@@ -901,17 +919,21 @@ impl AgentRule {
     }
 
     /// No socket peer of any of `peer_classes` once the same principal has read a path of
-    /// `secret_class`. A peer is reached by naming it or by writing to a socket connected to it,
-    /// including one connected before the read.
+    /// `secret_class`, or received its data through a file another principal wrote after reading
+    /// it. A peer is reached by naming it or by writing to a socket connected to it, including one
+    /// connected before the read.
     #[must_use]
     pub fn no_contact_after_read(secret_class: &str, peer_classes: &[&str]) -> AgentRuleSet {
         let read = TestExpr::and([
             principal_is(Comparison::Eq),
             action_is(Action::Read, Comparison::Eq),
-            resource_is("path", secret_class, Comparison::Eq),
+            TestExpr::or([
+                resource_is("path", secret_class, Comparison::Eq),
+                resource_is("taint", secret_class, Comparison::Eq),
+            ]),
         ]);
         let class = secret_class.to_owned();
-        AgentRuleSet(Self::many(
+        AgentRuleSet::new(Self::many(
             peer_classes
                 .iter()
                 .map(|peer| {
@@ -933,6 +955,7 @@ impl AgentRule {
                 })
                 .collect(),
         ))
+        .propagating(secret_class)
     }
 
     /// No socket peer of `peer_class` at all (`external`, `unknown`, `unix`, `loopback`, or a
@@ -940,7 +963,7 @@ impl AgentRule {
     #[must_use]
     pub fn no_network(peer_class: &str) -> AgentRuleSet {
         let class = peer_class.to_owned();
-        AgentRuleSet(vec![Self(TraceRule::new(
+        AgentRuleSet::new(vec![Self(TraceRule::new(
             forbid(Action::Edit, ["net", peer_class], RegexExpr::all()),
             move |event| {
                 (
@@ -963,7 +986,7 @@ impl AgentRule {
             resource_is("approve", class, Comparison::Eq),
         ]);
         let unapproved = RegexExpr::complement(ever(approval));
-        AgentRuleSet(Self::many(
+        AgentRuleSet::new(Self::many(
             change_heads(class)
                 .into_iter()
                 .map(|(action, resource)| {
@@ -988,7 +1011,7 @@ impl AgentRule {
     #[must_use]
     pub fn locked_after(edited: &str, locked: &str) -> AgentRuleSet {
         let tail = since_unapproved(changed_by_p(edited), locked);
-        AgentRuleSet(Self::many(
+        AgentRuleSet::new(Self::many(
             change_heads(locked)
                 .into_iter()
                 .map(|(action, resource)| {
@@ -1040,13 +1063,13 @@ impl AgentRule {
                 ));
             }
         }
-        AgentRuleSet(Self::many(rules))
+        AgentRuleSet::new(Self::many(rules))
     }
 
     /// Paths of `class` may be created but never modified or removed.
     #[must_use]
     pub fn append_only(class: &str) -> AgentRuleSet {
-        AgentRuleSet(Self::many(
+        AgentRuleSet::new(Self::many(
             [Action::Edit, Action::Delete]
                 .into_iter()
                 .map(|action| {
@@ -1090,7 +1113,7 @@ impl AgentRule {
             ),
             RegexExpr::concat(tail),
         );
-        AgentRuleSet(vec![Self(TraceRule::new(rule, move |event| {
+        AgentRuleSet::new(vec![Self(TraceRule::new(rule, move |event| {
             (
                 format!(
                     "{} exceeded its budget of {limit} deletions",
@@ -1103,11 +1126,27 @@ impl AgentRule {
 }
 
 /// The rules one [`AgentRule`] constructor produces; [`AgentPolicy::rule`] adds them all.
+///
+/// A set may also name classes that propagate: a principal that receives data of such a class
+/// through a file another principal wrote after reading it is judged as if it had read the class.
+/// [`AgentRule::no_contact_after_read`] propagates its secret class.
 #[derive(Clone, Debug)]
-pub struct AgentRuleSet(Vec<AgentRule>);
+pub struct AgentRuleSet(Vec<AgentRule>, Vec<String>);
+impl AgentRuleSet {
+    const fn new(rules: Vec<AgentRule>) -> Self {
+        Self(rules, Vec::new())
+    }
+
+    /// Also propagates `class`.
+    #[must_use]
+    pub fn propagating(mut self, class: &str) -> Self {
+        self.1.push(class.to_owned());
+        self
+    }
+}
 impl From<AgentRule> for AgentRuleSet {
     fn from(rule: AgentRule) -> Self {
-        Self(vec![rule])
+        Self::new(vec![rule])
     }
 }
 impl IntoIterator for AgentRuleSet {

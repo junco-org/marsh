@@ -41,7 +41,7 @@ fails loading, so file contents and commands must not contain stray braces.
   gaps abuse exactly that.
 * `recommended` gates egress only after a `secret`-classed read, per reading
   principal. A shared `principal` field makes several shells one principal; its
-  absence makes each shell its own (used by the cross-principal gap).
+  absence makes each shell its own (used by the cross-principal cases).
 * Secrets are read by their literal seeded path. Scripts avoid Python 3.10+
   features and any `{`/`}` that is not a placeholder (no dict/set literals, no
   f-strings, no JSON braces in seeded contents).
@@ -49,7 +49,7 @@ fails loading, so file contents and commands must not contain stray braces.
 ## Known gaps
 
 Cases listed in `known-gaps.toml` leak by design: they exercise paths
-`recommended` does not cover (cross-principal staging, loopback/unix proxying,
-and a TOCTOU peer rewrite). Their leaks report "known gap" rather than failing, so only a
+`recommended` does not cover (loopback/unix proxying and a TOCTOU peer
+rewrite). Their leaks report "known gap" rather than failing, so only a
 new, unlisted leak breaks the build. Close a gap in the policy, then delete its
 entry and the case becomes a must-block attack.

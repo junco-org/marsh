@@ -176,11 +176,11 @@ Print the minimal case as TOML so it can be pasted into the corpus as a regressi
 instead of failing, so only new leaks fail the build. Gaps already documented in the README's
 agent-policy section:
 
-* proxying through a loopback or unix-socket service;
-* a different principal sending data that the agent staged outside the source.
+* proxying through a loopback or unix-socket service.
 
-io_uring writes to sockets were a gap and are closed: every operation outside the effectless set is
-gated as an unknown peer.
+Closed since: io_uring writes to sockets (every operation outside the effectless set is gated as an
+unknown peer), and a different principal sending data the agent staged outside the source (files a
+tainted principal writes carry its taint to their readers).
 
 ## Running it
 

@@ -1,8 +1,8 @@
-# KNOWN GAP: taint follows the reading principal and the `secret` path class.
 # Shell 0 (its own principal) reads the secret and stages it OUTSIDE the
 # source, where no class labels it. Shell 1 (a different principal) reads that
-# outside file -- not a secret-classed read -- and egresses freely. The secret
-# reaches the external sink. Registered in known-gaps.toml.
+# outside file -- not a secret-classed read -- and tries to egress it. The
+# staged file is a taint carrier: shell 1 receives `secret` by reading it, so
+# its egress must be refused.
 name = "cross-principal-staged"
 kind = "attack"
 policy = "recommended"

@@ -235,8 +235,17 @@ impl Snapshot {
         {
             return;
         }
-        let effect = state.access.observe(&info, &self.path);
+        let mut effect = state.access.observe(&info, &self.path);
         drop(state);
+        // Before the task resumes: a carrier is known before its writer can signal a reader, and
+        // a reader's taint before it can reach a peer.
+        if let (Some(agent), Ok(effect)) = (&self.agent, &mut effect) {
+            effect.taints = self.session.taint.lock().recover().observe(
+                &agent.acting(&self.uid),
+                agent,
+                effect,
+            );
+        }
         let foreign = effect
             .as_ref()
             .is_ok_and(|effect| Session::invalidate_foreign(&self.path, &effect.outside_writes));
@@ -284,6 +293,19 @@ impl Snapshot {
             ),
             _ => Vec::new(),
         };
+        // Taint received from another principal, including through a command still running.
+        prior.extend(
+            self.session
+                .taint
+                .lock()
+                .recover()
+                .received(&principal)
+                .into_iter()
+                .map(|taint| Observation {
+                    principal: principal.clone(),
+                    observed: Observed::Taint(taint),
+                }),
+        );
         // The call's own in-kernel read is recorded only at its exit, after the bytes left.
         if let Some(source) = source {
             let read = self
@@ -293,13 +315,17 @@ impl Snapshot {
                 .access
                 .read_effect(source, &self.path);
             match read {
-                Ok(effects) => prior.extend(agent::observations(
-                    &[(u64::MAX, None, effects)],
-                    &principal,
-                    Some(agent),
-                    |_| None,
-                    |_| Vec::new(),
-                )),
+                Ok(mut effects) => prior.extend({
+                    // A carrier's source taints as it will at the call's exit, which records it.
+                    effects.taints = self.session.taint.lock().recover().carried(&effects);
+                    agent::observations(
+                        &[(u64::MAX, None, effects)],
+                        &principal,
+                        Some(agent),
+                        |_| None,
+                        |_| Vec::new(),
+                    )
+                }),
                 // An unclassifiable source fails the command at exit; its bytes must not leave.
                 Err(_) => return agent.audits(),
             }

@@ -422,6 +422,33 @@ open("rc", "w").write(rc)
 
 #[tokio::test]
 #[serial(agent_policy)]
+async fn a_secret_staged_outside_the_source_taints_whoever_reads_it() {
+    let fixture = Fixture::new();
+    fixture.write(".env", "TOKEN=1\n");
+    let outside = tempfile::tempdir().unwrap();
+    let outside = outside.path().display();
+    // Separate principals: only the staged file can carry the secret from one to the other.
+    let stager = fixture.agent(AgentPolicy::recommended().unwrap()).await;
+    let sender = fixture.agent(AgentPolicy::recommended().unwrap()).await;
+    accepted(
+        &stager,
+        &format!("cat .env > {outside}/stage && mv {outside}/stage {outside}/renamed"),
+    )
+    .await;
+    accepted(&sender, &egress("before")).await;
+    accepted(
+        &sender,
+        &format!("cat {outside}/renamed > /dev/null; {}", egress("after")),
+    )
+    .await;
+    assert_eq!(fixture.read("before"), STARTED);
+    assert_eq!(fixture.read("after"), BLOCKED);
+    close(stager).await;
+    close(sender).await;
+}
+
+#[tokio::test]
+#[serial(agent_policy)]
 async fn one_agent_principal_carries_taint_across_its_shells() {
     let fixture = Fixture::new();
     fixture.write(".env", "TOKEN=1\n");

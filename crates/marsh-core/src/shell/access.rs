@@ -13,6 +13,7 @@ use nix_observer::unistd::Pid;
 use syscalls::Sysno;
 
 use super::agent::Peer;
+use super::taint::Taint;
 
 /// `IORING_SETUP_SQPOLL`: a kernel thread consumes submissions without any syscall to observe.
 const IORING_SETUP_SQPOLL: u64 = 1 << 1;
@@ -32,6 +33,21 @@ pub(super) struct Effects {
     pub execs: Vec<PathBuf>,
     /// Socket peers a `connect`, `sendto`, `sendmsg` or `sendmmsg` named.
     pub peers: Vec<Peer>,
+    /// Files outside the source whose contents were read or written, by identity.
+    pub outside_contents: Vec<Content>,
+    /// Classes this call handed its principal through another principal's file; filled in by the
+    /// source's taint table, not by [`Access::observe`].
+    pub taints: Vec<Taint>,
+}
+
+/// A file outside the source whose contents a call read or wrote.
+#[derive(Debug)]
+pub(super) struct Content {
+    pub path: PathBuf,
+    pub device: u64,
+    pub inode: u64,
+    pub read: bool,
+    pub write: bool,
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -669,6 +685,15 @@ impl Access {
                 }
                 if read {
                     effects.outside_reads.push(path.clone());
+                }
+                if read || write {
+                    effects.outside_contents.push(Content {
+                        path: path.clone(),
+                        device: target.device,
+                        inode: target.inode,
+                        read,
+                        write,
+                    });
                 }
             }
         }

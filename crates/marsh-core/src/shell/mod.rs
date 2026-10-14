@@ -29,6 +29,7 @@ mod sandbox_policy;
 mod session;
 mod signal;
 mod snapshot;
+mod taint;
 mod view;
 
 pub use agent::{AgentPolicy, AgentPolicyError, AgentRule, AgentRuleSet};
