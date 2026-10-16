@@ -5,12 +5,13 @@
 //!
 //! Publish a root's networks before its answers: [`Controller::configure`] withdraws old answers
 //! while it replaces the trie. Keep a newly governed child stopped until [`Controller::task`]
-//! succeeds. Every map or reporting failure poisons enforcement for good; create a new controller
-//! only after terminating the old one's governed tasks. Maps and links are never pinned, and
-//! kernel-created descriptors are close-on-exec. Dropping the controller detaches its programs.
+//! returns. Every map or reporting failure poisons enforcement for good; create a new controller
+//! only after terminating the old one's governed tasks. Invalid input and an unattributable child
+//! fail only that call. Maps and links are never pinned, and kernel-created descriptors are
+//! close-on-exec. Dropping the controller detaches its programs.
 //!
 //! PID attribution uses the loader's actual PID namespace. Its procfs must expose that namespace
-//! (including PID 1); children entering another PID namespace are refused before they resume.
+//! (including PID 1); a child entering another PID namespace is killed before it resumes.
 
 use std::{
     collections::{BTreeMap, HashSet},
@@ -33,7 +34,7 @@ use aya::{
 };
 use marsh_peer_class::{
     AF_INET, AF_INET6, Answers, Endpoint, Event, MAX_CLASSES, Network, RECEIPT, Receipts,
-    UNANSWERED, effective_networks,
+    UNTAGGED, effective_networks,
 };
 
 /// Every LSM hook the programs attach to; all are required.
@@ -48,9 +49,17 @@ const HOOKS: [&str; 7] = [
     "uring_sqpoll",
 ];
 
-/// Socket reads, traced on return so a reader blocked before tainted bytes arrived is caught.
+/// Socket reads, traced on return so a reader blocked before tainted bytes arrived is caught:
+/// the protocol entries every read (each recvmmsg message included) passes, and splice.
 #[cfg(feature = "privileged")]
-const READS: [&str; 2] = ["sock_recvmsg", "sock_splice_read"];
+const READS: [&str; 6] = [
+    "inet_recvmsg",
+    "inet6_recvmsg",
+    "unix_stream_recvmsg",
+    "unix_dgram_recvmsg",
+    "unix_seqpacket_recvmsg",
+    "sock_splice_read",
+];
 
 macro_rules! pod {
     ($wire:ident, $inner:ty) => {
@@ -66,10 +75,20 @@ pod!(WireAnswers, Answers);
 pod!(WireReceipts, Receipts);
 pod!(WireEndpoint, Endpoint);
 
+/// What [`Controller::task`] did with a stopped process.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Admission {
+    /// Mapped to its root; it may resume.
+    Attributed,
+    /// Killed or already gone without being mapped: it never runs again.
+    Refused,
+}
+
 /// Owns the attached LSM programs and all their unpinned maps.
 ///
-/// Share it behind the tracer's mutex. Loss is sticky: any failed operation refuses every mapped
-/// task's contacts, auditing roots included. Tasks outside the task map are never affected.
+/// Share it behind the tracer's mutex. Loss is sticky: any failed map or reporting operation
+/// refuses every mapped task's contacts, auditing roots included. Tasks outside the task map are
+/// never affected.
 pub struct Controller {
     // Drop links before maps: Aya detaches the programs when `Ebpf` drops.
     programs: Option<Ebpf>,
@@ -182,8 +201,8 @@ impl Controller {
     /// Every trie key starts with the 64 root bits, so even `/0` cannot match another root. The
     /// root's answers are withdrawn; publish new ones afterwards.
     pub fn configure(&mut self, root: u64, networks: &[Network]) -> io::Result<()> {
+        validate_networks(networks)?;
         self.update(|this| {
-            validate_networks(networks)?;
             absent_ok(this.answers.remove(&root))?;
             this.clear_networks(root)?;
             for network in effective_networks(networks) {
@@ -227,23 +246,33 @@ impl Controller {
     }
 
     /// Attributes every thread of a stopped process to a root before it resumes. A root without
-    /// answers refuses its contacts. A child that changed PID namespace is refused rather than
-    /// resumed unattributed.
-    pub fn task(&mut self, tgid: u32, root: u64) -> io::Result<()> {
+    /// answers refuses its contacts. A child in another PID namespace cannot be attributed, and
+    /// would run ungoverned: it alone is killed, through its pidfd, and [`Admission::Refused`].
+    pub fn task(&mut self, tgid: u32, root: u64) -> io::Result<Admission> {
         self.update(|this| {
-            if let std::collections::btree_map::Entry::Vacant(entry) = this.tasks.entry(tgid) {
-                entry.insert(pidfd(tgid)?);
-            }
-            let namespace = std::fs::metadata(format!("/proc/{tgid}/ns/pid"))?;
-            if [namespace.dev(), namespace.ino()] != this.pid_namespace {
-                return Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    "governed child changed PID namespace; privileged attribution cannot resume it",
-                ));
+            let process = match this.tasks.entry(tgid) {
+                std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+                std::collections::btree_map::Entry::Vacant(entry) => match pidfd(tgid) {
+                    Ok(process) => entry.insert(process),
+                    // Only SIGKILL ends a stopped tracee: nothing of it can run again.
+                    Err(error) if error.raw_os_error() == Some(libc::ESRCH) => {
+                        return Ok(Admission::Refused);
+                    }
+                    Err(error) => return Err(error),
+                },
+            };
+            let attributable = std::fs::metadata(format!("/proc/{tgid}/ns/pid"))
+                .is_ok_and(|namespace| [namespace.dev(), namespace.ino()] == this.pid_namespace);
+            if !attributable {
+                kill(process)?;
+                this.tasks.remove(&tgid);
+                absent_ok(this.task_root.remove(&tgid))?;
+                return Ok(Admission::Refused);
             }
             this.task_root
                 .insert(tgid, root, 0)
-                .map_err(io::Error::other)
+                .map_err(io::Error::other)?;
+            Ok(Admission::Attributed)
         })
     }
 
@@ -274,17 +303,17 @@ impl Controller {
     /// under `untraced_local(Deny)`. Wildcard binds have a zero address and match every local
     /// address of their family and port. Unchanged entries stay in place throughout.
     pub fn local(&mut self, endpoints: &[Endpoint]) -> io::Result<()> {
+        let wanted: HashSet<Endpoint> = endpoints.iter().map(Endpoint::normalized).collect();
+        if let Some(invalid) = wanted
+            .iter()
+            .find(|endpoint| !matches!(endpoint.family, AF_INET | AF_INET6))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("local allowlist entry is not an IP endpoint: {invalid:?}"),
+            ));
+        }
         self.update(|this| {
-            let wanted: HashSet<Endpoint> = endpoints.iter().map(Endpoint::normalized).collect();
-            if let Some(invalid) = wanted
-                .iter()
-                .find(|endpoint| !matches!(endpoint.family, AF_INET | AF_INET6))
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("local allowlist entry is not an IP endpoint: {invalid:?}"),
-                ));
-            }
             for endpoint in this.allowed.difference(&wanted) {
                 absent_ok(this.local.remove(&WireEndpoint(*endpoint)))?;
             }
@@ -321,7 +350,7 @@ impl Controller {
                 if event.kind > RECEIPT
                     || event.class as usize >= MAX_CLASSES
                     || event.decision > 2
-                    || event.reason > UNANSWERED
+                    || event.reason > UNTAGGED
                     || event.endpoint.unix_len > 108
                 {
                     return Err(io::Error::other(
@@ -384,21 +413,8 @@ impl Controller {
     fn kill_tasks(&self) -> io::Result<()> {
         let mut failure = None;
         for process in self.tasks.values() {
-            // SAFETY: process is a live owned pidfd; no siginfo is supplied.
-            let result = unsafe {
-                libc::syscall(
-                    libc::SYS_pidfd_send_signal,
-                    process.as_raw_fd(),
-                    libc::SIGKILL,
-                    std::ptr::null::<libc::siginfo_t>(),
-                    0,
-                )
-            };
-            if result < 0 {
-                let error = io::Error::last_os_error();
-                if error.raw_os_error() != Some(libc::ESRCH) {
-                    failure = Some(error);
-                }
+            if let Err(error) = kill(process) {
+                failure = Some(error);
             }
         }
         failure.map_or(Ok(()), Err)
@@ -487,6 +503,27 @@ fn pidfd(tgid: u32) -> io::Result<OwnedFd> {
     let descriptor = i32::try_from(descriptor).map_err(io::Error::other)?;
     // SAFETY: the successful syscall returned a fresh owned descriptor.
     Ok(unsafe { OwnedFd::from_raw_fd(descriptor) })
+}
+
+/// SIGKILL through a pidfd; a process already gone is not an error.
+fn kill(process: &OwnedFd) -> io::Result<()> {
+    // SAFETY: process is a live owned pidfd; no siginfo is supplied.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            process.as_raw_fd(),
+            libc::SIGKILL,
+            std::ptr::null::<libc::siginfo_t>(),
+            0,
+        )
+    };
+    if result < 0 {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::ESRCH) {
+            return Err(error);
+        }
+    }
+    Ok(())
 }
 
 #[cfg(feature = "privileged")]

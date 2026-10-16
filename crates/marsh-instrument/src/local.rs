@@ -9,20 +9,19 @@ use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use crate::Endpoint;
-use std::io;
 
 /// Exact kernel bound endpoints, not the lossy abstract-name rendering in /proc/net/unix.
-pub(crate) fn endpoints(tasks: &[nix::unistd::Pid]) -> io::Result<Vec<Endpoint>> {
+///
+/// The result only ever allows contacts, so a task or socket that cannot be read (it exited, or
+/// a transient error) is left out: omission refuses its endpoints rather than failing every root.
+pub(crate) fn endpoints(tasks: &[nix::unistd::Pid]) -> Vec<Endpoint> {
     let mut seen = HashSet::new();
     let mut endpoints = HashSet::new();
     for tid in tasks {
-        let entries = match std::fs::read_dir(format!("/proc/{tid}/fd")) {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(error),
+        let Ok(entries) = std::fs::read_dir(format!("/proc/{tid}/fd")) else {
+            continue;
         };
-        for entry in entries {
-            let entry = entry?;
+        for entry in entries.flatten() {
             let Some(fd) = entry
                 .file_name()
                 .to_str()
@@ -43,17 +42,8 @@ pub(crate) fn endpoints(tasks: &[nix::unistd::Pid]) -> io::Result<Vec<Endpoint>>
             if seen.contains(&inode) {
                 continue;
             }
-            let (endpoint, v4) = match crate::socket::bound_endpoints(*tid, fd) {
-                Ok(endpoints) => endpoints,
-                Err(error)
-                    if matches!(
-                        error.raw_os_error(),
-                        Some(libc::EBADF | libc::ESRCH | libc::ENOENT)
-                    ) =>
-                {
-                    continue;
-                }
-                Err(error) => return Err(error),
+            let Ok((endpoint, v4)) = crate::socket::bound_endpoints(*tid, fd) else {
+                continue;
             };
             seen.insert(inode);
             endpoints.insert(endpoint);
@@ -73,7 +63,7 @@ pub(crate) fn endpoints(tasks: &[nix::unistd::Pid]) -> io::Result<Vec<Endpoint>>
             endpoint.unix,
         )
     });
-    Ok(endpoints)
+    endpoints
 }
 /// A local address a contact names.
 #[derive(Debug, PartialEq, Eq)]
@@ -285,11 +275,7 @@ mod tests {
             .unwrap()
             .ino();
         assert!(bound_to(&peer).unwrap().contains(&inode));
-        assert!(
-            endpoints(&[nix::unistd::getpid()])
-                .unwrap()
-                .contains(&Endpoint::from_sockaddr(&peer))
-        );
+        assert!(endpoints(&[nix::unistd::getpid()]).contains(&Endpoint::from_sockaddr(&peer)));
     }
 
     #[test]
@@ -301,11 +287,7 @@ mod tests {
         let mut bytes = family(libc::AF_UNIX);
         bytes.extend_from_slice(path.as_os_str().as_bytes());
         bytes.push(0);
-        assert!(
-            endpoints(&[nix::unistd::getpid()])
-                .unwrap()
-                .contains(&Endpoint::from_sockaddr(&bytes))
-        );
+        assert!(endpoints(&[nix::unistd::getpid()]).contains(&Endpoint::from_sockaddr(&bytes)));
     }
 
     #[test]
@@ -321,10 +303,6 @@ mod tests {
         let mut bytes = family(libc::AF_UNIX);
         bytes.push(0);
         bytes.extend_from_slice(name.as_bytes());
-        assert!(
-            endpoints(&[nix::unistd::getpid()])
-                .unwrap()
-                .contains(&Endpoint::from_sockaddr(&bytes))
-        );
+        assert!(endpoints(&[nix::unistd::getpid()]).contains(&Endpoint::from_sockaddr(&bytes)));
     }
 }

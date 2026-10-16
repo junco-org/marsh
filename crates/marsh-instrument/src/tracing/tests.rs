@@ -128,9 +128,9 @@ fn local_exceptions_exclude_an_untraced_co_listener() {
     fixture.finish(run);
     assert!(bound, "the traced TCP listener bound before inventory");
     let endpoint = crate::Endpoint::from(address);
-    assert!(raw.unwrap().contains(&endpoint));
+    assert!(raw.contains(&endpoint));
     assert!(
-        !allowed.unwrap().contains(&endpoint),
+        !allowed.contains(&endpoint),
         "an untraced UDP receiver shares the endpoint"
     );
 }

@@ -136,7 +136,7 @@ impl Tracing {
             kernel.publish(root, enforcer.refresh(target.run, source)?)?;
         }
         if kernel.restricts_untraced(root) {
-            kernel.allow_local(&self.traced_local_endpoints()?)?;
+            kernel.allow_local(&self.traced_local_endpoints())?;
         }
         Ok(copies)
     }
@@ -234,14 +234,14 @@ impl Tracing {
     }
 
     /// The IP endpoints traced tasks hold, excluding any an untraced process also listens on.
-    pub(super) fn traced_local_endpoints(&self) -> io::Result<Vec<Endpoint>> {
+    pub(super) fn traced_local_endpoints(&self) -> Vec<Endpoint> {
         let tasks: Vec<Pid> = lock(&self.state)
             .threads
             .iter()
             .filter(|(_, thread)| thread.inherited.is_some())
             .map(|(tid, _)| *tid)
             .collect();
-        Ok(local::endpoints(&tasks)?
+        local::endpoints(&tasks)
             .into_iter()
             .filter(|endpoint| matches!(endpoint.family, AF_INET | AF_INET6))
             .filter(|endpoint| {
@@ -249,7 +249,7 @@ impl Tracing {
                     !sockets.is_empty() && sockets.iter().all(|holders| !holders.is_empty())
                 })
             })
-            .collect())
+            .collect()
     }
 }
 
@@ -376,7 +376,7 @@ pub(crate) use unavailable::Kernel;
 mod privileged {
     use super::{Endpoint, Event, KernelPolicy, Mutex, Pid, io};
     use marsh_lib::RecoverPoison as _;
-    use marsh_bpf::Controller;
+    use marsh_bpf::{Admission, Controller};
     use marsh_peer_class::Network;
     use std::collections::HashMap;
     use std::os::fd::{BorrowedFd, OwnedFd};
@@ -466,11 +466,16 @@ mod privileged {
             self.inner().controller.local(endpoints)
         }
 
+        /// Maps a stopped task's process to `root`. A process that cannot be attributed is killed
+        /// by the controller and left unmapped; one already gone has nothing left to map.
         pub(super) fn map_task(&self, tid: Pid, root: u64) -> io::Result<()> {
-            let group = process_of(tid)?;
+            let Some(group) = process_of(tid)? else {
+                return Ok(());
+            };
             let mut inner = self.inner();
-            inner.controller.task(group, root)?;
-            inner.tasks.insert(tid, group);
+            if inner.controller.task(group, root)? == Admission::Attributed {
+                inner.tasks.insert(tid, group);
+            }
             drop(inner);
             Ok(())
         }
@@ -512,9 +517,19 @@ mod privileged {
         }
     }
 
-    fn process_of(tid: Pid) -> io::Result<u32> {
-        crate::capture::proc_field::<u32>(format!("/proc/{tid}/status"), "Tgid:")?
-            .ok_or_else(|| io::Error::other("missing tracee tgid"))
+    /// The process of a stopped task, or `None` once a SIGKILL has removed it.
+    fn process_of(tid: Pid) -> io::Result<Option<u32>> {
+        match crate::capture::proc_field::<u32>(format!("/proc/{tid}/status"), "Tgid:") {
+            Ok(Some(group)) => Ok(Some(group)),
+            Ok(None) => Err(io::Error::other("missing tracee tgid")),
+            Err(error)
+                if error.kind() == io::ErrorKind::NotFound
+                    || error.raw_os_error() == Some(libc::ESRCH) =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
     }
 }
 

@@ -130,6 +130,9 @@ pub const STALE: u32 = 2;
 pub const UNTRACED: u32 = 3;
 /// [`Event::reason`]: the root has no published answers.
 pub const UNANSWERED: u32 = 4;
+/// [`Event::reason`]: a permitted local contact whose taint the kernel could not record at its
+/// receiver (its tag map was full).
+pub const UNTAGGED: u32 = 5;
 
 /// One kernel record: a judged contact or a taint receipt.
 #[repr(C)]
@@ -155,8 +158,8 @@ pub struct Event {
     pub sender: u64,
     /// [`ALLOW`], [`DENY`] or [`AUDIT`] (contacts).
     pub decision: u32,
-    /// Which answer decided a contact: [`RULE`], [`CONTINGENT`], [`STALE`], [`UNTRACED`] or
-    /// [`UNANSWERED`].
+    /// Which answer decided a contact: [`RULE`], [`CONTINGENT`], [`STALE`], [`UNTRACED`],
+    /// [`UNANSWERED`] or [`UNTAGGED`].
     pub reason: u32,
     /// Endpoint used by the kernel, not a prior userspace copy (contacts).
     pub endpoint: Endpoint,

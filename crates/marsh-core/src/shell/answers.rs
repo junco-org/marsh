@@ -441,8 +441,13 @@ impl KernelAnswers {
             acknowledged: self.acknowledged,
             ..Answers::default()
         };
+        // A class beyond the kernel's ID space cannot follow this root's sends into receivers.
+        let mut untrackable = None;
         for class in &carried {
-            answers.carried |= 1 << taint_id(class)?;
+            match taint_id(class) {
+                Ok(id) => answers.carried |= 1 << id,
+                Err(error) => untrackable = Some(error.to_string()),
+            }
         }
         let mut contact_sensitive = false;
         let decisions = match &mut self.engine {
@@ -502,6 +507,22 @@ impl KernelAnswers {
                 })
             })
             .collect();
+        if let Some(reason) = untrackable {
+            // Refuse every contact of this root only; the shared tracer and other roots go on.
+            answers.deny = u64::MAX;
+            answers.contingent = [u64::MAX; MAX_TAINTS];
+            self.denials = self
+                .classes
+                .iter()
+                .map(|class| {
+                    Some(Denial {
+                        event: contact(principal, class),
+                        failed_precondition: format!("{reason}; this principal carries another"),
+                        allowed_fixes: Vec::new(),
+                    })
+                })
+                .collect();
+        }
         let mut policy = KernelPolicy {
             answers,
             networks: agent.kernel_networks()?,

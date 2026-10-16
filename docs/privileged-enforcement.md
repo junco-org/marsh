@@ -105,13 +105,13 @@ explicit request for the other mode is refused.
 |---|---|---|---|
 | `TASK_ROOT` | hash | tgid → root | the tracer, at every fork/clone stop before the child runs; removed at exit |
 | `ANSWERS` | hash | root → `Answers` | userspace only, replaced whole |
-| `RECEIVED` | hash | root → per-taint-class receipt counters | the kernel only (atomic adds) |
+| `RECEIVED` | hash | root → per-taint-class receipt counters | the kernel only (atomic adds); userspace removes a retired root's entry |
 | `CLASS_NET4`, `CLASS_NET6` | LPM trie | root-prefixed IP prefix → class | userspace, from declared networks (§4.5) |
 | `LOCAL_ALLOWED` | hash | IP endpoint → () | userspace: endpoints traced processes hold (§4.7) |
 | `SOCKS` | socket storage | socket → `{ traced, taint, sender }` | the kernel; freed with the socket |
-| `FLOWS` | hash | `{ netns, type, port, peer port, peer address }` → `{ taint, sender }` | the kernel; removed when the receiving socket is freed |
+| `FLOWS` | hash | `{ netns, type, port, peer port, peer address, destination family }` → `{ taint, sender }` | the kernel; a connection's tag goes with its socket, a port's only with its sole holder (§4.7) |
 | `EVENTS` | ring buffer | contacts and receipts | the kernel |
-| `HEALTH` | array | sticky poison flag | loader and kernel |
+| `HEALTH` | array | sticky poison flag: event loss or a map failure | loader and kernel |
 | `PID_NAMESPACE` | array | the loader's PID namespace | loader |
 
 `Answers` holds `generation`, `deny` (classes refused now), `guarded` (classes any rule can
@@ -176,16 +176,24 @@ userspace labels each inserted prefix Q with the first declared network containi
 | Hook | Covers |
 |---|---|
 | `socket_connect` | `connect` and io_uring `CONNECT`, judged on the kernel's copy of the address |
-| `socket_sendmsg` | `send*`, writes to sockets, io_uring `SEND`/`SENDMSG`/`WRITE`, judged on `msg_name` or the connected peer; tags the receiver |
+| `socket_sendmsg` | `send*`, writes to sockets, io_uring `SEND`/`SENDMSG` (and their zero-copy forms), judged on `msg_name` where the protocol sends to it, else the connected peer; tags the receiver |
 | `unix_may_send` | every UNIX datagram send, after the kernel found the receiving socket; tags it |
 | `socket_post_create`, `unix_stream_connect` | mark UNIX sockets a governed process created, and the server end of their stream connections, as traced |
-| `fexit` of `sock_recvmsg`, `sock_splice_read` | a governed read that returned data from a tagged socket (`recv*`, `read`, io_uring receives, `splice`), judged on return so a reader already blocked when the bytes arrived is caught |
-| `sk_free_security` | drops an IP socket's flow tags |
+| `fexit` of `inet_recvmsg`, `inet6_recvmsg`, `unix_stream_recvmsg`, `unix_dgram_recvmsg`, `unix_seqpacket_recvmsg`, `sock_splice_read` | a governed read that returned data from a tagged socket (`recv*`, every message of `recvmmsg`, `read`, `splice`), judged on return so a reader already blocked when the bytes arrived is caught |
+| `sk_free_security` | drops a freed IP socket's connection tag, and its port's tags when no other socket can hold that port |
 | `uring_sqpoll` | refuses kernel-polled rings for governed tasks before their worker exists |
 
+A send judges `msg_name` only where it is the destination: datagram and raw sockets, and an
+unconnected TCP socket's fast-open send. A connected TCP socket ignores a name and a UNIX stream or
+seqpacket socket refuses or drops one, so those are judged on their connected peer whatever name the
+call carries. The read hooks are the protocol entries rather than `sock_recvmsg`, which `recvmmsg`
+bypasses for every message after its first.
+
 In privileged mode kernel contact events replace captured peer observations; only `sendfile` and
-`splice` keep ptrace-observed peers as evidence. io_uring socket operations are accepted by the
-filesystem observer; other ring operations remain unsupported.
+`splice` keep ptrace-observed peers as evidence. Of io_uring's socket operations the filesystem
+observer accepts `CONNECT`, `SEND`, `SENDMSG`, `SEND_ZC` and `SENDMSG_ZC`; `WRITE`, the receives
+(`READ`, `RECV`, `RECVMSG`), `ACCEPT`, `SOCKET` and every other operation outside the effectless set
+remain unsupported, though the hooks above would judge them.
 
 ### 4.7 Local peers, taint and `untraced_local` (Phase C)
 
@@ -196,8 +204,16 @@ has not yet folded in) is nonempty tags the receiving socket:
   `unix_may_send` names. Its `SOCKS` entry ORs in the classes and records the sender.
 * IP loopback: the kernel cannot reach the receiving socket, so `FLOWS` keys the tag as the
   receiver sees itself: a TCP connection by network namespace, local port, peer port and peer
-  address (exactly one connection); anything else by its local port (every datagram reader of
-  that port, an over-approximation).
+  address (exactly one connection); anything else by its local port and the destination's family
+  (every datagram reader of that port, an over-approximation). An IPv4 destination's tag is read by
+  IPv4 and dual-stack IPv6 sockets of the port, an IPv6 one's by IPv6 sockets only.
+* A full `FLOWS` map, or socket storage that cannot be created, refuses that contact (`untagged`)
+  rather than poisoning every root: the receiver would otherwise read untainted.
+
+A freed socket removes its connection's tag. A port's tag is removed only when the freed socket was
+the port's sole possible holder: a wildcard bind on no device without `SO_REUSEADDR` or
+`SO_REUSEPORT`. Sockets bound to distinct addresses, devices or with reuse share a port, and another
+may still hold tagged datagrams; their port's tag stays until such a sole holder is freed.
 
 When a governed process's socket read returns data from a tagged socket, and the tag has classes
 its root neither carries nor already has pending, the hook increments the root's `RECEIVED` counter for each and reports a
@@ -236,7 +252,7 @@ ring while tasks only send.
   and quiescence waits for those deliveries and a final drain, so no root is retired with events
   in flight.
 * **Refusals go to the `PolicyObserver`** with the ptrace gate's wording (the cached denial for
-  the class, or the stale, untraced or unanswered explanation), once per run.
+  the class, or the stale, untraced, unanswered or untagged explanation), once per run.
 * **Audit mode** permits and reports `would block`.
 
 ## 5. Requirements
@@ -244,7 +260,8 @@ ring while tasks only send.
 * `CONFIG_BPF_LSM=y` with `bpf` in the active LSM list (`/sys/kernel/security/lsm`), BTF
   (`CONFIG_DEBUG_INFO_BTF=y`), and a kernel with the `uring_sqpoll` hook (5.19 or later); socket
   storage, `bpf_sock_from_file`, `bpf_skc_to_unix_sock` and BPF atomics are older than that.
-  The read hooks are `fexit` programs, which need BPF trampolines (x86-64 or arm64).
+  The read hooks are `fexit` programs, which need BPF trampolines (x86-64 or arm64), on functions
+  of built-in IPv4, IPv6 and UNIX sockets (`inet_recvmsg`, `inet6_recvmsg`, `unix_*_recvmsg`).
   Privileged startup requires every hook; a kernel lacking one is not given weaker enforcement.
 * Privileges to load and attach LSM programs: root in practice.
 * Build: clang 15 or later (`MARSH_BPF_CLANG`, default `clang`).
@@ -273,19 +290,24 @@ an installed generic kernel in a disposable QEMU guest with BPF LSM active inste
   after stripping authority, so the parent can still seize them.
 * Governed tasks use `PTRACE_O_EXITKILL`. A shared tracer failure kills every governed process
   through pidfds, clears task mappings even after poisoning, then detaches.
-* Event loss, a full flow-tag map or any map failure poisons enforcement for good: every governed
-  contact is refused, auditing roots included.
-* Task keys and events use the loader's PID namespace; a child changing PID namespace is refused.
-* `socket_sendmsg` sees a kernel-owned destination when `msg_name` is present; otherwise it reads
+* Event loss or a map failure poisons enforcement for good: every governed contact is refused,
+  auditing roots included. Failures one root causes stay with it: a full tag map refuses the
+  contact that needed the tag, a root carrying a taint class beyond the 16 kernel IDs has every
+  contact refused, and an unreadable socket or task drops out of `LOCAL_ALLOWED`.
+* Task keys and events use the loader's PID namespace. A child in another PID namespace cannot be
+  attributed: it alone is killed through its pidfd before it resumes, and enforcement stays healthy.
+* `socket_sendmsg` sees a kernel-owned destination when it judges `msg_name`; otherwise it reads
   the connected peer, which another holder of a connected UDP socket can reconnect between the
   hook and transmission (`connected-udp-peer-reconnect`). Closing that needs a destination-stable
   protocol or packet enforcement point.
-* Kernel taint follows reads on their return from `sock_recvmsg` and `sock_splice_read`, before the
-  reading thread regains control. Another thread of the reader could see the bytes in shared
-  memory before that return. A TCP zero-copy receive (`getsockopt(TCP_ZEROCOPY_RECEIVE)`) maps data
-  without either and is not tagged.
-* Loopback datagram tags cover a whole port, and a socket's tag persists until it is freed, so
-  readers can be over-tainted; never under-tainted.
+* Kernel taint follows reads on their return from the protocol `recvmsg` entries and
+  `sock_splice_read`, before the reading thread regains control. Another thread of the reader could
+  see the bytes in shared memory before that return. A TCP zero-copy receive
+  (`getsockopt(TCP_ZEROCOPY_RECEIVE)`) maps data without either and is not tagged.
+* Loopback datagram tags cover a whole port, and stay while any socket may share it, so readers
+  can be over-tainted; never under-tainted.
+* A UNIX socket counts as traced because a governed process created it, even after its descriptor
+  is passed to an untraced process.
 
 ## 8. Testing
 
@@ -301,9 +323,11 @@ sudo python3 bench/leak-fuzzer/privileged-vm.py env MARSH_LEAK_ENFORCEMENT=privi
 ```
 
 The `lsm` tests drive the real hooks: decisions, audit and stale outcomes, untraced receivers,
-declared networks per root, ring overflow, PID-namespace attribution, and taint receipts over UDP,
+declared networks per root, ring overflow, a PID-namespace child refused alone, connected TCP and
+UNIX seqpacket sends judged by their peer whatever name they carry, and taint receipts over UDP,
 TCP (only the tainted connection), UNIX streams read with `read()`, a reader already blocked when
-the bytes arrive, and several classes at once.
+the bytes arrive, the second message of one `recvmmsg`, a datagram port another socket shared at a
+different address, and several classes at once.
 `.github/workflows/privileged.yml` runs them and the corpus in both modes: pull requests with
 seed `20261014`, nightly with four seeds and two iterations each. The runner needs QEMU,
 busybox-static, cpio, zstd, kmod, iproute2 and an installed generic BPF/BTF kernel with 9p modules;

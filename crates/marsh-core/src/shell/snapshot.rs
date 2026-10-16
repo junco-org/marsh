@@ -23,7 +23,9 @@ use marsh_instrument::{
     KernelEvent, KernelPolicy, RootId, Syscall, TraceRun,
 };
 use marsh_lib::RecoverPoison as _;
-use marsh_peer_class::{ALLOW, CONTINGENT, DENY, MAX_TAINTS, RECEIPT, RULE, STALE, UNTRACED};
+use marsh_peer_class::{
+    ALLOW, CONTINGENT, DENY, MAX_TAINTS, RECEIPT, RULE, STALE, UNTAGGED, UNTRACED,
+};
 
 #[derive(Default)]
 pub(super) struct CommandEvidence {
@@ -1055,6 +1057,9 @@ impl Snapshot {
                     refused("a propagated class may not reach a local peer marsh does not trace")
                 })
             }
+            UNTAGGED => refused(
+                "the kernel could not record the taint this contact carries at its local receiver",
+            ),
             _ => refused("the kernel had no policy answers for the contact"),
         }
     }

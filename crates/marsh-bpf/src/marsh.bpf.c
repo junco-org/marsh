@@ -19,6 +19,7 @@
 #define EPERM 1
 #define SOCK_STREAM 1
 #define SOCK_DGRAM 2
+#define TCP_CLOSE 7
 
 #define MAP_HASH 1
 #define MAP_ARRAY 2
@@ -53,6 +54,10 @@ struct sock_common {
     __u16 skc_dport;
     __u16 skc_num;
     __u16 skc_family;
+    unsigned char skc_state;
+    unsigned char skc_reuse:4;
+    unsigned char skc_reuseport:1;
+    unsigned char skc_ipv6only:1;
     int skc_bound_dev_if;
     possible_net_t skc_net;
     struct in6_addr skc_v6_daddr;
@@ -77,6 +82,21 @@ static struct socket *(*bpf_sock_from_file)(struct file *file) = (void *)162;
 static struct unix_sock *(*bpf_skc_to_unix_sock)(void *sk) = (void *)178;
 
 #define READ(dst, field) bpf_probe_read_kernel(&(dst), sizeof(dst), __builtin_preserve_access_index(&(field)))
+
+/* A CO-RE bitfield through a raw read, as libbpf's BPF_CORE_READ_BITFIELD_PROBED (unsigned). */
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+#define BITFIELD_INTO(size) 0
+#else
+#define BITFIELD_INTO(size) (8 - (size))
+#endif
+#define BITFIELD(base, field) ({                                                                 \
+    __u64 bits = 0;                                                                              \
+    __u32 size = __builtin_preserve_field_info((base)->field, 1);                                \
+    bpf_probe_read_kernel((__u8 *)&bits + BITFIELD_INTO(size), size,                             \
+                          (const __u8 *)(base) + __builtin_preserve_field_info((base)->field, 0)); \
+    bits <<= __builtin_preserve_field_info((base)->field, 4);                                    \
+    bits >> __builtin_preserve_field_info((base)->field, 5);                                     \
+})
 
 /* Governed processes, by tgid in the loader's PID namespace: their root. */
 struct {
@@ -151,14 +171,16 @@ struct {
 
 /*
  * Taint sent to an IP receiver, keyed as the receiving socket sees itself: a TCP connection by
- * its peer's address and port, anything else by its local port alone.
+ * its peer's address and port, anything else by its local port and the destination's family
+ * (zero for a connection). An IPv4 destination reaches IPv4 and dual-stack IPv6 sockets of the
+ * port; an IPv6 one only IPv6 sockets.
  */
 struct flow {
     __u64 net;
     __u16 type;
     __u16 port;
     __u16 peer_port;
-    __u16 unused;
+    __u16 family;
     __u8 peer[16];
 };
 
@@ -181,8 +203,8 @@ struct {
 } EVENTS SEC(".maps");
 
 /*
- * Sticky: event loss, a full tag map or a userspace map failure refuses every governed contact.
- * Ungoverned processes are checked before this switch.
+ * Sticky: event loss or a userspace map failure refuses every governed contact. Ungoverned
+ * processes are checked before this switch.
  */
 struct {
     __uint(type, MAP_ARRAY);
@@ -482,16 +504,23 @@ static __always_inline int judge(struct marsh_event *event, int unreadable, stru
     return answers->audit ? 0 : -EPERM;
 }
 
+/* Refuses a permitted contact whose taint could not be recorded at its receiver. */
+static __always_inline int untagged(struct marsh_event *event)
+{
+    event->decision = DECISION_DENY;
+    event->reason = REASON_UNTAGGED;
+    return -EPERM;
+}
+
 /* Records taint a permitted local contact sends into its receiving socket. */
-static __always_inline void tag_unix(struct sock *receiver, __u64 taint, __u64 root)
+static __always_inline int tag_unix(struct sock *receiver, __u64 taint, __u64 root)
 {
     struct sock_state *state = receiver ? bpf_sk_storage_get(&SOCKS, receiver, 0, STORAGE_CREATE) : 0;
-    if (!state) {
-        poison();
-        return;
-    }
+    if (!state)
+        return -1;
     __sync_fetch_and_or(&state->taint, taint);
     state->sender = root;
+    return 0;
 }
 
 static __always_inline __u64 net_cookie(struct sock *sk)
@@ -503,41 +532,40 @@ static __always_inline __u64 net_cookie(struct sock *sk)
     return cookie;
 }
 
-static __always_inline void tag_flow(struct flow *key, __u64 taint, __u64 root)
+/* Full: refuse the contact, since an untagged receiver would read untainted. */
+static __always_inline int tag_flow(struct flow *key, __u64 taint, __u64 root)
 {
     struct tag *tag = bpf_map_lookup_elem(&FLOWS, key);
     if (!tag) {
         struct tag fresh = { .taint = taint, .sender = root };
         if (!bpf_map_update_elem(&FLOWS, key, &fresh, NOEXIST))
-            return;
+            return 0;
         tag = bpf_map_lookup_elem(&FLOWS, key);
-        if (!tag) {
-            /* Full: an untagged receiver would read untainted. */
-            poison();
-            return;
-        }
+        if (!tag)
+            return -1;
     }
     __sync_fetch_and_or(&tag->taint, taint);
     tag->sender = root;
+    return 0;
 }
 
 /* A loopback send: tag the receiver's connection, or its whole port for datagrams. */
-static __always_inline void tag_inet(struct sock *sk, const struct marsh_endpoint *destination, __u64 taint, __u64 root)
+static __always_inline int tag_inet(struct sock *sk, const struct marsh_endpoint *destination, __u64 taint, __u64 root)
 {
     struct flow key = {};
     __u16 type = 0, port = 0;
-    if (READ(type, sk->sk_type) || READ(port, sk->__sk_common.skc_num)) {
-        poison();
-        return;
-    }
+    if (READ(type, sk->sk_type) || READ(port, sk->__sk_common.skc_num))
+        return -1;
     key.net = net_cookie(sk);
     key.type = type;
     key.port = destination->port;
-    if (type == SOCK_STREAM && port && !inet_address(sk, 1, key.peer))
+    if (type == SOCK_STREAM && port && !inet_address(sk, 1, key.peer)) {
         key.peer_port = port;
-    else
+    } else {
         __builtin_memset(key.peer, 0, 16);
-    tag_flow(&key, taint, root);
+        key.family = destination->family;
+    }
+    return tag_flow(&key, taint, root);
 }
 
 static __always_inline void submit(struct marsh_event *event)
@@ -579,6 +607,24 @@ int socket_connect(unsigned long long *ctx)
     return poisoned() ? -EPERM : result;
 }
 
+/*
+ * Whether a send's named address is where its bytes go: 1 yes, 0 no, -1 unknown. A connected TCP
+ * socket ignores a name and a UNIX stream or seqpacket socket refuses or drops it, so naming
+ * another address must not change the contact's class; only an unconnected TCP fast-open send
+ * connects to the name it carries.
+ */
+static __always_inline int names_destination(struct sock *sk, __u16 family, __u16 type)
+{
+    if (family == AF_UNIX)
+        return 0;
+    if (type != SOCK_STREAM)
+        return 1;
+    __u8 state = 0;
+    if (READ(state, sk->__sk_common.skc_state))
+        return -1;
+    return state == TCP_CLOSE;
+}
+
 SEC("lsm/socket_sendmsg")
 int socket_sendmsg(unsigned long long *ctx)
 {
@@ -616,7 +662,8 @@ int socket_sendmsg(unsigned long long *ctx)
     }
     const void *name = 0;
     int len = 0, unreadable;
-    if (READ(name, message->msg_name) || READ(len, message->msg_namelen))
+    int named = names_destination(sk, family, type);
+    if (named < 0 || (named && (READ(name, message->msg_name) || READ(len, message->msg_namelen))))
         unreadable = 1;
     else if (name)
         unreadable = read_sockaddr(name, len, &event->endpoint) != 0;
@@ -628,10 +675,13 @@ int socket_sendmsg(unsigned long long *ctx)
     event->class = classify(event->root, &event->endpoint);
     int result = judge(event, unreadable, peer, 0);
     if (event->decision != DECISION_DENY && event->taint) {
+        int failed = 0;
         if (event->class == CLASS_UNIX && peer)
-            tag_unix(peer, event->taint, event->root);
+            failed = tag_unix(peer, event->taint, event->root);
         else if (event->class == CLASS_LOOPBACK)
-            tag_inet(sk, &event->endpoint, event->taint, event->root);
+            failed = tag_inet(sk, &event->endpoint, event->taint, event->root);
+        if (failed)
+            result = untagged(event);
     }
     submit(event);
     return poisoned() ? -EPERM : result;
@@ -663,8 +713,9 @@ int unix_may_send(unsigned long long *ctx)
     marsh_normalize_ip(&event->endpoint);
     event->class = CLASS_UNIX;
     int result = judge(event, 0, receiver, 0);
-    if (event->decision != DECISION_DENY && event->taint && receiver)
-        tag_unix(receiver, event->taint, event->root);
+    if (event->decision != DECISION_DENY && event->taint && receiver &&
+        tag_unix(receiver, event->taint, event->root))
+        result = untagged(event);
     submit(event);
     return poisoned() ? -EPERM : result;
 }
@@ -682,10 +733,9 @@ int socket_post_create(unsigned long long *ctx)
         return 0;
     struct sock *sk = sock->sk;
     struct sock_state *state = sk ? bpf_sk_storage_get(&SOCKS, sk, 0, STORAGE_CREATE) : 0;
-    if (!state) {
-        poison();
+    /* Unmarked, it would count as untraced; refusing the socket keeps the rest running. */
+    if (!state)
         return -EPERM;
-    }
     state->traced = 1;
     return 0;
 }
@@ -702,12 +752,21 @@ int unix_stream_connect(unsigned long long *ctx)
     if (!traced_socket(other))
         return 0;
     struct sock_state *state = bpf_sk_storage_get(&SOCKS, server, 0, STORAGE_CREATE);
-    if (!state) {
-        poison();
+    if (!state)
         return -EPERM;
-    }
     state->traced = 1;
     return 0;
+}
+
+/* Ors in a port's datagram (or unbound-sender) tag for destinations of `family`. */
+static __always_inline void port_tag(struct flow *key, __u16 family, __u64 *taint, __u64 *sender)
+{
+    key->family = family;
+    struct tag *tag = bpf_map_lookup_elem(&FLOWS, key);
+    if (tag) {
+        *taint |= tag->taint;
+        *sender = tag->sender;
+    }
 }
 
 /* A governed reader of a tagged socket receives its taint before it can act on the bytes. */
@@ -735,14 +794,16 @@ static __always_inline int receive(struct sock *sk)
             key.peer_port = host_port(sk->__sk_common.skc_dport);
             tag = bpf_map_lookup_elem(&FLOWS, &key);
         }
-        if (!tag) {
-            key.peer_port = 0;
-            __builtin_memset(key.peer, 0, 16);
-            tag = bpf_map_lookup_elem(&FLOWS, &key);
-        }
         if (tag) {
             taint = tag->taint;
             sender = tag->sender;
+        } else {
+            key.peer_port = 0;
+            __builtin_memset(key.peer, 0, 16);
+            port_tag(&key, family, &taint, &sender);
+            /* A dual-stack socket also receives what was sent to the port's IPv4 address. */
+            if (family == AF_INET6 && !BITFIELD(sk, __sk_common.skc_ipv6only))
+                port_tag(&key, AF_INET, &taint, &sender);
         }
     }
     if (!taint)
@@ -772,19 +833,49 @@ static __always_inline int receive(struct sock *sk)
     return 0;
 }
 
-/*
- * After a socket read returns data and before the reader regains control. Judging at the read's
- * entry instead would miss a reader already blocked when the tainted bytes arrive. Covers recv*,
- * read() (sock_read_iter) and io_uring receives; splice from a socket has its own path.
- */
-SEC("fexit/sock_recvmsg")
-int sock_recvmsg(unsigned long long *ctx)
+static __always_inline int read_returned(struct socket *sock, long received)
 {
-    struct socket *sock = (void *)ctx[0];
-    long received = (long)(int)ctx[3];
     if (received > 0)
         receive(sock->sk);
     return 0;
+}
+
+/*
+ * After a socket read returns data and before the reader regains control. Judging at the read's
+ * entry instead would miss a reader already blocked when the tainted bytes arrive. These are the
+ * protocol entries of every read of a taggable socket: recv*, read() (sock_read_iter), io_uring
+ * receives, and each message of recvmmsg, whose later messages bypass sock_recvmsg. Splice from a
+ * socket has its own path. A seqpacket read also enters unix_dgram_recvmsg unless inlined; a second
+ * fire finds the classes already pending.
+ */
+SEC("fexit/inet_recvmsg")
+int inet_recvmsg(unsigned long long *ctx)
+{
+    return read_returned((void *)ctx[0], (long)(int)ctx[4]);
+}
+
+SEC("fexit/inet6_recvmsg")
+int inet6_recvmsg(unsigned long long *ctx)
+{
+    return read_returned((void *)ctx[0], (long)(int)ctx[4]);
+}
+
+SEC("fexit/unix_stream_recvmsg")
+int unix_stream_recvmsg(unsigned long long *ctx)
+{
+    return read_returned((void *)ctx[0], (long)(int)ctx[4]);
+}
+
+SEC("fexit/unix_dgram_recvmsg")
+int unix_dgram_recvmsg(unsigned long long *ctx)
+{
+    return read_returned((void *)ctx[0], (long)(int)ctx[4]);
+}
+
+SEC("fexit/unix_seqpacket_recvmsg")
+int unix_seqpacket_recvmsg(unsigned long long *ctx)
+{
+    return read_returned((void *)ctx[0], (long)(int)ctx[4]);
 }
 
 SEC("fexit/sock_splice_read")
@@ -800,7 +891,32 @@ int sock_splice_read(unsigned long long *ctx)
     return 0;
 }
 
-/* A freed IP socket's tags must not taint the next socket with its addresses. */
+/*
+ * Whether no other socket of this type in its namespace can hold its port: a wildcard bind on no
+ * device without SO_REUSEADDR or SO_REUSEPORT. Distinct addresses, devices or reuse share a port.
+ */
+static __always_inline int sole_holder(struct sock *sk, __u16 family)
+{
+    if (BITFIELD(sk, __sk_common.skc_reuse) || BITFIELD(sk, __sk_common.skc_reuseport) ||
+        sk->__sk_common.skc_bound_dev_if)
+        return 0;
+    if (family == AF_INET)
+        return !sk->__sk_common.skc_rcv_saddr;
+    __u8 local[16];
+    if (bpf_probe_read_kernel(local, 16, __builtin_preserve_access_index(&sk->__sk_common.skc_v6_rcv_saddr)))
+        return 0;
+    __u64 high, low;
+    __builtin_memcpy(&high, local, 8);
+    __builtin_memcpy(&low, local + 8, 8);
+    return !high && !low;
+}
+
+/*
+ * A freed IP socket's tags must not taint the next socket with its addresses, nor be lost while
+ * another socket may still read what they describe: a connection's own tag goes with it, a port's
+ * only with its sole holder. Port tags of TCP (unbound fast-open senders) stay, since every
+ * connection accepted on the port shares it.
+ */
 SEC("lsm/sk_free_security")
 int sk_free_security(unsigned long long *ctx)
 {
@@ -812,9 +928,21 @@ int sk_free_security(unsigned long long *ctx)
     key.net = net_cookie(sk);
     key.type = sk->sk_type;
     key.port = sk->__sk_common.skc_num;
+    if (!key.port)
+        return 0;
+    if (key.type == SOCK_STREAM) {
+        if (!inet_address(sk, 0, key.peer)) {
+            key.peer_port = host_port(sk->__sk_common.skc_dport);
+            bpf_map_delete_elem(&FLOWS, &key);
+        }
+        return 0;
+    }
+    if (!sole_holder(sk, family))
+        return 0;
+    key.family = family;
     bpf_map_delete_elem(&FLOWS, &key);
-    if (key.type == SOCK_STREAM && !inet_address(sk, 0, key.peer)) {
-        key.peer_port = host_port(sk->__sk_common.skc_dport);
+    if (family == AF_INET6 && !BITFIELD(sk, __sk_common.skc_ipv6only)) {
+        key.family = AF_INET;
         bpf_map_delete_elem(&FLOWS, &key);
     }
     return 0;

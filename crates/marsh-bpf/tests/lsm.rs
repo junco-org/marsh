@@ -5,13 +5,13 @@ use std::{
     io::{self, Read, Write},
     net::{TcpListener, TcpStream, UdpSocket},
     os::{
-        fd::{AsRawFd, FromRawFd, OwnedFd},
+        fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
         linux::net::SocketAddrExt,
         unix::net::{SocketAddr, UnixDatagram, UnixStream},
     },
 };
 
-use marsh_bpf::Controller;
+use marsh_bpf::{Admission, Controller};
 use marsh_peer_class::{
     AF_INET, ALLOW, AUDIT, Answers, CONTACT, CONTINGENT, DENY, Endpoint, Event, LOOPBACK,
     NETLINK, Network, RECEIPT, RULE, STALE, UNANSWERED, UNIX, UNKNOWN, UNTRACED,
@@ -28,6 +28,91 @@ fn decisions(events: &[Event]) -> Vec<(u32, u32)> {
         .iter()
         .map(|event| (event.decision, event.reason))
         .collect()
+}
+
+/// `sendto` with an explicit name of any sockaddr type.
+fn send_named<T>(socket: RawFd, bytes: &[u8], name: &T) -> io::Result<usize> {
+    // SAFETY: bytes and name are initialized and outlive this synchronous call; the length is
+    // exactly the size of T.
+    let sent = unsafe {
+        libc::sendto(
+            socket,
+            bytes.as_ptr().cast(),
+            bytes.len(),
+            libc::MSG_NOSIGNAL,
+            std::ptr::from_ref(name).cast(),
+            libc::socklen_t::try_from(size_of::<T>()).map_err(io::Error::other)?,
+        )
+    };
+    usize::try_from(sent).map_err(|_| io::Error::last_os_error())
+}
+
+/// A `sockaddr_in` for an IPv4 address and port.
+fn ipv4(address: [u8; 4], port: u16) -> io::Result<libc::sockaddr_in> {
+    // SAFETY: the zeroed sockaddr_in is an integer-only C struct.
+    let mut name: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+    name.sin_family = u16::try_from(libc::AF_INET).map_err(io::Error::other)?;
+    name.sin_port = port.to_be();
+    name.sin_addr.s_addr = u32::from_ne_bytes(address);
+    Ok(name)
+}
+
+/// Sends on connected sockets go to their peer whatever name the call carries, so the kernel must
+/// judge the peer: TCP ignores the name and UNIX seqpacket drops it.
+#[test]
+#[ignore = "requires root, active BPF LSM, BTF, and loopback IPv4 in a disposable VM"]
+fn connected_sends_are_judged_by_their_peer() -> io::Result<()> {
+    let mut controller = Controller::load()?;
+    let tgid = std::process::id();
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let stream = TcpStream::connect(listener.local_addr()?)?;
+    let (_server, _) = listener.accept()?;
+    let mut pair = [0; 2];
+    // SAFETY: pair has room for exactly the two descriptors socketpair writes.
+    if unsafe {
+        libc::socketpair(
+            libc::AF_UNIX,
+            libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC,
+            0,
+            pair.as_mut_ptr(),
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: socketpair returned these two fresh descriptors, owned nowhere else.
+    let seqpacket = unsafe { OwnedFd::from_raw_fd(pair[0]) };
+    // SAFETY: as above, for the other end.
+    let _seqpacket_peer = unsafe { OwnedFd::from_raw_fd(pair[1]) };
+    controller.publish(
+        1,
+        Answers {
+            deny: (1 << LOOPBACK) | (1 << UNIX),
+            guarded: (1 << LOOPBACK) | (1 << UNIX),
+            ..Answers::default()
+        },
+    )?;
+    controller.task(tgid, 1)?;
+    // SAFETY: the zeroed sockaddr_nl is an integer-only C struct.
+    let mut netlink: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
+    netlink.nl_family = u16::try_from(libc::AF_NETLINK).map_err(io::Error::other)?;
+    assert!(refused(send_named(stream.as_raw_fd(), b"to loopback", &netlink)));
+    let external = ipv4([198, 51, 100, 1], 9)?;
+    assert!(refused(send_named(seqpacket.as_raw_fd(), b"to peer", &external)));
+    let events = controller.drain()?;
+    assert_eq!(
+        events
+            .iter()
+            .map(|event| (event.class, event.decision))
+            .collect::<Vec<_>>(),
+        [(LOOPBACK, DENY), (UNIX, DENY)]
+    );
+    assert_eq!(
+        events[0].endpoint,
+        Endpoint::from(listener.local_addr()?).normalized()
+    );
+    controller.remove_task(tgid)?;
+    Ok(())
 }
 
 #[test]
@@ -447,6 +532,79 @@ fn local_receipts_taint_the_reader_in_the_kernel() -> io::Result<()> {
     controller.remove_task(child.id())?;
     acknowledged[8] = 1;
 
+    // Every message of one recvmmsg is a read: a tainted datagram arriving after a clean one
+    // taints the reader, though recvmmsg reads it without passing sock_recvmsg.
+    stage(&mut controller, 1 << 9, acknowledged)?;
+    controller.remove_task(tgid)?;
+    let batch = UdpSocket::bind("127.0.0.1:0")?;
+    // SAFETY: the child runs only the async-signal-safe recvmmsg and _exit on its own stack.
+    let reader = unsafe { libc::fork() };
+    if reader == 0 {
+        let mut first = [0u8; 16];
+        let mut second = [0u8; 16];
+        let mut vectors = [
+            libc::iovec {
+                iov_base: first.as_mut_ptr().cast(),
+                iov_len: first.len(),
+            },
+            libc::iovec {
+                iov_base: second.as_mut_ptr().cast(),
+                iov_len: second.len(),
+            },
+        ];
+        // SAFETY: zeroed mmsghdrs are valid empty headers.
+        let mut headers: [libc::mmsghdr; 2] = unsafe { std::mem::zeroed() };
+        for (header, vector) in headers.iter_mut().zip(vectors.iter_mut()) {
+            header.msg_hdr.msg_iov = vector;
+            header.msg_hdr.msg_iovlen = 1;
+        }
+        // SAFETY: each header names one live iovec over a live buffer; recvmmsg blocks for
+        // both messages and returns before they go out of scope.
+        let count = unsafe {
+            libc::recvmmsg(
+                batch.as_raw_fd(),
+                headers.as_mut_ptr(),
+                2,
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+        // SAFETY: _exit ends the forked child without running the parent's destructors.
+        unsafe { libc::_exit(i32::from(count != 2)) };
+    }
+    let reader = u32::try_from(reader).map_err(|_| io::Error::last_os_error())?;
+    controller.task(reader, 2)?;
+    // Ungoverned, so untagged; the reader takes it before the tainted one exists.
+    udp_sender.send_to(b"clean", batch.local_addr()?)?;
+    std::thread::sleep(std::time::Duration::from_secs(1));
+    controller.task(tgid, 1)?;
+    udp_sender.send_to(b"secret", batch.local_addr()?)?;
+    let mut status = 0;
+    // SAFETY: waits for the forked child above; status is a live out-parameter.
+    if unsafe { libc::waitpid(reader.cast_signed(), &raw mut status, 0) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0);
+    controller.remove_task(reader)?;
+    assert_eq!(receipts(&controller.drain()?), [(2, 1 << 9, 1)]);
+    acknowledged[9] = 1;
+
+    // A port's datagram tag outlives a socket that shared the port at another address.
+    stage(&mut controller, 1 << 10, acknowledged)?;
+    controller.remove_task(tgid)?;
+    let shared = UdpSocket::bind("127.0.0.2:0")?;
+    let neighbour = UdpSocket::bind(("127.0.0.1", shared.local_addr()?.port()))?;
+    controller.task(tgid, 1)?;
+    udp_sender.send_to(b"secret", shared.local_addr()?)?;
+    drop(neighbour);
+    // UDP sockets are freed after an RCU grace period.
+    std::thread::sleep(std::time::Duration::from_secs(1));
+    controller.task(tgid, 2)?;
+    controller.drain()?;
+    shared.recv(&mut buffer)?;
+    assert_eq!(receipts(&controller.drain()?), [(2, 1 << 10, 1)]);
+    acknowledged[10] = 1;
+
     // Two classes at once are undecidable until userspace republishes.
     stage(&mut controller, (1 << 6) | (1 << 7), acknowledged)?;
     controller.task(tgid, 1)?;
@@ -463,9 +621,11 @@ fn local_receipts_taint_the_reader_in_the_kernel() -> io::Result<()> {
     Ok(())
 }
 
+/// A child in another PID namespace cannot be attributed: it alone is killed, and enforcement
+/// stays healthy for everyone else.
 #[test]
 #[ignore = "requires active BPF LSM, root PID-namespace privileges, and unshare in a disposable VM"]
-fn namespace_changed_child_cannot_be_registered() -> io::Result<()> {
+fn namespace_changed_child_is_refused_alone() -> io::Result<()> {
     use std::{
         io::BufRead,
         process::{Command, Stdio},
@@ -486,14 +646,12 @@ fn namespace_changed_child_cannot_be_registered() -> io::Result<()> {
     let mut line = String::new();
     io::BufReader::new(output).read_line(&mut line)?;
     let tgid: u32 = line.trim().parse().map_err(io::Error::other)?;
-    let registration = controller.task(tgid, 77);
-    // Rejected registration retains the pidfd, so fatal cleanup must kill this
-    // child too without affecting the unrelated unshare parent or host tasks.
-    controller.terminate()?;
-    child.wait()?;
-    assert_eq!(
-        registration.err().map(|error| error.kind()),
-        Some(io::ErrorKind::Unsupported)
-    );
+    let registration = controller.task(tgid, 77)?;
+    // The killed shell is its namespace's init, so the whole namespace and unshare end at once.
+    let ended = child.wait()?;
+    assert_eq!(registration, Admission::Refused);
+    assert!(!ended.success());
+    controller.publish(77, Answers::default())?;
+    assert!(controller.drain()?.is_empty());
     Ok(())
 }
