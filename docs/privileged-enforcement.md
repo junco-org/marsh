@@ -281,6 +281,10 @@ an installed generic kernel in a disposable QEMU guest with BPF LSM active inste
 
 ## 7. Security notes
 
+The threat model these notes are measured against, every kernel channel it implies and the plan to
+mediate all of them are in [`threat-model.md`](threat-model.md). The notes below are the current
+implementation's residuals; that document's §7 places each in its channel matrix.
+
 * The answers are computed from what ptrace observed. A secret read ptrace misses is still missed,
   and a read reaches the answers only at its exit stop (§4.4): the filesystem-side race of §2.
 * `TASK_ROOT` is filled before a child runs. A governed task without published answers is refused.
@@ -356,6 +360,9 @@ An earlier corpus run found the reader race §4.7's return-time hooks close: a r
 blocked in `recv` when tainted bytes arrived was not tainted by an entry-time hook.
 
 ## 9. Open questions
+
+Questions about completeness (untraced services, shared kernel tables, shared caches,
+delivery-time taint) are decisions in [`threat-model.md`](threat-model.md) §10.
 
 1. **Stale-window denials.** Committed-history changes and multi-class receipts refuse every
    guarded class until republished. Measure false denials with audit mode on the Harbor benchmark.
