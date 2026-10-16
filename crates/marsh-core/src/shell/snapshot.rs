@@ -17,12 +17,13 @@ use super::policy::{self, Denial, Event, PolicyDecision, PolicyKind, PolicyObser
 use super::session::Session;
 use super::taint::Taint;
 use super::{Principal, ShellError};
+use super::answers::{self, KernelAnswers};
 use marsh_instrument::{
-    Enforcer, ExecCommand, ExecDecision, ExecHooks, FileTarget, InvocationId, KernelPolicy, RootId,
-    Syscall, TraceRun,
+    Enforcement, Enforcer, ExecCommand, ExecDecision, ExecHooks, FileTarget, InvocationId,
+    KernelEvent, KernelPolicy, RootId, Syscall, TraceRun,
 };
 use marsh_lib::RecoverPoison as _;
-use marsh_peer_class::{Answers, Contact, LOOPBACK, MAX_CLASSES, UNIX};
+use marsh_peer_class::{ALLOW, CONTINGENT, DENY, MAX_TAINTS, RECEIPT, RULE, STALE, UNTRACED};
 
 #[derive(Default)]
 pub(super) struct CommandEvidence {
@@ -55,19 +56,12 @@ struct Prior {
 struct Verdicts {
     basis: Option<Basis>,
     answers: HashMap<String, Option<Denial>>,
-    generation: u64,
-    complete: bool,
-    contacts: HashMap<(u64, u32), Denial>,
-    sending: HashMap<u64, Vec<Taint>>,
-    // ponytail: retain denial generations for delayed io_uring reports until run end;
-    // prune earlier only with an event-delivery acknowledgement from the kernel.
 }
 
 /// What a set of [`Verdicts`] was decided from.
 #[derive(Clone, PartialEq, Eq)]
 struct Basis {
     run: TraceRun,
-    generation: u64,
     /// The policy validator's revision, which advances before any change to committed history.
     history: u64,
     /// The taint table's revision, which advances whenever any principal's taint changes.
@@ -125,6 +119,8 @@ pub(super) struct Snapshot {
     observer: Option<Arc<PolicyObserver>>,
     /// The agent policy's answers for the active command's contacts.
     verdicts: Mutex<Verdicts>,
+    /// In privileged mode, every class's answer for the kernel, kept current as the command runs.
+    kernel: OnceLock<Mutex<KernelAnswers>>,
     /// The run whose refused peers were reported, and the refusals reported for it: a program
     /// retrying a refused call is reported once.
     reported: Mutex<(Option<TraceRun>, HashSet<Event>)>,
@@ -151,9 +147,13 @@ impl Snapshot {
         session.check()?;
         let path = session.persistence.work(uid.as_str());
         let authority = session.validator.read();
+        let privileged = session.tracing.enforcement() == Enforcement::Privileged;
+        let kernel = OnceLock::new();
+        if let Some(agent) = agent.as_ref().filter(|_| privileged) {
+            let _ = kernel.set(Mutex::new(KernelAnswers::new(agent, &agent.acting(&uid))?));
+        }
         let mut access = Access::default();
-        access.kernel_contacts =
-            session.tracing.enforcement() == marsh_instrument::Enforcement::Privileged;
+        access.kernel_contacts = privileged;
         let tree_seq = authority.tree_seq;
         let epoch = session.epoch.load(Ordering::Acquire);
         let internal = session.tracing.internal_scope()?;
@@ -181,6 +181,7 @@ impl Snapshot {
             agent,
             observer,
             verdicts: Mutex::new(Verdicts::default()),
+            kernel,
             reported: Mutex::new((None, HashSet::new())),
         });
         let weak = Arc::downgrade(&snapshot);
@@ -321,21 +322,22 @@ impl Snapshot {
         drop(state);
         // Before the task resumes: a carrier is known before its writer can signal a reader, and
         // a reader's taint before it can reach a peer.
-        if let (Some(agent), Ok(effect)) = (&self.agent, &mut effect) {
+        let taint_changed = if let (Some(agent), Ok(effect)) = (&self.agent, &mut effect) {
             let mut table = self.session.taint.lock().recover();
             let before = table.revision();
             effect.taints = table.observe(&agent.acting(&self.uid), agent, effect);
-            let changed = table.revision() != before;
-            drop(table);
-            if changed {
-                self.session
-                    .invalidate_answers()
-                    .map_err(io::Error::other)?;
-            }
-        }
+            table.revision() != before
+        } else {
+            false
+        };
         let foreign = effect
             .as_ref()
             .is_ok_and(|effect| Session::invalidate_foreign(&self.path, &effect.outside_writes));
+        // A call that records nothing cannot change the kernel's answers: most calls.
+        let records = self.kernel.get().is_some()
+            && effect
+                .as_ref()
+                .is_ok_and(|effect| !agent::only_repeats(self.agent.as_deref(), effect, None));
         let mut state = self.state.lock().recover();
         if let Some((_, evidence)) = &mut state.evidence {
             if foreign {
@@ -352,38 +354,14 @@ impl Snapshot {
             evidence.records.push(info);
         }
         drop(state);
-        self.invalidate_if_changed()
-    }
-
-    fn invalidate_if_changed(&self) -> io::Result<()> {
-        if self.session.tracing.enforcement() != marsh_instrument::Enforcement::Privileged {
-            return Ok(());
+        // Likewise the kernel's answers, before the task can contact anything.
+        if taint_changed {
+            self.session.republish().map_err(io::Error::other)
+        } else if records {
+            self.republish()
+        } else {
+            Ok(())
         }
-        let Some(agent) = &self.agent else {
-            return Ok(());
-        };
-        let mut verdicts = self.verdicts.lock().recover();
-        let taint = self.session.taint.lock().recover().revision();
-        let history = self.session.validator.revision();
-        let current = {
-            let state = self.state.lock().recover();
-            match (&state.evidence, &mut verdicts.basis) {
-                (Some((run, evidence)), Some(basis)) => {
-                    basis.run == *run
-                        && basis.taint == taint
-                        && basis.history == history
-                        && basis.advance(agent, &evidence.effects)
-                }
-                _ => false,
-            }
-        };
-        drop(verdicts);
-        if !current {
-            self.session
-                .tracing
-                .stale(self.root().map_err(io::Error::other)?)?;
-        }
-        Ok(())
     }
 
     /// Whether the active command may reach `peer` (a native `sockaddr`, empty when unknown): its
@@ -501,9 +479,7 @@ impl Snapshot {
         let changed = table.revision() != before;
         drop(table);
         if changed {
-            self.session
-                .invalidate_answers()
-                .map_err(io::Error::other)?;
+            self.session.republish().map_err(io::Error::other)?;
         }
         Ok(())
     }
@@ -522,276 +498,6 @@ impl Snapshot {
                 Ok(effects)
             })
             .transpose()
-    }
-
-    /// Publishes every class under one history/taint/effect basis. The ptrace gate stays lazy.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "all class answers and their generation must be updated under one basis transaction"
-    )]
-    pub(super) fn refresh_all(
-        &self,
-        run: TraceRun,
-        source: Option<&FileTarget>,
-    ) -> io::Result<KernelPolicy> {
-        let agent = self
-            .agent
-            .as_ref()
-            .ok_or_else(|| io::Error::other("missing agent policy"))?;
-        let classes = agent.kernel_classes();
-        if classes.len() > MAX_CLASSES {
-            return Err(io::Error::other(
-                "agent policy exceeds the 64 kernel peer classes",
-            ));
-        }
-        let principal = agent.acting(&self.uid);
-        let source = self.read_source(source)?;
-        let sending =
-            self.session
-                .taint
-                .lock()
-                .recover()
-                .sending(&principal, agent, source.as_ref());
-        let mut verdicts = self.verdicts.lock().recover();
-        let taint = self.session.taint.lock().recover().revision();
-        let history = self.session.validator.revision();
-        let current = {
-            let state = self.state.lock().recover();
-            match (&state.evidence, &mut verdicts.basis) {
-                (Some((active, evidence)), Some(basis)) if *active == run => {
-                    basis.run == run
-                        && basis.history == history
-                        && basis.taint == taint
-                        && basis.advance(agent, &evidence.effects)
-                }
-                _ => false,
-            }
-        };
-        if !current || !verdicts.complete || source.is_some() {
-            let mut prior = self.prior(run, agent, &principal);
-            let (effects, order, last) = prior
-                .effects
-                .clone()
-                .ok_or_else(|| io::Error::other("inactive command policy refresh"))?;
-            let copied = source.is_some();
-            if let Some(source) = source {
-                prior.observations.extend(agent::observations(
-                    &[(u64::MAX, None, source)],
-                    &principal,
-                    Some(agent),
-                    |_| None,
-                    |_| Vec::new(),
-                ));
-            }
-            let authority = self.session.validator.read();
-            let generation = verdicts
-                .generation
-                .checked_add(1)
-                .ok_or_else(|| io::Error::other("policy generation exhaustion"))?;
-            if verdicts.basis.as_ref().is_none_or(|basis| basis.run != run) {
-                verdicts.contacts.clear();
-                verdicts.sending.clear();
-            }
-            verdicts.answers.clear();
-            for (id, class) in classes.iter().enumerate() {
-                let denial = agent.kernel_decide(
-                    &principal,
-                    class,
-                    &authority.observations,
-                    &prior.observations,
-                );
-                if let Some(denial) = &denial {
-                    verdicts.contacts.insert(
-                        (generation, u32::try_from(id).map_err(io::Error::other)?),
-                        denial.clone(),
-                    );
-                }
-                verdicts.answers.insert((*class).to_owned(), denial);
-            }
-            let history = self.session.validator.revision();
-            drop(authority);
-            verdicts.generation = generation;
-            verdicts.basis = Some(Basis {
-                run,
-                generation,
-                history,
-                taint: prior.taint,
-                effects,
-                order,
-                last,
-            });
-            verdicts.complete = !copied;
-            if !sending.is_empty() {
-                verdicts.sending.insert(generation, sending.clone());
-            }
-        }
-        let generation = verdicts
-            .basis
-            .as_ref()
-            .map_or(verdicts.generation, |basis| basis.generation);
-        let mut answers = Answers {
-            generation,
-            deny: 0,
-            guarded: 0,
-            local: 0,
-            stale: 0,
-            audit: u32::from(agent.audits()),
-        };
-        for (id, class) in classes.iter().enumerate() {
-            if agent.kernel_judges(&principal, class) {
-                answers.guarded |= 1u64 << id;
-            }
-            if verdicts.answers.get(*class).is_some_and(Option::is_some) {
-                answers.deny |= 1u64 << id;
-            }
-        }
-        if agent.denies_untraced_local() {
-            answers.guarded |= (1u64 << UNIX) | (1u64 << LOOPBACK);
-            if !sending.is_empty() {
-                answers.local = (1u64 << UNIX) | (1u64 << LOOPBACK);
-            }
-        }
-        drop(verdicts);
-        let local = if answers.local != 0 {
-            let roots: Vec<_> = self.followed().into_keys().collect();
-            self.session.tracing.local_endpoints(&roots)?
-        } else {
-            Vec::new()
-        };
-        Ok(KernelPolicy {
-            answers,
-            networks: agent.kernel_networks()?,
-            local,
-        })
-    }
-
-    fn handoff(&self, peer: &[u8], source: Option<&FileTarget>) -> io::Result<()> {
-        let Some(agent) = &self.agent else {
-            return Ok(());
-        };
-        let principal = agent.acting(&self.uid);
-        let source = self.read_source(source)?;
-        let sending =
-            self.session
-                .taint
-                .lock()
-                .recover()
-                .sending(&principal, agent, source.as_ref());
-        if !sending.is_empty()
-            && let Some(sockets) = self.session.tracing.receivers(peer)
-        {
-            self.hand_taint(
-                &principal,
-                &Peer::decode(peer),
-                &sending,
-                &sockets,
-                &self.followed(),
-            )?;
-        }
-        Ok(())
-    }
-
-    pub(super) fn contact(&self, run: TraceRun, contact: Contact) -> io::Result<()> {
-        let Some(agent) = &self.agent else {
-            return Ok(());
-        };
-        let principal = agent.acting(&self.uid);
-        let bytes = contact.endpoint.sockaddr();
-        let peer = Peer::decode(&bytes);
-        let verdicts = self.verdicts.lock().recover();
-        let cached = verdicts
-            .contacts
-            .get(&(contact.generation, contact.class))
-            .cloned();
-        let sending = verdicts
-            .sending
-            .get(&contact.generation)
-            .cloned()
-            .unwrap_or_else(|| {
-                self.session
-                    .taint
-                    .lock()
-                    .recover()
-                    .sending(&principal, agent, None)
-            });
-        drop(verdicts);
-        if contact.decision != 0 {
-            let classes = agent.kernel_classes();
-            let class = classes
-                .get(contact.class as usize)
-                .copied()
-                .unwrap_or("unknown");
-            let denial = if contact.decision >= 3 {
-                Denial {
-                    event: Event::new(principal.clone(), super::Action::Edit, ["net", class]),
-                    failed_precondition: "policy answers stale before the kernel contact".into(),
-                    allowed_fixes: Vec::new(),
-                }
-            } else {
-                cached
-                    .or_else(|| {
-                        if matches!(contact.class, UNIX | LOOPBACK) {
-                            untraced_denial(
-                                agent,
-                                &principal,
-                                &peer,
-                                &sending,
-                                &[HashSet::new()],
-                                &HashMap::new(),
-                            )
-                        } else {
-                            None
-                        }
-                    })
-                    .or_else(|| {
-                        (contact.class == marsh_peer_class::UNKNOWN).then(|| Denial {
-                            event: Event::new(
-                                principal.clone(),
-                                super::Action::Edit,
-                                ["net", "unknown"],
-                            ),
-                            failed_precondition:
-                                "kernel could not establish a permitted socket peer".into(),
-                            allowed_fixes: Vec::new(),
-                        })
-                    })
-                    .ok_or_else(|| io::Error::other("kernel denial has no cached policy answer"))?
-            };
-            self.report(run, agent, &denial);
-        }
-        if matches!(contact.decision, 0 | 2 | 4)
-            && !sending.is_empty()
-            && let Some(sockets) = self.session.tracing.receivers(&bytes)
-        {
-            self.hand_taint(&principal, &peer, &sending, &sockets, &self.followed())?;
-        }
-        Ok(())
-    }
-
-    /// Records an io-wq hook event without inventing a ptrace syscall for its untracked tid.
-    pub(super) fn asynchronous_contact(
-        &self,
-        run: TraceRun,
-        builtin: Option<InvocationId>,
-        order: u64,
-        contact: Contact,
-    ) -> io::Result<()> {
-        let mut state = self.state.lock().recover();
-        let (active, evidence) = state.evidence.as_mut().ok_or_else(|| {
-            io::Error::other("asynchronous contact has no active command evidence")
-        })?;
-        if *active != run {
-            return Err(io::Error::other(
-                "asynchronous contact command identity mismatch",
-            ));
-        }
-        let mut effects = Effects::default();
-        effects
-            .peers
-            .push(Peer::decode(&contact.endpoint.sockaddr()));
-        evidence.effects.push((order, builtin, effects));
-        drop(state);
-        self.invalidate_if_changed()
     }
 
     /// The agent policy's refusal, if any, of the active command reaching `peer`; see
@@ -870,7 +576,6 @@ impl Snapshot {
         if let Some((count, order, last)) = prior.effects {
             let basis = Basis {
                 run,
-                generation: verdicts.generation,
                 history,
                 taint: prior.taint,
                 effects: count,
@@ -879,7 +584,6 @@ impl Snapshot {
             };
             if verdicts.basis.as_ref() != Some(&basis) {
                 verdicts.answers.clear();
-                verdicts.complete = false;
                 verdicts.basis = Some(basis);
             }
             verdicts.answers.insert(class, denial.clone());
@@ -1124,7 +828,238 @@ impl Snapshot {
             None => drop(runner),
         }
     }
+
+    /// The root's kernel answers for the command `run`, including a read of `source`, the file
+    /// the stopped call copies into a socket in-kernel. `None` without privileged answers.
+    pub(super) fn kernel_policy(
+        &self,
+        run: TraceRun,
+        source: Option<&FileTarget>,
+    ) -> io::Result<Option<KernelPolicy>> {
+        let (Some(agent), Some(kernel)) = (&self.agent, self.kernel.get()) else {
+            return Ok(None);
+        };
+        let principal = agent.acting(&self.uid);
+        let copied = self.read_source(source)?;
+        // Lock order: answers, authority, then evidence, as `prepare` takes the last two. Taint is
+        // read under the answers lock, which receipts hold while folding into it.
+        let mut kernel = kernel.lock().recover();
+        self.decide_kernel(&mut kernel, agent, &principal, run, copied).map(Some)
+    }
+
+    /// Decides `kernel` for the command `run`; the caller holds its lock.
+    fn decide_kernel(
+        &self,
+        kernel: &mut KernelAnswers,
+        agent: &AgentPolicy,
+        principal: &Principal,
+        run: TraceRun,
+        copied: Option<Effects>,
+    ) -> io::Result<KernelPolicy> {
+        let (taint, received, carried) = {
+            let table = self.session.taint.lock().recover();
+            (
+                table.revision(),
+                table.received(principal),
+                table.sending(principal, agent, copied.as_ref()),
+            )
+        };
+        let source = copied.map_or_else(Vec::new, |source| {
+            agent::observations(
+                &[(u64::MAX, None, source)],
+                principal,
+                Some(agent),
+                |_| None,
+                |_| Vec::new(),
+            )
+        });
+        let authority = self.session.validator.read();
+        let history = self.session.validator.revision();
+        let state = self.state.lock().recover();
+        let (effects, baseline): (&[_], &Path) = match &state.evidence {
+            Some((active, evidence)) if *active == run => (&evidence.effects, &evidence.baseline),
+            _ => (&[], &self.path),
+        };
+        let policy = kernel.refresh(
+            &answers::Inputs {
+                agent,
+                principal,
+                work: &self.path,
+                history: (history, &authority.observations),
+                taint,
+                received: &received,
+                carried: &carried,
+                source: &source,
+            },
+            &answers::Command {
+                run,
+                effects,
+                baseline,
+            },
+        );
+        drop(state);
+        drop(authority);
+        policy
+    }
+
+    /// `run`'s answers decided from scratch, for comparison with the incremental ones.
+    #[cfg(test)]
+    pub(super) fn fresh_kernel_policy(&self, run: TraceRun) -> io::Result<KernelPolicy> {
+        let agent = self.agent.as_ref().ok_or_else(|| io::Error::other("no agent policy"))?;
+        let principal = agent.acting(&self.uid);
+        let mut fresh = KernelAnswers::new(agent, &principal)?;
+        self.decide_kernel(&mut fresh, agent, &principal, run, None)
+    }
+
+    /// Publishes the active command's answers to the kernel, if it has privileged answers.
+    pub(super) fn republish(&self) -> io::Result<()> {
+        let Some(run) = self
+            .state
+            .lock()
+            .recover()
+            .evidence
+            .as_ref()
+            .map(|(run, _)| *run)
+        else {
+            return Ok(());
+        };
+        match self.kernel_policy(run, None)? {
+            Some(policy) => self
+                .session
+                .tracing
+                .publish(self.root().map_err(io::Error::other)?, policy),
+            None => Ok(()),
+        }
+    }
+
+    /// Decides kernel answers without a loaded kernel, as privileged mode would.
+    #[cfg(test)]
+    pub(super) fn enable_kernel_answers(&self) -> io::Result<()> {
+        let agent = self.agent.as_ref().ok_or_else(|| io::Error::other("no agent policy"))?;
+        let _ = self
+            .kernel
+            .set(Mutex::new(KernelAnswers::new(agent, &agent.acting(&self.uid))?));
+        Ok(())
+    }
+
+    /// A kernel contact or taint receipt of the command `run`.
+    pub(super) fn kernel_event(
+        &self,
+        run: TraceRun,
+        builtin: Option<InvocationId>,
+        event: &KernelEvent,
+    ) -> io::Result<()> {
+        let (Some(agent), Some(kernel)) = (&self.agent, self.kernel.get()) else {
+            return Ok(());
+        };
+        let principal = agent.acting(&self.uid);
+        if event.kind == RECEIPT {
+            let classes = answers::taint_classes();
+            let sender = self
+                .followed()
+                .into_iter()
+                .find(|(root, _)| root.get() == event.sender)
+                .map_or_else(
+                    || Principal::new(format!("marsh root {}", event.sender)),
+                    |(_, principal)| principal,
+                );
+            let mut kernel = kernel.lock().recover();
+            let mut table = self.session.taint.lock().recover();
+            for id in (0..MAX_TAINTS).filter(|id| event.taint & (1 << id) != 0) {
+                if let Some(class) = classes.get(id) {
+                    table.hand(
+                        &principal,
+                        Taint {
+                            class: class.clone(),
+                            from: sender.clone(),
+                            via: "a local socket".into(),
+                        },
+                    );
+                }
+                kernel.acknowledge(id);
+            }
+            drop(table);
+            drop(kernel);
+            return self.session.republish().map_err(io::Error::other);
+        }
+        let peer = Peer::decode(&event.endpoint.sockaddr());
+        if event.decision != ALLOW {
+            let denial = self.kernel_denial(agent, &principal, &peer, event);
+            self.report(run, agent, &denial);
+        }
+        if event.decision != DENY {
+            let mut state = self.state.lock().recover();
+            let (active, evidence) = state
+                .evidence
+                .as_mut()
+                .ok_or_else(|| io::Error::other("kernel contact has no active command evidence"))?;
+            if *active != run {
+                return Err(io::Error::other("kernel contact command identity mismatch"));
+            }
+            evidence.effects.push((
+                event.time,
+                builtin,
+                Effects {
+                    peers: vec![peer],
+                    ..Effects::default()
+                },
+            ));
+            drop(state);
+        }
+        self.republish()
+    }
+
+    /// What the kernel refused `event` for, in the words the ptrace gate would use.
+    fn kernel_denial(
+        &self,
+        agent: &AgentPolicy,
+        principal: &Principal,
+        peer: &Peer,
+        event: &KernelEvent,
+    ) -> Denial {
+        let kernel = self.kernel.get().map(|kernel| kernel.lock().recover());
+        let class = kernel
+            .as_ref()
+            .and_then(|kernel| kernel.classes().get(event.class as usize).cloned())
+            .unwrap_or_else(|| "unknown".into());
+        let cached = kernel
+            .as_ref()
+            .and_then(|kernel| kernel.denial(event.class as usize).cloned());
+        drop(kernel);
+        let refused = |failed_precondition: &str| Denial {
+            event: Event::new(principal.clone(), super::Action::Edit, ["net", class.as_str()]),
+            failed_precondition: failed_precondition.into(),
+            allowed_fixes: Vec::new(),
+        };
+        match event.reason {
+            RULE | CONTINGENT => cached.unwrap_or_else(|| {
+                refused("the kernel refused the contact with the answers in force when it ran")
+            }),
+            STALE => refused("policy answers were stale when the kernel judged the contact"),
+            UNTRACED => {
+                let sending = self
+                    .session
+                    .taint
+                    .lock()
+                    .recover()
+                    .sending(principal, agent, None);
+                untraced_denial(
+                    agent,
+                    principal,
+                    peer,
+                    &sending,
+                    &[HashSet::new()],
+                    &HashMap::new(),
+                )
+                .unwrap_or_else(|| {
+                    refused("a propagated class may not reach a local peer marsh does not trace")
+                })
+            }
+            _ => refused("the kernel had no policy answers for the contact"),
+        }
+    }
 }
+
 struct SnapshotEnforcer(Weak<Snapshot>);
 impl SnapshotEnforcer {
     fn snapshot(&self) -> io::Result<Arc<Snapshot>> {
@@ -1145,29 +1080,18 @@ impl Enforcer for SnapshotEnforcer {
             .upgrade()
             .is_some_and(|snapshot| snapshot.permits_peer(run, peer, source))
     }
-    fn refresh(
-        &self,
-        run: TraceRun,
-        _: Option<InvocationId>,
-        source: Option<&FileTarget>,
-    ) -> io::Result<KernelPolicy> {
-        self.snapshot()?.refresh_all(run, source)
+    fn refresh(&self, run: TraceRun, source: Option<&FileTarget>) -> io::Result<KernelPolicy> {
+        self.snapshot()?
+            .kernel_policy(run, source)?
+            .ok_or_else(|| io::Error::other("kernel refresh for a root without privileged answers"))
     }
-    fn handoff(&self, _: TraceRun, peer: &[u8], source: Option<&FileTarget>) -> io::Result<()> {
-        self.snapshot()?.handoff(peer, source)
-    }
-    fn contact(&self, run: TraceRun, _: Option<InvocationId>, event: Contact) -> io::Result<()> {
-        self.snapshot()?.contact(run, event)
-    }
-    fn asynchronous_contact(
+    fn event(
         &self,
         run: TraceRun,
         builtin: Option<InvocationId>,
-        order: u64,
-        event: Contact,
+        event: &KernelEvent,
     ) -> io::Result<()> {
-        self.snapshot()?
-            .asynchronous_contact(run, builtin, order, event)
+        self.snapshot()?.kernel_event(run, builtin, event)
     }
 }
 
@@ -1243,6 +1167,10 @@ pub(super) fn prepare(
     state.dirty = true;
     drop(state);
     drop(authority);
+    // The previous command's answers must not judge this one. A failed publish leaves them stale,
+    // refusing what any rule could, and fails again where the tracer next needs them.
+    session.tracing.stale(snapshot.root()?)?;
+    let _ = snapshot.republish();
     let run = Arc::new(Run::managed(
         runtime,
         Arc::clone(&session.tracing),

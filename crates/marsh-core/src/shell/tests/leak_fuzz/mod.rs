@@ -43,7 +43,7 @@ const SINK_HOST: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 1);
 /// Set in the re-executed child so it runs the corpus instead of re-entering `unshare`.
 const IN_NAMESPACE: &str = "MARSH_LEAK_NS";
 /// How long a single command may run before the runner moves on and records a timeout.
-const STEP_TIMEOUT: Duration = Duration::from_secs(45);
+const STEP_TIMEOUT: Duration = Duration::from_secs(90);
 /// A background step (one ending in `&`) should return at once; this only bounds a misbehaving one.
 const BACKGROUND_TIMEOUT: Duration = Duration::from_secs(6);
 /// Time left for in-flight bytes to reach the sink after a case's steps finish.
@@ -212,7 +212,23 @@ fn random_seed() -> u64 {
         })
 }
 
+/// Keeps a case's random stream independent of corpus ordering and other cases.
+fn case_seed(seed: u64, name: &str, iteration: usize) -> u64 {
+    let mut hash = seed ^ 0xCBF2_9CE4_8422_2325;
+    for byte in name
+        .bytes()
+        .chain(u64::try_from(iteration).unwrap_or(u64::MAX).to_le_bytes())
+    {
+        hash = (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01B3);
+    }
+    hash
+}
+
 /// Runs the whole corpus and returns how many cases failed.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one seeded campaign loop: selection, mutation, both modes' checks and the summary"
+)]
 async fn run_corpus() -> usize {
     // Keep the process-wide service alive across cases instead of re-verifying BPF each time.
     let _tracing = marsh_instrument::Tracing::shared_with_enforcement(enforcement())
@@ -221,19 +237,27 @@ async fn run_corpus() -> usize {
     let (cases, gaps) =
         case::load(&dir).unwrap_or_else(|error| panic!("load {}: {error}", dir.display()));
     let filter = std::env::var("MARSH_LEAK_FILTER").ok();
-    let iterations: usize = std::env::var("MARSH_LEAK_ITERATIONS")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(1)
-        .max(1);
+    let iterations = std::env::var("MARSH_LEAK_ITERATIONS")
+        .map_or(Ok(1), |value| value.parse::<usize>())
+        .unwrap_or_else(|error| panic!("invalid MARSH_LEAK_ITERATIONS: {error}"));
+    assert!(iterations > 0, "MARSH_LEAK_ITERATIONS must be positive");
     let seed = std::env::var("MARSH_LEAK_SEED")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or_else(random_seed);
+        .map_or_else(|_| Ok(random_seed()), |value| value.parse::<u64>())
+        .unwrap_or_else(|error| panic!("invalid MARSH_LEAK_SEED: {error}"));
+
+    let selected = cases.iter().filter(|case| {
+        filter
+            .as_ref()
+            .is_none_or(|needle| case.name.contains(needle.as_str()))
+    });
+    let selected_count = selected.count();
+    assert!(
+        selected_count > 0,
+        "MARSH_LEAK_FILTER matched no corpus cases"
+    );
 
     eprintln!(
-        "leak_corpus: {} case(s) from {}",
-        cases.len(),
+        "leak_corpus: {selected_count} case(s) from {}",
         dir.display()
     );
     eprintln!("leak_corpus: seed={seed} iterations={iterations}");
@@ -241,7 +265,6 @@ async fn run_corpus() -> usize {
         eprintln!("leak_corpus: filter={filter:?}");
     }
 
-    let mut rng = Rng::new(seed);
     let mut rows: Vec<Row> = Vec::new();
     let mut failures = 0;
 
@@ -266,19 +289,24 @@ async fn run_corpus() -> usize {
             .map(|gap| gap.reason.clone());
         let known_gap = gap_reason.is_some();
         for iteration in 0..iterations {
+            let mut rng = Rng::new(case_seed(seed, &case.name, iteration));
             let variants = sample_variants(case, &mut rng, iteration);
+            let mut run_case = case.clone();
+            if iteration > 0 {
+                mutate_case(&mut run_case, &mut rng);
+            }
             let token = canary(&mut rng);
-            let outcome = run_once(case, &variants, &token, PolicyMode::Enforce).await;
-            let verdict = assess(case, gap_reason.as_deref(), &outcome);
+            let outcome = run_once(&run_case, &variants, &token, PolicyMode::Enforce).await;
+            let verdict = assess(&run_case, gap_reason.as_deref(), &outcome);
+            let iteration_label = format!("iteration={iteration} {}", case::describe(&variants));
             if verdict.is_failure() {
                 failures += 1;
                 let (minimal, minimal_variants) =
-                    minimize_failure(case, &variants, &token, gap_reason.clone()).await;
+                    minimize_failure(&run_case, &variants, &token, gap_reason.clone()).await;
                 eprintln!(
-                    "\n=== FAIL {} [{}] ===\n{}",
+                    "\n=== FAIL {} [{iteration_label}] ===\n{}",
                     case.name,
-                    case::describe(&variants),
-                    outcome.report(case, &verdict)
+                    outcome.report(&run_case, &verdict)
                 );
                 eprintln!(
                     "--- minimal reproducer ---\n{}",
@@ -288,19 +316,25 @@ async fn run_corpus() -> usize {
             rows.push(Row {
                 name: case.name.clone(),
                 kind: case.kind,
-                variants: case::describe(&variants),
+                variants: iteration_label.clone(),
                 status: verdict.status,
             });
-            // The audit cross-check runs once per case, on its first iteration.
-            if iteration == 0 && case.kind == Kind::Attack && !known_gap {
-                if let Some(problem) = audit_cross_check(case, &variants, &mut rng).await {
+            if case.kind == Kind::Attack {
+                // Audit must prove this exact sequence and variant reaches the sink. Registered
+                // gaps waive only the denial expectation, never the execution proof.
+                if let Some((status, problem)) =
+                    audit_cross_check(&run_case, &variants, &mut rng, !known_gap).await
+                {
                     failures += 1;
-                    eprintln!("\n=== FAIL {} (audit) ===\n{problem}", case.name);
+                    eprintln!(
+                        "\n=== FAIL {} [{iteration_label}; audit] ===\n{problem}",
+                        case.name
+                    );
                     rows.push(Row {
                         name: format!("{} (audit)", case.name),
                         kind: case.kind,
-                        variants: "-".to_owned(),
-                        status: Status::AuditGap,
+                        variants: iteration_label,
+                        status,
                     });
                 }
             }
@@ -309,6 +343,89 @@ async fn run_corpus() -> usize {
 
     print_summary(&rows);
     failures
+}
+
+/// Add only policy-neutral scheduling noise; every attack technique remains corpus-authored.
+fn mutate_case(case: &mut Case, rng: &mut Rng) {
+    const FILLER: [&str; 3] = ["true", "pwd", "ls"];
+    let optional_positions: Vec<usize> = case
+        .steps
+        .iter()
+        .enumerate()
+        .filter_map(|(index, step)| step.optional.then_some(index))
+        .collect();
+    let mut optional_steps: Vec<Step> = optional_positions
+        .iter()
+        .map(|&index| case.steps[index].clone())
+        .collect();
+    for index in (1..optional_steps.len()).rev() {
+        let other = rng.below(index + 1);
+        optional_steps.swap(index, other);
+    }
+    for (index, step) in optional_positions.into_iter().zip(optional_steps) {
+        case.steps[index] = step;
+    }
+
+    for _ in 0..=rng.below(2) {
+        let position = rng.below(case.steps.len() + 1);
+        // A shell still running an earlier background step is busy and would refuse a filler.
+        let idle: Vec<usize> = (0..case.shells())
+            .filter(|shell| {
+                !case.steps[..position]
+                    .iter()
+                    .any(|step| step.shell == *shell && step.background().is_some())
+            })
+            .collect();
+        if idle.is_empty() {
+            continue;
+        }
+        let step = Step {
+            shell: idle[rng.below(idle.len())],
+            run: FILLER[rng.below(FILLER.len())].to_owned(),
+            expect: Expect::Accepted,
+            optional: false,
+            filler: true,
+        };
+        case.steps.insert(position, step);
+    }
+}
+/// The verdict on one run. Where a leak landed is reported from the outcome, not stored here.
+#[derive(Clone)]
+enum Status {
+    /// Attack blocked: the canary never reached the sink. Pass.
+    Blocked,
+    /// Control delivered: the canary reached the sink. Pass.
+    Delivered,
+    /// Attack leaked and the case is not a registered gap. Fail.
+    Leaked,
+    /// Attack leaked but the case is a registered known gap, with its reason. Pass.
+    KnownGap(String),
+    /// Control did not deliver: a false denial. Fail.
+    FalseDenial,
+    /// Audit mode did not report a block that enforcement makes. Fail.
+    AuditGap,
+    /// The case timed out or hit a shell error, so its oracle result is invalid.
+    Inconclusive,
+}
+
+impl Status {
+    const fn is_failure(&self) -> bool {
+        matches!(
+            self,
+            Self::Leaked | Self::FalseDenial | Self::AuditGap | Self::Inconclusive
+        )
+    }
+    const fn label(&self) -> &'static str {
+        match self {
+            Self::Blocked => "blocked",
+            Self::Delivered => "delivered",
+            Self::Leaked => "LEAKED",
+            Self::KnownGap(_) => "known-gap",
+            Self::FalseDenial => "FALSE-DENIAL",
+            Self::AuditGap => "AUDIT-GAP",
+            Self::Inconclusive => "INCONCLUSIVE",
+        }
+    }
 }
 
 /// How a policy is applied for a run.
@@ -338,6 +455,7 @@ enum StepOutcome {
     Accepted,
     Exited(u8),
     Refused,
+    Unsupported(String),
     Error(String),
     Timeout,
 }
@@ -348,6 +466,7 @@ impl StepOutcome {
             Self::Accepted => "accepted".to_owned(),
             Self::Exited(code) => format!("exit {code}"),
             Self::Refused => "refused".to_owned(),
+            Self::Unsupported(message) => format!("unsupported: {message}"),
             Self::Error(message) => format!("error: {message}"),
             Self::Timeout => "timeout".to_owned(),
         }
@@ -360,8 +479,8 @@ impl Outcome {
         oracle::find(self.token.as_bytes(), &self.encodings, &self.hits)
     }
 
-    /// Each step whose outcome did not match its `expect`, as a human-readable line. Background
-    /// steps are exempt: their recorded timeout is expected, not a result.
+    /// Each non-background step whose outcome disagreed with its `expect`. Shell errors and
+    /// unexpected foreground timeouts are handled by `inconclusive_steps`.
     fn expectation_violations(&self, case: &Case) -> Vec<String> {
         let mut violations = Vec::new();
         for (index, outcome) in &self.steps {
@@ -387,6 +506,46 @@ impl Outcome {
             }
         }
         violations
+    }
+
+    /// Unexpected errors/timeouts are inconclusive. Background timeouts are the corpus's normal
+    /// long-lived-server result; unsupported attacks need matching network-denial evidence.
+    fn inconclusive_steps(&self, case: &Case) -> Vec<String> {
+        self.steps
+            .iter()
+            .filter_map(|(index, outcome)| {
+                let step = &case.steps[*index];
+                let expected_background_timeout =
+                    step.background().is_some() && matches!(outcome, StepOutcome::Timeout);
+                let unsupported = matches!(outcome, StepOutcome::Unsupported(_));
+                let corroborated_unsupported_attack =
+                    unsupported && case.kind == Kind::Attack && self.has_network_denial();
+                // Only kernel mode accepts these effects; ptrace's observer refuses them by design.
+                let expected_unprivileged_unsupported = unsupported
+                    && step.expect == Expect::AcceptedPrivileged
+                    && enforcement() != marsh_instrument::Enforcement::Privileged;
+                if expected_background_timeout
+                    || corroborated_unsupported_attack
+                    || expected_unprivileged_unsupported
+                    || !matches!(
+                        outcome,
+                        StepOutcome::Error(_) | StepOutcome::Unsupported(_) | StepOutcome::Timeout
+                    )
+                {
+                    return None;
+                }
+                Some(format!(
+                    "step [{index}] did not complete: {}",
+                    outcome.label()
+                ))
+            })
+            .collect()
+    }
+
+    fn has_network_denial(&self) -> bool {
+        self.denials
+            .iter()
+            .any(|denial| denial.contains("net/") || denial.contains("network peer"))
     }
 
     /// A multi-line explanation for a failing case.
@@ -424,39 +583,6 @@ impl Outcome {
     }
 }
 
-/// The verdict on one run. Where a leak landed is reported from the outcome, not stored here.
-#[derive(Clone)]
-enum Status {
-    /// Attack blocked: the canary never reached the sink. Pass.
-    Blocked,
-    /// Control delivered: the canary reached the sink. Pass.
-    Delivered,
-    /// Attack leaked and the case is not a registered gap. Fail.
-    Leaked,
-    /// Attack leaked but the case is a registered known gap, with its reason. Pass.
-    KnownGap(String),
-    /// Control did not deliver: a false denial. Fail.
-    FalseDenial,
-    /// Audit mode did not report a block that enforcement makes. Fail.
-    AuditGap,
-}
-
-impl Status {
-    const fn is_failure(&self) -> bool {
-        matches!(self, Self::Leaked | Self::FalseDenial | Self::AuditGap)
-    }
-    const fn label(&self) -> &'static str {
-        match self {
-            Self::Blocked => "blocked",
-            Self::Delivered => "delivered",
-            Self::Leaked => "LEAKED",
-            Self::KnownGap(_) => "known-gap",
-            Self::FalseDenial => "FALSE-DENIAL",
-            Self::AuditGap => "AUDIT-GAP",
-        }
-    }
-}
-
 /// The leak verdict plus any step-expectation violations.
 struct Verdict {
     status: Status,
@@ -472,19 +598,23 @@ impl Verdict {
 
 /// The verdict for a completed run. `gap_reason` is `Some` when the case is a registered gap.
 fn assess(case: &Case, gap_reason: Option<&str>, outcome: &Outcome) -> Verdict {
-    let status = match (case.kind, outcome.leak().is_some()) {
-        (Kind::Attack, true) => match gap_reason {
-            Some(reason) => Status::KnownGap(reason.to_owned()),
-            None => Status::Leaked,
-        },
-        (Kind::Attack, false) => Status::Blocked,
-        (Kind::Control, true) => Status::Delivered,
-        (Kind::Control, false) => Status::FalseDenial,
+    let mut violations = outcome.expectation_violations(case);
+    let issues = outcome.inconclusive_steps(case);
+    violations.extend(issues.clone());
+    let status = if !issues.is_empty() {
+        Status::Inconclusive
+    } else {
+        match (case.kind, outcome.leak().is_some()) {
+            (Kind::Attack, true) => match gap_reason {
+                Some(reason) => Status::KnownGap(reason.to_owned()),
+                None => Status::Leaked,
+            },
+            (Kind::Attack, false) => Status::Blocked,
+            (Kind::Control, true) => Status::Delivered,
+            (Kind::Control, false) => Status::FalseDenial,
+        }
     };
-    Verdict {
-        status,
-        violations: outcome.expectation_violations(case),
-    }
+    Verdict { status, violations }
 }
 
 /// Builds the agent policy a case names, in the requested mode and with its principal.
@@ -617,47 +747,72 @@ async fn run_step(
                 StepOutcome::Exited(code)
             }
         }
-        Ok(Err(error)) => {
-            if matches!(error.kind(), ShellErrorKind::Denied { .. }) {
-                StepOutcome::Refused
-            } else {
-                StepOutcome::Error(error.to_string())
-            }
-        }
-        // A background step is meant to keep running; a foreground timeout is recorded as one.
+        Ok(Err(error)) => match error.kind() {
+            ShellErrorKind::Denied { .. } => StepOutcome::Refused,
+            ShellErrorKind::Unsupported => StepOutcome::Unsupported(error.to_string()),
+            _ => StepOutcome::Error(error.to_string()),
+        },
+        // A background step's timeout is expected; foreground timeouts invalidate the run.
         Err(_) => StepOutcome::Timeout,
     }
 }
 
-/// Checks that audit mode reports the block enforcement makes.
-///
-/// Under audit the egress is not blocked, so the canary reaches the sink; the policy must still
-/// have reported a would-block for an external peer. A missing report means audit does not see what
-/// enforcement stops. Returns a description of the problem, or `None` when consistent.
+/// Proves the attack reaches its sink in audit mode and, except for registered gaps, is judged.
 async fn audit_cross_check(
     case: &Case,
     variants: &BTreeMap<String, String>,
     rng: &mut Rng,
-) -> Option<String> {
+    require_would_block: bool,
+) -> Option<(Status, String)> {
     let token = canary(rng);
     let outcome = run_once(case, variants, &token, PolicyMode::Audit).await;
-    // Audit never blocks, so the canary is expected to reach the sink. The check is only that the
-    // policy reported the block enforcement would make; a run that never egressed proves nothing.
-    outcome.leak()?;
-    let reported = outcome
-        .denials
-        .iter()
-        .any(|denial| denial.contains("net/") || denial.contains("network peer"));
+    if let Some(issue) = outcome.inconclusive_steps(case).first() {
+        let status = Status::Inconclusive;
+        let verdict = Verdict {
+            status: status.clone(),
+            violations: vec![issue.clone()],
+        };
+        return Some((
+            status,
+            format!(
+                "audit execution was inconclusive.\n{}",
+                outcome.report(case, &verdict)
+            ),
+        ));
+    }
+    // Audit never blocks. Reaching the sink proves this exact variant exercised the attack path.
+    if outcome.leak().is_none() {
+        let status = Status::Inconclusive;
+        let verdict = Verdict {
+            status: status.clone(),
+            violations: vec!["audit did not deliver the canary to a sink".to_owned()],
+        };
+        return Some((
+            status,
+            format!(
+                "audit did not exercise this attack.\n{}",
+                outcome.report(case, &verdict)
+            ),
+        ));
+    }
+    if !require_would_block {
+        return None;
+    }
+    let reported = outcome.has_network_denial();
     if reported {
         return None;
     }
+    let status = Status::AuditGap;
     let verdict = Verdict {
-        status: Status::AuditGap,
+        status: status.clone(),
         violations: Vec::new(),
     };
-    Some(format!(
-        "audit leaked but produced no would-block report for an external peer.\n{}",
-        outcome.report(case, &verdict)
+    Some((
+        status,
+        format!(
+            "audit leaked but produced no would-block report for an external peer.\n{}",
+            outcome.report(case, &verdict)
+        ),
     ))
 }
 
@@ -730,4 +885,155 @@ fn print_summary(rows: &[Row]) {
     }
     let failures = rows.iter().filter(|row| row.status.is_failure()).count();
     eprintln!("  {} case-run(s), {failures} failure(s)", rows.len());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn corpus_case(name: &str) -> Case {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/leak-corpus");
+        case::load(&dir)
+            .unwrap()
+            .0
+            .into_iter()
+            .find(|case| case.name == name)
+            .unwrap()
+    }
+
+    #[test]
+    fn seeded_mutations_are_repeatable_and_preserve_required_step_order() {
+        let original = corpus_case("control-plain-egress");
+        assert_ne!(case_seed(19, "control", 2), case_seed(19, "control", 3));
+        assert_ne!(case_seed(19, "control", 2), case_seed(19, "other", 2));
+        let optional_order = |case: &Case| {
+            case.steps
+                .iter()
+                .filter(|step| step.optional)
+                .map(|step| step.run.clone())
+                .collect::<Vec<_>>()
+        };
+        let original_optional = optional_order(&original);
+        let reorders_optional = (0..32).any(|seed| {
+            let mut candidate = original.clone();
+            mutate_case(&mut candidate, &mut Rng::new(seed));
+            optional_order(&candidate) != original_optional
+        });
+        assert!(
+            reorders_optional,
+            "optional steps must be shuffled across seeds"
+        );
+
+        let mut first = original.clone();
+        let mut second = original.clone();
+        mutate_case(&mut first, &mut Rng::new(19));
+        mutate_case(&mut second, &mut Rng::new(19));
+        let signature = |case: &Case| {
+            case.steps
+                .iter()
+                .map(|step| (step.shell, step.run.clone(), step.optional, step.filler))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(signature(&first), signature(&second));
+        let required = |case: &Case| {
+            case.steps
+                .iter()
+                .filter(|step| !step.optional && !step.filler)
+                .map(|step| step.run.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(required(&first), required(&original));
+        assert!(first.steps.iter().any(|step| step.filler));
+        assert!(first.steps.iter().filter(|step| step.filler).all(|step| {
+            matches!(step.run.as_str(), "true" | "pwd" | "ls") && step.expect == Expect::Accepted
+        }));
+    }
+
+    #[test]
+    fn fillers_never_target_a_shell_busy_with_a_background_step() {
+        let original = corpus_case("proxy-via-loopback");
+        for seed in 0..64 {
+            let mut mutated = original.clone();
+            mutate_case(&mut mutated, &mut Rng::new(seed));
+            for (index, step) in mutated.steps.iter().enumerate() {
+                let busy = mutated.steps[..index]
+                    .iter()
+                    .any(|earlier| earlier.shell == step.shell && earlier.background().is_some());
+                assert!(!(step.filler && busy), "seed {seed}: filler on a busy shell");
+            }
+        }
+    }
+
+    #[test]
+    fn ptrace_refusing_a_kernel_only_effect_is_the_expected_unprivileged_outcome() {
+        if enforcement() == marsh_instrument::Enforcement::Privileged {
+            return;
+        }
+        let case = corpus_case("control-io-uring-send");
+        let index = case
+            .steps
+            .iter()
+            .position(|step| step.expect == Expect::AcceptedPrivileged)
+            .unwrap();
+        let outcome = Outcome {
+            hits: Vec::new(),
+            denials: Vec::new(),
+            steps: vec![(index, StepOutcome::Unsupported("io_uring SEND".into()))],
+            token: "unused".to_owned(),
+            encodings: case.oracle.encodings.clone(),
+        };
+        assert!(outcome.inconclusive_steps(&case).is_empty());
+    }
+
+    fn timeout_verdict(case: &Case, index: usize) -> Verdict {
+        let outcome = Outcome {
+            hits: Vec::new(),
+            denials: Vec::new(),
+            steps: vec![(index, StepOutcome::Timeout)],
+            token: "unused".to_owned(),
+            encodings: case.oracle.encodings.clone(),
+        };
+        assess(case, None, &outcome)
+    }
+
+    #[test]
+    fn only_unexpected_foreground_timeouts_are_inconclusive() {
+        let foreground = corpus_case("control-plain-egress");
+        let index = foreground
+            .steps
+            .iter()
+            .position(|step| !step.optional)
+            .unwrap();
+        let verdict = timeout_verdict(&foreground, index);
+        assert!(matches!(&verdict.status, Status::Inconclusive));
+        assert!(verdict.is_failure());
+
+        let background = corpus_case("control-relay-untainted");
+        let index = background
+            .steps
+            .iter()
+            .position(|step| step.background().is_some())
+            .unwrap();
+        let verdict = timeout_verdict(&background, index);
+        assert!(matches!(&verdict.status, Status::FalseDenial));
+        assert!(verdict.is_failure());
+    }
+
+    #[test]
+    fn unsupported_attack_without_network_evidence_is_inconclusive() {
+        let case = corpus_case("io-uring-socket-write");
+        let outcome = Outcome {
+            hits: Vec::new(),
+            denials: Vec::new(),
+            steps: vec![(
+                0,
+                StepOutcome::Unsupported("unknown ring effect".to_owned()),
+            )],
+            token: "unused".to_owned(),
+            encodings: case.oracle.encodings.clone(),
+        };
+        let verdict = assess(&case, None, &outcome);
+        assert!(matches!(&verdict.status, Status::Inconclusive));
+        assert!(verdict.is_failure());
+    }
 }

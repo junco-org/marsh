@@ -121,13 +121,13 @@ fn local_exceptions_exclude_an_untraced_co_listener() {
     }
     let bound = ready.exists();
     let raw = local::endpoints(&[Pid::from_raw(i32::try_from(child.pid).unwrap())]);
-    let allowed = fixture.service.local_endpoints(&[fixture.root]);
+    let allowed = fixture.service.traced_local_endpoints();
     fixture.service.cancel(run).unwrap();
     assert_eq!(exited(&events).signal(), Some(libc::SIGKILL));
     child.wait_observed().unwrap();
     fixture.finish(run);
     assert!(bound, "the traced TCP listener bound before inventory");
-    let endpoint = Endpoint::from(address);
+    let endpoint = crate::Endpoint::from(address);
     assert!(raw.unwrap().contains(&endpoint));
     assert!(
         !allowed.unwrap().contains(&endpoint),

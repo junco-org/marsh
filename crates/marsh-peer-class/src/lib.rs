@@ -1,12 +1,8 @@
-//! Socket classification shared by userspace policy and BPF LSM enforcement.
+//! Socket classification shared by userspace policy and BPF LSM enforcement, and the fixed
+//! records exchanged with the kernel program (`crates/marsh-bpf/src/marsh.h` mirrors them).
 //!
 //! Addresses use network-order octets; ports and all other integers use host order. IPv4
 //! occupies the first four address bytes. Builtins are classified before declared networks.
-//! The `std` feature adds sockaddr serialization and first-declaration trie normalization.
-#![no_std]
-
-#[cfg(any(feature = "std", test))]
-extern crate std;
 
 /// Linux unknown/unspecified address family.
 pub const AF_UNSPEC: u16 = 0;
@@ -31,6 +27,8 @@ pub const EXTERNAL: u32 = 3;
 pub const UNKNOWN: u32 = 4;
 /// Class bitset width; declared labels start at ID 5.
 pub const MAX_CLASSES: usize = 64;
+/// Propagated taint classes the kernel can carry, process-wide.
+pub const MAX_TAINTS: usize = 16;
 
 /// Fixed-layout socket endpoint shared with the kernel.
 #[repr(C)]
@@ -77,53 +75,99 @@ pub struct Network {
     pub address: [u8; 16],
 }
 
-/// One root's precomputed answers at a policy generation.
+/// One root's precomputed answers at a policy generation. Userspace replaces the whole record;
+/// the kernel never writes it.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Answers {
     /// Userspace policy revision represented by these answers.
     pub generation: u64,
-    /// Classes currently forbidden by policy rules.
+    /// Peer classes currently forbidden by policy rules.
     pub deny: u64,
-    /// Classes any rule can forbid; used to fail closed while stale.
+    /// Peer classes any rule can forbid; all of them are refused while undecidable.
     pub guarded: u64,
-    /// Local classes requiring membership in `LOCAL_ALLOWED`.
-    pub local: u64,
-    /// Nonzero when the policy basis changed after this generation was published.
+    /// Local peer classes whose receiver must be traced while the root carries taint.
+    pub untraced: u64,
+    /// Taint classes the root's sends carry; receiving one of them changes nothing.
+    pub carried: u64,
+    /// `deny` as if the root had just received taint class `i` in the kernel.
+    pub contingent: [u64; MAX_TAINTS],
+    /// Kernel receipts per taint class already folded into these answers.
+    pub acknowledged: [u32; MAX_TAINTS],
+    /// Nonzero while an input changed and new answers are not yet published.
     pub stale: u32,
     /// Nonzero to report refusals without blocking the contact.
     pub audit: u32,
 }
 
-/// Kernel contact event, including the actual endpoint and answer generation.
+/// Kernel receipt counters of one root, per taint class; only the kernel increments them.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Contact {
-    /// Sending process's thread-group ID.
-    pub tgid: u32,
-    /// Sending thread ID.
-    pub tid: u32,
-    /// Tracer-assigned root ID.
-    pub root: u64,
-    /// Answer generation used for this contact.
-    pub generation: u64,
-    /// Endpoint used by the kernel, not a prior userspace copy.
-    pub endpoint: Endpoint,
-    /// Classified peer's class bit index.
-    pub class: u32,
-    /// 0 allow, 1 deny, 2 audit, 3 stale deny, 4 stale audit.
-    pub decision: u32,
+pub struct Receipts {
+    /// Receipts of each taint class, wrapping.
+    pub count: [u32; MAX_TAINTS],
 }
 
-/// Root-isolated key for a permitted traced local endpoint.
+/// [`Event::kind`]: a governed task contacted a socket peer.
+pub const CONTACT: u32 = 0;
+/// [`Event::kind`]: a governed task read a socket tagged with taint it did not carry.
+pub const RECEIPT: u32 = 1;
+
+/// [`Event::decision`]: the contact proceeded.
+pub const ALLOW: u32 = 0;
+/// [`Event::decision`]: the contact was refused.
+pub const DENY: u32 = 1;
+/// [`Event::decision`]: an auditing root's contact would have been refused.
+pub const AUDIT: u32 = 2;
+
+/// [`Event::reason`]: the published `deny` answer.
+pub const RULE: u32 = 0;
+/// [`Event::reason`]: the `contingent` answer for one class received in the kernel.
+pub const CONTINGENT: u32 = 1;
+/// [`Event::reason`]: the answers were stale or several classes arrived at once.
+pub const STALE: u32 = 2;
+/// [`Event::reason`]: a taint-carrying contact whose local receiver is untraced.
+pub const UNTRACED: u32 = 3;
+/// [`Event::reason`]: the root has no published answers.
+pub const UNANSWERED: u32 = 4;
+
+/// One kernel record: a judged contact or a taint receipt.
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub struct LocalKey {
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Event {
+    /// [`CONTACT`] or [`RECEIPT`].
+    pub kind: u32,
+    /// Acting process's thread-group ID.
+    pub tgid: u32,
+    /// Acting thread ID.
+    pub tid: u32,
+    /// Classified peer's class bit index (contacts).
+    pub class: u32,
     /// Tracer-assigned root ID.
     pub root: u64,
-    /// Canonical endpoint from [`Endpoint::normalized`].
+    /// `CLOCK_MONOTONIC` nanoseconds when the hook ran.
+    pub time: u64,
+    /// Answer generation used (contacts).
+    pub generation: u64,
+    /// Contacts: taint classes the send carried. Receipts: classes newly received.
+    pub taint: u64,
+    /// Receipts: the root whose send tagged the socket.
+    pub sender: u64,
+    /// [`ALLOW`], [`DENY`] or [`AUDIT`] (contacts).
+    pub decision: u32,
+    /// Which answer decided a contact: [`RULE`], [`CONTINGENT`], [`STALE`], [`UNTRACED`] or
+    /// [`UNANSWERED`].
+    pub reason: u32,
+    /// Endpoint used by the kernel, not a prior userspace copy (contacts).
     pub endpoint: Endpoint,
 }
+
+// Mirrored by `_Static_assert`s in marsh.h.
+const _: () = assert!(size_of::<Endpoint>() == 136);
+const _: () = assert!(size_of::<Network>() == 24);
+const _: () = assert!(size_of::<Answers>() == 240);
+const _: () = assert!(size_of::<Receipts>() == 64);
+const _: () = assert!(size_of::<Event>() == 200);
 
 impl Endpoint {
     /// Decode a Linux native sockaddr; malformed or unsupported addresses become unknown.
@@ -176,10 +220,7 @@ impl Endpoint {
         endpoint
     }
 
-    /// Canonicalize in place without a full endpoint temporary, for the BPF stack limit.
-    /// Abstract UNIX names retain every byte counted by their length.
-    #[cfg_attr(target_arch = "bpf", inline(always))]
-    #[cfg_attr(not(target_arch = "bpf"), inline)]
+    /// Canonicalize in place. Abstract UNIX names retain every byte counted by their length.
     #[expect(clippy::cast_possible_truncation, reason = "UNIX names contain at most 108 bytes")]
     pub fn normalize(&mut self) {
         match self.family {
@@ -206,15 +247,7 @@ impl Endpoint {
                         .unwrap_or(path.len())
                 };
                 self.unix_len = length as u32;
-                // BPF must see an absolute 0..108 index bound. A tail-slice memset
-                // loses the correlation between its variable pointer and length.
-                for (index, byte) in self.unix.iter_mut().enumerate() {
-                    if index >= length {
-                        // SAFETY: byte is an initialized, uniquely borrowed array
-                        // element. Volatile prevents folding back into tail memset.
-                        unsafe { core::ptr::write_volatile(byte, 0) };
-                    }
-                }
+                self.unix[length..].fill(0);
             }
             _ => {
                 if self.family != AF_NETLINK {
@@ -231,18 +264,17 @@ impl Endpoint {
 
     /// Encode a Linux native sockaddr. Unknown/malformed endpoints encode as an empty slice.
     /// IPv6 flowinfo is zero; pathname UNIX names include a terminator when there is room.
-    #[cfg(any(feature = "std", test))]
-    pub fn sockaddr(&self) -> std::vec::Vec<u8> {
+    pub fn sockaddr(&self) -> Vec<u8> {
         let mut bytes = match self.family {
-            AF_INET => std::vec![0; 16],
-            AF_INET6 => std::vec![0; 28],
-            AF_NETLINK => std::vec![0; 12],
+            AF_INET => vec![0; 16],
+            AF_INET6 => vec![0; 28],
+            AF_NETLINK => vec![0; 12],
             AF_UNIX if self.unix_len <= 108 => {
                 let length = self.unix_len as usize;
                 let terminator = usize::from(length > 0 && self.unix[0] != 0 && length < 108);
-                std::vec![0; 2 + length + terminator]
+                vec![0; 2 + length + terminator]
             }
-            _ => return std::vec::Vec::new(),
+            _ => return Vec::new(),
         };
         bytes[..2].copy_from_slice(&self.family.to_ne_bytes());
         match self.family {
@@ -263,7 +295,6 @@ impl Endpoint {
     }
 }
 
-#[cfg(any(feature = "std", test))]
 impl From<std::net::SocketAddr> for Endpoint {
     fn from(address: std::net::SocketAddr) -> Self {
         let mut endpoint = Self {
@@ -362,9 +393,8 @@ fn prefix_equal(left: &[u8], right: &[u8], prefix: u32) -> bool {
 /// Each canonical prefix carries the first declared network's class that contains it. Duplicate
 /// prefixes are emitted once, in their original order. Callers must validate network families,
 /// prefix widths and class IDs before loading a kernel map.
-#[cfg(any(feature = "std", test))]
-pub fn effective_networks(networks: &[Network]) -> std::vec::Vec<Network> {
-    let mut effective = std::vec::Vec::with_capacity(networks.len());
+pub fn effective_networks(networks: &[Network]) -> Vec<Network> {
+    let mut effective = Vec::with_capacity(networks.len());
     // ponytail: O(n²) setup for policy-sized network lists; use a prefix tree if setup grows hot.
     for network in networks {
         let mut network = *network;

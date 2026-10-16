@@ -664,11 +664,25 @@ impl AgentPolicy {
     /// Whether any rule can judge `candidate`; when none can, [`AgentPolicy::decide_now`] grants
     /// it without consulting history.
     pub(super) fn judges(&self, candidate: &Observation) -> bool {
-        self.label(candidate).is_some_and(|event| {
-            self.rules
-                .iter()
-                .any(|rule| could_fire(&rule.0.rule.head, &event))
-        })
+        self.label(candidate)
+            .is_some_and(|event| self.judges_event(&event))
+    }
+
+    /// Whether any rule's head can match `event`.
+    pub(super) fn judges_event(&self, event: &Event) -> bool {
+        self.rules
+            .iter()
+            .any(|rule| could_fire(&rule.0.rule.head, event))
+    }
+
+    /// Every rule, in order, for compiling the whole policy once.
+    pub(super) fn trace_rules(&self) -> impl Iterator<Item = TraceRule> + '_ {
+        self.rules.iter().map(|rule| rule.0.clone())
+    }
+
+    /// The classes whose data taints whoever receives it.
+    pub(super) fn propagated(&self) -> impl Iterator<Item = &str> {
+        self.propagated.iter().map(String::as_str)
     }
 
     /// Decides `candidate` now, while its command still runs: against the committed `history`
@@ -681,15 +695,6 @@ impl AgentPolicy {
         candidate: &Observation,
     ) -> Option<Denial> {
         let event = self.label(candidate)?;
-        self.decide_event(history, prior, event)
-    }
-
-    fn decide_event(
-        &self,
-        history: &[Observation],
-        prior: &[Observation],
-        event: Event,
-    ) -> Option<Denial> {
         let rules = self.firing(&event);
         if rules.is_empty() {
             return None;
@@ -744,27 +749,6 @@ impl AgentPolicy {
             .collect()
     }
 
-    pub(super) fn kernel_judges(&self, principal: &Principal, class: &str) -> bool {
-        let event = Event::new(principal.clone(), Action::Edit, ["net", class]);
-        self.rules
-            .iter()
-            .any(|rule| could_fire(&rule.0.rule.head, &event))
-    }
-
-    pub(super) fn kernel_decide(
-        &self,
-        principal: &Principal,
-        class: &str,
-        history: &[Observation],
-        prior: &[Observation],
-    ) -> Option<Denial> {
-        self.decide_event(
-            history,
-            prior,
-            Event::new(principal.clone(), Action::Edit, ["net", class]),
-        )
-    }
-
     /// Whether this policy reports denials without enforcing them.
     pub(super) const fn audits(&self) -> bool {
         self.audit
@@ -789,7 +773,7 @@ pub enum UntracedLocal {
 }
 
 /// The denial of `event` when a caller-built rule that could judge it does not compile.
-fn uncompiled(event: &Event, error: &CompileError) -> Denial {
+pub(super) fn uncompiled(event: &Event, error: &CompileError) -> Denial {
     Denial {
         event: event.clone(),
         failed_precondition: format!("agent policy does not compile: {error}"),

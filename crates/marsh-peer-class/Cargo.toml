@@ -1,6 +1,6 @@
 [package]
 name = "marsh-peer-class"
-description = "Shared no_std socket peer classification and privileged-enforcement ABI"
+description = "Shared socket peer classification and privileged-enforcement ABI"
 version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
@@ -8,10 +8,6 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 publish = false
-
-[features]
-default = []
-std = []
 
 [lints]
 workspace = true

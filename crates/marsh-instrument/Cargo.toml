@@ -24,7 +24,7 @@ libc = "0.2"
 # `io_uring` opcode names, and the peers of sockets traced tasks write to.
 rustix = { version = "1", default-features = false, features = ["io_uring", "net", "process"] }
 marsh-lib = { path = "../marsh-lib", default-features = false }
-marsh-peer-class = { path = "../marsh-peer-class", features = ["std"] }
+marsh-peer-class = { path = "../marsh-peer-class" }
 marsh-bpf = { path = "../marsh-bpf", optional = true }
 
 [dev-dependencies]

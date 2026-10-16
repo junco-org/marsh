@@ -2,9 +2,11 @@ name: Privileged socket enforcement
 
 on:
   workflow_dispatch:
+  schedule:
+    - cron: '17 4 * * *'
   pull_request:
     paths:
-      - 'crates/marsh-bpf*/**'
+      - 'crates/marsh-bpf/**'
       - 'crates/marsh-peer-class/**'
       - 'crates/marsh-instrument/**'
       - 'crates/marsh-core/**'
@@ -17,7 +19,7 @@ permissions:
 jobs:
   bpf-lsm:
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    timeout-minutes: ${{ github.event_name == 'schedule' && 240 || 90 }}
     env:
       CARGO_PROFILE_DEV_DEBUG: '0'
       CARGO_PROFILE_TEST_DEBUG: '0'
@@ -36,12 +38,10 @@ jobs:
           echo 'deb [signed-by=/usr/share/keyrings/llvm.gpg] https://apt.llvm.org/noble/ llvm-toolchain-noble-21 main' | sudo tee /etc/apt/sources.list.d/llvm21.list
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends clang-21 libclang-21-dev
-      - name: Install pinned Rust and BPF linker
+      - name: Install pinned Rust
         run: |
           rustup toolchain install 1.95.0 --profile minimal
           rustup default 1.95.0
-          rustup toolchain install nightly-2025-12-01 --profile minimal --component rust-src
-          cargo +nightly-2025-12-01 install bpf-linker --version 0.9.15 --locked
       - name: Build real BPF hooks and policy harnesses
         run: |
           cargo test --locked -p marsh-core -p marsh-bpf --features privileged --no-run --message-format=json > artifacts.json
@@ -56,7 +56,26 @@ jobs:
           PY
       - name: Exercise actual LSM hooks and PID namespace attribution
         run: |
-          sudo env PATH="$PATH" python3 bench/leak-fuzzer/privileged-vm.py /bin/sh -c '"$1" --ignored --nocapture && unshare --pid --fork --mount-proc "$1" --ignored --nocapture' sh "$LSM_TEST"
-      - name: Run unchanged leak corpus in both modes
+          sudo env PATH="$PATH" python3 bench/leak-fuzzer/privileged-vm.py /bin/sh -c '"$1" --ignored --nocapture --test-threads=1 && unshare --pid --fork --mount-proc "$1" --ignored --nocapture --test-threads=1' sh "$LSM_TEST"
+      - name: Run deterministic PR corpus smoke in both modes
+        if: github.event_name != 'schedule'
         run: |
-          sudo env PATH="$PATH" python3 bench/leak-fuzzer/privileged-vm.py /bin/sh -c 'MARSH_LEAK_ENFORCEMENT=unprivileged "$1" leak_corpus --ignored --nocapture --test-threads=1 && MARSH_LEAK_ENFORCEMENT=privileged "$1" leak_corpus --ignored --nocapture --test-threads=1' sh "$CORE_TEST"
+          sudo env PATH="$PATH" python3 bench/leak-fuzzer/privileged-vm.py /bin/sh -c '
+            set -eu
+            for mode in unprivileged privileged; do
+              MARSH_LEAK_SEED=20261014 MARSH_LEAK_ITERATIONS=1 MARSH_LEAK_ENFORCEMENT="$mode" "$1" leak_corpus --ignored --nocapture --test-threads=1
+            done
+          ' sh "$CORE_TEST"
+      - name: Run nightly seeded mutations in both modes
+        if: github.event_name == 'schedule'
+        timeout-minutes: 220
+        run: |
+          sudo env PATH="$PATH" python3 bench/leak-fuzzer/privileged-vm.py /bin/sh -c '
+            set -eu
+            for seed in 20261014 20261015 20261016 20261017; do
+              for mode in unprivileged privileged; do
+                echo "campaign seed=$seed mode=$mode iterations=2"
+                MARSH_LEAK_SEED="$seed" MARSH_LEAK_ITERATIONS=2 MARSH_LEAK_ENFORCEMENT="$mode" "$1" leak_corpus --ignored --nocapture --test-threads=1
+              done
+            done
+          ' sh "$CORE_TEST"

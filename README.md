@@ -280,22 +280,22 @@ contacts the same peer again changes nothing. A refused call is skipped by the k
 with `EPERM`, implemented on x86-64 only; elsewhere a refusal fails the command instead.
 The unprivileged tracer reads a call's address before the kernel copies it, so another thread can
 rewrite it in between. With the `privileged` Cargo feature, `ShellBuilder::enforcement` and
-`MuxProfile::enforcement` can instead select `Enforcement::Privileged`: the tracer refreshes every
-class under one policy generation, and BPF LSM hooks judge the address the kernel actually uses.
-Changed observations, history and taint mark answers stale; stale guarded contacts fail closed.
-Real endpoint reports supply contact observations, refusal text and local taint handoff.
+`MuxProfile::enforcement` can instead select `Enforcement::Privileged`: BPF LSM hooks judge the
+address and socket the kernel actually uses, against an answer for every peer class that the
+tracer keeps current incrementally after each observed call. Local sockets carry taint in the
+kernel: a governed process that reads one a tainted principal sent into is tainted before it can
+send anything on, with no dependence on addresses or `/proc` scans.
 
 Privileged startup requires BPF capabilities, BTF, active BPF LSM and the `uring_sqpoll` admission
 hook; an explicit request fails if loading is unavailable. Build with `cargo build --features
-privileged` after installing nightly-2025-12-01 with rust-src, clang 21 and bpf-linker 0.9.15.
+privileged`, which needs clang 15 or later (`MARSH_BPF_CLANG` selects another binary).
 `Enforcement::Auto` may fall back, with the reason reported through the first agent shell's
 `PolicyObserver` (or stderr without one); `Shell::enforcement()` returns the effective mode.
-The process-wide tracer refuses an incompatible explicit mode request. Phase A still uses network
-entry stops and userspace receiver discovery; eager incremental answers and in-kernel taint
-(Phases B/C) are deferred. See [`docs/privileged-enforcement.md`](docs/privileged-enforcement.md)
-for requirements, the isolated kernel runner, and residual filesystem/local-handoff/connected-UDP
-races. Privileged managed commands lose OS capabilities and cannot gain new privileges, so they
-cannot modify the enforcer's maps or use administrative capabilities even when launched as root.
+The process-wide tracer refuses an incompatible explicit mode request. See
+[`docs/privileged-enforcement.md`](docs/privileged-enforcement.md) for the design, requirements,
+the isolated kernel runner, and residual filesystem and connected-UDP races. Privileged managed
+commands lose OS capabilities and cannot gain new privileges, so they cannot modify the
+enforcer's maps or use administrative capabilities even when launched as root.
 
 Everything else is judged at publication, atomically with the Git policy. A refused command's
 source changes are rolled back, but what it read, ran and contacted stays in history. Effects

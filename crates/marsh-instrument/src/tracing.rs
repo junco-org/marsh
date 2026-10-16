@@ -36,10 +36,8 @@ use syscalls::{Sysno, SysnoSet};
 
 /// The published generation; a weak that no longer upgrades admits a new one.
 static SHARED: Mutex<Option<Weak<Tracing>>> = Mutex::new(None);
-use crate::Endpoint;
-#[cfg(feature = "privileged")]
-use crate::enforcement::Kernel;
-use crate::enforcement::{Enforcement, Enforcer, SELECTION};
+use crate::enforcement::{Enforcement, Enforcer};
+use kernel_integration::Kernel;
 #[path = "tracing_kernel.rs"]
 mod kernel_integration;
 
@@ -52,6 +50,14 @@ thread_local! {
 /// Opaque registration identity. Never reused within a service.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct RootId(u64);
+
+impl RootId {
+    /// The identity kernel records carry.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
 
 /// Opaque builtin invocation identity, distinct from a root, run or scope marker.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -220,9 +226,8 @@ struct Scope {
 struct RunState {
     cancelled: bool,
     waker: Option<std::task::Waker>,
-    /// Kernel records drained by a tracer but not yet delivered to the policy engine.
-    #[cfg(feature = "privileged")]
-    contacts: usize,
+    /// Kernel events drained but not yet delivered to the policy engine.
+    deliveries: usize,
 }
 
 #[derive(Default)]
@@ -406,10 +411,8 @@ pub struct Tracing {
     selected: SysnoSet,
     enforcement: Enforcement,
     fallback: OnceLock<String>,
-    #[cfg(feature = "privileged")]
-    kernel: Option<Mutex<Kernel>>,
-    #[cfg(feature = "privileged")]
-    contacts: Mutex<HashMap<Pid, Vec<Vec<u8>>>>,
+    /// The loaded BPF LSM programs in privileged mode.
+    kernel: Option<Kernel>,
 }
 
 impl Tracing {
@@ -418,89 +421,30 @@ impl Tracing {
     /// # Errors
     /// Returns a live generation's recorded failure.
     pub fn shared() -> io::Result<Arc<Self>> {
-        let mode = lock(&SELECTION)
-            .as_ref()
-            .map_or(Enforcement::Unprivileged, |(mode, _)| *mode);
-        Self::shared_with_enforcement(mode)
+        Self::shared_with_enforcement(kernel_integration::selected())
     }
 
     /// Selects socket enforcement once per process, refusing incompatible requests.
     pub fn shared_with_enforcement(requested: Enforcement) -> io::Result<Arc<Self>> {
         let mut shared = lock(&SHARED);
         if let Some(tracing) = shared.as_ref().and_then(Weak::upgrade) {
+            // Never drop a possibly-final owner while holding the cache.
             drop(shared);
-            if requested != Enforcement::Auto && requested != tracing.enforcement {
-                return Err(io::Error::other(
-                    "socket enforcement already selected differently for this process",
-                ));
-            }
+            tracing.admit_enforcement(requested)?;
             lock(&tracing.state).check()?;
-            if requested == Enforcement::Auto && tracing.enforcement == Enforcement::Unprivileged {
-                let reason = tracing.fallback.get_or_init(|| "process already selected unprivileged socket enforcement before Auto was requested".to_owned());
-                if let Some((_, fallback)) = lock(&SELECTION).as_mut() {
-                    fallback.get_or_insert_with(|| reason.clone());
-                }
-            }
             return Ok(tracing);
         }
-        let mut selection = lock(&SELECTION);
-        let previous = selection.as_ref().map(|(mode, _)| *mode);
-        if let Some(mode) = previous
-            && requested != Enforcement::Auto
-            && requested != mode
-        {
-            return Err(io::Error::other(
-                "socket enforcement already selected differently for this process",
-            ));
-        }
-        let desired = previous.unwrap_or(requested);
-        #[cfg(feature = "privileged")]
-        let (enforcement, kernel, fallback) = match desired {
-            Enforcement::Unprivileged => (Enforcement::Unprivileged, None, None),
-            Enforcement::Privileged | Enforcement::Auto => match Kernel::load() {
-                Ok(kernel) => (Enforcement::Privileged, Some(Mutex::new(kernel)), None),
-                Err(error) if desired == Enforcement::Auto => {
-                    (Enforcement::Unprivileged, None, Some(error.to_string()))
-                }
-                Err(error) => return Err(error),
-            },
-        };
-        #[cfg(not(feature = "privileged"))]
-        let (enforcement, fallback) = match desired {
-            Enforcement::Privileged => {
-                return Err(io::Error::other(
-                    "privileged socket enforcement requires the privileged cargo feature",
-                ));
-            }
-            Enforcement::Auto => (
-                Enforcement::Unprivileged,
-                Some(
-                    "privileged socket enforcement requires the privileged cargo feature"
-                        .to_owned(),
-                ),
-            ),
-            Enforcement::Unprivileged => (Enforcement::Unprivileged, None),
-        };
-        let fallback = selection.as_ref().and_then(|(_, reason)| reason.clone()).or(fallback)
-            .or_else(|| (requested == Enforcement::Auto && enforcement == Enforcement::Unprivileged).then(|| "process already selected unprivileged socket enforcement before Auto was requested".to_owned()));
-        let fallback_cell = OnceLock::new();
-        if let Some(reason) = &fallback {
-            let _ = fallback_cell.set(reason.clone());
-        }
+        let (enforcement, kernel, fallback) = kernel_integration::select(requested)?;
         let tracing = Arc::new(Self {
             state: Mutex::new(State::default()),
             progress: Condvar::new(),
             sequence: Arc::new(Sequence::default()),
             selected: Observer::selection()?,
             enforcement,
-            fallback: fallback_cell,
-            #[cfg(feature = "privileged")]
+            fallback: fallback.map(OnceLock::from).unwrap_or_default(),
             kernel,
-            #[cfg(feature = "privileged")]
-            contacts: Mutex::new(HashMap::new()),
         });
-        *selection = Some((enforcement, fallback));
-        drop(selection);
+        tracing.start_kernel_events()?;
         *shared = Some(Arc::downgrade(&tracing));
         drop(shared);
         Ok(tracing)
@@ -656,44 +600,36 @@ impl Tracing {
     /// Waits for all inherited producers and their pending calls to end.
     pub fn quiesce(&self, run: TraceRun) -> io::Result<()> {
         let mut state = lock(&self.state);
-        #[cfg(feature = "privileged")]
         let mut drained = false;
         loop {
             state.run(run)?;
-            #[cfg(feature = "privileged")]
-            if state.runs.get(&run).is_some_and(|run| run.contacts != 0) {
-                state = self.progress.wait(state).recover();
-                continue;
-            }
-            let busy = state.threads.values().any(|thread| {
-                run.owns(thread.inherited)
-                    || thread.pending.is_some_and(|(_, target)| run.owns(target))
-            }) || state
-                .deferred
-                .values()
-                .flatten()
-                .any(|(target, ..)| target.run == run)
+            let busy = state.runs.get(&run).is_some_and(|run| run.deliveries != 0)
+                || state.threads.values().any(|thread| {
+                    run.owns(thread.inherited)
+                        || thread.pending.is_some_and(|(_, target)| run.owns(target))
+                })
+                || state
+                    .deferred
+                    .values()
+                    .flatten()
+                    .any(|(target, ..)| target.run == run)
                 || state
                     .natives
                     .values()
                     .any(|native| native.run == run && native.phase != Phase::Ended);
             if !busy {
-                #[cfg(feature = "privileged")]
                 if self.kernel.is_some() && !drained {
                     drop(state);
-                    // The last io-wq contact must reach command evidence before quiescence
-                    // allows its consumer to take that evidence or retire its root.
-                    self.kernel_contacts(Pid::from_raw(0), None)?;
+                    // The last kernel events, an io-wq worker's contact or a receipt, must reach
+                    // the command's evidence before its consumer takes it or retires the root.
+                    self.deliver_kernel_events()?;
                     state = lock(&self.state);
                     drained = true;
                     continue;
                 }
                 break;
             }
-            #[cfg(feature = "privileged")]
-            {
-                drained = false;
-            }
+            drained = false;
             state = self.progress.wait(state).recover();
         }
         drop(state);
@@ -956,7 +892,6 @@ impl Tracing {
         }));
         let result = (|| -> io::Result<()> {
             let mut observe = |sequence, tid: Pid, status, event, info, exec| {
-                let info = self.kernel_contacts(tid, info)?;
                 let resume = self.deliver(sequence, tid, status, event, info, exec)?;
                 if tid == root {
                     report(&mut *events, status)?;
@@ -1019,7 +954,8 @@ impl Tracing {
     }
 
     /// Whether `tid`'s root lets it contact every one of `peers`, listed only for a gated task.
-    /// A task no root owns is not gated.
+    /// A task no root owns is not gated. In privileged mode the kernel judges the contact; this
+    /// stop only brings its answers up to date.
     fn permits(
         &self,
         tid: Pid,
@@ -1031,34 +967,20 @@ impl Tracing {
         let Some(target) = state.threads.get(&tid).and_then(|thread| thread.inherited) else {
             return Ok(true);
         };
-        let enforcer = state
+        let Some(enforcer) = state
             .roots
             .get(&target.run.root)
-            .and_then(|root| root.enforcer.clone());
+            .and_then(|root| root.enforcer.clone())
+        else {
+            return Ok(true);
+        };
         drop(state);
-        if let Some(enforcer) = enforcer {
-            let peers = peers();
-            if self.enforcement == Enforcement::Privileged {
-                for peer in peers.iter().filter(|peer| {
-                    matches!(
-                        marsh_peer_class::builtin_class(&Endpoint::from_sockaddr(peer)),
-                        Some(marsh_peer_class::UNIX | marsh_peer_class::LOOPBACK)
-                    )
-                }) {
-                    enforcer.handoff(target.run, peer, source)?;
-                }
-                self.refresh_kernel(target, &*enforcer, source)?;
-                // Older kernels can bypass socket_sendmsg for these in-kernel copies.
-                // Keep the ptrace gate as well until hook coverage is established.
-                if !matches!(syscall, Sysno::sendfile | Sysno::splice) {
-                    return Ok(true);
-                }
-            }
-            return Ok(peers
-                .iter()
-                .all(|peer| enforcer.permits(target.run, target.builtin, peer, source)));
+        if !self.kernel_entry(target, &*enforcer, syscall, source)? {
+            return Ok(true);
         }
-        Ok(true)
+        Ok(peers()
+            .iter()
+            .all(|peer| enforcer.permits(target.run, target.builtin, peer, source)))
     }
 
     /// Whether `tid`'s owner selects the executable it is about to exec.
@@ -1190,17 +1112,10 @@ impl Tracing {
     }
 
     fn fail(&self, cause: impl Into<String>) {
-        let cause = cause.into();
-        #[cfg(feature = "privileged")]
-        let cause = if let Some(kernel) = &self.kernel {
-            let terminated = lock(kernel).controller.terminate();
-            match terminated {
-                Ok(()) => cause,
-                Err(error) => format!("{cause}; terminating governed tasks: {error}"),
-            }
-        } else {
-            cause
-        };
+        let mut cause = cause.into();
+        if let Err(error) = self.terminate_kernel() {
+            cause = format!("{cause}; terminating governed tasks: {error}");
+        }
         let mut state = lock(&self.state);
         state.failure.get_or_insert(cause);
         let waiters: Vec<_> = state

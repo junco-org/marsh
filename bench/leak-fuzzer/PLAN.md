@@ -111,36 +111,44 @@ encodings = ["raw", "base64", "hex"]   # transforms of the canary to search for
   value fails loading.
 * Variants: a case may list alternative values per slot, for example `[variants.port] = [9, 80]`;
   the fuzzer samples combinations with the seeded PRNG.
-* Mutations that need no attack knowledge:
-  * sample variants;
-  * reorder steps marked `optional`;
-  * insert neutral filler steps from a fixed list (`true`, `ls`, writing `src/x`);
-  * split a multi-command step across commands or shells.
+* Iteration 0 runs the authored case unchanged with each slot's first value. Later iterations sample
+  slot values, shuffle only steps marked `optional` among their existing positions, and insert one
+  or two accepted neutral commands (`true`, `pwd`, `ls`) at seeded positions and shells.
+* These mutations vary sequence ordering and scheduling without synthesizing attack techniques.
+  Required steps stay in their original relative order; the audit run validates each mutated attack.
 
-  These exercise ordering, the policy's de-duplication of repeated observations, and principal
-  sharing across shells.
+The campaign intentionally does not generate arbitrary shell commands or claim coverage-guided
+fuzzing. New attack behavior remains a reviewed corpus case.
 
 ## Runner (`mod.rs`)
 
-For each case and each sampled variant:
+For each case, seed and iteration:
 
 1. Create a `Fixture::new()`, write the files, and start the `Sink`.
 2. Build N shells with `Fixture::observed_agent(policy.principal(…), observer)`. The observer
    collects every agent denial, as the existing agent-policy tests do.
-3. Run the steps in order with per-step timeouts (`tokio::time::timeout`). Record each step's
-   outcome (accepted, refused, error, timeout); fail on it only when `expect` says so.
+3. Run steps with per-step timeouts. A foreground timeout or shell error is inconclusive; an `&`
+   server's timeout is expected, but the control sink or attack audit must still prove execution.
 4. Close the shells, then drain the sink.
 5. Call the oracle and record a `Verdict`.
 
 Settings:
 
 * `MARSH_LEAK_SEED`: default random, always printed.
-* `MARSH_LEAK_ITERATIONS`: variants per case.
+* `MARSH_LEAK_ITERATIONS`: runs per case; iterations after the first sample variants and apply
+  seeded sequence mutations.
 * `MARSH_LEAK_CORPUS`: corpus directory override.
 * `MARSH_LEAK_FILTER`: case-name substring.
 
-At the end it prints a per-case summary table. The test fails if any attack case leaked or any
-control case was denied.
+Every attack iteration is replayed in audit mode with the same variant and mutated sequence. The
+audit run must deliver its canary to a sink; ordinary attacks must also produce a network
+would-block report. Unsupported attack effects require network-denial evidence and this audit
+proof; otherwise they are inconclusive. Known gaps waive only the would-block report. A case-name
+filter matching no cases is an error.
+
+A case-specific random stream makes sequence generation independent of corpus order. Seed, case name
+and iteration reproduce its variants, filler and canary. Enforcement failures print a minimized TOML
+reproducer with sampled variants fixed; audit failures print the same replay key and step outcomes.
 
 ## Oracle (`oracle.rs`)
 
@@ -150,11 +158,11 @@ control case was denied.
   because sent bytes cannot be recalled.
 * **Control case:** the canary must reach the sink. If it does not, the case fails as a false
   denial, with the observer's matching denials attached.
-* **Audit-mode run:** run the same attack corpus with `AgentPolicy::audit()`. Every leak must then
-  come with at least one "would block" report, which checks that audit sees what enforcement
-  blocks.
-* **Report:** the case name, seed, variant, the expanded commands, each step's outcome, the
-  observer's denial log, and the sink hit (listener and offset).
+* **Audit-mode run:** replay each attack iteration exactly under `AgentPolicy::audit()`. The
+  canary must reach a sink, proving the attack path ran; ordinary attacks must also produce at
+  least one "would block" report. Known gaps waive only the would-block expectation.
+* **Report:** campaign seed, case, iteration, sampled variants, step outcomes, denials and sink hit.
+  Enforcement failures also print minimized TOML with the sampled variants fixed.
 
 ## Shrinking (`shrink.rs`)
 
@@ -172,9 +180,11 @@ Print the minimal case as TOML so it can be pasted into the corpus as a regressi
 
 `leak-corpus/known-gaps.toml` lists case names, reasons and an optional enforcement mode. Registered
 leaks report `known gap` instead of failing. `toctou-peer-rewrite` is runnable and remains a gap only
-for ptrace; privileged mode must block it. `untraced-local-daemon-allowed` remains the deliberate
-`recommended` trade-off. Rewritten-local handoff and connected-UDP peer-state races are documented
-Phase A residuals without deterministic cases, not test coverage claims.
+for ptrace; privileged mode must block it. `local-handoff-rewrite` races the same rewrite against a
+local relay: ptrace hands taint to the port the address named, so it is a gap there, while
+privileged mode taints the relay when it reads. `untraced-local-daemon-allowed` remains the
+deliberate `recommended` trade-off. The connected-UDP peer-state race is a documented residual
+without a deterministic case, not a test coverage claim.
 
 Closed since: io_uring writes to sockets (every operation outside the effectless set is gated as an
 unknown peer); a different principal sending data the agent staged outside the source (files a
@@ -195,17 +205,14 @@ these cases.
 * `bench/leak-fuzzer/privileged-vm.py` boots an isolated qualifying kernel without rebooting the
   host. The privileged CI workflow builds the same artifacts and runs both modes; serialize VM
   verification on small hosts so emulation load does not turn command deadlines into false denials.
-* CI: a separate job on a Linux runner with user namespaces enabled. Run nightly with a random seed,
-  and per pull request with a fixed seed and a small iteration count.
+* Pull requests run seed `20261014`, one unchanged iteration, in both modes. Nightly CI runs four
+  fixed seeds (`20261014`–`20261017`), two iterations per seed, in both modes. The logs print each
+  seed and iteration for exact replay. Direct hook tests additionally cover classification, root
+  isolation, stale answers, ring-buffer overflow and task cleanup.
 
-## Order of work
+## Campaign boundaries
 
-1. Namespace bootstrap and the sink, plus a smoke test: one control case delivers and one trivial
-   attack case is blocked.
-2. The schema, loader and placeholders, plus the oracle for raw, base64 and hex.
-3. The runner, report, seed and filters.
-4. Neutral mutations, then shrinking, then the known-gaps file.
-5. Corpus import from hand-written cases or the SABER and RedCode exfiltration tasks.
-6. Document the suite in the README's agent-policy section, and point to it from
-   `bench/harbor/README.md` as the policy's leak test, separate from the benchmark's measure of
-   how much real work the policy blocks.
+The daily campaign uses four deterministic seeds and the newest generic kernel installed by the
+runner. It is not a supported-kernel matrix or a coverage-guided arbitrary-command fuzzer. The
+direct LSM tests exercise kernel event loss, task lifecycle and taint receipts over UDP, TCP and
+UNIX sockets; connected-UDP peer reconnect remains a documented residual, not campaign coverage.

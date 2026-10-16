@@ -19,6 +19,7 @@ use marsh_lib::RecoverPoison as _;
 
 mod access;
 mod agent;
+mod answers;
 pub mod builtins;
 mod completion;
 mod error;

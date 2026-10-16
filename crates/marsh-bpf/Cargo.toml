@@ -9,12 +9,15 @@ build = "build.rs"
 
 [features]
 default = []
-privileged = []
+privileged = ["dep:cc"]
+
+[build-dependencies]
+cc = { version = "1.4", optional = true }
 
 [dependencies]
 aya = "=0.13.1"
 libc = "0.2"
-marsh-peer-class = { path = "../marsh-peer-class", features = ["std"] }
+marsh-peer-class = { path = "../marsh-peer-class" }
 
 [lints]
 workspace = true

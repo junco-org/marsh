@@ -1,84 +1,100 @@
-//! Privileged-only BPF LSM loader and root-scoped policy maps.
+//! Privileged-only BPF LSM loader and the maps its programs read.
 //!
-//! Enable `privileged` to build and embed the real BPF object. Without that feature,
+//! Enable `privileged` to compile `src/marsh.bpf.c` with clang and embed it. Without that feature
 //! this crate builds without BPF tooling and [`Controller::load`] returns an error.
-//! Install `nightly-2025-12-01` with `rust-src`, clang 21, and `bpf-linker =0.9.15`
-//! (LLVM 21), then build with `cargo build -p marsh-bpf --features privileged`.
-//! The nested BPF build uses the pinned nightly and never host kernel headers.
 //!
-//! Publish networks and local endpoints before answers: [`Controller::configure`]
-//! and [`Controller::local`] invalidate old answers while replacing their maps.
-//! Keep newly governed children stopped until [`Controller::task`] succeeds.
-//! Every map/reporting failure permanently fails closed; create a new controller
-//! only after terminating the old controller's governed tasks. Maps and links are
-//! never pinned; kernel-created descriptors are close-on-exec. Dropping the
-//! controller detaches its programs and releases every descriptor.
+//! Publish a root's networks before its answers: [`Controller::configure`] withdraws old answers
+//! while it replaces the trie. Keep a newly governed child stopped until [`Controller::task`]
+//! succeeds. Every map or reporting failure poisons enforcement for good; create a new controller
+//! only after terminating the old one's governed tasks. Maps and links are never pinned, and
+//! kernel-created descriptors are close-on-exec. Dropping the controller detaches its programs.
 //!
-//! PID attribution uses the loader's actual PID namespace. Its procfs must expose
-//! that namespace (including PID 1); children entering another PID namespace are
-//! rejected before resume. Nested tracer namespaces with a matching procfs work.
+//! PID attribution uses the loader's actual PID namespace. Its procfs must expose that namespace
+//! (including PID 1); children entering another PID namespace are refused before they resume.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     io,
     os::{
-        fd::{AsRawFd, FromRawFd, OwnedFd},
+        fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd},
         unix::fs::MetadataExt,
     },
 };
 
 #[cfg(feature = "privileged")]
-use aya::{Btf, maps::Map, programs::Lsm};
+use aya::{
+    Btf,
+    maps::Map,
+    programs::{FExit, Lsm},
+};
 use aya::{
     Ebpf, Pod,
     maps::{Array, HashMap, LpmTrie, MapData, MapError, RingBuf, lpm_trie::Key},
 };
 use marsh_peer_class::{
-    AF_INET, AF_INET6, AF_UNIX, Answers, Contact, Endpoint, LocalKey, MAX_CLASSES, Network,
-    effective_networks,
+    AF_INET, AF_INET6, Answers, Endpoint, Event, MAX_CLASSES, Network, RECEIPT, Receipts,
+    UNANSWERED, effective_networks,
 };
 
-#[repr(transparent)]
-#[derive(Clone, Copy)]
-struct WireAnswers(Answers);
-// SAFETY: Answers contains only fixed-width integer fields and has no padding.
-unsafe impl Pod for WireAnswers {}
+/// Every LSM hook the programs attach to; all are required.
+#[cfg(feature = "privileged")]
+const HOOKS: [&str; 7] = [
+    "socket_connect",
+    "socket_sendmsg",
+    "unix_may_send",
+    "socket_post_create",
+    "unix_stream_connect",
+    "sk_free_security",
+    "uring_sqpoll",
+];
 
-#[repr(transparent)]
-#[derive(Clone, Copy)]
-struct WireLocal(LocalKey);
-// SAFETY: LocalKey contains only fixed-width integers/byte arrays and no padding.
-unsafe impl Pod for WireLocal {}
+/// Socket reads, traced on return so a reader blocked before tainted bytes arrived is caught.
+#[cfg(feature = "privileged")]
+const READS: [&str; 2] = ["sock_recvmsg", "sock_splice_read"];
 
-/// Owns the attached LSM programs and all their unpinned policy/reporting maps.
+macro_rules! pod {
+    ($wire:ident, $inner:ty) => {
+        #[repr(transparent)]
+        #[derive(Clone, Copy)]
+        struct $wire($inner);
+        // SAFETY: the record holds only fixed-width integers and byte arrays, with no padding;
+        // marsh-peer-class asserts its size against marsh.h.
+        unsafe impl Pod for $wire {}
+    };
+}
+pod!(WireAnswers, Answers);
+pod!(WireReceipts, Receipts);
+pod!(WireEndpoint, Endpoint);
+
+/// Owns the attached LSM programs and all their unpinned maps.
 ///
-/// Share this controller behind the tracer service's mutex. Loss is sticky: any
-/// failed operation poisons enforcement for all mapped tasks, including audit roots.
-/// Tasks not in the task map are always left unaffected.
+/// Share it behind the tracer's mutex. Loss is sticky: any failed operation refuses every mapped
+/// task's contacts, auditing roots included. Tasks outside the task map are never affected.
 pub struct Controller {
-    // Drop links before maps. Aya owns the links and detaches them on Ebpf::drop.
+    // Drop links before maps: Aya detaches the programs when `Ebpf` drops.
     programs: Option<Ebpf>,
     task_root: HashMap<MapData, u32, u64>,
     answers: HashMap<MapData, u64, WireAnswers>,
+    received: HashMap<MapData, u64, WireReceipts>,
     net4: LpmTrie<MapData, [u8; 12], u32>,
     net6: LpmTrie<MapData, [u8; 24], u32>,
-    local: HashMap<MapData, WireLocal, u32>,
+    local: HashMap<MapData, WireEndpoint, u32>,
+    allowed: HashSet<Endpoint>,
     events: RingBuf<MapData>,
     health: Array<MapData, u64>,
-    // pidfds avoid killing a recycled PID if poisoning the HEALTH map itself fails.
+    // pidfds: killing a recycled PID is impossible even when poisoning HEALTH itself fails.
     tasks: BTreeMap<u32, OwnedFd>,
     pid_namespace: [u64; 2],
     _pid_namespace: OwnedFd,
 }
 
 impl Controller {
-    /// Load and attach both socket hooks and the mandatory SQPOLL refusal hook.
+    /// Loads and attaches every hook.
     ///
-    /// Requires active BPF LSM, kernel BTF, ring buffers, and sufficient privileges.
-    /// A kernel lacking any requirement is never given an unprivileged fallback.
-    /// Successful loading makes the tracer nondumpable, preventing capless traced
-    /// processes from stealing its BPF descriptors. Failed loading leaves the
-    /// dumpability flag unchanged, so an explicit Auto fallback remains usable.
+    /// Requires active BPF LSM, kernel BTF, ring buffers and privileges. A kernel lacking any of
+    /// them gets no weaker enforcement. Success makes the tracer nondumpable, so capless traced
+    /// processes cannot steal its BPF descriptors; failure leaves dumpability unchanged, so an
+    /// `Auto` fallback stays usable.
     pub fn load() -> io::Result<Self> {
         #[cfg(not(feature = "privileged"))]
         {
@@ -91,71 +107,80 @@ impl Controller {
         {
             let btf = prerequisites()?;
             let (pid_namespace_fd, pid_namespace) = own_pid_namespace()?;
-            let mut programs = Ebpf::load(aya::include_bytes_aligned!(concat!(env!("OUT_DIR"), "/marsh-bpf.o")))
-                .map_err(|error| io::Error::other(format!("loading BPF LSM maps/CO-RE relocations failed (BPF privileges and ring-buffer support required): {error}")))?;
-            let task_root =
-                HashMap::try_from(take(&mut programs, "TASK_ROOT")?).map_err(io::Error::other)?;
-            let answers =
-                HashMap::try_from(take(&mut programs, "ANSWERS")?).map_err(io::Error::other)?;
-            let net4 =
-                LpmTrie::try_from(take(&mut programs, "CLASS_NET4")?).map_err(io::Error::other)?;
-            let net6 =
-                LpmTrie::try_from(take(&mut programs, "CLASS_NET6")?).map_err(io::Error::other)?;
-            let local = HashMap::try_from(take(&mut programs, "LOCAL_ALLOWED")?)
-                .map_err(io::Error::other)?;
-            let events =
-                RingBuf::try_from(take(&mut programs, "EVENTS")?).map_err(io::Error::other)?;
-            let health =
-                Array::try_from(take(&mut programs, "HEALTH")?).map_err(io::Error::other)?;
-            let mut namespace_map: Array<_, [u64; 2]> = Array::try_from(
+            // Socket storage is a map type Aya has no wrapper for; the kernel owns it entirely.
+            let mut programs = aya::EbpfLoader::new()
+                .allow_unsupported_maps()
+                .load(aya::include_bytes_aligned!(concat!(env!("OUT_DIR"), "/marsh.bpf.o")))
+                .map_err(|error| io::Error::other(format!("loading BPF LSM maps/CO-RE relocations failed (BPF privileges, ring buffers and socket storage required): {error}")))?;
+            let mut namespace: Array<_, [u64; 2]> = Array::try_from(
                 programs
                     .map_mut("PID_NAMESPACE")
-                    .ok_or_else(|| io::Error::other("missing BPF PID namespace configuration"))?,
+                    .ok_or_else(|| io::Error::other("missing BPF map PID_NAMESPACE"))?,
             )
             .map_err(io::Error::other)?;
-            namespace_map
-                .set(0, pid_namespace, 0)
-                .map_err(io::Error::other)?;
-            for name in ["socket_connect", "socket_sendmsg", "uring_sqpoll"] {
-                let program: &mut Lsm = programs
-                    .program_mut(name)
-                    .ok_or_else(|| io::Error::other(format!("missing BPF program {name}")))?
-                    .try_into()
-                    .map_err(io::Error::other)?;
-                program.load(name, &btf).map_err(|error| {
-                    io::Error::other(format!("loading BPF LSM {name} failed: {error}"))
-                })?;
-                program.attach().map_err(|error| {
-                    io::Error::other(format!("attaching BPF LSM {name} failed: {error}"))
-                })?;
-            }
-            // Do this last: no governed child exists yet, and a failed load must
-            // not make Auto's unprivileged fallback inherit nondumpable children.
-            // SAFETY: PR_SET_DUMPABLE accepts scalar arguments and no pointers.
-            if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) } != 0 {
-                let error = io::Error::last_os_error();
-                return Err(io::Error::new(error.kind(), format!("protecting BPF descriptors with PR_SET_DUMPABLE failed: {error}")));
-            }
-            Ok(Self {
-                programs: Some(programs),
-                task_root,
-                answers,
-                net4,
-                net6,
-                local,
-                events,
-                health,
+            namespace.set(0, pid_namespace, 0).map_err(io::Error::other)?;
+            let controller = Self {
+                task_root: map(&mut programs, "TASK_ROOT")?,
+                answers: map(&mut programs, "ANSWERS")?,
+                received: map(&mut programs, "RECEIVED")?,
+                net4: map(&mut programs, "CLASS_NET4")?,
+                net6: map(&mut programs, "CLASS_NET6")?,
+                local: map(&mut programs, "LOCAL_ALLOWED")?,
+                allowed: HashSet::new(),
+                events: map(&mut programs, "EVENTS")?,
+                health: map(&mut programs, "HEALTH")?,
                 tasks: BTreeMap::new(),
                 pid_namespace,
                 _pid_namespace: pid_namespace_fd,
+                programs: None,
+            };
+            for hook in HOOKS {
+                let program: &mut Lsm = programs
+                    .program_mut(hook)
+                    .ok_or_else(|| io::Error::other(format!("missing BPF program {hook}")))?
+                    .try_into()
+                    .map_err(io::Error::other)?;
+                program.load(hook, &btf).map_err(|error| {
+                    io::Error::other(format!("loading BPF LSM {hook} failed: {error}"))
+                })?;
+                program.attach().map_err(|error| {
+                    io::Error::other(format!("attaching BPF LSM {hook} failed: {error}"))
+                })?;
+            }
+            for read in READS {
+                let program: &mut FExit = programs
+                    .program_mut(read)
+                    .ok_or_else(|| io::Error::other(format!("missing BPF program {read}")))?
+                    .try_into()
+                    .map_err(io::Error::other)?;
+                program.load(read, &btf).map_err(|error| {
+                    io::Error::other(format!("loading BPF fexit {read} failed: {error}"))
+                })?;
+                program.attach().map_err(|error| {
+                    io::Error::other(format!("attaching BPF fexit {read} failed: {error}"))
+                })?;
+            }
+            // Last: no governed child exists yet, and a failed load must not leave an Auto
+            // fallback's children nondumpable.
+            // SAFETY: PR_SET_DUMPABLE takes scalar arguments only.
+            if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) } != 0 {
+                let error = io::Error::last_os_error();
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!("protecting BPF descriptors with PR_SET_DUMPABLE failed: {error}"),
+                ));
+            }
+            Ok(Self {
+                programs: Some(programs),
+                ..controller
             })
         }
     }
 
-    /// Replace this root's networks, preserving first-declaration policy precedence.
+    /// Replaces this root's declared networks, preserving first-declaration precedence.
     ///
-    /// Every trie key starts with all 64 root bits: even `/0` cannot match another
-    /// root. Existing answers are invalidated; publish new answers afterwards.
+    /// Every trie key starts with the 64 root bits, so even `/0` cannot match another root. The
+    /// root's answers are withdrawn; publish new ones afterwards.
     pub fn configure(&mut self, root: u64, networks: &[Network]) -> io::Result<()> {
         self.update(|this| {
             validate_networks(networks)?;
@@ -163,30 +188,22 @@ impl Controller {
             this.clear_networks(root)?;
             for network in effective_networks(networks) {
                 let class = u32::from(network.class);
-                if network.family == AF_INET {
+                let prefix = 64 + network.prefix;
+                let inserted = if network.family == AF_INET {
                     this.net4
-                        .insert(
-                            &Key::new(64 + network.prefix, net4_key(root, &network.address)),
-                            class,
-                            0,
-                        )
-                        .map_err(io::Error::other)?;
+                        .insert(&Key::new(prefix, net4_key(root, &network.address)), class, 0)
                 } else {
                     this.net6
-                        .insert(
-                            &Key::new(64 + network.prefix, net6_key(root, &network.address)),
-                            class,
-                            0,
-                        )
-                        .map_err(io::Error::other)?;
-                }
+                        .insert(&Key::new(prefix, net6_key(root, &network.address)), class, 0)
+                };
+                inserted.map_err(io::Error::other)?;
             }
             Ok(())
         })
     }
 
-    /// Atomically publish the complete answer generation after dependent maps are ready.
-    pub fn answers(&mut self, root: u64, answers: Answers) -> io::Result<()> {
+    /// Atomically replaces a root's answers.
+    pub fn publish(&mut self, root: u64, answers: Answers) -> io::Result<()> {
         self.update(|this| {
             this.answers
                 .insert(root, WireAnswers(answers), 0)
@@ -194,8 +211,7 @@ impl Controller {
         })
     }
 
-    /// Mark a root stale, retaining its generation, audit flag, and guarded-class mask.
-    /// A root without answers already denies every contact and needs no update.
+    /// Marks a root's answers stale, keeping the rest. A root without answers already refuses.
     pub fn stale(&mut self, root: u64) -> io::Result<()> {
         self.update(|this| {
             let mut answers = match this.answers.get(&root, 0) {
@@ -210,10 +226,9 @@ impl Controller {
         })
     }
 
-    /// Attribute all threads of a stopped process to a root before the child resumes.
-    /// Missing root answers deny contacts, rather than leaving the child ungoverned.
-    /// The process must remain in the controller's PID namespace; namespace-changing
-    /// children are refused before resume, rather than silently losing attribution.
+    /// Attributes every thread of a stopped process to a root before it resumes. A root without
+    /// answers refuses its contacts. A child that changed PID namespace is refused rather than
+    /// resumed unattributed.
     pub fn task(&mut self, tgid: u32, root: u64) -> io::Result<()> {
         self.update(|this| {
             if let std::collections::btree_map::Entry::Vacant(entry) = this.tasks.entry(tgid) {
@@ -232,7 +247,7 @@ impl Controller {
         })
     }
 
-    /// Remove an exited process's mapping; repeated cleanup is harmless.
+    /// Removes an exited process's mapping; repeated cleanup is harmless.
     pub fn remove_task(&mut self, tgid: u32) -> io::Result<()> {
         if let Err(error) = absent_ok(self.task_root.remove(&tgid)) {
             let error = self.poison(error);
@@ -245,21 +260,88 @@ impl Controller {
         Ok(())
     }
 
-    /// Remove a root's answers, network declarations, and local allowlist.
-    /// Any process still mapped to this root remains governed and denied.
+    /// Removes a root's answers, receipts and networks. Processes still mapped to it refuse.
     pub fn remove_root(&mut self, root: u64) -> io::Result<()> {
         let result = (|| {
             absent_ok(self.answers.remove(&root))?;
-            self.clear_networks(root)?;
-            self.clear_local(root)
+            absent_ok(self.received.remove(&root))?;
+            self.clear_networks(root)
         })();
         result.map_err(|error| self.poison(error))
     }
 
-    /// Send SIGKILL to every governed pidfd, clean up even if poisoned, and detach.
-    /// Call on a shared-service failure. Signal failures retain the hooks; after
-    /// successful signaling, map cleanup errors are returned but stale numeric
-    /// PID keys cannot affect PID reuse because the programs are detached.
+    /// Replaces the IP endpoints traced processes hold, which a taint-carrying root may reach
+    /// under `untraced_local(Deny)`. Wildcard binds have a zero address and match every local
+    /// address of their family and port. Unchanged entries stay in place throughout.
+    pub fn local(&mut self, endpoints: &[Endpoint]) -> io::Result<()> {
+        self.update(|this| {
+            let wanted: HashSet<Endpoint> = endpoints.iter().map(Endpoint::normalized).collect();
+            if let Some(invalid) = wanted
+                .iter()
+                .find(|endpoint| !matches!(endpoint.family, AF_INET | AF_INET6))
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("local allowlist entry is not an IP endpoint: {invalid:?}"),
+                ));
+            }
+            for endpoint in this.allowed.difference(&wanted) {
+                absent_ok(this.local.remove(&WireEndpoint(*endpoint)))?;
+            }
+            for endpoint in wanted.difference(&this.allowed) {
+                this.local
+                    .insert(WireEndpoint(*endpoint), 1, 0)
+                    .map_err(io::Error::other)?;
+            }
+            this.allowed = wanted;
+            Ok(())
+        })
+    }
+
+    /// Readable when events are waiting; poll it, then [`Self::drain`].
+    pub fn events(&self) -> BorrowedFd<'_> {
+        // SAFETY: the ring's descriptor lives exactly as long as `self`, which this borrows.
+        unsafe { BorrowedFd::borrow_raw(self.events.as_raw_fd()) }
+    }
+
+    /// Drains every waiting event. Overflow, malformed records and map errors poison for good,
+    /// auditing roots included.
+    pub fn drain(&mut self) -> io::Result<Vec<Event>> {
+        self.update(|this| {
+            let mut events = Vec::new();
+            while let Some(bytes) = this.events.next() {
+                if bytes.len() != size_of::<Event>() {
+                    return Err(io::Error::other(
+                        "malformed BPF event record; enforcement poisoned",
+                    ));
+                }
+                // SAFETY: bytes holds exactly one Event, which consists of integers and byte
+                // arrays only; read_unaligned tolerates the ring's alignment.
+                let mut event = unsafe { bytes.as_ptr().cast::<Event>().read_unaligned() };
+                if event.kind > RECEIPT
+                    || event.class as usize >= MAX_CLASSES
+                    || event.decision > 2
+                    || event.reason > UNANSWERED
+                    || event.endpoint.unix_len > 108
+                {
+                    return Err(io::Error::other(
+                        "invalid BPF event record; enforcement poisoned",
+                    ));
+                }
+                event.endpoint.normalize();
+                events.push(event);
+            }
+            // Loss racing the first check must not pass as a complete drain.
+            this.check_health()?;
+            Ok(events)
+        })
+    }
+
+    /// Sends SIGKILL to every governed pidfd, cleans up even when poisoned, then detaches.
+    ///
+    /// Call on a shared-service failure. A signalling failure keeps the hooks attached; after
+    /// successful signalling, map cleanup errors are returned, but stale numeric PID keys cannot
+    /// match a reused PID because the programs are detached.
     pub fn terminate(&mut self) -> io::Result<()> {
         let mut failure = self.health.set(0, 1, 0).map_err(io::Error::other).err();
         self.kill_tasks()?;
@@ -273,74 +355,10 @@ impl Controller {
         failure.map_or(Ok(()), Err)
     }
 
-    /// Replace normalized local receiver endpoints, invalidating old answers first.
-    ///
-    /// Abstract UNIX name length is significant. Wildcard IP listeners match
-    /// loopback contacts of the same family and port in the kernel; other endpoints
-    /// must match exactly. Publish the refreshed answers after this method returns.
-    pub fn local(&mut self, root: u64, endpoints: &[Endpoint]) -> io::Result<()> {
-        self.update(|this| {
-            absent_ok(this.answers.remove(&root))?;
-            this.clear_local(root)?;
-            for endpoint in endpoints {
-                let endpoint = endpoint.normalized();
-                if !matches!(endpoint.family, AF_UNIX | AF_INET | AF_INET6) {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "local allowlist contains an unknown endpoint",
-                    ));
-                }
-                this.local
-                    .insert(WireLocal(LocalKey { root, endpoint }), 1, 0)
-                    .map_err(io::Error::other)?;
-            }
-            Ok(())
-        })
-    }
-
-    /// Drain real contacts. Overflow/malformed records/map errors permanently fail closed.
-    /// Reporting loss is fatal even when the root uses audit mode.
-    pub fn drain(&mut self) -> io::Result<Vec<Contact>> {
-        self.update(|this| {
-            let mut contacts = Vec::new();
-            while let Some(bytes) = this.events.next() {
-                if bytes.len() != size_of::<Contact>() {
-                    return Err(io::Error::other(
-                        "malformed BPF contact record; enforcement poisoned",
-                    ));
-                }
-                // SAFETY: bytes has exactly Contact's size; Contact consists entirely
-                // of integers/byte arrays, and read_unaligned handles ring alignment.
-                let contact = unsafe { bytes.as_ptr().cast::<Contact>().read_unaligned() };
-                if contact.class as usize >= MAX_CLASSES
-                    || contact.decision > 4
-                    || contact.endpoint.unix_len > 108
-                {
-                    return Err(io::Error::other(
-                        "invalid BPF contact record; enforcement poisoned",
-                    ));
-                }
-                contacts.push(contact);
-            }
-            // Loss racing the first check must not be returned as a successful drain.
-            this.check_health()?;
-            Ok(contacts)
-        })
-    }
-
-    /// Whether socket `sendfile`/`splice` can skip the ptrace peer gate.
-    ///
-    /// False conservatively on every kernel: version numbers do not establish
-    /// backported `sock_sendmsg` routing. Keep the existing ptrace fallback until
-    /// that path is positively probed on the deployment kernel.
-    pub const fn sendfile_covered(&self) -> bool {
-        false
-    }
-
     fn check_health(&self) -> io::Result<()> {
         if self.health.get(&0, 0).map_err(io::Error::other)? != 0 {
             return Err(io::Error::other(
-                "BPF reporting/map loss: privileged enforcement is permanently poisoned",
+                "BPF reporting or map loss: privileged enforcement is permanently poisoned",
             ));
         }
         Ok(())
@@ -353,8 +371,8 @@ impl Controller {
 
     fn poison(&mut self, error: io::Error) -> io::Error {
         if let Err(map_error) = self.health.set(0, 1, 0) {
-            // If even the poison switch is unavailable, pidfds are the last
-            // fail-closed boundary. Never wait here: ptrace exit stops need the tracer.
+            // Without the switch, pidfds are the last fail-closed boundary. Never wait here:
+            // ptrace exit stops need the tracer.
             let termination = self.terminate();
             return io::Error::other(format!(
                 "{error}; cannot poison BPF maps: {map_error}; termination: {termination:?}"
@@ -387,14 +405,12 @@ impl Controller {
     }
 
     fn clear_networks(&mut self, root: u64) -> io::Result<()> {
-        // ponytail: scan shared maps on replacement; track per-root keys if this becomes hot.
+        // ponytail: scans the shared tries on replacement; track per-root keys if this gets hot.
+        let prefix = root.to_ne_bytes();
         let keys: Vec<_> = self
             .net4
             .keys()
-            .filter(|key| {
-                key.as_ref()
-                    .map_or(true, |key| key.data()[..8] == root.to_be_bytes())
-            })
+            .filter(|key| key.as_ref().map_or(true, |key| key.data()[..8] == prefix))
             .collect::<Result<_, _>>()
             .map_err(io::Error::other)?;
         for key in keys {
@@ -403,10 +419,7 @@ impl Controller {
         let keys: Vec<_> = self
             .net6
             .keys()
-            .filter(|key| {
-                key.as_ref()
-                    .map_or(true, |key| key.data()[..8] == root.to_be_bytes())
-            })
+            .filter(|key| key.as_ref().map_or(true, |key| key.data()[..8] == prefix))
             .collect::<Result<_, _>>()
             .map_err(io::Error::other)?;
         for key in keys {
@@ -414,31 +427,19 @@ impl Controller {
         }
         Ok(())
     }
-
-    fn clear_local(&mut self, root: u64) -> io::Result<()> {
-        let keys: Vec<_> = self
-            .local
-            .keys()
-            .filter(|key| key.as_ref().map_or(true, |key| key.0.root == root))
-            .collect::<Result<_, _>>()
-            .map_err(io::Error::other)?;
-        for key in keys {
-            self.local.remove(&key).map_err(io::Error::other)?;
-        }
-        Ok(())
-    }
 }
 
+/// Trie keys begin with the root in native byte order, as the kernel program copies it.
 fn net4_key(root: u64, address: &[u8; 16]) -> [u8; 12] {
     let mut key = [0; 12];
-    key[..8].copy_from_slice(&root.to_be_bytes());
+    key[..8].copy_from_slice(&root.to_ne_bytes());
     key[8..].copy_from_slice(&address[..4]);
     key
 }
 
 fn net6_key(root: u64, address: &[u8; 16]) -> [u8; 24] {
     let mut key = [0; 24];
-    key[..8].copy_from_slice(&root.to_be_bytes());
+    key[..8].copy_from_slice(&root.to_ne_bytes());
     key[8..].copy_from_slice(address);
     key
 }
@@ -469,9 +470,7 @@ fn validate_networks(networks: &[Network]) -> io::Result<()> {
 fn absent_ok(result: Result<(), MapError>) -> io::Result<()> {
     match result {
         Ok(()) | Err(MapError::KeyNotFound) => Ok(()),
-        Err(MapError::SyscallError(error))
-            if error.io_error.raw_os_error() == Some(libc::ENOENT) =>
-        {
+        Err(MapError::SyscallError(error)) if error.io_error.raw_os_error() == Some(libc::ENOENT) => {
             Ok(())
         }
         Err(error) => Err(io::Error::other(error)),
@@ -479,8 +478,8 @@ fn absent_ok(result: Result<(), MapError>) -> io::Result<()> {
 }
 
 fn pidfd(tgid: u32) -> io::Result<OwnedFd> {
-    // SAFETY: pidfd_open takes an integer PID and flags, not pointers; its returned
-    // descriptor is fresh, close-on-exec, and owned only by this function.
+    // SAFETY: pidfd_open takes an integer PID and flags; it returns a fresh close-on-exec
+    // descriptor owned only here.
     let descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, tgid, 0) };
     if descriptor < 0 {
         return Err(io::Error::last_os_error());
@@ -491,10 +490,14 @@ fn pidfd(tgid: u32) -> io::Result<OwnedFd> {
 }
 
 #[cfg(feature = "privileged")]
-fn take(programs: &mut Ebpf, name: &str) -> io::Result<Map> {
-    programs
+fn map<T: TryFrom<Map>>(programs: &mut Ebpf, name: &str) -> io::Result<T>
+where
+    T::Error: std::fmt::Display,
+{
+    let map = programs
         .take_map(name)
-        .ok_or_else(|| io::Error::other(format!("missing BPF map {name}")))
+        .ok_or_else(|| io::Error::other(format!("missing BPF map {name}")))?;
+    T::try_from(map).map_err(|error| io::Error::other(format!("BPF map {name}: {error}")))
 }
 
 #[cfg(feature = "privileged")]
@@ -526,36 +529,64 @@ fn prerequisites() -> io::Result<Btf> {
     Btf::from_sys_fs().map_err(|error| io::Error::other(format!("kernel BTF unavailable at /sys/kernel/btf/vmlinux: enable CONFIG_DEBUG_INFO_BTF: {error}")))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "privileged"))]
 mod tests {
     use super::*;
+    use marsh_peer_class::builtin_class;
 
+    #[link(name = "marsh_classify", kind = "static")]
+    unsafe extern "C" {
+        fn marsh_host_builtin_class(endpoint: *const Endpoint) -> i32;
+        fn marsh_host_normalize_ip(endpoint: *mut Endpoint);
+    }
+
+    /// The kernel's classifier is C; it must agree with the policy's Rust one on every IP.
     #[test]
-    fn abi_and_root_prefixes_are_isolated() {
-        assert_eq!(size_of::<Answers>(), 40);
-        assert_eq!(size_of::<WireAnswers>(), 40);
-        assert_eq!(size_of::<Endpoint>(), 136);
-        assert_eq!(size_of::<WireLocal>(), 144);
-        assert_eq!(size_of::<Contact>(), 168);
-        let address = [0; 16];
-        assert_ne!(net4_key(1, &address)[..8], net4_key(2, &address)[..8]);
-        assert_ne!(net6_key(1, &address)[..8], net6_key(2, &address)[..8]);
-        assert_eq!(net4_key(1, &address)[..8], net6_key(1, &address)[..8]);
-        let valid = Network {
-            family: AF_INET,
-            prefix: 0,
-            class: 5,
-            address,
+    fn kernel_classifier_matches_policy_classifier() {
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
         };
-        assert!(validate_networks(&[valid]).is_ok());
-        assert!(
-            validate_networks(&[Network {
-                prefix: 33,
-                ..valid
-            }])
-            .is_err()
-        );
-        assert!(validate_networks(&[Network { class: 64, ..valid }]).is_err());
-        assert!(validate_networks(&[Network { class: 4, ..valid }]).is_err());
+        let interesting: [[u8; 16]; 6] = [
+            [0; 16],
+            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 127, 0, 0, 1],
+            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 0, 0, 0, 0],
+            [127, 3, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2],
+        ];
+        for round in 0..20_000 {
+            let mut endpoint = Endpoint {
+                family: [AF_INET, AF_INET6, 1, 16, 0, 17][usize::try_from(next() % 6).unwrap()],
+                port: 80,
+                scope: u32::try_from(next() % 3).unwrap(),
+                ..Endpoint::default()
+            };
+            endpoint.address = if round % 2 == 0 {
+                interesting[usize::try_from(next() % 6).unwrap()]
+            } else {
+                let mut address = [0; 16];
+                for byte in &mut address {
+                    *byte = u8::try_from(next() % 4).unwrap() * 85;
+                }
+                address
+            };
+            // SAFETY: endpoint is a live, initialized Endpoint, the C struct's exact layout.
+            let kernel = unsafe { marsh_host_builtin_class(&endpoint) };
+            assert_eq!(
+                builtin_class(&endpoint).map_or(-1, |class| i32::try_from(class).unwrap()),
+                kernel,
+                "{endpoint:?}"
+            );
+            if matches!(endpoint.family, AF_INET | AF_INET6) {
+                let mut kernel = endpoint;
+                // SAFETY: as above, uniquely borrowed for the call.
+                unsafe { marsh_host_normalize_ip(&mut kernel) };
+                assert_eq!(kernel, endpoint.normalized(), "{endpoint:?}");
+            }
+        }
     }
 }

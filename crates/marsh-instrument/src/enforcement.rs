@@ -1,9 +1,8 @@
-//! Process-wide socket enforcement selection and the shared policy/kernel boundary.
+//! The enforcement modes and the seam between the tracer and the shared policy engine.
 
 use std::io;
-use std::sync::Mutex;
 
-use marsh_peer_class::{Answers, Contact, Endpoint, Network};
+use marsh_peer_class::{Answers, Event, Network};
 
 use crate::{FileTarget, InvocationId, TraceRun};
 
@@ -19,19 +18,21 @@ pub enum Enforcement {
     Auto,
 }
 
-/// A root's eagerly computed policy table and local exceptions.
+/// One root's answers for the kernel program.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KernelPolicy {
-    /// Answers for every peer class under one policy basis.
+    /// Answers for every peer class, under one policy basis.
     pub answers: Answers,
-    /// Declared networks with stable class IDs.
+    /// Declared networks with their class IDs.
     pub networks: Vec<Network>,
-    /// Local endpoints held by commands belonging to the same source.
-    pub local: Vec<Endpoint>,
+    /// Whether recording one more contact could change `answers`: the tracer then refreshes them
+    /// at every socket call's entry, since the kernel cannot.
+    pub contact_sensitive: bool,
 }
 
 /// The policy engine shared by ptrace and kernel socket enforcement.
 pub trait Enforcer: Send + Sync {
-    /// Judge a ptrace-mode contact using the lazy policy cache.
+    /// Judges a contact at its ptrace entry stop, against the address the call names.
     fn permits(
         &self,
         run: TraceRun,
@@ -39,40 +40,13 @@ pub trait Enforcer: Send + Sync {
         peer: &[u8],
         source: Option<&FileTarget>,
     ) -> bool;
-    /// Compute every class's answer before a kernel-mode contact can run.
-    fn refresh(
-        &self,
-        run: TraceRun,
-        builtin: Option<InvocationId>,
-        source: Option<&FileTarget>,
-    ) -> io::Result<KernelPolicy>;
-    /// Preserve the early local taint handoff without using it as kernel evidence.
-    fn handoff(
-        &self,
-        _run: TraceRun,
-        _peer: &[u8],
-        _source: Option<&FileTarget>,
-    ) -> io::Result<()> {
-        Ok(())
-    }
-    /// Consume a kernel-observed contact before the corresponding syscall's effects.
-    fn contact(
-        &self,
-        run: TraceRun,
-        builtin: Option<InvocationId>,
-        event: Contact,
-    ) -> io::Result<()>;
-    /// Record an asynchronous kernel contact with no ptrace syscall completion of its own.
-    fn asynchronous_contact(
-        &self,
-        run: TraceRun,
-        builtin: Option<InvocationId>,
-        order: u64,
-        event: Contact,
-    ) -> io::Result<()>;
+    /// The root's current answers, including a read of `source`, the file the stopped call copies
+    /// into a socket in-kernel.
+    fn refresh(&self, run: TraceRun, source: Option<&FileTarget>) -> io::Result<KernelPolicy>;
+    /// A kernel contact or taint receipt of `run`. Its `time` orders it among ptrace records.
+    fn event(&self, run: TraceRun, builtin: Option<InvocationId>, event: &Event)
+    -> io::Result<()>;
 }
-
-pub(crate) static SELECTION: Mutex<Option<(Enforcement, Option<String>)>> = Mutex::new(None);
 
 /// Runs only in the trusted post-fork setup, before the command's handshake and exec.
 /// Root commands must not inherit authority to rewrite maps or inspect the loader's descriptors.
@@ -137,28 +111,4 @@ pub(crate) fn restrict_child() -> io::Result<()> {
     }
     // The loader is nondumpable; its capless child must still admit its parent's ptrace seize.
     control(libc::PR_SET_DUMPABLE, 1)
-}
-
-#[cfg(feature = "privileged")]
-pub(crate) struct Kernel {
-    pub controller: marsh_bpf::Controller,
-    pub epochs: std::collections::HashMap<u64, u64>,
-    pub networks: std::collections::HashMap<u64, Vec<Network>>,
-    pub tasks: std::collections::HashMap<u32, u32>,
-    pub local: std::collections::HashMap<u64, Vec<Endpoint>>,
-    pub published: std::collections::HashMap<u64, Answers>,
-}
-
-#[cfg(feature = "privileged")]
-impl Kernel {
-    pub fn load() -> io::Result<Self> {
-        Ok(Self {
-            controller: marsh_bpf::Controller::load()?,
-            epochs: std::collections::HashMap::new(),
-            networks: std::collections::HashMap::new(),
-            tasks: std::collections::HashMap::new(),
-            local: std::collections::HashMap::new(),
-            published: std::collections::HashMap::new(),
-        })
-    }
 }

@@ -408,7 +408,7 @@ impl SourceDomain {
         self.validator.declassify(approver, holder.clone(), class)?;
         if let Some(session) = self.session() {
             session.taint.lock().recover().declassify(holder, class);
-            session.invalidate_answers()?;
+            session.republish()?;
         }
         Ok(())
     }
@@ -436,13 +436,12 @@ impl SourceDomain {
             let metadata = std::fs::metadata(path)?;
             Carrier::Outside(metadata.dev(), metadata.ino())
         };
-        session.invalidate_answers()?;
+        // A carrier's taint matters only to later reads: no published answer changes.
         session
             .taint
             .lock()
             .recover()
             .declassify_carrier(&carrier, class);
-        session.invalidate_answers()?;
         Ok(())
     }
 
@@ -833,19 +832,30 @@ pub(super) struct Session {
 }
 
 impl Session {
-    /// Marks every source root stale before changed history or taint can be consumed.
-    pub fn invalidate_answers(&self) -> Result<(), ShellError> {
-        if self.tracing.enforcement() != marsh_instrument::Enforcement::Privileged {
-            return Ok(());
+    /// Republishes every source root's kernel answers after the taint they read changed.
+    pub fn republish(&self) -> Result<(), ShellError> {
+        for snapshot in self.live() {
+            snapshot.republish()?;
         }
-        let snapshots: Vec<_> = self
-            .snapshots
+        Ok(())
+    }
+
+    fn live(&self) -> Vec<Arc<Snapshot>> {
+        self.snapshots
             .lock()
             .recover()
             .values()
             .filter_map(Weak::upgrade)
-            .collect();
-        for snapshot in snapshots {
+            .collect()
+    }
+
+    /// Marks every source root's kernel answers stale before the committed history changes. The
+    /// tracer recomputes them at the next stop that needs them.
+    pub fn invalidate_answers(&self) -> Result<(), ShellError> {
+        if self.tracing.enforcement() != marsh_instrument::Enforcement::Privileged {
+            return Ok(());
+        }
+        for snapshot in self.live() {
             self.tracing.stale(snapshot.root()?)?;
         }
         Ok(())

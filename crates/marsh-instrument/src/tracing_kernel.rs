@@ -1,84 +1,84 @@
-//! Kernel-mode map lifecycle and ordered delivery, owned by the tracing service.
-use super::{RootId, Target, Tracing, lock};
-#[cfg(feature = "privileged")]
-use crate::{Contact, KernelPolicy};
-use crate::{Endpoint, Enforcer, FileTarget, Syscall, local};
-#[cfg(feature = "privileged")]
-use marsh_lib::RecoverPoison as _;
+//! Privileged enforcement inside the tracing service: the kernel program's maps, kept in step with
+//! ptrace stops, and its event stream delivered to each root's policy engine.
+//!
+//! Without the `privileged` feature [`Kernel`] is uninhabited, so every privileged path below is
+//! statically dead and the ptrace gate is the only enforcement.
+
+use super::{RootId, State, Target, Tracing, lock};
+use crate::enforcement::{Enforcement, Enforcer, KernelPolicy};
+use crate::{FileTarget, local};
+use marsh_peer_class::{AF_INET, AF_INET6, Endpoint, Event};
 use nix::unistd::Pid;
-use std::{io, sync::Arc};
+use std::{io, sync::Arc, sync::Mutex};
+use syscalls::Sysno;
 
-#[cfg(feature = "privileged")]
-struct KernelContact {
-    target: Target,
-    synchronous: Option<Pid>,
-    enforcer: Arc<dyn Enforcer>,
-    event: Contact,
+/// Process-wide: the mode the first shell chose, and why an `Auto` request fell back.
+static SELECTION: Mutex<Option<(Enforcement, Option<String>)>> = Mutex::new(None);
+
+const ALREADY_UNPRIVILEGED: &str =
+    "process already selected unprivileged socket enforcement before Auto was requested";
+
+/// The mode this process selected, unprivileged before any selection.
+pub(super) fn selected() -> Enforcement {
+    lock(&SELECTION)
+        .as_ref()
+        .map_or(Enforcement::Unprivileged, |(mode, _)| *mode)
 }
 
-/// Pins command evidence while a drained batch is delivered without tracing locks.
-#[cfg(feature = "privileged")]
-pub(super) struct KernelContacts<'a> {
-    tracing: &'a Tracing,
-    records: Vec<KernelContact>,
-    completed: usize,
-}
-
-#[cfg(feature = "privileged")]
-impl KernelContacts<'_> {
-    pub(super) fn deliver(&mut self) -> io::Result<()> {
-        for record in &self.records[self.completed..] {
-            let KernelContact {
-                target,
-                synchronous,
-                enforcer,
-                event,
-            } = record;
-            enforcer.contact(target.run, target.builtin, *event)?;
-            if let Some(tid) = synchronous {
-                lock(&self.tracing.contacts)
-                    .entry(*tid)
-                    .or_default()
-                    .push(event.endpoint.sockaddr());
-            } else {
-                enforcer.asynchronous_contact(
-                    target.run,
-                    target.builtin,
-                    self.tracing.sequence.next()?,
-                    *event,
-                )?;
+/// Resolves `requested` against the process's selection, loading the kernel programs when the
+/// result is privileged: the mode in force, its kernel, and why `Auto` fell back, if it did.
+pub(super) fn select(
+    requested: Enforcement,
+) -> io::Result<(Enforcement, Option<Kernel>, Option<String>)> {
+    let mut selection = lock(&SELECTION);
+    let (desired, reason) = match selection.clone() {
+        Some((mode, _)) if requested != Enforcement::Auto && requested != mode => {
+            return Err(io::Error::other(
+                "socket enforcement already selected differently for this process",
+            ));
+        }
+        Some((mode, reason)) => (mode, reason),
+        None => (requested, None),
+    };
+    let (mode, kernel, reason) = match desired {
+        Enforcement::Unprivileged => (
+            Enforcement::Unprivileged,
+            None,
+            reason.or_else(|| {
+                (requested == Enforcement::Auto).then(|| ALREADY_UNPRIVILEGED.to_owned())
+            }),
+        ),
+        Enforcement::Privileged | Enforcement::Auto => match Kernel::load() {
+            Ok(kernel) => (Enforcement::Privileged, Some(kernel), None),
+            Err(error) if desired == Enforcement::Auto => {
+                (Enforcement::Unprivileged, None, Some(error.to_string()))
             }
-            if let Some(run) = lock(&self.tracing.state).runs.get_mut(&target.run) {
-                run.contacts -= 1;
-            }
-            self.completed += 1;
-            self.tracing.progress.notify_all();
-        }
-        Ok(())
-    }
-}
-
-#[cfg(feature = "privileged")]
-impl Drop for KernelContacts<'_> {
-    fn drop(&mut self) {
-        if self.completed == self.records.len() {
-            return;
-        }
-        if std::thread::panicking() {
-            self.tracing.fail("native kernel contact consumer panicked");
-        }
-        let mut state = lock(&self.tracing.state);
-        for record in &self.records[self.completed..] {
-            if let Some(run) = state.runs.get_mut(&record.target.run) {
-                run.contacts -= 1;
-            }
-        }
-        drop(state);
-        self.tracing.progress.notify_all();
-    }
+            Err(error) => return Err(error),
+        },
+    };
+    *selection = Some((mode, reason.clone()));
+    drop(selection);
+    Ok((mode, kernel, reason))
 }
 
 impl Tracing {
+    /// Admits a later shell's request into this generation's mode.
+    pub(super) fn admit_enforcement(&self, requested: Enforcement) -> io::Result<()> {
+        match requested {
+            Enforcement::Auto => {
+                if self.enforcement == Enforcement::Unprivileged {
+                    self.fallback
+                        .get_or_init(|| ALREADY_UNPRIVILEGED.to_owned());
+                }
+                Ok(())
+            }
+            mode if mode == self.enforcement => Ok(()),
+            _ => Err(io::Error::other(
+                "socket enforcement already selected differently for this process",
+            )),
+        }
+    }
+
     /// Installs the shared policy engine for both enforcement modes.
     pub fn enforce_peers(&self, root: RootId, enforcer: Arc<dyn Enforcer>) -> io::Result<()> {
         let mut state = lock(&self.state);
@@ -97,277 +97,479 @@ impl Tracing {
         Ok(())
     }
 
-    /// Invalidates kernel answers before a policy input changes.
-    pub fn stale(&self, root: RootId) -> io::Result<()> {
-        #[cfg(feature = "privileged")]
-        if let Some(kernel) = &self.kernel {
-            let mut kernel = lock(kernel);
-            let epoch = kernel.epochs.entry(root.0).or_default();
-            *epoch = epoch
-                .checked_add(1)
-                .ok_or_else(|| io::Error::other("kernel policy epoch exhausted"))?;
-            kernel.controller.stale(root.0)?;
-            if let Some(answers) = kernel.published.get_mut(&root.0) {
-                answers.stale = 1;
-            }
+    /// Publishes a root's answers to the kernel. Answers of an older generation than those in
+    /// force are dropped: concurrent tracers may publish out of order.
+    pub fn publish(&self, root: RootId, policy: KernelPolicy) -> io::Result<()> {
+        match &self.kernel {
+            Some(kernel) => kernel.publish(root.0, policy),
+            None => Ok(()),
         }
-        #[cfg(not(feature = "privileged"))]
-        let _ = root;
-        Ok(())
     }
 
-    pub(super) fn refresh_kernel(
+    /// Makes the kernel refuse every class any rule could forbid until the root's answers are
+    /// published again: an input changed and they are not recomputed yet.
+    pub fn stale(&self, root: RootId) -> io::Result<()> {
+        match &self.kernel {
+            Some(kernel) => kernel.stale(root.0),
+            None => Ok(()),
+        }
+    }
+
+    /// Prepares the kernel for a socket call stopped at its entry. Returns whether the ptrace gate
+    /// must judge it too: always without the kernel, and for in-kernel copies whose hook
+    /// coverage varies by kernel.
+    pub(super) fn kernel_entry(
         &self,
         target: Target,
         enforcer: &dyn Enforcer,
+        syscall: Sysno,
         source: Option<&FileTarget>,
-    ) -> io::Result<()> {
-        #[cfg(feature = "privileged")]
-        if let Some(kernel) = &self.kernel {
-            let epoch = *lock(kernel).epochs.entry(target.run.root.0).or_default();
-            let KernelPolicy {
-                mut answers,
-                networks,
-                local,
-            } = enforcer.refresh(target.run, target.builtin, source)?;
-            let mut kernel = lock(kernel);
-            if kernel
-                .epochs
-                .get(&target.run.root.0)
-                .copied()
-                .unwrap_or_default()
-                != epoch
-            {
-                answers.stale = 1;
-            }
-            if kernel.networks.get(&target.run.root.0) != Some(&networks) {
-                kernel.controller.configure(target.run.root.0, &networks)?;
-                kernel.networks.insert(target.run.root.0, networks);
-                kernel.published.remove(&target.run.root.0);
-            }
-            if kernel.local.get(&target.run.root.0) != Some(&local) {
-                kernel.controller.local(target.run.root.0, &local)?;
-                kernel.local.insert(target.run.root.0, local);
-                kernel.published.remove(&target.run.root.0);
-            }
-            if kernel.published.get(&target.run.root.0) != Some(&answers) {
-                kernel.controller.answers(target.run.root.0, answers)?;
-                kernel.published.insert(target.run.root.0, answers);
-            }
+    ) -> io::Result<bool> {
+        let Some(kernel) = &self.kernel else {
+            return Ok(true);
+        };
+        let copies = matches!(syscall, Sysno::sendfile | Sysno::splice);
+        let root = target.run.root.0;
+        if copies || kernel.needs_refresh(root) {
+            // Contacts already made must reach the answers before this one is judged.
+            self.deliver_kernel_events()?;
+            kernel.publish(root, enforcer.refresh(target.run, source)?)?;
         }
-        #[cfg(not(feature = "privileged"))]
-        let _ = (target, enforcer, source);
-        Ok(())
+        if kernel.restricts_untraced(root) {
+            kernel.allow_local(&self.traced_local_endpoints()?)?;
+        }
+        Ok(copies)
     }
 
     pub(super) fn map_task(&self, tid: Pid) -> io::Result<()> {
-        #[cfg(feature = "privileged")]
-        if let Some(kernel) = &self.kernel {
-            let state = lock(&self.state);
-            let Some(target) = state.threads.get(&tid).and_then(|thread| thread.inherited) else {
-                return Ok(());
-            };
-            if state
-                .roots
-                .get(&target.run.root)
-                .is_none_or(|root| root.enforcer.is_none())
-            {
-                return Ok(());
-            }
-            drop(state);
-            let group = Self::task_group(tid)?;
-            let mut kernel = lock(kernel);
-            kernel.controller.task(group, target.run.root.0)?;
-            kernel.tasks.insert(tid.as_raw().cast_unsigned(), group);
+        let Some(kernel) = &self.kernel else {
+            return Ok(());
+        };
+        let state = lock(&self.state);
+        let Some(target) = state.threads.get(&tid).and_then(|thread| thread.inherited) else {
+            return Ok(());
+        };
+        if state
+            .roots
+            .get(&target.run.root)
+            .is_none_or(|root| root.enforcer.is_none())
+        {
+            return Ok(());
         }
-        #[cfg(not(feature = "privileged"))]
-        let _ = tid;
-        Ok(())
-    }
-
-    #[cfg(feature = "privileged")]
-    fn task_group(tid: Pid) -> io::Result<u32> {
-        let text = std::fs::read_to_string(format!("/proc/{tid}/status"))?;
-        text.lines()
-            .find_map(|line| line.strip_prefix("Tgid:"))
-            .ok_or_else(|| io::Error::other("missing tracee tgid"))?
-            .trim()
-            .parse()
-            .map_err(io::Error::other)
+        drop(state);
+        kernel.map_task(tid, target.run.root.0)
     }
 
     pub(super) fn unmap_task(&self, tid: Pid) -> io::Result<()> {
-        #[cfg(feature = "privileged")]
-        if let Some(kernel) = &self.kernel {
-            let mut kernel = lock(kernel);
-            if let Some(group) = kernel.tasks.remove(&tid.as_raw().cast_unsigned())
-                && !kernel.tasks.values().any(|other| *other == group)
-            {
-                kernel.controller.remove_task(group)?;
-            }
-            drop(kernel);
-            lock(&self.contacts).remove(&tid);
+        match &self.kernel {
+            Some(kernel) => kernel.unmap_task(tid),
+            None => Ok(()),
         }
-        #[cfg(not(feature = "privileged"))]
-        let _ = tid;
-        Ok(())
     }
 
     pub(super) fn remove_kernel_root(&self, root: RootId) -> io::Result<()> {
-        #[cfg(feature = "privileged")]
-        if let Some(kernel) = &self.kernel {
-            let mut kernel = lock(kernel);
-            kernel.controller.remove_root(root.0)?;
-            kernel.epochs.remove(&root.0);
-            kernel.networks.remove(&root.0);
-            kernel.local.remove(&root.0);
-            kernel.published.remove(&root.0);
+        match &self.kernel {
+            Some(kernel) => kernel.remove_root(root.0),
+            None => Ok(()),
         }
-        #[cfg(not(feature = "privileged"))]
-        let _ = root;
-        Ok(())
     }
 
-    #[cfg(feature = "privileged")]
-    fn reserve_kernel_contacts<'a>(
-        &'a self,
-        state: &mut super::State,
-        events: Vec<Contact>,
-    ) -> io::Result<KernelContacts<'a>> {
-        let records = events
-            .into_iter()
-            .map(|event| {
-                let event_tid = Pid::from_raw(i32::try_from(event.tid).map_err(io::Error::other)?);
-                let synchronous = state
-                    .threads
-                    .get(&event_tid)
-                    .and_then(|thread| thread.inherited)
-                    .filter(|target| target.run.root.0 == event.root);
-                let target = synchronous
-                    .or_else(|| {
-                        state
-                            .threads
-                            .values()
-                            .find(|thread| {
-                                thread.process.as_ref().is_some_and(|process| {
-                                    process.group.as_raw().cast_unsigned() == event.tgid
-                                })
-                            })
-                            .and_then(|thread| thread.inherited)
-                            .filter(|target| target.run.root.0 == event.root)
-                    })
-                    .or_else(|| {
-                        state
-                            .runs
-                            .keys()
-                            .find(|run| run.root.0 == event.root)
-                            .map(|run| Target {
-                                run: *run,
-                                builtin: None,
-                            })
-                    })
-                    .ok_or_else(|| {
-                        io::Error::other("kernel socket contact has no live trace root")
-                    })?;
-                state.run(target.run)?;
-                let enforcer = state
-                    .roots
-                    .get(&target.run.root)
-                    .and_then(|root| root.enforcer.clone())
-                    .ok_or_else(|| io::Error::other("kernel contact lost its policy engine"))?;
-                Ok(KernelContact {
-                    target,
-                    synchronous: synchronous.map(|_| event_tid),
-                    enforcer,
-                    event,
-                })
-            })
-            .collect::<io::Result<Vec<_>>>()?;
-        for record in &records {
-            state
-                .runs
-                .get_mut(&record.target.run)
-                .ok_or_else(|| io::Error::other("kernel contact lost its trace run"))?
-                .contacts += 1;
+    /// Kills every governed task and detaches the programs after a shared failure.
+    pub(super) fn terminate_kernel(&self) -> io::Result<()> {
+        match &self.kernel {
+            Some(kernel) => kernel.terminate(),
+            None => Ok(()),
         }
-        Ok(KernelContacts {
-            tracing: self,
-            records,
-            completed: 0,
+    }
+
+    /// Drains the kernel's events and delivers each to its root's policy engine, outside every
+    /// trace lock. A failure fails the whole service: an undelivered taint receipt or contact
+    /// cannot be recovered.
+    pub(super) fn deliver_kernel_events(&self) -> io::Result<()> {
+        let Some(kernel) = &self.kernel else {
+            return Ok(());
+        };
+        // Attribution is reserved while the drain's state lock is held: another tracer could
+        // otherwise retire a root whose events this batch already removed from the ring.
+        let mut state = lock(&self.state);
+        let events = kernel.drain()?;
+        let mut deliveries = Deliveries::reserve(self, &mut state, events)?;
+        drop(state);
+        deliveries.deliver().inspect_err(|error| {
+            // Other owners must see the failure before releasing their undelivered records
+            // could make them quiescent enough to publish incomplete evidence.
+            self.fail(format!("kernel event delivery: {error}"));
         })
     }
 
-    pub(super) fn kernel_contacts(
-        &self,
-        tid: Pid,
-        info: Option<Syscall>,
-    ) -> io::Result<Option<Syscall>> {
-        #[cfg(feature = "privileged")]
-        if let Some(kernel) = &self.kernel {
-            let mut info = info;
-            // Reserve attribution while the drain's state lock is still held: a different
-            // tracer can otherwise retire a root whose records this batch already removed.
-            let mut state = lock(&self.state);
-            let events = lock(kernel).controller.drain()?;
-            let mut contacts = self.reserve_kernel_contacts(&mut state, events)?;
-            drop(state);
-            if let Err(error) = contacts.deliver() {
-                // Other owners must see the failure before releasing their undelivered records
-                // can make them quiescent enough to publish incomplete evidence.
-                self.fail(format!("native observation: {error}"));
-                return Err(error);
-            }
-            drop(contacts);
-            let mut state = lock(&self.state);
-            let run = state
-                .threads
-                .get(&tid)
-                .and_then(|thread| thread.inherited)
-                .map(|target| target.run);
-            while run.is_some_and(|run| state.runs.get(&run).is_some_and(|run| run.contacts != 0)) {
-                state.check()?;
-                state = self.progress.wait(state).recover();
-            }
-            drop(state);
-            if let Some(call) = &mut info {
-                call.peers
-                    .extend(lock(&self.contacts).remove(&tid).unwrap_or_default());
-            }
-            return Ok(info);
-        }
-        let _ = tid;
-        Ok(info)
+    /// Delivers kernel events as they arrive, so taint receipts reach the policy engine without
+    /// waiting for a stop and the ring cannot overflow while tasks only send.
+    pub(super) fn start_kernel_events(self: &Arc<Self>) -> io::Result<()> {
+        let Some(kernel) = &self.kernel else {
+            return Ok(());
+        };
+        let ring = kernel.events()?;
+        let tracing = Arc::downgrade(self);
+        std::thread::Builder::new()
+            .name("marsh-bpf-events".into())
+            .spawn(move || {
+                let mut poll = libc::pollfd {
+                    fd: std::os::fd::AsRawFd::as_raw_fd(&ring),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                loop {
+                    // Bounded, so the thread notices the service ending without owning it.
+                    // SAFETY: poll reads and writes exactly this one live pollfd.
+                    let ready = unsafe { libc::poll(&raw mut poll, 1, 100) } > 0;
+                    let Some(tracing) = tracing.upgrade() else {
+                        return;
+                    };
+                    if ready && tracing.deliver_kernel_events().is_err() {
+                        return;
+                    }
+                }
+            })?;
+        Ok(())
     }
 
-    /// Local socket endpoints held by traced tasks belonging to these roots.
-    pub fn local_endpoints(&self, roots: &[RootId]) -> io::Result<Vec<Endpoint>> {
+    /// The IP endpoints traced tasks hold, excluding any an untraced process also listens on.
+    pub(super) fn traced_local_endpoints(&self) -> io::Result<Vec<Endpoint>> {
         let tasks: Vec<Pid> = lock(&self.state)
             .threads
             .iter()
-            .filter_map(|(tid, thread)| {
-                thread
-                    .inherited
-                    .filter(|target| roots.contains(&target.run.root))
-                    .map(|_| *tid)
-            })
+            .filter(|(_, thread)| thread.inherited.is_some())
+            .map(|(tid, _)| *tid)
             .collect();
-        let endpoints = local::endpoints(&tasks)?;
-        Ok(endpoints
+        Ok(local::endpoints(&tasks)?
             .into_iter()
+            .filter(|endpoint| matches!(endpoint.family, AF_INET | AF_INET6))
             .filter(|endpoint| {
-                self.receivers(&endpoint.sockaddr())
-                    .is_some_and(|listeners| {
-                        !listeners.is_empty()
-                            && listeners
-                                .iter()
-                                .all(|holders| holders.iter().any(|holder| roots.contains(holder)))
-                    })
+                self.receivers(&endpoint.sockaddr()).is_some_and(|sockets| {
+                    !sockets.is_empty() && sockets.iter().all(|holders| !holders.is_empty())
+                })
             })
             .collect())
     }
 }
 
-#[cfg(all(test, feature = "privileged"))]
+/// One drained event and where it goes.
+struct Delivery {
+    target: Target,
+    enforcer: Arc<dyn Enforcer>,
+    event: Event,
+}
+
+/// A drained batch whose runs stay live until each event is delivered, or the batch dropped.
+struct Deliveries<'a> {
+    tracing: &'a Tracing,
+    pending: Vec<Delivery>,
+    completed: usize,
+}
+
+impl<'a> Deliveries<'a> {
+    fn reserve(tracing: &'a Tracing, state: &mut State, events: Vec<Event>) -> io::Result<Self> {
+        let pending = events
+            .into_iter()
+            .map(|event| {
+                let target = attribute(state, &event)?;
+                state.run(target.run)?;
+                let enforcer = state
+                    .roots
+                    .get(&target.run.root)
+                    .and_then(|root| root.enforcer.clone())
+                    .ok_or_else(|| io::Error::other("kernel event lost its policy engine"))?;
+                Ok(Delivery {
+                    target,
+                    enforcer,
+                    event,
+                })
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+        for delivery in &pending {
+            state
+                .runs
+                .get_mut(&delivery.target.run)
+                .ok_or_else(|| io::Error::other("kernel event lost its trace run"))?
+                .deliveries += 1;
+        }
+        Ok(Self {
+            tracing,
+            pending,
+            completed: 0,
+        })
+    }
+
+    fn deliver(&mut self) -> io::Result<()> {
+        while let Some(delivery) = self.pending.get(self.completed) {
+            let run = delivery.target.run;
+            delivery
+                .enforcer
+                .event(run, delivery.target.builtin, &delivery.event)?;
+            self.release(run);
+            self.completed += 1;
+        }
+        Ok(())
+    }
+
+    fn release(&self, run: super::TraceRun) {
+        if let Some(run) = lock(&self.tracing.state).runs.get_mut(&run) {
+            run.deliveries -= 1;
+        }
+        self.tracing.progress.notify_all();
+    }
+}
+
+impl Drop for Deliveries<'_> {
+    fn drop(&mut self) {
+        if self.completed == self.pending.len() {
+            return;
+        }
+        if std::thread::panicking() {
+            self.tracing.fail("kernel event delivery panicked");
+        }
+        for delivery in &self.pending[self.completed..] {
+            self.release(delivery.target.run);
+        }
+    }
+}
+
+/// The run an event belongs to: its thread's, else its process's, else any run of its root
+/// (an `io_uring` worker thread is never traced itself).
+fn attribute(state: &State, event: &Event) -> io::Result<Target> {
+    let of_root = |target: Option<Target>| target.filter(|target| target.run.root.0 == event.root);
+    let tid = Pid::from_raw(i32::try_from(event.tid).map_err(io::Error::other)?);
+    of_root(state.threads.get(&tid).and_then(|thread| thread.inherited))
+        .or_else(|| {
+            of_root(
+                state
+                    .threads
+                    .values()
+                    .find(|thread| {
+                        thread.process.as_ref().is_some_and(|process| {
+                            process.group.as_raw().cast_unsigned() == event.tgid
+                        })
+                    })
+                    .and_then(|thread| thread.inherited),
+            )
+        })
+        .or_else(|| {
+            state
+                .runs
+                .keys()
+                .find(|run| run.root.0 == event.root)
+                .map(|run| Target {
+                    run: *run,
+                    builtin: None,
+                })
+        })
+        .ok_or_else(|| io::Error::other("kernel event has no live trace run"))
+}
+
+#[cfg(feature = "privileged")]
+pub(crate) use privileged::Kernel;
+
+#[cfg(not(feature = "privileged"))]
+pub(crate) use unavailable::Kernel;
+
+#[cfg(feature = "privileged")]
+mod privileged {
+    use super::{Endpoint, Event, KernelPolicy, Mutex, Pid, io};
+    use marsh_lib::RecoverPoison as _;
+    use marsh_bpf::Controller;
+    use marsh_peer_class::Network;
+    use std::collections::HashMap;
+    use std::os::fd::{BorrowedFd, OwnedFd};
+
+    /// The loaded programs, and what was last published to them for each root.
+    pub(crate) struct Kernel(Mutex<Inner>);
+
+    struct Inner {
+        controller: Controller,
+        roots: HashMap<u64, Published>,
+        /// Governed threads and the process each belongs to.
+        tasks: HashMap<Pid, u32>,
+    }
+
+    #[derive(Default)]
+    struct Published {
+        networks: Option<Vec<Network>>,
+        policy: Option<KernelPolicy>,
+    }
+
+    impl Kernel {
+        pub(super) fn load() -> io::Result<Self> {
+            Ok(Self(Mutex::new(Inner {
+                controller: Controller::load()?,
+                roots: HashMap::new(),
+                tasks: HashMap::new(),
+            })))
+        }
+
+        fn inner(&self) -> std::sync::MutexGuard<'_, Inner> {
+            self.0.lock().recover()
+        }
+
+        pub(super) fn publish(&self, root: u64, policy: KernelPolicy) -> io::Result<()> {
+            let mut inner = self.inner();
+            let Inner {
+                controller, roots, ..
+            } = &mut *inner;
+            let published = roots.entry(root).or_default();
+            if let Some(current) = &published.policy
+                && (policy.answers.generation < current.answers.generation || *current == policy)
+            {
+                return Ok(());
+            }
+            if published.networks.as_ref() != Some(&policy.networks) {
+                controller.configure(root, &policy.networks)?;
+                published.networks = Some(policy.networks.clone());
+            }
+            controller.publish(root, policy.answers)?;
+            published.policy = Some(policy);
+            drop(inner);
+            Ok(())
+        }
+
+        pub(super) fn stale(&self, root: u64) -> io::Result<()> {
+            let mut inner = self.inner();
+            inner.controller.stale(root)?;
+            if let Some(policy) = inner
+                .roots
+                .get_mut(&root)
+                .and_then(|published| published.policy.as_mut())
+            {
+                policy.answers.stale = 1;
+            }
+            drop(inner);
+            Ok(())
+        }
+
+        /// Whether the kernel's answers for `root` cannot be trusted for one more contact.
+        pub(super) fn needs_refresh(&self, root: u64) -> bool {
+            self.inner()
+                .roots
+                .get(&root)
+                .and_then(|published| published.policy.as_ref())
+                .is_none_or(|policy| policy.answers.stale != 0 || policy.contact_sensitive)
+        }
+
+        pub(super) fn restricts_untraced(&self, root: u64) -> bool {
+            self.inner()
+                .roots
+                .get(&root)
+                .and_then(|published| published.policy.as_ref())
+                .is_some_and(|policy| policy.answers.untraced != 0)
+        }
+
+        pub(super) fn allow_local(&self, endpoints: &[Endpoint]) -> io::Result<()> {
+            self.inner().controller.local(endpoints)
+        }
+
+        pub(super) fn map_task(&self, tid: Pid, root: u64) -> io::Result<()> {
+            let group = process_of(tid)?;
+            let mut inner = self.inner();
+            inner.controller.task(group, root)?;
+            inner.tasks.insert(tid, group);
+            drop(inner);
+            Ok(())
+        }
+
+        pub(super) fn unmap_task(&self, tid: Pid) -> io::Result<()> {
+            let mut inner = self.inner();
+            if let Some(group) = inner.tasks.remove(&tid)
+                && !inner.tasks.values().any(|other| *other == group)
+            {
+                inner.controller.remove_task(group)?;
+            }
+            drop(inner);
+            Ok(())
+        }
+
+        pub(super) fn remove_root(&self, root: u64) -> io::Result<()> {
+            let mut inner = self.inner();
+            inner.controller.remove_root(root)?;
+            inner.roots.remove(&root);
+            drop(inner);
+            Ok(())
+        }
+
+        pub(super) fn terminate(&self) -> io::Result<()> {
+            self.inner().controller.terminate()
+        }
+
+        pub(super) fn drain(&self) -> io::Result<Vec<Event>> {
+            self.inner().controller.drain()
+        }
+
+        /// A duplicate of the ring's descriptor, which outlives the controller harmlessly.
+        pub(super) fn events(&self) -> io::Result<OwnedFd> {
+            let inner = self.inner();
+            let ring: BorrowedFd<'_> = inner.controller.events();
+            let owned = ring.try_clone_to_owned();
+            drop(inner);
+            owned
+        }
+    }
+
+    fn process_of(tid: Pid) -> io::Result<u32> {
+        crate::capture::proc_field::<u32>(format!("/proc/{tid}/status"), "Tgid:")?
+            .ok_or_else(|| io::Error::other("missing tracee tgid"))
+    }
+}
+
+#[cfg(not(feature = "privileged"))]
+mod unavailable {
+    use super::*;
+    use std::os::fd::OwnedFd;
+
+    /// Never constructed: privileged enforcement was not compiled.
+    pub(crate) enum Kernel {}
+
+    impl Kernel {
+        pub(super) fn load() -> io::Result<Self> {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "privileged socket enforcement requires the privileged cargo feature",
+            ))
+        }
+        pub(super) fn publish(&self, _: u64, _: KernelPolicy) -> io::Result<()> {
+            match *self {}
+        }
+        pub(super) fn stale(&self, _: u64) -> io::Result<()> {
+            match *self {}
+        }
+        pub(super) fn needs_refresh(&self, _: u64) -> bool {
+            match *self {}
+        }
+        pub(super) fn restricts_untraced(&self, _: u64) -> bool {
+            match *self {}
+        }
+        pub(super) fn allow_local(&self, _: &[Endpoint]) -> io::Result<()> {
+            match *self {}
+        }
+        pub(super) fn map_task(&self, _: Pid, _: u64) -> io::Result<()> {
+            match *self {}
+        }
+        pub(super) fn unmap_task(&self, _: Pid) -> io::Result<()> {
+            match *self {}
+        }
+        pub(super) fn remove_root(&self, _: u64) -> io::Result<()> {
+            match *self {}
+        }
+        pub(super) fn terminate(&self) -> io::Result<()> {
+            match *self {}
+        }
+        pub(super) fn drain(&self) -> io::Result<Vec<Event>> {
+            match *self {}
+        }
+        pub(super) fn events(&self) -> io::Result<OwnedFd> {
+            match *self {}
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -394,44 +596,28 @@ mod tests {
             _: &[u8],
             _: Option<&FileTarget>,
         ) -> bool {
-            unreachable!("this regression exercises contact delivery, not policy refresh")
+            unreachable!("this regression exercises event delivery, not policy")
         }
 
-        fn refresh(
-            &self,
-            _: TraceRun,
-            _: Option<InvocationId>,
-            _: Option<&FileTarget>,
-        ) -> io::Result<KernelPolicy> {
-            unreachable!("this regression exercises contact delivery, not policy refresh")
+        fn refresh(&self, _: TraceRun, _: Option<&FileTarget>) -> io::Result<KernelPolicy> {
+            unreachable!("this regression exercises event delivery, not policy")
         }
 
-        fn contact(&self, run: TraceRun, _: Option<InvocationId>, _: Contact) -> io::Result<()> {
-            // These acquire both production locks when present: delivery cannot hold either.
+        fn event(&self, run: TraceRun, _: Option<InvocationId>, _: &Event) -> io::Result<()> {
+            // Delivery must hold no trace lock: these take the production locks.
             let tracing = self.tracing.upgrade().unwrap();
             tracing.health(run)?;
             tracing.stale(run.root)?;
             if self.fail.load(Ordering::Acquire) {
                 return Err(io::Error::other("consumer failure"));
             }
-            Ok(())
-        }
-
-        fn asynchronous_contact(
-            &self,
-            run: TraceRun,
-            _: Option<InvocationId>,
-            _: u64,
-            _: Contact,
-        ) -> io::Result<()> {
-            self.tracing.upgrade().unwrap().health(run)?;
             self.observed.fetch_add(1, Ordering::AcqRel);
             Ok(())
         }
     }
 
     #[test]
-    fn drained_contacts_keep_run_live_until_callbacks_finish() {
+    fn drained_events_keep_run_live_until_delivered() {
         let tracing = Tracing::shared().unwrap();
         let directory = tempfile::tempdir().unwrap();
         let root = tracing
@@ -444,18 +630,17 @@ mod tests {
         });
         tracing.enforce_peers(root, consumer.clone()).unwrap();
         let run = tracing.begin_run(root).unwrap();
-        let event = Contact {
+        let event = Event {
             root: root.0,
             tid: nix::unistd::gettid().as_raw().cast_unsigned(),
             tgid: std::process::id(),
-            ..Contact::default()
+            ..Event::default()
         };
-        // Its producer has already ended: only the drained record keeps this real registered
-        // run alive while another thread tries to finish it.
-        let mut contacts = tracing
-            .reserve_kernel_contacts(&mut lock(&tracing.state), vec![event])
-            .unwrap();
-        assert_eq!(lock(&tracing.state).runs.get(&run).unwrap().contacts, 1);
+        // Its producer already ended: only the drained record keeps this run alive while
+        // another thread tries to finish it.
+        let mut deliveries =
+            Deliveries::reserve(&tracing, &mut lock(&tracing.state), vec![event]).unwrap();
+        assert_eq!(lock(&tracing.state).runs.get(&run).unwrap().deliveries, 1);
         let (started, start) = mpsc::channel();
         let (closed, close) = mpsc::channel();
         let retiring = Arc::clone(&tracing);
@@ -469,24 +654,23 @@ mod tests {
             close.recv_timeout(Duration::from_millis(100)),
             Err(mpsc::RecvTimeoutError::Timeout)
         ));
-        contacts.deliver().unwrap();
-        drop(contacts);
+        deliveries.deliver().unwrap();
+        drop(deliveries);
         close.recv_timeout(Duration::from_secs(5)).unwrap();
         closer.join().unwrap();
         assert_eq!(consumer.observed.load(Ordering::Acquire), 1);
 
-        // A failed callback must release the whole remaining batch too, not strand shutdown.
+        // A failed delivery must release the rest of the batch, not strand shutdown.
         let run = tracing.begin_run(root).unwrap();
         consumer.fail.store(true, Ordering::Release);
-        let mut contacts = tracing
-            .reserve_kernel_contacts(&mut lock(&tracing.state), vec![event, event])
-            .unwrap();
+        let mut deliveries =
+            Deliveries::reserve(&tracing, &mut lock(&tracing.state), vec![event, event]).unwrap();
         assert_eq!(
-            contacts.deliver().unwrap_err().to_string(),
+            deliveries.deliver().unwrap_err().to_string(),
             "consumer failure"
         );
-        drop(contacts);
-        assert_eq!(lock(&tracing.state).runs.get(&run).unwrap().contacts, 0);
+        drop(deliveries);
+        assert_eq!(lock(&tracing.state).runs.get(&run).unwrap().deliveries, 0);
         tracing.end_run(run).unwrap();
         tracing.unregister_root(root).unwrap();
     }

@@ -118,18 +118,35 @@ struct Task {
 }
 
 /// The service-wide delivery order shared by every tracer thread and host record.
+///
+/// Strictly increasing and never behind `CLOCK_MONOTONIC` nanoseconds, the clock BPF event
+/// timestamps use: a kernel contact made before a stop is processed orders before that stop's
+/// call, and after every call already ordered.
 #[derive(Default)]
 pub(crate) struct Sequence(AtomicU64);
 
 impl Sequence {
     pub(crate) fn next(&self) -> io::Result<u64> {
+        let now = monotonic();
         self.0
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
-                value.checked_add(1)
+                value.checked_add(1).map(|next| next.max(now))
             })
-            .map(|previous| previous + 1)
+            .map(|previous| (previous + 1).max(now))
             .map_err(|_| io::Error::other("native delivery sequence exhausted"))
     }
+}
+
+/// `CLOCK_MONOTONIC` in nanoseconds, as `bpf_ktime_get_ns` reads it.
+fn monotonic() -> u64 {
+    let mut time = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: clock_gettime writes one timespec into this live local; CLOCK_MONOTONIC exists.
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &raw mut time) };
+    u64::try_from(time.tv_sec).unwrap_or_default() * 1_000_000_000
+        + u64::try_from(time.tv_nsec).unwrap_or_default()
 }
 
 pub(crate) struct Observer {
@@ -499,6 +516,8 @@ impl Observer {
                 self.sockets.forget();
             }
             let sockets = &mut self.sockets;
+            // The kernel reports every contact except, conservatively, in-kernel copies: their
+            // ptrace-observed peers stay evidence in privileged mode.
             let fallback = self.kernel_peers && matches!(syscall, Sysno::sendfile | Sysno::splice);
             let mut fallback_peers = None;
             let blocked = match &mut self.gate {
@@ -509,17 +528,11 @@ impl Observer {
                         tid,
                         syscall,
                         &mut || {
-                            if self.kernel_peers
-                                && !matches!(syscall, Sysno::sendfile | Sysno::splice)
-                            {
-                                capture.peers().to_vec()
-                            } else {
-                                let peers = contacted(tid, syscall, &capture, registers, sockets);
-                                if fallback {
-                                    fallback_peers = Some(peers.clone());
-                                }
-                                peers
+                            let peers = contacted(tid, syscall, &capture, registers, sockets);
+                            if fallback {
+                                fallback_peers = Some(peers.clone());
                             }
+                            peers
                         },
                         source,
                     )?

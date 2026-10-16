@@ -35,19 +35,20 @@ traced command holds, so tests can reach a local database after reading its \
 password; the taint cannot follow into that daemon. A policy built with \
 `untraced_local(Deny)` refuses the contact (`untraced-local-daemon-exfil`)."""
 
-# Phase A residuals without deterministic corpus cases; not claims of coverage.
 [[gap]]
-name = "kernel-local-handoff-race"
-enforcement = "privileged"
+name = "local-handoff-rewrite"
+enforcement = "unprivileged"
 reason = """
-A rewritten local destination is handed taint when its real kernel contact is \
-drained at the sender's exit stop. A receiving relay can run before that stop. \
-Phase C's kernel receive-side taint is needed to close this window."""
+The tracer hands taint to whoever holds the local port the address named at \
+entry. Another thread can rewrite it before the kernel copies it, delivering \
+to an untainted relay. Privileged mode taints the relay in the kernel when it \
+reads the socket, whatever port the sender named."""
 
+# A residual without a deterministic corpus case; not a claim of coverage.
 [[gap]]
 name = "connected-udp-peer-reconnect"
 reason = """
 A holder sharing a connected datagram socket can reconnect its mutable peer \
 after the socket_sendmsg hook inspects it but before protocol transmission. \
-The two Phase A LSM hooks close named-sockaddr rewrites, not this socket-state \
-race; it requires destination-stable protocol or packet enforcement."""
+The socket hooks close named-sockaddr rewrites, not this socket-state race; \
+it requires destination-stable protocol or packet enforcement."""

@@ -48,35 +48,15 @@ impl Fixture {
     }
 }
 
-#[tokio::test]
-#[serial(agent_policy)]
-async fn an_unresolved_kernel_peer_reports_audit_without_aborting_the_command() {
+/// `shell`'s snapshot deciding privileged answers as if a kernel were loaded, in a fresh command.
+async fn kernel_command(
+    shell: &Shell,
+) -> (
+    Arc<super::super::snapshot::Snapshot>,
+    marsh_instrument::TraceRun,
+) {
     use super::super::snapshot::CommandEvidence;
-    use marsh_peer_class::{Contact, Endpoint, UNKNOWN};
-    let fixture = Fixture::new();
-    let notices = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let recorded = Arc::clone(&notices);
-    let observer = Arc::new(crate::PolicyObserver::new(move |event, decision| {
-        if let crate::PolicyDecision::Deny {
-            failed_precondition,
-            ..
-        } = decision
-        {
-            recorded.lock().unwrap().push((
-                event.resource.clone(),
-                failed_precondition.starts_with("would block:"),
-            ));
-        }
-    }));
-    let shell = fixture
-        .observed_agent(
-            AgentPolicy::new()
-                .rule(AgentRule::no_network("external"))
-                .audit(),
-            Some(observer),
-        )
-        .await;
-    accepted(&shell, ":").await;
+    accepted(shell, ":").await;
     let snapshot = shell
         .shared
         .live
@@ -88,89 +68,40 @@ async fn an_unresolved_kernel_peer_reports_audit_without_aborting_the_command() 
         .snapshot
         .clone()
         .unwrap();
+    snapshot.enable_kernel_answers().unwrap();
     let run = snapshot
         .session
         .tracing
         .begin_run(snapshot.root().unwrap())
         .unwrap();
     let mut evidence = CommandEvidence::default();
-    evidence.baseline.push(snapshot.path());
+    evidence.baseline = snapshot.path().to_path_buf();
     snapshot.state.lock().unwrap().evidence = Some((run, evidence));
-    let refreshed = snapshot.refresh_all(run, None).unwrap();
-    assert_eq!(refreshed.answers.deny & (1 << UNKNOWN), 0);
-    let event = Contact {
-        generation: refreshed.answers.generation,
-        endpoint: Endpoint::default(),
-        class: UNKNOWN,
-        decision: 2,
-        ..Contact::default()
-    };
-    snapshot.contact(run, event).unwrap();
-    snapshot.contact(run, event).unwrap();
-    {
-        let seen = notices.lock().unwrap();
-        assert_eq!(seen.len(), 1);
-        assert_eq!(seen[0].0.segments(), ["net", "unknown"]);
-        assert!(seen[0].1);
-        drop(seen);
-    }
+    (snapshot, run)
+}
+
+fn end_kernel_command(
+    snapshot: &super::super::snapshot::Snapshot,
+    run: marsh_instrument::TraceRun,
+) {
     snapshot.state.lock().unwrap().evidence = None;
     snapshot.session.tracing.end_run(run).unwrap();
-    close(shell).await;
 }
 
 #[tokio::test]
 #[serial(agent_policy)]
-async fn kernel_refresh_matches_lazy_classes_and_tracks_one_generation() {
+async fn kernel_answers_stay_equal_to_fresh_and_lazy_decisions_as_the_command_runs() {
     use super::super::access::Effects;
-    use super::super::agent::Peer;
-    use super::super::snapshot::CommandEvidence;
-    use marsh_peer_class::{Contact, EXTERNAL, Endpoint};
+    use marsh_peer_class::{ALLOW, CONTACT, Endpoint, Event as KernelEvent, RULE};
     let fixture = Fixture::new();
     fixture.write(".env", "TOKEN=1\n");
-    let notices = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let recorded = Arc::clone(&notices);
-    let observer = Arc::new(crate::PolicyObserver::new(move |_, decision| {
-        if let crate::PolicyDecision::Deny {
-            failed_precondition,
-            ..
-        } = decision
-        {
-            recorded.lock().unwrap().push(failed_precondition.clone());
-        }
-    }));
     let policy = AgentPolicy::recommended()
         .unwrap()
         .network("203.0.113.0/24", "cloud")
         .unwrap()
         .rule(AgentRule::no_contact_after_read("secret", &["cloud"]));
-    let shell = fixture.observed_agent(policy, Some(observer)).await;
-    accepted(&shell, ":").await;
-    let snapshot = shell
-        .shared
-        .live
-        .lock()
-        .await
-        .as_ref()
-        .unwrap()
-        .resources
-        .snapshot
-        .clone()
-        .unwrap();
-    let run = snapshot
-        .session
-        .tracing
-        .begin_run(snapshot.root().unwrap())
-        .unwrap();
-    let mut evidence = CommandEvidence::default();
-    evidence.baseline.push(snapshot.path());
-    snapshot.state.lock().unwrap().evidence = Some((run, evidence));
-    let first = snapshot.refresh_all(run, None).unwrap();
-    assert_eq!(first.answers.deny, 0);
-    assert_eq!(
-        snapshot.refresh_all(run, None).unwrap().answers.generation,
-        first.answers.generation
-    );
+    let shell = fixture.agent(policy).await;
+    let (snapshot, run) = kernel_command(&shell).await;
     let endpoints = [
         Endpoint {
             family: marsh_peer_class::AF_UNIX,
@@ -185,80 +116,162 @@ async fn kernel_refresh_matches_lazy_classes_and_tracks_one_generation() {
         Endpoint::default(),
         Endpoint::from("203.0.113.1:9".parse::<std::net::SocketAddr>().unwrap()),
     ];
-    for (id, endpoint) in endpoints.iter().enumerate() {
-        assert_eq!(
-            snapshot.permits_peer(run, &endpoint.sockaddr(), None),
-            first.answers.deny & (1 << id) == 0
-        );
-    }
-    {
+    // Incremental answers equal answers decided from scratch, and the ptrace gate's lazy ones.
+    let check = |step: &str| {
+        let incremental = snapshot.kernel_policy(run, None).unwrap().unwrap();
+        let fresh = snapshot.fresh_kernel_policy(run).unwrap();
+        let mut unversioned = incremental.clone();
+        unversioned.answers.generation = fresh.answers.generation;
+        assert_eq!(unversioned, fresh, "{step}");
+        for (id, endpoint) in endpoints.iter().enumerate() {
+            assert_eq!(
+                snapshot.permits_peer(run, &endpoint.sockaddr(), None),
+                incremental.answers.deny & (1 << id) == 0,
+                "{step}: class {id}"
+            );
+        }
+        incremental
+    };
+    let push = |order: u64, effects: Effects| {
         let mut state = snapshot.state.lock().unwrap();
-        state.evidence.as_mut().unwrap().1.effects.push((
-            1,
-            None,
-            Effects {
-                reads: vec![PathBuf::from(".env")],
-                ..Effects::default()
-            },
-        ));
-    }
-    let changed = snapshot.refresh_all(run, None).unwrap();
-    assert!(changed.answers.generation > first.answers.generation);
-    // Actual hook refusals reuse cached text and are deduplicated before lazy calls report it.
-    let contact = Contact {
-        root: 0,
-        tgid: 0,
-        tid: 0,
-        generation: changed.answers.generation,
-        endpoint: endpoints[3],
-        class: EXTERNAL,
-        decision: 1,
+        state
+            .evidence
+            .as_mut()
+            .unwrap()
+            .1
+            .effects
+            .push((order, None, effects));
     };
-    snapshot.contact(run, contact).unwrap();
-    snapshot.contact(run, contact).unwrap();
-    assert_eq!(notices.lock().unwrap().len(), 1);
-    assert!(notices.lock().unwrap()[0].starts_with("blocked: "));
-    for (id, endpoint) in endpoints.iter().enumerate() {
-        assert_eq!(
-            snapshot.permits_peer(run, &endpoint.sockaddr(), None),
-            changed.answers.deny & (1 << id) == 0
-        );
-    }
-    // An untracked io-wq tid contributes its real endpoint, ordered evidence and no fake syscall.
-    let asynchronous = Contact {
-        tid: u32::MAX,
-        ..contact
+    let first = check("start");
+    assert_eq!(first.answers.deny, 0);
+    assert_eq!(
+        check("unchanged").answers.generation,
+        first.answers.generation
+    );
+    push(
+        10,
+        Effects {
+            reads: vec![PathBuf::from(".env")],
+            ..Effects::default()
+        },
+    );
+    let secret = check("secret read");
+    assert_ne!(secret.answers.deny & (1 << 5), 0);
+    assert!(secret.answers.generation > first.answers.generation);
+    // A blocking call's earlier entry order rebuilds the command's observations.
+    push(
+        5,
+        Effects {
+            reads: vec![PathBuf::from("README.md")],
+            ..Effects::default()
+        },
+    );
+    check("out of order");
+    // A write's classification follows the path's existence in the work view.
+    std::fs::write(snapshot.path().join("made.txt"), "made").unwrap();
+    push(
+        20,
+        Effects {
+            writes: vec![PathBuf::from("made.txt")],
+            ..Effects::default()
+        },
+    );
+    check("created");
+    std::fs::remove_file(snapshot.path().join("made.txt")).unwrap();
+    push(
+        30,
+        Effects {
+            writes: vec![PathBuf::from("made.txt")],
+            ..Effects::default()
+        },
+    );
+    check("created then deleted");
+    // A kernel contact is evidence at the time the hook ran, between ptrace orders.
+    let contact = KernelEvent {
+        kind: CONTACT,
+        time: 25,
+        class: marsh_peer_class::LOOPBACK,
+        decision: ALLOW,
+        reason: RULE,
+        endpoint: endpoints[2],
+        ..KernelEvent::default()
     };
-    snapshot
-        .asynchronous_contact(run, None, 2, asynchronous)
-        .unwrap();
+    snapshot.kernel_event(run, None, &contact).unwrap();
     {
         let state = snapshot.state.lock().unwrap();
-        let evidence = &state.evidence.as_ref().unwrap().1;
-        assert!(evidence.records.is_empty());
-        assert_eq!(evidence.effects[1].0, 2);
-        assert_eq!(
-            evidence.effects[1].2.peers,
-            [Peer::decode(&endpoints[3].sockaddr())]
-        );
+        let effects = &state.evidence.as_ref().unwrap().1.effects;
+        let (order, _, effect) = effects.last().unwrap();
+        assert_eq!(*order, 25);
+        assert_eq!(effect.peers.len(), 1);
         drop(state);
     }
-    let contacted = snapshot.refresh_all(run, None).unwrap();
-    assert!(contacted.answers.generation > changed.answers.generation);
-    // Consecutive real contacts retain the all-class generation after the first new contact.
-    snapshot
-        .asynchronous_contact(run, None, 3, asynchronous)
-        .unwrap();
-    assert_eq!(
-        snapshot.refresh_all(run, None).unwrap().answers.generation,
-        contacted.answers.generation
-    );
+    check("contact");
     shell.approve("network").unwrap();
-    assert!(
-        snapshot.refresh_all(run, None).unwrap().answers.generation > changed.answers.generation
-    );
-    snapshot.state.lock().unwrap().evidence = None;
-    snapshot.session.tracing.end_run(run).unwrap();
+    check("committed history changed");
+    end_kernel_command(&snapshot, run);
+    close(shell).await;
+}
+
+#[tokio::test]
+#[serial(agent_policy)]
+async fn kernel_events_report_once_and_fold_receipts_into_taint() {
+    use marsh_peer_class::{AUDIT, CONTACT, Event as KernelEvent, RECEIPT, RULE, UNKNOWN};
+    let fixture = Fixture::new();
+    let notices = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorded = Arc::clone(&notices);
+    let observer = Arc::new(crate::PolicyObserver::new(move |event, decision| {
+        if let crate::PolicyDecision::Deny {
+            failed_precondition,
+            ..
+        } = decision
+        {
+            recorded
+                .lock()
+                .unwrap()
+                .push((event.resource.clone(), failed_precondition.clone()));
+        }
+    }));
+    let shell = fixture
+        .observed_agent(AgentPolicy::recommended().unwrap().audit(), Some(observer))
+        .await;
+    let (snapshot, run) = kernel_command(&shell).await;
+    // An audited refusal is reported once per run, and its contact is still evidence.
+    let refused = KernelEvent {
+        kind: CONTACT,
+        time: 1,
+        class: UNKNOWN,
+        decision: AUDIT,
+        reason: RULE,
+        ..KernelEvent::default()
+    };
+    snapshot.kernel_event(run, None, &refused).unwrap();
+    snapshot.kernel_event(run, None, &refused).unwrap();
+    {
+        let seen = notices.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].0.segments(), ["net", "unknown"]);
+        assert!(seen[0].1.starts_with("would block:"));
+        drop(seen);
+    }
+    // A kernel receipt hands this principal the class, and its answers become exactly the
+    // contingent ones the kernel switched to.
+    let id = super::super::answers::taint_id("secret").unwrap();
+    let before = snapshot.kernel_policy(run, None).unwrap().unwrap();
+    assert_eq!(before.answers.carried & (1 << id), 0);
+    let receipt = KernelEvent {
+        kind: RECEIPT,
+        time: 2,
+        taint: 1 << id,
+        sender: u64::MAX,
+        ..KernelEvent::default()
+    };
+    snapshot.kernel_event(run, None, &receipt).unwrap();
+    let after = snapshot.kernel_policy(run, None).unwrap().unwrap();
+    assert_ne!(after.answers.carried & (1 << id), 0);
+    assert_eq!(after.answers.acknowledged[id], before.answers.acknowledged[id] + 1);
+    assert_eq!(after.answers.deny, before.answers.contingent[id]);
+    assert_ne!(after.answers.deny & (1 << marsh_peer_class::EXTERNAL), 0);
+    end_kernel_command(&snapshot, run);
     close(shell).await;
 }
 

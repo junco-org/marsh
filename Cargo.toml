@@ -92,7 +92,6 @@ workspace = true
 [workspace]
 resolver = "3"
 members = ["crates/*", "fuzz"]
-exclude = ["crates/marsh-bpf-ebpf"]
 
 [workspace.package]
 authors = ["reuben olinsky"]
@@ -191,3 +190,8 @@ redundant_pub_crate = "allow"
 result_large_err = "allow"
 similar_names = "allow"
 struct_excessive_bools = "allow"
+
+# Phase B needs junco-policy's incremental TraceCursor, on the local `feat/incremental-trace`
+# branch until it is pushed upstream.
+[patch."https://github.com/zachary-kent/junco-policy.git"]
+junco-policy = { path = "../junco-policy" }

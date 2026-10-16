@@ -47,6 +47,13 @@ impl Trace {
             })
             .unwrap_or_else(|| panic!("no successful open of {path:?}"))
     }
+    /// The delivery ordered `order`.
+    fn at(&self, order: u64) -> &Delivery {
+        self.0
+            .iter()
+            .find(|delivery| delivery.sequence == order)
+            .unwrap_or_else(|| panic!("no delivery ordered {order}"))
+    }
     fn sequence(&self, call: &Syscall) -> u64 {
         self.0
             .iter()
@@ -127,11 +134,9 @@ fn files_and_sequences(directory: &Path, file: &Path) {
         "cd {} && /bin/cat file >/dev/null; exec 3<file; exec 4<&3",
         directory.display()
     ));
-    for (index, delivery) in trace.0.iter().enumerate() {
-        assert_eq!(delivery.sequence, index as u64 + 1);
-    }
+    assert!(trace.0.windows(2).all(|pair| pair[0].sequence < pair[1].sequence));
     for call in trace.calls() {
-        let entry = &trace.0[usize::try_from(call.entry_order).unwrap() - 1];
+        let entry = trace.at(call.entry_order);
         assert_eq!(entry.tid, call.info.pid);
         assert!(matches!(entry.status, WaitStatus::PtraceSyscall(_)));
         assert!(entry.call.is_none());
@@ -274,7 +279,8 @@ threading.Event().wait()
         .unwrap();
     assert_eq!(
         u64::try_from(
-            threads.0[usize::try_from(completed.entry_order).unwrap() - 1]
+            threads
+                .at(completed.entry_order)
                 .tid
                 .as_raw()
         )
@@ -532,7 +538,7 @@ fn exec_selection(directory: &Path) {
         .iter()
         .find(|delivery| delivery.exec.is_some())
         .unwrap();
-    let entry = &trace.0[usize::try_from(command.entry_order).unwrap() - 1];
+    let entry = trace.at(command.entry_order);
     assert!(matches!(entry.status, WaitStatus::PtraceSyscall(_)));
     assert_eq!(command.pid, exec.tid.as_raw());
     // The new image ran nothing before its exec was delivered.

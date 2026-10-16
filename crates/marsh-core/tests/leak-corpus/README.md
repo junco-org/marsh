@@ -17,21 +17,32 @@ is not a case; it registers cases whose leaks are expected (see below).
   here never read a `secret`-classed path, so egress is allowed and the sink
   receives the canary.
 
-Every attack also runs under `AgentPolicy::audit()` (done by the harness, not a
-separate case): a leak must come with a "would block" report.
+Every attack iteration is replayed under `AgentPolicy::audit()` with the same
+variant and mutation. The audit canary must reach a sink; ordinary attacks also
+require a network "would block" report. Registered gaps waive only that report.
+Foreground timeouts and shell errors are inconclusive. Timeouts from declared
+`&` server steps are expected only when the later sink/audit oracle proves the
+operation ran. Unsupported attack effects need a network denial plus successful
+audit delivery; without both, they are inconclusive.
 
 Run the same corpus with `MARSH_LEAK_ENFORCEMENT=unprivileged` or `privileged`.
 The latter requires `--features privileged` and an active BPF-LSM kernel; it
 never skips or falls back if unavailable. `bench/leak-fuzzer/privileged-vm.py`
 provides an isolated runner when the host's boot-time LSM list lacks `bpf`.
 Root runs use a network namespace without dropping initial-user-namespace
-BPF authority. See `docs/privileged-enforcement.md` for pinned build tools.
+BPF authority. See `docs/privileged-enforcement.md` for build tools.
 
 `expect = "accepted-privileged"` requires successful publication in kernel
 mode while allowing the unprivileged filesystem observer to refuse unsupported
 ring operations. Both modes still require a control's canary to be delivered.
 The SEND control forces an io-wq worker; the privilege-boundary control checks
 capability stripping and loader descriptor isolation.
+
+Iterations after the first sample declared variants, shuffle optional steps,
+and insert one or two neutral `true`/`pwd`/`ls` commands. The attack recipes
+remain hand-written; the harness does not generate arbitrary commands.
+Pull requests run fixed seed `20261014` once. Nightly CI runs seeds
+`20261014`–`20261017` twice each in both enforcement modes.
 
 ## Placeholders
 
@@ -67,10 +78,11 @@ fails loading, so file contents and commands must not contain stray braces.
 ## Known gaps
 
 Entries may select an `enforcement` mode. A named-sockaddr rewrite is a known
-gap only for ptrace; kernel mode must block it. `recommended`'s allowance for
-untraced daemons remains deliberate in both modes. Phase A's rewritten-local
-taint handoff and shared connected-UDP peer-state races are documented
-residuals without deterministic cases, not claims of test coverage.
+gap only for ptrace; kernel mode must block it, and must taint a local relay
+whatever port a rewritten address named (`local-handoff-rewrite`).
+`recommended`'s allowance for untraced daemons remains deliberate in both
+modes. The shared connected-UDP peer-state race is a documented residual
+without a deterministic case, not a claim of test coverage.
 
 Registered leaks report "known gap" rather than failing. A new, unlisted leak
 breaks the build; remove an entry once its case is actually closed.

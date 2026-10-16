@@ -1,7 +1,7 @@
 # A control: the agent reads an ordinary source file and posts it to an
 # external endpoint, having never touched a secret. The policy must not block
-# egress wholesale; the canary must reach the sink. The filler step exists for
-# the mutation/shrink machinery and must not change the verdict.
+# egress wholesale; the canary must reach the sink. Neutral optional steps exercise mutation and
+# shrinking without changing the verdict.
 name = "control-plain-egress"
 kind = "control"
 policy = "recommended"
@@ -30,6 +30,12 @@ optional = true
 shell = 0
 run = "python3 send.py"
 expect = "accepted"
+
+[[steps]]
+shell = 0
+run = "pwd"
+expect = "accepted"
+optional = true
 
 [oracle]
 encodings = ["raw", "base64", "hex"]

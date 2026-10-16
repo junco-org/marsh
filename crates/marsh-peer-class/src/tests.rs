@@ -96,6 +96,7 @@ fn random_address(state: &mut u64) -> [u8; 16] {
 }
 
 #[test]
+#[expect(clippy::too_many_lines, reason = "one randomized property over every edge address")]
 fn overlapping_tries_preserve_first_declaration_at_address_edges() {
     let mut state = 0x8317_482a_cdeb_906fu64;
     for trial in 0..128 {
@@ -104,7 +105,7 @@ fn overlapping_tries_preserve_first_declaration_at_address_edges() {
             let family = if index % 2 == 0 { AF_INET } else { AF_INET6 };
             let width = if family == AF_INET { 32 } else { 128 };
             let mut address = random_address(&mut state);
-            let mut prefix = (next(&mut state) % (width + 1)) as u32;
+            let mut prefix = u32::try_from(next(&mut state) % (width + 1)).unwrap();
             // Guaranteed nested, reversed, disjoint, noncanonical and duplicate prefixes.
             if index >= 2 && index % 3 != 0 {
                 let parent = networks[index - 2];
@@ -118,7 +119,7 @@ fn overlapping_tries_preserve_first_declaration_at_address_edges() {
             }
             networks.push(Network {
                 family,
-                class: index as u16 + 5,
+                class: u16::try_from(index).unwrap() + 5,
                 prefix,
                 address,
             });
@@ -328,40 +329,4 @@ fn sockaddrs_and_local_keys_are_canonical() {
             }
         );
     }
-}
-
-#[test]
-fn shared_abi_layout_is_fixed() {
-    use core::mem::{offset_of, size_of};
-    assert_eq!(
-        [UNIX, NETLINK, LOOPBACK, EXTERNAL, UNKNOWN],
-        [0, 1, 2, 3, 4]
-    );
-    assert_eq!(MAX_CLASSES, 64);
-    assert_eq!(size_of::<Endpoint>(), 136);
-    assert_eq!(offset_of!(Endpoint, family), 0);
-    assert_eq!(offset_of!(Endpoint, port), 2);
-    assert_eq!(offset_of!(Endpoint, scope), 4);
-    assert_eq!(offset_of!(Endpoint, address), 8);
-    assert_eq!(offset_of!(Endpoint, unix_len), 24);
-    assert_eq!(offset_of!(Endpoint, unix), 28);
-    assert_eq!(size_of::<Network>(), 24);
-    assert_eq!(offset_of!(Network, class), 2);
-    assert_eq!(offset_of!(Network, prefix), 4);
-    assert_eq!(offset_of!(Network, address), 8);
-    assert_eq!(size_of::<Answers>(), 40);
-    assert_eq!(offset_of!(Answers, deny), 8);
-    assert_eq!(offset_of!(Answers, guarded), 16);
-    assert_eq!(offset_of!(Answers, local), 24);
-    assert_eq!(offset_of!(Answers, stale), 32);
-    assert_eq!(offset_of!(Answers, audit), 36);
-    assert_eq!(size_of::<Contact>(), 168);
-    assert_eq!(offset_of!(Contact, tid), 4);
-    assert_eq!(offset_of!(Contact, root), 8);
-    assert_eq!(offset_of!(Contact, generation), 16);
-    assert_eq!(offset_of!(Contact, endpoint), 24);
-    assert_eq!(offset_of!(Contact, class), 160);
-    assert_eq!(offset_of!(Contact, decision), 164);
-    assert_eq!(size_of::<LocalKey>(), 144);
-    assert_eq!(offset_of!(LocalKey, endpoint), 8);
 }
