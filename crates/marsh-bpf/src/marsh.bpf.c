@@ -1,7 +1,13 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
  * marsh's BPF LSM programs: agent-policy socket answers enforced against the kernel's own
- * address and socket, and secret taint carried by local sockets to the processes that read them.
+ * address and socket, secret taint carried by local sockets to the processes that read them, and
+ * refusal of the operations by which governed code could escape governance or reach another
+ * domain's processes.
+ *
+ * A domain is a cgroup v2 that userspace maps to a root in DOMAINS. A task is governed while its
+ * cgroup is a domain: membership is inherited by fork and io_uring workers inside the kernel,
+ * survives PID namespaces, and cannot be left by a non-root task.
  *
  * Kernel structs below describe only the fields used. preserve_access_index makes every access a
  * CO-RE relocation, applied by the loader against the running kernel's BTF; no generated
@@ -21,8 +27,21 @@
 #define SOCK_DGRAM 2
 #define TCP_CLOSE 7
 
+/* include/uapi/linux/prctl.h */
+#define PR_SET_MM 35
+#define PR_SET_PTRACER 0x59616d61
+/* include/uapi/asm-generic/ioctls.h, also powerpc's; alpha, mips and sparc number them otherwise. */
+#define TIOCSTI 0x5412
+#define TIOCLINUX 0x541C
+/* include/linux/key.h */
+#define KEY_ALLOC_UID_KEYRING 0x10
+#define KEY_NEED_WRITE 3
+#define KEY_NEED_LINK 5
+#define KEY_NEED_SETATTR 6
+
 #define MAP_HASH 1
 #define MAP_ARRAY 2
+#define MAP_LRU_HASH 9
 #define MAP_LPM_TRIE 11
 #define MAP_SK_STORAGE 24
 #define MAP_RINGBUF 27
@@ -39,6 +58,7 @@ static void *(*bpf_map_lookup_elem)(void *map, const void *key) = (void *)1;
 static long (*bpf_map_update_elem)(void *map, const void *key, const void *value, __u64 flags) = (void *)2;
 static long (*bpf_map_delete_elem)(void *map, const void *key) = (void *)3;
 static __u64 (*bpf_ktime_get_ns)(void) = (void *)5;
+static __u64 (*bpf_get_current_cgroup_id)(void) = (void *)80;
 static void *(*bpf_sk_storage_get)(void *map, void *sk, void *value, __u64 flags) = (void *)107;
 static long (*bpf_probe_read_kernel)(void *dst, __u32 size, const void *src) = (void *)113;
 static long (*bpf_get_ns_current_pid_tgid)(__u64 dev, __u64 ino, struct bpf_pidns_info *ids, __u32 size) = (void *)120;
@@ -78,6 +98,12 @@ struct unix_sock {
 } CORE;
 struct msghdr { void *msg_name; int msg_namelen; } CORE;
 
+/* A task's cgroup v2 id, as bpf_get_current_cgroup_id() computes it for the current task. */
+struct kernfs_node { __u64 id; } CORE;
+struct cgroup { struct kernfs_node *kn; } CORE;
+struct css_set { struct cgroup *dfl_cgrp; } CORE;
+struct task_struct { struct css_set *cgroups; } CORE;
+
 static struct socket *(*bpf_sock_from_file)(struct file *file) = (void *)162;
 static struct unix_sock *(*bpf_skc_to_unix_sock)(void *sk) = (void *)178;
 
@@ -98,14 +124,31 @@ static struct unix_sock *(*bpf_skc_to_unix_sock)(void *sk) = (void *)178;
     bits >> __builtin_preserve_field_info((base)->field, 5);                                     \
 })
 
-/* Governed processes, by tgid in the loader's PID namespace: their root. */
+/*
+ * Domains: a cgroup v2 id (its kernfs node id, the directory's inode number on 64-bit kernels)
+ * and the root it belongs to. Every task in the cgroup is governed as that root.
+ */
 struct {
     __uint(type, MAP_HASH);
-    __uint(max_entries, 65536);
+    __uint(max_entries, 4096);
     __uint(map_flags, NO_PREALLOC);
-    __type(key, __u32);
+    __type(key, __u64);
     __type(value, __u64);
-} TASK_ROOT SEC(".maps");
+} DOMAINS SEC(".maps");
+
+/*
+ * Keys a domain allocated, by kernel address: their root. A key's serial is assigned only after
+ * the key_alloc hook, so the address is the identity. No LSM hook sees a key freed: a stale entry
+ * stays until key_alloc reuses its address, rewriting the entry before the new key is usable, or
+ * the LRU evicts it. Evicting a live domain key only fails closed: its domain can no longer
+ * modify it.
+ */
+struct {
+    __uint(type, MAP_LRU_HASH);
+    __uint(max_entries, 16384);
+    __type(key, __u64);
+    __type(value, __u64);
+} KEYS SEC(".maps");
 
 /* Each root's published answers; replaced whole by userspace, RCU-safe with NO_PREALLOC. */
 struct {
@@ -224,20 +267,25 @@ struct {
 
 char LICENSE[] SEC("license") = "GPL";
 
-static __always_inline int current_ids(struct bpf_pidns_info *ids)
+/*
+ * The current task's ids in the loader's PID namespace, for reporting only: zero for a task whose
+ * active PID namespace is another one. Governance never depends on them.
+ */
+static __always_inline void current_ids(struct bpf_pidns_info *ids)
 {
     __u32 zero = 0;
     struct pid_namespace *namespace = bpf_map_lookup_elem(&PID_NAMESPACE, &zero);
-    /* Registration refuses children that change PID namespace before they resume. */
-    return namespace && !bpf_get_ns_current_pid_tgid(namespace->dev, namespace->ino, ids, sizeof(*ids)) ? 0 : -1;
+    if (!namespace || bpf_get_ns_current_pid_tgid(namespace->dev, namespace->ino, ids, sizeof(*ids))) {
+        ids->pid = 0;
+        ids->tgid = 0;
+    }
 }
 
-/* The current process's root, when marsh governs it. */
-static __always_inline __u64 *governed(struct bpf_pidns_info *ids)
+/* The current task's root, when its cgroup is a domain. */
+static __always_inline __u64 *governed(void)
 {
-    if (current_ids(ids))
-        return 0;
-    return bpf_map_lookup_elem(&TASK_ROOT, &ids->tgid);
+    __u64 cgroup = bpf_get_current_cgroup_id();
+    return bpf_map_lookup_elem(&DOMAINS, &cgroup);
 }
 
 static __always_inline volatile __u64 *health(void)
@@ -259,17 +307,19 @@ static __always_inline void poison(void)
         *state = 1;
 }
 
-static __always_inline struct marsh_event *reserve(__u32 kind, struct bpf_pidns_info *ids, __u64 root)
+static __always_inline struct marsh_event *reserve(__u32 kind, __u64 root)
 {
     struct marsh_event *event = bpf_ringbuf_reserve(&EVENTS, sizeof(*event), 0);
     if (!event) {
         poison();
         return 0;
     }
+    struct bpf_pidns_info ids;
+    current_ids(&ids);
     __builtin_memset(event, 0, sizeof(*event));
     event->kind = kind;
-    event->tgid = ids->tgid;
-    event->tid = ids->pid;
+    event->tgid = ids.tgid;
+    event->tid = ids.pid;
     event->root = root;
     event->time = bpf_ktime_get_ns();
     return event;
@@ -582,19 +632,18 @@ int socket_connect(unsigned long long *ctx)
 {
     const void *address = (void *)ctx[1];
     int len = ctx[2], previous = ctx[3];
-    struct bpf_pidns_info ids;
     __u16 family = 0;
     if (previous)
         return previous;
     /* AF_UNSPEC disconnects a socket: no peer contact or observation exists. */
     if (address && len >= 2 && !bpf_probe_read_kernel(&family, 2, address) && family == AF_UNSPEC)
         return 0;
-    __u64 *root = governed(&ids);
+    __u64 *root = governed();
     if (!root)
         return 0;
     if (poisoned())
         return -EPERM;
-    struct marsh_event *event = reserve(EVENT_CONTACT, &ids, *root);
+    struct marsh_event *event = reserve(EVENT_CONTACT, *root);
     if (!event)
         return -EPERM;
     int unreadable = read_sockaddr(address, len, &event->endpoint) != 0;
@@ -631,10 +680,9 @@ int socket_sendmsg(unsigned long long *ctx)
     struct socket *sock = (void *)ctx[0];
     struct msghdr *message = (void *)ctx[1];
     int previous = ctx[3];
-    struct bpf_pidns_info ids;
     if (previous)
         return previous;
-    __u64 *root = governed(&ids);
+    __u64 *root = governed();
     if (!root)
         return 0;
     if (poisoned())
@@ -647,7 +695,7 @@ int socket_sendmsg(unsigned long long *ctx)
     /* UNIX datagrams are judged at unix_may_send, which knows the receiving socket. */
     if (family == AF_UNIX && type == SOCK_DGRAM)
         return 0;
-    struct marsh_event *event = reserve(EVENT_CONTACT, &ids, *root);
+    struct marsh_event *event = reserve(EVENT_CONTACT, *root);
     if (!event)
         return -EPERM;
     /* The receiving UNIX socket: typed for socket storage, raw for reading its name. */
@@ -693,15 +741,14 @@ int unix_may_send(unsigned long long *ctx)
 {
     struct socket *other = (void *)ctx[1];
     int previous = ctx[2];
-    struct bpf_pidns_info ids;
     if (previous)
         return previous;
-    __u64 *root = governed(&ids);
+    __u64 *root = governed();
     if (!root)
         return 0;
     if (poisoned())
         return -EPERM;
-    struct marsh_event *event = reserve(EVENT_CONTACT, &ids, *root);
+    struct marsh_event *event = reserve(EVENT_CONTACT, *root);
     if (!event)
         return -EPERM;
     struct sock *receiver = other->sk;
@@ -726,10 +773,9 @@ int socket_post_create(unsigned long long *ctx)
 {
     struct socket *sock = (void *)ctx[0];
     int family = ctx[1], kern = ctx[4], previous = ctx[5];
-    struct bpf_pidns_info ids;
     if (previous)
         return previous;
-    if (family != AF_UNIX || kern || !governed(&ids))
+    if (family != AF_UNIX || kern || !governed())
         return 0;
     struct sock *sk = sock->sk;
     struct sock_state *state = sk ? bpf_sk_storage_get(&SOCKS, sk, 0, STORAGE_CREATE) : 0;
@@ -772,8 +818,7 @@ static __always_inline void port_tag(struct flow *key, __u16 family, __u64 *tain
 /* A governed reader of a tagged socket receives its taint before it can act on the bytes. */
 static __always_inline int receive(struct sock *sk)
 {
-    struct bpf_pidns_info ids;
-    __u64 *root = governed(&ids);
+    __u64 *root = governed();
     if (!root || !sk)
         return 0;
     __u16 family = sk->__sk_common.skc_family;
@@ -820,7 +865,7 @@ static __always_inline int receive(struct sock *sk)
         bpf_map_update_elem(&RECEIVED, &key, &zero, NOEXIST);
         receipts = bpf_map_lookup_elem(&RECEIVED, &key);
     }
-    struct marsh_event *event = receipts ? reserve(EVENT_RECEIPT, &ids, key) : 0;
+    struct marsh_event *event = receipts ? reserve(EVENT_RECEIPT, key) : 0;
     if (!event) {
         poison();
         return -EPERM;
@@ -948,13 +993,223 @@ int sk_free_security(unsigned long long *ctx)
     return 0;
 }
 
+/* An operation no governed task may perform, unless an earlier program already decided. */
+static __always_inline int refused(int previous)
+{
+    if (previous)
+        return previous;
+    return governed() ? -EPERM : 0;
+}
+
 /* A SQPOLL ring's kernel thread submits without stops; refuse it before it exists. */
 SEC("lsm/uring_sqpoll")
 int uring_sqpoll(unsigned long long *ctx)
 {
-    int previous = ctx[0];
-    struct bpf_pidns_info ids;
+    return refused(ctx[0]);
+}
+
+/* An io_uring personality runs requests under credentials registered earlier. */
+SEC("lsm/uring_override_creds")
+int uring_override_creds(unsigned long long *ctx)
+{
+    return refused(ctx[1]);
+}
+
+/* Passthrough commands reach drivers below every file and socket hook. */
+SEC("lsm/uring_cmd")
+int uring_cmd(unsigned long long *ctx)
+{
+    return refused(ctx[1]);
+}
+
+/* A user namespace would hand governed code capabilities inside it. */
+SEC("lsm/userns_create")
+int userns_create(unsigned long long *ctx)
+{
+    return refused(ctx[1]);
+}
+
+/*
+ * BPF and perf reach kernel state every domain shares. The BPF hooks' `kernel` flag marks the
+ * kernel's own calls (syscall programs, light skeletons), which pass. bpf_token_create has no
+ * such flag.
+ */
+SEC("lsm/bpf")
+int bpf(unsigned long long *ctx)
+{
+    int kernel = (__u8)ctx[3], previous = ctx[4];
+    return kernel ? previous : refused(previous);
+}
+
+SEC("lsm/bpf_map_create")
+int bpf_map_create(unsigned long long *ctx)
+{
+    int kernel = (__u8)ctx[3], previous = ctx[4];
+    return kernel ? previous : refused(previous);
+}
+
+SEC("lsm/bpf_prog_load")
+int bpf_prog_load(unsigned long long *ctx)
+{
+    int kernel = (__u8)ctx[3], previous = ctx[4];
+    return kernel ? previous : refused(previous);
+}
+
+SEC("lsm/bpf_token_create")
+int bpf_token_create(unsigned long long *ctx)
+{
+    return refused(ctx[3]);
+}
+
+SEC("lsm/perf_event_open")
+int perf_event_open(unsigned long long *ctx)
+{
+    return refused(ctx[1]);
+}
+
+/*
+ * PR_SET_PTRACER lets another process trace the caller; PR_SET_MM rewrites its memory map
+ * description. Any other option passes: when every program returns 0 the trampoline runs the
+ * hook's stub, whose -ENOSYS tells prctl that no module handled the option. A module ordered
+ * before bpf (Yama) has already applied PR_SET_PTRACER when this refuses it, so tracing across
+ * domains must also be refused where the trace is checked.
+ */
+SEC("lsm/task_prctl")
+int task_prctl(unsigned long long *ctx)
+{
+    int option = ctx[0], previous = ctx[5];
     if (previous)
         return previous;
-    return governed(&ids) ? -EPERM : 0;
+    if (option != PR_SET_PTRACER && option != PR_SET_MM)
+        return 0;
+    return governed() ? -EPERM : 0;
+}
+
+/* TIOCSTI and TIOCLINUX (selection paste) inject input for whoever reads the terminal. */
+static __always_inline int terminal_injection(unsigned long long *ctx)
+{
+    unsigned int cmd = ctx[1];
+    int previous = ctx[3];
+    if (previous)
+        return previous;
+    if (cmd != TIOCSTI && cmd != TIOCLINUX)
+        return 0;
+    return governed() ? -EPERM : 0;
+}
+
+SEC("lsm/file_ioctl")
+int file_ioctl(unsigned long long *ctx)
+{
+    return terminal_injection(ctx);
+}
+
+SEC("lsm/file_ioctl_compat")
+int file_ioctl_compat(unsigned long long *ctx)
+{
+    return terminal_injection(ctx);
+}
+
+/* A task's cgroup v2 id; zero, which no cgroup has, when unreadable. */
+static __always_inline __u64 task_cgroup(struct task_struct *task)
+{
+    struct css_set *set = 0;
+    struct cgroup *cgroup = 0;
+    struct kernfs_node *node = 0;
+    __u64 id = 0;
+    if (READ(set, task->cgroups) || !set || READ(cgroup, set->dfl_cgrp) || !cgroup ||
+        READ(node, cgroup->kn) || !node || READ(id, node->id))
+        return 0;
+    return id;
+}
+
+/*
+ * Process attributes are storage channels another process can observe: a governed task changes
+ * them only for tasks in its own cgroup.
+ */
+static __always_inline int other_domain(struct task_struct *task, int previous)
+{
+    if (previous)
+        return previous;
+    if (!governed())
+        return 0;
+    return task_cgroup(task) == bpf_get_current_cgroup_id() ? 0 : -EPERM;
+}
+
+SEC("lsm/task_setnice")
+int task_setnice(unsigned long long *ctx)
+{
+    return other_domain((void *)ctx[0], ctx[2]);
+}
+
+SEC("lsm/task_setioprio")
+int task_setioprio(unsigned long long *ctx)
+{
+    return other_domain((void *)ctx[0], ctx[2]);
+}
+
+SEC("lsm/task_setscheduler")
+int task_setscheduler(unsigned long long *ctx)
+{
+    return other_domain((void *)ctx[0], ctx[1]);
+}
+
+SEC("lsm/task_movememory")
+int task_movememory(unsigned long long *ctx)
+{
+    return other_domain((void *)ctx[0], ctx[1]);
+}
+
+SEC("lsm/task_setpgid")
+int task_setpgid(unsigned long long *ctx)
+{
+    return other_domain((void *)ctx[0], ctx[2]);
+}
+
+/* prlimit(2) on another process passes here as well as task_prlimit. */
+SEC("lsm/task_setrlimit")
+int task_setrlimit(unsigned long long *ctx)
+{
+    return other_domain((void *)ctx[0], ctx[3]);
+}
+
+/*
+ * Keyrings are shared with untraced processes of the same uid, the user keyring above all. A
+ * governed task may write, link or change the attributes of only keys its own root allocated;
+ * viewing, reading and searching flow inward.
+ */
+SEC("lsm/key_alloc")
+int key_alloc(unsigned long long *ctx)
+{
+    __u64 key = ctx[0];
+    unsigned long flags = ctx[2];
+    int previous = ctx[3];
+    if (previous)
+        return previous;
+    __u64 *root = governed();
+    /* The user and user-session keyrings belong to the uid, whichever lookup created them. */
+    if (!root || (flags & KEY_ALLOC_UID_KEYRING)) {
+        bpf_map_delete_elem(&KEYS, &key);
+        return 0;
+    }
+    __u64 owner = *root;
+    /* Unrecorded, a stale entry for the address could hand the key to another root. */
+    return bpf_map_update_elem(&KEYS, &key, &owner, 0) ? -EPERM : 0;
+}
+
+SEC("lsm/key_permission")
+int key_permission(unsigned long long *ctx)
+{
+    /* A key_ref_t is the key's address with bit 0 marking possession. */
+    __u64 key = ctx[0] & ~1ULL;
+    __u32 need = ctx[2];
+    int previous = ctx[3];
+    if (previous)
+        return previous;
+    if (need != KEY_NEED_WRITE && need != KEY_NEED_LINK && need != KEY_NEED_SETATTR)
+        return 0;
+    __u64 *root = governed();
+    if (!root)
+        return 0;
+    __u64 *owner = bpf_map_lookup_elem(&KEYS, &key);
+    return owner && *owner == *root ? 0 : -EPERM;
 }

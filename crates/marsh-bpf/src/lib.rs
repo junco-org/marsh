@@ -4,22 +4,21 @@
 //! this crate builds without BPF tooling and [`Controller::load`] returns an error.
 //!
 //! Publish a root's networks before its answers: [`Controller::configure`] withdraws old answers
-//! while it replaces the trie. Keep a newly governed child stopped until [`Controller::task`]
-//! returns. Every map or reporting failure poisons enforcement for good; create a new controller
-//! only after terminating the old one's governed tasks. Invalid input and an unattributable child
-//! fail only that call. Maps and links are never pinned, and kernel-created descriptors are
+//! while it replaces the trie. A domain is a cgroup v2 whose tasks are all governed as one root,
+//! whatever their PID namespace: register it with [`Controller::domain`] before any task enters
+//! the cgroup. Its id is the cgroup's kernfs id: the directory's inode number on 64-bit kernels,
+//! and in general the id in its `name_to_handle_at` handle. Every map or reporting failure poisons
+//! enforcement for good; create a new controller only after killing the old one's domains. Invalid
+//! input fails only that call. Maps and links are never pinned, and kernel-created descriptors are
 //! close-on-exec. Dropping the controller detaches its programs.
 //!
-//! PID attribution uses the loader's actual PID namespace. Its procfs must expose that namespace
-//! (including PID 1); a child entering another PID namespace is killed before it resumes.
+//! Governed tasks may not use bpf(2), so the controller must run outside every domain. Event tgids
+//! and tids are in the loader's PID namespace, and zero for a task in any other.
 
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::HashSet,
     io,
-    os::{
-        fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd},
-        unix::fs::MetadataExt,
-    },
+    os::fd::{AsRawFd, BorrowedFd},
 };
 
 #[cfg(feature = "privileged")]
@@ -39,7 +38,7 @@ use marsh_peer_class::{
 
 /// Every LSM hook the programs attach to; all are required.
 #[cfg(feature = "privileged")]
-const HOOKS: [&str; 7] = [
+const HOOKS: [&str; 26] = [
     "socket_connect",
     "socket_sendmsg",
     "unix_may_send",
@@ -47,6 +46,25 @@ const HOOKS: [&str; 7] = [
     "unix_stream_connect",
     "sk_free_security",
     "uring_sqpoll",
+    "uring_override_creds",
+    "uring_cmd",
+    "userns_create",
+    "bpf",
+    "bpf_map_create",
+    "bpf_prog_load",
+    "bpf_token_create",
+    "perf_event_open",
+    "task_prctl",
+    "file_ioctl",
+    "file_ioctl_compat",
+    "task_setnice",
+    "task_setioprio",
+    "task_setscheduler",
+    "task_movememory",
+    "task_setpgid",
+    "task_setrlimit",
+    "key_alloc",
+    "key_permission",
 ];
 
 /// Socket reads, traced on return so a reader blocked before tainted bytes arrived is caught:
@@ -75,24 +93,15 @@ pod!(WireAnswers, Answers);
 pod!(WireReceipts, Receipts);
 pod!(WireEndpoint, Endpoint);
 
-/// What [`Controller::task`] did with a stopped process.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Admission {
-    /// Mapped to its root; it may resume.
-    Attributed,
-    /// Killed or already gone without being mapped: it never runs again.
-    Refused,
-}
-
 /// Owns the attached LSM programs and all their unpinned maps.
 ///
 /// Share it behind the tracer's mutex. Loss is sticky: any failed map or reporting operation
-/// refuses every mapped task's contacts, auditing roots included. Tasks outside the task map are
-/// never affected.
+/// refuses every governed task's contacts, auditing roots included. Tasks outside every domain
+/// are never affected.
 pub struct Controller {
     // Drop links before maps: Aya detaches the programs when `Ebpf` drops.
     programs: Option<Ebpf>,
-    task_root: HashMap<MapData, u32, u64>,
+    domains: HashMap<MapData, u64, u64>,
     answers: HashMap<MapData, u64, WireAnswers>,
     received: HashMap<MapData, u64, WireReceipts>,
     net4: LpmTrie<MapData, [u8; 12], u32>,
@@ -101,10 +110,6 @@ pub struct Controller {
     allowed: HashSet<Endpoint>,
     events: RingBuf<MapData>,
     health: Array<MapData, u64>,
-    // pidfds: killing a recycled PID is impossible even when poisoning HEALTH itself fails.
-    tasks: BTreeMap<u32, OwnedFd>,
-    pid_namespace: [u64; 2],
-    _pid_namespace: OwnedFd,
 }
 
 impl Controller {
@@ -125,7 +130,7 @@ impl Controller {
         #[cfg(feature = "privileged")]
         {
             let btf = prerequisites()?;
-            let (pid_namespace_fd, pid_namespace) = own_pid_namespace()?;
+            let pid_namespace = own_pid_namespace()?;
             // Socket storage is a map type Aya has no wrapper for; the kernel owns it entirely.
             let mut programs = aya::EbpfLoader::new()
                 .allow_unsupported_maps()
@@ -139,7 +144,7 @@ impl Controller {
             .map_err(io::Error::other)?;
             namespace.set(0, pid_namespace, 0).map_err(io::Error::other)?;
             let controller = Self {
-                task_root: map(&mut programs, "TASK_ROOT")?,
+                domains: map(&mut programs, "DOMAINS")?,
                 answers: map(&mut programs, "ANSWERS")?,
                 received: map(&mut programs, "RECEIVED")?,
                 net4: map(&mut programs, "CLASS_NET4")?,
@@ -148,9 +153,6 @@ impl Controller {
                 allowed: HashSet::new(),
                 events: map(&mut programs, "EVENTS")?,
                 health: map(&mut programs, "HEALTH")?,
-                tasks: BTreeMap::new(),
-                pid_namespace,
-                _pid_namespace: pid_namespace_fd,
                 programs: None,
             };
             for hook in HOOKS {
@@ -245,51 +247,23 @@ impl Controller {
         })
     }
 
-    /// Attributes every thread of a stopped process to a root before it resumes. A root without
-    /// answers refuses its contacts. A child in another PID namespace cannot be attributed, and
-    /// would run ungoverned: it alone is killed, through its pidfd, and [`Admission::Refused`].
-    pub fn task(&mut self, tgid: u32, root: u64) -> io::Result<Admission> {
+    /// Governs every task in a cgroup v2, `cgroup` being its kernfs id, as `root`. Register it
+    /// before any task enters the cgroup; children inherit it, and only a privileged task can
+    /// leave it. A root without answers refuses its contacts.
+    pub fn domain(&mut self, cgroup: u64, root: u64) -> io::Result<()> {
         self.update(|this| {
-            let process = match this.tasks.entry(tgid) {
-                std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
-                std::collections::btree_map::Entry::Vacant(entry) => match pidfd(tgid) {
-                    Ok(process) => entry.insert(process),
-                    // Only SIGKILL ends a stopped tracee: nothing of it can run again.
-                    Err(error) if error.raw_os_error() == Some(libc::ESRCH) => {
-                        return Ok(Admission::Refused);
-                    }
-                    Err(error) => return Err(error),
-                },
-            };
-            let attributable = std::fs::metadata(format!("/proc/{tgid}/ns/pid"))
-                .is_ok_and(|namespace| [namespace.dev(), namespace.ino()] == this.pid_namespace);
-            if !attributable {
-                kill(process)?;
-                this.tasks.remove(&tgid);
-                absent_ok(this.task_root.remove(&tgid))?;
-                return Ok(Admission::Refused);
-            }
-            this.task_root
-                .insert(tgid, root, 0)
-                .map_err(io::Error::other)?;
-            Ok(Admission::Attributed)
+            this.domains
+                .insert(cgroup, root, 0)
+                .map_err(io::Error::other)
         })
     }
 
-    /// Removes an exited process's mapping; repeated cleanup is harmless.
-    pub fn remove_task(&mut self, tgid: u32) -> io::Result<()> {
-        if let Err(error) = absent_ok(self.task_root.remove(&tgid)) {
-            let error = self.poison(error);
-            let cleanup = self.terminate();
-            return Err(io::Error::other(format!(
-                "{error}; task-map cleanup failed; controller termination: {cleanup:?}"
-            )));
-        }
-        self.tasks.remove(&tgid);
-        Ok(())
+    /// Stops governing a cgroup; repeated cleanup is harmless.
+    pub fn remove_domain(&mut self, cgroup: u64) -> io::Result<()> {
+        absent_ok(self.domains.remove(&cgroup)).map_err(|error| self.poison(error))
     }
 
-    /// Removes a root's answers, receipts and networks. Processes still mapped to it refuse.
+    /// Removes a root's answers, receipts and networks. Domains still mapped to it refuse.
     pub fn remove_root(&mut self, root: u64) -> io::Result<()> {
         let result = (|| {
             absent_ok(self.answers.remove(&root))?;
@@ -366,22 +340,16 @@ impl Controller {
         })
     }
 
-    /// Sends SIGKILL to every governed pidfd, cleans up even when poisoned, then detaches.
+    /// Poisons enforcement, removes every domain even when poisoned, then detaches the programs.
     ///
-    /// Call on a shared-service failure. A signalling failure keeps the hooks attached; after
-    /// successful signalling, map cleanup errors are returned, but stale numeric PID keys cannot
-    /// match a reused PID because the programs are detached.
+    /// Call on a shared-service failure. It signals nothing: kill every domain through its
+    /// cgroup's `cgroup.kill` first, since once this returns no domain is governed any more. Map
+    /// errors are returned after detaching.
     pub fn terminate(&mut self) -> io::Result<()> {
-        let mut failure = self.health.set(0, 1, 0).map_err(io::Error::other).err();
-        self.kill_tasks()?;
-        for tgid in self.tasks.keys() {
-            if let Err(error) = absent_ok(self.task_root.remove(tgid)) {
-                failure = Some(error);
-            }
-        }
-        self.tasks.clear();
+        let poisoned = self.health.set(0, 1, 0).map_err(io::Error::other);
+        let cleared = self.clear_domains();
         self.programs.take();
-        failure.map_or(Ok(()), Err)
+        cleared.and(poisoned)
     }
 
     fn check_health(&self) -> io::Result<()> {
@@ -400,24 +368,24 @@ impl Controller {
 
     fn poison(&mut self, error: io::Error) -> io::Error {
         if let Err(map_error) = self.health.set(0, 1, 0) {
-            // Without the switch, pidfds are the last fail-closed boundary. Never wait here:
-            // ptrace exit stops need the tracer.
-            let termination = self.terminate();
+            // Detaching would only lift what enforcement remains; killing is the caller's.
             return io::Error::other(format!(
-                "{error}; cannot poison BPF maps: {map_error}; termination: {termination:?}"
+                "{error}; cannot poison BPF maps: {map_error}; kill every domain"
             ));
         }
         error
     }
 
-    fn kill_tasks(&self) -> io::Result<()> {
-        let mut failure = None;
-        for process in self.tasks.values() {
-            if let Err(error) = kill(process) {
-                failure = Some(error);
-            }
+    fn clear_domains(&mut self) -> io::Result<()> {
+        let cgroups: Vec<u64> = self
+            .domains
+            .keys()
+            .collect::<Result<_, _>>()
+            .map_err(io::Error::other)?;
+        for cgroup in cgroups {
+            absent_ok(self.domains.remove(&cgroup))?;
         }
-        failure.map_or(Ok(()), Err)
+        Ok(())
     }
 
     fn clear_networks(&mut self, root: u64) -> io::Result<()> {
@@ -493,39 +461,6 @@ fn absent_ok(result: Result<(), MapError>) -> io::Result<()> {
     }
 }
 
-fn pidfd(tgid: u32) -> io::Result<OwnedFd> {
-    // SAFETY: pidfd_open takes an integer PID and flags; it returns a fresh close-on-exec
-    // descriptor owned only here.
-    let descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, tgid, 0) };
-    if descriptor < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let descriptor = i32::try_from(descriptor).map_err(io::Error::other)?;
-    // SAFETY: the successful syscall returned a fresh owned descriptor.
-    Ok(unsafe { OwnedFd::from_raw_fd(descriptor) })
-}
-
-/// SIGKILL through a pidfd; a process already gone is not an error.
-fn kill(process: &OwnedFd) -> io::Result<()> {
-    // SAFETY: process is a live owned pidfd; no siginfo is supplied.
-    let result = unsafe {
-        libc::syscall(
-            libc::SYS_pidfd_send_signal,
-            process.as_raw_fd(),
-            libc::SIGKILL,
-            std::ptr::null::<libc::siginfo_t>(),
-            0,
-        )
-    };
-    if result < 0 {
-        let error = io::Error::last_os_error();
-        if error.raw_os_error() != Some(libc::ESRCH) {
-            return Err(error);
-        }
-    }
-    Ok(())
-}
-
 #[cfg(feature = "privileged")]
 fn map<T: TryFrom<Map>>(programs: &mut Ebpf, name: &str) -> io::Result<T>
 where
@@ -537,19 +472,13 @@ where
     T::try_from(map).map_err(|error| io::Error::other(format!("BPF map {name}: {error}")))
 }
 
+/// The loader's own PID namespace, whose ids events report. `/proc/self` names the caller in any
+/// procfs that can see it, so the namespace is right whenever it resolves.
 #[cfg(feature = "privileged")]
-fn own_pid_namespace() -> io::Result<(OwnedFd, [u64; 2])> {
-    let namespace = std::fs::File::open("/proc/self/ns/pid")?;
-    let own = namespace.metadata()?;
-    let visible = std::fs::metadata("/proc/1/ns/pid")?;
-    let identity = [own.dev(), own.ino()];
-    if [visible.dev(), visible.ino()] != identity {
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "procfs PID namespace does not match the tracer: mount procfs in the tracer's PID namespace",
-        ));
-    }
-    Ok((namespace.into(), identity))
+fn own_pid_namespace() -> io::Result<[u64; 2]> {
+    use std::os::unix::fs::MetadataExt as _;
+    let own = std::fs::metadata("/proc/self/ns/pid")?;
+    Ok([own.dev(), own.ino()])
 }
 
 #[cfg(feature = "privileged")]

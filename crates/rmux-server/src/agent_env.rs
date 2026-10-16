@@ -13,6 +13,10 @@
 //!   policy always enforces.
 //! * `MARSH_ENFORCEMENT`: unset, empty or `unprivileged` keeps the ptrace gate; `privileged`
 //!   requires BPF LSM support and a privileged-feature build; `auto` reports any fallback.
+//! * `MARSH_GOVERNED_UID`: under privileged enforcement, the non-root uid agent-governed
+//!   commands run as; unset, each source's owner.
+//! * `MARSH_WRITABLE`: under privileged enforcement, `:`-separated absolute paths
+//!   agent-governed commands may write beyond their private view and `/tmp`.
 //!
 //! Every pane is one agent: its observations are attributed to the principal `agent`, so taint
 //! from one pane follows the agent into the others.
@@ -36,6 +40,8 @@ pub(crate) struct AgentEnvironment {
     pub agent_policy: Option<Arc<AgentPolicy>>,
     pub policy_observer: Option<Arc<PolicyObserver>>,
     pub enforcement: Enforcement,
+    pub governed_user: Option<u32>,
+    pub writable: Vec<PathBuf>,
 }
 
 impl AgentEnvironment {
@@ -72,6 +78,8 @@ impl AgentEnvironment {
             agent_policy,
             policy_observer,
             enforcement,
+            governed_user: governed_uid(&std::env::var("MARSH_GOVERNED_UID").unwrap_or_default())?,
+            writable: writable(&std::env::var_os("MARSH_WRITABLE").unwrap_or_default())?,
         })
     }
 }
@@ -85,6 +93,33 @@ fn enforcement(mode: &str) -> std::io::Result<Enforcement> {
             "MARSH_ENFORCEMENT must be unprivileged, privileged or auto, not {other:?}"
         ))),
     }
+}
+
+/// A numeric uid; empty means each source's owner.
+fn governed_uid(uid: &str) -> std::io::Result<Option<u32>> {
+    if uid.is_empty() {
+        return Ok(None);
+    }
+    uid.parse().map(Some).map_err(|_| {
+        std::io::Error::other(format!("MARSH_GOVERNED_UID must be a numeric uid, not {uid:?}"))
+    })
+}
+
+/// `:`-separated absolute paths; empty entries are ignored.
+fn writable(paths: &std::ffi::OsStr) -> std::io::Result<Vec<PathBuf>> {
+    std::env::split_paths(paths)
+        .filter(|path| !path.as_os_str().is_empty())
+        .map(|path| {
+            if path.is_absolute() {
+                Ok(path)
+            } else {
+                Err(std::io::Error::other(format!(
+                    "MARSH_WRITABLE entries must be absolute: {}",
+                    path.display()
+                )))
+            }
+        })
+        .collect()
 }
 
 /// An observer appending each non-grant decision to `path` from a dedicated writer thread, so the

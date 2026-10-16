@@ -317,7 +317,8 @@ pub(crate) enum Removal {
 /// if they are the bytes `hash` names: whatever the source tree's mutability, what reaches the seed
 /// is what the log describes. The copy is fsynced before the rename; the rename's two directories
 /// are the caller's to fsync before it records the transaction finished. A symlink is recreated,
-/// never followed, and hashed by its target.
+/// never followed, and hashed by its target. Under a root publisher the copy takes `target`'s
+/// owner, so the seed stays its owner's.
 ///
 /// # Errors
 ///
@@ -347,6 +348,9 @@ pub(crate) fn apply_write(
                 Mode::RUSR | Mode::WUSR,
             )?);
             let copied = ContentHash::of_stream(input, Some(&mut output), buffer)?;
+            if let Some((owner, group)) = inherited_owner(target)? {
+                rustix::fs::fchown(&output, Some(owner), Some(group))?;
+            }
             rustix::fs::fchmod(&output, Mode::from_raw_mode(mode.bits()))?;
             output.sync_all()?;
             copied
@@ -354,6 +358,15 @@ pub(crate) fn apply_write(
         Kind::Symlink => {
             let link = rustix::fs::readlinkat(source, source_name, Vec::new())?;
             rustix::fs::symlinkat(link.as_c_str(), staging, part.as_str())?;
+            if let Some((owner, group)) = inherited_owner(target)? {
+                rustix::fs::chownat(
+                    staging,
+                    part.as_str(),
+                    Some(owner),
+                    Some(group),
+                    AtFlags::SYMLINK_NOFOLLOW,
+                )?;
+            }
             ContentHash::of(link.as_bytes())
         }
         Kind::Directory | Kind::Special => {
@@ -399,17 +412,39 @@ pub(crate) fn apply_remove(
     }
 }
 
-/// Creates the directory `name` of `directory`, `0700`; one already there is left as it is. The
-/// entry's kind, its final mode and its parent's fsync are the caller's.
+/// Creates the directory `name` of `directory`, `0700` and, under a root publisher, owned like
+/// `directory`; one already there is left as it is. The entry's kind, its final mode and its
+/// parent's fsync are the caller's.
 ///
 /// # Errors
 ///
 /// Fails with [`Error::Io`] when the creation fails for any reason other than the name existing.
 pub(crate) fn apply_mkdir(directory: BorrowedFd<'_>, name: &OsStr) -> Result<(), Error> {
     match rustix::fs::mkdirat(directory, name, Mode::RWXU) {
-        Ok(()) | Err(Errno::EXIST) => Ok(()),
-        Err(error) => Err(error.into()),
+        Ok(()) => {}
+        Err(Errno::EXIST) => return Ok(()),
+        Err(error) => return Err(error.into()),
     }
+    if let Some((owner, group)) = inherited_owner(directory)? {
+        rustix::fs::chownat(directory, name, Some(owner), Some(group), AtFlags::empty())?;
+    }
+    Ok(())
+}
+
+/// The owner a new entry of `directory` takes when the publisher runs as root: the directory's.
+/// A root daemon publishes for a seed's owner, whose governed commands must still be able to
+/// change what it published; any other publisher keeps the kernel's default.
+fn inherited_owner(
+    directory: BorrowedFd<'_>,
+) -> Result<Option<(rustix::fs::Uid, rustix::fs::Gid)>, Error> {
+    if !rustix::process::geteuid().is_root() {
+        return Ok(None);
+    }
+    let stat = rustix::fs::fstat(directory)?;
+    Ok(Some((
+        rustix::fs::Uid::from_raw(stat.st_uid),
+        rustix::fs::Gid::from_raw(stat.st_gid),
+    )))
 }
 
 /// Grants the owner read, write and search on the directory `name` of `directory`, whose

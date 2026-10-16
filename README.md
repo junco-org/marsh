@@ -293,9 +293,13 @@ privileged`, which needs clang 15 or later (`MARSH_BPF_CLANG` selects another bi
 `PolicyObserver` (or stderr without one); `Shell::enforcement()` returns the effective mode.
 The process-wide tracer refuses an incompatible explicit mode request. See
 [`docs/privileged-enforcement.md`](docs/privileged-enforcement.md) for the design, requirements,
-the isolated kernel runner, and residual filesystem and connected-UDP races. Privileged managed
-commands lose OS capabilities and cannot gain new privileges, so they cannot modify the
-enforcer's maps or use administrative capabilities even when launched as root.
+the isolated kernel runner, and residual filesystem and connected-UDP races. Privileged agent
+shells confine their commands ([`docs/threat-model.md`](docs/threat-model.md) §8.2): each runs as
+the source's owner (never root), in its shell's own cgroup, mount and IPC namespaces with a private
+`/tmp`, without capabilities or new privileges, and under Landlock, which lets it write only its
+view, its private directories, the source's shared scratch (`/tmp/shared`) and an operator
+allowlist. The interpreter's own redirections and probes take the same authority, and such a
+shell refuses the direct route.
 
 Everything else is judged at publication, atomically with the Git policy. A refused command's
 source changes are rolled back, but what it read, ran and contacted stays in history. Effects
@@ -319,6 +323,9 @@ The `rmux` daemon reads these environment variables when it starts:
 * `MARSH_POLICY_LOG=<file>` appends each denial as a JSON line.
 * `MARSH_ENFORCEMENT=unprivileged|privileged|auto` selects socket enforcement; unset defaults to
   unprivileged. Build `rmux` with `cargo build --features privileged` to enable BPF loading.
+* `MARSH_GOVERNED_UID=<uid>` names the non-root user privileged agent commands run as; unset,
+  each source's owner (a root-owned source then refuses privileged agent shells).
+* `MARSH_WRITABLE=<path>:<path>` lists what else privileged agent commands may write.
 
 Every pane acts as the one principal `agent`.
 

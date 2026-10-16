@@ -249,6 +249,27 @@ impl ExecutionObserver for MarshExecutor {
             context.fail_evidence(format!("host filesystem evidence: {error}"));
         }
     }
+    /// A confined run's interpreter sees the private `/tmp` and `/dev/shm` its commands see.
+    fn host_path<'a>(&self, path: &'a Path) -> std::borrow::Cow<'a, Path> {
+        let Ok(context) = self.context() else {
+            return std::borrow::Cow::Borrowed(path);
+        };
+        match &context.run.backend {
+            Backend::Managed { tracing, trace, .. } => tracing.host_path(*trace, path),
+            Backend::Direct { .. } => std::borrow::Cow::Borrowed(path),
+        }
+    }
+    /// A confined run's interpreter accesses the filesystem with its commands' authority, never
+    /// the daemon's.
+    fn host_fs<T: Send>(&self, access: impl FnOnce() -> T + Send) -> std::io::Result<T> {
+        let Ok(context) = self.context() else {
+            return Ok(access());
+        };
+        match &context.run.backend {
+            Backend::Managed { tracing, trace, .. } => tracing.host_fs(*trace, access),
+            Backend::Direct { .. } => Ok(access()),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -894,18 +915,34 @@ impl BuiltinContext {
         lease.completed = true;
         Ok(result)
     }
-    fn io<T>(
+    /// Runs one filesystem access on `path` in the owning run's view. A confined run's access
+    /// uses the path its commands would see and runs with their authority, in the run's trace
+    /// scope so its evidence is still recorded (`docs/threat-model.md` §8.2).
+    fn io<T: Send>(
         &self,
         path: &Path,
-        operation: impl FnOnce(&Path) -> std::io::Result<T>,
+        operation: impl FnOnce(&Path) -> std::io::Result<T> + Send,
     ) -> std::io::Result<T> {
         let logical = if path.is_absolute() {
             path.to_path_buf()
         } else {
             self.cwd.join(path)
         };
+        let scope = self.scope().map_err(std::io::Error::other)?;
         self.step("command context has ended", |view| {
-            operation(&physical(view, &logical))
+            let physical = physical(view, &logical);
+            match &self.run.backend {
+                Backend::Managed { tracing, trace, .. } => {
+                    let used = tracing.host_path(*trace, &physical);
+                    tracing
+                        .host_fs(*trace, || {
+                            let _scope = scope.as_ref().map(TraceScope::enter);
+                            operation(&used)
+                        })
+                        .and_then(|result| result)
+                }
+                Backend::Direct { .. } => operation(&physical),
+            }
         })?
     }
     /// Restates one access made through this context as the run's evidence. A process cannot

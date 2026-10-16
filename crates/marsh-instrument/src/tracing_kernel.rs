@@ -1,14 +1,18 @@
-//! Privileged enforcement inside the tracing service: the kernel program's maps, kept in step with
-//! ptrace stops, and its event stream delivered to each root's policy engine.
+//! Privileged enforcement inside the tracing service: each confined root's cgroup, which the
+//! kernel programs use as its domain, the programs' maps kept in step with ptrace stops, and their
+//! event stream delivered to each root's policy engine.
 //!
 //! Without the `privileged` feature [`Kernel`] is uninhabited, so every privileged path below is
 //! statically dead and the ptrace gate is the only enforcement.
 
-use super::{RootId, State, Target, Tracing, lock};
+use super::{RootId, State, Target, TraceRun, Tracing, lock};
+use crate::confine::{Confinement, Prepared};
 use crate::enforcement::{Enforcement, Enforcer, KernelPolicy};
 use crate::{FileTarget, local};
 use marsh_peer_class::{AF_INET, AF_INET6, Endpoint, Event};
 use nix::unistd::Pid;
+use std::borrow::Cow;
+use std::path::Path;
 use std::{io, sync::Arc, sync::Mutex};
 use syscalls::Sysno;
 
@@ -141,29 +145,75 @@ impl Tracing {
         Ok(copies)
     }
 
-    pub(super) fn map_task(&self, tid: Pid) -> io::Result<()> {
+    /// Confines a privileged root's commands (`docs/threat-model.md` §8.1, §8.2): its own cgroup,
+    /// which the kernel programs use as its domain, private namespaces, a non-root identity and a
+    /// Landlock domain. Required before a root with a socket enforcer begins running.
+    ///
+    /// # Errors
+    /// Refuses without privileged enforcement, for a missing or running root, and when the host
+    /// lacks cgroup v2 or Landlock ABI 6.
+    pub fn confine(&self, root: RootId, confinement: &Confinement) -> io::Result<()> {
         let Some(kernel) = &self.kernel else {
-            return Ok(());
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "launch confinement needs privileged enforcement",
+            ));
         };
-        let state = lock(&self.state);
-        let Some(target) = state.threads.get(&tid).and_then(|thread| thread.inherited) else {
-            return Ok(());
-        };
-        if state
-            .roots
-            .get(&target.run.root)
-            .is_none_or(|root| root.enforcer.is_none())
         {
-            return Ok(());
+            let state = lock(&self.state);
+            state.check()?;
+            if !state.roots.contains_key(&root) || state.runs.keys().any(|run| run.root == root) {
+                return Err(io::Error::other(
+                    "confinement must precede a registered root's first run",
+                ));
+            }
         }
-        drop(state);
-        kernel.map_task(tid, target.run.root.0)
+        let cgroup = kernel.confine(root.0)?;
+        let prepared = match Prepared::new(confinement, cgroup) {
+            Ok(prepared) => Arc::new(prepared),
+            Err(error) => {
+                kernel.remove_root(root.0)?;
+                return Err(error);
+            }
+        };
+        lock(&self.state)
+            .roots
+            .get_mut(&root)
+            .ok_or_else(|| io::Error::other("unknown root"))?
+            .confined = Some(prepared);
+        Ok(())
     }
 
-    pub(super) fn unmap_task(&self, tid: Pid) -> io::Result<()> {
-        match &self.kernel {
-            Some(kernel) => kernel.unmap_task(tid),
-            None => Ok(()),
+    fn confinement(&self, root: RootId) -> Option<Arc<Prepared>> {
+        lock(&self.state)
+            .roots
+            .get(&root)
+            .and_then(|root| root.confined.clone())
+    }
+
+    /// The path `run`'s confined commands see `path` as: their private `/tmp`, `/tmp/shared`
+    /// and `/dev/shm` are their root's own directories. Any other run's path is unchanged.
+    pub fn host_path<'a>(&self, run: TraceRun, path: &'a Path) -> Cow<'a, Path> {
+        match self.confinement(run.root) {
+            Some(confined) => match confined.host_path(path) {
+                Cow::Borrowed(_) => Cow::Borrowed(path),
+                Cow::Owned(mapped) => Cow::Owned(mapped),
+            },
+            None => Cow::Borrowed(path),
+        }
+    }
+
+    /// Performs a filesystem access the interpreter makes for `run`. A confined root's runs on a
+    /// thread of its own with its commands' identity and Landlock domain, so the interpreter
+    /// never lends them the daemon's authority (`docs/threat-model.md` §8.2); any other run's
+    /// runs here.
+    ///
+    /// # Errors
+    /// When the confined thread cannot take on the commands' identity or Landlock domain.
+    pub fn host_fs<T: Send>(&self, run: TraceRun, access: impl FnOnce() -> T + Send) -> io::Result<T> {
+        match self.confinement(run.root) {
+            Some(confined) => confined.run(access),
+            None => Ok(access()),
         }
     }
 
@@ -174,7 +224,8 @@ impl Tracing {
         }
     }
 
-    /// Kills every governed task and detaches the programs after a shared failure.
+    /// Kills every governed task through its root's cgroup and detaches the programs after a
+    /// shared failure.
     pub(super) fn terminate_kernel(&self) -> io::Result<()> {
         match &self.kernel {
             Some(kernel) => kernel.terminate(),
@@ -374,12 +425,14 @@ pub(crate) use unavailable::Kernel;
 
 #[cfg(feature = "privileged")]
 mod privileged {
-    use super::{Endpoint, Event, KernelPolicy, Mutex, Pid, io};
+    use super::{Endpoint, Event, KernelPolicy, Mutex, io};
+    use crate::confine::Cgroup;
     use marsh_lib::RecoverPoison as _;
-    use marsh_bpf::{Admission, Controller};
+    use marsh_bpf::Controller;
     use marsh_peer_class::Network;
     use std::collections::HashMap;
     use std::os::fd::{BorrowedFd, OwnedFd};
+    use std::sync::Arc;
 
     /// The loaded programs, and what was last published to them for each root.
     pub(crate) struct Kernel(Mutex<Inner>);
@@ -387,8 +440,8 @@ mod privileged {
     struct Inner {
         controller: Controller,
         roots: HashMap<u64, Published>,
-        /// Governed threads and the process each belongs to.
-        tasks: HashMap<Pid, u32>,
+        /// Each confined root's cgroup: its domain in the programs.
+        cgroups: HashMap<u64, Arc<Cgroup>>,
     }
 
     #[derive(Default)]
@@ -402,7 +455,7 @@ mod privileged {
             Ok(Self(Mutex::new(Inner {
                 controller: Controller::load()?,
                 roots: HashMap::new(),
-                tasks: HashMap::new(),
+                cgroups: HashMap::new(),
             })))
         }
 
@@ -466,41 +519,46 @@ mod privileged {
             self.inner().controller.local(endpoints)
         }
 
-        /// Maps a stopped task's process to `root`. A process that cannot be attributed is killed
-        /// by the controller and left unmapped; one already gone has nothing left to map.
-        pub(super) fn map_task(&self, tid: Pid, root: u64) -> io::Result<()> {
-            let Some(group) = process_of(tid)? else {
-                return Ok(());
-            };
+        /// Creates `root`'s cgroup and makes it the root's domain in the programs.
+        pub(super) fn confine(&self, root: u64) -> io::Result<Arc<Cgroup>> {
+            let cgroup = Arc::new(Cgroup::create(&format!("root-{root}"))?);
             let mut inner = self.inner();
-            if inner.controller.task(group, root)? == Admission::Attributed {
-                inner.tasks.insert(tid, group);
+            if let Err(error) = inner.controller.domain(cgroup.id, root) {
+                drop(inner);
+                let _ = cgroup.remove();
+                return Err(error);
             }
+            inner.cgroups.insert(root, Arc::clone(&cgroup));
             drop(inner);
-            Ok(())
-        }
-
-        pub(super) fn unmap_task(&self, tid: Pid) -> io::Result<()> {
-            let mut inner = self.inner();
-            if let Some(group) = inner.tasks.remove(&tid)
-                && !inner.tasks.values().any(|other| *other == group)
-            {
-                inner.controller.remove_task(group)?;
-            }
-            drop(inner);
-            Ok(())
+            Ok(cgroup)
         }
 
         pub(super) fn remove_root(&self, root: u64) -> io::Result<()> {
             let mut inner = self.inner();
             inner.controller.remove_root(root)?;
             inner.roots.remove(&root);
+            let cgroup = inner.cgroups.remove(&root);
+            if let Some(cgroup) = &cgroup {
+                inner.controller.remove_domain(cgroup.id)?;
+            }
             drop(inner);
-            Ok(())
+            cgroup.map_or(Ok(()), |cgroup| cgroup.remove())
         }
 
+        /// Poisons the programs, kills every confined root's processes, then detaches.
         pub(super) fn terminate(&self) -> io::Result<()> {
-            self.inner().controller.terminate()
+            let mut inner = self.inner();
+            let mut failure = None;
+            for cgroup in inner.cgroups.values() {
+                if let Err(error) = cgroup.kill() {
+                    failure = Some(error);
+                }
+            }
+            if let Err(error) = inner.controller.terminate() {
+                failure = Some(error);
+            }
+            drop(inner);
+            failure.map_or(Ok(()), Err)
         }
 
         pub(super) fn drain(&self) -> io::Result<Vec<Event>> {
@@ -514,21 +572,6 @@ mod privileged {
             let owned = ring.try_clone_to_owned();
             drop(inner);
             owned
-        }
-    }
-
-    /// The process of a stopped task, or `None` once a SIGKILL has removed it.
-    fn process_of(tid: Pid) -> io::Result<Option<u32>> {
-        match crate::capture::proc_field::<u32>(format!("/proc/{tid}/status"), "Tgid:") {
-            Ok(Some(group)) => Ok(Some(group)),
-            Ok(None) => Err(io::Error::other("missing tracee tgid")),
-            Err(error)
-                if error.kind() == io::ErrorKind::NotFound
-                    || error.raw_os_error() == Some(libc::ESRCH) =>
-            {
-                Ok(None)
-            }
-            Err(error) => Err(error),
         }
     }
 }
@@ -563,10 +606,7 @@ mod unavailable {
         pub(super) fn allow_local(&self, _: &[Endpoint]) -> io::Result<()> {
             match *self {}
         }
-        pub(super) fn map_task(&self, _: Pid, _: u64) -> io::Result<()> {
-            match *self {}
-        }
-        pub(super) fn unmap_task(&self, _: Pid) -> io::Result<()> {
+        pub(super) fn confine(&self, _: u64) -> io::Result<std::sync::Arc<crate::confine::Cgroup>> {
             match *self {}
         }
         pub(super) fn remove_root(&self, _: u64) -> io::Result<()> {

@@ -106,8 +106,8 @@ impl Subvolumes for CopyTree {
 }
 
 /// Copies `src` onto `dest` recursively, as a btrfs snapshot would present it: contents,
-/// permission bits of files and directories alike, symlinks as symlinks, and hard links as links
-/// among the copies.
+/// permission bits of files and directories alike, symlinks as symlinks, hard links as links
+/// among the copies, and, when the copier is root, every entry's owner, as a btrfs snapshot does.
 ///
 /// The walk state carried by [`marsh_lib::walk_directory`] is the destination directory the
 /// current source directory copies into, so each entry only has to join its own file name. Every
@@ -119,8 +119,10 @@ impl Subvolumes for CopyTree {
 /// A fifo, socket or device node is refused rather than copied: `std::fs::copy` would open a
 /// fifo and block until a writer came, and no copy of such an entry is the entry anyway.
 fn copy_tree(src: &Path, dest: &Path) -> Result<(), Error> {
-    let root_mode = std::fs::metadata(src)?.mode();
+    let root = std::fs::metadata(src)?;
+    let root_mode = root.mode();
     std::fs::create_dir_all(dest)?;
+    own(dest, &root)?;
     let mut directories: Vec<(PathBuf, u32)> = vec![(dest.to_path_buf(), root_mode)];
     let mut linked: BTreeMap<(u64, u64), PathBuf> = BTreeMap::new();
     marsh_lib::walk_directory::<_, Error>(src, dest.to_path_buf(), |entry, to| {
@@ -129,12 +131,14 @@ fn copy_tree(src: &Path, dest: &Path) -> Result<(), Error> {
         let file_type = metadata.file_type();
         if file_type.is_dir() {
             std::fs::create_dir(&target)?;
+            own(&target, &metadata)?;
             chmod(&target, 0o700)?;
             directories.push((target.clone(), metadata.mode()));
             return Ok(Some(target));
         }
         if file_type.is_symlink() {
             std::os::unix::fs::symlink(std::fs::read_link(entry.path())?, &target)?;
+            own(&target, &metadata)?;
         } else if file_type.is_file() {
             if metadata.nlink() > 1 {
                 match linked.entry((metadata.dev(), metadata.ino())) {
@@ -150,6 +154,8 @@ fn copy_tree(src: &Path, dest: &Path) -> Result<(), Error> {
             // After the bytes: a write by an unprivileged process clears setuid and setgid, so
             // the mode `std::fs::copy` set up front does not survive its own copy.
             std::fs::copy(entry.path(), &target)?;
+            // Before the mode: a change of owner clears setuid and setgid.
+            own(&target, &metadata)?;
             chmod(&target, metadata.mode())?;
         } else {
             return Err(Error::Snapshot(format!(
@@ -161,6 +167,15 @@ fn copy_tree(src: &Path, dest: &Path) -> Result<(), Error> {
     })?;
     for (directory, mode) in directories.into_iter().rev() {
         chmod(&directory, mode)?;
+    }
+    Ok(())
+}
+
+/// Gives `target` the owner of the entry it copies, when the copier is root and can.
+fn own(target: &Path, source: &std::fs::Metadata) -> Result<(), Error> {
+    // SAFETY: geteuid takes no arguments and has no memory effects.
+    if unsafe { libc::geteuid() } == 0 {
+        std::os::unix::fs::lchown(target, Some(source.uid()), Some(source.gid()))?;
     }
     Ok(())
 }

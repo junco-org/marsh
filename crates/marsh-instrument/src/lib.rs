@@ -6,6 +6,7 @@
 //! attribution.
 
 mod capture;
+mod confine;
 mod enforcement;
 mod host;
 mod local;
@@ -16,6 +17,7 @@ mod syscall;
 mod tracing;
 mod wire;
 
+pub use confine::{Confinement, Identity};
 pub use enforcement::{Enforcement, Enforcer, KernelPolicy};
 pub use host::HostCall;
 pub use marsh_peer_class::{Answers, Endpoint, Event as KernelEvent, Network};

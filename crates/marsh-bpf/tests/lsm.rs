@@ -1,21 +1,238 @@
-//! Run explicitly as root in a BPF-LSM-enabled VM, never against arbitrary host tasks.
+//! Run explicitly as root in a BPF-LSM-enabled VM, never against arbitrary host tasks, one test at
+//! a time: each test moves its whole process between cgroups to govern itself.
 #![cfg(feature = "privileged")]
 
 use std::{
+    ffi::CStr,
     io::{self, Read, Write},
     net::{TcpListener, TcpStream, UdpSocket},
     os::{
         fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
         linux::net::SocketAddrExt,
-        unix::net::{SocketAddr, UnixDatagram, UnixStream},
+        unix::{
+            fs::{MetadataExt, OpenOptionsExt},
+            net::{SocketAddr, UnixDatagram, UnixStream},
+        },
     },
+    path::{Path, PathBuf},
+    process::Command,
 };
 
-use marsh_bpf::{Admission, Controller};
+use marsh_bpf::Controller;
 use marsh_peer_class::{
     AF_INET, ALLOW, AUDIT, Answers, CONTACT, CONTINGENT, DENY, Endpoint, Event, LOOPBACK,
     NETLINK, Network, RECEIPT, RULE, STALE, UNANSWERED, UNIX, UNKNOWN, UNTRACED,
 };
+
+const CGROUPS: &str = "/sys/fs/cgroup";
+
+/// The cgroup v2 directory a process is in.
+fn cgroup_of(pid: u32) -> io::Result<PathBuf> {
+    let membership = std::fs::read_to_string(format!("/proc/{pid}/cgroup"))?;
+    let path = membership
+        .lines()
+        .find_map(|line| line.strip_prefix("0::"))
+        .ok_or_else(|| io::Error::other("no cgroup v2 membership"))?;
+    Ok(Path::new(CGROUPS).join(path.trim_start_matches('/')))
+}
+
+/// Moves every thread of a process into a cgroup.
+fn move_to(cgroup: &Path, pid: u32) -> io::Result<()> {
+    std::fs::write(cgroup.join("cgroup.procs"), pid.to_string())
+}
+
+/// This test's cgroups, `/sys/fs/cgroup/marsh-lsm-test-<pid>/<name>`. The test process starts in
+/// the parent, which is no domain, and returns to its own cgroup on drop.
+struct Cgroups {
+    parent: PathBuf,
+    home: PathBuf,
+}
+
+impl Cgroups {
+    fn new() -> io::Result<Self> {
+        let pid = std::process::id();
+        let home = cgroup_of(pid)?;
+        let parent = Path::new(CGROUPS).join(format!("marsh-lsm-test-{pid}"));
+        std::fs::create_dir(&parent)?;
+        let cgroups = Self { parent, home };
+        cgroups.leave(pid)?;
+        Ok(cgroups)
+    }
+
+    /// A new child cgroup, governed as `root`.
+    fn domain(&self, controller: &mut Kernel<'_>, name: &str, root: u64) -> io::Result<Cgroup> {
+        let path = self.parent.join(name);
+        std::fs::create_dir(&path)?;
+        // On 64-bit kernels a cgroup's id is its directory's inode number.
+        let cgroup = Cgroup {
+            id: std::fs::metadata(&path)?.ino(),
+            path,
+            parent: self.parent.clone(),
+        };
+        controller.domain(cgroup.id, root)?;
+        Ok(cgroup)
+    }
+
+    /// Moves a process to the parent cgroup, where it is ungoverned.
+    fn leave(&self, pid: u32) -> io::Result<()> {
+        move_to(&self.parent, pid)
+    }
+}
+
+impl Drop for Cgroups {
+    fn drop(&mut self) {
+        let _ = move_to(&self.home, std::process::id());
+        let _ = std::fs::remove_dir(&self.parent);
+    }
+}
+
+/// A domain cgroup, removed on drop.
+struct Cgroup {
+    path: PathBuf,
+    parent: PathBuf,
+    id: u64,
+}
+
+impl Cgroup {
+    /// Moves a process here: it is governed as this domain's root.
+    fn enter(&self, pid: u32) -> io::Result<()> {
+        move_to(&self.path, pid)
+    }
+}
+
+impl Drop for Cgroup {
+    fn drop(&mut self) {
+        let pid = std::process::id();
+        if cgroup_of(pid).is_ok_and(|current| current == self.path) {
+            let _ = move_to(&self.parent, pid);
+        }
+        let _ = std::fs::remove_dir(&self.path);
+    }
+}
+
+/// The controller, called from the parent cgroup only: governed tasks may not use bpf(2), and
+/// this test process governs itself by entering domains.
+struct Kernel<'a> {
+    controller: Controller,
+    cgroups: &'a Cgroups,
+}
+
+impl<'a> Kernel<'a> {
+    fn load(cgroups: &'a Cgroups) -> io::Result<Self> {
+        Ok(Self {
+            controller: Controller::load()?,
+            cgroups,
+        })
+    }
+
+    fn call<T>(&mut self, action: impl FnOnce(&mut Controller) -> io::Result<T>) -> io::Result<T> {
+        let pid = std::process::id();
+        let here = cgroup_of(pid)?;
+        self.cgroups.leave(pid)?;
+        let result = action(&mut self.controller);
+        move_to(&here, pid)?;
+        result
+    }
+
+    fn configure(&mut self, root: u64, networks: &[Network]) -> io::Result<()> {
+        self.call(|controller| controller.configure(root, networks))
+    }
+
+    fn publish(&mut self, root: u64, answers: Answers) -> io::Result<()> {
+        self.call(|controller| controller.publish(root, answers))
+    }
+
+    fn stale(&mut self, root: u64) -> io::Result<()> {
+        self.call(|controller| controller.stale(root))
+    }
+
+    fn domain(&mut self, cgroup: u64, root: u64) -> io::Result<()> {
+        self.call(|controller| controller.domain(cgroup, root))
+    }
+
+    fn remove_domain(&mut self, cgroup: u64) -> io::Result<()> {
+        self.call(|controller| controller.remove_domain(cgroup))
+    }
+
+    fn remove_root(&mut self, root: u64) -> io::Result<()> {
+        self.call(|controller| controller.remove_root(root))
+    }
+
+    fn local(&mut self, endpoints: &[Endpoint]) -> io::Result<()> {
+        self.call(|controller| controller.local(endpoints))
+    }
+
+    fn drain(&mut self) -> io::Result<Vec<Event>> {
+        self.call(Controller::drain)
+    }
+}
+
+/// Runs `action` in a forked child and returns its exit status, -1 when it did not exit. The
+/// action must be async-signal-safe: the test process has other threads.
+fn in_child(action: impl FnOnce() -> i32) -> io::Result<i32> {
+    // SAFETY: the child runs only the async-signal-safe action, then _exit.
+    let child = unsafe { libc::fork() };
+    if child == 0 {
+        let status = action();
+        // SAFETY: _exit ends the forked child without running the parent's destructors.
+        unsafe { libc::_exit(status) };
+    }
+    if child < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut status = 0;
+    // SAFETY: waits for the child forked above; status is a live out-parameter.
+    if unsafe { libc::waitpid(child, &raw mut status, 0) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(if libc::WIFEXITED(status) {
+        libc::WEXITSTATUS(status)
+    } else {
+        -1
+    })
+}
+
+/// A system call's errno, 0 when it succeeded.
+fn errno(result: impl Into<i64>) -> i32 {
+    if result.into() >= 0 {
+        0
+    } else {
+        io::Error::last_os_error().raw_os_error().unwrap_or(-1)
+    }
+}
+
+/// A new pty's master and its terminal end, which is not this process's controlling terminal.
+fn pty() -> io::Result<(OwnedFd, std::fs::File)> {
+    // SAFETY: posix_openpt takes flags only and returns a fresh descriptor.
+    let master = unsafe { libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC) };
+    if master < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: posix_openpt returned this fresh descriptor, owned nowhere else.
+    let master = unsafe { OwnedFd::from_raw_fd(master) };
+    // SAFETY: grantpt takes the live master only.
+    if unsafe { libc::grantpt(master.as_raw_fd()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: unlockpt takes the live master only.
+    if unsafe { libc::unlockpt(master.as_raw_fd()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut name = [0; 64];
+    // SAFETY: ptsname_r writes at most name.len() bytes, NUL-terminated on success.
+    let error = unsafe { libc::ptsname_r(master.as_raw_fd(), name.as_mut_ptr(), name.len()) };
+    if error != 0 {
+        return Err(io::Error::from_raw_os_error(error));
+    }
+    // SAFETY: ptsname_r succeeded, so name holds a NUL-terminated path.
+    let path = unsafe { CStr::from_ptr(name.as_ptr()) };
+    let terminal = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOCTTY)
+        .open(path.to_str().map_err(io::Error::other)?)?;
+    Ok((master, terminal))
+}
 
 fn refused(result: io::Result<impl Sized>) -> bool {
     result
@@ -62,7 +279,8 @@ fn ipv4(address: [u8; 4], port: u16) -> io::Result<libc::sockaddr_in> {
 #[test]
 #[ignore = "requires root, active BPF LSM, BTF, and loopback IPv4 in a disposable VM"]
 fn connected_sends_are_judged_by_their_peer() -> io::Result<()> {
-    let mut controller = Controller::load()?;
+    let cgroups = Cgroups::new()?;
+    let mut controller = Kernel::load(&cgroups)?;
     let tgid = std::process::id();
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let stream = TcpStream::connect(listener.local_addr()?)?;
@@ -92,7 +310,8 @@ fn connected_sends_are_judged_by_their_peer() -> io::Result<()> {
             ..Answers::default()
         },
     )?;
-    controller.task(tgid, 1)?;
+    let one = cgroups.domain(&mut controller, "one", 1)?;
+    one.enter(tgid)?;
     // SAFETY: the zeroed sockaddr_nl is an integer-only C struct.
     let mut netlink: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
     netlink.nl_family = u16::try_from(libc::AF_NETLINK).map_err(io::Error::other)?;
@@ -111,14 +330,16 @@ fn connected_sends_are_judged_by_their_peer() -> io::Result<()> {
         events[0].endpoint,
         Endpoint::from(listener.local_addr()?).normalized()
     );
-    controller.remove_task(tgid)?;
+    cgroups.leave(tgid)?;
+    controller.remove_domain(one.id)?;
     Ok(())
 }
 
 #[test]
 #[ignore = "requires root, active BPF LSM, BTF, and loopback IPv4/IPv6 in a disposable VM"]
 fn contacts_are_judged_against_the_kernels_address() -> io::Result<()> {
-    let mut controller = Controller::load()?;
+    let cgroups = Cgroups::new()?;
+    let mut controller = Kernel::load(&cgroups)?;
     let sender = UdpSocket::bind("127.0.0.1:0")?;
     let receiver = UdpSocket::bind("127.0.0.1:0")?;
     let destination = receiver.local_addr()?;
@@ -137,7 +358,8 @@ fn contacts_are_judged_against_the_kernels_address() -> io::Result<()> {
     // A populated denial table must not affect an ungoverned task.
     sender.send_to(b"unmapped", destination)?;
     assert!(controller.drain()?.is_empty());
-    controller.task(tgid, 1)?;
+    let one = cgroups.domain(&mut controller, "one", 1)?;
+    one.enter(tgid)?;
     assert!(refused(sender.send_to(b"denied", destination)));
     assert!(refused(TcpStream::connect(listener.local_addr()?)));
     let events = controller.drain()?;
@@ -386,18 +608,20 @@ fn contacts_are_judged_against_the_kernels_address() -> io::Result<()> {
             ..Answers::default()
         },
     )?;
-    controller.task(tgid, 2)?;
+    let two = cgroups.domain(&mut controller, "two", 2)?;
+    two.enter(tgid)?;
     assert!(refused(sender.send_to(b"root two", "198.51.100.1:9")));
     assert_eq!(controller.drain()?[0].class, 6);
     controller.remove_root(2)?;
     assert!(refused(sender.send_to(b"missing answers", destination)));
     assert_eq!(decisions(&controller.drain()?), [(DENY, UNANSWERED)]);
-    controller.remove_task(tgid)?;
-    controller.remove_task(tgid)?;
+    // Its cgroup no longer a domain, the process is ungoverned where it stands.
+    controller.remove_domain(two.id)?;
+    controller.remove_domain(two.id)?;
     sender.send_to(b"unmapped again", destination)?;
 
     // Overflow must poison enforcement and reporting, even for an auditing root.
-    controller.task(tgid, 1)?;
+    one.enter(tgid)?;
     controller.publish(
         1,
         Answers {
@@ -409,7 +633,7 @@ fn contacts_are_judged_against_the_kernels_address() -> io::Result<()> {
     assert!(overflowed);
     assert!(controller.drain().is_err());
     assert!(refused(sender.send_to(b"sticky poison", destination)));
-    controller.remove_task(tgid)?;
+    controller.remove_domain(one.id)?;
     controller.remove_root(1)?;
     sender.send_to(b"unmapped despite poison", destination)?;
     drop(controller);
@@ -422,13 +646,16 @@ fn contacts_are_judged_against_the_kernels_address() -> io::Result<()> {
 #[test]
 #[ignore = "requires root, active BPF LSM, BTF, and loopback IPv4 in a disposable VM"]
 fn local_receipts_taint_the_reader_in_the_kernel() -> io::Result<()> {
-    let mut controller = Controller::load()?;
+    let cgroups = Cgroups::new()?;
+    let mut controller = Kernel::load(&cgroups)?;
+    let one = cgroups.domain(&mut controller, "one", 1)?;
+    let two = cgroups.domain(&mut controller, "two", 2)?;
     let tgid = std::process::id();
     let outside = UdpSocket::bind("127.0.0.1:0")?;
     let mut buffer = [0; 64];
     let mut acknowledged = [0; 16];
     // Root 1 carries `carried`; root 2 refuses loopback once it receives any class it lacks.
-    let stage = |controller: &mut Controller, carried: u64, acknowledged: [u32; 16]| {
+    let stage = |controller: &mut Kernel<'_>, carried: u64, acknowledged: [u32; 16]| {
         controller.publish(
             1,
             Answers {
@@ -459,10 +686,10 @@ fn local_receipts_taint_the_reader_in_the_kernel() -> io::Result<()> {
     stage(&mut controller, 1 << 3, acknowledged)?;
     let receiver = UdpSocket::bind("127.0.0.1:0")?;
     let udp_sender = UdpSocket::bind("127.0.0.1:0")?;
-    controller.task(tgid, 1)?;
+    one.enter(tgid)?;
     udp_sender.send_to(b"secret", receiver.local_addr()?)?;
     udp_sender.send_to(b"again", receiver.local_addr()?)?;
-    controller.task(tgid, 2)?;
+    two.enter(tgid)?;
     controller.drain()?;
     receiver.recv(&mut buffer)?;
     receiver.recv(&mut buffer)?;
@@ -487,14 +714,14 @@ fn local_receipts_taint_the_reader_in_the_kernel() -> io::Result<()> {
     // A TCP connection is tagged by its peer: another connection to the same port is not.
     stage(&mut controller, 1 << 4, acknowledged)?;
     let listener = TcpListener::bind("127.0.0.1:0")?;
-    controller.task(tgid, 2)?;
+    two.enter(tgid)?;
     let mut quiet = TcpStream::connect(listener.local_addr()?)?;
     let (mut quiet_server, _) = listener.accept()?;
-    controller.task(tgid, 1)?;
+    one.enter(tgid)?;
     let mut loud = TcpStream::connect(listener.local_addr()?)?;
     let (mut loud_server, _) = listener.accept()?;
     loud.write_all(b"secret")?;
-    controller.task(tgid, 2)?;
+    two.enter(tgid)?;
     quiet.write_all(b"plain")?;
     controller.drain()?;
     quiet_server.read_exact(&mut buffer[..5])?;
@@ -505,10 +732,10 @@ fn local_receipts_taint_the_reader_in_the_kernel() -> io::Result<()> {
 
     // A UNIX stream tags its connected peer; read() is a socket read too.
     stage(&mut controller, 1 << 5, acknowledged)?;
-    controller.task(tgid, 1)?;
+    one.enter(tgid)?;
     let (mut unix_sender, mut unix_receiver) = UnixStream::pair()?;
     unix_sender.write_all(b"secret")?;
-    controller.task(tgid, 2)?;
+    two.enter(tgid)?;
     controller.drain()?;
     unix_receiver.read_exact(&mut buffer[..6])?;
     assert_eq!(receipts(&controller.drain()?), [(2, 1 << 5, 1)]);
@@ -516,26 +743,26 @@ fn local_receipts_taint_the_reader_in_the_kernel() -> io::Result<()> {
 
     // A reader already blocked when the tainted bytes arrive is tainted as its read returns.
     stage(&mut controller, 1 << 8, acknowledged)?;
-    controller.task(tgid, 1)?;
+    one.enter(tgid)?;
     let (mut writer, reader) = UnixStream::pair()?;
     let mut child = std::process::Command::new("head")
         .args(["-c", "6"])
         .stdin(std::process::Stdio::from(OwnedFd::from(reader)))
         .stdout(std::process::Stdio::null())
         .spawn()?;
-    controller.task(child.id(), 2)?;
+    // Spawned into this process's domain; the reader belongs to another.
+    two.enter(child.id())?;
     std::thread::sleep(std::time::Duration::from_millis(500));
     controller.drain()?;
     writer.write_all(b"secret")?;
     assert!(child.wait()?.success());
     assert_eq!(receipts(&controller.drain()?), [(2, 1 << 8, 1)]);
-    controller.remove_task(child.id())?;
     acknowledged[8] = 1;
 
     // Every message of one recvmmsg is a read: a tainted datagram arriving after a clean one
     // taints the reader, though recvmmsg reads it without passing sock_recvmsg.
     stage(&mut controller, 1 << 9, acknowledged)?;
-    controller.remove_task(tgid)?;
+    cgroups.leave(tgid)?;
     let batch = UdpSocket::bind("127.0.0.1:0")?;
     // SAFETY: the child runs only the async-signal-safe recvmmsg and _exit on its own stack.
     let reader = unsafe { libc::fork() };
@@ -573,11 +800,11 @@ fn local_receipts_taint_the_reader_in_the_kernel() -> io::Result<()> {
         unsafe { libc::_exit(i32::from(count != 2)) };
     }
     let reader = u32::try_from(reader).map_err(|_| io::Error::last_os_error())?;
-    controller.task(reader, 2)?;
+    two.enter(reader)?;
     // Ungoverned, so untagged; the reader takes it before the tainted one exists.
     udp_sender.send_to(b"clean", batch.local_addr()?)?;
     std::thread::sleep(std::time::Duration::from_secs(1));
-    controller.task(tgid, 1)?;
+    one.enter(tgid)?;
     udp_sender.send_to(b"secret", batch.local_addr()?)?;
     let mut status = 0;
     // SAFETY: waits for the forked child above; status is a live out-parameter.
@@ -585,21 +812,20 @@ fn local_receipts_taint_the_reader_in_the_kernel() -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
     assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0);
-    controller.remove_task(reader)?;
     assert_eq!(receipts(&controller.drain()?), [(2, 1 << 9, 1)]);
     acknowledged[9] = 1;
 
     // A port's datagram tag outlives a socket that shared the port at another address.
     stage(&mut controller, 1 << 10, acknowledged)?;
-    controller.remove_task(tgid)?;
+    cgroups.leave(tgid)?;
     let shared = UdpSocket::bind("127.0.0.2:0")?;
     let neighbour = UdpSocket::bind(("127.0.0.1", shared.local_addr()?.port()))?;
-    controller.task(tgid, 1)?;
+    one.enter(tgid)?;
     udp_sender.send_to(b"secret", shared.local_addr()?)?;
     drop(neighbour);
     // UDP sockets are freed after an RCU grace period.
     std::thread::sleep(std::time::Duration::from_secs(1));
-    controller.task(tgid, 2)?;
+    two.enter(tgid)?;
     controller.drain()?;
     shared.recv(&mut buffer)?;
     assert_eq!(receipts(&controller.drain()?), [(2, 1 << 10, 1)]);
@@ -607,51 +833,140 @@ fn local_receipts_taint_the_reader_in_the_kernel() -> io::Result<()> {
 
     // Two classes at once are undecidable until userspace republishes.
     stage(&mut controller, (1 << 6) | (1 << 7), acknowledged)?;
-    controller.task(tgid, 1)?;
+    one.enter(tgid)?;
     let (datagram_sender, datagram_receiver) = UnixDatagram::pair()?;
     datagram_sender.send(b"secrets")?;
-    controller.task(tgid, 2)?;
+    two.enter(tgid)?;
     controller.drain()?;
     datagram_receiver.recv(&mut buffer)?;
     assert!(refused(outside.send_to(b"undecidable", outside.local_addr()?)));
     let events = controller.drain()?;
     assert_eq!(receipts(&events), [(2, (1 << 6) | (1 << 7), 1)]);
     assert_eq!(decisions(&events[1..]), [(DENY, STALE)]);
-    controller.remove_task(tgid)?;
+    cgroups.leave(tgid)?;
     Ok(())
 }
 
-/// A child in another PID namespace cannot be attributed: it alone is killed, and enforcement
-/// stays healthy for everyone else.
+/// A child in another PID namespace stays in its parent's cgroup, so it stays governed: its contact
+/// is judged, though its ids, invisible in the loader's PID namespace, are reported as zero.
 #[test]
-#[ignore = "requires active BPF LSM, root PID-namespace privileges, and unshare in a disposable VM"]
-fn namespace_changed_child_is_refused_alone() -> io::Result<()> {
-    use std::{
-        io::BufRead,
-        process::{Command, Stdio},
-    };
+#[ignore = "requires root, active BPF LSM, BTF, loopback IPv4 and PID namespaces in a disposable VM"]
+fn pid_namespace_child_stays_governed() -> io::Result<()> {
+    let cgroups = Cgroups::new()?;
+    let mut controller = Kernel::load(&cgroups)?;
+    let tgid = std::process::id();
+    let receiver = UdpSocket::bind("127.0.0.1:0")?;
+    let sender = UdpSocket::bind("127.0.0.1:0")?;
+    let destination = ipv4([127, 0, 0, 1], receiver.local_addr()?.port())?;
+    controller.publish(
+        77,
+        Answers {
+            deny: 1 << LOOPBACK,
+            guarded: 1 << LOOPBACK,
+            ..Answers::default()
+        },
+    )?;
+    let one = cgroups.domain(&mut controller, "one", 77)?;
+    one.enter(tgid)?;
+    let socket = sender.as_raw_fd();
+    let status = in_child(|| {
+        // SAFETY: unshare takes flags only and changes only this single-threaded child.
+        if unsafe { libc::unshare(libc::CLONE_NEWPID) } != 0 {
+            return 100;
+        }
+        // The new namespace's init: PID 1 there, absent from the loader's namespace.
+        in_child(|| i32::from(!refused(send_named(socket, b"namespaced", &destination))))
+            .unwrap_or(101)
+    })?;
+    cgroups.leave(tgid)?;
+    assert_eq!(status, 0);
+    let events = controller.drain()?;
+    assert_eq!(decisions(&events), [(DENY, RULE)]);
+    assert_eq!((events[0].root, events[0].tgid, events[0].tid), (77, 0, 0));
+    controller.remove_domain(one.id)?;
+    Ok(())
+}
 
-    let mut controller = Controller::load()?;
-    // Keep the inherited procfs view: its first NSpid is the tracer-visible PID.
-    // The shell reads its own status with builtins, not a subprocess's PID.
-    let script = "while IFS= read -r line; do case \"$line\" in NSpid:*) set -- $line; printf '%s\\n' \"$2\"; break ;; esac; done </proc/self/status; sleep 30";
-    let mut child = Command::new("unshare")
-        .args(["--pid", "--fork", "/bin/sh", "-c", script])
-        .stdout(Stdio::piped())
-        .spawn()?;
-    let output = child
-        .stdout
-        .take()
-        .ok_or_else(|| io::Error::other("missing namespace child stdout"))?;
-    let mut line = String::new();
-    io::BufReader::new(output).read_line(&mut line)?;
-    let tgid: u32 = line.trim().parse().map_err(io::Error::other)?;
-    let registration = controller.task(tgid, 77)?;
-    // The killed shell is its namespace's init, so the whole namespace and unshare end at once.
-    let ended = child.wait()?;
-    assert_eq!(registration, Admission::Refused);
-    assert!(!ended.success());
-    controller.publish(77, Answers::default())?;
-    assert!(controller.drain()?.is_empty());
+const KEY_SPEC_SESSION_KEYRING: libc::c_long = -3;
+const KEY_SPEC_USER_KEYRING: libc::c_long = -4;
+const KEYCTL_JOIN_SESSION_KEYRING: libc::c_long = 1;
+const KEYCTL_UNLINK: libc::c_long = 9;
+
+/// Links a new user key into `keyring`, then unlinks it so that no run leaves one behind.
+fn add_key(keyring: libc::c_long) -> i32 {
+    // SAFETY: the pointers are NUL-terminated literals; the payload is their first byte.
+    let serial = unsafe {
+        libc::syscall(
+            libc::SYS_add_key,
+            c"user".as_ptr(),
+            c"marsh-lsm-test".as_ptr(),
+            c"x".as_ptr(),
+            1_usize,
+            keyring,
+        )
+    };
+    if serial >= 0 {
+        // SAFETY: KEYCTL_UNLINK takes integers only.
+        unsafe { libc::syscall(libc::SYS_keyctl, KEYCTL_UNLINK, serial, keyring) };
+    }
+    errno(serial)
+}
+
+/// Each escape's errno, 0 when it succeeded: a user namespace, terminal injection, a ptrace
+/// exception, `other`'s priority, bpf(2), and a key linked into the user keyring.
+fn escape_attempts(terminal: RawFd, other: u32) -> io::Result<[i32; 6]> {
+    let none: libc::c_ulong = 0;
+    let attr = [0_u64; 9];
+    Ok([
+        // SAFETY: unshare takes flags only and changes only the forked child.
+        in_child(|| errno(unsafe { libc::unshare(libc::CLONE_NEWUSER) }))?,
+        // SAFETY: TIOCSTI reads one byte of the NUL-terminated literal.
+        errno(unsafe { libc::ioctl(terminal, libc::TIOCSTI, c"x".as_ptr()) }),
+        // SAFETY: PR_SET_PTRACER 0 clears this process's exception; it takes no pointers.
+        errno(unsafe { libc::prctl(libc::PR_SET_PTRACER, none, none, none, none) }),
+        // SAFETY: setpriority takes integers only.
+        errno(unsafe { libc::setpriority(libc::PRIO_PROCESS, other, 5) }),
+        // SAFETY: BPF_MAP_CREATE (0) only reads the zeroed attr, which outlives the call.
+        errno(unsafe { libc::syscall(libc::SYS_bpf, 0, attr.as_ptr(), size_of_val(&attr)) }),
+        add_key(KEY_SPEC_USER_KEYRING),
+    ])
+}
+
+/// A governed task cannot leave governance or act on another domain's processes, while outside
+/// every domain the same operations are not refused: a user namespace, terminal injection, a
+/// ptrace exception, another cgroup's process priority, bpf(2), and a write to the user keyring.
+#[test]
+#[ignore = "requires root, active BPF LSM, BTF, keyrings, ptys and user namespaces in a disposable VM"]
+fn escapes_are_refused_in_a_domain() -> io::Result<()> {
+    let cgroups = Cgroups::new()?;
+    let mut controller = Kernel::load(&cgroups)?;
+    let tgid = std::process::id();
+    let one = cgroups.domain(&mut controller, "one", 1)?;
+    let (_master, terminal) = pty()?;
+    // In the parent cgroup with this process, which is no domain.
+    let mut other = Command::new("sleep").arg("60").spawn()?;
+    let outside = escape_attempts(terminal.as_raw_fd(), other.id())?;
+    one.enter(tgid)?;
+    let inside = escape_attempts(terminal.as_raw_fd(), other.id())?;
+    // What is the domain's own stays usable: its processes' attributes and the keys it allocated.
+    one.enter(other.id())?;
+    // SAFETY: setpriority takes integers only.
+    let own_process = errno(unsafe { libc::setpriority(libc::PRIO_PROCESS, other.id(), 6) });
+    // SAFETY: a null name asks for a new anonymous session keyring; no other argument is read.
+    let joined = errno(unsafe {
+        libc::syscall(
+            libc::SYS_keyctl,
+            KEYCTL_JOIN_SESSION_KEYRING,
+            std::ptr::null::<libc::c_char>(),
+        )
+    });
+    let own_key = add_key(KEY_SPEC_SESSION_KEYRING);
+    cgroups.leave(tgid)?;
+    other.kill()?;
+    other.wait()?;
+    assert!(outside.iter().all(|&error| error != libc::EPERM), "{outside:?}");
+    assert_eq!(inside, [libc::EPERM; 6]);
+    assert_eq!((own_process, joined, own_key), (0, 0, 0));
+    controller.remove_domain(one.id)?;
     Ok(())
 }

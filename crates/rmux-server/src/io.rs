@@ -664,6 +664,8 @@ impl ShellIo {
             policy_observer: agent.policy_observer,
             agent_policy: agent.agent_policy,
             enforcement: agent.enforcement,
+            governed_user: agent.governed_user,
+            writable: agent.writable,
         };
 
         let mux = create_mux(profile, Arc::new(std::sync::Mutex::new(frontend)))?;

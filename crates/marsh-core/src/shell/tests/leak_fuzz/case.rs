@@ -172,7 +172,7 @@ impl Case {
             return Err(format!("variant slot {slot} has no values"));
         }
         let choice = self.first_variants();
-        let values = self.values("CANARY", "SINK_HOST", (0, 0), &choice);
+        let values = self.values("CANARY", "SINK_HOST", (0, 0), "SHARED_TMP", &choice);
         for text in self
             .files
             .iter()
@@ -209,12 +209,14 @@ impl Case {
             .map_or("", |file| file.path.as_str())
     }
 
-    /// The value of every placeholder for one run.
+    /// The value of every placeholder for one run. `{SHARED_TMP}` is a directory every shell of
+    /// the source can write: `/tmp/shared` when confined commands each have a private `/tmp`.
     pub(super) fn values(
         &self,
         canary: &str,
         host: &str,
         (port, local_port): (u16, u16),
+        shared_tmp: &str,
         variants: &BTreeMap<String, String>,
     ) -> HashMap<String, String> {
         let mut values: HashMap<String, String> = variants
@@ -226,6 +228,7 @@ impl Case {
         values.insert("SINK_HOST".to_owned(), host.to_owned());
         values.insert("SINK_PORT".to_owned(), port.to_string());
         values.insert("LOCAL_SINK_PORT".to_owned(), local_port.to_string());
+        values.insert("SHARED_TMP".to_owned(), shared_tmp.to_owned());
         values
     }
 

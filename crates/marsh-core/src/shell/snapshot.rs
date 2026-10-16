@@ -19,13 +19,21 @@ use super::taint::Taint;
 use super::{Principal, ShellError};
 use super::answers::{self, KernelAnswers};
 use marsh_instrument::{
-    Enforcement, Enforcer, ExecCommand, ExecDecision, ExecHooks, FileTarget, InvocationId,
-    KernelEvent, KernelPolicy, RootId, Syscall, TraceRun,
+    Confinement, Enforcement, Enforcer, ExecCommand, ExecDecision, ExecHooks, FileTarget, Identity,
+    InvocationId, KernelEvent, KernelPolicy, RootId, Syscall, TraceRun,
 };
 use marsh_lib::RecoverPoison as _;
 use marsh_peer_class::{
     ALLOW, CONTINGENT, DENY, MAX_TAINTS, RECEIPT, RULE, STALE, UNTAGGED, UNTRACED,
 };
+
+/// How privileged enforcement confines a shell's managed commands (`docs/threat-model.md` §8.2).
+pub(super) struct Confined {
+    /// Who the commands run as.
+    pub identity: Identity,
+    /// What they may write beyond their view and private directories.
+    pub writable: Vec<PathBuf>,
+}
 
 #[derive(Default)]
 pub(super) struct CommandEvidence {
@@ -126,6 +134,8 @@ pub(super) struct Snapshot {
     /// The run whose refused peers were reported, and the refusals reported for it: a program
     /// retrying a refused call is reported once.
     reported: Mutex<(Option<TraceRun>, HashSet<Event>)>,
+    /// A confined view's private directories (`/tmp`, `/dev/shm`), removed when it closes.
+    private: OnceLock<PathBuf>,
 }
 
 pub(super) struct SnapshotState {
@@ -145,6 +155,7 @@ impl Snapshot {
         uid: Principal,
         agent: Option<Arc<AgentPolicy>>,
         observer: Option<Arc<PolicyObserver>>,
+        confined: Option<&Confined>,
     ) -> Result<Arc<Self>, ShellError> {
         session.check()?;
         let path = session.persistence.work(uid.as_str());
@@ -185,6 +196,7 @@ impl Snapshot {
             verdicts: Mutex::new(Verdicts::default()),
             kernel,
             reported: Mutex::new((None, HashSet::new())),
+            private: OnceLock::new(),
         });
         let weak = Arc::downgrade(&snapshot);
         let (select, begin, end) = (weak.clone(), weak.clone(), weak.clone());
@@ -225,6 +237,9 @@ impl Snapshot {
                 .tracing
                 .enforce_peers(root, Arc::new(SnapshotEnforcer(Arc::downgrade(&snapshot))))?;
         }
+        if let Some(confined) = confined {
+            snapshot.confine(root, confined)?;
+        }
         snapshot
             .session
             .snapshots
@@ -232,6 +247,41 @@ impl Snapshot {
             .recover()
             .insert(snapshot.path.clone(), Arc::downgrade(&snapshot));
         Ok(snapshot)
+    }
+
+    /// Creates this view's private `/tmp` and `/dev/shm` and the source's shared scratch, owned
+    /// by the governed identity, and confines the view's root (`docs/threat-model.md` §8.2).
+    fn confine(&self, root: RootId, confined: &Confined) -> Result<(), ShellError> {
+        let state = &self.session.persistence.root;
+        let private = state.join("confine").join(self.uid.as_str());
+        match std::fs::remove_dir_all(&private) {
+            Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error.into()),
+            _ => {}
+        }
+        let _ = self.private.set(private.clone());
+        let (tmp, shm, shared) = (private.join("tmp"), private.join("shm"), state.join("shared"));
+        let identity = &confined.identity;
+        for directory in [&private, &tmp, &tmp.join("shared"), &shm, &shared] {
+            std::fs::create_dir_all(directory)?;
+            std::os::unix::fs::chown(directory, Some(identity.uid), Some(identity.gid))?;
+            std::fs::set_permissions(
+                directory,
+                std::os::unix::fs::PermissionsExt::from_mode(0o700),
+            )?;
+        }
+        let mut writable = vec![self.path.clone()];
+        writable.extend(confined.writable.iter().cloned());
+        self.session.tracing.confine(
+            root,
+            &Confinement {
+                identity: identity.clone(),
+                writable,
+                tmp,
+                shm,
+                shared,
+            },
+        )?;
+        Ok(())
     }
 
     pub fn close(&self) -> Result<(), ShellError> {
@@ -245,6 +295,13 @@ impl Snapshot {
                 self.retained.store(true, Ordering::Release);
                 return Err(error.into());
             }
+        }
+        if let Some(private) = self.private.get() {
+            std::fs::remove_dir_all(private)
+                .or_else(|error| match error.kind() {
+                    io::ErrorKind::NotFound => Ok(()),
+                    _ => Err(error),
+                })?;
         }
         self.closed.store(true, Ordering::Release);
         if self.retained.load(Ordering::Acquire) {

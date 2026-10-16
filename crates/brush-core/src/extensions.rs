@@ -181,6 +181,9 @@ pub enum HostAccess<'a> {
 /// * [`host_access`](Self::host_access) reports, after the fact, each filesystem access the
 ///   interpreter performs itself: opens for redirections and sourced scripts, `test`/`[[`
 ///   probes, glob directory enumeration, `PATH` searches, working-directory changes.
+/// * [`host_path`](Self::host_path) and [`host_fs`](Self::host_fs) choose the path each of those
+///   accesses uses and perform it, so an embedder can make it on the path the shell's commands
+///   would see and with the authority it grants them.
 ///
 /// The futures returned by [`run_builtin`](Self::run_builtin) and
 /// [`scope_future`](Self::scope_future) capture exactly their type parameters
@@ -276,6 +279,23 @@ pub trait ExecutionObserver: Clone + Default + Send + Sync + 'static {
     /// thread performed it. Accesses made by external commands (after the spawner's
     /// [`spawn`](ExternalCommandSpawner::spawn)) are not reported. The default does nothing.
     fn host_access(&self, _access: HostAccess<'_>) {}
+
+    /// The path an interpreter access of `path` uses: by default `path` itself; an embedder may
+    /// map it to the path the shell's commands would see (for example a private `/tmp`).
+    fn host_path<'a>(&self, path: &'a Path) -> std::borrow::Cow<'a, Path> {
+        std::borrow::Cow::Borrowed(path)
+    }
+
+    /// Performs one filesystem access the interpreter itself makes: `access` carries it out and
+    /// returns what it found. The default runs it here, as the host process; an embedder may run
+    /// it with the authority it grants the shell's commands, and refuses it by returning `Err`.
+    /// The interpreter then reports it through [`host_access`](Self::host_access) on the current
+    /// thread.
+    ///
+    /// Called synchronously, never across an `.await`.
+    fn host_fs<T: Send>(&self, access: impl FnOnce() -> T + Send) -> std::io::Result<T> {
+        Ok(access())
+    }
 }
 
 /// Default execution observer; runs and schedules everything exactly as the shell requests,

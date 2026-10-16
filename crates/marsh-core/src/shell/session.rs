@@ -323,6 +323,11 @@ pub(super) struct SourceDomain {
     tracing: Arc<Tracing>,
 }
 impl SourceDomain {
+    /// The canonical seed, or the policy root when no storage is available.
+    pub fn key(&self) -> &Path {
+        &self.key
+    }
+
     /// Resolves `initial` to its logical directory, policy root and source domain. Creates nothing.
     pub fn discover(
         initial: &Path,
@@ -630,6 +635,8 @@ pub(super) struct ExecutionResources {
     pub policy_observer: Option<Arc<PolicyObserver>>,
     /// Judges this shell's managed commands' observations.
     pub agent_policy: Option<SharedAgentPolicy>,
+    /// How privileged enforcement confines this shell's managed commands.
+    pub confined: Option<Arc<super::snapshot::Confined>>,
 }
 impl ExecutionResources {
     pub const fn new(
@@ -639,6 +646,7 @@ impl ExecutionResources {
         policy: SandboxPolicy,
         policy_observer: Option<Arc<PolicyObserver>>,
         agent_policy: Option<SharedAgentPolicy>,
+        confined: Option<Arc<super::snapshot::Confined>>,
     ) -> Self {
         Self {
             domain,
@@ -650,6 +658,7 @@ impl ExecutionResources {
             serial: 1,
             policy_observer,
             agent_policy,
+            confined,
         }
     }
 

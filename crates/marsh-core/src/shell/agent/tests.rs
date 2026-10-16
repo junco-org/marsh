@@ -115,6 +115,32 @@ fn networks_match_by_prefix() {
     assert!(AgentPolicy::new().network("nonsense", "x").is_err());
 }
 
+/// Privileged enforcement runs commands as the source's owner, so `~/` classes must name that
+/// account's home, not the daemon's, while absolute and source classes stay as they were.
+#[test]
+fn home_classes_follow_the_governed_account() {
+    let daemon = std::env::var("HOME").unwrap();
+    let policy = AgentPolicy::recommended()
+        .unwrap()
+        .for_home(Path::new("/home/operator/"))
+        .unwrap();
+    let class = |name: &str| {
+        policy
+            .label(&path("a", PathAction::Read, name))
+            .map(|event| event.resource.to_string())
+    };
+    assert_eq!(
+        class("/home/operator/.ssh/id_ed25519").as_deref(),
+        Some("path/secret")
+    );
+    assert_eq!(class("/home/operator/.aws/credentials").as_deref(), Some("path/secret"));
+    if daemon.trim_end_matches('/') != "/home/operator" {
+        assert_eq!(class(&format!("{daemon}/.ssh/id_ed25519")), None);
+    }
+    assert_eq!(class("/etc/shadow").as_deref(), Some("path/secret"));
+    assert_eq!(class(".env").as_deref(), Some("path/secret"));
+}
+
 #[test]
 fn classes_are_first_match_inside_and_outside_the_source() {
     let policy = AgentPolicy::recommended().unwrap();

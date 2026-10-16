@@ -74,7 +74,8 @@ def main():
                 shutil.copyfile(source, module_dir / name)
         subprocess.run(['depmod', '-b', str(root), args.kernel], check=True)
         runtime_path = '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:' + os.environ.get('PATH', '')
-        command = 'export PATH=' + shlex.quote(runtime_path) + '; ip link set lo up && cd ' + shlex.quote(str(repo)) + ' && ' + shlex.join(args.command)
+        # Fixtures live under /var/tmp: confined commands get a private /tmp of their own.
+        command = 'export PATH=' + shlex.quote(runtime_path) + ' TMPDIR=/var/tmp; ip link set lo up && cd ' + shlex.quote(str(repo)) + ' && ' + shlex.join(args.command)
         init = f'''#!/bin/sh
 export PATH=/bin
 mount -t proc proc /proc
@@ -89,6 +90,9 @@ mount -t proc proc /host/proc
 mount -t sysfs sys /host/sys
 mount -t devtmpfs dev /host/dev
 mount -t tmpfs tmp /host/tmp
+mount -t tmpfs vartmp /host/var/tmp
+mkdir -p /host/dev/shm && mount -t tmpfs shm /host/dev/shm
+mount -t cgroup2 cgroup2 /host/sys/fs/cgroup || {{ echo MARSH_VM_FAILURE; poweroff -f; }}
 mount -t securityfs securityfs /host/sys/kernel/security
 cat /host/sys/kernel/security/lsm
 chroot /host /bin/sh -c {shlex.quote(command)}

@@ -56,6 +56,10 @@ fails loading, so file contents and commands must not contain stray braces.
   (`192.0.2.1`, a per-case port).
 * `{LOCAL_SINK_PORT}` — a capture listener on `127.0.0.1` standing in for a
   local daemon marsh does not trace. What reaches it counts as leaked too.
+* `{SHARED_TMP}` — a directory every shell of the source can write:
+  `/tmp/shared` under privileged enforcement, where each shell's commands have
+  a private `/tmp`, and `/tmp` otherwise. Cases hand data between principals
+  through it.
 * Variant slots: `[variants.<slot>] = [...]` feeds the `{<SLOT>}` placeholder
   (uppercased). `encoded-exfil.toml` uses `enc` -> `{ENC}`.
 

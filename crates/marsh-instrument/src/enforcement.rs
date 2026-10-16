@@ -50,7 +50,11 @@ pub trait Enforcer: Send + Sync {
 
 /// Runs only in the trusted post-fork setup, before the command's handshake and exec.
 /// Root commands must not inherit authority to rewrite maps or inspect the loader's descriptors.
-pub(crate) fn restrict_child() -> io::Result<()> {
+///
+/// A confined root's command first joins its cgroup and private namespaces while still root,
+/// becomes its governed identity once the bounding set is gone, and enters its Landlock domain
+/// last (`docs/threat-model.md` §8.2).
+pub(crate) fn restrict_child(confined: Option<&crate::confine::Prepared>) -> io::Result<()> {
     let control = |option, value: libc::c_ulong| {
         // SAFETY: these prctl operations take integer arguments, not pointers.
         if unsafe {
@@ -68,6 +72,9 @@ pub(crate) fn restrict_child() -> io::Result<()> {
             Ok(())
         }
     };
+    if let Some(confined) = confined {
+        confined.enter()?;
+    }
     control(libc::PR_SET_NO_NEW_PRIVS, 1)?;
     // SAFETY: geteuid has no arguments or memory effects.
     if unsafe { libc::geteuid() } == 0 {
@@ -98,6 +105,9 @@ pub(crate) fn restrict_child() -> io::Result<()> {
             }
         }
     }
+    if let Some(confined) = confined {
+        confined.assume()?;
+    }
     control(
         libc::PR_CAP_AMBIENT,
         libc::PR_CAP_AMBIENT_CLEAR_ALL as libc::c_ulong,
@@ -109,6 +119,11 @@ pub(crate) fn restrict_child() -> io::Result<()> {
     if unsafe { libc::syscall(libc::SYS_capset, header.as_ptr(), data.as_ptr()) } < 0 {
         return Err(io::Error::last_os_error());
     }
-    // The loader is nondumpable; its capless child must still admit its parent's ptrace seize.
-    control(libc::PR_SET_DUMPABLE, 1)
+    // The loader is nondumpable, and a uid change resets dumpability: its capless child must
+    // still admit its parent's ptrace seize.
+    control(libc::PR_SET_DUMPABLE, 1)?;
+    if let Some(confined) = confined {
+        confined.restrict()?;
+    }
+    Ok(())
 }

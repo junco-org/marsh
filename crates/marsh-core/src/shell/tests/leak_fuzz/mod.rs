@@ -645,10 +645,12 @@ async fn run_once(
     let sink = Sink::start(IpAddr::V4(SINK_HOST)).expect("bind sink");
     // A local daemon marsh does not trace: what reaches it has left marsh's sight too.
     let local = Sink::start(IpAddr::V4(Ipv4Addr::LOCALHOST)).expect("bind local sink");
+    let privileged = enforcement() == marsh_instrument::Enforcement::Privileged;
     let values = case.values(
         token,
         &SINK_HOST.to_string(),
         (sink.port, local.port),
+        if privileged { "/tmp/shared" } else { "/tmp" },
         variants,
     );
 
@@ -662,6 +664,9 @@ async fn run_once(
             std::fs::create_dir_all(parent).expect("seed directory");
         }
         std::fs::write(&full, contents).expect("seed file");
+    }
+    if privileged {
+        govern_as_nobody(&fixture);
     }
 
     let denials = Arc::new(Mutex::new(Vec::new()));
@@ -707,6 +712,27 @@ async fn run_once(
         steps,
         token: token.to_owned(),
         encodings: case.oracle.encodings.clone(),
+    }
+}
+
+/// The non-root account privileged enforcement runs the corpus's commands as.
+const NOBODY: u32 = 65_534;
+
+/// Hands the fixture's seed to `nobody`: privileged enforcement runs a source's commands as its
+/// owner, never root, and that owner must be able to reach the seed's state beside it.
+fn govern_as_nobody(fixture: &super::Fixture) {
+    use std::os::unix::fs::PermissionsExt as _;
+    let scratch = fixture.seed.parent().expect("seed parent");
+    std::fs::set_permissions(scratch, std::fs::Permissions::from_mode(0o755))
+        .expect("open the scratch directory to the governed owner");
+    let mut pending = vec![fixture.seed.clone()];
+    while let Some(path) = pending.pop() {
+        std::os::unix::fs::lchown(&path, Some(NOBODY), Some(NOBODY)).expect("chown seed entry");
+        if path.is_dir() && !path.is_symlink() {
+            for entry in std::fs::read_dir(&path).expect("list seed directory") {
+                pending.push(entry.expect("seed entry").path());
+            }
+        }
     }
 }
 

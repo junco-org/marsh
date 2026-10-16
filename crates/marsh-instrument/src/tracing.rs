@@ -93,6 +93,8 @@ struct Root {
     observe: Arc<dyn Fn(TraceRun, Option<InvocationId>, Syscall) -> io::Result<()> + Send + Sync>,
     exec: Option<ExecHooks>,
     enforcer: Option<Arc<dyn Enforcer>>,
+    /// A privileged root's launch confinement; required before a governed root runs.
+    confined: Option<Arc<crate::confine::Prepared>>,
 }
 
 /// A selected command a traced task has just executed, read before its new image ran anything.
@@ -483,6 +485,7 @@ impl Tracing {
                 observe,
                 exec,
                 enforcer: None,
+                confined: None,
             },
         );
         drop(state);
@@ -797,7 +800,23 @@ impl Tracing {
         let target = self
             .current()
             .ok_or_else(|| io::Error::other("a managed command spawned outside its run's scope"))?;
-        lock(&self.state).run(target.run)?;
+        let restricted = self.enforcement == Enforcement::Privileged;
+        let confined = {
+            let state = lock(&self.state);
+            state.run(target.run)?;
+            let root = state
+                .roots
+                .get(&target.run.root)
+                .ok_or_else(|| io::Error::other("missing trace root"))?;
+            if restricted && root.enforcer.is_some() && root.confined.is_none() {
+                return Err(io::Error::other(
+                    "a privileged governed root must be confined before its commands run",
+                ));
+            }
+            let confined = root.confined.clone();
+            drop(state);
+            confined
+        };
         // A PATH search would exec several candidates, and only the first failure is detached.
         if !command.get_program().as_encoded_bytes().contains(&b'/') {
             return Err(io::Error::new(
@@ -816,13 +835,12 @@ impl Tracing {
                 tracing.trace(request_read, release_write, &pinned, target, host, events)
             })?;
         let (request, release) = (request_write.as_raw_fd(), release_read.as_raw_fd());
-        let restricted = self.enforcement == Enforcement::Privileged;
-        // SAFETY: the post-fork hook uses only stack data and Linux syscalls; it neither
-        // allocates nor locks before the inherited-descriptor handshake and exec.
+        // SAFETY: the post-fork hook uses only stack data, data prepared before the fork and
+        // Linux syscalls; it neither allocates nor locks before the handshake and exec.
         unsafe {
             command.pre_exec(move || {
                 if restricted {
-                    crate::enforcement::restrict_child()?;
+                    crate::enforcement::restrict_child(confined.as_deref())?;
                 }
                 handshake(request, release)
             });
@@ -906,7 +924,6 @@ impl Tracing {
                 .send(process.try_clone()?)
                 .map_err(|_| io::Error::other("spawner abandoned its command"))?;
             self.adopt_root(root, target, host, process)?;
-            self.map_task(root)?;
             observer.stop(root, status, &mut observe)?;
             std::fs::File::from(release).write_all(&[1])?;
             observer.run(&mut observe)?;
@@ -922,7 +939,6 @@ impl Tracing {
         })();
         if observer.detached() {
             lock(&self.state).threads.remove(&root);
-            self.unmap_task(root)?;
             self.progress.notify_all();
         }
         if let Err(error) = &result {
@@ -940,7 +956,6 @@ impl Tracing {
             }
             observer.abandon(|tid, status| {
                 lock(&self.state).threads.remove(&tid);
-                let _ = self.unmap_task(tid);
                 if tid == root {
                     events(ChildEvent::Exited(std::process::ExitStatus::from_raw(
                         status,
@@ -1161,12 +1176,6 @@ impl Tracing {
         {
             let former = Self::event_thread(event, "missing exec identity")?;
             state.rekey(tid, former);
-            if former != tid {
-                drop(state);
-                self.unmap_task(former)?;
-                self.map_task(tid)?;
-                state = lock(&self.state);
-            }
         }
         if let Some(thread) = state.threads.get_mut(&tid) {
             thread.job_stopped = matches!(
@@ -1195,9 +1204,6 @@ impl Tracing {
             let child = Self::event_thread(event, "missing child identity")?;
             let early = Self::adopt(&mut state, tid, child)?;
             drop(state);
-            if !early.iter().any(|(_, status, _, _)| ended(*status)) {
-                self.map_task(child)?;
-            }
             let mut held = false;
             for (sequence, status, event, info) in early {
                 let replay = self.deliver(sequence, child, status, event, info, None)?;
@@ -1229,7 +1235,6 @@ impl Tracing {
             }
             state.threads.remove(&tid);
             drop(state);
-            self.unmap_task(tid)?;
             self.progress.notify_all();
             return self.settle(resume, ready);
         }

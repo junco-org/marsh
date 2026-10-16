@@ -60,6 +60,8 @@ pub struct ShellBuilder {
     policy_observer: Option<Arc<PolicyObserver>>,
     agent_policy: Option<Arc<AgentPolicy>>,
     enforcement: Enforcement,
+    governed_user: Option<u32>,
+    writable: Vec<PathBuf>,
 }
 impl Default for ShellBuilder {
     fn default() -> Self {
@@ -78,6 +80,8 @@ impl Default for ShellBuilder {
             policy_observer: None,
             agent_policy: None,
             enforcement: Enforcement::Unprivileged,
+            governed_user: None,
+            writable: Vec::new(),
         }
     }
 }
@@ -138,6 +142,20 @@ impl ShellBuilder {
     #[must_use]
     pub const fn enforcement(mut self, enforcement: Enforcement) -> Self {
         self.enforcement = enforcement;
+        self
+    }
+    /// The non-root user privileged enforcement runs agent-governed commands as. Unset, it is the
+    /// source's owner; a root-owned source needs one.
+    #[must_use]
+    pub const fn governed_user(mut self, uid: Option<u32>) -> Self {
+        self.governed_user = uid;
+        self
+    }
+    /// Paths, beyond the private view and private `/tmp`, that privileged enforcement lets
+    /// agent-governed commands write (`docs/threat-model.md` §8.2). Empty by default.
+    #[must_use]
+    pub fn writable(mut self, paths: Vec<PathBuf>) -> Self {
+        self.writable = paths;
         self
     }
     /// Enables normal interactive shell semantics.
@@ -236,6 +254,29 @@ impl ShellBuilder {
         };
         let uid = fresh_principal()?;
         let sandbox = sandbox_record(&discovered, self.sandbox_id, &uid)?;
+        // Privileged agent shells run their commands as a non-root identity, whose home anchors
+        // the policy's `~/` classes.
+        let confined = match self.agent_policy.take() {
+            Some(policy) if enforcement == Enforcement::Privileged => {
+                let identity = match self.governed_user {
+                    Some(user) => marsh_instrument::Identity::of_user(user),
+                    None => marsh_instrument::Identity::owner_of(discovered.domain.key()),
+                }?;
+                self.agent_policy = Some(Arc::new(
+                    policy
+                        .for_home(&identity.home)
+                        .map_err(|error| ShellError::infrastructure(error.to_string()))?,
+                ));
+                Some(Arc::new(snapshot::Confined {
+                    identity,
+                    writable: std::mem::take(&mut self.writable),
+                }))
+            }
+            policy => {
+                self.agent_policy = policy;
+                None
+            }
+        };
         let mut resources = ExecutionResources::new(
             discovered.domain,
             discovered.coverage,
@@ -243,6 +284,7 @@ impl ShellBuilder {
             self.policy,
             self.policy_observer,
             self.agent_policy,
+            confined.clone(),
         );
         let executor = MarshExecutor::new();
         let profile = self.options.profile;
@@ -282,6 +324,11 @@ impl ShellBuilder {
             let mut variable = ShellVariable::new(value);
             variable.export();
             builder = builder.var(name, variable);
+        }
+        if let Some(confined) = &confined {
+            let mut home = ShellVariable::new(confined.identity.home.to_string_lossy().into_owned());
+            home.export();
+            builder = builder.var("HOME", home);
         }
         let scope = tracing.internal_scope()?;
         let mut interpreter =
@@ -908,6 +955,7 @@ impl Shared {
                         resources.principal.clone(),
                         resources.agent_policy.clone(),
                         resources.policy_observer.clone(),
+                        resources.confined.as_deref(),
                     )?;
                     view::Transition::plan(
                         interpreter,
@@ -928,6 +976,13 @@ impl Shared {
                 SpanRoute::Managed(prepared)
             }
             Route::Direct => {
+                // Direct commands run as the daemon itself: under privileged enforcement, root.
+                if resources.confined.is_some() {
+                    return Err(ShellError::infrastructure(
+                        "a privileged agent shell runs every command on the managed route; \
+                         configure its sandbox policy to always sandbox",
+                    ));
+                }
                 if let Some(snapshot) = &resources.snapshot {
                     if snapshot.retained.load(Ordering::Acquire) {
                         return Err(ShellError::infrastructure(

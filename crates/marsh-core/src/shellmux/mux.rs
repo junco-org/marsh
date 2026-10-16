@@ -147,7 +147,9 @@ impl ShellMux {
             .sandbox_policy(policy)
             .policy_observer(self.profile.policy_observer.clone())
             .agent_policy(self.profile.agent_policy.clone())
-            .enforcement(self.profile.enforcement);
+            .enforcement(self.profile.enforcement)
+            .governed_user(self.profile.governed_user)
+            .writable(self.profile.writable.clone());
         if let Some(environment) = environment {
             builder = builder.environment(environment);
         } else {

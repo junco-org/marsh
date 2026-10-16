@@ -229,6 +229,12 @@ pub struct MuxProfile {
     pub agent_policy: Option<std::sync::Arc<crate::AgentPolicy>>,
     /// Process-wide socket enforcement; unprivileged unless explicitly selected.
     pub enforcement: crate::Enforcement,
+    /// The non-root user privileged enforcement runs agent-governed commands as; unset, each
+    /// source's owner.
+    pub governed_user: Option<u32>,
+    /// Paths privileged enforcement lets agent-governed commands write beyond their private view
+    /// and `/tmp`.
+    pub writable: Vec<std::path::PathBuf>,
 }
 
 impl std::fmt::Debug for MuxProfile {
@@ -242,6 +248,8 @@ impl std::fmt::Debug for MuxProfile {
             .field("policy_observer", &self.policy_observer.is_some())
             .field("agent_policy", &self.agent_policy)
             .field("enforcement", &self.enforcement)
+            .field("governed_user", &self.governed_user)
+            .field("writable", &self.writable)
             .finish_non_exhaustive()
     }
 }

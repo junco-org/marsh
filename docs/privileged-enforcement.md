@@ -103,7 +103,7 @@ explicit request for the other mode is refused.
 
 | Map | Type | Key → value | Written by |
 |---|---|---|---|
-| `TASK_ROOT` | hash | tgid → root | the tracer, at every fork/clone stop before the child runs; removed at exit |
+| `DOMAINS` | hash | cgroup v2 id → root | the tracer, when it confines a root (before its first command); removed with the root |
 | `ANSWERS` | hash | root → `Answers` | userspace only, replaced whole |
 | `RECEIVED` | hash | root → per-taint-class receipt counters | the kernel only (atomic adds); userspace removes a retired root's entry |
 | `CLASS_NET4`, `CLASS_NET6` | LPM trie | root-prefixed IP prefix → class | userspace, from declared networks (§4.5) |
@@ -112,16 +112,18 @@ explicit request for the other mode is refused.
 | `FLOWS` | hash | `{ netns, type, port, peer port, peer address, destination family }` → `{ taint, sender }` | the kernel; a connection's tag goes with its socket, a port's only with its sole holder (§4.7) |
 | `EVENTS` | ring buffer | contacts and receipts | the kernel |
 | `HEALTH` | array | sticky poison flag: event loss or a map failure | loader and kernel |
-| `PID_NAMESPACE` | array | the loader's PID namespace | loader |
+| `PID_NAMESPACE` | array | the loader's PID namespace, for event tgid/tid only | loader |
+| `KEYS` | LRU hash | key address → root that created it | the kernel (`key_alloc`) |
 
 `Answers` holds `generation`, `deny` (classes refused now), `guarded` (classes any rule can
 refuse), `untraced` (local classes whose receiver must be traced while the root carries taint),
 `carried` (taint classes its sends carry), `contingent[16]` (`deny` as if it had just received
 taint class *i*), `acknowledged[16]` (receipts folded in), `stale` and `audit`.
 
-Tasks are keyed by tgid: io_uring's `io-wq` workers are threads of the submitting process, and
-exec keeps the tgid. A table filled from ptrace stops is race-free because the child cannot run
-before the tracer has seen it.
+A root's domain is its cgroup: every command of a confined root joins it before exec (§7), the
+kernel keeps every descendant and io_uring worker in it, and no unprivileged task can leave it.
+Events still carry the task's tgid and tid in the loader's PID namespace, to attribute them to
+runs; a task in another PID namespace reports zeros and stays governed.
 
 ### 4.4 Keeping answers current (Phase B)
 
@@ -264,6 +266,11 @@ ring while tasks only send.
   of built-in IPv4, IPv6 and UNIX sockets (`inet_recvmsg`, `inet6_recvmsg`, `unix_*_recvmsg`).
   Privileged startup requires every hook; a kernel lacking one is not given weaker enforcement.
 * Privileges to load and attach LSM programs: root in practice.
+* cgroup v2 mounted at `/sys/fs/cgroup`, `landlock` in the active LSM list with ABI 6 or later
+  (scoped signals and abstract UNIX sockets), and `CONFIG_KEYS`, `CONFIG_PERF_EVENTS`,
+  `CONFIG_IO_URING` and `CONFIG_BPF_SYSCALL`, whose hooks the refusals attach to.
+* Governed commands run as a non-root user: the source's owner, or `ShellBuilder::governed_user`
+  (`MARSH_GOVERNED_UID` for rmux) when root owns the source.
 * Build: clang 15 or later (`MARSH_BPF_CLANG`, default `clang`).
 
 This development host's boot-time LSM list lacks `bpf`; `bench/leak-fuzzer/privileged-vm.py` boots
@@ -277,7 +284,8 @@ an installed generic kernel in a disposable QEMU guest with BPF LSM active inste
 | Ordering kernel and ptrace records | `Sequence` in `observation.rs` |
 | Incremental answers, taint class IDs | `answers.rs` |
 | Republishing, kernel events into evidence and taint | `Snapshot::{republish, kernel_event}`, `Session::republish` |
-| Capability stripping for privileged children | `restrict_child` in `enforcement.rs` |
+| Launch confinement: cgroup, namespaces, identity, Landlock | `confine.rs`, `restrict_child` in `enforcement.rs` |
+| The interpreter's own accesses under the commands' authority | `host_path`/`host_fs` (`ExecutionObserver`, `Tracing`) |
 
 ## 7. Security notes
 
@@ -287,19 +295,32 @@ implementation's residuals; that document's §7 places each in its channel matri
 
 * The answers are computed from what ptrace observed. A secret read ptrace misses is still missed,
   and a read reaches the answers only at its exit stop (§4.4): the filesystem-side race of §2.
-* `TASK_ROOT` is filled before a child runs. A governed task without published answers is refused.
+* A root is confined before its first command runs; a governed task without published answers is
+  refused.
 * The maps are not pinned and their descriptors are close-on-exec; loading makes the tracer
-  nondumpable. Privileged managed launches clear all capabilities and set `NO_NEW_PRIVS`; root
-  children also lock `NOROOT` and clear their bounding set. Their dumpability is restored only
-  after stripping authority, so the parent can still seize them.
-* Governed tasks use `PTRACE_O_EXITKILL`. A shared tracer failure kills every governed process
-  through pidfds, clears task mappings even after poisoning, then detaches.
+  nondumpable. A confined root's commands (`threat-model.md` §8.2) join its cgroup and fresh mount
+  and IPC namespaces with a private `/tmp` and `/dev/shm` (the source's shared scratch at
+  `/tmp/shared`), switch to the non-root governed identity in a session keyring of their own,
+  clear all capabilities, set `NO_NEW_PRIVS`, and enter a Landlock domain that confines writes to
+  their view, private directories, operator allowlist and `/dev/null`-like devices and refuses
+  signals and abstract UNIX sockets outside it. Each root's Landlock domain is separate, so no
+  root can ptrace or signal another's tasks. Dumpability is restored only after all of that, so
+  the parent can still seize them.
+* The interpreter's own filesystem accesses for a confined root (redirections, `source`, tests,
+  globbing, `PATH` search, marsh's builtins) run on a short-lived thread with the same identity
+  and Landlock domain, on the paths its commands see; a privileged agent shell refuses the
+  direct route, whose commands would run as the daemon.
+* BPF refuses governed tasks user namespaces, BPF, perf events, `PR_SET_PTRACER`/`PR_SET_MM`,
+  `TIOCSTI`/`TIOCLINUX`, io_uring personalities and passthrough commands, changes to other
+  cgroups' process attributes, and writes or links to keys their root did not create.
+* Governed tasks use `PTRACE_O_EXITKILL`. A shared tracer failure kills every confined root's
+  processes through `cgroup.kill`, then poisons the maps, clears every domain and detaches.
 * Event loss or a map failure poisons enforcement for good: every governed contact is refused,
   auditing roots included. Failures one root causes stay with it: a full tag map refuses the
   contact that needed the tag, a root carrying a taint class beyond the 16 kernel IDs has every
   contact refused, and an unreadable socket or task drops out of `LOCAL_ALLOWED`.
-* Task keys and events use the loader's PID namespace. A child in another PID namespace cannot be
-  attributed: it alone is killed through its pidfd before it resumes, and enforcement stays healthy.
+* Task keys are cgroup ids, so a child in another PID namespace stays governed; its events carry
+  no tgid and are attributed to a run of its root.
 * `socket_sendmsg` sees a kernel-owned destination when it judges `msg_name`; otherwise it reads
   the connected peer, which another holder of a connected UDP socket can reconnect between the
   hook and transmission (`connected-udp-peer-reconnect`). Closing that needs a destination-stable

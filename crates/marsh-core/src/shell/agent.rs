@@ -266,7 +266,9 @@ impl Network {
 #[derive(Clone, Default)]
 pub struct AgentPolicy {
     inside: Vec<(Pattern, String)>,
-    outside: Vec<(Pattern, String)>,
+    /// First-match outside classes; a `~/` pattern also keeps the part after `~/`, so it can be
+    /// re-anchored at another account's home ([`AgentPolicy::for_home`]).
+    outside: Vec<(Pattern, String, Option<String>)>,
     networks: Vec<(Network, String)>,
     rules: Vec<AgentRule>,
     /// Classes whose data taints whoever receives it from a principal that read it.
@@ -413,17 +415,37 @@ impl AgentPolicy {
         if let Some(rest) = pattern.strip_prefix("~/") {
             let home = std::env::var("HOME")
                 .map_err(|_| AgentPolicyError(format!("{pattern:?} needs a UTF-8 $HOME")))?;
-            let home = Pattern::escape(home.trim_end_matches('/'));
-            let compiled = Pattern::new(&format!("{home}/{rest}")).map_err(invalid)?;
-            self.outside.push((compiled, label.to_owned()));
+            let compiled = home_pattern(&home, rest).map_err(invalid)?;
+            self.outside
+                .push((compiled, label.to_owned(), Some(rest.to_owned())));
         } else if pattern.starts_with('/') {
             self.outside
-                .push((Pattern::new(pattern).map_err(invalid)?, label.to_owned()));
+                .push((Pattern::new(pattern).map_err(invalid)?, label.to_owned(), None));
         } else {
             self.inside
                 .push((Pattern::new(pattern).map_err(invalid)?, label.to_owned()));
         }
         Ok(self)
+    }
+
+    /// This policy with every `~/` class anchored at `home`, not the policy owner's `$HOME`:
+    /// privileged enforcement runs commands as the source's owner, whose home holds the secrets
+    /// they can read.
+    ///
+    /// # Errors
+    /// When `home` is not UTF-8.
+    pub(super) fn for_home(&self, home: &Path) -> Result<Self, AgentPolicyError> {
+        let home = home
+            .to_str()
+            .ok_or_else(|| AgentPolicyError(format!("{} is not UTF-8", home.display())))?;
+        let mut policy = self.clone();
+        for (pattern, _, rest) in &mut policy.outside {
+            if let Some(rest) = rest {
+                *pattern = home_pattern(home, rest)
+                    .map_err(|error| AgentPolicyError(format!("invalid class pattern: {error}")))?;
+            }
+        }
+        Ok(policy)
     }
 
     /// Labels socket peers inside `cidr` (for example `10.0.0.0/8` or `2001:db8::/32`).
@@ -498,8 +520,8 @@ impl AgentPolicy {
     pub(super) fn outside_class(&self, path: &Path) -> Option<&str> {
         self.outside
             .iter()
-            .find(|(pattern, _)| pattern.matches_path_with(path, MATCH))
-            .map(|(_, label)| label.as_str())
+            .find(|(pattern, ..)| pattern.matches_path_with(path, MATCH))
+            .map(|(_, label, _)| label.as_str())
     }
 
     /// The class of a socket peer.
@@ -770,6 +792,14 @@ pub enum UntracedLocal {
     Allow,
     /// The contact is refused.
     Deny,
+}
+
+/// A `~/rest` class pattern anchored at `home`.
+fn home_pattern(home: &str, rest: &str) -> Result<Pattern, glob::PatternError> {
+    Pattern::new(&format!(
+        "{}/{rest}",
+        Pattern::escape(home.trim_end_matches('/'))
+    ))
 }
 
 /// The denial of `event` when a caller-built rule that could judge it does not compile.

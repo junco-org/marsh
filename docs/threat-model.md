@@ -1,9 +1,10 @@
 # Threat model and complete mediation for privileged enforcement
 
-Status: **design**. It defines what the privileged mode must guarantee, enumerates every kernel
-channel against that guarantee, and lays out how to enforce it comprehensively. The current
-implementation is in [`privileged-enforcement.md`](privileged-enforcement.md); §8 below places its
-known holes in this model.
+Status: **phase 1 implemented** (§9 step 1, pending verification in the BPF LSM VM); the rest is
+design. It defines what the privileged mode must guarantee, enumerates every kernel channel
+against that guarantee, and lays out how to enforce it comprehensively. The current
+implementation is in [`privileged-enforcement.md`](privileged-enforcement.md); §7 below places
+its known holes in this model.
 
 Two bodies of prior work set the method:
 
@@ -135,13 +136,14 @@ Appendix A assigns every hook to one of these rows.
 | 8 | Descriptor passing | `SCM_RIGHTS`, `pidfd_getfd`, binder | `file_receive` makes the receiver a holder (R3) | none | a passed pipe or memfd skips socket tags |
 | 9 | Process to process | `ptrace`, `/proc/<pid>/*`, signals, `sigqueue` payloads, `prlimit`, nice, `PR_SET_PTRACER` | R6, R7: no inspection or control across domains; `/proc` inodes labelled with their task's domain | Yama scope only | storage channels to U (`/proc/<pid>/cmdline`, `comm`, `oom_score_adj`) |
 | 10 | Names and metadata in shared directories | `/tmp` names, xattrs, timestamps, sizes | R7 write confinement (Landlock) and per-domain `/tmp`; labels within writable roots | none | file names in shared directories are a high-bandwidth channel to U |
-| 11 | Escape to untraced execution | uid-0 writes, rc files, autostart, systemd units, service managers, `TIOCSTI` | R7 | `NO_NEW_PRIVS`, capabilities dropped | uid 0 retained; persistence writes; service managers under Allow |
+| 11 | Escape to untraced execution | uid-0 writes, rc files, autostart, systemd units, service managers, `TIOCSTI` | R7 | phase 1: non-root identity, Landlock write confinement, private namespaces, BPF refusals | service managers under Allow |
 | 12 | Keyrings | user, session keyrings | per-domain session keyring; user keyring read-only | none | channel to U |
 | 13 | SysV IPC, POSIX queues, watch queues | message queues, semaphores | per-domain IPC namespace; B across domains | none | channel to U |
 | 14 | Shared kernel tables | `/proc/net/*` ports and abstract names, PID allocation, locks | decision: per-domain network namespace, or accept with bandwidth bound | none | port numbers and abstract names visible to U |
 | 15 | io_uring | rings, personalities, passthrough | operations reach rows 1–8; refuse SQPOLL, personalities, `uring_cmd` | SQPOLL refused; opcodes checked by ptrace | personalities and `uring_cmd` unrefused |
 | 16 | TCB-mediated | rmux panes, terminal escape sequences | rmux treats pane output as the pane principal's data; filters OSC 52 clipboard writes | not considered | clipboard to U |
 | 17 | Timing and contention | CPU, caches, locks, allocation | non-goal | — | — |
+| 18 | The interpreter's own accesses | redirections, `source`, tests, globbing, `PATH` search, marsh builtins: run in the daemon | R7: each access runs with the commands' identity, Landlock domain and private paths; the direct route is refused | phase 1 | — |
 
 ## 7. What the earlier holes were
 
@@ -157,28 +159,38 @@ Every hole found so far is an instance of a row above, which is why they kept ap
 | host's own LAN address reaches local listeners | 7 | R5 with the namespace's own addresses classified local |
 | DNS through the local resolver under `recommended` | 11 | R7: an untraced service is a sink unless allowlisted |
 | connected-UDP peer reconnect, `sendmmsg` batches | 7 | per-packet judgement for datagrams |
-| uid 0 retained: owner writes to `/etc/cron.d`, `/etc/systemd/system` | 11 | R7: governed tasks run as a non-root uid |
+| uid 0 retained: owner writes to `/etc/cron.d`, `/etc/systemd/system` | 11 | R7: governed tasks run as a non-root uid (phase 1) |
+| builtins and redirections run as the root daemon, outside Landlock | 18 | R7: interpreter accesses take the commands' authority (phase 1) |
+| `~/` secret classes expand the daemon's home, not the governed account's | 1 | classes follow the governed identity's home (phase 1) |
 | `toctou-peer-rewrite`, `local-handoff-rewrite` | 5, 7 | already closed in privileged mode by kernel hooks |
 
 ## 8. Enforcement architecture
 
 ### 8.1 Domains in the kernel
-Each root runs in its own cgroup v2 (`marsh/root-<id>`, owned by root). BPF identifies a task's
-domain with `bpf_get_current_cgroup_id` and keeps domain state in cgroup storage. Membership is
+Each root runs in its own cgroup v2 (`marsh-<daemon pid>/root-<id>`, owned by root). BPF
+identifies a task's domain with `bpf_get_current_cgroup_id` in the `DOMAINS` map. Membership is
 inherited by `fork` and io_uring workers inside the kernel, survives PID namespaces, and cannot be
-left by a non-root task. It replaces the tgid-keyed `TASK_ROOT` and its fork-stop races. The same
-cgroup attaches `cgroup_skb/egress` for per-packet judgement (row 7).
+left by a non-root task; it replaced the tgid-keyed `TASK_ROOT` and its fork-stop races (phase 1).
+The same cgroup can attach `cgroup_skb/egress` for per-packet judgement (row 7).
 
 ### 8.2 Launch confinement (in `restrict_child`)
-* Switch to the operator's non-root uid and gid before exec; keep `NO_NEW_PRIVS` and the empty
-  capability sets.
-* Apply a Landlock ruleset (inherited, not removable): writes beneath the private view, a
-  per-domain temporary directory and an allowlist of tool caches only; `LANDLOCK_SCOPE_SIGNAL` and
-  `LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET`.
-* Unshare a mount namespace with private `/tmp` and `/dev/shm`, and an IPC namespace.
-* BPF refusals for the D rows of Appendix A: user namespaces, BPF, perf, mounts, ptrace and `/proc`
-  across domains, cross-domain process attributes, terminal injection, io_uring personalities and
-  passthrough, user-keyring writes.
+* Switch to the governed identity (the source's owner, or a configured non-root user) before
+  exec, in a session keyring of its own; keep `NO_NEW_PRIVS` and the empty capability sets.
+* Apply a Landlock ruleset (inherited, not removable): writes beneath the private view, the
+  domain's private `/tmp` and `/dev/shm`, the source's shared scratch, an operator allowlist, and
+  `/dev/null`, `/dev/zero`, `/dev/full`, `/dev/tty` only; `LANDLOCK_SCOPE_SIGNAL` and
+  `LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET`. Separate Landlock domains per root also refuse ptrace and
+  ptrace-gated `/proc` access across roots, and every mount.
+* Unshare a mount namespace with private `/tmp` and `/dev/shm` and the shared scratch at
+  `/tmp/shared`, and an IPC namespace.
+* BPF refusals for the D rows of Appendix A: user namespaces, BPF, perf, `PR_SET_PTRACER` and
+  `PR_SET_MM`, cross-domain process attributes, terminal injection, io_uring personalities and
+  passthrough, writes and links to keys the domain did not create.
+* The interpreter's own filesystem accesses for the root run on a short-lived thread with the same
+  identity and Landlock domain, on the paths its commands see (row 18); the direct route, whose
+  commands would run as the daemon, is refused.
+* Daemon-side writes into a view or the seed (publication) take their directory's owner, so the
+  governed identity can still change what marsh wrote for it.
 
 ### 8.3 Kernel classification (R1)
 Class patterns compile to anchored forms the kernel can evaluate: a directory inode whose subtree

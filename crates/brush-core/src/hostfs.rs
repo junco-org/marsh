@@ -1,6 +1,8 @@
 //! Filesystem accesses the interpreter performs itself on a host thread.
 //!
-//! Every helper here performs exactly one access and then reports it through
+//! Every helper here performs exactly one access on the path [`ExecutionObserver::host_path`]
+//! chooses, through [`ExecutionObserver::host_fs`], which may run it with the authority of the
+//! shell's commands, and then reports it with that path through
 //! [`ExecutionObserver::host_access`], so that an embedder sees the interpreter's own accesses
 //! (which no tracer of spawned commands can observe). Callers pass absolute paths; an empty path
 //! (which fails with `ENOENT` without any lookup) is not reported.
@@ -32,15 +34,20 @@ pub(crate) fn metadata(
     path: &Path,
     follow: bool,
 ) -> std::io::Result<std::fs::Metadata> {
-    let result = if follow {
-        std::fs::metadata(path)
-    } else {
-        std::fs::symlink_metadata(path)
-    };
+    let used = observer.host_path(path);
+    let result = observer
+        .host_fs(|| {
+            if follow {
+                std::fs::metadata(&used)
+            } else {
+                std::fs::symlink_metadata(&used)
+            }
+        })
+        .and_then(|result| result);
     report(
         observer,
         HostAccess::Metadata {
-            path,
+            path: &used,
             follow,
             errno: result.as_ref().err().map(errno),
         },
@@ -70,13 +77,16 @@ pub(crate) fn access(
     path: &Path,
     mode: nix::unistd::AccessFlags,
 ) -> bool {
-    let result = nix::unistd::access(path, mode);
+    let used = observer.host_path(path);
+    let result = observer
+        .host_fs(|| nix::unistd::access(used.as_ref(), mode).map_err(std::io::Error::from))
+        .and_then(|result| result);
     report(
         observer,
         HostAccess::Metadata {
-            path,
+            path: &used,
             follow: true,
-            errno: result.err().map(|e| e as i32),
+            errno: result.as_ref().err().map(errno),
         },
     );
     result.is_ok()
@@ -92,11 +102,14 @@ pub(crate) fn read_dir(
     observer: &impl ExecutionObserver,
     path: &Path,
 ) -> std::io::Result<std::fs::ReadDir> {
-    let result = std::fs::read_dir(path);
+    let used = observer.host_path(path);
+    let result = observer
+        .host_fs(|| std::fs::read_dir(&used))
+        .and_then(|result| result);
     report(
         observer,
         HostAccess::ReadDir {
-            path,
+            path: &used,
             errno: result.as_ref().err().map(errno),
         },
     );
@@ -109,7 +122,10 @@ pub(crate) fn open(
     options: &std::fs::OpenOptions,
     path: &Path,
 ) -> std::io::Result<std::fs::File> {
-    let result = options.open(path);
+    let used = observer.host_path(path);
+    let result = observer
+        .host_fs(|| options.open(&used))
+        .and_then(|result| result);
     report(
         observer,
         HostAccess::Open {
@@ -117,7 +133,7 @@ pub(crate) fn open(
                 .as_ref()
                 .map(std::os::fd::AsRawFd::as_raw_fd)
                 .map_err(errno),
-            path,
+            path: &used,
         },
     );
     result
