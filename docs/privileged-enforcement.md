@@ -1,8 +1,8 @@
 # Privileged enforcement: agent-policy socket checks in the kernel
 
-Status: **Phases A, B and C implemented** on `feat/agent-policy` (uncommitted). Phase B depends on
-junco-policy's incremental `TraceCursor`, on the local branch `feat/incremental-trace` that the
-workspace `[patch]` points at until it is pushed. Verification is recorded in §8.
+Status: **Phases A, B and C implemented** on `feat/agent-policy`. Phase B depends on junco-policy's
+incremental `TraceCursor`, which the workspace takes from the upstream `feat/incremental-trace`
+branch. Verification is recorded in §8.
 
 marsh offers two enforcement modes for agent-policy socket checks. The **unprivileged** mode is the
 ptrace gate and stays the default. The **privileged** mode moves the check into BPF LSM hooks,
@@ -341,4 +341,5 @@ blocked in `recv` when tainted bytes arrived was not tainted by an entry-time ho
    are race-free too; it needs a filesystem observer that trusts the kernel's path.
 4. **IP receiver ownership.** A `cgroup/post_bind` program could record which root owns each bound
    port, replacing `LOCAL_ALLOWED`'s `/proc` scan for `untraced_local(Deny)`.
-5. **junco-policy.** Push `feat/incremental-trace` and drop the workspace `[patch]`.
+5. **junco-policy.** Merge `feat/incremental-trace` upstream and repin the workspace to the merged
+   branch.

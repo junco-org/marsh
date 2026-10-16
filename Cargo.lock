@@ -1785,6 +1785,7 @@ dependencies = [
 [[package]]
 name = "junco-policy"
 version = "0.1.0"
+source = "git+https://github.com/junco-org/junco-policy.git?branch=feat%2Fincremental-trace#576be58b054a9744bc198026f46ada2a538bacb3"
 dependencies = [
  "bumpalo",
  "hashbrown 0.16.1",

@@ -48,7 +48,7 @@ libc = "0.2"
 nix = { version = "0.31.2", features = ["fs", "term"] }
 # The capability policy every staged line is checked against before it is published. Its default
 # branch is the authored source of the action predicates the git builtin classifies with.
-junco-policy = { git = "https://github.com/zachary-kent/junco-policy.git", branch = "feat/trace-policy" }
+junco-policy = { git = "https://github.com/junco-org/junco-policy.git", branch = "feat/incremental-trace" }
 # Owns one compiled junco policy and the incremental cursors borrowing its arena.
 self_cell = "1.2"
 
