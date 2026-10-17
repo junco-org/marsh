@@ -32,13 +32,17 @@ mod view;
 
 pub use error::{ShellError, ShellErrorKind};
 pub use junco_policy::{Action, Principal};
-pub use policy::{Denial, Event, PolicyDecision, PolicyObserver, PolicyValidator};
+pub use policy::{
+    Bump, Denial, EmptyPolicy, Event, LockPolicy, Policy, PolicyDecision, PolicyObserver,
+    PolicyValidator,
+};
 pub use sandbox_policy::{CommandContext, MarshTool, SandboxPolicy, ShellCommand};
 pub use signal::Signal;
 
 pub(crate) use execution::ExecutionProgress;
 use execution::{ManagedExtensions, MarshExecutor, Run};
-use session::{Admission, ExecutionResources, Route, SourceDomain, fresh_principal};
+pub use session::fresh_principal;
+use session::{Admission, ExecutionResources, Route, SourceDomain};
 use snapshot::Snapshot;
 
 use crate::shellmux::{JobDir, Sandbox, ShellId};
@@ -52,6 +56,10 @@ pub struct ShellBuilder {
     /// The display name a mux reserved; a standalone shell is named by its principal.
     pub(crate) sandbox_id: Option<ShellId>,
     policy_observer: Option<Arc<PolicyObserver>>,
+    /// Unset means [`LockPolicy`], resolved once in `build`.
+    shell_policy: Option<Arc<dyn Policy>>,
+    /// Trusted policy principal shared across shells; unset means the shell's own uid.
+    policy_owner: Option<Principal>,
 }
 impl Default for ShellBuilder {
     fn default() -> Self {
@@ -68,6 +76,8 @@ impl Default for ShellBuilder {
             backend: None,
             sandbox_id: None,
             policy_observer: None,
+            shell_policy: None,
+            policy_owner: None,
         }
     }
 }
@@ -113,6 +123,22 @@ impl ShellBuilder {
     #[must_use]
     pub fn policy_observer(mut self, observer: Option<Arc<PolicyObserver>>) -> Self {
         self.policy_observer = observer;
+        self
+    }
+    /// Selects the authorization policy this shell's managed commands are checked against.
+    /// Without one, the shell uses [`LockPolicy`].
+    #[must_use]
+    pub fn shell_policy(mut self, policy: Arc<dyn Policy>) -> Self {
+        self.shell_policy = Some(policy);
+        self
+    }
+    /// Makes this shell's managed commands act as `owner`, a principal the caller minted (see
+    /// [`fresh_principal`]) and trusts, so files written in one shell can be released from
+    /// another. Without one, the shell acts as its own fresh uid. Never derive it from an
+    /// untrusted name.
+    #[must_use]
+    pub fn policy_owner(mut self, owner: Option<Principal>) -> Self {
+        self.policy_owner = owner;
         self
     }
     /// Enables normal interactive shell semantics.
@@ -189,7 +215,9 @@ impl ShellBuilder {
             discovered.domain,
             discovered.coverage,
             uid.clone(),
+            self.policy_owner.unwrap_or_else(|| uid.clone()),
             self.policy,
+            self.shell_policy.unwrap_or_else(|| Arc::new(LockPolicy)),
             self.policy_observer,
         );
         let executor = MarshExecutor::new();
@@ -218,17 +246,6 @@ impl ShellBuilder {
             }
         }
         for (name, variable) in self.options.vars {
-            builder = builder.var(name, variable);
-        }
-        // Git identity is an instance property, never a reusable mux name or recovered principal.
-        for (name, value) in [
-            ("GIT_AUTHOR_NAME", format!("marsh-{uid}")),
-            ("GIT_COMMITTER_NAME", format!("marsh-{uid}")),
-            ("GIT_AUTHOR_EMAIL", format!("{uid}@marsh.local")),
-            ("GIT_COMMITTER_EMAIL", format!("{uid}@marsh.local")),
-        ] {
-            let mut variable = ShellVariable::new(value);
-            variable.export();
             builder = builder.var(name, variable);
         }
         let scope = tracing.internal_scope()?;
@@ -815,7 +832,11 @@ impl Shared {
             Route::Managed => {
                 if resources.snapshot.is_none() {
                     let session = resources.domain.managed().await?;
-                    let snapshot = Snapshot::new(session, resources.principal.clone())?;
+                    let snapshot = Snapshot::new(
+                        session,
+                        resources.principal.clone(),
+                        resources.owner.clone(),
+                    )?;
                     view::Transition::plan(
                         interpreter,
                         &snapshot.session.persistence.seed,
@@ -904,8 +925,12 @@ impl Shared {
             );
         }
         let session = Arc::clone(&executed.prepared.snapshot.session);
-        let authorized =
-            policy::authorize(&session, executed, resources.policy_observer.as_deref())?;
+        let authorized = policy::authorize(
+            &session,
+            executed,
+            resources.shell_policy.as_ref(),
+            resources.policy_observer.as_deref(),
+        )?;
         publication::commit(authorized)
     }
     async fn conclude_direct(

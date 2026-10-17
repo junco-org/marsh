@@ -347,6 +347,8 @@ pub(crate) async fn open_pane_terminal(
             }),
         },
         environment: Some(environment),
+        // Every public pane is managed, peer or not: its writes own files until released.
+        force_sandbox: true,
         ..SpawnOptions::default()
     };
 

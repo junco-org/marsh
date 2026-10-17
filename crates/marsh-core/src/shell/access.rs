@@ -28,6 +28,10 @@ pub(super) struct Effects {
     pub recursive_reads: Vec<PathBuf>,
     pub recursive_writes: Vec<PathBuf>,
     pub outside_writes: Vec<PathBuf>,
+    /// A successful unlink/rmdir: `writes` names the removed entry, whose claims it clears.
+    pub removed: bool,
+    /// The one entry an explicit `release` relinquishes; nothing is read or written.
+    pub release: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -56,6 +60,10 @@ struct Mapping {
     target: FileTarget,
     shared: bool,
     generation: WorkGeneration,
+    /// The name `target` was captured at has since been removed.
+    // ponytail: removing the captured name retires the binding even if a hard link survives;
+    // rebind to a verified surviving alias if that ever matters.
+    binding_removed: bool,
 }
 
 #[derive(Clone)]
@@ -327,6 +335,7 @@ impl Access {
                         target: target.clone(),
                         shared,
                         generation: self.generation,
+                        binding_removed: false,
                     });
                 }
             }
@@ -394,6 +403,10 @@ impl Access {
                         }
                     }
                     self.links.remove(&path);
+                    if !matches!(info.info.syscall, Sysno::mkdir | Sysno::mkdirat) {
+                        effects.removed = true;
+                        self.forget(&path);
+                    }
                     write_path(&mut effects, root, path)?;
                 }
             }
@@ -546,6 +559,45 @@ impl Access {
             _ => {}
         }
         Ok(effects)
+    }
+
+    /// Forgets a removed entry's prepared names: a surviving hard-link alias no longer reaches
+    /// it, and a mapping bound through it can no longer claim it.
+    fn forget(&mut self, removed: &Path) {
+        for names in self.aliases.values_mut() {
+            names.retain(|name| name != removed);
+        }
+        for task in std::iter::once(&self.host).chain(self.tasks.values()) {
+            for mapping in &mut *task.mappings.lock().recover() {
+                if target_path(&mapping.target) == removed {
+                    mapping.binding_removed = true;
+                }
+            }
+        }
+    }
+
+    /// Resolves an explicit release of the physical absolute `path`: ancestor links are followed,
+    /// the final component is not, and the resolved entry must be a protected, nonroot resource.
+    pub fn release(&self, path: &Path, root: &Path) -> Result<Effects, String> {
+        let mut effects = Effects::default();
+        let mut resolved = PathBuf::new();
+        self.walk(
+            path.components(),
+            false,
+            &mut resolved,
+            root,
+            &mut effects,
+            &mut 0,
+        )?;
+        match protected(root, &resolved)? {
+            Some(relative) if !relative.as_os_str().is_empty() => {
+                effects.dependencies.push(relative.clone());
+                effects.release = Some(relative);
+                Ok(effects)
+            }
+            Some(_) => Err("release names the source root, not a file".into()),
+            None => Err(format!("{} is outside the source", resolved.display())),
+        }
     }
 
     fn task(&self, tid: Pid) -> &TaskState {
@@ -800,6 +852,9 @@ impl Access {
                 && protected(root, &target_path(&mapping.target))?.is_some()
             {
                 return Err("mapping belongs to a retired work generation".into());
+            }
+            if mapping.binding_removed && info.info.syscall != Sysno::munmap {
+                return Err("mapped file's name was removed".into());
             }
             Self::check_origin(&mapping.target, root)?;
             if matches!(info.info.syscall, Sysno::mprotect | Sysno::pkey_mprotect) {

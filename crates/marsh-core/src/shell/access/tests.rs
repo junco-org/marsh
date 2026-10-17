@@ -295,6 +295,101 @@ fn shared_mappings_require_edits_and_partial_unmaps_preserve_the_rest() {
     );
 }
 
+fn unlinkat(path: &[u8], flags: i32, result: RetCode) -> Syscall {
+    let mut info = info(
+        Sysno::unlinkat,
+        vec![
+            SyscallArg::Int(i64::from(libc::AT_FDCWD)),
+            SyscallArg::Addr(0x1000),
+            SyscallArg::Int(i64::from(flags)),
+        ],
+        result,
+    );
+    info.paths.push((1, path.to_vec()));
+    info.descriptors.push((0, Some(target(b"/work"))));
+    info
+}
+
+#[test]
+fn only_a_successful_removal_releases_and_only_the_removed_name() {
+    let root = Path::new("/work");
+    let mut access = Access::default();
+    let failed = access
+        .observe(&unlinkat(b"a", 0, RetCode::Err(libc::ENOENT)), root)
+        .unwrap();
+    assert!(!failed.removed && failed.writes.is_empty());
+    let directory = access
+        .observe(&unlinkat(b"d", libc::AT_REMOVEDIR, RetCode::Ok(0)), root)
+        .unwrap();
+    assert!(directory.removed);
+    assert_eq!(directory.writes, [PathBuf::from("d")]);
+
+    // A hard-link alias survives its sibling's removal but no longer reaches the removed name.
+    access
+        .aliases
+        .insert(Inode(1, 2), vec!["/work/a".into(), "/work/b".into()]);
+    let removed = access
+        .observe(&unlinkat(b"a", 0, RetCode::Ok(0)), root)
+        .unwrap();
+    assert!(removed.removed);
+    assert_eq!(removed.writes, [PathBuf::from("a")]);
+    assert_eq!(
+        access.observe(&read_fd(b"/work/b"), root).unwrap().reads,
+        [PathBuf::from("b")]
+    );
+
+    // Unlinking a final symlink removes the link's own resource, never its target.
+    access
+        .links
+        .insert(PathBuf::from("/work/alias"), PathBuf::from("actual"));
+    let link = access
+        .observe(&unlinkat(b"alias", 0, RetCode::Ok(0)), root)
+        .unwrap();
+    assert_eq!(link.writes, [PathBuf::from("alias")]);
+}
+
+#[test]
+fn a_removed_name_retires_its_cached_mappings() {
+    let root = Path::new("/work");
+    let mut access = Access::default();
+    access.observe(&shared_mapping(), root).unwrap();
+    access
+        .observe(&unlinkat(b"db", 0, RetCode::Ok(0)), root)
+        .unwrap();
+    assert!(access.observe(&protect_for_write(0x10000), root).is_err());
+    let unmap = info(
+        Sysno::munmap,
+        vec![SyscallArg::Addr(0x10000), SyscallArg::Int(8192)],
+        RetCode::Ok(0),
+    );
+    assert!(access.observe(&unmap, root).unwrap().writes.is_empty());
+}
+
+#[test]
+fn release_names_one_protected_entry_without_following_its_leaf() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("root");
+    std::fs::create_dir_all(root.join("real")).unwrap();
+    std::os::unix::fs::symlink(root.join("real"), root.join("dir")).unwrap();
+    std::os::unix::fs::symlink(root.join("real/file"), root.join("leaf")).unwrap();
+    let mut access = Access::default();
+    access.prepare(&root, false).unwrap();
+
+    let through = access.release(&root.join("dir/missing"), &root).unwrap();
+    assert_eq!(through.release, Some(PathBuf::from("real/missing")));
+    assert!(through.reads.is_empty() && through.writes.is_empty());
+    assert_eq!(
+        access.release(&root.join("leaf"), &root).unwrap().release,
+        Some(PathBuf::from("leaf"))
+    );
+    assert!(access.release(&root, &root).is_err());
+    assert!(
+        access
+            .release(&directory.path().join("outside"), &root)
+            .is_err()
+    );
+}
+
 #[test]
 fn symlink_lookups_track_both_lookup_and_resolved_resources() {
     let mut access = Access::default();

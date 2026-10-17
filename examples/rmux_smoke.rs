@@ -1080,8 +1080,6 @@ async fn prove_second_seed(
     let start = fixture.other("src");
     let start = start.to_str().ok_or("the fixture path is not UTF-8")?;
 
-    let wal = write_incompatible_wal(fixture)?;
-
     rmux(
         binary,
         socket,
@@ -1122,15 +1120,6 @@ async fn prove_second_seed(
         "the sibling seed publishes on its own: {}",
         describe(&published)
     );
-    // Storage opens lazily at the pane's first admitted span rather than during construction, so
-    // the incompatible log is observed only once a command on that seed has completed; by then
-    // the log holds that command's own frames and none of the incompatible ones.
-    let log = std::fs::read(&wal)?;
-    ensure!(
-        !log.windows(b"old-schema".len())
-            .any(|window| window == b"old-schema"),
-        "the pane's first admission replaced the incompatible log"
-    );
     ensure_eq!(
         std::fs::read(second.join("src").join("marker"))?,
         b"second",
@@ -1161,36 +1150,10 @@ async fn prove_second_seed(
     .await?;
     let shown: Vec<&str> = screen.lines().filter(|line| !line.is_empty()).collect();
     println!("[11] rmux -N -S … capture-pane -t {target} -> {shown:?}");
-    println!("[wal] incompatible startup WAL reset; pane publication succeeded");
+    println!("[wal] pane publication on the sibling seed succeeded");
 
     prove_first_seed_still_live(io, api, &first, &second, binary, socket).await?;
     prove_rmux_sibling(io, &b, &second, binary, socket).await
-}
-
-/// Writes the sibling seed's log as an old-schema record that recovery must discard, returning it.
-///
-/// The sibling seed's only live shell so far is an idle standalone peer that opens storage
-/// lazily, so the pane's first admission is the first to read this log: a complete record
-/// missing the `staging` every current `BEGIN` carries, which recovery must discard whole
-/// rather than refuse the pane.
-fn write_incompatible_wal(fixture: &Fixture) -> Result<PathBuf, Failure> {
-    let wal = fixture
-        .scratch
-        .path()
-        .join(marsh_btrfs::STATE_DIR)
-        .join("other/meta")
-        .join(marsh_wal::LOG_FILE);
-    std::fs::create_dir_all(wal.parent().ok_or("the log has no parent")?)?;
-    std::fs::write(
-        &wal,
-        concat!(
-            r#"{"op":"BEGIN","seq":1,"uid":"old-schema","op_count":0,"cmd":"old-schema","principal":"previous-owner","granted":[]}"#,
-            "\n",
-            r#"{"op":"END","seq":1}"#,
-            "\n",
-        ),
-    )?;
-    Ok(wal)
 }
 
 /// The API job still publishes into the first seed while the pane holds the second.
@@ -1513,8 +1476,8 @@ async fn pane_shell(
 
 /// The two concurrency verdicts, driven through real panes and real persistent shells.
 ///
-/// The first half is the reported conflict: one pane writes an unstaged file, another appends to
-/// it, and the pane must show a *capability denial* naming the owner's unstaged precondition —
+/// The first half is the reported conflict: one pane writes an unreleased file, another appends
+/// to it, and the pane must show a *capability denial* naming the owner's precondition —
 /// never an instruction to rerun. A conflicting read returns stale after one evaluation.
 async fn prove_capability_sync(
     io: &RmuxFrontend,

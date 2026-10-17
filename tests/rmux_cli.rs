@@ -435,6 +435,71 @@ async fn a_denied_write_fails_the_command_that_exited_zero() {
     host.shutdown().await;
 }
 
+/// Every public pane is managed even with no peer, so the embedded `release` builtin reaches
+/// durable authority: a one-shot write-and-release frees the file for the next owner, an
+/// unreleased write outlives its invocation, and a pane's lock is released only at that pane's
+/// own prompt — never by a fresh `-c` or a `run-shell` borrowing the pane's context.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn cli_release_is_durable_without_a_peer_and_owned_by_its_pane() {
+    let host = Host::shared().await;
+    let refused = async |line: &str| {
+        let outcome = host.run_cli(&["-c", line], b"").await;
+        assert_ne!(outcome.code, 0, "{line} is refused: {}", outcome.stderr);
+    };
+    let builtin = host.run_cli(&["-c", "type release"], b"").await;
+    assert!(
+        String::from_utf8_lossy(&builtin.stdout).contains("builtin"),
+        "release is a discoverable builtin: {}",
+        builtin.stderr
+    );
+
+    host.succeeds(
+        &["-c", "printf one > freed && release -- freed"],
+        "a one-shot write releases",
+    )
+    .await;
+    host.succeeds(&["-c", "printf kept > kept"], "an unreleased write")
+        .await;
+    host.succeeds(&["-c", "printf two > freed"], "the next owner writes")
+        .await;
+    assert_eq!(std::fs::read(host.seed("freed")).unwrap(), b"two");
+    refused("printf lost > kept").await;
+    for line in ["release", "release a b", "release -- kept"] {
+        refused(line).await;
+    }
+    host.succeeds(
+        &["-c", "printf dash > -dash && release -- -dash"],
+        "a dash-leading name",
+    )
+    .await;
+
+    let job = open_prompt(&host, "release-pane").await;
+    let line = "printf pane > pane-file";
+    let wrote = submit_typed(&host, "release-pane", &job, &[line, "Enter"], line).await;
+    assert_published(&wrote, line);
+    refused("release -- pane-file").await;
+    host.run_cli(
+        &[
+            "-N",
+            "run-shell",
+            "-t",
+            "release-pane",
+            "release -- pane-file",
+        ],
+        b"",
+    )
+    .await;
+    refused("printf lost > pane-file").await;
+    let line = "release -- pane-file";
+    let released = submit_typed(&host, "release-pane", &job, &[line, "Enter"], line).await;
+    assert_published(&released, line);
+    host.succeeds(&["-c", "printf next > pane-file"], "the pane released it")
+        .await;
+    assert_eq!(std::fs::read(host.seed("pane-file")).unwrap(), b"next");
+    host.shutdown().await;
+}
+
 /// Redirected stdin is relayed, EOF arrives as terminal EOF, and the last bytes are not lost.
 ///
 /// Three failure modes in one scenario, because they share a single ordering. If stdin were not

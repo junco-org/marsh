@@ -47,12 +47,22 @@ impl Host {
         Self::with(Arc::new(CopyTree::new())).await
     }
 
+    /// Binds a host whose library shells keep the default shared-source routing, so only the
+    /// production pane and helper entrypoints decide whether a CLI command is managed.
+    pub async fn shared() -> Self {
+        Self::serving(Arc::new(CopyTree::new()), marsh::SandboxPolicy::default()).await
+    }
+
     /// Binds a host over fresh seeds created through `fs`.
     ///
     /// The seam exists for the test that has to observe the daemon *mid*-teardown: the seeds are
     /// created through the same backend the host serves over, so a fixture can intercept a
     /// filesystem operation the engine's release performs.
     pub async fn with(fs: Arc<dyn Subvolumes>) -> Self {
+        Self::serving(fs, marsh::SandboxPolicy::allow()).await
+    }
+
+    async fn serving(fs: Arc<dyn Subvolumes>, policy: marsh::SandboxPolicy) -> Self {
         let scratch = tempfile::tempdir().expect("a scratch directory");
         // Siblings rather than parent and child: a nested tree would be reachable by walking up
         // out of the first seed, and the two would not be independent publication roots.
@@ -63,7 +73,16 @@ impl Host {
             // Each seed is its own work tree, so a shell's source root is the seed itself.
             git2::Repository::init(root).expect("initialize a seed work tree");
         }
-        let rmux = frontend(&socket, &seed, Arc::clone(&fs), "open an rmux frontend").await;
+        let rmux = rmux_server::test_support::open_frontend(
+            DaemonConfig::new(socket.clone()),
+            &seed,
+            ShellEnvironment::new(),
+            TerminalGeometry { rows: 24, cols: 80 },
+            Arc::clone(&fs),
+            policy,
+        )
+        .await
+        .expect("open an rmux frontend");
         Self {
             io: rmux.io(),
             rmux: Some(rmux),

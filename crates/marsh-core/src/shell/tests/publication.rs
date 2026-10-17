@@ -1,7 +1,7 @@
 //! Storage faults are tested privately; consumer Shell APIs expose only their typed verdicts.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use super::super::ShellErrorKind;
+use super::super::{EmptyPolicy, SandboxPolicy, Shell, ShellErrorKind};
 use super::{Fixture, accepted, close, refused, session};
 use marsh_btrfs::Subvolumes;
 use serial_test::serial;
@@ -11,70 +11,57 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 #[tokio::test]
 #[serial]
-async fn complete_bad_wal_records_reset_startup_without_changing_the_seed() {
-    let fixture = Fixture::new();
-    let owner = fixture.shell().await;
-    accepted(&owner, "printf first > first").await;
-    accepted(&owner, "printf second > second").await;
-    let log = fixture.log();
-    close(owner).await;
-    let original = std::fs::read(&log).unwrap();
-    let split = original.iter().position(|byte| *byte == b'\n').unwrap() + 1;
-    let mut corrupt = original[..split].to_vec();
-    corrupt.extend_from_slice(b"{not a complete valid record}\n");
-    corrupt.extend_from_slice(&original[split..]);
-    std::fs::write(&log, &corrupt).unwrap();
-    let reopened = fixture
-        .open()
-        .await
-        .expect("an undecodable startup log is reset");
-    assert_eq!(std::fs::read(&log).unwrap(), b"");
-    assert_eq!(std::fs::read(fixture.seed.join("first")).unwrap(), b"first");
-    assert_eq!(
-        std::fs::read(fixture.seed.join("second")).unwrap(),
-        b"second"
-    );
-    close(reopened).await;
+async fn complete_bad_wal_records_reject_startup_intact() {
+    for violation in ["undecodable line", "missing staging"] {
+        let fixture = Fixture::new();
+        let owner = fixture.shell().await;
+        accepted(&owner, "printf first > first").await;
+        accepted(&owner, "printf second > second").await;
+        let log = fixture.log();
+        close(owner).await;
+        let original = std::fs::read(&log).unwrap();
+        let split = original.iter().position(|byte| *byte == b'\n').unwrap() + 1;
+        let mut corrupt = if violation == "undecodable line" {
+            let mut corrupt = original[..split].to_vec();
+            corrupt.extend_from_slice(b"{not a complete valid record}\n");
+            corrupt
+        } else {
+            let mut begin: serde_json::Value = serde_json::from_slice(&original[..split]).unwrap();
+            begin.as_object_mut().unwrap().remove("staging").unwrap();
+            let mut corrupt = serde_json::to_vec(&begin).unwrap();
+            corrupt.push(b'\n');
+            corrupt
+        };
+        corrupt.extend_from_slice(&original[split..]);
+        std::fs::write(&log, &corrupt).unwrap();
+        assert!(fixture.open().await.is_err(), "{violation} is refused");
+        assert_eq!(std::fs::read(&log).unwrap(), corrupt, "{violation}");
+        assert_eq!(fixture.read("first"), "first");
+        assert_eq!(fixture.read("second"), "second");
+    }
 }
 
 #[tokio::test]
 #[serial]
-async fn missing_staging_at_startup_starts_a_fresh_usable_wal() {
+async fn shell_policy_selects_authorization_per_shell() {
     let fixture = Fixture::new();
-    let shell = fixture.shell().await;
-    accepted(&shell, "printf before > before").await;
-    close(shell).await;
-    let log = fixture.log();
-    let original = std::fs::read(&log).unwrap();
-    let split = original.iter().position(|byte| *byte == b'\n').unwrap() + 1;
-    let mut begin: serde_json::Value = serde_json::from_slice(&original[..split]).unwrap();
-    assert_eq!(begin["op"], "BEGIN");
-    begin
-        .as_object_mut()
-        .unwrap()
-        .remove("staging")
-        .expect("a current BEGIN names its staging");
-    let mut incompatible = serde_json::to_vec(&begin).unwrap();
-    incompatible.push(b'\n');
-    incompatible.extend_from_slice(&original[split..]);
-    std::fs::write(&log, &incompatible).unwrap();
-
-    let reopened = fixture
-        .open()
-        .await
-        .expect("an incompatible startup log is reset");
-    assert_eq!(std::fs::read(&log).unwrap(), b"");
-    assert_eq!(fixture.read("before"), "before");
-    accepted(&reopened, "printf recovered > recovered").await;
-    assert_eq!(fixture.read("recovered"), "recovered");
-    close(reopened).await;
-    let fresh = std::fs::read(&log).unwrap();
-
-    let reopened = fixture.open().await.expect("the fresh log recovers");
-    assert_eq!(std::fs::read(&log).unwrap(), fresh);
-    refused(&reopened, "printf blind > recovered").await;
-    assert_eq!(fixture.read("recovered"), "recovered");
-    close(reopened).await;
+    let owner = fixture.shell().await;
+    accepted(&owner, "cat src/a.txt > /dev/null; printf owned > src/a.txt").await;
+    let thief = fixture.shell().await;
+    refused(&thief, "printf stolen > src/a.txt").await;
+    assert_eq!(fixture.read("src/a.txt"), "owned");
+    let mut builder = Shell::builder()
+        .working_dir(fixture.seed.clone())
+        .sandbox_policy(SandboxPolicy::allow())
+        .shell_policy(Arc::new(EmptyPolicy));
+    builder.backend = Some(fixture.fs.clone());
+    let permissive = builder.build().await.unwrap();
+    accepted(&permissive, ":").await;
+    accepted(&permissive, "printf allowed > src/a.txt").await;
+    assert_eq!(fixture.read("src/a.txt"), "allowed");
+    close(permissive).await;
+    close(thief).await;
+    close(owner).await;
 }
 
 #[tokio::test]
@@ -83,7 +70,13 @@ async fn pre_intent_failure_preserves_exit_and_rolls_back_tentative_grants() {
     use super::super::policy::{Action, Event, Resource};
     use junco_policy::PolicyDecision;
     let fixture = Fixture::new();
-    let shell = fixture.shell().await;
+    let mut builder = Shell::builder()
+        .working_dir(fixture.seed.clone())
+        .sandbox_policy(SandboxPolicy::allow())
+        .shell_policy(Arc::new(EmptyPolicy));
+    builder.backend = Some(fixture.fs.clone());
+    let shell = builder.build().await.unwrap();
+    accepted(&shell, ":").await;
     // A live sibling keeps the source's in-memory authority across the failing shell's close.
     let sibling = fixture.shell().await;
     let validator = Arc::clone(&session(&sibling).await.validator);
@@ -298,13 +291,15 @@ async fn lease_child(source: PathBuf) {
 
 #[tokio::test]
 #[serial]
-async fn incompatible_ownership_metadata_resets_startup_without_changing_the_seed() {
+async fn incompatible_ownership_metadata_rejects_startup_intact() {
     const FILES: [&str; 3] = ["first", "second", "third"];
     for violation in [
         "missing principal",
         "missing grants",
         "empty principal",
         "obsolete ownership",
+        "stage",
+        "delete",
     ] {
         let fixture = Fixture::new();
         let shell = fixture.shell().await;
@@ -343,22 +338,21 @@ async fn incompatible_ownership_metadata_resets_startup_without_changing_the_see
             "obsolete ownership" => {
                 metadata.insert("durable_principal".into(), "another-owner".into());
             }
-            _ => unreachable!(),
+            removed => {
+                // Retired Git actions, including `delete`, are never reinterpreted as `remove`.
+                metadata["granted"][0]["action"] = removed.into();
+            }
         }
         let mut invalid = original[..start].to_vec();
         invalid.extend(serde_json::to_vec(&begin).unwrap());
         invalid.push(b'\n');
         invalid.extend_from_slice(&original[end..]);
         std::fs::write(&log, &invalid).unwrap();
-        let reopened = fixture
-            .open()
-            .await
-            .unwrap_or_else(|error| panic!("{violation}: {error}"));
-        assert_eq!(std::fs::read(&log).unwrap(), b"", "{violation}");
+        assert!(fixture.open().await.is_err(), "{violation} is refused");
+        assert_eq!(std::fs::read(&log).unwrap(), invalid, "{violation}");
         for name in FILES {
             assert_eq!(fixture.read(name), name);
         }
-        close(reopened).await;
     }
 }
 

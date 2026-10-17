@@ -366,6 +366,8 @@ pub(super) async fn spawn_popup_job(
                         geometry: Some(geometry),
                     },
                     environment: Some(environment),
+                    // Popups are public CLI shells: always managed, peer or not.
+                    force_sandbox: true,
                     ..SpawnOptions::default()
                 },
             )

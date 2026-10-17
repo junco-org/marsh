@@ -96,7 +96,7 @@ async fn prove_first_generation(
     let completion = tokio::time::timeout(
         limit,
         writer.run_command(
-            "printf owner > owned; printf staged > released; git add -- released; printf same > api-zero",
+            "printf owner > owned; printf released > released; release -- released; printf same > api-zero",
             CommandOptions::default(),
         ),
     )

@@ -62,12 +62,12 @@
 //! of display names, which may be reused when a pane closes or the daemon restarts. Reusing a
 //! name never lets the new shell inherit the last holder's stake.
 //!
-//! The consequence: a path left **unstaged** when the host shuts down stays owned by a principal
-//! that no longer exists. The policy admits only that owner for staging, checkout or stash, so
-//! after the restart no one can edit it — the denial names the same principal with no live shell.
-//! Staging a path before shutdown releases it. An application that opens jobs which leave work
-//! unstaged should therefore treat "stage or discard before shutdown" as part of its teardown,
-//! not as housekeeping it can skip.
+//! The consequence: a path left **unreleased** when the host shuts down stays owned by a
+//! principal that no longer exists. Only that owner may edit, remove or release it, so after the
+//! restart no one can edit it — the denial names the same principal with no live shell. Running
+//! `release -- PATH` in the owning shell before shutdown releases it; deleting the path does too.
+//! An application that opens jobs which leave work unreleased should therefore treat "release or
+//! discard before shutdown" as part of its teardown, not as housekeeping it can skip.
 //!
 //! "Approved" also means marsh's publication gate rather than OS confinement. The daemon's own
 //! socket, pseudoterminal allocation, IPC framing and write-ahead-log handling are trusted

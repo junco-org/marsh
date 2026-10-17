@@ -12,14 +12,13 @@ pub mod rmux;
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
 use std::os::fd::OwnedFd;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use marsh::shellmux::{CommandCompletion, CommandOptions, RunError};
 use marsh::{
     ExecutionResult, OpenFile, SandboxPolicy, Shell, ShellBuilder, ShellError, ShellErrorKind,
-    ShellVariable,
 };
 use marsh_btrfs::fake::CopyTree;
 use tempfile::TempDir;
@@ -98,7 +97,7 @@ pub async fn status(shell: &Shell, line: &str) -> u8 {
 }
 
 /// A canonicalized `source` directory under a fresh scratch root, which is kept alive by the
-/// returned guard. Canonical, because the git builtin compares it against the repository root.
+/// returned guard.
 pub fn scratch() -> (TempDir, PathBuf) {
     let root = tempfile::tempdir().expect("scratch directory");
     let source = root
@@ -259,84 +258,4 @@ pub async fn join(
         .await
         .expect("owned operation completes")
         .expect("operation task")
-}
-
-/// The git identity variables a reproducible commit pins, for the author and the committer alike.
-const IDENTITY: [(&str, &str); 3] = [
-    ("NAME", "Test"),
-    ("EMAIL", "test@example.com"),
-    ("DATE", "1112911993 +0000"),
-];
-
-/// Every git identity variable's name, with the value a reproducible commit pins it to.
-fn identities() -> impl Iterator<Item = (String, &'static str)> {
-    ["AUTHOR", "COMMITTER"].into_iter().flat_map(|who| {
-        IDENTITY
-            .into_iter()
-            .map(move |(suffix, value)| (format!("GIT_{who}_{suffix}"), value))
-    })
-}
-
-/// Builds a normal managed shell in `dir`, registered as the root of its own test filesystem.
-///
-/// A commit is only reproducible when both identities and the timestamp are pinned, and git reads
-/// them from the environment the shell exports; without `pinned` the shell has none of them.
-pub async fn git_shell(dir: &Path, pinned: bool) -> Shell {
-    let filesystem = Arc::new(CopyTree::new());
-    filesystem.register(dir);
-    let shell = marsh_core::test_support::shell_builder(filesystem)
-        .working_dir(dir.to_path_buf())
-        .sandbox_policy(SandboxPolicy::allow())
-        .build()
-        .await
-        .expect("build shell");
-    if pinned {
-        for (name, value) in identities() {
-            export(&shell, &name, value).await;
-        }
-    } else {
-        unset_identity(&shell).await;
-    }
-    shell
-}
-
-/// Unsets every git identity variable in the shell's environment.
-pub async fn unset_identity(shell: &Shell) {
-    for (name, _) in identities() {
-        shell
-            .run(&format!("unset {name}"))
-            .await
-            .expect("unset identity");
-    }
-}
-
-/// Exports one variable into the shell's environment.
-pub async fn export(shell: &Shell, name: &str, value: &str) {
-    let mut variable = ShellVariable::new(value);
-    variable.export();
-    shell.set_var(name, variable).await.expect("set variable");
-}
-
-/// A repository whose root commit is empty, built through libgit2 rather than through the builtin.
-///
-/// `git commit -- <path>` is a *partial* commit, which the CLI refuses on an unborn branch
-/// ("fatal: could not resolve 'HEAD'") and so does the builtin. The fixture therefore has to give
-/// HEAD something to be.
-pub fn init_repository(work: &Path) {
-    let repository = git2::Repository::init(work).expect("init a repository");
-    let who = git2::Signature::new(
-        "Test",
-        "test@example.com",
-        &git2::Time::new(1_112_911_993, 0),
-    )
-    .expect("signature");
-    let empty = repository
-        .index()
-        .expect("index")
-        .write_tree()
-        .expect("write the empty tree");
-    let tree = repository.find_tree(empty).expect("find the empty tree");
-    repository
-        .commit(Some("HEAD"), &who, &who, "root\n", &tree, &[])
-        .expect("root commit");
 }

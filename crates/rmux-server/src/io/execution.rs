@@ -577,6 +577,8 @@ impl ShellIo {
                     SpawnOptions {
                         io: JobIo::Pipes,
                         environment: spec.environment,
+                        // Helpers are public CLI shells: always managed, peer or not.
+                        force_sandbox: true,
                         ..SpawnOptions::default()
                     },
                 )

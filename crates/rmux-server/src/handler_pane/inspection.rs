@@ -542,7 +542,7 @@ impl RequestHandler {
         let attached_count = self.attached_count(&session_name).await;
 
         let (expanded, duration, display_session_id) = {
-            let mut state = self.state.lock().await;
+            let state = self.state.lock().await;
             if exact_target_client_session
                 .as_ref()
                 .is_some_and(|(expected_name, expected_id)| {
@@ -581,9 +581,6 @@ impl RequestHandler {
                         "target pane changed before message delivery".to_owned(),
                     ),
                 });
-            }
-            if let Err(error) = state.refresh_format_target_exit_status(&context_target) {
-                return Response::Error(ErrorResponse { error });
             }
             let (format_session, mut context) =
                 match display_message_context(&state, &context_target, attached_count) {
@@ -715,12 +712,7 @@ impl RequestHandler {
             let active_attach = self.active_attach.lock().await;
             active_attach.attached_count(&request.target)
         };
-        let mut state = self.state.lock().await;
-        if let Err(error) =
-            state.refresh_list_panes_exit_statuses(&request.target, request.target_window_index)
-        {
-            return Response::Error(ErrorResponse { error });
-        }
+        let state = self.state.lock().await;
         let Some(session) = state.sessions.session(&request.target) else {
             return Response::Error(ErrorResponse {
                 error: session_not_found(&request.target),

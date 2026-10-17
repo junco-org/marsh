@@ -155,33 +155,64 @@ async fn startup_reconciliation_preserves_other_paths() {
     close(next).await;
 }
 
-/// A deletion marsh published is no deletion behind its back: the removal and the grant that
-/// allowed it stay, and so does the deleting shell's claim on the path.
+/// A logged removal releases the removed name: after reopen another shell recreates it without a
+/// read of what no longer exists, even where create-then-remove left no diff at all. A name
+/// recreated after its removal stays owned, and a challenger cannot remove a foreign-owned file
+/// to clear its claims.
 #[tokio::test]
 #[serial]
-async fn startup_reconciliation_preserves_logged_deletions() {
+async fn startup_reconciliation_releases_logged_deletions() {
     let fixture = Fixture::new();
     let owner = fixture.shell().await;
-    accepted(&owner, "rm src/a.txt").await;
+    accepted(
+        &owner,
+        "rm src/a.txt; printf x > tmp; rm tmp; mkdir d; rmdir d; printf one > kept; rm kept; printf two > kept",
+    )
+    .await;
+    let challenger = fixture.shell().await;
+    refused(&challenger, "rm kept").await;
+    assert_eq!(fixture.read("kept"), "two");
+    close(challenger).await;
     close(owner).await;
 
     let next = fixture.shell().await;
-    refused(&next, "mkdir -p src; printf other > src/a.txt").await;
-    assert!(!fixture.seed.join("src/a.txt").exists());
-    let transactions = fixture.transactions();
-    assert!(
-        transactions.iter().any(|(_, operations, grants)| operations
-            .contains(&"DELETE src/a.txt".to_owned())
-            && grants.contains(&"Edit src/a.txt".to_owned())),
-        "the logged removal and its grant stay: {transactions:?}"
-    );
+    accepted(
+        &next,
+        "mkdir -p src; printf other > src/a.txt; printf other > tmp; mkdir d",
+    )
+    .await;
+    assert_eq!(fixture.read("src/a.txt"), "other");
+    refused(&next, "printf other > kept").await;
+    assert_eq!(fixture.read("kept"), "two");
     close(next).await;
 }
 
-/// A grant names a path no operation of its transaction does — a stage writes only `.git/index` —
-/// and it is reconciled all the same: a grant over a deleted path is dropped, a grant over a
-/// present one stays in force, and a transaction whose operations all went keeps its surviving
-/// grants in a frame of no operations.
+/// An explicit release is durable across reopen, changes no bytes and keeps the last reader's
+/// claim: a third shell must read before it may edit.
+#[tokio::test]
+#[serial]
+async fn startup_keeps_explicit_releases() {
+    let fixture = Fixture::new();
+    let owner = fixture.shell().await;
+    let reader = fixture.shell().await;
+    accepted(&owner, "printf mine > kept").await;
+    accepted(&reader, "cat kept >/dev/null").await;
+    accepted(&owner, "release -- kept").await;
+    assert_eq!(fixture.read("kept"), "mine");
+    close(reader).await;
+    close(owner).await;
+
+    let next = fixture.shell().await;
+    refused(&next, "printf other > kept").await;
+    accepted(&next, "cat kept >/dev/null; printf other > kept").await;
+    assert_eq!(fixture.read("kept"), "other");
+    close(next).await;
+}
+
+/// A grant names a path no operation of its transaction does — an explicit release writes
+/// nothing — and it is reconciled all the same: a grant over a deleted path is dropped, a grant
+/// over a present one stays in force, and a transaction whose operations all went keeps its
+/// surviving grants in a frame of no operations.
 #[tokio::test]
 #[serial]
 async fn startup_reconciliation_includes_grant_only_paths() {

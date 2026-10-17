@@ -5,14 +5,12 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
-use super::builtins::gitcmd::GitAction;
 use super::completion::{Completion, Finalize};
 use super::execution::ExecutedCommand;
 use super::session::{Authority, Session};
 use super::{ShellError, ShellErrorKind};
 pub(super) use junco_policy::{Action, Principal, Resource};
-use junco_policy::{Bump, GitPolicy};
-pub use junco_policy::{Event, PolicyDecision};
+pub use junco_policy::{Bump, Event, PolicyDecision};
 use marsh_lib::RecoverPoison as _;
 use marsh_wal::CommitOp;
 
@@ -54,6 +52,42 @@ impl std::fmt::Display for Denial {
     }
 }
 
+/// Immutable authorization configuration selected per shell. Marsh calls [`Policy::evaluator`]
+/// once per command batch and owns everything around it: observer notification, append-on-grant,
+/// denial collection, rollback, freshness, and publication. The evaluator only decides.
+pub trait Policy: Send + Sync + 'static {
+    /// Fresh decision state for one batch; `arena` outlives it.
+    fn evaluator<'batch>(
+        &'batch self,
+        arena: &'batch Bump,
+    ) -> Box<dyn FnMut(&[Event], &Event) -> PolicyDecision + 'batch>;
+}
+
+/// The ownership-lock capability policy: a shell's default.
+#[derive(Debug, Default)]
+pub struct LockPolicy;
+impl Policy for LockPolicy {
+    fn evaluator<'batch>(
+        &'batch self,
+        arena: &'batch Bump,
+    ) -> Box<dyn FnMut(&[Event], &Event) -> PolicyDecision + 'batch> {
+        let mut evaluator = junco_policy::LockPolicy::new(arena);
+        Box::new(move |history, event| evaluator.decide(history, event))
+    }
+}
+
+/// Grants every capability. Snapshots, freshness, history, and publication still apply.
+#[derive(Debug, Default)]
+pub struct EmptyPolicy;
+impl Policy for EmptyPolicy {
+    fn evaluator<'batch>(
+        &'batch self,
+        _arena: &'batch Bump,
+    ) -> Box<dyn FnMut(&[Event], &Event) -> PolicyDecision + 'batch> {
+        Box::new(|_, _| PolicyDecision::Grant)
+    }
+}
+
 /// One source's policy authority: its committed capability history and ledger ordering, shared by
 /// every shell on that source and by routing predicates that query it.
 pub struct PolicyValidator {
@@ -68,8 +102,9 @@ impl PolicyValidator {
             revision: AtomicU64::new(0),
         }
     }
-    /// What the policy would decide for `event` against the committed history, without adopting
-    /// it. Resources name seed-relative paths, exactly as managed authorization does.
+    /// What the lock policy would decide for `event` against the shared committed history,
+    /// without adopting it. Resources name seed-relative paths, exactly as managed authorization
+    /// does. This is a lock-policy query, not the selected shell's publication policy.
     pub fn decide(&self, event: &Event) -> Result<PolicyDecision, ShellError> {
         let authority = self.read();
         if authority.recovery_required {
@@ -78,7 +113,7 @@ impl PolicyValidator {
             ));
         }
         let arena = Bump::new();
-        let mut policy = GitPolicy::new(&arena);
+        let mut policy = junco_policy::LockPolicy::new(&arena);
         let decision = policy.decide(&authority.history, event);
         drop(authority);
         Ok(decision)
@@ -104,15 +139,16 @@ impl PolicyValidator {
 impl Authority {
     fn check(
         &mut self,
+        shell_policy: &dyn Policy,
         events: &[Event],
         observer: Option<&PolicyObserver>,
     ) -> Result<(), Vec<Denial>> {
         let arena = Bump::new();
-        let mut policy = GitPolicy::new(&arena);
+        let mut decide = shell_policy.evaluator(&arena);
         let checkpoint = self.history.len();
         let mut denials = Vec::new();
         for event in events {
-            let decision = policy.decide(&self.history, event);
+            let decision = decide(&self.history, event);
             if let Some(observer) = observer {
                 observer.notify(event, &decision);
             }
@@ -164,6 +200,7 @@ impl Finalize for AuthorizedCommand<'_> {
 pub(super) fn authorize<'session>(
     session: &'session Session,
     mut executed: ExecutedCommand,
+    shell_policy: &dyn Policy,
     observer: Option<&PolicyObserver>,
 ) -> Result<Completion<AuthorizedCommand<'session>>, ShellError> {
     // Every refusal carries the native status the command already produced.
@@ -202,7 +239,7 @@ pub(super) fn authorize<'session>(
         let events = translate(&executed)?;
         let checkpoint = guard.history.len();
         guard
-            .check(&events, observer)
+            .check(shell_policy, &events, observer)
             .map_err(|denials| ShellError::new(ShellErrorKind::Denied { denials }))?;
         Ok((guard, operations, events, checkpoint))
     })();
@@ -221,7 +258,7 @@ pub(super) fn authorize<'session>(
 fn preflight(executed: &ExecutedCommand, operations: &[CommitOp]) -> Result<(), ShellError> {
     use std::os::unix::fs::MetadataExt;
     for operation in operations {
-        let covered = executed.evidence.effects.iter().any(|(_, _, effect)| {
+        let covered = executed.evidence.effects.iter().any(|(_, effect)| {
             effect.writes.iter().any(|path| path == operation.path())
                 || effect
                     .recursive_writes
@@ -253,7 +290,7 @@ fn preflight(executed: &ExecutedCommand, operations: &[CommitOp]) -> Result<(), 
 
 fn stale_paths(executed: &ExecutedCommand, authority: &Authority) -> Vec<PathBuf> {
     let mut stale = std::collections::BTreeSet::new();
-    for (_, _, effects) in &executed.evidence.effects {
+    for (_, effects) in &executed.evidence.effects {
         for (changed, sequence) in &authority.versions {
             if *sequence <= executed.prepared.tree_seq {
                 continue;
@@ -277,63 +314,26 @@ fn stale_paths(executed: &ExecutedCommand, authority: &Authority) -> Vec<PathBuf
     stale.into_iter().collect()
 }
 
+/// The run's effects as one ordered capability batch for the shell's policy principal: a read
+/// claims, a write edits, a successful removal removes and an explicit release releases, each at
+/// its own entry order. A repeated action on a resource collapses into its first.
 fn translate(executed: &ExecutedCommand) -> Result<Vec<Event>, ShellError> {
-    let principal = &executed.prepared.snapshot.uid;
+    let principal = &executed.prepared.snapshot.owner;
     let mut ordered = Vec::new();
-    for (order, builtin, effects) in &executed.evidence.effects {
-        let semantic = builtin.and_then(|id| {
-            executed
-                .evidence
-                .git
-                .iter()
-                .find(|git| git.invocation == id)
-        });
+    for (order, effects) in &executed.evidence.effects {
         for path in &effects.reads {
             ordered.push((*order, Action::Read, path.as_path()));
         }
+        let write = if effects.removed {
+            Action::Remove
+        } else {
+            Action::Edit
+        };
         for path in &effects.writes {
-            let metadata = path
-                .components()
-                .any(|component| component.as_os_str() == ".git");
-            if metadata {
-                if semantic
-                    .is_none_or(|git| !git.metadata.iter().any(|root| path.starts_with(root)))
-                {
-                    return Err(ShellError::unsupported(
-                        "repository metadata changed outside a successful managed git invocation",
-                    ));
-                }
-                continue;
-            }
-            if semantic.is_some_and(|git| {
-                git.requests.iter().any(|(action, resource)| {
-                    resource == path && capability_of(action.clone()).is_write()
-                })
-            }) {
-                continue;
-            }
-            ordered.push((*order, Action::Edit, path.as_path()));
+            ordered.push((*order, write.clone(), path.as_path()));
         }
-    }
-    for git in &executed.evidence.git {
-        // An ordinary concurrent write inside an invocation's native interval has no causal
-        // ordering relative to its semantic action, so it cannot be granted by inventing one.
-        for (order, builtin, effects) in &executed.evidence.effects {
-            if *order > git.started_order
-                && *order < git.finished_order
-                && *builtin != Some(git.invocation)
-                && effects
-                    .writes
-                    .iter()
-                    .any(|path| git.requests.iter().any(|(_, requested)| requested == path))
-            {
-                return Err(ShellError::unsupported(
-                    "unordered git and ordinary writes overlap",
-                ));
-            }
-        }
-        for (action, path) in &git.requests {
-            ordered.push((git.finished_order, capability_of(action.clone()), path));
+        if let Some(path) = &effects.release {
+            ordered.push((*order, Action::Release, path.as_path()));
         }
     }
     ordered.sort_by_key(|(order, _, _)| *order);
@@ -352,21 +352,6 @@ fn translate(executed: &ExecutedCommand) -> Result<Vec<Event>, ShellError> {
     Ok(events)
 }
 
-pub(super) fn capability_of(action: GitAction) -> Action {
-    match action {
-        GitAction::Stage => Action::Stage,
-        GitAction::Delete => Action::Delete,
-        GitAction::Commit { message } => Action::Commit { message },
-        GitAction::Unstage => Action::Unstage,
-        GitAction::Checkout => Action::Checkout,
-        GitAction::Stash => Action::Stash,
-        GitAction::Clean => Action::Clean,
-        GitAction::Diff => Action::Diff,
-        GitAction::History => Action::History,
-        GitAction::Read => Action::Read,
-        GitAction::Edit => Action::Edit,
-    }
-}
 pub(super) fn resource_of(path: &Path) -> Result<Option<Resource>, ShellError> {
     if path.as_os_str().is_empty() {
         return Ok(None);
@@ -379,9 +364,6 @@ pub(super) fn resource_of(path: &Path) -> Result<Option<Resource>, ShellError> {
         let component = component
             .to_str()
             .ok_or_else(|| ShellError::unsupported("non-UTF-8 policy resource"))?;
-        if component == ".git" {
-            return Ok(None);
-        }
         segments.push(component.to_owned());
     }
     Ok(Some(Resource::from(segments)))

@@ -14,7 +14,7 @@ use marsh_wal::{CommitOp, Seq};
 use super::completion::{Completion, Finalize};
 use super::execution::Run;
 use super::policy::{
-    Action, Event, PolicyObserver, PolicyValidator, Principal, Resource, resource_of,
+    Action, Event, Policy, PolicyObserver, PolicyValidator, Principal, Resource, resource_of,
 };
 use super::sandbox_policy::{CommandContext, SandboxPolicy};
 use super::snapshot::{CommandNumber, Snapshot};
@@ -27,8 +27,9 @@ static CHANGED: tokio::sync::Notify = tokio::sync::Notify::const_new();
 static FILESYSTEM: LazyLock<Arc<dyn Subvolumes>> = LazyLock::new(|| Arc::new(LibBtrfs));
 static IDENTITIES: AtomicU64 = AtomicU64::new(1);
 
-/// Creates an opaque owner unrelated to the shell's user-facing name.
-pub(super) fn fresh_principal() -> Result<Principal, ShellError> {
+/// Creates an opaque principal unrelated to any user-facing name: a shell's uid, or a policy
+/// owner a trusted caller shares across shells.
+pub fn fresh_principal() -> Result<Principal, ShellError> {
     let next = IDENTITIES
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
             value.checked_add(1)
@@ -44,21 +45,15 @@ pub(super) fn fresh_principal() -> Result<Principal, ShellError> {
     )))
 }
 
-/// Serde operates directly on Junco's action, without a second runtime vocabulary.
+/// Serde operates directly on Junco's action, without a second runtime vocabulary. A log naming
+/// any other action is incompatible and refused whole at recovery.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(remote = "Action", rename_all = "lowercase")]
 enum ActionSerde {
     Read,
     Edit,
-    Stage,
-    Unstage,
-    Commit { message: Option<String> },
-    Checkout,
-    Stash,
-    Delete,
-    Clean,
-    Diff,
-    History,
+    Release,
+    Remove,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -505,8 +500,8 @@ impl SourceDomain {
                     .map(|grant| Event::new(meta.principal.clone(), grant.action, grant.resource)),
             );
         }
-        // Recovery validated every frame, or discarded an undecodable log whole, before any
-        // resource can be swept.
+        // Recovery validated every frame, refusing an undecodable log whole, before any resource
+        // can be swept.
         match std::fs::read_dir(persistence.snap()) {
             Ok(entries) => {
                 for entry in entries {
@@ -563,13 +558,18 @@ fn policy_root(directory: &Path) -> Result<PathBuf, ShellError> {
 /// A shell's persistent execution resources and its live-membership registration.
 pub(super) struct ExecutionResources {
     pub domain: Arc<SourceDomain>,
+    /// The shell instance's uid: its registry membership, view and ledger identity.
     pub principal: Principal,
+    /// The policy principal its managed commands act as.
+    pub owner: Principal,
     registered: bool,
     pub policy: SandboxPolicy,
     /// The managed view, while this shell is in one.
     pub snapshot: Option<Arc<Snapshot>>,
     pub coverage: PathBuf,
     serial: u64,
+    /// The authorization policy every managed command of this shell is checked against.
+    pub shell_policy: Arc<dyn Policy>,
     /// Notified of every capability decision this shell's commands reach.
     pub policy_observer: Option<Arc<PolicyObserver>>,
 }
@@ -578,17 +578,21 @@ impl ExecutionResources {
         domain: Arc<SourceDomain>,
         coverage: PathBuf,
         principal: Principal,
+        owner: Principal,
         policy: SandboxPolicy,
+        shell_policy: Arc<dyn Policy>,
         policy_observer: Option<Arc<PolicyObserver>>,
     ) -> Self {
         Self {
             domain,
             principal,
+            owner,
             registered: false,
             policy,
             snapshot: None,
             coverage,
             serial: 1,
+            shell_policy,
             policy_observer,
         }
     }
