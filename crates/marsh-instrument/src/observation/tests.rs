@@ -558,6 +558,125 @@ fn held_stops() {
     assert_eq!(failed.err().unwrap().to_string(), UNCLASSIFIED);
 }
 
+fn creation_event_classifies_before_creator_exit(directory: &Path) {
+    let script = r#"
+import os, sys
+sys.stdin.readline()
+pid = os.fork()
+if pid == 0:
+    with open(sys.argv[1], "xb") as output:
+        output.write(b"native-child")
+    os._exit(0)
+os.waitpid(pid, 0)
+"#;
+    let mut runs = Vec::new();
+    for killed in [false, true] {
+        let fixture_path = directory.join(if killed {
+            "creation-killed"
+        } else {
+            "creation-normal"
+        });
+        let mut creator = None;
+        let mut events = Vec::new();
+        let mut held = HashSet::new();
+        let mut seen = HashSet::new();
+        let mut created = HashSet::new();
+        let mut signal = None;
+        let result = observe_with(
+            Command::new("python3")
+                .args(["-c", script])
+                .arg(&fixture_path),
+            |delivery| {
+                let root = *creator.get_or_insert(delivery.tid);
+                let mut resume = Resume::default();
+                if let WaitStatus::PtraceEvent(_, _, code) = delivery.status
+                    && creation(code)
+                    && let Some(child) = delivery.event
+                {
+                    events.push((
+                        delivery.tid,
+                        child,
+                        delivery.sequence,
+                        delivery.call.is_some(),
+                    ));
+                    if let Ok(child) = i32::try_from(child) {
+                        let child = Pid::from_raw(child);
+                        created.insert(child);
+                        if held.remove(&child) {
+                            resume.release.push(child);
+                        }
+                    }
+                    if killed {
+                        signal = Some(nix::sys::signal::kill(root, Signal::SIGKILL));
+                    }
+                }
+                if seen.insert(delivery.tid)
+                    && delivery.tid != root
+                    && !created.contains(&delivery.tid)
+                    && !matches!(
+                        delivery.status,
+                        WaitStatus::Exited(..) | WaitStatus::Signaled(..)
+                    )
+                {
+                    held.insert(delivery.tid);
+                    resume.hold_current = true;
+                }
+                resume
+            },
+        );
+        println!(
+            "creation-event killed={killed} creator={creator:?} events={events:?} signal={signal:?} observed={}",
+            result.is_ok()
+        );
+        runs.push((killed, fixture_path, creator, events, signal, held, result));
+    }
+    for (killed, fixture_path, creator, events, signal, held, result) in runs {
+        let trace = result.expect("creation-event observation must complete and reap every task");
+        assert!(held.is_empty());
+        assert_eq!(events.len(), 1);
+        let (parent, child, sequence, completed) = events[0];
+        assert_eq!(Some(parent), creator);
+        if killed {
+            assert_eq!(signal, Some(Ok(())));
+        }
+        assert!(
+            completed,
+            "missing completed creating call on creation-event delivery (killed={killed})"
+        );
+        let calls: Vec<_> = trace
+            .calls()
+            .filter(|call| {
+                call.info.pid == parent
+                    && matches!(
+                        call.info.syscall,
+                        Sysno::clone | Sysno::clone3 | Sysno::fork | Sysno::vfork
+                    )
+            })
+            .collect();
+        assert_eq!(
+            calls.len(),
+            1,
+            "one completion, including after ordinary syscall exit"
+        );
+        let returned = match calls[0].info.result {
+            RetCode::Ok(value) => u64::try_from(value).unwrap(),
+            RetCode::Address(value) => u64::try_from(value).unwrap(),
+            ref other => panic!("creation failed: {other:?}"),
+        };
+        assert_eq!(returned, child);
+        assert_eq!(trace.sequence(calls[0]), sequence);
+        let effect = trace.open(&fixture_path);
+        assert_eq!(u64::try_from(effect.info.pid.as_raw()).unwrap(), child);
+        assert!(sequence < trace.sequence(effect));
+        assert_eq!(std::fs::read(&fixture_path).unwrap(), b"native-child");
+        if !killed {
+            assert!(trace.0.iter().any(|delivery| delivery.tid == parent
+                && delivery.sequence > sequence
+                && matches!(delivery.status, WaitStatus::PtraceSyscall(_))));
+        }
+    }
+}
+
 #[test]
 fn native_observer_regressions() {
     match std::env::var("MARSH_OBSERVER_SCENARIO").as_deref() {
@@ -575,6 +694,7 @@ fn native_observer_regressions() {
             missing_upstream_roles(directory.path());
             memory_at_page_edges();
             held_stops();
+            creation_event_classifies_before_creator_exit(directory.path());
             println!("native observer scenarios completed");
             return;
         }

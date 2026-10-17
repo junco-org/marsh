@@ -159,6 +159,28 @@ impl State {
                 .any(|thread| thread.classify_after == Some(entry));
         if orphaned {
             if !cancelled {
+                if std::env::var("MARSH_NATIVE_OBSERVER_DEBUG").as_deref() == Ok("1") {
+                    let mut children: Vec<_> = self
+                        .threads
+                        .iter()
+                        .filter(|(_, thread)| thread.classify_after == Some(entry))
+                        .collect();
+                    children.sort_unstable_by_key(|(tid, _)| **tid);
+                    eprintln!(
+                        "native-acceptance origin=retire-orphan creator={} entry={} cancelled={} deferred={} children={}",
+                        tid,
+                        entry,
+                        cancelled,
+                        self.deferred.get(&entry).map_or(0, Vec::len),
+                        children.len()
+                    );
+                    for (child, thread) in children.into_iter().take(32) {
+                        eprintln!(
+                            "native-acceptance origin=retire-orphan child={} known_parent={} classify_after={:?}",
+                            child, thread.known_parent, thread.classify_after
+                        );
+                    }
+                }
                 return Err(io::Error::other(UNCLASSIFIED));
             }
             // Cancelled work publishes nothing: drop what can never be ordered.
@@ -684,7 +706,22 @@ impl Tracing {
         {
             let child = Self::event_thread(event, "missing child identity")?;
             let early = Self::adopt(&mut state, tid, child)?;
+            let info =
+                info.ok_or_else(|| io::Error::other("native completion lacks attribution entry"))?;
+            let (entry, run) = state
+                .threads
+                .get_mut(&tid)
+                .and_then(|thread| thread.pending.take())
+                .ok_or_else(|| io::Error::other("native completion lacks attribution entry"))?;
+            if entry != info.entry_order {
+                return Err(io::Error::other("native completion entry mismatch"));
+            }
             drop(state);
+            // Adoption needs the pending entry; classification must precede child replay.
+            // An upstream creator may still defer this call and all its descendants.
+            if let Some(run) = run {
+                self.classify(run, info)?;
+            }
             let mut held = false;
             for (sequence, status, event, info) in early {
                 let replay = self.deliver(sequence, child, status, event, info)?;

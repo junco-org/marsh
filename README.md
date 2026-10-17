@@ -57,6 +57,12 @@ and reaps the command's whole process tree. The interpreter's own filesystem acc
 records in the same vocabulary. A launch the tracer cannot seize never runs, and failed
 observation fails closed. No trace spool, sysctl changes or fallback tracer is involved.
 
+A validated kernel fork/vfork/clone event completes the captured creating call with its child
+identity before child stops are replayed. The ordinary syscall exit does not complete it again;
+the creator may die before that exit. Attribution can still defer the call and its descendants
+behind an upstream creator. Missing creation evidence and genuinely unreleased children remain
+fail-closed. `marsh-instrument`'s isolated observer regression covers normal and killed creators.
+
 `io_uring` operations bypass per-operation syscalls, so at every `io_uring_enter` stop the tracer
 reads the opcodes pending in that ring's submission queue. A ring is accepted only without a
 kernel submission thread (`IORING_SETUP_SQPOLL`) and while every submission has no filesystem

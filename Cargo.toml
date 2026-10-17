@@ -189,3 +189,6 @@ redundant_pub_crate = "allow"
 result_large_err = "allow"
 similar_names = "allow"
 struct_excessive_bools = "allow"
+
+[patch."https://github.com/junco-org/junco-policy.git"]
+junco-policy = { path = "/home/eioannidis/git/junco-policy-native-debug" }

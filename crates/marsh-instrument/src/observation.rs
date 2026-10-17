@@ -190,6 +190,28 @@ impl Observer {
     pub(crate) fn run(&mut self, observe: &mut Observe<'_>) -> io::Result<()> {
         loop {
             if !self.held.is_empty() && self.tasks.keys().all(|tid| self.held.contains_key(tid)) {
+                if std::env::var("MARSH_NATIVE_OBSERVER_DEBUG").as_deref() == Ok("1") {
+                    let mut tids: Vec<_> = self.held.keys().copied().collect();
+                    tids.sort_unstable();
+                    eprintln!(
+                        "native-acceptance origin=all-held root={} total={} held={} tids={:?}",
+                        self.root,
+                        self.tasks.len(),
+                        self.held.len(),
+                        &tids[..tids.len().min(32)]
+                    );
+                    for tid in tids.iter().take(32) {
+                        if let Some(task) = self.tasks.get(tid) {
+                            eprintln!(
+                                "native-acceptance origin=all-held tid={} in_syscall={} entry={:?} syscall={:?}",
+                                tid,
+                                task.in_syscall,
+                                task.entry.as_ref().map(|entry| entry.order),
+                                task.entry.as_ref().map(|entry| entry.syscall)
+                            );
+                        }
+                    }
+                }
                 return Err(io::Error::other(UNCLASSIFIED));
             }
             let Some((tid, status)) = wait_any()? else {
@@ -232,8 +254,8 @@ impl Observer {
         }
     }
 
-    /// Applies a lifecycle stop to the task table, returning its message.
-    fn lifecycle(&mut self, tid: Pid, code: i32) -> io::Result<Option<u64>> {
+    /// Applies a lifecycle stop, completing a creating call at its kernel creation event.
+    fn lifecycle(&mut self, tid: Pid, code: i32) -> io::Result<(Option<u64>, Option<Syscall>)> {
         let message = event_message(tid, code)?;
         let exec = code == Event::PTRACE_EVENT_EXEC as i32;
         if exec && tid == self.root {
@@ -253,13 +275,40 @@ impl Observer {
             None => {}
         }
         let task = self.tasks.entry(tid).or_default();
+        let call = if creation(code)
+            && let Some(child) = other
+        {
+            let entry = task
+                .entry
+                .take()
+                .filter(|entry| {
+                    matches!(
+                        entry.syscall,
+                        Sysno::clone | Sysno::clone3 | Sysno::fork | Sysno::vfork
+                    )
+                })
+                .ok_or_else(|| {
+                    io::Error::other("native creation event lacks a matching creating syscall")
+                })?;
+            // The validated kernel identity proves success even if the creator never returns.
+            // Keep in_syscall set until its ordinary exit stop, which must not complete twice.
+            Some(entry.capture.complete(
+                tid,
+                entry.syscall,
+                successful_result(u64::from(child.as_raw().cast_unsigned())),
+                entry.order,
+                entry.started.elapsed(),
+            )?)
+        } else {
+            None
+        };
         if code == Event::PTRACE_EVENT_EXIT as i32 {
             // exit/exit_group never return. A killed or exec-displaced call is also
             // retired here, without manufacturing a successful kernel result.
             task.entry = None;
             task.in_syscall = false;
         }
-        Ok(message)
+        Ok((message, call))
     }
 
     /// Delivers one stop, then resumes its task unless the consumer holds it.
@@ -270,21 +319,21 @@ impl Observer {
         observe: &mut Observe<'_>,
     ) -> io::Result<()> {
         let wait = WaitStatus::from_raw(tid, status)?;
-        let event = match wait {
+        let (event, call) = match wait {
             WaitStatus::PtraceSyscall(_) => return self.syscall_stop(tid, status, observe),
             WaitStatus::Exited(..) | WaitStatus::Signaled(..) => {
                 self.tasks.remove(&tid);
                 self.held.remove(&tid);
-                None
+                (None, None)
             }
             WaitStatus::PtraceEvent(_, _, code) => self.lifecycle(tid, code)?,
             WaitStatus::Stopped(..) => {
                 self.tasks.entry(tid).or_default();
-                None
+                (None, None)
             }
             WaitStatus::Continued(_) | WaitStatus::StillAlive => return Ok(()),
         };
-        let resume = observe(self.sequence.next()?, tid, status, event, None)?;
+        let resume = observe(self.sequence.next()?, tid, status, event, call)?;
         self.apply(tid, status, resume)
     }
 
@@ -332,14 +381,8 @@ impl Observer {
                 let exit = unsafe { info.u.exit };
                 let result = if exit.is_error != 0 {
                     RetCode::Err(i32::try_from(exit.sval).map_err(io::Error::other)?)
-                } else if let Ok(value) = i32::try_from(exit.sval)
-                    && (0..=0x8000).contains(&value)
-                {
-                    RetCode::Ok(value)
                 } else {
-                    // Upstream Address is also a success: preserve all large values, not
-                    // only addresses, and never infer errno from a signed-looking bit pattern.
-                    RetCode::Address(native_usize(exit.sval.cast_unsigned()))
+                    successful_result(exit.sval.cast_unsigned())
                 };
                 self.exit(tid, status, result, observe)
             }
@@ -444,6 +487,17 @@ impl Observer {
             return self.apply(tid, status, resume);
         }
         resume(tid, None)
+    }
+}
+
+fn successful_result(value: u64) -> RetCode {
+    if let Ok(value) = i32::try_from(value)
+        && (0..=0x8000).contains(&value)
+    {
+        RetCode::Ok(value)
+    } else {
+        // Address also represents large successful values, including signed-looking bits.
+        RetCode::Address(native_usize(value))
     }
 }
 
