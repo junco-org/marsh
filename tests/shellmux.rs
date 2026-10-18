@@ -11,13 +11,17 @@ mod common;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex, Weak};
+use std::time::Duration;
 
 use common::{Seed, TIMEOUT, denied, run};
 use marsh::shellmux::{
     CommandCompletion, CommandHandle, CommandOptions, FrontendEvent, JobIo, JobView, MuxProfile,
     OutputChannel, Shell, ShellFrontend, ShellId, ShellMux, SpawnOptions, TerminalGeometry,
 };
-use marsh::{Principal, SandboxPolicy, ShellErrorKind};
+use marsh::{
+    PipelineOptions, Principal, ResourceEvent, ResourceLimits, ResourceMonitorConfig,
+    SandboxPolicy, ShellErrorKind,
+};
 use serial_test::serial;
 
 #[derive(Default)]
@@ -271,6 +275,126 @@ async fn one_shot_receipts_keep_exact_output_and_native_status() {
     assert_eq!(stderr, b"error");
     assert_eq!(finished, [receipt.id()]);
     assert_eq!(fixture.bytes("file"), b"published");
+    fixture.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn each_session_enforces_and_reports_its_own_pipeline_options() {
+    let fixture = Fixture::new();
+    let probe = "/bin/sh -c 'd=/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup); cat $d/pids.max'";
+    // 100 ms: the stream is drained only after close; a faster interval could fill the 64-event
+    // channel and `Finished` (which awaits space) would then stall the pipeline's completion.
+    let monitor = ResourceMonitorConfig::new(Duration::from_millis(100));
+    let mut events = monitor.events().expect("receiver taken once");
+    let limits = |pids| ResourceLimits {
+        pids: Some(pids),
+        ..ResourceLimits::default()
+    };
+    let limited = fixture
+        .mux
+        .open_shell(
+            &fixture.source,
+            Some("limited".into()),
+            SpawnOptions {
+                io: JobIo::Pipes,
+                pipeline_options: PipelineOptions::default()
+                    .with_resource_limits(limits(4))
+                    .with_resource_monitor(monitor),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let result = completed(&schedule(&limited, probe).await).await;
+    if result.exit_code() != Some(0) {
+        // Fail-closed without delegation: the command never ran, the reason is on stderr.
+        fixture
+            .output(&limited, b"cgroup resource control unavailable")
+            .await;
+        assert!(
+            fixture.recorder.lock().unwrap().instances[&limited.sandbox().uid]
+                .output
+                .get(&OutputChannel::Stdout)
+                .is_none_or(Vec::is_empty)
+        );
+        eprintln!("skipping: cgroup delegation unavailable");
+        fixture.shutdown().await;
+        return;
+    }
+    fixture.output(&limited, b"4\n").await;
+
+    let plain = fixture
+        .mux
+        .open_shell(
+            &fixture.source,
+            Some("plain".into()),
+            SpawnOptions {
+                io: JobIo::Pipes,
+                pipeline_options: PipelineOptions::default().with_resource_limits(limits(5)),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        completed(&schedule(&plain, probe).await).await.exit_code(),
+        Some(0)
+    );
+    fixture.output(&plain, b"5\n").await;
+
+    let free = fixture.open("free", JobIo::Pipes).await;
+    run(&free, "/bin/cat /proc/self/cgroup").await;
+    fixture.output(&free, b"0::/").await;
+    let stdout = fixture.recorder.lock().unwrap().instances[&free.sandbox().uid].output
+        [&OutputChannel::Stdout]
+        .clone();
+    assert!(
+        !stdout.windows(7).any(|part| part == b"/brush-"),
+        "{}",
+        String::from_utf8_lossy(&stdout)
+    );
+
+    // Pipe sessions close automatically after their one command; retained handles stay usable.
+    limited.wait_closed().await.unwrap();
+    let collected = tokio::time::timeout(TIMEOUT, async {
+        let mut collected = Vec::new();
+        while let Some(event) = events.recv().await {
+            collected.push(event);
+        }
+        collected
+    })
+    .await
+    .expect("the limited session's event stream ends when it closes");
+    let started: Vec<_> = collected
+        .iter()
+        .filter_map(|event| match event {
+            ResourceEvent::Started {
+                pipeline_id,
+                command,
+            } => Some((*pipeline_id, command.as_str())),
+            _ => None,
+        })
+        .collect();
+    let finished: Vec<_> = collected
+        .iter()
+        .filter_map(|event| match event {
+            ResourceEvent::Finished {
+                pipeline_id,
+                sample,
+            } => Some((*pipeline_id, *sample)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(started.len(), 1, "{collected:?}");
+    assert_eq!(started[0].1, probe);
+    assert_eq!(finished.len(), 1, "{collected:?}");
+    assert_eq!(finished[0].0, started[0].0);
+    assert_eq!(finished[0].1.pids, 0);
+    assert!(collected.iter().all(|event| !matches!(event, ResourceEvent::Sample { pipeline_id, .. } if *pipeline_id != started[0].0)));
+
+    plain.wait_closed().await.unwrap();
+    free.wait_closed().await.unwrap();
     fixture.shutdown().await;
 }
 

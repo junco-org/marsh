@@ -20,8 +20,8 @@
 //!
 //! | Multiplexer capability | Public application route |
 //! |---|---|
-//! | Construction, seed/lease ownership | [`RmuxFrontend::open`], [`RmuxFrontend::open_with`] plus [`ShellIo::seeds`]; no raw spawner escape |
-//! | Default directory, per-seed policy history | [`ShellIo::default_dir`], [`ShellIo::history`] |
+//! | Construction | [`RmuxFrontend::open`]; no raw spawner escape |
+//! | Default directory | [`ShellIo::default_dir`] |
 //! | Jobs, one job, current selection | [`ShellIo::snapshot`], [`ShellIo::jobs`], [`ShellIo::job`], [`ShellIo::current_job`], [`ShellIo::shell`] |
 //! | Create a shell and keep it | [`ShellIo::open_shell`], [`ShellIo::keep`] |
 //! | Run a line and await its verdict | [`ShellHandle::run_command`], [`CommandHandle::wait`](types::CommandHandle::wait) |
@@ -50,7 +50,7 @@
 //!
 //! Bytes observed live are **provisional**. They are real output, but whether the filesystem
 //! changes behind them survive is the gate's answer, and the only spelling of that answer is
-//! [`Outcome::Published`](types::Outcome::Published). A line can exit zero and be denied; a line
+//! [`CommandCompletion::is_published`](types::CommandCompletion::is_published). A line can exit zero and be denied; a line
 //! can be discarded having already run and spawned processes; a pipe reaching end of file, a
 //! command finishing, a job closing and the host shutting down are four different boundaries and
 //! not one of them is approval.
@@ -106,6 +106,13 @@ pub mod types {
     /// [`ExecutionSpec::environment`](super::ExecutionSpec) and
     /// [`SpawnOptions::environment`](marsh_core::shellmux::SpawnOptions).
     pub use brush_core::env::ShellEnvironment;
+
+    /// Per-session resource limits and monitoring, for
+    /// [`SpawnOptions::pipeline_options`](marsh_core::shellmux::SpawnOptions).
+    pub use marsh_core::{
+        CpuLimit, MIB, MemoryLimit, PipelineOptions, ResourceEvent, ResourceLimits,
+        ResourceMonitorConfig, ResourceSample,
+    };
 
     /// Where an observer starts reading a stream, for [`ShellIo::output`](super::ShellIo::output).
     pub use rmux_sdk::PaneOutputStart;

@@ -467,15 +467,10 @@ impl ShellMux {
             endpoints,
             readers,
         } = Self::open_streams(io)?;
+        let requested_io = options.io;
+        let automatic_close = options.automatic_close;
         let interpreter = self
-            .build_shell(
-                Some(id.clone()),
-                &requested,
-                fds,
-                options.environment,
-                options.force_sandbox,
-                options.policy_owner,
-            )
+            .build_shell(Some(id.clone()), &requested, fds, options)
             .await?;
         let working_directory = interpreter.working_dir().await;
         let sandbox = interpreter.sandbox().clone();
@@ -494,11 +489,11 @@ impl ShellMux {
                 }),
                 command: None,
                 starting: false,
-                close: (options.automatic_close && terminal).then_some(JobCloseMode::Automatic),
+                close: (automatic_close && terminal).then_some(JobCloseMode::Automatic),
                 release: Some(release),
             },
         );
-        let latest = self.install(id, &shell, options.io)?;
+        let latest = self.install(id, &shell, requested_io)?;
         if let (Some(geometry), Some(master)) = (latest, shell.master())
             && let Err(error) = resize_pty(master.get_ref().as_fd(), geometry.rows, geometry.cols)
         {

@@ -10,8 +10,9 @@ use std::sync::{Arc, Mutex, Weak};
 pub use brush_core::env::ShellEnvironment;
 pub use brush_core::openfiles::OpenFile;
 pub use brush_core::{
-    ExecutionParameters, ExecutionResult, ProfileLoadBehavior, RcLoadBehavior, ShellFd,
-    ShellVariable, SourceInfo,
+    CpuLimit, ExecutionParameters, ExecutionResult, MIB, MemoryLimit, PipelineOptions,
+    ProfileLoadBehavior, RcLoadBehavior, ResourceEvent, ResourceLimits, ResourceMonitorConfig,
+    ResourceSample, ShellFd, ShellVariable, SourceInfo,
 };
 pub use brush_interactive::UIOptions;
 use marsh_lib::RecoverPoison as _;
@@ -104,6 +105,13 @@ impl ShellBuilder {
     #[must_use]
     pub fn fds(mut self, fds: HashMap<ShellFd, OpenFile>) -> Self {
         self.options.fds = fds;
+        self
+    }
+    /// Applies resource limits and monitoring to each outermost pipeline this shell runs; see
+    /// [`PipelineOptions`]. The default enforces and reports nothing.
+    #[must_use]
+    pub fn pipeline_options(mut self, options: PipelineOptions) -> Self {
+        self.options.pipeline_options = options;
         self
     }
     /// Registers a builtin without exposing the private interpreter or observer.
@@ -234,6 +242,7 @@ impl ShellBuilder {
             .rc(RcLoadBehavior::Skip)
             .do_not_inherit_env(self.environment.is_some())
             .fds(self.options.fds)
+            .pipeline_options(self.options.pipeline_options)
             .external_cmd_leads_session(self.options.external_cmd_leads_session)
             .shell_name(self.options.shell_name.unwrap_or_else(|| "marsh".into()))
             .shell_args(self.options.shell_args.unwrap_or_default())
@@ -279,11 +288,7 @@ impl ShellBuilder {
                 finished: tokio::sync::Notify::new(),
             }),
         };
-        if startup
-            && let Err(error) = shell
-                .execute(Command::Startup(profile, rc), None)
-                .await
-        {
+        if startup && let Err(error) = shell.execute(Command::Startup(profile, rc), None).await {
             // Membership ends before the caller sees the failure, not when a detached drop runs.
             let _ = shell.close(true).await;
             return Err(error);

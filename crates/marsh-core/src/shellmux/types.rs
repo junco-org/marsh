@@ -147,6 +147,12 @@ pub struct SpawnOptions {
     /// `Some` *replaces* the ordinary inherited and profile variables rather than merging with
     /// them; it does not resurrect a variable the caller unset.
     pub environment: Option<brush_core::env::ShellEnvironment>,
+    /// Resource limits and monitoring for each outermost pipeline this shell runs; see
+    /// [`PipelineOptions`](crate::PipelineOptions). Each session is configured on its own: a
+    /// monitor's event stream belongs to the sessions built from that configuration (and any
+    /// clone the caller kept) and ends once all of them are gone. The default enforces and
+    /// reports nothing.
+    pub pipeline_options: brush_core::PipelineOptions,
     /// Whether this shell reclaims itself once a command run in it ends.
     ///
     /// Terminal shells only, and cancellable by

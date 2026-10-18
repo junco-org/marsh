@@ -185,6 +185,9 @@ pub struct CreateOptions<SE: extensions::ShellExtensions = extensions::DefaultSh
     /// Provides a set of initial open files to be tracked by the shell.
     #[builder(default)]
     pub fds: HashMap<ShellFd, openfiles::OpenFile>,
+    /// Resource limits and monitoring for each outermost pipeline the shell runs.
+    #[builder(default)]
+    pub pipeline_options: crate::resources::PipelineOptions,
     /// Whether to launch external commands as session leaders.
     #[builder(default)]
     pub external_cmd_leads_session: bool,
@@ -243,6 +246,7 @@ impl<SE: extensions::ShellExtensions> Default for Shell<SE> {
             execution_observer: SE::ExecutionObserver::default(),
             traps: traps::TrapHandlerConfig::default(),
             open_files: openfiles::OpenFiles::default(),
+            pipeline_options: crate::resources::PipelineOptions::default(),
             working_dir: PathBuf::default(),
             env: env::ShellEnvironment::default(),
             funcs: functions::FunctionEnv::default(),

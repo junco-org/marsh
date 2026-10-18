@@ -10,8 +10,8 @@ use crate::shellmux::error::MuxError;
 use crate::shellmux::frontend::{FrontendEvent, ShellFrontend, lock_frontend, notify};
 use crate::shellmux::ids::{JobDir, Principal, ShellId};
 use crate::shellmux::jobs::{ShellRegistry, validate_size};
-use crate::shellmux::types::MuxProfile;
-use crate::{Action, MarshTool, OpenFile, ShellBuilder, ShellEnvironment, ShellFd};
+use crate::shellmux::types::{MuxProfile, SpawnOptions};
+use crate::{Action, MarshTool, OpenFile, ShellBuilder, ShellFd};
 use tokio::sync::Notify;
 
 /// Presentation identity and logical source location of one shell instance.
@@ -114,7 +114,15 @@ impl ShellMux {
             return Err(MuxError::ShuttingDown);
         }
         let shell = self
-            .build_shell(None, directory, HashMap::new(), None, false, owner)
+            .build_shell(
+                None,
+                directory,
+                HashMap::new(),
+                SpawnOptions {
+                    policy_owner: owner,
+                    ..Default::default()
+                },
+            )
             .await?;
         let outcome = shell.run_tool(tool, operation).await;
         let closed = shell.close(false).await;
@@ -125,19 +133,20 @@ impl ShellMux {
     }
 
     /// Builds a shell with this mux's builder and profile; `id` is the display name a job
-    /// reserved, and a shell without one is named by its principal. `force_sandbox` replaces the
-    /// profile's routing policy with one that always takes the managed route; `owner` is the
-    /// trusted policy principal its managed commands act as.
+    /// reserved, and a shell without one is named by its principal.
+    ///
+    /// `options.force_sandbox` replaces the profile's routing policy with one that always takes
+    /// the managed route; `options.policy_owner` is the trusted policy principal its managed
+    /// commands act as. `options.pipeline_options` is the resource policy of every outermost
+    /// pipeline the shell runs. Stream setup and closure are handled by the caller.
     pub(crate) async fn build_shell(
         &self,
         id: Option<ShellId>,
         directory: &Path,
         fds: HashMap<ShellFd, OpenFile>,
-        environment: Option<ShellEnvironment>,
-        force_sandbox: bool,
-        owner: Option<Principal>,
+        options: SpawnOptions,
     ) -> Result<Arc<crate::Shell>, MuxError> {
-        let policy = if force_sandbox {
+        let policy = if options.force_sandbox {
             crate::SandboxPolicy::allow()
         } else {
             self.profile.sandbox_policy.clone()
@@ -145,6 +154,7 @@ impl ShellMux {
         let mut builder = (self.builder)()
             .working_dir(directory.to_path_buf())
             .fds(fds)
+            .pipeline_options(options.pipeline_options)
             .interactive(false)
             .no_editing(true)
             .external_cmd_leads_session(true)
@@ -152,8 +162,8 @@ impl ShellMux {
             .sandbox_policy(policy)
             .shell_policy(Arc::clone(&self.profile.shell_policy))
             .policy_observer(self.profile.policy_observer.clone())
-            .policy_owner(owner);
-        if let Some(environment) = environment {
+            .policy_owner(options.policy_owner);
+        if let Some(environment) = options.environment {
             builder = builder.environment(environment);
         } else {
             for (name, variable) in self.profile.environment.iter() {

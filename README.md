@@ -276,6 +276,25 @@ argument of `ShellMux::run_tool` make a shell act as a trusted principal from
 an owner from a display name or other untrusted input. A reused display name inherits nothing,
 and native `git` is an ordinary program: staging or committing releases nothing.
 
+## Per-session pipeline resources
+
+Set `SpawnOptions::pipeline_options` when opening a `shellmux::ShellMux` session, or use
+`ShellBuilder::pipeline_options` for a standalone shell. Each outermost pipeline inherits that
+shell's limits and monitoring; nested functions, groups, subshells and substitutions share the
+enclosing pipeline's cgroup. Defaults impose no limits and emit no events; there is no mux-profile
+resource default.
+
+Build `PipelineOptions::default().with_resource_limits(ResourceLimits { pids: Some(64),
+..Default::default() })` and optionally call `.with_resource_monitor(monitor)`. Take the receiver
+with `ResourceMonitorConfig::events()` before moving the monitor into the options, and drain it
+while commands run. The stream ends when all shells and caller-held configuration clones using
+that monitor are dropped or closed. Builtin-only pipelines emit no events. Resource control
+requires Linux cgroup v2 with delegated cpu/memory/pids controllers; setup errors fail closed
+rather than running commands without their limits.
+
+`CpuLimit`, `MIB`, `MemoryLimit`, `PipelineOptions`, `ResourceEvent`, `ResourceLimits`,
+`ResourceMonitorConfig` and `ResourceSample` are available from `marsh` and `marsh::rmux::types`.
+
 ## Publication and recovery
 
 * A fresh immutable baseline is captured per command. The candidate diff is baseline→work, not

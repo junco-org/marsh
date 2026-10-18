@@ -205,7 +205,7 @@ impl ResourceMonitorConfig {
 /// fall back to unenforced execution. Linux cgroup v2 and delegated cpu/memory/pids controllers
 /// are required. Processes in the delegated parent are moved into its `host` leaf to enable
 /// controllers; lingering children retain their limits after the pipeline finishes.
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct PipelineOptions {
     limits: Option<ResourceLimits>,
     monitor: Option<ResourceMonitorConfig>,
@@ -277,6 +277,7 @@ impl PipelineOptions {
 }
 
 #[cfg(not(target_os = "linux"))]
+#[derive(Debug)]
 pub(crate) struct PipelineResources;
 
 #[cfg(not(target_os = "linux"))]
@@ -428,6 +429,7 @@ mod linux {
             );
     }
 
+    #[derive(Debug)]
     pub(crate) struct PipelineResources {
         limits: ResourceLimits,
         monitor: Option<ResourceMonitorConfig>,
@@ -534,6 +536,7 @@ mod linux {
         }
     }
 
+    #[derive(Debug)]
     struct PipelineCgroup {
         id: u64,
         dir: PathBuf,

@@ -78,6 +78,10 @@ pub struct Shell<SE: extensions::ShellExtensions = extensions::DefaultShellExten
     /// Manages files opened and accessible via redirection operators.
     open_files: openfiles::OpenFiles,
 
+    /// Resource limits and monitoring seeded into every default execution parameter set.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pipeline_options: crate::resources::PipelineOptions,
+
     /// The current working directory.
     working_dir: PathBuf,
 
@@ -164,6 +168,7 @@ impl<SE: extensions::ShellExtensions> Clone for Shell<SE> {
             execution_observer: self.execution_observer.clone(),
             traps: self.traps.clone(),
             open_files: self.open_files.clone(),
+            pipeline_options: self.pipeline_options.clone(),
             working_dir: self.working_dir.clone(),
             env: self.env.clone(),
             funcs: self.funcs.clone(),
@@ -228,6 +233,7 @@ impl<SE: extensions::ShellExtensions> Shell<SE> {
             external_command_spawner: options.external_command_spawner,
             execution_observer: options.execution_observer,
             open_files: openfiles::OpenFiles::new(),
+            pipeline_options: options.pipeline_options,
             options: runtime_options,
             name: options.shell_name,
             args: options.shell_args.unwrap_or_default(),
