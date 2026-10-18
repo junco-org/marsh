@@ -31,6 +31,7 @@ pub mod patterns;
 pub mod processes;
 mod prompt;
 mod regex;
+pub mod resources;
 pub mod results;
 mod shell;
 pub mod sourceinfo;
@@ -56,6 +57,10 @@ pub use error::{BuiltinError, Error, ErrorKind};
 pub use extensions::ShellExtensions;
 pub use interp::{ExecutionParameters, ProcessGroupPolicy};
 pub use parser::{SourcePosition, SourcePositionOffset, SourceSpan};
+pub use resources::{
+    CpuLimit, MIB, MemoryLimit, PipelineOptions, ResourceEvent, ResourceLimits,
+    ResourceMonitorConfig, ResourceSample,
+};
 pub use results::{ExecutionControlFlow, ExecutionExitCode, ExecutionResult, ExecutionSpawnResult};
 pub use shell::{
     CreateOptions, ProfileLoadBehavior, RcLoadBehavior, Shell, ShellBuilder, ShellBuilderState,

@@ -38,6 +38,8 @@ pub struct ExecutionParameters {
     /// Whether `errexit` (exit on error) behavior should be
     /// suppressed in this execution context. Defaults to `false`.
     pub suppress_errexit: bool,
+    /// Resource limits and monitoring for the pipelines run with these parameters.
+    pub pipeline_options: crate::resources::PipelineOptions,
 }
 
 impl ExecutionParameters {
@@ -398,14 +400,18 @@ impl Execute for ast::Pipeline {
             params.suppress_errexit = true;
         }
 
-        // Spawn all the processes required for the pipeline, connecting outputs/inputs with pipes
-        // as needed.
-        let spawn_results = spawn_pipeline_processes(self, shell, &params).await?;
-
-        // Wait for the processes. This also has a side effect of updating pipeline status.
-        let mut result =
-            wait_for_pipeline_processes_and_update_status(self, spawn_results, shell, &params)
-                .await?;
+        // Outermost pipelines own resources; nested pipelines reuse this params clone's state.
+        // The cgroup itself is created lazily at the first external spawn.
+        let resources = params.pipeline_options.begin(|| self.to_string())?;
+        let waited = async {
+            let spawn_results = spawn_pipeline_processes(self, shell, &params).await?;
+            wait_for_pipeline_processes_and_update_status(self, spawn_results, shell, &params).await
+        }
+        .await;
+        if let Some(resources) = &resources {
+            resources.finish().await;
+        }
+        let mut result = waited?;
 
         // Invert the exit code if requested.
         if self.bang {

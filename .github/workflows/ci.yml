@@ -176,7 +176,7 @@ jobs:
             -p CPUAffinity=0-1 -p CPUQuota=200% -p CPUQuotaPeriodSec=100ms \
             -p MemoryMax=7G -p MemorySwapMax=0 -p OOMPolicy=kill \
             -p CPUAccounting=yes -p MemoryAccounting=yes \
-            -p KillMode=control-group -p TimeoutStopSec=5s -p RuntimeMaxSec=60min \
+            -p Delegate=yes -p KillMode=control-group -p TimeoutStopSec=5s -p RuntimeMaxSec=60min \
             --setenv=RUSTUP_TOOLCHAIN="$RUSTUP_TOOLCHAIN" --setenv=CARGO_BUILD_JOBS="$CARGO_BUILD_JOBS" \
             --setenv=CARGO_INCREMENTAL="$CARGO_INCREMENTAL" --setenv=CARGO_PROFILE_TEST_DEBUG="$CARGO_PROFILE_TEST_DEBUG" \
             --setenv=CARGO_PROFILE_TEST_STRIP="$CARGO_PROFILE_TEST_STRIP" --setenv=TOKIO_WORKER_THREADS="$TOKIO_WORKER_THREADS" \
@@ -196,7 +196,7 @@ jobs:
             -p CPUAffinity=0-1 -p CPUQuota=200% -p CPUQuotaPeriodSec=100ms \
             -p MemoryMax=7G -p MemorySwapMax=0 -p OOMPolicy=kill \
             -p CPUAccounting=yes -p MemoryAccounting=yes \
-            -p KillMode=control-group -p TimeoutStopSec=5s -p RuntimeMaxSec=60min \
+            -p Delegate=yes -p KillMode=control-group -p TimeoutStopSec=5s -p RuntimeMaxSec=60min \
             --setenv=RUSTUP_TOOLCHAIN="$RUSTUP_TOOLCHAIN" --setenv=CARGO_BUILD_JOBS="$CARGO_BUILD_JOBS" \
             --setenv=CARGO_INCREMENTAL="$CARGO_INCREMENTAL" --setenv=CARGO_PROFILE_TEST_DEBUG="$CARGO_PROFILE_TEST_DEBUG" \
             --setenv=CARGO_PROFILE_TEST_STRIP="$CARGO_PROFILE_TEST_STRIP" --setenv=TOKIO_WORKER_THREADS="$TOKIO_WORKER_THREADS" \
@@ -216,7 +216,7 @@ jobs:
             -p CPUAffinity=0-1 -p CPUQuota=200% -p CPUQuotaPeriodSec=100ms \
             -p MemoryMax=7G -p MemorySwapMax=0 -p OOMPolicy=kill \
             -p CPUAccounting=yes -p MemoryAccounting=yes \
-            -p KillMode=control-group -p TimeoutStopSec=5s -p RuntimeMaxSec=60min \
+            -p Delegate=yes -p KillMode=control-group -p TimeoutStopSec=5s -p RuntimeMaxSec=60min \
             --setenv=RUSTUP_TOOLCHAIN="$RUSTUP_TOOLCHAIN" --setenv=CARGO_BUILD_JOBS="$CARGO_BUILD_JOBS" \
             --setenv=CARGO_INCREMENTAL="$CARGO_INCREMENTAL" --setenv=CARGO_PROFILE_TEST_DEBUG="$CARGO_PROFILE_TEST_DEBUG" \
             --setenv=CARGO_PROFILE_TEST_STRIP="$CARGO_PROFILE_TEST_STRIP" --setenv=TOKIO_WORKER_THREADS="$TOKIO_WORKER_THREADS" \

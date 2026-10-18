@@ -272,6 +272,11 @@ pub enum ErrorKind {
     #[error("operation not supported on this platform: {0}")]
     NotSupportedOnThisPlatform(&'static str),
 
+    /// Resource limits or monitoring were requested for a pipeline, but its cgroup could not
+    /// be set up (not Linux, no cgroup v2, no delegation, or a refused limit value).
+    #[error("cgroup resource control unavailable: {0}")]
+    CgroupUnavailable(#[source] std::io::Error),
+
     /// Command history is not enabled in this shell.
     #[error("command history is not enabled in this shell")]
     HistoryNotEnabled,

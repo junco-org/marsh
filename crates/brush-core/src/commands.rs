@@ -607,7 +607,6 @@ pub(crate) fn execute_external_command(
     // argv[0] defaults to context.command_name (the user-facing name of the
     // command) unless the caller specified an explicit override.
     let argv0 = argv0_override.unwrap_or(context.command_name.as_str());
-    #[allow(unused_mut, reason = "only mutated on unix platforms")]
     let mut cmd = compose_std_command(
         &context,
         executable_path,
@@ -634,6 +633,12 @@ pub(crate) fn execute_external_command(
         if let Some(pgid) = process_group_id {
             cmd.process_group(pgid);
         }
+    }
+
+    // The child joins before exec; setup failures never run the command unenforced.
+    // Resources are created lazily on this first external spawn.
+    if let Some(resources) = context.params.pipeline_options.active() {
+        resources.attach(&mut cmd, context.shell.execution_observer())?;
     }
 
     // When tracing is enabled, report.
