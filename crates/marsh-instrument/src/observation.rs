@@ -158,7 +158,11 @@ impl Observer {
             let mut status = 0;
             // SAFETY: status points to one writable integer; the pid is this thread's tracee.
             let waited = unsafe {
-                libc::waitpid(pid.as_raw(), &raw mut status, libc::__WALL | libc::__WNOTHREAD)
+                libc::waitpid(
+                    pid.as_raw(),
+                    &raw mut status,
+                    libc::__WALL | libc::__WNOTHREAD,
+                )
             };
             if waited < 0 {
                 match Errno::last() {
@@ -232,26 +236,59 @@ impl Observer {
         }
     }
 
-    /// Applies a lifecycle stop to the task table, returning its message.
-    fn lifecycle(&mut self, tid: Pid, code: i32) -> io::Result<Option<u64>> {
-        let message = event_message(tid, code)?;
+    /// Applies a lifecycle stop, including creation proved before a syscall-return stop.
+    fn lifecycle(&mut self, tid: Pid, code: i32) -> io::Result<(Option<u64>, Option<Syscall>)> {
+        let mut message = event_message(tid, code)?;
         let exec = code == Event::PTRACE_EVENT_EXEC as i32;
+        if (creation(code) || exec)
+            && message.is_some_and(|value| value == 0 || value > i32::MAX as u64)
+            && alive(ptrace::getregs(tid))?.is_none()
+        {
+            // A fatal group exit can clear the event message after wait. Only a
+            // vanished ptrace stop permits absence; a live invalid identity still fails.
+            message = None;
+        }
         if exec && tid == self.root {
             self.root_executed = true;
         }
-        // A task killed at this stop has no message left to read; its lifecycle then ends here.
         let other = if (creation(code) || exec) && message.is_some() {
             Some(event_pid(message)?)
         } else {
             None
         };
-        match other {
-            Some(former) if exec => rekey(&mut self.tasks, tid, former),
+        let completed = match other {
+            Some(former) if exec => {
+                rekey(&mut self.tasks, tid, former);
+                None
+            }
             Some(child) => {
                 self.tasks.entry(child).or_default();
+                self.tasks
+                    .get_mut(&tid)
+                    .and_then(|task| task.entry.take())
+                    .map(|entry| {
+                        if !matches!(
+                            entry.syscall,
+                            Sysno::clone | Sysno::clone3 | Sysno::fork | Sysno::vfork
+                        ) {
+                            return Err(io::Error::other(
+                                "native creation stop does not match its syscall entry",
+                            ));
+                        }
+                        // This is the kernel's child identity, not an invented return stop.
+                        // Keep in_syscall set so a later real return is consumed only once.
+                        entry.capture.complete(
+                            tid,
+                            entry.syscall,
+                            RetCode::Ok(child.as_raw()),
+                            entry.order,
+                            entry.started.elapsed(),
+                        )
+                    })
+                    .transpose()?
             }
-            None => {}
-        }
+            None => None,
+        };
         let task = self.tasks.entry(tid).or_default();
         if code == Event::PTRACE_EVENT_EXIT as i32 {
             // exit/exit_group never return. A killed or exec-displaced call is also
@@ -259,7 +296,7 @@ impl Observer {
             task.entry = None;
             task.in_syscall = false;
         }
-        Ok(message)
+        Ok((message, completed))
     }
 
     /// Delivers one stop, then resumes its task unless the consumer holds it.
@@ -270,21 +307,21 @@ impl Observer {
         observe: &mut Observe<'_>,
     ) -> io::Result<()> {
         let wait = WaitStatus::from_raw(tid, status)?;
-        let event = match wait {
+        let (event, completed) = match wait {
             WaitStatus::PtraceSyscall(_) => return self.syscall_stop(tid, status, observe),
             WaitStatus::Exited(..) | WaitStatus::Signaled(..) => {
                 self.tasks.remove(&tid);
                 self.held.remove(&tid);
-                None
+                (None, None)
             }
             WaitStatus::PtraceEvent(_, _, code) => self.lifecycle(tid, code)?,
             WaitStatus::Stopped(..) => {
                 self.tasks.entry(tid).or_default();
-                None
+                (None, None)
             }
             WaitStatus::Continued(_) | WaitStatus::StillAlive => return Ok(()),
         };
-        let resume = observe(self.sequence.next()?, tid, status, event, None)?;
+        let resume = observe(self.sequence.next()?, tid, status, event, completed)?;
         self.apply(tid, status, resume)
     }
 
@@ -557,8 +594,7 @@ fn wait_any() -> io::Result<Option<(Pid, i32)>> {
         let mut status = 0;
         // SAFETY: status points to one writable integer. `__WNOTHREAD` confines the wait to this
         // tracer thread's own tracees; the host's other children are never touched.
-        let tid =
-            unsafe { libc::waitpid(-1, &raw mut status, libc::__WALL | libc::__WNOTHREAD) };
+        let tid = unsafe { libc::waitpid(-1, &raw mut status, libc::__WALL | libc::__WNOTHREAD) };
         if tid > 0 {
             return Ok(Some((Pid::from_raw(tid), status)));
         }

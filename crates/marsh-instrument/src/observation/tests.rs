@@ -534,10 +534,18 @@ fn held_stops() {
     .unwrap();
     assert!(held.is_empty());
     for (child, at) in &released {
-        let held_at = trace.0.iter().find(|delivery| delivery.tid == *child).unwrap();
-        assert!(trace.0.iter().filter(|delivery| delivery.tid == *child).all(
-            |delivery| delivery.sequence == held_at.sequence || delivery.sequence > *at
-        ));
+        let held_at = trace
+            .0
+            .iter()
+            .find(|delivery| delivery.tid == *child)
+            .unwrap();
+        assert!(
+            trace
+                .0
+                .iter()
+                .filter(|delivery| delivery.tid == *child)
+                .all(|delivery| delivery.sequence == held_at.sequence || delivery.sequence > *at)
+        );
     }
 
     // A creator killed while its child is held can never release it: the observation fails
@@ -558,6 +566,132 @@ fn held_stops() {
     assert_eq!(failed.err().unwrap().to_string(), UNCLASSIFIED);
 }
 
+fn creator_exit_after_creation(file: &Path) {
+    let script = format!(
+        r#"
+import os, sys
+sys.stdin.readline()
+if os.fork() == 0:
+    fd = os.open({file:?}, os.O_RDONLY)
+    assert os.read(fd, 1) == b"x"
+    os.close(fd)
+    os._exit(0)
+os.wait()
+"#,
+        file = file.display().to_string(),
+    );
+    let mut creator = None;
+    let mut child = None;
+    let mut early_child = None;
+    let mut killed = false;
+    let trace = observe_with(Command::new("python3").args(["-c", &script]), |delivery| {
+        let root = *creator.get_or_insert(delivery.tid);
+        let mut resume = Resume::default();
+        if let WaitStatus::PtraceEvent(tid, _, code) = delivery.status
+            && creation(code)
+        {
+            assert_eq!(tid, root);
+            let identity = event_pid(delivery.event).unwrap();
+            assert!(child.replace(identity).is_none());
+            // Keep the creator inside fork: it must never reach its syscall-return stop.
+            resume.hold_current = true;
+            if let Some(early) = early_child.take() {
+                assert_eq!(early, identity);
+                resume.release.push(early);
+            }
+        } else if delivery.tid != root && child.is_none() {
+            // Linux may report the child's initial stop before the creation event.
+            assert!(early_child.replace(delivery.tid).is_none());
+            resume.hold_current = true;
+        }
+        if !killed
+            && delivery.call.as_ref().is_some_and(|call| {
+                matches!(call.info.syscall, Sysno::open | Sysno::openat)
+                    && !matches!(call.info.result, RetCode::Err(_))
+                    && call
+                        .paths
+                        .iter()
+                        .any(|(_, path)| path == file.as_os_str().as_bytes())
+            })
+        {
+            assert_eq!(Some(delivery.tid), child);
+            nix::sys::signal::kill(root, Signal::SIGKILL).unwrap();
+            resume.release.push(root);
+            killed = true;
+        }
+        resume
+    })
+    .unwrap();
+    assert!(killed);
+    assert_created_child(&trace, creator.unwrap(), child.unwrap(), file);
+}
+
+fn assert_created_child(trace: &Trace, creator: Pid, child: Pid, file: &Path) {
+    let creations: Vec<_> = trace
+        .calls()
+        .filter(|call| {
+            call.info.pid == creator
+                && matches!(
+                    call.info.syscall,
+                    Sysno::clone | Sysno::clone3 | Sysno::fork | Sysno::vfork
+                )
+        })
+        .collect();
+    assert_eq!(
+        creations.len(),
+        1,
+        "kernel-proven creation must complete exactly once"
+    );
+    let creation = creations[0];
+    let returned_child = match &creation.info.result {
+        RetCode::Ok(value) => u64::try_from(*value).unwrap(),
+        RetCode::Address(value) => u64::try_from(*value).unwrap(),
+        RetCode::Err(error) => panic!("creation failed: {error:?}"),
+    };
+    assert_eq!(returned_child, u64::try_from(child.as_raw()).unwrap());
+    assert!(
+        !trace.0.iter().any(|delivery| {
+            delivery.tid == creator
+                && delivery.sequence > creation.entry_order
+                && matches!(delivery.status, WaitStatus::PtraceSyscall(_))
+        }),
+        "creator must exit without a fork return"
+    );
+    let opened = trace.open(file);
+    assert_eq!(opened.info.pid, child);
+    assert!(trace.sequence(creation) < trace.sequence(opened));
+    let RetCode::Ok(fd) = opened.info.result else {
+        panic!("{opened:?}")
+    };
+    for syscall in [Sysno::read, Sysno::close] {
+        assert!(trace.calls().any(|call| {
+            call.info.pid == child && call.info.syscall == syscall
+                && matches!(call.info.args.0.first(), Some(SyscallArg::Int(value)) if *value == i64::from(fd))
+                && !matches!(call.info.result, RetCode::Err(_))
+        }), "child {syscall:?} effect must remain attributed");
+    }
+    let terminals: Vec<_> = trace
+        .0
+        .iter()
+        .filter_map(|delivery| match delivery.status {
+            WaitStatus::Exited(tid, 0) if tid == child => Some(tid),
+            WaitStatus::Signaled(tid, Signal::SIGKILL, _) if tid == creator => Some(tid),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(terminals.len(), 2);
+    assert_eq!(
+        terminals.into_iter().collect::<HashSet<_>>(),
+        HashSet::from([creator, child])
+    );
+    assert!(
+        trace
+            .0
+            .iter()
+            .all(|delivery| delivery.tid == creator || delivery.tid == child)
+    );
+}
+
 #[test]
 fn native_observer_regressions() {
     match std::env::var("MARSH_OBSERVER_SCENARIO").as_deref() {
@@ -575,6 +709,7 @@ fn native_observer_regressions() {
             missing_upstream_roles(directory.path());
             memory_at_page_edges();
             held_stops();
+            creator_exit_after_creation(&file);
             println!("native observer scenarios completed");
             return;
         }

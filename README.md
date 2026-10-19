@@ -404,6 +404,11 @@ resetting an incompatible WAL), native file I/O, stale-without-replay and natura
 factories for deterministic tests. No production constructor accepts a backend. The smoke reports
 whether it used real btrfs or CopyTree; only real btrfs proves readonly subvolume ioctls.
 
+Native lifecycle regressions cover creator exit before syscall return, irreversible thread exit
+stops, late ancestry adoption and PID reuse. Kernel-proven creation is classified before descendant
+effects; terminal-only metadata is retired after the wait tree drains. Unclassified completed
+evidence still fails closed.
+
 The private publication regression captures explicitly Internal-scoped calls through the
 test-only `marsh-instrument/testing` feature. It correlates the completed WAL frame with
 native intent sync, staged-payload fsync, namespace fsync and END sync in that order. This is

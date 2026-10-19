@@ -93,13 +93,183 @@ fn exited(events: &mpsc::Receiver<ChildEvent>) -> std::process::ExitStatus {
 }
 
 #[test]
+fn unknown_exit_stops_are_resumable_and_late_adoption_retires_them() {
+    let fixture = Fixture::new();
+    let run = fixture.service.begin_run(fixture.root).unwrap();
+    let parent = Pid::from_raw(i32::MAX - 1);
+    let child = Pid::from_raw(i32::MAX - 2);
+    let exit = (Event::PTRACE_EVENT_EXIT as i32) << 16 | (libc::SIGTRAP << 8) | 0x7f;
+    let first = fixture.service.sequence.next().unwrap();
+    assert!(
+        !fixture
+            .service
+            .deliver(first, child, exit, Some(0), None)
+            .unwrap()
+            .hold_current
+    );
+    let terminal = fixture.service.sequence.next().unwrap();
+    assert!(
+        !fixture
+            .service
+            .deliver(terminal, child, 0, None, None)
+            .unwrap()
+            .hold_current
+    );
+    let early = {
+        let mut state = lock(&fixture.service.state);
+        // Cleanup for a different delivery must not erase a late creation's terminal.
+        state.forget_terminal(child, first).unwrap();
+        state.threads.insert(
+            parent,
+            Thread {
+                inherited: Some(run),
+                known_parent: true,
+                ..Thread::default()
+            },
+        );
+        let early = Tracing::adopt(&mut state, parent, child).unwrap();
+        drop(state);
+        early
+    };
+    assert!(early.iter().any(|(_, status, _, _)| ended(*status)));
+    for (sequence, status, event, info) in early {
+        fixture
+            .service
+            .deliver(sequence, child, status, event, info)
+            .unwrap();
+    }
+    let mut state = lock(&fixture.service.state);
+    assert!(!state.threads.contains_key(&child));
+    state.threads.remove(&parent);
+    drop(state);
+    fixture.finish(run);
+}
+
+#[test]
+fn reused_pid_initial_stop_does_not_replay_the_old_terminal() {
+    let fixture = Fixture::new();
+    let run = fixture.service.begin_run(fixture.root).unwrap();
+    let parent = Pid::from_raw(i32::MAX - 3);
+    let child = Pid::from_raw(i32::MAX - 4);
+    let exit = (Event::PTRACE_EVENT_EXIT as i32) << 16 | (libc::SIGTRAP << 8) | 0x7f;
+    fixture
+        .service
+        .deliver(
+            fixture.service.sequence.next().unwrap(),
+            child,
+            exit,
+            Some(0),
+            None,
+        )
+        .unwrap();
+    let terminal = fixture.service.sequence.next().unwrap();
+    fixture
+        .service
+        .deliver(terminal, child, 0, None, None)
+        .unwrap();
+    let entry = fixture.service.sequence.next().unwrap();
+    let stopped = fixture.service.sequence.next().unwrap();
+    let status = (libc::SIGSTOP << 8) | 0x7f;
+    assert!(
+        fixture
+            .service
+            .deliver(stopped, child, status, None, None)
+            .unwrap()
+            .hold_current
+    );
+    let early = {
+        let mut state = lock(&fixture.service.state);
+        state.forget_terminal(child, terminal).unwrap();
+        state.threads.insert(
+            parent,
+            Thread {
+                inherited: Some(run),
+                known_parent: true,
+                pending: Some((entry, Some(run))),
+                ..Thread::default()
+            },
+        );
+        let early = Tracing::adopt(&mut state, parent, child).unwrap();
+        drop(state);
+        early
+    };
+    for (sequence, status, event, info) in early {
+        fixture
+            .service
+            .deliver(sequence, child, status, event, info)
+            .unwrap();
+    }
+    assert!(
+        lock(&fixture.service.state)
+            .threads
+            .get(&child)
+            .is_some_and(|thread| thread.known_parent)
+    );
+    fixture
+        .service
+        .deliver(
+            fixture.service.sequence.next().unwrap(),
+            child,
+            0,
+            None,
+            None,
+        )
+        .unwrap();
+    let mut state = lock(&fixture.service.state);
+    assert!(!state.threads.contains_key(&child));
+    state.threads.remove(&parent);
+    drop(state);
+    fixture.finish(run);
+}
+
+#[test]
+fn terminal_cleanup_keeps_unclassified_completed_effects() {
+    let tid = nix::unistd::gettid();
+    let record = records(
+        probe(Path::new("/retained-evidence")),
+        tid,
+        &Sequence::default(),
+    )
+    .unwrap()
+    .pop()
+    .unwrap();
+    let mut state = State::default();
+    state.threads.insert(
+        tid,
+        Thread {
+            early: vec![(1, 0, None, Some(record)), (2, 0, None, None)],
+            ..Thread::default()
+        },
+    );
+    assert_eq!(
+        state.forget_terminal(tid, 2).unwrap_err().to_string(),
+        UNCLASSIFIED
+    );
+    assert!(
+        state
+            .threads
+            .get(&tid)
+            .unwrap()
+            .early
+            .iter()
+            .any(|(_, _, _, info)| info.is_some())
+    );
+    state.threads.get_mut(&tid).unwrap().early.remove(0);
+    state.forget_terminal(tid, 2).unwrap();
+    assert!(!state.threads.contains_key(&tid));
+}
+
+#[test]
 fn spawned_commands_are_traced_attributed_and_reaped_in_process() {
     let fixture = Fixture::new();
     let run = fixture.service.begin_run(fixture.root).unwrap();
     let scope = fixture.service.scope(run).unwrap();
     let file = fixture.path("traced.txt");
     let (child, events) = fixture
-        .spawn(&scope, &format!("printf traced > '{}'; /bin/true", file.display()))
+        .spawn(
+            &scope,
+            &format!("printf traced > '{}'; /bin/true", file.display()),
+        )
         .unwrap();
     assert!(exited(&events).success());
     fixture.service.quiesce(run).unwrap();
@@ -260,7 +430,9 @@ fn failed_launches_and_unscoped_spawns_leave_nothing_running() {
     assert!(unscoped.is_err());
     let unresolved = {
         let _guard = scope.enter();
-        fixture.service.spawn(Command::new("true"), Box::new(|_| {}))
+        fixture
+            .service
+            .spawn(Command::new("true"), Box::new(|_| {}))
     };
     assert_eq!(
         unresolved.err().map(|error| error.kind()),

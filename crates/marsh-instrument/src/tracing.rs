@@ -172,6 +172,27 @@ impl State {
         Ok(())
     }
 
+    /// Forgets only recordless terminal metadata after its tree drained or its PID was reused.
+    fn forget_terminal(&mut self, tid: Pid, sequence: u64) -> io::Result<()> {
+        let Some(thread) = self.threads.get(&tid) else {
+            return Ok(());
+        };
+        let Some((last, status, _, _)) = thread.early.last() else {
+            return Ok(());
+        };
+        if thread.known_parent || *last != sequence || !ended(*status) {
+            return Ok(());
+        }
+        if thread.pending.is_some()
+            || thread.classify_after.is_some()
+            || thread.early.iter().any(|(_, _, _, info)| info.is_some())
+        {
+            return Err(io::Error::other(UNCLASSIFIED));
+        }
+        self.threads.remove(&tid);
+        Ok(())
+    }
+
     /// Whether an attributed run has been cancelled.
     fn cancelled(&self, run: Option<TraceRun>) -> bool {
         run.is_some_and(|run| self.runs.get(&run).is_some_and(|run| run.cancelled))
@@ -538,9 +559,18 @@ impl Tracing {
         }
         let root = Pid::from_raw(i32::from_ne_bytes(pid));
         let mut observer = Observer::new(self.selected.clone(), Arc::clone(&self.sequence), root);
+        let mut terminal = Vec::new();
         let result = (|| -> io::Result<()> {
             let mut observe = |sequence, tid: Pid, status, event, info| {
                 let resume = self.deliver(sequence, tid, status, event, info)?;
+                if ended(status)
+                    && lock(&self.state)
+                        .threads
+                        .get(&tid)
+                        .is_some_and(|thread| !thread.known_parent)
+                {
+                    terminal.push((tid, sequence));
+                }
                 if tid == root {
                     report(&mut *events, status)?;
                 }
@@ -556,7 +586,15 @@ impl Tracing {
             self.adopt_root(root, run, host, process)?;
             observer.stop(root, status, &mut observe)?;
             std::fs::File::from(release).write_all(&[1])?;
-            observer.run(&mut observe)
+            observer.run(&mut observe)?;
+            // Every wait for this tree is drained: no late creation can adopt these
+            // recordless exits. Completed effects still fail closed in forget_terminal.
+            let mut state = lock(&self.state);
+            for (tid, sequence) in terminal {
+                state.forget_terminal(tid, sequence)?;
+            }
+            drop(state);
+            Ok(())
         })();
         if observer.detached() {
             lock(&self.state).threads.remove(&root);
@@ -578,7 +616,9 @@ impl Tracing {
             observer.abandon(|tid, status| {
                 lock(&self.state).threads.remove(&tid);
                 if tid == root {
-                    events(ChildEvent::Exited(std::process::ExitStatus::from_raw(status)));
+                    events(ChildEvent::Exited(std::process::ExitStatus::from_raw(
+                        status,
+                    )));
                 }
             });
             self.progress.notify_all();
@@ -650,6 +690,18 @@ impl Tracing {
         let mut resume = Resume::default();
         let mut state = lock(&self.state);
         state.check()?;
+        // A terminal task cannot stop again. Retire only its recordless old
+        // incarnation before a reused PID acquires a lease or new early stops.
+        let retired = state
+            .threads
+            .get(&tid)
+            .filter(|thread| !thread.known_parent)
+            .and_then(|thread| thread.early.last())
+            .filter(|event| ended(event.1) && event.0 < sequence)
+            .map(|event| event.0);
+        if let Some(terminal) = retired {
+            state.forget_terminal(tid, terminal)?;
+        }
         if state.runs.is_empty()
             && matches!(wait, WaitStatus::Exited(..) | WaitStatus::Signaled(..))
         {
@@ -678,13 +730,29 @@ impl Tracing {
         if matches!(wait, WaitStatus::PtraceEvent(..) | WaitStatus::Stopped(..)) {
             Self::lease(&mut state, tid)?;
         }
+        if let Some(thread) = state.threads.get_mut(&tid)
+            && !thread.known_parent
+        {
+            // No user code may run before ancestry is known. An irreversible exit
+            // stop is different: holding it can keep an exited group leader a zombie.
+            resume.hold_current = !ended(status)
+                && !matches!(wait, WaitStatus::PtraceEvent(_, _, code) if code == Event::PTRACE_EVENT_EXIT as i32);
+            thread.early.push((sequence, status, event, info));
+            return Ok(resume);
+        }
         if let WaitStatus::PtraceEvent(_, _, code) = wait
             && creation(code)
             && event.is_some()
         {
             let child = Self::event_thread(event, "missing child identity")?;
             let early = Self::adopt(&mut state, tid, child)?;
+            let completed = info
+                .map(|info| Self::take_entry(&mut state, tid, &info).map(|run| (run, info)))
+                .transpose()?;
             drop(state);
+            if let Some((Some(run), info)) = completed {
+                self.classify(run, info)?;
+            }
             let mut held = false;
             for (sequence, status, event, info) in early {
                 let replay = self.deliver(sequence, child, status, event, info)?;
@@ -696,15 +764,6 @@ impl Tracing {
                 resume.release.push(child);
             }
             self.progress.notify_all();
-            return Ok(resume);
-        }
-        if let Some(thread) = state.threads.get_mut(&tid)
-            && !thread.known_parent
-        {
-            // Nothing it does may run before its owner is known: its records could not be
-            // attributed.
-            resume.hold_current = !ended(status);
-            thread.early.push((sequence, status, event, info));
             return Ok(resume);
         }
         if matches!(wait, WaitStatus::Exited(..) | WaitStatus::Signaled(..)) {
@@ -722,14 +781,7 @@ impl Tracing {
             Self::note_stop(&mut state, tid, wait, sequence)?;
             return Ok(resume);
         };
-        let (entry, run) = state
-            .threads
-            .get_mut(&tid)
-            .and_then(|thread| thread.pending.take())
-            .ok_or_else(|| io::Error::other("native completion lacks attribution entry"))?;
-        if entry != info.entry_order {
-            return Err(io::Error::other("native completion entry mismatch"));
-        }
+        let run = Self::take_entry(&mut state, tid, &info)?;
         drop(state);
         if let Some(run) = run {
             self.classify(run, info)?;
@@ -738,9 +790,22 @@ impl Tracing {
         Ok(resume)
     }
 
+    fn take_entry(state: &mut State, tid: Pid, info: &Syscall) -> io::Result<Option<TraceRun>> {
+        let (entry, run) = state
+            .threads
+            .get_mut(&tid)
+            .and_then(|thread| thread.pending.take())
+            .ok_or_else(|| io::Error::other("native completion lacks attribution entry"))?;
+        if entry != info.entry_order {
+            return Err(io::Error::other("native completion entry mismatch"));
+        }
+        Ok(run)
+    }
+
     /// Pins a stopped task's process identity once, killing it when its run was cancelled.
     fn lease(state: &mut State, tid: Pid) -> io::Result<()> {
-        let cancelled = state.cancelled(state.threads.get(&tid).and_then(|thread| thread.inherited));
+        let cancelled =
+            state.cancelled(state.threads.get(&tid).and_then(|thread| thread.inherited));
         let thread = state.threads.entry(tid).or_default();
         if thread.process.is_none()
             && let Some(group) = proc_field::<i32>(format!("/proc/{tid}/status"), "Tgid:")
@@ -776,6 +841,19 @@ impl Tracing {
             .and_then(|(_, run)| run)
             .or_else(|| parent.and_then(|thread| thread.inherited));
         let cancelled = state.cancelled(inherited);
+        // A terminal before this entry belongs to an older reuse of the PID. A
+        // terminal after it must remain buffered for this creation's late adoption.
+        let retired = state
+            .threads
+            .get(&child)
+            .and_then(|thread| thread.early.last())
+            .filter(|event| {
+                ended(event.1) && parent_entry.is_some_and(|(entry, _)| event.0 < entry)
+            })
+            .map(|event| event.0);
+        if let Some(sequence) = retired {
+            state.forget_terminal(child, sequence)?;
+        }
         let thread = state.threads.entry(child).or_default();
         thread.known_parent = true;
         thread.inherited = inherited;
@@ -866,13 +944,8 @@ fn handshake(request: RawFd, release: RawFd) -> io::Result<()> {
     let mut written = 0;
     while written < pid.len() {
         // SAFETY: the buffer is live for the stated length; the descriptor was inherited open.
-        let count = unsafe {
-            libc::write(
-                request,
-                pid[written..].as_ptr().cast(),
-                pid.len() - written,
-            )
-        };
+        let count =
+            unsafe { libc::write(request, pid[written..].as_ptr().cast(), pid.len() - written) };
         match usize::try_from(count) {
             Ok(count) => written += count,
             Err(_) if Errno::last() == Errno::EINTR => {}
@@ -903,7 +976,9 @@ const fn ended(status: i32) -> bool {
 fn report(events: &mut dyn FnMut(ChildEvent), status: i32) -> io::Result<()> {
     match WaitStatus::from_raw(Pid::from_raw(0), status)? {
         WaitStatus::Exited(..) | WaitStatus::Signaled(..) => {
-            events(ChildEvent::Exited(std::process::ExitStatus::from_raw(status)));
+            events(ChildEvent::Exited(std::process::ExitStatus::from_raw(
+                status,
+            )));
         }
         WaitStatus::PtraceEvent(_, signal, code)
             if code == Event::PTRACE_EVENT_STOP as i32
