@@ -172,6 +172,7 @@ async fn memory_limit_kills_the_pipeline() -> Result<()> {
     if !available(&mut shell).await? {
         return Ok(());
     }
+    let host_cgroup = std::fs::read_to_string("/proc/self/cgroup")?;
     let monitor = ResourceMonitorConfig::new(Duration::from_millis(10));
     let mut events = monitor.events().context("receiver taken once")?;
     let options = PipelineOptions::default()
@@ -183,14 +184,20 @@ async fn memory_limit_kills_the_pipeline() -> Result<()> {
     let (result, sample) = tokio::join!(
         run(
             &mut shell,
-            "python3 -c 'bytearray(128 * 1024 * 1024)'",
+            "python3 -c 'import pathlib; print(pathlib.Path(\"/proc/self/cgroup\").read_text(), flush=True); bytearray(128 * 1024 * 1024)'",
             options
         ),
         final_sample(&mut events),
     );
-    let (code, _, stderr) = result?;
+    let (code, stdout, stderr) = result?;
     let sample = sample?;
     assert_eq!(code, 137, "{stderr}");
+    assert_eq!(std::fs::read_to_string("/proc/self/cgroup")?, host_cgroup);
+    assert_ne!(stdout.trim(), host_cgroup.trim());
+    assert!(
+        stdout.contains(&format!("/brush-{}-", std::process::id())),
+        "{stdout}"
+    );
     assert!(sample.oom_kills >= 1, "{sample:?}");
     assert!(sample.memory_peak_bytes <= 36 * MIB, "{sample:?}");
     eprintln!(

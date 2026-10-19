@@ -292,6 +292,14 @@ that monitor are dropped or closed. Builtin-only pipelines emit no events. Resou
 requires Linux cgroup v2 with delegated cpu/memory/pids controllers; setup errors fail closed
 rather than running commands without their limits.
 
+Older systemd versions (including Ubuntu 24.04's systemd 255) treat a pipeline's intentional
+memory-limit OOM as a service OOM under `OOMPolicy=kill`. Delegated CI services use
+`OOMPolicy=continue` with a privileged `ExecStartPre` setting the **service's**
+`memory.oom.group=1`: leaf OOMs remain local, while crossing the unchanged 7 GiB service budget
+still kills the whole service in the kernel. `.github/test_cgroup_policy.py` exercises both
+boundaries in fresh, dedicated services with a smaller test-only outer budget; it takes the
+same `CGROUP_OOM_PRESTART` property used by CI and requires passwordless sudo and cgroup v2.
+
 `CpuLimit`, `MIB`, `MemoryLimit`, `PipelineOptions`, `ResourceEvent`, `ResourceLimits`,
 `ResourceMonitorConfig` and `ResourceSample` are available from `marsh` and `marsh::rmux::types`.
 

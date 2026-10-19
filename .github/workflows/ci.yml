@@ -37,6 +37,10 @@ jobs:
       CARGO_TARGET_DIR: ${{ github.workspace }}/marsh/target/ci
       REPORT: ${{ github.workspace }}/marsh/target/slow-test-decile/ci-${{ github.run_id }}-${{ github.run_attempt }}
       UNIT: marsh-${{ github.run_id }}-${{ github.run_attempt }}-ci
+      # systemd 255 treats a delegated leaf's OOM as a service OOM with OOMPolicy=kill.
+      # Continue only the userspace policy; retain the kernel's whole-service group kill.
+      CGROUP_OOM_PRESTART: >-
+        ExecStartPre=+/bin/sh -ec 'echo 1 > "/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup)/memory.oom.group"'
       # Backing file of the services' btrfs HOME; inside the workspace, so the disk gates count its
       # full capacity.
       HOME_IMAGE: ${{ github.workspace }}/marsh-home.btrfs
@@ -52,6 +56,10 @@ jobs:
           { echo "== initial"; df -B1 "$GITHUB_WORKSPACE" "$RUNNER_TEMP"; } >> "$REPORT/disk.txt"
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends build-essential clang libclang-dev libbtrfsutil-dev pkg-config git python3 jq coreutils btrfs-progs time
+
+      - name: Verify delegated OOM boundaries
+        timeout-minutes: 2
+        run: python3 .github/test_cgroup_policy.py | tee "$REPORT/cgroup-policy.log"
 
       # The services' HOME: marsh's real-btrfs tests and rmux_smoke need a writable btrfs HOME
       # with user_subvol_rm_allowed, which the runner's own HOME is not. rustup stays where it is.
@@ -174,7 +182,7 @@ jobs:
           sudo systemd-run --uid="$(id -u)" --gid="$(id -g)" --wait --pipe --collect --service-type=exec --expand-environment=no \
             --working-directory="$PWD" --unit="$UNIT-sample-1" \
             -p CPUAffinity=0-1 -p CPUQuota=200% -p CPUQuotaPeriodSec=100ms \
-            -p MemoryMax=7G -p MemorySwapMax=0 -p OOMPolicy=kill \
+            -p MemoryMax=7G -p MemorySwapMax=0 -p OOMPolicy=continue -p "$CGROUP_OOM_PRESTART" \
             -p CPUAccounting=yes -p MemoryAccounting=yes \
             -p Delegate=yes -p KillMode=control-group -p TimeoutStopSec=5s -p RuntimeMaxSec=60min \
             --setenv=RUSTUP_TOOLCHAIN="$RUSTUP_TOOLCHAIN" --setenv=CARGO_BUILD_JOBS="$CARGO_BUILD_JOBS" \
@@ -194,7 +202,7 @@ jobs:
           sudo systemd-run --uid="$(id -u)" --gid="$(id -g)" --wait --pipe --collect --service-type=exec --expand-environment=no \
             --working-directory="$PWD" --unit="$UNIT-sample-2" \
             -p CPUAffinity=0-1 -p CPUQuota=200% -p CPUQuotaPeriodSec=100ms \
-            -p MemoryMax=7G -p MemorySwapMax=0 -p OOMPolicy=kill \
+            -p MemoryMax=7G -p MemorySwapMax=0 -p OOMPolicy=continue -p "$CGROUP_OOM_PRESTART" \
             -p CPUAccounting=yes -p MemoryAccounting=yes \
             -p Delegate=yes -p KillMode=control-group -p TimeoutStopSec=5s -p RuntimeMaxSec=60min \
             --setenv=RUSTUP_TOOLCHAIN="$RUSTUP_TOOLCHAIN" --setenv=CARGO_BUILD_JOBS="$CARGO_BUILD_JOBS" \
@@ -214,7 +222,7 @@ jobs:
           sudo systemd-run --uid="$(id -u)" --gid="$(id -g)" --wait --pipe --collect --service-type=exec --expand-environment=no \
             --working-directory="$PWD" --unit="$UNIT-sample-3" \
             -p CPUAffinity=0-1 -p CPUQuota=200% -p CPUQuotaPeriodSec=100ms \
-            -p MemoryMax=7G -p MemorySwapMax=0 -p OOMPolicy=kill \
+            -p MemoryMax=7G -p MemorySwapMax=0 -p OOMPolicy=continue -p "$CGROUP_OOM_PRESTART" \
             -p CPUAccounting=yes -p MemoryAccounting=yes \
             -p Delegate=yes -p KillMode=control-group -p TimeoutStopSec=5s -p RuntimeMaxSec=60min \
             --setenv=RUSTUP_TOOLCHAIN="$RUSTUP_TOOLCHAIN" --setenv=CARGO_BUILD_JOBS="$CARGO_BUILD_JOBS" \

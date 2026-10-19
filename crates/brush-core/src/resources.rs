@@ -5,6 +5,11 @@
 //! closed with [`crate::ErrorKind::CgroupUnavailable`] if resource control is unavailable.
 //! On non-Linux platforms, requesting these options fails with the same error kind.
 //!
+//! A delegated service manager must allow expected pipeline OOM kills without stopping the
+//! host. In particular, older systemd versions apply `OOMPolicy=kill` to descendant OOM events.
+//! Use `OOMPolicy=continue` there and set the service's own `memory.oom.group=1` before execution
+//! to retain whole-service killing at its outer memory budget; pipeline limits stay independent.
+//!
 //! ```no_run
 //! use std::time::Duration;
 //! use brush_core::{
