@@ -25,17 +25,19 @@
 //! Rules are enforced at two points:
 //!
 //! * **At the syscall, for socket peers.** At the entry of every `connect`, `sendto`, `sendmsg` and
-//!   `sendmmsg`, the tracer asks the policy about each peer the call names. It also asks at every
-//!   `io_uring_enter` that submits network operations or whose submissions it cannot read; there
-//!   the peer is `unknown`. The policy decides against committed history plus what the command
-//!   has done so far. A refused call never reaches the kernel: the task sees `EPERM`, and the rest
-//!   of the command proceeds normally. The tracer reads the address at entry, so another thread of
+//!   `sendmmsg`, the tracer asks the policy about each peer the call names. At every write to a
+//!   connected socket it asks about the socket's peer, so a connection made before a secret was
+//!   read cannot carry it. It also asks at every `io_uring_enter` that submits network operations
+//!   or whose submissions it cannot read; there the peer is `unknown`. The policy decides against
+//!   committed history plus what the command has done so far. A refused call never reaches the
+//!   kernel: the task sees `EPERM`, and the rest of the command proceeds normally. The tracer reads the address at entry, so another thread of
 //!   the tracee could rewrite it before the kernel copies it; this blocks what the call names,
 //!   not what a racing thread substitutes. Blocking rewrites the syscall number, implemented on
 //!   x86-64 only; elsewhere a refused call fails the command's observation instead.
 //! * **At publication, for everything.** The command's whole batch of observations is checked
 //!   atomically with the capability policy. A denial refuses the command's source effects and keeps
-//!   them out of history. Writes outside the source are not rolled back.
+//!   them out of history; what it read, ran or contacted cannot be undone, so it stays in history.
+//!   Writes outside the source are not rolled back.
 //!
 //! Observations are kept in memory for the source's lifetime and are not recovered from the WAL.
 
@@ -57,7 +59,7 @@ use junco_policy::{
 use socket2::{SockAddr, SockAddrStorage, socklen_t};
 
 use super::access::Effects;
-use super::policy::{Action, Denial, Event, PolicyObserver, Principal, Resource};
+use super::policy::{Action, Denial, Event, PolicyKind, PolicyObserver, Principal, Resource};
 
 const PRINCIPAL: &str = "p";
 const MATCH: MatchOptions = MatchOptions {
@@ -73,6 +75,8 @@ pub(super) enum Peer {
     Unix(Vec<u8>),
     /// An IPv4 or IPv6 endpoint.
     Ip(SocketAddr),
+    /// A netlink socket: the kernel, or another process on this host.
+    Netlink,
     /// A family this module does not decode, or an address that could not be read.
     Unknown,
 }
@@ -98,14 +102,16 @@ impl Peer {
                 };
                 Self::Unix(path.get(..end).unwrap_or_default().to_vec())
             }
+            libc::AF_NETLINK => Self::Netlink,
             // The kernel refuses shorter IPv4 lengths, and IPv6 ones that stop before the scope.
             libc::AF_INET if bytes.len() < size_of::<libc::sockaddr_in>() => Self::Unknown,
             libc::AF_INET6 if bytes.len() < offset_of!(libc::sockaddr_in6, sin6_scope_id) => {
                 Self::Unknown
             }
-            _ => address.as_socket().map_or(Self::Unknown, |peer| {
+            libc::AF_INET | libc::AF_INET6 => address.as_socket().map_or(Self::Unknown, |peer| {
                 Self::Ip(SocketAddr::new(peer.ip(), peer.port()))
             }),
+            _ => Self::Unknown,
         }
     }
 
@@ -157,6 +163,18 @@ pub(super) enum Observed {
     Connect(Peer),
     /// An operator's approval of a label.
     Approve(String),
+}
+
+impl Observed {
+    /// Whether rolling back the command that made this observation cannot undo it: a read, an
+    /// exec, a socket contact, or a write outside the source. Such observations stay in history
+    /// even when their command is refused.
+    pub(super) const fn irreversible(&self) -> bool {
+        match self {
+            Self::Path { action, inside, .. } => matches!(action, PathAction::Read) || !*inside,
+            Self::Exec(_) | Self::Connect(_) | Self::Approve(_) => true,
+        }
+    }
 }
 
 /// One principal's observation.
@@ -224,8 +242,12 @@ impl Network {
 /// Path classes are first-match globs. Relative patterns label source-relative paths; an absolute
 /// pattern, or one beginning with `~/` (the policy owner's `$HOME`), labels paths outside the
 /// source. A source path no pattern labels has class `other`; an outside path no pattern labels is
-/// not recorded. Socket peers are `unix`, `loopback`, the first matching declared network's label,
-/// or `external`; an unreadable peer is `unknown`.
+/// not recorded. Socket peers are `unix`, `netlink`, `loopback` (including the unspecified
+/// address, which reaches this host), the first matching declared network's label, or
+/// `external`; an unreadable peer, or one of another family, is `unknown`.
+///
+/// Observations are attributed to the shell's policy owner ([`crate::ShellBuilder::policy_owner`]),
+/// so shells sharing a trusted owner are one principal to every rule.
 #[derive(Clone, Default)]
 pub struct AgentPolicy {
     inside: Vec<(Pattern, String)>,
@@ -255,7 +277,8 @@ impl AgentPolicy {
     /// A conservative starting point for coding agents.
     ///
     /// Classes: `secret` (dotenv files, keys, credential files, `~/.ssh`, `~/.aws`, ...), `ci`,
-    /// `vcs-hooks`, `lockfile`, `tests`, and `src` for every other source path. Rules: no external
+    /// `vcs-hooks`, `lockfile`, `cache` (interpreter and test-runner caches, which running tests
+    /// writes), `tests`, and `src` for every other source path. Rules: no external
     /// or unknown network peer after reading a secret; approval before changing `secret`, `ci` or
     /// `vcs-hooks`; tests are locked once the same principal changed `src`; no `ci`, `lockfile` or
     /// `vcs-hooks` change after running a downloader; at most 100 deletions between approvals.
@@ -319,6 +342,17 @@ impl AgentPolicy {
         ] {
             policy = policy.class(pattern, "lockfile")?;
         }
+        for directory in [
+            "__pycache__",
+            ".pytest_cache",
+            ".mypy_cache",
+            ".ruff_cache",
+            ".hypothesis",
+        ] {
+            policy = policy.class(&format!("**/{directory}"), "cache")?;
+            policy = policy.class(&format!("**/{directory}/**"), "cache")?;
+        }
+        policy = policy.class("**/*.pyc", "cache")?;
         for pattern in [
             "test/**",
             "tests/**",
@@ -415,6 +449,7 @@ impl AgentPolicy {
     fn peer_class(&self, peer: &Peer) -> &str {
         match peer {
             Peer::Unix(_) => "unix",
+            Peer::Netlink => "netlink",
             Peer::Unknown => "unknown",
             Peer::Ip(address) => {
                 let ip = address.ip();
@@ -422,7 +457,8 @@ impl AgentPolicy {
                     IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, IpAddr::V4),
                     IpAddr::V4(_) => ip,
                 };
-                if ip.is_loopback() {
+                // Connecting to the unspecified address reaches this host.
+                if ip.is_loopback() || ip.is_unspecified() {
                     return "loopback";
                 }
                 self.networks
@@ -499,6 +535,9 @@ impl AgentPolicy {
     /// Checks `batch` in order against the labelled `history`, as one atomic decision. Every
     /// decision is reported to `observer`; on any denial, every denial is returned, unless this
     /// policy only audits.
+    ///
+    /// Socket contacts were already judged at their syscall, against the same history; an
+    /// auditing policy reported its would-be denials there, so they are not reported twice.
     pub(super) fn check(
         &self,
         history: &[Observation],
@@ -510,7 +549,7 @@ impl AgentPolicy {
         }
         let arena = Bump::new();
         // Each distinct candidate compiles only the rules that can judge it, once per batch.
-        let mut judges: HashMap<Event, TracePolicy<'_>> = HashMap::new();
+        let mut judges: HashMap<Event, Result<TracePolicy<'_>, Denial>> = HashMap::new();
         let mut labelled: Vec<Event> = history.iter().filter_map(|o| self.label(o)).collect();
         let mut denials = Vec::new();
         for event in batch.iter().filter_map(|o| self.label(o)) {
@@ -518,12 +557,26 @@ impl AgentPolicy {
                 Entry::Occupied(judge) => judge.into_mut(),
                 Entry::Vacant(slot) => slot.insert(
                     TracePolicy::new(&arena, self.firing(&event))
-                        .map_err(|error| vec![uncompiled(&error)])?,
+                        .map_err(|error| uncompiled(&event, &error)),
                 ),
             };
-            let decision = judge.decide(&labelled, &event);
-            if let Some(observer) = observer {
-                observer.notify(&event, &decision);
+            let decision = match judge {
+                Ok(judge) => judge.decide(&labelled, &event),
+                Err(denial) => PolicyDecision::Deny {
+                    failed_precondition: denial.failed_precondition.clone(),
+                    allowed_fixes: denial.allowed_fixes.clone(),
+                },
+            };
+            let reported_at_syscall = self.audit
+                && event
+                    .resource
+                    .segments()
+                    .first()
+                    .is_some_and(|kind| kind == "net");
+            if let Some(observer) = observer
+                && !(reported_at_syscall && matches!(decision, PolicyDecision::Deny { .. }))
+            {
+                observer.notify(PolicyKind::Agent, &event, &decision);
             }
             match decision {
                 PolicyDecision::Grant => labelled.push(event),
@@ -545,6 +598,16 @@ impl AgentPolicy {
         }
     }
 
+    /// Whether any rule can judge `candidate`; when none can, [`AgentPolicy::decide_now`] grants
+    /// it without consulting history.
+    pub(super) fn judges(&self, candidate: &Observation) -> bool {
+        self.label(candidate).is_some_and(|event| {
+            self.rules
+                .iter()
+                .any(|rule| could_fire(&rule.0.rule.head, &event))
+        })
+    }
+
     /// Decides `candidate` now, while its command still runs: against the committed `history`
     /// and the command's own `prior` observations, which are not yet granted. Returns the denial,
     /// if any; an auditing policy's denial is the caller's to report, not to enforce.
@@ -562,7 +625,7 @@ impl AgentPolicy {
         let arena = Bump::new();
         let mut judge = match TracePolicy::new(&arena, rules) {
             Ok(judge) => judge,
-            Err(error) => return Some(uncompiled(&error)),
+            Err(error) => return Some(uncompiled(&event, &error)),
         };
         let labelled: Vec<Event> = history
             .iter()
@@ -588,10 +651,10 @@ impl AgentPolicy {
     }
 }
 
-/// The denial every candidate gets when a caller-built rule does not compile.
-fn uncompiled(error: &CompileError) -> Denial {
+/// The denial of `event` when a caller-built rule that could judge it does not compile.
+fn uncompiled(event: &Event, error: &CompileError) -> Denial {
     Denial {
-        event: Event::new("agent-policy", Action::Read, Resource::new(["rules"])),
+        event: event.clone(),
         failed_precondition: format!("agent policy does not compile: {error}"),
         allowed_fixes: Vec::new(),
     }
@@ -614,13 +677,16 @@ fn could_fire(head: &Head, event: &Event) -> bool {
     principal && action && resource
 }
 
-/// One command's observations so far, in execution order and each recorded once. `write`
-/// classifies a source path the command wrote, or drops it (`None`) when it left no change.
+/// One command's observations so far, in execution order, with consecutive repeats collapsed.
+/// `write` classifies a source path the command wrote, or drops it (`None`) when it left no
+/// change. `expand` lists the source paths beneath a directory the command renamed or removed,
+/// each of which that changed; the directory alone would not name their classes.
 pub(super) fn observations(
     effects: &[(u64, Effects)],
     principal: &Principal,
     agent: Option<&AgentPolicy>,
     write: impl Fn(&Path) -> Option<PathAction>,
+    expand: impl Fn(&Path) -> Vec<PathBuf>,
 ) -> Vec<Observation> {
     let metadata = |path: &Path| {
         path.as_os_str().is_empty()
@@ -628,6 +694,12 @@ pub(super) fn observations(
                 .components()
                 .any(|component| component.as_os_str() == ".git")
     };
+    let written: HashSet<&Path> = effects
+        .iter()
+        .flat_map(|(_, effects)| &effects.writes)
+        .map(PathBuf::as_path)
+        .collect();
+    let mut expanded = HashSet::new();
     let mut ordered = Vec::new();
     for (order, effects) in effects {
         let mut push = |observed| ordered.push((*order, observed));
@@ -645,6 +717,28 @@ pub(super) fn observations(
                     path: path.clone(),
                     inside: true,
                 });
+            }
+        }
+        // A path the command also wrote directly is already observed at that write.
+        for directory in effects
+            .recursive_writes
+            .iter()
+            .filter(|path| !metadata(path))
+        {
+            for path in expand(directory) {
+                if metadata(&path)
+                    || written.contains(path.as_path())
+                    || !expanded.insert(path.clone())
+                {
+                    continue;
+                }
+                if let Some(action) = write(&path) {
+                    push(Observed::Path {
+                        action,
+                        path,
+                        inside: true,
+                    });
+                }
             }
         }
         for (paths, action) in [
@@ -667,11 +761,18 @@ pub(super) fn observations(
         }
     }
     ordered.sort_by_key(|(order, _)| *order);
-    let mut seen = HashSet::new();
+    // Only consecutive repeats are redundant: a past-time rule may turn on a path being changed
+    // again after some other event.
+    let mut previous: Option<Observed> = None;
     ordered
         .into_iter()
         .map(|(_, observed)| observed)
-        .filter(|observed| AgentPolicy::records(agent, observed) && seen.insert(observed.clone()))
+        .filter(|observed| AgentPolicy::records(agent, observed))
+        .filter(|observed| {
+            let repeat = previous.as_ref() == Some(observed);
+            previous = Some(observed.clone());
+            !repeat
+        })
         .map(|observed| Observation {
             principal: principal.clone(),
             observed,
@@ -780,6 +881,14 @@ impl AgentRule {
     /// `secret_class`.
     #[must_use]
     pub fn no_egress_after_read(secret_class: &str) -> AgentRuleSet {
+        Self::no_contact_after_read(secret_class, &["external", "unknown"])
+    }
+
+    /// No socket peer of any of `peer_classes` once the same principal has read a path of
+    /// `secret_class`. A peer is reached by naming it or by writing to a socket connected to it,
+    /// including one connected before the read.
+    #[must_use]
+    pub fn no_contact_after_read(secret_class: &str, peer_classes: &[&str]) -> AgentRuleSet {
         let read = TestExpr::and([
             principal_is(Comparison::Eq),
             action_is(Action::Read, Comparison::Eq),
@@ -787,19 +896,21 @@ impl AgentRule {
         ]);
         let class = secret_class.to_owned();
         AgentRuleSet(Self::many(
-            ["external", "unknown"]
-                .into_iter()
+            peer_classes
+                .iter()
                 .map(|peer| {
-                    let class = class.clone();
+                    let (class, peer) = (class.clone(), (*peer).to_owned());
                     TraceRule::new(
-                        forbid(Action::Edit, ["net", peer], ever(read.clone())),
+                        forbid(Action::Edit, ["net", &peer], ever(read.clone())),
                         move |event| {
                             (
                                 format!(
                                     "{} contacted an {peer} network peer after reading {class} data",
                                     event.principal
                                 ),
-                                vec![format!("contact only loopback or declared networks after reading {class}")],
+                                vec![format!(
+                                    "contact {peer} peers only from a principal that has not read {class}"
+                                )],
                             )
                         },
                     )

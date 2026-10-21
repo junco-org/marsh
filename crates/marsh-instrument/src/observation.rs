@@ -22,6 +22,7 @@ use syscalls::{Sysno, SysnoSet};
 use crate::Syscall;
 use crate::capture::{Captured, native_usize};
 use crate::ring::Rings;
+use crate::socket::Sockets;
 
 #[cfg(target_arch = "x86_64")]
 const NATIVE_ARCH: u32 = 0xC000_003E;
@@ -50,9 +51,10 @@ pub(crate) struct Resume {
 pub(crate) type Observe<'a> =
     dyn FnMut(u64, Pid, i32, Option<u64>, Option<Syscall>) -> io::Result<Resume> + 'a;
 
-/// Decides at a socket call's entry whether the task may contact a peer, given its `sockaddr`
-/// (empty when unknown). A refused call is skipped and fails with `EPERM`.
-pub(crate) type Gate = Box<dyn FnMut(Pid, &[u8]) -> bool>;
+/// Decides at the entry of a call that may reach a socket peer whether the task may: `peers`
+/// lists each peer's `sockaddr` (empty when unknown), and is only called for a gated task. A
+/// refused call is skipped and fails with `EPERM`.
+pub(crate) type Gate = Box<dyn FnMut(Pid, &mut dyn FnMut() -> Vec<Vec<u8>>) -> bool>;
 
 /// `io_uring` operations that contact a peer. Their destinations live in memory a ring read
 /// cannot attribute to a call.
@@ -115,6 +117,8 @@ pub(crate) struct Observer {
     held: HashMap<Pid, i32>,
     /// Which peers socket calls may contact; every one without one.
     gate: Option<Gate>,
+    /// The peers of connected sockets this tree wrote to.
+    sockets: Sockets,
 }
 
 impl Observer {
@@ -162,10 +166,12 @@ impl Observer {
             rings: Rings::default(),
             held: HashMap::new(),
             gate: None,
+            sockets: Sockets::default(),
         }
     }
 
-    /// Consults `gate` at the entry of every call that would contact a peer.
+    /// Consults `gate` at the entry of every call that may reach a socket peer: one naming a
+    /// peer, a write to a connected socket, or an `io_uring_enter` that may submit either.
     pub(crate) fn gate_peers(&mut self, gate: Gate) {
         self.gate = Some(gate);
     }
@@ -445,11 +451,15 @@ impl Observer {
             if syscall == Sysno::io_uring_enter {
                 capture.submit(self.rings.pending(tid, capture.descriptor(0)));
             }
+            if syscall == Sysno::connect {
+                self.sockets.forget();
+            }
+            let sockets = &mut self.sockets;
             let blocked = match &mut self.gate {
-                Some(gate) => contacted(syscall, &capture, registers)
-                    .iter()
-                    .any(|peer| !gate(tid, peer)),
-                None => false,
+                Some(gate) if reaches_peer(syscall) => !gate(tid, &mut || {
+                    contacted(tid, syscall, &capture, registers, sockets)
+                }),
+                _ => false,
             };
             if blocked && alive(skip_syscall(tid, registers))?.is_none() {
                 return Ok(());
@@ -557,25 +567,60 @@ fn event_message(tid: Pid, event: i32) -> io::Result<Option<u64>> {
     }
 }
 
-/// The peers a call at its entry stop would contact: the addresses it names, or one unknown peer
-/// for an `io_uring_enter` submitting network operations, or submissions it cannot read.
-fn contacted(syscall: Sysno, capture: &Captured, registers: libc::user_regs_struct) -> Vec<&[u8]> {
+/// Calls that may reach a socket peer.
+fn reaches_peer(syscall: Sysno) -> bool {
+    matches!(
+        syscall,
+        Sysno::connect | Sysno::sendto | Sysno::sendmsg | Sysno::sendmmsg | Sysno::io_uring_enter
+    ) || written_descriptor(syscall).is_some()
+}
+
+/// The argument naming the descriptor a call writes through, for calls that write to any
+/// descriptor, sockets included.
+fn written_descriptor(syscall: Sysno) -> Option<usize> {
     match syscall {
-        Sysno::connect | Sysno::sendto | Sysno::sendmsg | Sysno::sendmmsg => {
-            capture.peers().iter().map(Vec::as_slice).collect()
-        }
-        Sysno::io_uring_enter
-            if lurk_cli::arch::get_arg_value(registers, 1) != 0
-                && capture.submissions().is_none_or(|opcodes| {
-                    opcodes
-                        .iter()
-                        .any(|opcode| NETWORK_IO_URING_OPS.contains(opcode))
-                }) =>
-        {
-            vec![&[]]
-        }
-        _ => Vec::new(),
+        Sysno::write
+        | Sysno::writev
+        | Sysno::pwrite64
+        | Sysno::pwritev
+        | Sysno::pwritev2
+        | Sysno::sendfile
+        | Sysno::sendto
+        | Sysno::sendmsg
+        | Sysno::sendmmsg => Some(0),
+        Sysno::splice => Some(2),
+        _ => None,
     }
+}
+
+/// The peers a call at its entry stop may reach: the addresses it names, the peer of a connected
+/// socket it writes to, or one unknown peer for an `io_uring_enter` submitting network
+/// operations, or submissions it cannot read.
+fn contacted(
+    tid: Pid,
+    syscall: Sysno,
+    capture: &Captured,
+    registers: libc::user_regs_struct,
+    sockets: &mut Sockets,
+) -> Vec<Vec<u8>> {
+    let argument = |index| lurk_cli::arch::get_arg_value(registers, index);
+    if syscall == Sysno::io_uring_enter {
+        let networked = argument(1) != 0
+            && capture.submissions().is_none_or(|opcodes| {
+                opcodes
+                    .iter()
+                    .any(|opcode| NETWORK_IO_URING_OPS.contains(opcode))
+            });
+        return if networked { vec![Vec::new()] } else { Vec::new() };
+    }
+    // A stream socket ignores the address a send names, so a send is judged by both.
+    let mut peers = capture.peers().to_vec();
+    if let Some(index) = written_descriptor(syscall)
+        && let Some(peer) = sockets.peer(tid, argument(index))
+    {
+        peers.push(peer);
+    }
+    peers
 }
 
 /// Makes the kernel skip the call `tid` is stopped at the entry of.

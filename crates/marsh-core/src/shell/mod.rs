@@ -36,8 +36,8 @@ pub use agent::{AgentPolicy, AgentPolicyError, AgentRule, AgentRuleSet};
 pub use error::{ShellError, ShellErrorKind};
 pub use junco_policy::{Action, Principal};
 pub use policy::{
-    Bump, Denial, EmptyPolicy, Event, LockPolicy, Policy, PolicyDecision, PolicyObserver,
-    PolicyValidator,
+    Bump, Denial, EmptyPolicy, Event, LockPolicy, Policy, PolicyDecision, PolicyKind,
+    PolicyObserver, PolicyValidator,
 };
 pub use sandbox_policy::{CommandContext, MarshTool, SandboxPolicy, ShellCommand};
 pub use signal::Signal;

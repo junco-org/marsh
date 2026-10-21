@@ -1,5 +1,6 @@
 //! Stage 1: clean work generation, immutable baseline, and owned evaluation resources.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -8,15 +9,17 @@ use marsh_instrument::{RootId, Syscall, TraceRun};
 use marsh_lib::RecoverPoison as _;
 
 use super::access::{Access, Effects};
-use super::agent::{self, AgentPolicy, Observation, Observed, PathAction, Peer};
+use super::agent::{self, AgentPolicy, Observation, Observed, Peer};
 use super::completion::{Completion, Finalize};
 use super::execution::Run;
-use super::policy::{PolicyDecision, PolicyObserver};
+use super::policy::{self, Event, PolicyDecision, PolicyKind, PolicyObserver};
 use super::session::Session;
 use super::{Principal, ShellError};
 
 #[derive(Default)]
 pub(super) struct CommandEvidence {
+    /// The command's frozen baseline, against which its source changes are classified.
+    pub baseline: PathBuf,
     pub records: Vec<Syscall>,
     /// Every classified effect with its entry order in the run's sequence.
     pub effects: Vec<(u64, Effects)>,
@@ -40,6 +43,9 @@ pub(super) struct Snapshot {
     agent: Option<Arc<AgentPolicy>>,
     /// Notified of each peer the agent policy refuses (or, auditing, would refuse).
     observer: Option<Arc<PolicyObserver>>,
+    /// The run whose refused peers were reported, and the refusals reported for it: a program
+    /// retrying a refused call is reported once.
+    reported: Mutex<(Option<TraceRun>, HashSet<Event>)>,
 }
 
 pub(super) struct SnapshotState {
@@ -88,6 +94,7 @@ impl Snapshot {
             }),
             agent,
             observer,
+            reported: Mutex::new((None, HashSet::new())),
         });
         let weak = Arc::downgrade(&snapshot);
         let root = snapshot.session.tracing.register_root(
@@ -244,23 +251,30 @@ impl Snapshot {
         Ok(())
     }
 
-    /// Whether the active command may contact `peer` (a native `sockaddr`, empty when unknown):
-    /// its agent policy decides against committed history plus the command's observations so
-    /// far. Called on the tracer thread while the calling task is stopped at the call's entry.
+    /// Whether the active command may reach `peer` (a native `sockaddr`, empty when unknown): its
+    /// agent policy decides against committed history plus the command's observations so far.
+    /// Called on the tracer thread while the calling task is stopped at the call's entry.
     fn permits_peer(&self, run: TraceRun, peer: &[u8]) -> bool {
         let Some(agent) = &self.agent else {
             return true;
         };
+        let principal = &self.owner;
         let candidate = Observation {
-            principal: self.owner.clone(),
+            principal: principal.clone(),
             observed: Observed::Connect(Peer::decode(peer)),
         };
+        if !agent.judges(&candidate) {
+            return true;
+        }
+        // Taken one after the other, never nested: `prepare` locks this state under the authority.
         let prior = match &self.state.lock().recover().evidence {
-            Some((active, evidence)) if *active == run => {
-                agent::observations(&evidence.effects, &self.owner, Some(agent), |_| {
-                    Some(PathAction::Edit)
-                })
-            }
+            Some((active, evidence)) if *active == run => agent::observations(
+                &evidence.effects,
+                principal,
+                Some(agent),
+                |path| policy::change(&evidence.baseline, &self.path, path),
+                |_| Vec::new(),
+            ),
             _ => Vec::new(),
         };
         let denial = {
@@ -270,16 +284,33 @@ impl Snapshot {
         let Some(denial) = denial else {
             return true;
         };
-        if let Some(observer) = &self.observer {
+        if let Some(observer) = &self.observer
+            && self.first_report(run, &denial.event)
+        {
+            let verb = if agent.audits() {
+                "would block"
+            } else {
+                "blocked"
+            };
             observer.notify(
+                PolicyKind::Agent,
                 &denial.event,
                 &PolicyDecision::Deny {
-                    failed_precondition: format!("blocked: {}", denial.failed_precondition),
+                    failed_precondition: format!("{verb}: {}", denial.failed_precondition),
                     allowed_fixes: denial.allowed_fixes,
                 },
             );
         }
         agent.audits()
+    }
+
+    /// Whether `event` is the first refusal of its kind in `run`.
+    fn first_report(&self, run: TraceRun, event: &Event) -> bool {
+        let mut reported = self.reported.lock().recover();
+        if reported.0 != Some(run) {
+            *reported = (Some(run), HashSet::new());
+        }
+        reported.1.insert(event.clone())
     }
 
     /// Marks the active command's evidence incomplete, so it is never published.
@@ -363,7 +394,13 @@ pub(super) fn prepare(
             return Err(error.into());
         }
     };
-    state.evidence = Some((trace, CommandEvidence::default()));
+    state.evidence = Some((
+        trace,
+        CommandEvidence {
+            baseline: baseline.clone(),
+            ..CommandEvidence::default()
+        },
+    ));
     state.dirty = true;
     drop(state);
     drop(authority);

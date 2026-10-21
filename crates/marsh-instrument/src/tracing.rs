@@ -61,9 +61,9 @@ struct Root {
     peers: Option<PeerGate>,
 }
 
-/// Whether a task of `run` may contact the peer whose `sockaddr` it names (empty when unknown).
-/// Called at the call's entry stop, without trace locks held, from the tracer thread owning the
-/// task; a refused call is skipped and fails with `EPERM`.
+/// Whether a task of `run` may reach the peer whose `sockaddr` it names or writes to (empty when
+/// unknown). Called at the call's entry stop, without trace locks held, from the tracer thread
+/// owning the task; a refused call is skipped and fails with `EPERM`.
 pub type PeerGate = Arc<dyn Fn(TraceRun, &[u8]) -> bool + Send + Sync>;
 
 /// A traced process's identity, pinned while one of its tasks was stopped.
@@ -581,7 +581,7 @@ impl Tracing {
         let mut observer = Observer::new(self.selected.clone(), Arc::clone(&self.sequence), root);
         let mut terminal = Vec::new();
         let gate = Arc::clone(self);
-        observer.gate_peers(Box::new(move |tid, peer| gate.permits(tid, peer)));
+        observer.gate_peers(Box::new(move |tid, peers| gate.permits(tid, peers)));
         let result = (|| -> io::Result<()> {
             let mut observe = |sequence, tid: Pid, status, event, info| {
                 let resume = self.deliver(sequence, tid, status, event, info)?;
@@ -648,8 +648,9 @@ impl Tracing {
         result
     }
 
-    /// Whether `tid`'s root lets it contact `peer`. A task no root owns is not gated.
-    fn permits(&self, tid: Pid, peer: &[u8]) -> bool {
+    /// Whether `tid`'s root lets it contact every one of `peers`, listed only for a gated task.
+    /// A task no root owns is not gated.
+    fn permits(&self, tid: Pid, peers: &mut dyn FnMut() -> Vec<Vec<u8>>) -> bool {
         let state = lock(&self.state);
         let Some(run) = state.threads.get(&tid).and_then(|thread| thread.inherited) else {
             return true;
@@ -660,7 +661,7 @@ impl Tracing {
             .and_then(|root| root.peers.as_ref())
             .map(Arc::clone);
         drop(state);
-        gate.is_none_or(|gate| gate(run, peer))
+        gate.is_none_or(|gate| peers().iter().all(|peer| gate(run, peer)))
     }
     /// Registers a seized command under the scope that spawned it, and hands its classifier
     /// the fork that created it, so its inherited descriptors are the host's.

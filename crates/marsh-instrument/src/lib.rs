@@ -9,6 +9,7 @@ mod capture;
 mod host;
 mod observation;
 mod ring;
+mod socket;
 mod syscall;
 mod tracing;
 mod wire;
