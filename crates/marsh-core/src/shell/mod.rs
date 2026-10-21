@@ -865,6 +865,8 @@ impl Shared {
                         session,
                         resources.principal.clone(),
                         resources.owner.clone(),
+                        resources.agent_policy.clone(),
+                        resources.policy_observer.clone(),
                     )?;
                     view::Transition::plan(
                         interpreter,
