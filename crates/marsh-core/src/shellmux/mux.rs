@@ -162,7 +162,8 @@ impl ShellMux {
             .sandbox_policy(policy)
             .shell_policy(Arc::clone(&self.profile.shell_policy))
             .policy_observer(self.profile.policy_observer.clone())
-            .policy_owner(options.policy_owner);
+            .policy_owner(options.policy_owner)
+            .agent_policy(self.profile.agent_policy.clone());
         if let Some(environment) = options.environment {
             builder = builder.environment(environment);
         } else {
