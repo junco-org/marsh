@@ -43,8 +43,9 @@ libc = "0.2"
 # `term` carries both `nix::sys::termios` and `nix::pty`.
 nix = { version = "0.31.2", features = ["fs", "term"] }
 # The ownership-lock policy every managed command's capabilities are checked against before it
-# is published, pinned to the exact revision this source's action vocabulary matches.
-junco-policy = { git = "https://github.com/junco-org/junco-policy.git", rev = "8d3150b7ce657dbb53de23b6f74095711ad78e07" }
+# is published, and the TracePolicy agent rules compile into, pinned to the exact revision this
+# source's action vocabulary matches.
+junco-policy = { git = "https://github.com/junco-org/junco-policy.git", rev = "6ac02dd6de419439db068cd8b9494e5597b7804d" }
 
 [dev-dependencies]
 marsh-btrfs = { path = "../marsh-btrfs", features = ["fake"] }

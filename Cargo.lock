@@ -1739,7 +1739,7 @@ dependencies = [
 [[package]]
 name = "junco-policy"
 version = "0.1.0"
-source = "git+https://github.com/junco-org/junco-policy.git?rev=8d3150b7ce657dbb53de23b6f74095711ad78e07#8d3150b7ce657dbb53de23b6f74095711ad78e07"
+source = "git+https://github.com/junco-org/junco-policy.git?rev=6ac02dd6de419439db068cd8b9494e5597b7804d#6ac02dd6de419439db068cd8b9494e5597b7804d"
 dependencies = [
  "bumpalo",
  "hashbrown 0.16.1",
