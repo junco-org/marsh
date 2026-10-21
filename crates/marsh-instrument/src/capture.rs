@@ -21,6 +21,10 @@ pub(crate) const PATH_LIMIT: usize = 4096;
 const WORD: u64 = std::mem::size_of::<libc::c_long>() as u64;
 /// `sizeof(struct sockaddr_storage)`: no peer address the kernel accepts is longer.
 const SOCKADDR_LIMIT: u64 = 128;
+/// `sizeof(struct mmsghdr)` on every 64-bit ABI: a `msghdr` and its `msg_len`, padded.
+const MMSGHDR_SIZE: u64 = 64;
+/// `UIO_MAXIOV`: the kernel sends at most this many messages per `sendmmsg`.
+const MMSG_LIMIT: u64 = 1024;
 
 /// Only added role information: the native value and scalar/pointer vocabulary stay upstream.
 struct Roles {
@@ -84,7 +88,7 @@ pub(crate) struct Captured {
     cwd: Option<FileTarget>,
     flags: Option<u64>,
     submissions: Option<Vec<u8>>,
-    address: Option<Vec<u8>>,
+    peers: Vec<Vec<u8>>,
     failure: Option<io::Error>,
 }
 
@@ -103,7 +107,7 @@ impl Captured {
             cwd: None,
             flags: None,
             submissions: None,
-            address: None,
+            peers: Vec::new(),
             failure: None,
         };
         for (index, kind) in types.into_iter().enumerate() {
@@ -168,21 +172,11 @@ impl Captured {
             };
             captured.flags = captured.keep(result);
         }
-        let address = match syscall {
-            Sysno::connect => Some(read_sockaddr(
-                tid,
-                get_arg_value(registers, 1),
-                get_arg_value(registers, 2),
-            )),
-            Sysno::sendto if get_arg_value(registers, 4) != 0 => Some(read_sockaddr(
-                tid,
-                get_arg_value(registers, 4),
-                get_arg_value(registers, 5),
-            )),
-            Sysno::sendmsg => read_message_name(tid, get_arg_value(registers, 1)).transpose(),
-            _ => None,
-        };
-        captured.address = address.and_then(|address| captured.keep(address));
+        // An unreadable peer is kept as an empty address: an unknown peer, never no peer.
+        captured.peers = read_peers(tid, syscall, registers)
+            .into_iter()
+            .map(|peer| captured.keep(peer).unwrap_or_default())
+            .collect();
         Ok(captured)
     }
 
@@ -192,6 +186,16 @@ impl Captured {
             .iter()
             .find(|(position, _)| *position == index)
             .and_then(|(_, target)| target.as_ref())
+    }
+
+    /// The peer `sockaddr`s a socket call names; an empty one could not be read.
+    pub(crate) fn peers(&self) -> &[Vec<u8>] {
+        &self.peers
+    }
+
+    /// The opcodes an `io_uring_enter` found pending at its entry, when they were readable.
+    pub(crate) fn submissions(&self) -> Option<&[u8]> {
+        self.submissions.as_deref()
     }
 
     /// Records the opcodes an `io_uring_enter` found pending at its entry.
@@ -256,7 +260,7 @@ impl Captured {
             descriptors: self.descriptors,
             flags: self.flags,
             submissions: self.submissions,
-            address: self.address,
+            peers: self.peers,
         })
     }
 }
@@ -394,6 +398,40 @@ fn read_message_name(tid: Pid, header: u64) -> io::Result<Option<Vec<u8>>> {
         return Ok(None);
     }
     read_sockaddr(tid, name, u64::from(length)).map(Some)
+}
+
+/// Reads every peer `sockaddr` a socket call names at its entry.
+fn read_peers(
+    tid: Pid,
+    syscall: Sysno,
+    registers: libc::user_regs_struct,
+) -> Vec<io::Result<Vec<u8>>> {
+    let argument = |index| get_arg_value(registers, index);
+    match syscall {
+        Sysno::connect => vec![read_sockaddr(tid, argument(1), argument(2))],
+        Sysno::sendto if argument(4) != 0 => vec![read_sockaddr(tid, argument(4), argument(5))],
+        Sysno::sendmsg => read_message_name(tid, argument(1))
+            .transpose()
+            .into_iter()
+            .collect(),
+        Sysno::sendmmsg => read_message_names(tid, argument(1), argument(2)),
+        _ => Vec::new(),
+    }
+}
+
+/// Reads the peer address of each of a `sendmmsg`'s first `count` headers that names one.
+fn read_message_names(tid: Pid, vector: u64, count: u64) -> Vec<io::Result<Vec<u8>>> {
+    (0..count.min(MMSG_LIMIT))
+        .filter_map(|index| {
+            let header = index
+                .checked_mul(MMSGHDR_SIZE)
+                .and_then(|offset| vector.checked_add(offset));
+            match header {
+                Some(header) => read_message_name(tid, header).transpose(),
+                None => Some(Err(io::Error::other("mmsghdr wraps the address space"))),
+            }
+        })
+        .collect()
 }
 
 pub(crate) fn read_path(tid: Pid, address: u64) -> io::Result<Vec<u8>> {
