@@ -33,6 +33,8 @@ glob = "0.3"
 futures-util = "0.3"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0.149"
+# Decodes the socket peers a traced command names, from the bytes the tracer copied out.
+socket2 = "0.6"
 thiserror = "2.0.18"
 tokio = { version = "1.52.3", features = ["rt", "rt-multi-thread", "sync", "net", "macros", "time"] }
 # The pty ioctls, the `read`/`write` on its master, and the `kill(-pgid, SIGKILL)` a forced stop

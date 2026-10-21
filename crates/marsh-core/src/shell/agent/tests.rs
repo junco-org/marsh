@@ -1,4 +1,5 @@
 use super::*;
+use std::net::Ipv6Addr;
 
 fn path(principal: &str, action: PathAction, path: &str) -> Observation {
     Observation {
@@ -57,6 +58,17 @@ fn peers_decode_from_native_sockaddrs() {
     let mut unix = u16::try_from(libc::AF_UNIX).unwrap().to_ne_bytes().to_vec();
     unix.extend(b"/run/x.sock\0\0\0");
     assert_eq!(Peer::decode(&unix), Peer::Unix(b"/run/x.sock".to_vec()));
+    // A length without the terminating NUL, an abstract name, and an unnamed socket.
+    assert_eq!(
+        Peer::decode(&unix[..2 + 11]),
+        Peer::Unix(b"/run/x.sock".to_vec())
+    );
+    let family = &unix[..2];
+    assert_eq!(
+        Peer::decode(&[family, b"\0name"].concat()),
+        Peer::Unix(b"\0name".to_vec())
+    );
+    assert_eq!(Peer::decode(family), Peer::Unix(Vec::new()));
     let mut v6 = u16::try_from(libc::AF_INET6)
         .unwrap()
         .to_ne_bytes()
@@ -66,6 +78,14 @@ fn peers_decode_from_native_sockaddrs() {
     v6.extend(Ipv6Addr::LOCALHOST.octets());
     v6.extend([0; 4]);
     assert_eq!(Peer::decode(&v6), Peer::Ip("[::1]:443".parse().unwrap()));
+    // The scope is dropped; a length stopping just before it is accepted, as by the kernel.
+    v6.splice(24.., 2u32.to_ne_bytes());
+    assert_eq!(Peer::decode(&v6), Peer::Ip("[::1]:443".parse().unwrap()));
+    assert_eq!(
+        Peer::decode(&v6[..24]),
+        Peer::Ip("[::1]:443".parse().unwrap())
+    );
+    assert_eq!(Peer::decode(&v6[..23]), Peer::Unknown);
     assert_eq!(Peer::decode(&[]), Peer::Unknown);
     assert_eq!(
         Peer::decode(&sockaddr_in([1, 2, 3, 4], 1)[..6]),
