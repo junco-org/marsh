@@ -7,11 +7,15 @@ is not a case; it registers cases whose leaks are expected (see below).
 
 ## What each `kind` asserts
 
-* `attack` — a secret's bytes must **not** reach an external sink. The case
-  passes when the policy blocks the egress. Most model a real exfiltration
-  technique; a few probe a specific enforcement point (a pre-connected socket,
-  `writev`, an IPv4-mapped IPv6 peer, `sendfile`/`splice` copying in-kernel, an
-  io_uring `WRITE` to a connected socket).
+* `attack` — nothing an untraced observer can see may depend on the secret.
+  The case runs twice with independent canaries; the bytes the sinks received
+  and the changes to shared state (files in `/tmp`, `/var/tmp`, `/dev/shm`,
+  `/dev/mqueue` outside the fixture, bound ports and socket names, process
+  arguments, keys, System V IPC) must be the same in both runs, whatever the
+  encoding. Most cases model a real exfiltration technique; a few probe a
+  specific enforcement point (a pre-connected socket, `writev`, an IPv4-mapped
+  IPv6 peer, `sendfile`/`splice` copying in-kernel, an io_uring `WRITE` to a
+  connected socket, a `vfork` child contacting before its creator returns).
 * `control` — legitimate traffic that must **not** be blocked. The canary must
   reach the sink; if it does not, the case fails as a false denial. Controls
   here never read a `secret`-classed path, so egress is allowed and the sink

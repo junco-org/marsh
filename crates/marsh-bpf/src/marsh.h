@@ -79,6 +79,95 @@ _Static_assert(sizeof(struct marsh_answers) == 240, "Answers ABI");
 _Static_assert(sizeof(struct marsh_receipts) == 64, "Receipts ABI");
 _Static_assert(sizeof(struct marsh_event) == 200, "Event ABI");
 
+/* A receipt's sender when the reader read a classified file rather than another root's data. */
+#define SENDER_CLASSIFIED 0xffffffffffffffffULL
+#define MAX_NAME_RULES 32
+#define NAME_GLOB 32
+
+/*
+ * What an inode's name and place classify it as (docs/threat-model.md §8.3). `classes` is what a
+ * read of it carries; a directory also holds `subtree` (classes every entry beneath it carries),
+ * `deep` (scopes its subdirectories inherit) and `direct` (scopes of its own entries only).
+ */
+struct marsh_inode_label {
+    __u64 classes;
+    __u64 subtree;
+    __u64 deep;
+    __u64 direct;
+};
+
+/*
+ * Classifies an entry whose parent directory holds one of `scope` and whose name is `prefix`
+ * exactly, or, with `star`, `prefix`, anything, `suffix`. A matched directory also gets `subtree`
+ * and `direct`.
+ */
+struct marsh_name_rule {
+    __u64 scope;
+    __u64 classes;
+    __u64 subtree;
+    __u64 direct;
+    __u8 prefix_len;
+    __u8 suffix_len;
+    __u8 star;
+    __u8 unused[5];
+    __u8 prefix[NAME_GLOB];
+    __u8 suffix[NAME_GLOB];
+};
+
+_Static_assert(sizeof(struct marsh_inode_label) == 32, "InodeLabel ABI");
+_Static_assert(sizeof(struct marsh_name_rule) == 104, "NameRule ABI");
+
+/*
+ * Whether a name of `len` bytes matches `rule`. `head` holds its first NAME_GLOB bytes (only the
+ * first `len` matter); a name longer than NAME_GLOB also has its last NAME_GLOB bytes in `tail`.
+ * Indexes are masked so the BPF verifier can bound them.
+ */
+MARSH_INLINE int marsh_name_matches(const struct marsh_name_rule *rule, const __u8 head[NAME_GLOB],
+                                    const __u8 tail[NAME_GLOB], __u32 len)
+{
+    __u32 prefix = rule->prefix_len, suffix = rule->suffix_len;
+    if (prefix > NAME_GLOB || suffix > NAME_GLOB)
+        return 0;
+    if (rule->star ? len < prefix + suffix : len != prefix)
+        return 0;
+    for (__u32 i = 0; i < NAME_GLOB; i++)
+        if (i < prefix && head[i] != rule->prefix[i])
+            return 0;
+    for (__u32 i = 0; i < NAME_GLOB; i++) {
+        if (i >= suffix)
+            break;
+        __u8 byte = len > NAME_GLOB ? tail[(NAME_GLOB - suffix + i) & (NAME_GLOB - 1)]
+                                    : head[(len - suffix + i) & (NAME_GLOB - 1)];
+        if (byte != rule->suffix[i])
+            return 0;
+    }
+    return 1;
+}
+
+/* What an entry of the directory `parent` carries before any rule matches its name. */
+MARSH_INLINE void marsh_inherit(const struct marsh_inode_label *parent, int directory,
+                                struct marsh_inode_label *out)
+{
+    out->classes = parent->subtree;
+    out->subtree = directory ? parent->subtree : 0;
+    out->deep = directory ? parent->deep : 0;
+    out->direct = 0;
+}
+
+/* Adds what `rule` gives an entry of a directory with scopes `scopes`, when it applies. */
+MARSH_INLINE void marsh_apply_rule(const struct marsh_name_rule *rule, __u64 scopes,
+                                   const __u8 head[NAME_GLOB], const __u8 tail[NAME_GLOB],
+                                   __u32 len, int directory, struct marsh_inode_label *out)
+{
+    if (!(rule->scope & scopes) || !marsh_name_matches(rule, head, tail, len))
+        return;
+    out->classes |= rule->classes;
+    if (directory) {
+        out->subtree |= rule->subtree;
+        out->direct |= rule->direct;
+    }
+}
+
 /* Mapped IPv6 unwraps to IPv4, exactly as Endpoint::normalize. */
 MARSH_INLINE int marsh_ipv4(const struct marsh_endpoint *e, __u8 out[4])
 {

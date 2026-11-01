@@ -199,7 +199,7 @@ enum Hold {
 }
 impl Hold {
     /// Reads share with reads and work; recovery excludes every other hold.
-    fn excludes(self, other: Self) -> bool {
+    const fn excludes(self, other: Self) -> bool {
         match (self, other) {
             (Self::Recovery, _) | (_, Self::Recovery) => true,
             (Self::Read, _) | (_, Self::Read) | (Self::Managed, Self::Managed) => false,

@@ -309,8 +309,10 @@ the WAL.
 A leak fuzzer exercises these rules end to end. `crates/marsh-core/tests/leak-corpus/` holds
 hand-written cases — each reads (or deliberately does not read) a secret, then tries to send it to
 a stand-in external host — and `cargo test -p marsh-core --lib leak_corpus -- --ignored` runs them
-inside an isolated network namespace, failing if any canary reaches the sink or legitimate traffic
-is blocked. `MARSH_LEAK_ENFORCEMENT=privileged` selects the kernel mode (build with `--features
+inside an isolated network namespace. Each attack runs twice with different secrets and fails if
+anything an untraced observer could see (the sinks' bytes, shared files, bound ports, process
+arguments, keys, IPC objects) differs between the runs; a control fails if its canary never reaches
+the sink. `MARSH_LEAK_ENFORCEMENT=privileged` selects the kernel mode (build with `--features
 privileged`). Root runs retain initial-user-namespace BPF authority; unprivileged runs also create
 a user namespace. Known gaps are mode-specific: named-address rewriting remains a ptrace gap,
 and `recommended` deliberately permits untraced local daemons. Remaining Phase A races are

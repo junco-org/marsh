@@ -310,6 +310,10 @@ impl Fixture {
 }
 
 #[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one tracked tree's execs, forks and late writes are checked against one run in order"
+)]
 fn tracked_execs_own_their_whole_tree_until_their_end() {
     let probe = tempfile::tempdir().unwrap();
     let sub = probe.path().canonicalize().unwrap();

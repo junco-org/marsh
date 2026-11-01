@@ -39,9 +39,9 @@ Goals:
 * Never fall back silently: a deployment relying on the privileged mode fails closed without it.
 
 Non-goals:
-* Filesystem enforcement. An `openat` path can be swapped after the tracer reads it, so a secret
-  read could go unrecorded. Closing it needs an LSM `file_open` hook and a filesystem observer
-  that trusts the kernel's path (§9).
+* Filesystem enforcement beyond taint sources. Reads of a propagated class's files are kernel
+  receipts ([`threat-model.md`](threat-model.md) §8.3), so a swapped `openat` path or a thread
+  racing the read's exit stop cannot hide them; file content moving between domains is phase 3.
 * Replacing ptrace. It still observes every filesystem effect, runs the exec hooks, restricts
   io_uring's filesystem operations (`access.rs`), and feeds the taint table.
 
@@ -114,6 +114,9 @@ explicit request for the other mode is refused.
 | `HEALTH` | array | sticky poison flag: event loss or a map failure | loader and kernel |
 | `PID_NAMESPACE` | array | the loader's PID namespace, for event tgid/tid only | loader |
 | `KEYS` | LRU hash | key address → root that created it | the kernel (`key_alloc`) |
+| `INODES` | inode storage | inode → `InodeLabel { classes, subtree, deep, direct }` | the kernel at every load, link and rename; the controller on anchors and already-loaded entries |
+| `NAME_RULES` | array (32) | `NameRule`: scope, name (literal or `prefix*suffix`) → classes, subtree, direct scopes | userspace: every classified root's rules joined |
+| `RETAINED` | hash | `(device, inode)` → label a renamed or linked inode's new name would not give back | the kernel; removed when the inode is freed unlinked |
 
 `Answers` holds `generation`, `deny` (classes refused now), `guarded` (classes any rule can
 refuse), `untraced` (local classes whose receiver must be traced while the root carries taint),
@@ -165,6 +168,14 @@ read completing and that stop, another thread A of the same root can contact a p
 answers; the bytes are in the process's memory already, so ptrace-based observation cannot close
 this (§7).
 
+**Unordered records.** The tracer orders a new task's records after the call that created it, so
+they reach the policy only once that call returns, and a `vfork` parent's returns only after the
+child execs or exits. Until then the root's answers cannot include what the child read: any answers
+published meanwhile are published stale (`Tracing::publish`), a socket call's entry refreshes them
+as such, and the ptrace gate refuses every contact the policy judges, reported as made before the
+records were ordered (`vfork-child-read-exfil`, `vfork-child-staged-exfil`). The records' own
+republish, or the next socket call's refresh, lifts it once they are ordered.
+
 ### 4.5 Classifying addresses in the kernel
 
 The classifier mirrors `peer_class`: `AF_UNIX` → `unix`, `AF_NETLINK` → `netlink`, any other family
@@ -184,6 +195,9 @@ userspace labels each inserted prefix Q with the first declared network containi
 | `fexit` of `inet_recvmsg`, `inet6_recvmsg`, `unix_stream_recvmsg`, `unix_dgram_recvmsg`, `unix_seqpacket_recvmsg`, `sock_splice_read` | a governed read that returned data from a tagged socket (`recv*`, every message of `recvmmsg`, `read`, `splice`), judged on return so a reader already blocked when the bytes arrived is caught |
 | `sk_free_security` | drops a freed IP socket's connection tag, and its port's tags when no other socket can hold that port |
 | `uring_sqpoll` | refuses kernel-polled rings for governed tasks before their worker exists |
+| `d_instantiate` | labels every inode the kernel attaches to a name, created or looked up, from its parent's label and its name, plus anything retained |
+| `inode_rename`, `inode_link`, `inode_free_security` | add the new name's label; retain what it would not give back; drop the retained label with the last link |
+| `file_permission` (`MAY_READ`), `mmap_file`, `bprm_check_security` | a governed read, mapping or exec of a classified inode is a receipt of its classes (sender `CLASSIFIED`) before the data reaches it |
 
 A send judges `msg_name` only where it is the destination: datagram and raw sockets, and an
 unconnected TCP socket's fast-open send. A connected TCP socket ignores a name and a UNIX stream or
@@ -352,7 +366,9 @@ declared networks per root, ring overflow, a PID-namespace child refused alone, 
 UNIX seqpacket sends judged by their peer whatever name they carry, and taint receipts over UDP,
 TCP (only the tainted connection), UNIX streams read with `read()`, a reader already blocked when
 the bytes arrive, the second message of one `recvmmsg`, a datagram port another socket shared at a
-different address, and several classes at once.
+different address, and several classes at once; and classified reads: an entry loaded before
+classification and evicted, one created beneath a classified directory, one renamed away from its
+classifying name and evicted, a governed mapping, and an ungoverned read that is no receipt.
 `.github/workflows/privileged.yml` runs them and the corpus in both modes: pull requests with
 seed `20261014`, nightly with four seeds and two iterations each. The runner needs QEMU,
 busybox-static, cpio, zstd, kmod, iproute2 and an installed generic BPF/BTF kernel with 9p modules;
@@ -364,8 +380,28 @@ Observed verification is recorded in §8.1.
 
 Observed on this host (2 vCPUs, QEMU TCG without KVM, guest kernel 7.0.0-38-generic with BPF LSM):
 
-* All nine programs pass the host kernel's verifier (`bpftool prog loadall`), and the three `lsm`
-  tests pass in the guest in both the initial and a nested PID namespace.
+* Differential oracle (`leak_fuzz/projection.rs`), seed `20261014`, one iteration: 35 case runs
+  with zero failures in each mode, each attack run as twins with independent canaries, audit
+  cross-checks included. Privileged mode left only `untraced-local-daemon-allowed`, the
+  `recommended` policy's registered allowance; unprivileged mode only its registered gaps, now
+  including `cross-principal-staged` and `vfork-child-staged-exfil`, whose secret is staged in
+  the host's `/tmp`. Before the unordered-record fix the `vfork-child-*` cases leaked in both
+  modes. An earlier run, with clippy competing for the host's two CPUs, found
+  `local-handoff-rewrite`'s privileged audit replay inconclusive (no canary reached a sink); the
+  idle rerun passed.
+* Threat-model phases 1–2: every program loads and attaches through `Controller::load`, and all six
+  `lsm` tests pass in the initial and a nested PID namespace, `classified_reads_are_receipts` and
+  `escapes_are_refused_in_a_domain` included. Loading first found `key_permission` reading its
+  `key_ref_t` argument directly, which the verifier refuses (it now uses `bpf_get_func_arg`).
+* Leak corpus, seed `20261014`, one iteration: 33 case runs with zero failures in each mode.
+  `thread-window-read-exfil` is blocked in privileged mode; unprivileged mode leaked only its
+  registered gaps. The guest runner now mounts `devpts`, switches root instead of `chroot`ing
+  (the kernel refuses user namespaces to a chrooted task), and disables apport, whose Python
+  hook treats fixtures under `/var` as packaged and outlasted step timeouts collecting reports.
+
+Earlier, before threat-model phase 1:
+* All nine programs passed the host kernel's verifier (`bpftool prog loadall`), and the three
+  `lsm` tests passed in the guest in both the initial and a nested PID namespace.
 * Leak corpus, seed `20261014`, one iteration: 32 case runs with zero failures in each mode, audit
   cross-checks included. `local-handoff-rewrite` and `toctou-peer-rewrite` are blocked in
   privileged mode.
@@ -389,8 +425,8 @@ delivery-time taint) are decisions in [`threat-model.md`](threat-model.md) §10.
    guarded class until republished. Measure false denials with audit mode on the Harbor benchmark.
 2. **Loading and privileges.** Should a small privileged helper own the programs and hand map
    descriptors to an unprivileged marsh?
-3. **Filesystem race.** An LSM `file_open` hook could record secret opens, so the answers' inputs
-   are race-free too; it needs a filesystem observer that trusts the kernel's path.
+3. **Filesystem race.** Closed for taint sources by kernel classification (`threat-model.md`
+   §8.3); file content between domains is phase 3 there.
 4. **IP receiver ownership.** A `cgroup/post_bind` program could record which root owns each bound
    port, replacing `LOCAL_ALLOWED`'s `/proc` scan for `untraced_local(Deny)`.
 5. **junco-policy.** Merge `feat/incremental-trace` upstream and repin the workspace to the merged

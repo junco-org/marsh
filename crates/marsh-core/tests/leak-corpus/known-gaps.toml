@@ -11,12 +11,14 @@
 # * `sendfile-exfil`: the gate counts a sendfile's source as a read.
 # * `io-uring-socket-write`: every io_uring operation outside the effectless
 #   set is gated as an unknown peer.
-# * `cross-principal-staged`: a file written after a secret read is a taint
-#   carrier for every principal that reads it.
+# * `cross-principal-staged`'s egress: a file written after a secret read is a
+#   taint carrier for every principal that reads it.
 # * `proxy-via-loopback`, `proxy-via-unix`: a tainted principal's contact with
 #   a local socket taints the principals whose commands hold it.
 # * `untraced-local-daemon-exfil`: under `untraced_local(Deny)` a tainted
 #   principal may not contact a local socket no traced command holds.
+# * `vfork-child-read-exfil`, and `vfork-child-staged-exfil`'s contact: a
+#   contact is refused while the root has records the tracer cannot yet order.
 
 [[gap]]
 name = "toctou-peer-rewrite"
@@ -43,6 +45,30 @@ The tracer hands taint to whoever holds the local port the address named at \
 entry. Another thread can rewrite it before the kernel copies it, delivering \
 to an untainted relay. Privileged mode taints the relay in the kernel when it \
 reads the socket, whatever port the sender named."""
+
+[[gap]]
+name = "thread-window-read-exfil"
+enforcement = "unprivileged"
+reason = """
+The tracer records a read at its exit stop, after the kernel copied the bytes. \
+Another thread can send them before that stop is handled, judged as untainted. \
+Privileged mode makes the read a kernel taint receipt before the copy."""
+
+[[gap]]
+name = "cross-principal-staged"
+enforcement = "unprivileged"
+reason = """
+Unprivileged commands share the host's /tmp, so the staged secret itself is a \
+file any local user can read, whatever the policy does with its later \
+egress. Privileged mode confines writes beneath the root's own directories, \
+where /tmp/shared is the source's governed scratch."""
+
+[[gap]]
+name = "vfork-child-staged-exfil"
+enforcement = "unprivileged"
+reason = """
+As `cross-principal-staged`: the secret staged in the host's /tmp is readable \
+by any local user. The child's contact itself is refused."""
 
 # A residual without a deterministic corpus case; not a claim of coverage.
 [[gap]]

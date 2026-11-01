@@ -552,12 +552,15 @@ mod tests {
             if kill -0 $PPID 2>/dev/null; then exit 15; fi";
         let mut command = std::process::Command::new("/bin/sh");
         command.args(["-c", script]).current_dir(scratch.path());
-        // SAFETY: the hook makes two syscalls on a descriptor that outlives the spawn.
+        let restrict = move || {
+            // SAFETY: this prctl operation takes integer arguments, not pointers.
+            check(unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) }.into())?;
+            // SAFETY: the syscall reads only the ruleset descriptor, which outlives the spawn.
+            check(unsafe { libc::syscall(libc::SYS_landlock_restrict_self, raw, 0) }).map(drop)
+        };
+        // SAFETY: the hook only makes those two async-signal-safe syscalls.
         unsafe {
-            command.pre_exec(move || {
-                check(libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0).into())?;
-                check(libc::syscall(libc::SYS_landlock_restrict_self, raw, 0)).map(drop)
-            });
+            command.pre_exec(restrict);
         }
         let status = command.status().unwrap();
         drop(ruleset);

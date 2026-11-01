@@ -18,9 +18,11 @@ mod tracing;
 mod wire;
 
 pub use confine::{Confinement, Identity};
-pub use enforcement::{Enforcement, Enforcer, KernelPolicy};
+pub use enforcement::{Enforcement, Enforcer, FileClasses, KernelPolicy};
 pub use host::HostCall;
-pub use marsh_peer_class::{Answers, Endpoint, Event as KernelEvent, Network};
+pub use marsh_peer_class::{
+    Answers, Endpoint, Event as KernelEvent, InodeLabel, NameRule, Network,
+};
 pub use observation::EFFECTLESS_IO_URING_OPS;
 pub use syscall::{FileTarget, Syscall};
 pub use tracing::{

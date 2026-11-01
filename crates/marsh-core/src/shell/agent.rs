@@ -1341,6 +1341,9 @@ impl IntoIterator for AgentRuleSet {
 /// Shared handle to a shell's agent policy.
 pub(super) type SharedAgentPolicy = Arc<AgentPolicy>;
 
+#[path = "agent/files.rs"]
+mod files;
+
 #[cfg(test)]
 #[path = "agent/tests.rs"]
 mod tests;

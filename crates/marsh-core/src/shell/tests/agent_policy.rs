@@ -125,7 +125,7 @@ async fn kernel_answers_stay_equal_to_fresh_and_lazy_decisions_as_the_command_ru
         assert_eq!(unversioned, fresh, "{step}");
         for (id, endpoint) in endpoints.iter().enumerate() {
             assert_eq!(
-                snapshot.permits_peer(run, &endpoint.sockaddr(), None),
+                snapshot.permits_peer(run, &endpoint.sockaddr(), None, true),
                 incremental.answers.deny & (1 << id) == 0,
                 "{step}: class {id}"
             );
@@ -253,8 +253,8 @@ async fn kernel_events_report_once_and_fold_receipts_into_taint() {
         assert!(seen[0].1.starts_with("would block:"));
         drop(seen);
     }
-    // A kernel receipt hands this principal the class, and its answers become exactly the
-    // contingent ones the kernel switched to.
+    // A kernel receipt of a classified file read hands this principal the class, and its answers
+    // become exactly the contingent ones the kernel switched to.
     let id = super::super::answers::taint_id("secret").unwrap();
     let before = snapshot.kernel_policy(run, None).unwrap().unwrap();
     assert_eq!(before.answers.carried & (1 << id), 0);
@@ -262,7 +262,7 @@ async fn kernel_events_report_once_and_fold_receipts_into_taint() {
         kind: RECEIPT,
         time: 2,
         taint: 1 << id,
-        sender: u64::MAX,
+        sender: marsh_peer_class::CLASSIFIED,
         ..KernelEvent::default()
     };
     snapshot.kernel_event(run, None, &receipt).unwrap();

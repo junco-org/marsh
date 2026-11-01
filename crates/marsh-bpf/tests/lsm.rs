@@ -1,6 +1,11 @@
 //! Run explicitly as root in a BPF-LSM-enabled VM, never against arbitrary host tasks, one test at
 //! a time: each test moves its whole process between cgroups to govern itself.
 #![cfg(feature = "privileged")]
+#![allow(
+    clippy::tests_outside_test_module,
+    clippy::panic_in_result_fn,
+    reason = "an integration test file is the test module, and its tests assert and propagate I/O"
+)]
 
 use std::{
     ffi::CStr,
@@ -20,8 +25,9 @@ use std::{
 
 use marsh_bpf::Controller;
 use marsh_peer_class::{
-    AF_INET, ALLOW, AUDIT, Answers, CONTACT, CONTINGENT, DENY, Endpoint, Event, LOOPBACK,
-    NETLINK, Network, RECEIPT, RULE, STALE, UNANSWERED, UNIX, UNKNOWN, UNTRACED,
+    AF_INET, ALLOW, AUDIT, Answers, CLASSIFIED, CONTACT, CONTINGENT, DENY, Endpoint, Event,
+    InodeLabel, LOOPBACK, NETLINK, NameRule, Network, RECEIPT, RULE, STALE, UNANSWERED, UNIX,
+    UNKNOWN, UNTRACED,
 };
 
 const CGROUPS: &str = "/sys/fs/cgroup";
@@ -337,6 +343,10 @@ fn connected_sends_are_judged_by_their_peer() -> io::Result<()> {
 
 #[test]
 #[ignore = "requires root, active BPF LSM, BTF, and loopback IPv4/IPv6 in a disposable VM"]
+#[expect(
+    clippy::too_many_lines,
+    reason = "every decision and audit outcome is checked against one loaded program set in turn"
+)]
 fn contacts_are_judged_against_the_kernels_address() -> io::Result<()> {
     let cgroups = Cgroups::new()?;
     let mut controller = Kernel::load(&cgroups)?;
@@ -463,7 +473,8 @@ fn contacts_are_judged_against_the_kernels_address() -> io::Result<()> {
     // Reading back what this root sent while carrying class 0 is a receipt of class 0, which
     // the kernel counts until published answers acknowledge it.
     let mut sink = [0; 64];
-    stream_pair.1.read(&mut sink)?;
+    let read = stream_pair.1.read(&mut sink)?;
+    assert_ne!(read, 0);
     let events = controller.drain()?;
     assert_eq!(
         events
@@ -645,6 +656,10 @@ fn contacts_are_judged_against_the_kernels_address() -> io::Result<()> {
 /// reader's next contact: the kernel switches the reader to its contingent answers at once.
 #[test]
 #[ignore = "requires root, active BPF LSM, BTF, and loopback IPv4 in a disposable VM"]
+#[expect(
+    clippy::too_many_lines,
+    reason = "each transport's receipt is checked in turn against the same two governed roots"
+)]
 fn local_receipts_taint_the_reader_in_the_kernel() -> io::Result<()> {
     let cgroups = Cgroups::new()?;
     let mut controller = Kernel::load(&cgroups)?;
@@ -967,6 +982,128 @@ fn escapes_are_refused_in_a_domain() -> io::Result<()> {
     assert!(outside.iter().all(|&error| error != libc::EPERM), "{outside:?}");
     assert_eq!(inside, [libc::EPERM; 6]);
     assert_eq!((own_process, joined, own_key), (0, 0, 0));
+    controller.remove_domain(one.id)?;
+    Ok(())
+}
+
+/// Drops every unused dentry and inode, so the next lookup loads them again.
+fn evict() -> io::Result<()> {
+    std::fs::write("/proc/sys/vm/drop_caches", "2")
+}
+
+/// What a governed read of each path received, by class bits: a classified file's classes.
+fn read_receipts(
+    controller: &mut Kernel<'_>,
+    domain: &Cgroup,
+    paths: &[&Path],
+) -> io::Result<Vec<u64>> {
+    let tgid = std::process::id();
+    let mut received = Vec::new();
+    for path in paths {
+        controller.drain()?;
+        domain.enter(tgid)?;
+        let read = std::fs::read(path);
+        controller.cgroups.leave(tgid)?;
+        read?;
+        let events = controller.drain()?;
+        assert!(
+            events
+                .iter()
+                .all(|event| event.kind == RECEIPT && event.sender == CLASSIFIED),
+            "{events:?}"
+        );
+        received.push(events.iter().fold(0, |taint, event| taint | event.taint));
+    }
+    Ok(received)
+}
+
+/// Reading a classified file is a receipt of its classes before the bytes arrive: whether the
+/// entry was loaded before classification, created after it, inherited its class from a
+/// directory, or lost its classifying name, and after the kernel evicted and reloaded it.
+#[test]
+#[ignore = "requires root, active BPF LSM, BTF and an evictable filesystem in a disposable VM"]
+fn classified_reads_are_receipts() -> io::Result<()> {
+    let cgroups = Cgroups::new()?;
+    let mut controller = Kernel::load(&cgroups)?;
+    let one = cgroups.domain(&mut controller, "one", 1)?;
+    // tmpfs never evicts; the VM's target directory is on 9p.
+    let directory =
+        Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("lsm-classify-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&directory);
+    std::fs::create_dir_all(directory.join("keys"))?;
+    // Present and loaded before any classification exists.
+    std::fs::write(directory.join(".env"), "TOKEN=1")?;
+    std::fs::write(directory.join("keys/id"), "key")?;
+    std::fs::write(directory.join("README"), "public")?;
+    let rule = |glob: &str| NameRule::new(glob, 1).ok_or_else(|| io::Error::other("bad glob"));
+    let rules = [
+        NameRule {
+            classes: 1 << 3,
+            ..rule(".env")?
+        },
+        NameRule {
+            subtree: 1 << 4,
+            ..rule("keys")?
+        },
+    ];
+    let anchor = std::fs::File::open(&directory)?;
+    controller.call(|controller| {
+        controller.name_rules(&rules)?;
+        controller.label(
+            std::os::fd::AsFd::as_fd(&anchor),
+            InodeLabel {
+                direct: 1,
+                ..InodeLabel::default()
+            },
+        )
+    })?;
+    evict()?;
+    let paths = [".env", "keys/id", "README"].map(|name| directory.join(name));
+    let paths: Vec<&Path> = paths.iter().map(PathBuf::as_path).collect();
+    assert_eq!(read_receipts(&mut controller, &one, &paths)?, [1 << 3, 1 << 4, 0]);
+
+    // Created after classification, beneath a classified directory.
+    std::fs::write(directory.join("keys/new"), "key")?;
+    assert_eq!(
+        read_receipts(&mut controller, &one, &[&directory.join("keys/new")])?,
+        [1 << 4]
+    );
+    // Renamed away from its classifying name, then evicted: the inode keeps its class.
+    std::fs::rename(directory.join(".env"), directory.join("notes"))?;
+    evict()?;
+    assert_eq!(
+        read_receipts(&mut controller, &one, &[&directory.join("notes")])?,
+        [1 << 3]
+    );
+    // A governed mapping is a read too; an ungoverned read is no receipt.
+    let file = std::fs::File::open(directory.join("keys/id"))?;
+    controller.drain()?;
+    one.enter(std::process::id())?;
+    // SAFETY: maps one page of a live file read-only; the mapping is unmapped below.
+    let mapping = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            3,
+            libc::PROT_READ,
+            libc::MAP_PRIVATE,
+            file.as_raw_fd(),
+            0,
+        )
+    };
+    cgroups.leave(std::process::id())?;
+    assert_ne!(mapping, libc::MAP_FAILED);
+    // SAFETY: unmaps exactly the mapping made above.
+    unsafe { libc::munmap(mapping, 3) };
+    let mapped = controller.drain()?;
+    std::fs::read(directory.join(".env").with_file_name("notes"))?;
+    let ungoverned = controller.drain()?;
+    assert_eq!(
+        mapped.iter().map(|event| event.taint).collect::<Vec<_>>(),
+        [1 << 4]
+    );
+    assert!(ungoverned.is_empty(), "{ungoverned:?}");
+    drop(anchor);
+    std::fs::remove_dir_all(&directory)?;
     controller.remove_domain(one.id)?;
     Ok(())
 }

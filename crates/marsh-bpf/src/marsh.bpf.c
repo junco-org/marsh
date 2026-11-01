@@ -45,6 +45,7 @@
 #define MAP_LPM_TRIE 11
 #define MAP_SK_STORAGE 24
 #define MAP_RINGBUF 27
+#define MAP_INODE_STORAGE 28
 #define NO_PREALLOC 1
 #define NOEXIST 1
 #define STORAGE_CREATE 1
@@ -64,6 +65,8 @@ static long (*bpf_probe_read_kernel)(void *dst, __u32 size, const void *src) = (
 static long (*bpf_get_ns_current_pid_tgid)(__u64 dev, __u64 ino, struct bpf_pidns_info *ids, __u32 size) = (void *)120;
 static void *(*bpf_ringbuf_reserve)(void *ring, __u64 size, __u64 flags) = (void *)131;
 static void (*bpf_ringbuf_submit)(void *data, __u64 flags) = (void *)132;
+static void *(*bpf_inode_storage_get)(void *map, void *inode, void *value, __u64 flags) = (void *)145;
+static long (*bpf_get_func_arg)(void *ctx, __u32 n, __u64 *value) = (void *)183;
 
 struct in6_addr { __u8 bytes[16]; } CORE;
 struct net { __u64 net_cookie; } CORE;
@@ -88,7 +91,39 @@ struct sock {
     __u16 sk_type;
 } CORE;
 struct socket { struct sock *sk; } CORE;
-struct file;
+/* What classification reads of filesystem entries (§8.3). */
+struct super_block { __u32 s_dev; } CORE;
+struct inode {
+    unsigned short i_mode;
+    struct super_block *i_sb;
+    unsigned long i_ino;
+    union {
+        const unsigned int i_nlink;
+        unsigned int __i_nlink;
+    };
+} CORE;
+struct qstr {
+    union {
+        struct {
+            __u32 hash;
+            __u32 len;
+        };
+        __u64 hash_len;
+    };
+    const unsigned char *name;
+} CORE;
+struct dentry {
+    struct dentry *d_parent;
+    struct qstr d_name;
+    struct inode *d_inode;
+} CORE;
+struct file { struct inode *f_inode; } CORE;
+struct linux_binprm { struct file *file; } CORE;
+#define S_IFMT 0170000
+#define S_IFDIR 0040000
+#define MAY_READ 4
+#define PROT_READ 1
+#define PROT_EXEC 4
 struct sockaddr_un { __u16 sun_family; __u8 sun_path[108]; };
 struct unix_address { int len; struct sockaddr_un name[1]; } CORE;
 struct unix_sock {
@@ -264,6 +299,41 @@ struct {
     __type(key, __u32);
     __type(value, struct pid_namespace);
 } PID_NAMESPACE SEC(".maps");
+
+/* What each inode's name and place classify it as (docs/threat-model.md §8.3). */
+struct {
+    __uint(type, MAP_INODE_STORAGE);
+    __uint(map_flags, NO_PREALLOC);
+    __type(key, int);
+    __type(value, struct marsh_inode_label);
+} INODES SEC(".maps");
+
+/* Name rules; an unused slot has no scope. Userspace replaces them as policies arrive. */
+struct {
+    __uint(type, MAP_ARRAY);
+    __uint(max_entries, MAX_NAME_RULES);
+    __type(key, __u32);
+    __type(value, struct marsh_name_rule);
+} NAME_RULES SEC(".maps");
+
+/* An inode's identity across eviction: its filesystem's device and its number. */
+struct inode_id {
+    __u64 dev;
+    __u64 ino;
+};
+
+/*
+ * Labels a name cannot give back: an inode renamed or linked from a classifying name keeps that
+ * label here, and regains it whenever the kernel loads it again. Removed when the inode is freed
+ * with no links left. Classification is recomputed from the parent on every load otherwise.
+ */
+struct {
+    __uint(type, MAP_HASH);
+    __uint(map_flags, NO_PREALLOC);
+    __uint(max_entries, 1 << 16);
+    __type(key, struct inode_id);
+    __type(value, struct marsh_inode_label);
+} RETAINED SEC(".maps");
 
 char LICENSE[] SEC("license") = "GPL";
 
@@ -815,6 +885,41 @@ static __always_inline void port_tag(struct flow *key, __u16 family, __u64 *tain
     }
 }
 
+/*
+ * `root` comes to hold `taint`, before the data that carries it reaches the reader: each class it
+ * neither carries nor has pending counts as a receipt, which switches its contacts to contingent
+ * answers at once and is reported for userspace to fold in. `sender` is the root whose data it was,
+ * or SENDER_CLASSIFIED for a classified file. A receipt that cannot be counted or reported poisons.
+ */
+static __always_inline int acquire(__u64 root, __u64 taint, __u64 sender)
+{
+    if (!taint)
+        return 0;
+    __u64 key = root;
+    struct marsh_answers *answers = bpf_map_lookup_elem(&ANSWERS, &key);
+    __u64 known = answers ? answers->carried | pending(answers, key) : 0;
+    __u64 fresh = taint & ~known;
+    if (!fresh)
+        return 0;
+    struct marsh_receipts *receipts = bpf_map_lookup_elem(&RECEIVED, &key);
+    if (!receipts) {
+        struct marsh_receipts zero = {};
+        bpf_map_update_elem(&RECEIVED, &key, &zero, NOEXIST);
+        receipts = bpf_map_lookup_elem(&RECEIVED, &key);
+    }
+    struct marsh_event *event = receipts ? reserve(EVENT_RECEIPT, key) : 0;
+    if (!event) {
+        poison();
+        return -EPERM;
+    }
+    for (int i = 0; i < MAX_TAINTS; i++)
+        __sync_fetch_and_add(&receipts->count[i], (fresh >> i) & 1);
+    event->taint = fresh;
+    event->sender = sender;
+    bpf_ringbuf_submit(event, 0);
+    return 0;
+}
+
 /* A governed reader of a tagged socket receives its taint before it can act on the bytes. */
 static __always_inline int receive(struct sock *sk)
 {
@@ -851,31 +956,248 @@ static __always_inline int receive(struct sock *sk)
                 port_tag(&key, AF_INET, &taint, &sender);
         }
     }
-    if (!taint)
-        return 0;
-    __u64 key = *root;
-    struct marsh_answers *answers = bpf_map_lookup_elem(&ANSWERS, &key);
-    __u64 known = answers ? answers->carried | pending(answers, key) : 0;
-    __u64 fresh = taint & ~known;
-    if (!fresh)
-        return 0;
-    struct marsh_receipts *receipts = bpf_map_lookup_elem(&RECEIVED, &key);
-    if (!receipts) {
-        struct marsh_receipts zero = {};
-        bpf_map_update_elem(&RECEIVED, &key, &zero, NOEXIST);
-        receipts = bpf_map_lookup_elem(&RECEIVED, &key);
-    }
-    struct marsh_event *event = receipts ? reserve(EVENT_RECEIPT, key) : 0;
-    if (!event) {
-        poison();
-        return -EPERM;
-    }
-    for (int i = 0; i < MAX_TAINTS; i++)
-        __sync_fetch_and_add(&receipts->count[i], (fresh >> i) & 1);
-    event->taint = fresh;
-    event->sender = sender;
-    bpf_ringbuf_submit(event, 0);
+    return acquire(*root, taint, sender);
+}
+
+/* An entry's name as marsh_name_matches reads it. */
+struct name {
+    __u8 head[NAME_GLOB];
+    __u8 tail[NAME_GLOB];
+    __u32 len;
+};
+
+static __always_inline int read_name(struct dentry *dentry, struct name *out)
+{
+    const unsigned char *name = 0;
+    __u32 len = 0;
+    __builtin_memset(out, 0, sizeof(*out));
+    if (READ(name, dentry->d_name.name) || READ(len, dentry->d_name.len) || !name)
+        return -1;
+    out->len = len;
+    /*
+     * A name shorter than NAME_GLOB lives in the dentry's inline buffer, which is longer still;
+     * a longer one is at least NAME_GLOB bytes. Either way NAME_GLOB bytes from its start, and
+     * from NAME_GLOB before its end, are readable.
+     */
+    if (bpf_probe_read_kernel(out->head, NAME_GLOB, name))
+        return -1;
+    if (len > NAME_GLOB && bpf_probe_read_kernel(out->tail, NAME_GLOB, name + len - NAME_GLOB))
+        return -1;
     return 0;
+}
+
+static __always_inline int unlabelled(const struct marsh_inode_label *label)
+{
+    return !(label->classes | label->subtree | label->deep | label->direct);
+}
+
+/* What the entry `name` of a directory labelled `parent` carries (marsh_peer_class::InodeLabel::child). */
+static __always_inline void label_child(const struct marsh_inode_label *parent, const struct name *name,
+                                        int directory, struct marsh_inode_label *out)
+{
+    marsh_inherit(parent, directory, out);
+    __u64 scopes = parent->deep | parent->direct;
+    if (!scopes)
+        return;
+#pragma clang loop unroll(disable)
+    for (__u32 i = 0; i < MAX_NAME_RULES; i++) {
+        __u32 key = i;
+        struct marsh_name_rule *rule = bpf_map_lookup_elem(&NAME_RULES, &key);
+        if (rule)
+            marsh_apply_rule(rule, scopes, name->head, name->tail, name->len, directory, out);
+    }
+}
+
+/* Adds `with` to `inode`'s label. Fails when the label cannot be stored. */
+static __always_inline int label(struct inode *inode, const struct marsh_inode_label *with)
+{
+    if (unlabelled(with))
+        return 0;
+    struct marsh_inode_label *label = bpf_inode_storage_get(&INODES, inode, 0, STORAGE_CREATE);
+    if (!label)
+        return -1;
+    __sync_fetch_and_or(&label->classes, with->classes);
+    __sync_fetch_and_or(&label->subtree, with->subtree);
+    __sync_fetch_and_or(&label->deep, with->deep);
+    __sync_fetch_and_or(&label->direct, with->direct);
+    return 0;
+}
+
+static __always_inline void inode_id(struct inode *inode, struct inode_id *out)
+{
+    out->dev = inode->i_sb->s_dev;
+    out->ino = inode->i_ino;
+}
+
+/* What the entry `dentry` names in its parent directory, which `parent` is the inode of. */
+static __always_inline int named(struct inode *parent, struct dentry *dentry, int directory,
+                                 struct marsh_inode_label *out)
+{
+    __builtin_memset(out, 0, sizeof(*out));
+    struct marsh_inode_label *label = parent ? bpf_inode_storage_get(&INODES, parent, 0, 0) : 0;
+    if (!label || unlabelled(label))
+        return 0;
+    struct marsh_inode_label from = *label;
+    struct name name;
+    if (read_name(dentry, &name))
+        return -1;
+    label_child(&from, &name, directory, out);
+    return 0;
+}
+
+static __always_inline int is_directory(struct inode *inode)
+{
+    return (inode->i_mode & S_IFMT) == S_IFDIR;
+}
+
+/*
+ * Every inode the kernel attaches to a name, created or loaded by a lookup, carries what its
+ * name and parent classify it as, and what it retained from earlier names. Labels live only as
+ * long as the in-memory inode, so this recomputes them after every eviction: a parent is
+ * loaded, and labelled, before its entries are, down from anchors userspace keeps loaded.
+ */
+SEC("lsm/d_instantiate")
+int d_instantiate(unsigned long long *ctx)
+{
+    struct dentry *dentry = (void *)ctx[0];
+    struct inode *inode = (void *)ctx[1];
+    if (!inode)
+        return 0;
+    struct dentry *parent = dentry->d_parent;
+    struct marsh_inode_label with;
+    /* A root dentry is its own parent and has no name to classify. */
+    if (parent == dentry)
+        __builtin_memset(&with, 0, sizeof(with));
+    else if (named(parent->d_inode, dentry, is_directory(inode), &with))
+        goto lost;
+    struct inode_id id;
+    inode_id(inode, &id);
+    struct marsh_inode_label *kept = bpf_map_lookup_elem(&RETAINED, &id);
+    if (kept) {
+        with.classes |= kept->classes;
+        with.subtree |= kept->subtree;
+        with.deep |= kept->deep;
+        with.direct |= kept->direct;
+    }
+    if (label(inode, &with))
+        goto lost;
+    return 0;
+lost:
+    /* This hook cannot refuse; an unclassified secret would read as nothing. */
+    poison();
+    return 0;
+}
+
+/*
+ * `entry`'s inode gains the name `dentry` in `dir`. It carries what that name classifies at
+ * once; whatever it carries that the new name would not give back after an eviction is retained.
+ */
+static __always_inline int renamed(struct inode *dir, struct dentry *dentry, struct dentry *entry)
+{
+    struct inode *inode = entry->d_inode;
+    if (!inode)
+        return 0;
+    struct marsh_inode_label child;
+    if (named(dir, dentry, is_directory(inode), &child) || label(inode, &child))
+        return -EPERM;
+    struct marsh_inode_label *current = bpf_inode_storage_get(&INODES, inode, 0, 0);
+    if (!current)
+        return 0;
+    struct marsh_inode_label held = *current;
+    if (!((held.classes & ~child.classes) | (held.subtree & ~child.subtree) |
+          (held.deep & ~child.deep) | (held.direct & ~child.direct)))
+        return 0;
+    struct inode_id id;
+    inode_id(inode, &id);
+    struct marsh_inode_label *kept = bpf_map_lookup_elem(&RETAINED, &id);
+    if (!kept) {
+        if (bpf_map_update_elem(&RETAINED, &id, &held, NOEXIST) == 0)
+            return 0;
+        kept = bpf_map_lookup_elem(&RETAINED, &id);
+        if (!kept)
+            return -EPERM;
+    }
+    __sync_fetch_and_or(&kept->classes, held.classes);
+    __sync_fetch_and_or(&kept->subtree, held.subtree);
+    __sync_fetch_and_or(&kept->deep, held.deep);
+    __sync_fetch_and_or(&kept->direct, held.direct);
+    return 0;
+}
+
+/* An exchange calls this twice, once for each entry taking the other's name. */
+SEC("lsm/inode_rename")
+int inode_rename(unsigned long long *ctx)
+{
+    if (ctx[4])
+        return ctx[4];
+    return renamed((void *)ctx[2], (void *)ctx[3], (void *)ctx[1]);
+}
+
+SEC("lsm/inode_link")
+int inode_link(unsigned long long *ctx)
+{
+    if (ctx[3])
+        return ctx[3];
+    return renamed((void *)ctx[1], (void *)ctx[2], (void *)ctx[0]);
+}
+
+/* A retained label outlives evictions, not the inode: drop it once the last link is gone. */
+SEC("lsm/inode_free_security")
+int inode_free_security(unsigned long long *ctx)
+{
+    struct inode *inode = (void *)ctx[0];
+    if (inode->i_nlink)
+        return 0;
+    struct inode_id id;
+    inode_id(inode, &id);
+    bpf_map_delete_elem(&RETAINED, &id);
+    return 0;
+}
+
+/*
+ * A governed read of a classified inode is a receipt of its classes before the bytes reach the
+ * reader: every read path (read, io_uring, splice, sendfile, copy_file_range, reflink) passes
+ * file_permission, a mapping passes mmap_file, and exec reads its file.
+ */
+static __always_inline int read_classified(struct inode *inode, int previous)
+{
+    if (previous)
+        return previous;
+    __u64 *root = governed();
+    if (!root || !inode)
+        return 0;
+    struct marsh_inode_label *label = bpf_inode_storage_get(&INODES, inode, 0, 0);
+    if (!label || !label->classes)
+        return 0;
+    return acquire(*root, label->classes, SENDER_CLASSIFIED);
+}
+
+SEC("lsm/file_permission")
+int file_permission(unsigned long long *ctx)
+{
+    struct file *file = (void *)ctx[0];
+    int mask = ctx[1];
+    if (!(mask & MAY_READ))
+        return (int)ctx[2];
+    return read_classified(file->f_inode, ctx[2]);
+}
+
+SEC("lsm/mmap_file")
+int mmap_file(unsigned long long *ctx)
+{
+    struct file *file = (void *)ctx[0];
+    unsigned long prot = ctx[2];
+    if (!file || !(prot & (PROT_READ | PROT_EXEC)))
+        return (int)ctx[4];
+    return read_classified(file->f_inode, ctx[4]);
+}
+
+SEC("lsm/bprm_check_security")
+int bprm_check_security(unsigned long long *ctx)
+{
+    struct linux_binprm *bprm = (void *)ctx[0];
+    struct file *file = bprm->file;
+    return read_classified(file ? file->f_inode : 0, ctx[1]);
 }
 
 static __always_inline int read_returned(struct socket *sock, long received)
@@ -1199,8 +1521,14 @@ int key_alloc(unsigned long long *ctx)
 SEC("lsm/key_permission")
 int key_permission(unsigned long long *ctx)
 {
-    /* A key_ref_t is the key's address with bit 0 marking possession. */
-    __u64 key = ctx[0] & ~1ULL;
+    /*
+     * A key_ref_t is the key's address with bit 0 marking possession. Its BTF type points to a
+     * struct that is never defined, so the verifier refuses a direct context read of it.
+     */
+    __u64 key = 0;
+    if (bpf_get_func_arg(ctx, 0, &key))
+        return -EPERM;
+    key &= ~1ULL;
     __u32 need = ctx[2];
     int previous = ctx[3];
     if (previous)

@@ -13,8 +13,9 @@ const POLL: Duration = Duration::from_millis(50);
 /// Bytes one connection or one datagram delivered.
 #[derive(Clone, Debug)]
 pub(super) struct Hit {
-    /// `tcp` or `udp`, with the sender's address.
+    /// Which listener: `tcp` or `udp`, prefixed by the sink's role where there are several.
     pub(super) listener: String,
+    pub(super) from: SocketAddr,
     pub(super) bytes: Vec<u8>,
 }
 
@@ -103,7 +104,8 @@ fn read(mut stream: TcpStream, from: SocketAddr, hits: &Mutex<Vec<Hit>>, stop: &
         }
     }
     hits.lock().unwrap().push(Hit {
-        listener: format!("tcp from {from}"),
+        listener: "tcp".to_owned(),
+        from,
         bytes,
     });
 }
@@ -113,7 +115,8 @@ fn receive(socket: &UdpSocket, hits: &Mutex<Vec<Hit>>, stop: &AtomicBool) {
     while !stop.load(Ordering::Acquire) {
         match socket.recv_from(&mut buffer) {
             Ok((read, from)) => hits.lock().unwrap().push(Hit {
-                listener: format!("udp from {from}"),
+                listener: "udp".to_owned(),
+                from,
                 bytes: buffer[..read].to_vec(),
             }),
             Err(error) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}

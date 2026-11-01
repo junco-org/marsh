@@ -124,13 +124,15 @@ fuzzing. New attack behavior remains a reviewed corpus case.
 
 For each case, seed and iteration:
 
-1. Create a `Fixture::new()`, write the files, and start the `Sink`.
+1. Create a `Fixture::new()`, write the files, start the sinks, and capture the shared state the
+   untraced world can see (`projection.rs`).
 2. Build N shells with `Fixture::observed_agent(policy.principal(…), observer)`. The observer
    collects every agent denial, as the existing agent-policy tests do.
 3. Run steps with per-step timeouts. A foreground timeout or shell error is inconclusive; an `&`
    server's timeout is expected, but the control sink or attack audit must still prove execution.
-4. Close the shells, then drain the sink.
-5. Call the oracle and record a `Verdict`.
+4. Drain the sinks and capture the shared state again, then close the shells.
+5. An attack runs steps 1-4 a second time with an independent canary. Call the oracle and record
+   a `Verdict`.
 
 Settings:
 
@@ -150,19 +152,31 @@ A case-specific random stream makes sequence generation independent of corpus or
 and iteration reproduce its variants, filler and canary. Enforcement failures print a minimized TOML
 reproducer with sampled variants fixed; audit failures print the same replay key and step outcomes.
 
-## Oracle (`oracle.rs`)
+## Oracle (`projection.rs`, `oracle.rs`)
 
-* **Attack case:** it leaks if any configured encoding of the canary appears in the external
-  sinks' bytes. Encodings: raw, base64 (with and without padding), hex, and any per-case encodings
-  named in the TOML. A leak is a failure even when the step that sent it was later refused,
-  because sent bytes cannot be recalled.
-* **Control case:** the canary must reach the sink. If it does not, the case fails as a false
-  denial, with the observer's matching denials attached.
+* **Attack case:** differential. The case runs twice, identical except for the canary, and each
+  run is projected onto what an untraced observer could see: every byte the external and
+  untraced-local sinks received (by listener and sender address), and how shared state changed
+  across the steps — files in `/tmp`, `/var/tmp`, `/dev/shm` and `/dev/mqueue` outside the
+  fixture's governed state (owner, mode, size and contents), listening TCP and bound UDP ports,
+  bound UNIX socket names, other processes' names and arguments, visible keys, and System V IPC
+  objects. The fixture's path and the sinks' ports are normalised; pids, inode numbers, times and
+  client ports are never recorded. Any fact in one projection and not the other is a leak,
+  whatever the encoding or channel, and the report lists the differing facts. A leak is a
+  failure even when the step that sent it was later refused, because sent bytes cannot be
+  recalled. The projection is captured from the harness's own vantage: noise from other
+  activity in those directories during a run shows as a difference, so run the corpus on an
+  otherwise idle guest.
+* **Control case:** the canary must reach a sink in a configured encoding (raw, base64 with and
+  without padding, hex). If it does not, the case fails as a false denial, with the observer's
+  matching denials attached.
 * **Audit-mode run:** replay each attack iteration exactly under `AgentPolicy::audit()`. The
-  canary must reach a sink, proving the attack path ran; ordinary attacks must also produce at
-  least one "would block" report. Known gaps waive only the would-block expectation.
-* **Report:** campaign seed, case, iteration, sampled variants, step outcomes, denials and sink hit.
-  Enforcement failures also print minimized TOML with the sampled variants fixed.
+  canary must reach a sink in a configured encoding, proving the attack path ran; ordinary
+  attacks must also produce at least one "would block" report. Known gaps waive only the
+  would-block expectation.
+* **Report:** campaign seed, case, iteration, sampled variants, step outcomes, denials, sink hit
+  and, for a leaking attack, the differing facts. Enforcement failures also print minimized TOML
+  with the sampled variants fixed.
 
 ## Shrinking (`shrink.rs`)
 

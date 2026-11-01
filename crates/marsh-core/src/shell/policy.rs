@@ -27,9 +27,13 @@ pub enum PolicyKind {
 }
 
 /// Receives every capability decision `Authority::check` makes, in order, before its effect.
+///
 /// A grant is tentative: a later denial in the same batch or a failed publication rolls it back.
 /// Called under the authority's write lock, so it must only enqueue, never block.
-pub struct PolicyObserver(Box<dyn Fn(PolicyKind, &Event, &PolicyDecision) + Send + Sync>);
+pub struct PolicyObserver(Box<Observe>);
+
+/// A [`PolicyObserver`]'s callback.
+type Observe = dyn Fn(PolicyKind, &Event, &PolicyDecision) + Send + Sync;
 impl PolicyObserver {
     /// Wraps the callback each decision is passed to.
     pub fn new(observe: impl Fn(&Event, &PolicyDecision) + Send + Sync + 'static) -> Self {

@@ -1,8 +1,9 @@
 //! The enforcement modes and the seam between the tracer and the shared policy engine.
 
 use std::io;
+use std::path::PathBuf;
 
-use marsh_peer_class::{Answers, Event, Network};
+use marsh_peer_class::{Answers, Event, InodeLabel, NameRule, Network};
 
 use crate::{FileTarget, InvocationId, TraceRun};
 
@@ -30,15 +31,29 @@ pub struct KernelPolicy {
     pub contact_sensitive: bool,
 }
 
+/// What the kernel classifies files by, so that reading one is a taint receipt
+/// (`docs/threat-model.md` §8.3).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FileClasses {
+    /// Rules naming what an entry of a scoped directory carries.
+    pub rules: Vec<NameRule>,
+    /// Directories and the labels they start with; the rules classify what lies beneath them.
+    pub anchors: Vec<(PathBuf, InodeLabel)>,
+}
+
 /// The policy engine shared by ptrace and kernel socket enforcement.
 pub trait Enforcer: Send + Sync {
-    /// Judges a contact at its ptrace entry stop, against the address the call names.
+    /// Judges a contact at its ptrace entry stop, against the address the call names. `ordered`
+    /// is false while the root has records the tracer cannot yet order (a new task's, before the
+    /// call that created it returns): the policy has not seen them, so it cannot judge the
+    /// contact.
     fn permits(
         &self,
         run: TraceRun,
         builtin: Option<InvocationId>,
         peer: &[u8],
         source: Option<&FileTarget>,
+        ordered: bool,
     ) -> bool;
     /// The root's current answers, including a read of `source`, the file the stopped call copies
     /// into a socket in-kernel.

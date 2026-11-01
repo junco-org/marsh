@@ -438,5 +438,8 @@ pub fn effective_networks(networks: &[Network]) -> Vec<Network> {
     effective
 }
 
+mod file_class;
+pub use file_class::{CLASSIFIED, InodeLabel, MAX_NAME_RULES, NAME_GLOB, NameRule};
+
 #[cfg(test)]
 mod tests;

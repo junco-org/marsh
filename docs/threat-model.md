@@ -1,6 +1,6 @@
 # Threat model and complete mediation for privileged enforcement
 
-Status: **phase 1 implemented** (§9 step 1, pending verification in the BPF LSM VM); the rest is
+Status: **phases 1 and 2 implemented and verified in the BPF LSM VM** (§9 steps 1–2); the rest is
 design. It defines what the privileged mode must guarantee, enumerates every kernel channel
 against that guarantee, and lays out how to enforce it comprehensively. The current
 implementation is in [`privileged-enforcement.md`](privileged-enforcement.md); §7 below places
@@ -126,7 +126,7 @@ Appendix A assigns every hook to one of these rows.
 
 | # | Family | Objects | Rule and mechanism | Today | Gap |
 |---|---|---|---|---|---|
-| 1 | Taint sources | files of a propagated class | R1, R2: inode labels; `file_permission` (`read`, io_uring, splice, `sendfile`, `copy_file_range`, reflink), `mmap_file` | ptrace at syscall stops | path swap, io_uring queue race, thread window |
+| 1 | Taint sources | files of a propagated class | R1, R2: inode labels; `file_permission` (`read`, io_uring, splice, `sendfile`, `copy_file_range`, reflink), `mmap_file` | phase 2: kernel classification (§8.3) and read receipts | classes whose patterns do not compile refuse the shell |
 | 2 | File content between domains | regular files, directories, symlinks | R2, R3 on inode storage | userspace carriers (path, inode) from ptrace | the same races |
 | 3 | Shared memory | `MAP_SHARED` files, memfd, `/dev/shm`, SysV shm | R4; per-domain `/dev/shm` and IPC namespace | mapping counted once, at `mmap` | stores after a secret read are unseen |
 | 4 | Pipes and FIFOs | pipefs and FIFO inodes | R3 at delivery to holders | ptrace inode carriers | reader blocked before data arrives |
@@ -134,13 +134,13 @@ Appendix A assigns every hook to one of these rows.
 | 6 | Netlink | user ports and groups | R6, R7: user destinations are local services | allowed, untagged | relay to U or other principals |
 | 7 | Network egress | IP, VSOCK, SCTP, MPTCP | R5 at connect and send; per packet for datagrams; MPTCP subflows and SCTP addresses judged | kernel answers at connect and send | connected-UDP reconnect, MPTCP and SCTP extra addresses, host's own addresses, `sendmmsg` batches |
 | 8 | Descriptor passing | `SCM_RIGHTS`, `pidfd_getfd`, binder | `file_receive` makes the receiver a holder (R3) | none | a passed pipe or memfd skips socket tags |
-| 9 | Process to process | `ptrace`, `/proc/<pid>/*`, signals, `sigqueue` payloads, `prlimit`, nice, `PR_SET_PTRACER` | R6, R7: no inspection or control across domains; `/proc` inodes labelled with their task's domain | Yama scope only | storage channels to U (`/proc/<pid>/cmdline`, `comm`, `oom_score_adj`) |
+| 9 | Process to process | `ptrace`, `/proc/<pid>/*`, signals, `sigqueue` payloads, `prlimit`, nice, `PR_SET_PTRACER` | R6, R7: no inspection or control across domains; `/proc` inodes labelled with their task's domain | phase 1: attributes of another cgroup's tasks and `PR_SET_PTRACER`/`PR_SET_MM` refused; signals scoped by Landlock; Yama | storage channels to U (`/proc/<pid>/cmdline`, `comm`, `oom_score_adj`) |
 | 10 | Names and metadata in shared directories | `/tmp` names, xattrs, timestamps, sizes | R7 write confinement (Landlock) and per-domain `/tmp`; labels within writable roots | none | file names in shared directories are a high-bandwidth channel to U |
 | 11 | Escape to untraced execution | uid-0 writes, rc files, autostart, systemd units, service managers, `TIOCSTI` | R7 | phase 1: non-root identity, Landlock write confinement, private namespaces, BPF refusals | service managers under Allow |
-| 12 | Keyrings | user, session keyrings | per-domain session keyring; user keyring read-only | none | channel to U |
-| 13 | SysV IPC, POSIX queues, watch queues | message queues, semaphores | per-domain IPC namespace; B across domains | none | channel to U |
+| 12 | Keyrings | user, session keyrings | per-domain session keyring; user keyring read-only | phase 1: own session keyring; writing, linking or changing keys the root did not allocate refused | reading the user keyring is not labelled |
+| 13 | SysV IPC, POSIX queues, watch queues | message queues, semaphores | per-domain IPC namespace; B across domains | phase 1: private IPC namespace | POSIX queues and watch queues outside the IPC namespace |
 | 14 | Shared kernel tables | `/proc/net/*` ports and abstract names, PID allocation, locks | decision: per-domain network namespace, or accept with bandwidth bound | none | port numbers and abstract names visible to U |
-| 15 | io_uring | rings, personalities, passthrough | operations reach rows 1–8; refuse SQPOLL, personalities, `uring_cmd` | SQPOLL refused; opcodes checked by ptrace | personalities and `uring_cmd` unrefused |
+| 15 | io_uring | rings, personalities, passthrough | operations reach rows 1–8; refuse SQPOLL, personalities, `uring_cmd` | phase 1: SQPOLL, personalities and `uring_cmd` refused; opcodes checked by ptrace | operations reaching unimplemented rows 2–4 and 8 |
 | 16 | TCB-mediated | rmux panes, terminal escape sequences | rmux treats pane output as the pane principal's data; filters OSC 52 clipboard writes | not considered | clipboard to U |
 | 17 | Timing and contention | CPU, caches, locks, allocation | non-goal | — | — |
 | 18 | The interpreter's own accesses | redirections, `source`, tests, globbing, `PATH` search, marsh builtins: run in the daemon | R7: each access runs with the commands' identity, Landlock domain and private paths; the direct route is refused | phase 1 | — |
@@ -193,12 +193,31 @@ The same cgroup can attach `cgroup_skb/egress` for per-packet judgement (row 7).
   governed identity can still change what marsh wrote for it.
 
 ### 8.3 Kernel classification (R1)
-Class patterns compile to anchored forms the kernel can evaluate: a directory inode whose subtree
-carries the class (`~/.ssh/**`) and basename or suffix patterns (`**/.env`, `**/*.pem`). New and
-renamed inodes are classified in `inode_create`, `inode_rename`, `inode_link`, `inode_mkdir` and
-`inode_post_create_tmpfile` from their name and parent; a TCB scan labels existing files at
-session start. A pattern that does not compile to these forms makes privileged startup refuse the
-policy. Every class that a contact rule depends on is labelled in the kernel, propagated or not.
+Class patterns compile to anchored forms the kernel can evaluate: name rules (a literal, or one
+`*` between literal parts of at most 32 bytes) that apply in directories holding a scope bit, and
+the directories that start with those scopes. A leading `**` gives a deep scope, which
+subdirectories inherit; any other `**` must end the pattern and gives the matched directory's
+subtree the class. Relative patterns anchor at each view's root; absolute and `~/` ones at their
+deepest existing directory, so a rule still names what is replaced beneath it. Scope bits are
+shared by every policy (64 at most), and every root's rules are joined in one table of 32.
+
+Labels live in inode storage, which dies with the in-memory inode, so the kernel recomputes them
+in `d_instantiate`, which every creation and every lookup passes: an inode carries what its name
+and its parent's label give it. Anchors are held open by the controller, and a dentry pins its
+parent, so every loaded inode beneath an anchor is reached from labelled parents. When the root
+is classified, userspace labels what was already loaded beneath each anchor. `inode_rename` and
+`inode_link` add the new name's label at once; whatever the inode carries that its new name would
+not give back is retained by `(device, inode number)` and restored at every load, until
+`inode_free_security` frees it with no links left. A failure to label poisons enforcement.
+
+Only propagated classes are classified; a propagated class's pattern that does not compile refuses
+the shell. The kernel adds every matching class where the policy takes the first matching
+pattern, which can only over-taint. `file_permission` (`MAY_READ`), `mmap_file`
+(`PROT_READ`/`PROT_EXEC`) and `bprm_check_security` make a governed task's read of a classified
+inode a receipt with sender `CLASSIFIED` before the data reaches it. Residuals: a directory moved
+into a scope keeps its loaded entries' old labels until they are evicted, which only matters for
+files the agent placed there itself; btrfs snapshots share inode numbers, so a retained label
+can over-taint the same file in another view.
 
 ### 8.4 Label stores
 Inode storage for files, directories, pipes, socket inodes and `/proc` inodes (via
@@ -231,9 +250,9 @@ case per hole it closes.
 1. **Escape and identity (row 11, 9, 12, 13, 15).** Non-root uid, Landlock confinement, private
    `/tmp`, `/dev/shm` and IPC namespace, cgroup domains, the D refusals. Closes the uid-0 escape,
    persistence writes, terminal injection and process-to-process channels.
-2. **Kernel taint sources (row 1).** Classification, `file_permission` and `mmap_file` receipts.
-   Closes the path swap, the io_uring queue race and the thread window; io_uring needs no ptrace
-   check for confidentiality.
+2. **Kernel taint sources (row 1).** Classification, `file_permission`, `mmap_file` and exec
+   receipts (implemented). Closes the path swap, the io_uring queue race and the thread window;
+   io_uring needs no ptrace check for confidentiality.
 3. **Object labels and delivery (rows 2–5, 8).** Inode labels, holders, R3 delivery for files,
    pipes and sockets (sockets move from read-return receipts to delivery), R4.
 4. **Untraced boundary (rows 6, 11).** R6 on every side the kernel sees, netlink user ports,
@@ -314,7 +333,7 @@ domains. `*` marks hooks BPF LSM cannot attach to (`bpf_lsm_disabled_hooks`); al
 |---|---|
 | `path_unlink`, `path_mkdir`, `path_rmdir`, `path_mknod`, `path_post_mknod`, `path_truncate`, `path_symlink`, `path_link`, `path_rename`, `path_chmod`, `path_chown`, `path_chroot` | W: write confinement: a governed domain changes names and metadata only beneath its own writable roots (Landlock); within them, a change labels the directory and inode |
 | `path_notify` | N: watches observe only names inside the observer's view of the namespace; governed writes land in private namespaces |
-| `inode_create`, `inode_post_create_tmpfile`, `inode_link`, `inode_unlink`, `inode_symlink`, `inode_mkdir`, `inode_rmdir`, `inode_mknod`, `inode_rename` | W, Label: as `path_*`; a new or renamed inode takes its classification from its name and parent (secret patterns), plus its creator's label |
+| `inode_create`, `inode_post_create_tmpfile`, `inode_link`, `inode_unlink`, `inode_symlink`, `inode_mkdir`, `inode_rmdir`, `inode_mknod`, `inode_rename` | W, Label: as `path_*`; `inode_link` and `inode_rename` add the new name's classification and retain what it would not give back (§8.3); created inodes are classified at `d_instantiate` |
 | `inode_setattr`, `inode_post_setattr`, `inode_setxattr`, `inode_post_setxattr`, `inode_removexattr`, `inode_post_removexattr`, `inode_set_acl`, `inode_post_set_acl`, `inode_remove_acl`, `inode_post_remove_acl`, `inode_file_setattr`, `inode_killpriv`, `inode_setsecurity`, `inode_setintegrity` | W: metadata writes are writes |
 | `inode_getattr`, `inode_getxattr`, `inode_listxattr`, `inode_get_acl`, `inode_file_getattr`, `inode_readlink`, `inode_follow_link` | T: metadata reads are reads of the inode's label (names and sizes carry data) |
 | `inode_alloc_security`, `inode_free_security`, `inode_free_security_rcu`, `inode_init_security`, `inode_init_security_anon`, `dentry_init_security`, `dentry_create_files_as`, `d_instantiate`, `kernfs_init_security`, `inode_getlsmprop`, `inode_copy_up`, `inode_copy_up_xattr`\*, `inode_xattr_skipcap`, `inode_need_killpriv`\*, `inode_getsecurity`\*, `inode_listsecurity`\*, `inode_invalidate_secctx`, `inode_notifysecctx`, `inode_setsecctx`, `inode_getsecctx` | N: label storage lifecycle and LSM-attribute plumbing |

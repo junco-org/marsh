@@ -24,7 +24,7 @@ use marsh_instrument::{
 };
 use marsh_lib::RecoverPoison as _;
 use marsh_peer_class::{
-    ALLOW, CONTINGENT, DENY, MAX_TAINTS, RECEIPT, RULE, STALE, UNTAGGED, UNTRACED,
+    ALLOW, CLASSIFIED, CONTINGENT, DENY, MAX_TAINTS, RECEIPT, RULE, STALE, UNTAGGED, UNTRACED,
 };
 
 /// How privileged enforcement confines a shell's managed commands (`docs/threat-model.md` §8.2).
@@ -239,6 +239,11 @@ impl Snapshot {
         }
         if let Some(confined) = confined {
             snapshot.confine(root, confined)?;
+            if let Some(agent) = &snapshot.agent {
+                // Before the first command: reading a classified file is a kernel taint receipt.
+                let files = agent.kernel_files(&snapshot.path)?;
+                snapshot.session.tracing.classify_files(root, files)?;
+            }
         }
         snapshot
             .session
@@ -426,15 +431,17 @@ impl Snapshot {
     /// Whether the active command may reach `peer` (a native `sockaddr`, empty when unknown): its
     /// agent policy decides against committed history plus the command's observations so far,
     /// including a read of `source`, the file this same call copies into the socket in-kernel.
-    /// When the call sends a propagated class to a local `peer`, the policy may also refuse a peer
-    /// only untraced processes hold, and a permitted contact hands the class to the other
-    /// principals of this source whose commands hold it. Called on the tracer thread while the
-    /// calling task is stopped at the call's entry.
+    /// Unless `ordered`, some of those observations have not reached the policy yet, so a contact
+    /// it judges is refused. When the call sends a propagated class to a local `peer`, the policy
+    /// may also refuse a peer only untraced processes hold, and a permitted contact hands the
+    /// class to the other principals of this source whose commands hold it. Called on the tracer
+    /// thread while the calling task is stopped at the call's entry.
     pub(super) fn permits_peer(
         &self,
         run: TraceRun,
         peer: &[u8],
         source: Option<&FileTarget>,
+        ordered: bool,
     ) -> bool {
         let Some(agent) = &self.agent else {
             return true;
@@ -463,6 +470,7 @@ impl Snapshot {
         let peer = Peer::decode(peer);
         let denial = self
             .judge_peer(run, agent, &principal, &peer, source)
+            .or_else(|| (!ordered).then(|| unordered_denial(agent, &principal, &peer))?)
             .or_else(|| {
                 let (sockets, followed) = receivers.as_ref()?;
                 untraced_denial(agent, &principal, &peer, &sending, sockets, followed)
@@ -1014,14 +1022,21 @@ impl Snapshot {
         let principal = agent.acting(&self.uid);
         if event.kind == RECEIPT {
             let classes = answers::taint_classes();
-            let sender = self
-                .followed()
-                .into_iter()
-                .find(|(root, _)| root.get() == event.sender)
-                .map_or_else(
-                    || Principal::new(format!("marsh root {}", event.sender)),
-                    |(_, principal)| principal,
-                );
+            // A classified file's read may precede its ptrace record, so it is received taint,
+            // not the reader's own; anything else came from a root.
+            let (sender, via) = if event.sender == CLASSIFIED {
+                (Principal::new("classified file"), "a classified file read")
+            } else {
+                let sender = self
+                    .followed()
+                    .into_iter()
+                    .find(|(root, _)| root.get() == event.sender)
+                    .map_or_else(
+                        || Principal::new(format!("marsh root {}", event.sender)),
+                        |(_, principal)| principal,
+                    );
+                (sender, "a local socket")
+            };
             let mut kernel = kernel.lock().recover();
             let mut table = self.session.taint.lock().recover();
             for id in (0..MAX_TAINTS).filter(|id| event.taint & (1 << id) != 0) {
@@ -1031,7 +1046,7 @@ impl Snapshot {
                         Taint {
                             class: class.clone(),
                             from: sender.clone(),
-                            via: "a local socket".into(),
+                            via: via.into(),
                         },
                     );
                 }
@@ -1137,10 +1152,11 @@ impl Enforcer for SnapshotEnforcer {
         _: Option<InvocationId>,
         peer: &[u8],
         source: Option<&FileTarget>,
+        ordered: bool,
     ) -> bool {
         self.0
             .upgrade()
-            .is_some_and(|snapshot| snapshot.permits_peer(run, peer, source))
+            .is_some_and(|snapshot| snapshot.permits_peer(run, peer, source, ordered))
     }
     fn refresh(&self, run: TraceRun, source: Option<&FileTarget>) -> io::Result<KernelPolicy> {
         self.snapshot()?
@@ -1351,5 +1367,27 @@ fn untraced_denial(
             .map(|class| format!("declassify {class} for {principal}"))
             .chain(["allow untraced local peers in the agent policy".to_owned()])
             .collect(),
+    })
+}
+
+/// The refusal of a contact with `peer` that the policy judges while some of the command's
+/// records have not reached it: a new task's, which the tracer orders only once the call that
+/// created it returns. A `vfork` parent's returns only after the child execs or exits, so a child
+/// could otherwise read a secret and send it before the read counts.
+fn unordered_denial(agent: &AgentPolicy, principal: &Principal, peer: &Peer) -> Option<Denial> {
+    let candidate = Observation {
+        principal: principal.clone(),
+        observed: Observed::Connect(peer.clone()),
+    };
+    if !agent.judges(&candidate) {
+        return None;
+    }
+    Some(Denial {
+        event: agent.label(&candidate)?,
+        failed_precondition: format!(
+            "{principal} contacted {peer} before the records of a task it had just created were \
+             ordered, so they could not be judged"
+        ),
+        allowed_fixes: Vec::new(),
     })
 }

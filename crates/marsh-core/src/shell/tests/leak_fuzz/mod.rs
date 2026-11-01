@@ -1,11 +1,14 @@
 //! A leak fuzzer for the agent policy.
 //!
-//! It runs each corpus case against managed marsh shells judged by an agent policy, captures every
-//! byte the traced commands send to a stand-in external server, and fails on two outcomes:
+//! It runs each corpus case against managed marsh shells judged by an agent policy and fails on
+//! two outcomes:
 //!
-//! * an **attack** case whose canary reached the external sink in any configured encoding (a leak
-//!   the policy should have blocked), unless the case is a registered known gap;
-//! * a **control** case whose canary never reached the sink (a false denial of legitimate work).
+//! * an **attack** case the untraced world can tell apart by its secret (a leak the policy should
+//!   have blocked), unless the case is a registered known gap. Each attack runs twice with
+//!   independent canaries, and everything an untraced observer could see afterwards (the stand-in
+//!   servers' bytes, files in shared directories, bound sockets, process arguments, keys and IPC
+//!   objects; see `projection`) is compared: any difference is a leak, whatever its encoding;
+//! * a **control** case whose canary never reached a sink (a false denial of legitimate work).
 //!
 //! The harness never invents an attack: every case is read from the hand-written corpus under
 //! `tests/leak-corpus/`. The whole suite runs inside a user+network namespace where TEST-NET-1
@@ -19,6 +22,7 @@
 
 mod case;
 mod oracle;
+mod projection;
 mod shrink;
 mod sink;
 
@@ -296,13 +300,19 @@ async fn run_corpus() -> usize {
                 mutate_case(&mut run_case, &mut rng);
             }
             let token = canary(&mut rng);
-            let outcome = run_once(&run_case, &variants, &token, PolicyMode::Enforce).await;
-            let verdict = assess(&run_case, gap_reason.as_deref(), &outcome);
+            let twin_token = canary(&mut rng);
+            let (outcome, verdict) =
+                judge(&run_case, &variants, (&token, &twin_token), gap_reason.as_deref()).await;
             let iteration_label = format!("iteration={iteration} {}", case::describe(&variants));
             if verdict.is_failure() {
                 failures += 1;
-                let (minimal, minimal_variants) =
-                    minimize_failure(&run_case, &variants, &token, gap_reason.clone()).await;
+                let (minimal, minimal_variants) = minimize_failure(
+                    &run_case,
+                    &variants,
+                    (&token, &twin_token),
+                    gap_reason.clone(),
+                )
+                .await;
                 eprintln!(
                     "\n=== FAIL {} [{iteration_label}] ===\n{}",
                     case.name,
@@ -439,6 +449,8 @@ enum PolicyMode {
 struct Outcome {
     /// Bytes each sink listener received.
     hits: Vec<sink::Hit>,
+    /// What the untraced world could observe of the run, normalised for comparison with a twin.
+    projection: Vec<String>,
     /// Every denial the observer saw, as `"<resource> <precondition>"`.
     denials: Vec<String>,
     /// Each step's index paired with how it ended.
@@ -576,6 +588,15 @@ impl Outcome {
                 found.encoding, found.listener, found.offset
             );
         }
+        if !verdict.differences.is_empty() {
+            out.push_str("\nobservable differences between the twin runs:");
+            for difference in verdict.differences.iter().take(REPORTED_DIFFERENCES) {
+                let _ = write!(out, "\n  {difference}");
+            }
+            if let Some(more) = verdict.differences.len().checked_sub(REPORTED_DIFFERENCES) {
+                let _ = write!(out, "\n  ... and {more} more");
+            }
+        }
         if let Status::KnownGap(reason) = &verdict.status {
             let _ = write!(out, "\nknown gap: {reason}");
         }
@@ -583,10 +604,15 @@ impl Outcome {
     }
 }
 
+/// How many twin differences a report lists.
+const REPORTED_DIFFERENCES: usize = 20;
+
 /// The leak verdict plus any step-expectation violations.
 struct Verdict {
     status: Status,
     violations: Vec<String>,
+    /// What the untraced world saw differently in an attack's twin runs.
+    differences: Vec<String>,
 }
 
 impl Verdict {
@@ -596,25 +622,73 @@ impl Verdict {
     }
 }
 
-/// The verdict for a completed run. `gap_reason` is `Some` when the case is a registered gap.
-fn assess(case: &Case, gap_reason: Option<&str>, outcome: &Outcome) -> Verdict {
+/// The verdict for a completed case. A control is judged by its one run: its canary must reach
+/// a sink. An attack is judged by two runs differing only in their canary, `outcome` and
+/// `twin`: any difference the untraced world could observe is a leak, whatever its channel or
+/// encoding. `gap_reason` is `Some` when the case is a registered gap.
+fn assess(
+    case: &Case,
+    gap_reason: Option<&str>,
+    outcome: &Outcome,
+    twin: Option<&Outcome>,
+) -> Verdict {
     let mut violations = outcome.expectation_violations(case);
-    let issues = outcome.inconclusive_steps(case);
+    let mut issues = outcome.inconclusive_steps(case);
+    if let Some(twin) = twin {
+        violations.extend(
+            twin.expectation_violations(case)
+                .into_iter()
+                .map(|violation| format!("twin {violation}")),
+        );
+        issues.extend(
+            twin.inconclusive_steps(case)
+                .into_iter()
+                .map(|issue| format!("twin {issue}")),
+        );
+    }
     violations.extend(issues.clone());
+    let differences = match case.kind {
+        Kind::Attack => projection::differences(
+            &outcome.projection,
+            &twin.expect("an attack is judged against its twin").projection,
+        ),
+        Kind::Control => Vec::new(),
+    };
     let status = if !issues.is_empty() {
         Status::Inconclusive
     } else {
-        match (case.kind, outcome.leak().is_some()) {
-            (Kind::Attack, true) => match gap_reason {
+        match case.kind {
+            Kind::Attack if differences.is_empty() => Status::Blocked,
+            Kind::Attack => match gap_reason {
                 Some(reason) => Status::KnownGap(reason.to_owned()),
                 None => Status::Leaked,
             },
-            (Kind::Attack, false) => Status::Blocked,
-            (Kind::Control, true) => Status::Delivered,
-            (Kind::Control, false) => Status::FalseDenial,
+            Kind::Control if outcome.leak().is_some() => Status::Delivered,
+            Kind::Control => Status::FalseDenial,
         }
     };
-    Verdict { status, violations }
+    Verdict {
+        status,
+        violations,
+        differences,
+    }
+}
+
+/// Runs a case as [`assess`] judges it: an attack twice with independent canaries, a control
+/// once with the first.
+async fn judge(
+    case: &Case,
+    variants: &BTreeMap<String, String>,
+    (token, twin_token): (&str, &str),
+    gap_reason: Option<&str>,
+) -> (Outcome, Verdict) {
+    let outcome = run_once(case, variants, token, PolicyMode::Enforce).await;
+    let twin = match case.kind {
+        Kind::Attack => Some(run_once(case, variants, twin_token, PolicyMode::Enforce).await),
+        Kind::Control => None,
+    };
+    let verdict = assess(case, gap_reason, &outcome, twin.as_ref());
+    (outcome, verdict)
 }
 
 /// Builds the agent policy a case names, in the requested mode and with its principal.
@@ -668,6 +742,19 @@ async fn run_once(
     if privileged {
         govern_as_nobody(&fixture);
     }
+    // Everything governed lives beside the seed: the views, the shells' state, and confined
+    // commands' private and shared scratch directories.
+    let governed = fixture.seed.parent().expect("fixture scratch").to_path_buf();
+    let scope = projection::Scope {
+        dirs: projection::SHARED_DIRS.iter().map(PathBuf::from).collect(),
+        names: vec![
+            (governed.to_string_lossy().into_owned(), "{FIXTURE}"),
+            (sink.port.to_string(), "{SINK_PORT}"),
+            (local.port.to_string(), "{LOCAL_SINK_PORT}"),
+        ],
+        governed: vec![governed],
+    };
+    let before = projection::capture(&scope);
 
     let denials = Arc::new(Mutex::new(Vec::new()));
     let observer = {
@@ -702,11 +789,16 @@ async fn run_once(
         hit.listener = format!("untraced local {}", hit.listener);
         hit
     }));
+    // Before the shells close, while what their commands left running is still observable.
+    let after = projection::capture(&scope);
     for shell in shells {
         let _ = shell.close(true).await;
     }
+    // Neither the twin nor a later case may start from what this run left in shared directories.
+    projection::remove_created(&before, &projection::capture(&scope));
     let denials = std::mem::take(&mut *denials.lock().unwrap());
     Outcome {
+        projection: projection::project(&scope, &hits, &before, &after),
         hits,
         denials,
         steps,
@@ -797,6 +889,7 @@ async fn audit_cross_check(
         let verdict = Verdict {
             status: status.clone(),
             violations: vec![issue.clone()],
+            differences: Vec::new(),
         };
         return Some((
             status,
@@ -812,6 +905,7 @@ async fn audit_cross_check(
         let verdict = Verdict {
             status: status.clone(),
             violations: vec!["audit did not deliver the canary to a sink".to_owned()],
+            differences: Vec::new(),
         };
         return Some((
             status,
@@ -832,6 +926,7 @@ async fn audit_cross_check(
     let verdict = Verdict {
         status: status.clone(),
         violations: Vec::new(),
+        differences: Vec::new(),
     };
     Some((
         status,
@@ -846,19 +941,20 @@ async fn audit_cross_check(
 async fn minimize_failure(
     case: &Case,
     variants: &BTreeMap<String, String>,
-    token: &str,
+    (token, twin_token): (&str, &str),
     gap_reason: Option<String>,
 ) -> (Case, BTreeMap<String, String>) {
-    let token = token.to_owned();
+    let tokens = (token.to_owned(), twin_token.to_owned());
     let fails: Box<shrink::Reproduces<'_>> =
         Box::new(move |candidate: &Case, choice: &BTreeMap<String, String>| {
-            let token = token.clone();
+            let tokens = tokens.clone();
             let candidate = candidate.clone();
             let choice = choice.clone();
             let gap_reason = gap_reason.clone();
             Box::pin(async move {
-                let outcome = run_once(&candidate, &choice, &token, PolicyMode::Enforce).await;
-                assess(&candidate, gap_reason.as_deref(), &outcome).is_failure()
+                let (_, verdict) =
+                    judge(&candidate, &choice, (&tokens.0, &tokens.1), gap_reason.as_deref()).await;
+                verdict.is_failure()
             }) as std::pin::Pin<Box<dyn std::future::Future<Output = bool>>>
         });
     shrink::minimize(case, variants, &fails).await
@@ -1001,25 +1097,26 @@ mod tests {
             .iter()
             .position(|step| step.expect == Expect::AcceptedPrivileged)
             .unwrap();
-        let outcome = Outcome {
-            hits: Vec::new(),
-            denials: Vec::new(),
-            steps: vec![(index, StepOutcome::Unsupported("io_uring SEND".into()))],
-            token: "unused".to_owned(),
-            encodings: case.oracle.encodings.clone(),
-        };
+        let outcome = outcome(
+            &case,
+            vec![(index, StepOutcome::Unsupported("io_uring SEND".into()))],
+        );
         assert!(outcome.inconclusive_steps(&case).is_empty());
     }
 
-    fn timeout_verdict(case: &Case, index: usize) -> Verdict {
-        let outcome = Outcome {
+    fn outcome(case: &Case, steps: Vec<(usize, StepOutcome)>) -> Outcome {
+        Outcome {
             hits: Vec::new(),
+            projection: Vec::new(),
             denials: Vec::new(),
-            steps: vec![(index, StepOutcome::Timeout)],
+            steps,
             token: "unused".to_owned(),
             encodings: case.oracle.encodings.clone(),
-        };
-        assess(case, None, &outcome)
+        }
+    }
+
+    fn timeout_verdict(case: &Case, index: usize) -> Verdict {
+        assess(case, None, &outcome(case, vec![(index, StepOutcome::Timeout)]), None)
     }
 
     #[test]
@@ -1048,18 +1145,38 @@ mod tests {
     #[test]
     fn unsupported_attack_without_network_evidence_is_inconclusive() {
         let case = corpus_case("io-uring-socket-write");
-        let outcome = Outcome {
-            hits: Vec::new(),
-            denials: Vec::new(),
-            steps: vec![(
+        let outcome = outcome(
+            &case,
+            vec![(
                 0,
                 StepOutcome::Unsupported("unknown ring effect".to_owned()),
             )],
-            token: "unused".to_owned(),
-            encodings: case.oracle.encodings.clone(),
-        };
-        let verdict = assess(&case, None, &outcome);
+        );
+        let verdict = assess(&case, None, &outcome, Some(&outcome));
         assert!(matches!(&verdict.status, Status::Inconclusive));
         assert!(verdict.is_failure());
+    }
+
+    #[test]
+    fn an_attack_leaks_when_its_twins_differ_in_anything_observable() {
+        let case = corpus_case("connect-tcp-exfil");
+        let steps: Vec<_> = (0..case.steps.len())
+            .map(|index| (index, StepOutcome::Refused))
+            .collect();
+        let observed = |fact: &str| Outcome {
+            projection: vec![fact.to_owned()],
+            ..outcome(&case, steps.clone())
+        };
+        let quiet = observed("socket tcp 0100007F:8080: 1");
+        let verdict = assess(&case, None, &quiet, Some(&observed("socket tcp 0100007F:8080: 1")));
+        assert!(matches!(&verdict.status, Status::Blocked));
+
+        // No canary reached a sink, yet the secret chose a port the untraced world can see.
+        let chosen = observed("socket tcp 0100007F:8081: 1");
+        let verdict = assess(&case, None, &quiet, Some(&chosen));
+        assert!(matches!(&verdict.status, Status::Leaked));
+        assert_eq!(verdict.differences.len(), 2);
+        let verdict = assess(&case, Some("registered"), &quiet, Some(&chosen));
+        assert!(matches!(&verdict.status, Status::KnownGap(_)));
     }
 }

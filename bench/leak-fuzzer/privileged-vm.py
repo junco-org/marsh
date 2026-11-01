@@ -36,9 +36,10 @@ def main():
         root.mkdir()
         for name in ('bin', 'dev', 'proc', 'sys', 'host', 'tmp'):
             (root / name).mkdir()
-        shutil.copyfile(shutil.which('busybox'), root / 'bin/busybox')
+        busybox = shutil.which('busybox')
+        shutil.copyfile(busybox, root / 'bin/busybox')
         os.chmod(root / 'bin/busybox', 0o755)
-        for name in ('sh', 'mount', 'modprobe', 'chroot', 'mkdir', 'poweroff', 'echo', 'cat'):
+        for name in ('sh', 'mount', 'modprobe', 'switch_root', 'mkdir', 'poweroff', 'echo', 'cat'):
             (root / 'bin' / name).symlink_to('busybox')
         copied = set()
 
@@ -76,6 +77,9 @@ def main():
         runtime_path = '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:' + os.environ.get('PATH', '')
         # Fixtures live under /var/tmp: confined commands get a private /tmp of their own.
         command = 'export PATH=' + shlex.quote(runtime_path) + ' TMPDIR=/var/tmp; ip link set lo up && cd ' + shlex.quote(str(repo)) + ' && ' + shlex.join(args.command)
+        # The host tree becomes the real root rather than a chroot, which the kernel would refuse
+        # user namespaces; the host's own busybox powers off afterwards.
+        command += '; echo MARSH_VM_EXIT=$?; ' + shlex.quote(busybox) + ' poweroff -f'
         init = f'''#!/bin/sh
 export PATH=/bin
 mount -t proc proc /proc
@@ -92,16 +96,18 @@ mount -t devtmpfs dev /host/dev
 mount -t tmpfs tmp /host/tmp
 mount -t tmpfs vartmp /host/var/tmp
 mkdir -p /host/dev/shm && mount -t tmpfs shm /host/dev/shm
+mkdir -p /host/dev/pts && mount -t devpts -o ptmxmode=0666 devpts /host/dev/pts
 mount -t cgroup2 cgroup2 /host/sys/fs/cgroup || {{ echo MARSH_VM_FAILURE; poweroff -f; }}
 mount -t securityfs securityfs /host/sys/kernel/security
+# Apport's Python hook treats scripts under /var as packaged and collects a full crash report,
+# spawning traced helpers, whenever one dies on a refused call.
+[ -f /host/etc/default/apport ] && mount -o bind /apport /host/etc/default/apport
 cat /host/sys/kernel/security/lsm
-chroot /host /bin/sh -c {shlex.quote(command)}
-rc=$?
-echo MARSH_VM_EXIT=$rc
-poweroff -f
+exec switch_root /host /bin/sh -c {shlex.quote(command)}
 '''
         (root / 'init').write_text(init)
         os.chmod(root / 'init', 0o755)
+        (root / 'apport').write_text('enabled=0\n')
         archive = Path(directory) / 'initramfs.cpio.gz'
         names = [b'.'] + [os.fsencode(str(path.relative_to(root))) for path in root.rglob('*')]
         result = subprocess.run(['cpio', '-o', '-H', 'newc', '--null', '--quiet'], cwd=root, input=b'\0'.join(names) + b'\0', stdout=subprocess.PIPE, check=True)

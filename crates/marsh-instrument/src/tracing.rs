@@ -284,6 +284,16 @@ impl State {
             .any(|(_, cohort, _)| *cohort == Some(id))
     }
 
+    /// Whether `root` made records it cannot order yet: a new task's, waiting for the call that
+    /// created it to return, which a `vfork` parent's does only after the child execs or exits.
+    /// Its policy has not seen them, so no contact of the root can be judged until it has.
+    fn unordered(&self, root: RootId) -> bool {
+        self.deferred
+            .values()
+            .flatten()
+            .any(|(target, ..)| target.run.root == root)
+    }
+
     /// Moves an exec-displaced thread's bookkeeping to the thread that now owns its identity.
     /// A displaced live member of a tracked tree no longer counts toward it.
     fn rekey(&mut self, tid: Pid, former: Pid) {
@@ -993,9 +1003,10 @@ impl Tracing {
         if !self.kernel_entry(target, &*enforcer, syscall, source)? {
             return Ok(true);
         }
+        let ordered = !lock(&self.state).unordered(target.run.root);
         Ok(peers()
             .iter()
-            .all(|peer| enforcer.permits(target.run, target.builtin, peer, source)))
+            .all(|peer| enforcer.permits(target.run, target.builtin, peer, source, ordered)))
     }
 
     /// Whether `tid`'s owner selects the executable it is about to exec.

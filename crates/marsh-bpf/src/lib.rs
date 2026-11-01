@@ -18,7 +18,7 @@
 use std::{
     collections::HashSet,
     io,
-    os::fd::{AsRawFd, BorrowedFd},
+    os::fd::{AsFd, AsRawFd, BorrowedFd},
 };
 
 #[cfg(feature = "privileged")]
@@ -32,13 +32,13 @@ use aya::{
     maps::{Array, HashMap, LpmTrie, MapData, MapError, RingBuf, lpm_trie::Key},
 };
 use marsh_peer_class::{
-    AF_INET, AF_INET6, Answers, Endpoint, Event, MAX_CLASSES, Network, RECEIPT, Receipts,
-    UNTAGGED, effective_networks,
+    AF_INET, AF_INET6, Answers, Endpoint, Event, InodeLabel, MAX_CLASSES, MAX_NAME_RULES,
+    NameRule, Network, RECEIPT, Receipts, UNTAGGED, effective_networks,
 };
 
 /// Every LSM hook the programs attach to; all are required.
 #[cfg(feature = "privileged")]
-const HOOKS: [&str; 26] = [
+const HOOKS: [&str; 33] = [
     "socket_connect",
     "socket_sendmsg",
     "unix_may_send",
@@ -65,6 +65,13 @@ const HOOKS: [&str; 26] = [
     "task_setrlimit",
     "key_alloc",
     "key_permission",
+    "d_instantiate",
+    "inode_rename",
+    "inode_link",
+    "inode_free_security",
+    "file_permission",
+    "mmap_file",
+    "bprm_check_security",
 ];
 
 /// Socket reads, traced on return so a reader blocked before tainted bytes arrived is caught:
@@ -92,6 +99,7 @@ macro_rules! pod {
 pod!(WireAnswers, Answers);
 pod!(WireReceipts, Receipts);
 pod!(WireEndpoint, Endpoint);
+pod!(WireNameRule, NameRule);
 
 /// Owns the attached LSM programs and all their unpinned maps.
 ///
@@ -110,6 +118,9 @@ pub struct Controller {
     allowed: HashSet<Endpoint>,
     events: RingBuf<MapData>,
     health: Array<MapData, u64>,
+    rules: Array<MapData, WireNameRule>,
+    /// Inode storage, which Aya has no wrapper for: updated through the raw syscall.
+    inodes: MapData,
 }
 
 impl Controller {
@@ -153,6 +164,11 @@ impl Controller {
                 allowed: HashSet::new(),
                 events: map(&mut programs, "EVENTS")?,
                 health: map(&mut programs, "HEALTH")?,
+                rules: map(&mut programs, "NAME_RULES")?,
+                inodes: match programs.take_map("INODES") {
+                    Some(Map::Unsupported(inodes)) => inodes,
+                    _ => return Err(io::Error::other("missing BPF inode storage INODES")),
+                },
                 programs: None,
             };
             for hook in HOOKS {
@@ -298,6 +314,46 @@ impl Controller {
             }
             this.allowed = wanted;
             Ok(())
+        })
+    }
+
+    /// Replaces the kernel's name rules (`docs/threat-model.md` §8.3), which classify entries as
+    /// they are created, linked or renamed; unused slots match nothing.
+    pub fn name_rules(&mut self, rules: &[NameRule]) -> io::Result<()> {
+        if rules.len() > MAX_NAME_RULES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("at most {MAX_NAME_RULES} file classification rules fit the kernel"),
+            ));
+        }
+        self.update(|this| {
+            for slot in 0..MAX_NAME_RULES {
+                let rule = rules.get(slot).copied().unwrap_or_default();
+                let index = u32::try_from(slot).map_err(io::Error::other)?;
+                this.rules
+                    .set(index, WireNameRule(rule), 0)
+                    .map_err(io::Error::other)?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Adds `label` to the label of the inode `file` names (any descriptor, `O_PATH` included).
+    ///
+    /// The kernel only ever adds to labels too; a classification racing this one on the same
+    /// inode can lose its bits to the write-back, so label before the inode can be renamed.
+    pub fn label(&mut self, file: BorrowedFd<'_>, label: InodeLabel) -> io::Result<()> {
+        self.update(|this| {
+            let map = this.inodes.fd().as_fd().as_raw_fd();
+            let key = file.as_raw_fd();
+            let mut current = InodeLabel::default();
+            match map_element(LOOKUP_ELEM, map, &key, &raw mut current) {
+                Ok(()) => {}
+                Err(error) if error.raw_os_error() == Some(libc::ENOENT) => {}
+                Err(error) => return Err(error),
+            }
+            current.merge(label);
+            map_element(UPDATE_ELEM, map, &key, &raw mut current)
         })
     }
 
@@ -461,6 +517,49 @@ fn absent_ok(result: Result<(), MapError>) -> io::Result<()> {
     }
 }
 
+const LOOKUP_ELEM: libc::c_int = 1;
+const UPDATE_ELEM: libc::c_int = 2;
+
+/// `union bpf_attr` for the element commands.
+#[repr(C)]
+struct ElementAttr {
+    map_fd: u32,
+    pad: u32,
+    key: u64,
+    value: u64,
+    flags: u64,
+}
+
+/// A raw element lookup or update (flags `BPF_ANY`) on a map Aya cannot type.
+fn map_element<K>(
+    command: libc::c_int,
+    map: std::os::fd::RawFd,
+    key: &K,
+    value: *mut InodeLabel,
+) -> io::Result<()> {
+    let attr = ElementAttr {
+        map_fd: u32::try_from(map).map_err(io::Error::other)?,
+        pad: 0,
+        key: std::ptr::from_ref(key) as u64,
+        value: value as u64,
+        flags: 0,
+    };
+    // SAFETY: attr is a live element command naming a live key and a live, writable value of the
+    // map's value size.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_bpf,
+            command,
+            &raw const attr,
+            size_of::<ElementAttr>(),
+        )
+    };
+    if result < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 #[cfg(feature = "privileged")]
 fn map<T: TryFrom<Map>>(programs: &mut Ebpf, name: &str) -> io::Result<T>
 where
@@ -495,7 +594,8 @@ fn prerequisites() -> io::Result<Btf> {
     Btf::from_sys_fs().map_err(|error| io::Error::other(format!("kernel BTF unavailable at /sys/kernel/btf/vmlinux: enable CONFIG_DEBUG_INFO_BTF: {error}")))
 }
 
-#[cfg(all(test, feature = "privileged"))]
+#[cfg(test)]
+#[cfg(feature = "privileged")]
 mod tests {
     use super::*;
     use marsh_peer_class::builtin_class;
@@ -504,6 +604,7 @@ mod tests {
     unsafe extern "C" {
         fn marsh_host_builtin_class(endpoint: *const Endpoint) -> i32;
         fn marsh_host_normalize_ip(endpoint: *mut Endpoint);
+        fn marsh_host_name_matches(rule: *const NameRule, name: *const u8, len: u32) -> i32;
     }
 
     /// The kernel's classifier is C; it must agree with the policy's Rust one on every IP.
@@ -541,7 +642,7 @@ mod tests {
                 address
             };
             // SAFETY: endpoint is a live, initialized Endpoint, the C struct's exact layout.
-            let kernel = unsafe { marsh_host_builtin_class(&endpoint) };
+            let kernel = unsafe { marsh_host_builtin_class(&raw const endpoint) };
             assert_eq!(
                 builtin_class(&endpoint).map_or(-1, |class| i32::try_from(class).unwrap()),
                 kernel,
@@ -550,8 +651,68 @@ mod tests {
             if matches!(endpoint.family, AF_INET | AF_INET6) {
                 let mut kernel = endpoint;
                 // SAFETY: as above, uniquely borrowed for the call.
-                unsafe { marsh_host_normalize_ip(&mut kernel) };
+                unsafe { marsh_host_normalize_ip(&raw mut kernel) };
                 assert_eq!(kernel, endpoint.normalized(), "{endpoint:?}");
+            }
+        }
+    }
+
+    /// The kernel matches names it reads only partly (first and last bytes); it must agree with
+    /// the userspace rule on whole names, including names longer than both halves.
+    #[test]
+    fn kernel_name_matcher_matches_policy_matcher() {
+        fn next(state: &mut u64) -> u64 {
+            *state ^= *state << 13;
+            *state ^= *state >> 7;
+            *state ^= *state << 17;
+            *state
+        }
+        fn word(state: &mut u64, length: u64) -> String {
+            (0..length)
+                .map(|_| char::from(b".envpk"[usize::try_from(next(state) % 6).unwrap()]))
+                .collect()
+        }
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        let mut globs = vec![
+            ".env".to_owned(),
+            ".env.*".to_owned(),
+            "*.pem".to_owned(),
+            "id_rsa*".to_owned(),
+            "*".to_owned(),
+            format!("{}*{}", "p".repeat(32), "k".repeat(32)),
+        ];
+        for _ in 0..200 {
+            let (prefix_len, suffix_len) = (next(&mut state) % 5, next(&mut state) % 5);
+            let (prefix, suffix) = (word(&mut state, prefix_len), word(&mut state, suffix_len));
+            globs.push(if next(&mut state).is_multiple_of(2) {
+                format!("{prefix}*{suffix}")
+            } else {
+                format!("{prefix}{suffix}")
+            });
+        }
+        let mut names: Vec<Vec<u8>> = vec![b".env".to_vec(), b"x.pem".to_vec()];
+        for _ in 0..400 {
+            let length = if next(&mut state).is_multiple_of(2) {
+                next(&mut state) % 6
+            } else {
+                30 + next(&mut state) % 40
+            };
+            names.push(word(&mut state, length).into_bytes());
+        }
+        for glob in &globs {
+            let Some(rule) = NameRule::new(glob, 1) else {
+                continue;
+            };
+            for name in &names {
+                // SAFETY: rule is a live NameRule in the C layout; name is live for its length.
+                let kernel = unsafe {
+                    marsh_host_name_matches(
+                        &raw const rule,
+                        name.as_ptr(),
+                        u32::try_from(name.len()).unwrap(),
+                    )
+                };
+                assert_eq!(kernel != 0, rule.matches(name), "{glob:?} on {name:?}");
             }
         }
     }

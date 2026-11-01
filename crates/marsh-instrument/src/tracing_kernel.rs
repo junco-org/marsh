@@ -7,7 +7,7 @@
 
 use super::{RootId, State, Target, TraceRun, Tracing, lock};
 use crate::confine::{Confinement, Prepared};
-use crate::enforcement::{Enforcement, Enforcer, KernelPolicy};
+use crate::enforcement::{Enforcement, Enforcer, FileClasses, KernelPolicy};
 use crate::{FileTarget, local};
 use marsh_peer_class::{AF_INET, AF_INET6, Endpoint, Event};
 use nix::unistd::Pid;
@@ -105,9 +105,18 @@ impl Tracing {
     /// force are dropped: concurrent tracers may publish out of order.
     pub fn publish(&self, root: RootId, policy: KernelPolicy) -> io::Result<()> {
         match &self.kernel {
-            Some(kernel) => kernel.publish(root.0, policy),
+            Some(kernel) => self.publish_to(kernel, root, policy),
             None => Ok(()),
         }
+    }
+
+    /// Answers decided without records the root cannot order yet are published stale, so the
+    /// kernel refuses what they could forbid until answers that include the records replace them.
+    fn publish_to(&self, kernel: &Kernel, root: RootId, mut policy: KernelPolicy) -> io::Result<()> {
+        if lock(&self.state).unordered(root) {
+            policy.answers.stale = 1;
+        }
+        kernel.publish(root.0, policy)
     }
 
     /// Makes the kernel refuse every class any rule could forbid until the root's answers are
@@ -133,13 +142,13 @@ impl Tracing {
             return Ok(true);
         };
         let copies = matches!(syscall, Sysno::sendfile | Sysno::splice);
-        let root = target.run.root.0;
-        if copies || kernel.needs_refresh(root) {
+        let root = target.run.root;
+        if copies || kernel.needs_refresh(root.0) || lock(&self.state).unordered(root) {
             // Contacts already made must reach the answers before this one is judged.
             self.deliver_kernel_events()?;
-            kernel.publish(root, enforcer.refresh(target.run, source)?)?;
+            self.publish_to(kernel, root, enforcer.refresh(target.run, source)?)?;
         }
-        if kernel.restricts_untraced(root) {
+        if kernel.restricts_untraced(root.0) {
             kernel.allow_local(&self.traced_local_endpoints())?;
         }
         Ok(copies)
@@ -182,6 +191,32 @@ impl Tracing {
             .ok_or_else(|| io::Error::other("unknown root"))?
             .confined = Some(prepared);
         Ok(())
+    }
+
+    /// Classifies files for the kernel's taint receipts (`docs/threat-model.md` §8.3) before a
+    /// root's first run: its rules join every other root's, and its anchors are labelled, with
+    /// what is already loaded beneath them, and kept loaded until the root is removed.
+    ///
+    /// # Errors
+    /// Refuses without privileged enforcement, for a missing or running root, a missing anchor,
+    /// and when every root's rules together exceed the kernel's table.
+    pub fn classify_files(&self, root: RootId, files: FileClasses) -> io::Result<()> {
+        let Some(kernel) = &self.kernel else {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "file classification needs privileged enforcement",
+            ));
+        };
+        {
+            let state = lock(&self.state);
+            state.check()?;
+            if !state.roots.contains_key(&root) || state.runs.keys().any(|run| run.root == root) {
+                return Err(io::Error::other(
+                    "file classification must precede a registered root's first run",
+                ));
+            }
+        }
+        kernel.classify_files(root.0, files)
     }
 
     fn confinement(&self, root: RootId) -> Option<Arc<Prepared>> {
@@ -234,23 +269,31 @@ impl Tracing {
     }
 
     /// Drains the kernel's events and delivers each to its root's policy engine, outside every
-    /// trace lock. A failure fails the whole service: an undelivered taint receipt or contact
-    /// cannot be recovered.
+    /// trace lock. Any failure, in draining, attributing or delivering, fails the whole service:
+    /// drained events are gone from the ring, and an undelivered taint receipt or contact cannot
+    /// be recovered.
     pub(super) fn deliver_kernel_events(&self) -> io::Result<()> {
-        let Some(kernel) = &self.kernel else {
-            return Ok(());
+        match &self.kernel {
+            Some(kernel) => self.deliver_drained(|| kernel.drain()),
+            None => Ok(()),
+        }
+    }
+
+    fn deliver_drained(&self, drain: impl FnOnce() -> io::Result<Vec<Event>>) -> io::Result<()> {
+        let failed = |error: io::Error| {
+            self.fail(format!("kernel event delivery: {error}"));
+            error
         };
         // Attribution is reserved while the drain's state lock is held: another tracer could
         // otherwise retire a root whose events this batch already removed from the ring.
         let mut state = lock(&self.state);
-        let events = kernel.drain()?;
-        let mut deliveries = Deliveries::reserve(self, &mut state, events)?;
+        let reserved = drain().and_then(|events| Deliveries::reserve(self, &mut state, events));
         drop(state);
-        deliveries.deliver().inspect_err(|error| {
-            // Other owners must see the failure before releasing their undelivered records
-            // could make them quiescent enough to publish incomplete evidence.
-            self.fail(format!("kernel event delivery: {error}"));
-        })
+        let mut deliveries = reserved.map_err(failed)?;
+        // Other owners must see the failure before releasing their undelivered records could
+        // make them quiescent enough to publish incomplete evidence, so it is recorded while
+        // `deliveries` still holds them.
+        deliveries.deliver().map_err(failed)
     }
 
     /// Delivers kernel events as they arrive, so taint receipts reach the policy engine without
@@ -425,13 +468,16 @@ pub(crate) use unavailable::Kernel;
 
 #[cfg(feature = "privileged")]
 mod privileged {
-    use super::{Endpoint, Event, KernelPolicy, Mutex, io};
+    use super::{Endpoint, Event, FileClasses, KernelPolicy, Mutex, io};
     use crate::confine::Cgroup;
     use marsh_lib::RecoverPoison as _;
     use marsh_bpf::Controller;
-    use marsh_peer_class::Network;
+    use marsh_peer_class::{InodeLabel, NameRule, Network};
     use std::collections::HashMap;
-    use std::os::fd::{BorrowedFd, OwnedFd};
+    use std::fs::{File, OpenOptions};
+    use std::os::fd::{AsFd as _, BorrowedFd, OwnedFd};
+    use std::os::unix::fs::OpenOptionsExt as _;
+    use std::path::{Path, PathBuf};
     use std::sync::Arc;
 
     /// The loaded programs, and what was last published to them for each root.
@@ -442,6 +488,9 @@ mod privileged {
         roots: HashMap<u64, Published>,
         /// Each confined root's cgroup: its domain in the programs.
         cgroups: HashMap<u64, Arc<Cgroup>>,
+        /// Each classified root's rules, and its anchors, held open so the kernel keeps them
+        /// loaded: their labels live only as long as their in-memory inodes.
+        classified: HashMap<u64, (Vec<NameRule>, Vec<File>)>,
     }
 
     #[derive(Default)]
@@ -456,6 +505,7 @@ mod privileged {
                 controller: Controller::load()?,
                 roots: HashMap::new(),
                 cgroups: HashMap::new(),
+                classified: HashMap::new(),
             })))
         }
 
@@ -533,10 +583,42 @@ mod privileged {
             Ok(cgroup)
         }
 
+        /// Installs every classified root's rules with `root`'s, then labels its anchors and what
+        /// is already loaded beneath them; anything loaded later the programs label themselves.
+        pub(super) fn classify_files(&self, root: u64, files: FileClasses) -> io::Result<()> {
+            let mut inner = self.inner();
+            let Inner {
+                controller,
+                classified,
+                ..
+            } = &mut *inner;
+            let mut rules = Vec::new();
+            for rule in classified
+                .iter()
+                .filter(|(other, _)| **other != root)
+                .flat_map(|(_, (rules, _))| rules)
+                .chain(&files.rules)
+            {
+                NameRule::join(&mut rules, *rule);
+            }
+            controller.name_rules(&rules)?;
+            let mut anchors = Vec::new();
+            for (path, label) in &files.anchors {
+                let anchor = open_path(path)?;
+                controller.label(anchor.as_fd(), *label)?;
+                label_loaded(controller, path, *label, &rules)?;
+                anchors.push(anchor);
+            }
+            classified.insert(root, (files.rules, anchors));
+            drop(inner);
+            Ok(())
+        }
+
         pub(super) fn remove_root(&self, root: u64) -> io::Result<()> {
             let mut inner = self.inner();
             inner.controller.remove_root(root)?;
             inner.roots.remove(&root);
+            inner.classified.remove(&root);
             let cgroup = inner.cgroups.remove(&root);
             if let Some(cgroup) = &cgroup {
                 inner.controller.remove_domain(cgroup.id)?;
@@ -574,11 +656,68 @@ mod privileged {
             owned
         }
     }
+
+    /// An `O_PATH` descriptor for `path` itself, never a symlink's target.
+    fn open_path(path: &Path) -> io::Result<File> {
+        OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_PATH | libc::O_NOFOLLOW)
+            .open(path)
+    }
+
+    /// Labels every entry beneath `directory` that its scopes or subtree classify, as the
+    /// programs would on loading it: entries already loaded were never shown to them.
+    // ponytail: walks a whole view under a `**/` scope; a fresh btrfs snapshot loads nothing
+    // until used, so only copied views need it.
+    fn label_loaded(
+        controller: &mut Controller,
+        directory: &Path,
+        label: InodeLabel,
+        rules: &[NameRule],
+    ) -> io::Result<()> {
+        let mut pending: Vec<(PathBuf, InodeLabel)> = vec![(directory.to_owned(), label)];
+        while let Some((directory, label)) = pending.pop() {
+            if label.deep | label.direct | label.subtree == 0 {
+                continue;
+            }
+            let entries = match std::fs::read_dir(&directory) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                entries => entries?,
+            };
+            for entry in entries {
+                let entry = entry?;
+                let is_directory = entry.file_type()?.is_dir();
+                let name = entry.file_name();
+                let child =
+                    label.child(rules, std::os::unix::ffi::OsStrExt::as_bytes(name.as_os_str()), is_directory);
+                if child.is_empty() {
+                    continue;
+                }
+                let path = entry.path();
+                match open_path(&path) {
+                    Ok(file) => controller.label(file.as_fd(), child)?,
+                    // Renamed or removed meanwhile: the programs label it wherever it is loaded.
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(error),
+                }
+                if is_directory {
+                    pending.push((path, child));
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(not(feature = "privileged"))]
+#[allow(
+    clippy::uninhabited_references,
+    clippy::missing_const_for_fn,
+    reason = "no `Kernel` exists: each method matches its uninhabited receiver to prove it is \
+              never called, and mirrors the privileged signature it stands in for"
+)]
 mod unavailable {
-    use super::*;
+    use super::{Endpoint, Event, FileClasses, KernelPolicy, io};
     use std::os::fd::OwnedFd;
 
     /// Never constructed: privileged enforcement was not compiled.
@@ -610,6 +749,9 @@ mod unavailable {
             match *self {}
         }
         pub(super) fn remove_root(&self, _: u64) -> io::Result<()> {
+            match *self {}
+        }
+        pub(super) fn classify_files(&self, _: u64, _: FileClasses) -> io::Result<()> {
             match *self {}
         }
         pub(super) fn terminate(&self) -> io::Result<()> {
@@ -650,6 +792,7 @@ mod tests {
             _: Option<InvocationId>,
             _: &[u8],
             _: Option<&FileTarget>,
+            _: bool,
         ) -> bool {
             unreachable!("this regression exercises event delivery, not policy")
         }
@@ -728,5 +871,31 @@ mod tests {
         assert_eq!(lock(&tracing.state).runs.get(&run).unwrap().deliveries, 0);
         tracing.end_run(run).unwrap();
         tracing.unregister_root(root).unwrap();
+    }
+
+    #[test]
+    fn undeliverable_kernel_events_fail_the_service() {
+        // A private generation: failing the shared one would fail every concurrent test.
+        let tracing = Tracing {
+            state: Mutex::new(State::default()),
+            progress: std::sync::Condvar::new(),
+            sequence: Arc::default(),
+            selected: crate::observation::Observer::selection().unwrap(),
+            enforcement: Enforcement::Unprivileged,
+            fallback: std::sync::OnceLock::new(),
+            kernel: None,
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let root = tracing
+            .register_root(directory.path(), Arc::new(|_, _, _| Ok(())), None)
+            .unwrap();
+        // Drained, so gone from the ring, but its root has no live run to deliver it to.
+        let event = Event {
+            root: root.0,
+            ..Event::default()
+        };
+        let error = tracing.deliver_drained(|| Ok(vec![event])).unwrap_err();
+        assert_eq!(error.to_string(), "kernel event has no live trace run");
+        assert!(tracing.begin_run(root).is_err());
     }
 }

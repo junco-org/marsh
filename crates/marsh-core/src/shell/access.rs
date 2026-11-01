@@ -210,37 +210,33 @@ impl Access {
                     }
                 }
             }
-            Sysno::read | Sysno::pread64 | Sysno::readv | Sysno::preadv | Sysno::preadv2 => {
-                if success {
-                    self.fd_effect(&mut effects, info, 0, root, true, false)?;
-                }
+            Sysno::read | Sysno::pread64 | Sysno::readv | Sysno::preadv | Sysno::preadv2
+                if success =>
+            {
+                self.fd_effect(&mut effects, info, 0, root, true, false)?;
             }
             Sysno::write
             | Sysno::pwrite64
             | Sysno::writev
             | Sysno::pwritev
             | Sysno::pwritev2
-            | Sysno::fallocate => {
-                if success {
-                    self.fd_effect(&mut effects, info, 0, root, false, true)?;
-                }
+            | Sysno::fallocate
+                if success =>
+            {
+                self.fd_effect(&mut effects, info, 0, root, false, true)?;
             }
-            Sysno::sendfile => {
-                if success {
-                    self.fd_effect(&mut effects, info, 1, root, true, false)?;
-                    self.fd_effect(&mut effects, info, 0, root, false, true)?;
-                }
+            Sysno::sendfile if success => {
+                self.fd_effect(&mut effects, info, 1, root, true, false)?;
+                self.fd_effect(&mut effects, info, 0, root, false, true)?;
             }
-            Sysno::copy_file_range | Sysno::splice | Sysno::tee => {
-                if success {
-                    self.fd_effect(&mut effects, info, 0, root, true, false)?;
-                    let output = if info.info.syscall == Sysno::tee {
-                        1
-                    } else {
-                        2
-                    };
-                    self.fd_effect(&mut effects, info, output, root, false, true)?;
-                }
+            Sysno::copy_file_range | Sysno::splice | Sysno::tee if success => {
+                self.fd_effect(&mut effects, info, 0, root, true, false)?;
+                let output = if info.info.syscall == Sysno::tee {
+                    1
+                } else {
+                    2
+                };
+                self.fd_effect(&mut effects, info, output, root, false, true)?;
             }
             Sysno::dup | Sysno::dup2 | Sysno::dup3 | Sysno::fcntl => {
                 if success && let Some(target) = &info.return_fd {
@@ -259,107 +255,94 @@ impl Access {
                     }
                 }
             }
-            Sysno::close => {
-                if success {
-                    let number = descriptor_number(info, 0)?;
-                    self.task(tid).descriptors.lock().recover().remove(&number);
-                }
+            Sysno::close if success => {
+                let number = descriptor_number(info, 0)?;
+                self.task(tid).descriptors.lock().recover().remove(&number);
             }
-            Sysno::close_range => {
-                if success {
-                    let flags = integer(info, 2)?;
-                    if flags & u64::from(libc::CLOSE_RANGE_UNSHARE) != 0 {
-                        let task = self.task(tid);
-                        let descriptors = inherit(&task.descriptors, false);
-                        let mappings = Arc::clone(&task.mappings);
-                        self.tasks.insert(
-                            tid,
-                            TaskState {
-                                descriptors,
-                                mappings,
-                            },
-                        );
-                    }
-                    // CLOEXEC marks descriptors; it does not close them. A subsequent dup must
-                    // retain the original generation even before an exec actually closes anything.
-                    if flags & u64::from(libc::CLOSE_RANGE_CLOEXEC) != 0 {
-                        return Ok(effects);
-                    }
-                    let first = integer(info, 0)?;
-                    let last = integer(info, 1)?;
-                    self.task(tid)
-                        .descriptors
-                        .lock()
-                        .recover()
-                        .retain(|number, _| {
-                            let number = u64::from(number.cast_unsigned());
-                            number < first || number > last
-                        });
+            Sysno::close_range if success => {
+                let flags = integer(info, 2)?;
+                if flags & u64::from(libc::CLOSE_RANGE_UNSHARE) != 0 {
+                    let task = self.task(tid);
+                    let descriptors = inherit(&task.descriptors, false);
+                    let mappings = Arc::clone(&task.mappings);
+                    self.tasks.insert(
+                        tid,
+                        TaskState {
+                            descriptors,
+                            mappings,
+                        },
+                    );
                 }
-            }
-            Sysno::ftruncate | Sysno::fchmod => {
-                if success {
-                    self.fd_effect(&mut effects, info, 0, root, false, true)?;
+                // CLOEXEC marks descriptors; it does not close them. A subsequent dup must
+                // retain the original generation even before an exec actually closes anything.
+                if flags & u64::from(libc::CLOSE_RANGE_CLOEXEC) != 0 {
+                    return Ok(effects);
                 }
-            }
-            Sysno::fstat | Sysno::fstatfs | Sysno::lseek | Sysno::fchdir => {
-                if success {
-                    self.fd_effect(&mut effects, info, 0, root, false, false)?;
-                }
-            }
-            Sysno::getdents | Sysno::getdents64 => {
-                if success {
-                    if let Some(target) = info.fd(0)? {
-                        self.check_fd(info, 0, root)?;
-                        if let Some(path) = protected(root, &target_path(target))? {
-                            effects.recursive_reads.push(path);
-                        }
-                    } else {
-                        return Err("directory enumeration has no stopped-task identity".into());
-                    }
-                }
-            }
-            Sysno::mmap => {
-                if success
-                    && integer(info, 3)? & u64::from(libc::MAP_ANONYMOUS.cast_unsigned()) == 0
-                {
-                    let target = info
-                        .fd(4)?
-                        .ok_or_else(|| "file mapping has no stopped-task identity".to_string())?;
-                    self.check_fd(info, 4, root)?;
-                    let protection = integer(info, 2)?;
-                    let shared =
-                        integer(info, 3)? & u64::from(libc::MAP_SHARED.cast_unsigned()) != 0;
-                    self.target_effect(
-                        &mut effects,
-                        target,
-                        root,
-                        protection & u64::from((libc::PROT_READ | libc::PROT_EXEC).cast_unsigned())
-                            != 0,
-                        shared && protection & u64::from(libc::PROT_WRITE.cast_unsigned()) != 0,
-                    )?;
-                    let start =
-                        returned(info).ok_or_else(|| "mapping has no address".to_string())?;
-                    let end = start
-                        .checked_add(integer(info, 1)?)
-                        .ok_or_else(|| "mapping range overflow".to_string())?;
-                    self.task(tid).mappings.lock().recover().push(Mapping {
-                        start,
-                        end,
-                        target: target.clone(),
-                        shared,
-                        generation: self.generation,
+                let first = integer(info, 0)?;
+                let last = integer(info, 1)?;
+                self.task(tid)
+                    .descriptors
+                    .lock()
+                    .recover()
+                    .retain(|number, _| {
+                        let number = u64::from(number.cast_unsigned());
+                        number < first || number > last
                     });
+            }
+            Sysno::ftruncate | Sysno::fchmod if success => {
+                self.fd_effect(&mut effects, info, 0, root, false, true)?;
+            }
+            Sysno::fstat | Sysno::fstatfs | Sysno::lseek | Sysno::fchdir if success => {
+                self.fd_effect(&mut effects, info, 0, root, false, false)?;
+            }
+            Sysno::getdents | Sysno::getdents64 if success => {
+                if let Some(target) = info.fd(0)? {
+                    self.check_fd(info, 0, root)?;
+                    if let Some(path) = protected(root, &target_path(target))? {
+                        effects.recursive_reads.push(path);
+                    }
+                } else {
+                    return Err("directory enumeration has no stopped-task identity".into());
                 }
+            }
+            Sysno::mmap
+                if success
+                    && integer(info, 3)? & u64::from(libc::MAP_ANONYMOUS.cast_unsigned()) == 0 =>
+            {
+                let target = info
+                    .fd(4)?
+                    .ok_or_else(|| "file mapping has no stopped-task identity".to_string())?;
+                self.check_fd(info, 4, root)?;
+                let protection = integer(info, 2)?;
+                let shared = integer(info, 3)? & u64::from(libc::MAP_SHARED.cast_unsigned()) != 0;
+                self.target_effect(
+                    &mut effects,
+                    target,
+                    root,
+                    protection & u64::from((libc::PROT_READ | libc::PROT_EXEC).cast_unsigned())
+                        != 0,
+                    shared && protection & u64::from(libc::PROT_WRITE.cast_unsigned()) != 0,
+                )?;
+                let start = returned(info).ok_or_else(|| "mapping has no address".to_string())?;
+                let end = start
+                    .checked_add(integer(info, 1)?)
+                    .ok_or_else(|| "mapping range overflow".to_string())?;
+                self.task(tid).mappings.lock().recover().push(Mapping {
+                    start,
+                    end,
+                    target: target.clone(),
+                    shared,
+                    generation: self.generation,
+                });
             }
             Sysno::mprotect
             | Sysno::pkey_mprotect
             | Sysno::munmap
             | Sysno::mremap
-            | Sysno::msync => {
-                if success {
-                    self.mapping_effects(info, root, &mut effects)?;
-                }
+            | Sysno::msync
+                if success =>
+            {
+                self.mapping_effects(info, root, &mut effects)?;
             }
             Sysno::stat
             | Sysno::lstat
@@ -493,46 +476,44 @@ impl Access {
             | Sysno::lremovexattr
             | Sysno::fremovexattr
             | Sysno::mknod
-            | Sysno::mknodat => {
-                if success {
-                    let path = if matches!(
-                        info.info.syscall,
-                        Sysno::fchown | Sysno::fsetxattr | Sysno::fremovexattr
-                    ) {
-                        info.fd(0)?
-                            .map(target_path)
-                            .ok_or_else(|| "mutation has no descriptor identity".to_string())?
-                    } else {
-                        let at = matches!(info.info.syscall, Sysno::fchownat | Sysno::mknodat);
-                        self.path(info, at.then_some(0), usize::from(at), root, &mut effects)?
-                    };
-                    if protected(root, &path)?.is_some() {
-                        return Err(format!(
-                            "unsupported protected effect: {}",
-                            info.info.syscall
-                        ));
-                    }
+            | Sysno::mknodat
+                if success =>
+            {
+                let path = if matches!(
+                    info.info.syscall,
+                    Sysno::fchown | Sysno::fsetxattr | Sysno::fremovexattr
+                ) {
+                    info.fd(0)?
+                        .map(target_path)
+                        .ok_or_else(|| "mutation has no descriptor identity".to_string())?
+                } else {
+                    let at = matches!(info.info.syscall, Sysno::fchownat | Sysno::mknodat);
+                    self.path(info, at.then_some(0), usize::from(at), root, &mut effects)?
+                };
+                if protected(root, &path)?.is_some() {
+                    return Err(format!(
+                        "unsupported protected effect: {}",
+                        info.info.syscall
+                    ));
                 }
             }
             // A ring is observable while every submission is visible at an `io_uring_enter` stop:
             // no kernel submission thread, and only operations with no filesystem effect.
-            Sysno::io_uring_setup => {
-                if success && captured_flags(info)? & IORING_SETUP_SQPOLL != 0 {
-                    return Err("kernel-polled io_uring submissions are unobservable".into());
-                }
+            Sysno::io_uring_setup
+                if success && captured_flags(info)? & IORING_SETUP_SQPOLL != 0 =>
+            {
+                return Err("kernel-polled io_uring submissions are unobservable".into());
             }
-            Sysno::io_uring_enter => {
-                if integer(info, 1)? != 0 {
-                    let submissions = info
-                        .submissions
-                        .as_ref()
-                        .ok_or_else(|| "unobserved io_uring submissions".to_string())?;
-                    if let Some(opcode) = submissions.iter().find(|opcode| {
-                        !(EFFECTLESS_IO_URING_OPS.contains(opcode)
-                            || self.kernel_contacts && matches!(**opcode, 9 | 16 | 26 | 47 | 48))
-                    }) {
-                        return Err(format!("unsupported io_uring operation {opcode}"));
-                    }
+            Sysno::io_uring_enter if integer(info, 1)? != 0 => {
+                let submissions = info
+                    .submissions
+                    .as_ref()
+                    .ok_or_else(|| "unobserved io_uring submissions".to_string())?;
+                if let Some(opcode) = submissions.iter().find(|opcode| {
+                    !(EFFECTLESS_IO_URING_OPS.contains(opcode)
+                        || self.kernel_contacts && matches!(**opcode, 9 | 16 | 26 | 47 | 48))
+                }) {
+                    return Err(format!("unsupported io_uring operation {opcode}"));
                 }
             }
             Sysno::io_uring_register
@@ -545,13 +526,13 @@ impl Access {
             | Sysno::move_mount
             | Sysno::setxattrat
             | Sysno::removexattrat
-            | Sysno::file_setattr => {
-                if success {
-                    return Err(format!(
-                        "unsupported workload effect: {}",
-                        info.info.syscall
-                    ));
-                }
+            | Sysno::file_setattr
+                if success =>
+            {
+                return Err(format!(
+                    "unsupported workload effect: {}",
+                    info.info.syscall
+                ));
             }
             Sysno::ioctl => {
                 if success && let Some(target) = info.fd(0)? {
